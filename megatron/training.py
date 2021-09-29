@@ -24,6 +24,8 @@ _TRAIN_START_TIME = time.time()
 
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+import bagua.torch_api as bagua
+from bagua.torch_api.algorithms import gradient_allreduce
 
 from megatron import get_args
 from megatron import get_timers
@@ -242,6 +244,17 @@ def get_model(model_provider_func):
     # Fp16 conversion.
     if args.fp16 or args.bf16:
         model = [Float16Module(model_module, args) for model_module in model]
+
+    if args.DDP_impl == 'bagua':
+        bagua.init_process_group()
+        i = torch.cuda.current_device()
+        model = [
+            model_module.with_bagua(
+                algorithm=gradient_allreduce.GradientAllReduceAlgorithm(),
+                process_group=bagua.communication.from_torch_group(
+                    mpu.get_data_parallel_group())
+            ) for model_module in model]
+        return model
 
     if args.DDP_impl == 'torch':
         i = torch.cuda.current_device()

@@ -32,6 +32,8 @@ from megatron.global_vars import set_global_variables
 from megatron.mpu import (set_tensor_model_parallel_rank,
                           set_tensor_model_parallel_world_size)
 
+import bagua.torch_api as bagua
+
 
 def initialize_megatron(extra_args_provider=None, args_defaults={},
                         ignore_unknown_args=False, allow_no_cuda=False):
@@ -176,6 +178,9 @@ def _initialize_distributed():
             else:
                 args.local_rank = device
             torch.cuda.set_device(device)
+
+        bagua.init_process_group()
+
         # Call the init process
         torch.distributed.init_process_group(
             backend=args.distributed_backend,
