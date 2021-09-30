@@ -118,6 +118,8 @@ def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
     if isinstance(model, torchDDP):
         context_handler = model.no_sync
 
+    print('model.type={}', type(model))
+
     losses_reduced = []
     input_tensor, output_tensor_grad = None, None
     with context_handler():
