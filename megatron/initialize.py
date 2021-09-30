@@ -181,11 +181,11 @@ def _initialize_distributed():
 
         bagua.init_process_group()
 
-        # Call the init process
-        torch.distributed.init_process_group(
-            backend=args.distributed_backend,
-            world_size=args.world_size, rank=args.rank,
-            timeout=timedelta(days=7))
+        # # Call the init process
+        # torch.distributed.init_process_group(
+        #     backend=args.distributed_backend,
+        #     world_size=args.world_size, rank=args.rank,
+        #     timeout=timedelta(days=7))
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
