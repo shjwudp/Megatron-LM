@@ -138,7 +138,8 @@ def _compile_dependencies():
         fused_kernels.load(args)
         torch.distributed.barrier()
     else:
-        print('rank={}, current_device={}'.format(args.rank, torch.cuda.current_device()))
+        print('rank={}, current_device={}'.format(
+            args.rank, torch.cuda.current_device()))
         torch.distributed.barrier()
         fused_kernels.load(args)
     # Simple barrier to make sure all ranks have passed the
@@ -181,6 +182,8 @@ def _initialize_distributed():
             torch.cuda.set_device(device)
 
         bagua.init_process_group()
+        print("torch.distributed.is_initialized={}".format(
+            torch.distributed.is_initialized()))
 
         # # Call the init process
         # torch.distributed.init_process_group(
