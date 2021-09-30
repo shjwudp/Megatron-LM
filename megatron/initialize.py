@@ -138,6 +138,7 @@ def _compile_dependencies():
         fused_kernels.load(args)
         torch.distributed.barrier()
     else:
+        print('rank={}, current_device={}'.format(args.rank, torch.cuda.current_device()))
         torch.distributed.barrier()
         fused_kernels.load(args)
     # Simple barrier to make sure all ranks have passed the
