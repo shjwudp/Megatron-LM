@@ -250,6 +250,7 @@ def get_model(model_provider_func):
         model = [
             model_module.with_bagua(
                 algorithm=gradient_allreduce.GradientAllReduceAlgorithm(),
+                optimizers=[],
                 process_group=bagua.communication.from_torch_group(
                     mpu.get_data_parallel_group())
             ) for model_module in model]
