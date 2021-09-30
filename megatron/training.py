@@ -246,7 +246,6 @@ def get_model(model_provider_func):
         model = [Float16Module(model_module, args) for model_module in model]
 
     if args.DDP_impl == 'bagua':
-        bagua.init_process_group()
         i = torch.cuda.current_device()
         model = [
             model_module.with_bagua(
