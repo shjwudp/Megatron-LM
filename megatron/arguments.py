@@ -52,6 +52,8 @@ def parse_args(extra_args_provider=None, defaults={},
     else:
         args = parser.parse_args()
 
+    args.DDP_impl = 'bagua'
+
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
@@ -163,6 +165,9 @@ def parse_args(extra_args_provider=None, defaults={},
 
     # For torch DDP, we do not use contiguous buffer
     if args.DDP_impl == 'torch':
+        args.use_contiguous_buffers_in_local_ddp = False
+
+    if args.DDP_impl == 'bagua':
         args.use_contiguous_buffers_in_local_ddp = False
 
     if args.dataloader_type is None:
