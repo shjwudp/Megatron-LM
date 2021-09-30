@@ -181,8 +181,10 @@ def _initialize_distributed():
                 args.local_rank = device
             torch.cuda.set_device(device)
 
+        print("rank={} go init_process_group".format(args.rank))
         bagua.init_process_group()
-        print("torch.distributed.is_initialized={}".format(
+        print("rank={} torch.distributed.is_initialized={}".format(
+            args.rank,
             torch.distributed.is_initialized()))
 
         # # Call the init process
