@@ -31,6 +31,7 @@ from megatron.p2p_communication import recv_forward, send_forward
 
 # These are needed to unwrap the model, would be nice to put these in megatron.utils if possible?
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from bagua.torch_api.ddp_compatible import DistributedDataParallel as baguaDDP
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
 
@@ -201,7 +202,7 @@ def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
 
     # Forward pass through the model.
     unwrapped_model = unwrap_model(
-        model, (torchDDP, LocalDDP, Float16Module))
+        model, (baguaDDP, torchDDP, LocalDDP, Float16Module))
     unwrapped_model.set_input_tensor(input_tensor)
     output_tensor = model(tokens, position_ids, attention_mask,
                           tokentype_ids=tokentype_ids,

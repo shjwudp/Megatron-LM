@@ -24,6 +24,7 @@ _TRAIN_START_TIME = time.time()
 
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from bagua.torch_api.ddp_compatible import DistributedDataParallel as baguaDDP
 import bagua.torch_api as bagua
 from bagua.torch_api.algorithms import gradient_allreduce
 
@@ -248,12 +249,10 @@ def get_model(model_provider_func):
     if args.DDP_impl == 'bagua':
         i = torch.cuda.current_device()
         model = [
-            model_module.with_bagua(
-                algorithm=gradient_allreduce.GradientAllReduceAlgorithm(),
-                optimizers=[],
-                process_group=bagua.communication.from_torch_group(
-                    mpu.get_data_parallel_group())
-            ) for model_module in model]
+            baguaDDP(model_module, device_ids=[i], output_device=i,
+                process_group=mpu.get_data_parallel_group())
+            for model_module in model
+        ]
         return model
 
     if args.DDP_impl == 'torch':
@@ -324,7 +323,7 @@ def setup_model_and_optimizer(model_provider_func):
     model = get_model(model_provider_func)
 
     unwrapped_model = unwrap_model(model,
-                                   (torchDDP, LocalDDP, Float16Module))
+                                   (baguaDDP, torchDDP, LocalDDP, Float16Module))
     optimizer = get_megatron_optimizer(unwrapped_model)
 
     lr_scheduler = get_learning_rate_scheduler(optimizer)
@@ -398,7 +397,7 @@ def train_step(forward_step_func, data_iterator,
         elif mpu.is_pipeline_last_stage(ignore_virtual=True):
             unwrapped_model = model[-1]
         unwrapped_model = unwrap_model(
-            unwrapped_model, (torchDDP, LocalDDP, Float16Module))
+            unwrapped_model, (baguaDDP, torchDDP, LocalDDP, Float16Module))
 
         if unwrapped_model.share_word_embeddings:
             word_embeddings_weight = unwrapped_model.word_embeddings_weight()
