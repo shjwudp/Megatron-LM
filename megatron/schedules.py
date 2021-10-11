@@ -58,7 +58,11 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
     output_tensor, loss_func = forward_step_func(data_iterator, model)
     if mpu.is_pipeline_last_stage():
         output_tensor = loss_func(output_tensor)
-        loss, loss_reduced = output_tensor
+        try:
+            loss, loss_reduced = output_tensor
+        except:
+            print('output_tensor={}'.format(output_tensor))
+            raise
         output_tensor = loss / get_num_microbatches()
         losses_reduced.append(loss_reduced)
     timers('forward-compute').stop()
