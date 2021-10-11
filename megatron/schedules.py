@@ -57,8 +57,8 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
     unwrapped_model.set_input_tensor(input_tensor)
     output_tensor, loss_func = forward_step_func(data_iterator, model)
     if mpu.is_pipeline_last_stage():
-        output_tensor = loss_func(output_tensor)
         try:
+            output_tensor = loss_func(output_tensor)
             loss, loss_reduced = output_tensor
         except:
             print('output_tensor={}'.format(output_tensor))
