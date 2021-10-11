@@ -405,6 +405,7 @@ def train_step(forward_step_func, data_iterator,
             if args.DDP_impl == 'local':
                 grad = word_embeddings_weight.main_grad
             else:
+                print('it happens!')
                 grad = word_embeddings_weight.grad
             torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
     timers('backward-embedding-all-reduce').stop()
