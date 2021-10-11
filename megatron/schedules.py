@@ -90,6 +90,7 @@ def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad):
     # Backward pass.
     if output_tensor_grad is None:
         output_tensor = optimizer.scale_loss(output_tensor)
+    print('output_tensor_grad={}'.format(output_tensor_grad))
     torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
 
     # Collect the grad of the input_tensor.
