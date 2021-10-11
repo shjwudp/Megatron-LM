@@ -112,6 +112,8 @@ def forward_step(data_iterator, model):
     if not args.bert_binary_head:
         types = None
 
+    print('model={}'.format(model))
+
     # Forward pass through the model.
     output_tensor = model(tokens, padding_mask, tokentype_ids=types,
                           lm_labels=lm_labels)
