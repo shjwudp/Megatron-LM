@@ -23,7 +23,9 @@ import time
 _TRAIN_START_TIME = time.time()
 
 import torch
+import bagua.torch_api as bagua
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from bagua.torch_api.ddp_compatible import DistributedDataParallel as baguaDDP
 
 from megatron import get_args
 from megatron import get_timers
@@ -209,6 +211,18 @@ def get_model(model_provider_func):
         model = torchDDP(model, device_ids=[i], output_device=i,
                          process_group=mpu.get_data_parallel_group())
         return model
+
+    if args.DDP_impl == 'bagua':
+        i = torch.cuda.current_device()
+        bagua_process_group = bagua.communication.from_torch_group(
+            mpu.get_data_parallel_group())
+        model = [
+            baguaDDP(model_module, device_ids=[i], output_device=i,
+                process_group=bagua_process_group)
+            for model_module in model
+        ]
+        return model
+
     if args.DDP_impl == 'local':
         model = LocalDDP(model)
         return model
@@ -267,7 +281,7 @@ def setup_model_and_optimizer(model_provider_func):
     model = get_model(model_provider_func)
 
     unwrapped_model = model
-    while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16Module)):
+    while isinstance(unwrapped_model, (baguaDDP, torchDDP, LocalDDP, FP16Module)):
         unwrapped_model = unwrapped_model.module
     optimizer = get_megatron_optimizer(unwrapped_model)
 
@@ -608,7 +622,7 @@ def train_step(forward_step_func, data_iterator,
     if (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()) and \
             mpu.get_pipeline_model_parallel_world_size() > 1:
         unwrapped_model = model
-        while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16Module)):
+        while isinstance(unwrapped_model, (baguaDDP, torchDDP, LocalDDP, FP16Module)):
             unwrapped_model = unwrapped_model.module
 
         if unwrapped_model.share_word_embeddings:

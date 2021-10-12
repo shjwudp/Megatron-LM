@@ -19,9 +19,11 @@ import os
 import random
 import sys
 import numpy as np
+from playground.ut_hang.bagua import bagua
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
+from bagua.torch_api.ddp_compatible import DistributedDataParallel as baguaDDP
 
 from megatron import mpu, get_args, update_num_microbatches
 from megatron import get_args
@@ -111,6 +113,9 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     if isinstance(model, torchDDP):
         model = model.module
 
+    if isinstance(model, baguaDDP):
+        model = model.module
+
     if torch.distributed.get_rank() == 0:
         print('saving checkpoint at iteration {:7d} to {}'.format(
             iteration, args.save), flush=True)
@@ -165,6 +170,8 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
     load_dir = getattr(args, load_arg)
 
     if isinstance(model, torchDDP):
+        model = model.module
+    if isinstance(model, baguaDDP):
         model = model.module
     # Read the tracker file and set the iteration.
     tracker_filename = get_checkpoint_tracker_filename(load_dir)
@@ -298,6 +305,9 @@ def load_ict_checkpoint(model, only_query_model=False, only_block_model=False, f
     args = get_args()
 
     if isinstance(model, torchDDP):
+        model = model.module
+
+    if isinstance(model, baguaDDP):
         model = model.module
 
     load_path = args.load if from_realm_chkpt else args.ict_load
