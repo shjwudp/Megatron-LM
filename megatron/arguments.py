@@ -41,6 +41,8 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_autoresume_args(parser)
     parser = _add_realm_args(parser)
 
+    parser.add_argument("--ddp-impl", type=str, default="torch")
+
     # Custom arguments.
     if extra_args_provider is not None:
         parser = extra_args_provider(parser)
@@ -50,6 +52,8 @@ def parse_args(extra_args_provider=None, defaults={},
         args, _ = parser.parse_known_args()
     else:
         args = parser.parse_args()
+
+    args.DDP_impl = args.ddp_impl
 
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
