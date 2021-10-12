@@ -19,7 +19,6 @@ import os
 import random
 import sys
 import numpy as np
-from playground.ut_hang.bagua import bagua
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
