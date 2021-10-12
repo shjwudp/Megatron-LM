@@ -126,8 +126,7 @@ def _initialize_distributed():
         init_method += master_ip + ':' + master_port
         torch.distributed.init_process_group(
             backend=args.distributed_backend,
-            world_size=args.world_size, rank=args.rank,
-            init_method=init_method)
+            world_size=args.world_size, rank=args.rank)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
