@@ -20,6 +20,7 @@ import os
 
 import numpy as np
 import torch
+import bagua.torch_api as bagua
 
 from megatron import get_adlr_autoresume
 from megatron import get_args
@@ -119,14 +120,14 @@ def _initialize_distributed():
             else:
                 args.local_rank = device
             torch.cuda.set_device(device)
-        # Call the init process
-        init_method = 'tcp://'
-        master_ip = os.getenv('MASTER_ADDR', 'localhost')
-        master_port = os.getenv('MASTER_PORT', '6000')
-        init_method += master_ip + ':' + master_port
-        torch.distributed.init_process_group(
-            backend=args.distributed_backend,
-            world_size=args.world_size, rank=args.rank)
+
+        if args.DDP_impl == 'torch':
+            # Call the init process
+            torch.distributed.init_process_group(
+                backend=args.distributed_backend,
+                world_size=args.world_size, rank=args.rank)
+        if args.DDP_impl == 'bagua':
+            bagua.init_process_group()
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
