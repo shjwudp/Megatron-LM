@@ -485,7 +485,7 @@ def _add_distributed_args(parser):
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
     group.add_argument('--DDP-impl', default='local',
-                       choices=['local', 'torch'],
+                       choices=['local', 'torch', 'bagua'],
                        help='which DistributedDataParallel implementation '
                        'to use.')
     group.add_argument('--local_rank', type=int, default=None,
