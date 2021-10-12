@@ -216,11 +216,8 @@ def get_model(model_provider_func):
         i = torch.cuda.current_device()
         bagua_process_group = bagua.communication.from_torch_group(
             mpu.get_data_parallel_group())
-        model = [
-            baguaDDP(model_module, device_ids=[i], output_device=i,
+        model = baguaDDP(model, device_ids=[i], output_device=i,
                 process_group=bagua_process_group)
-            for model_module in model
-        ]
         return model
 
     if args.DDP_impl == 'local':
