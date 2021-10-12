@@ -53,10 +53,6 @@ def parse_args(extra_args_provider=None, defaults={},
     else:
         args = parser.parse_args()
 
-    print('args.ddp_impl={}'.format(args.ddp_impl))
-
-    args.DDP_impl = args.ddp_impl
-
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
