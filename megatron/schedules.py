@@ -16,6 +16,7 @@
 from contextlib import contextmanager
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from bagua.torch_api.ddp_compatible import DistributedDataParallel as baguaDDP
 
 from megatron import get_args
 from megatron import get_num_microbatches
@@ -52,7 +53,7 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
 
     timers('forward-compute').start()
     unwrapped_model = unwrap_model(
-        model, (torchDDP, LocalDDP, Float16Module))
+        model, (baguaDDP, torchDDP, LocalDDP, Float16Module))
     unwrapped_model.set_input_tensor(input_tensor)
     output_tensor, loss_func = forward_step_func(data_iterator, model)
     if mpu.is_pipeline_last_stage():
@@ -116,6 +117,9 @@ def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
 
     context_handler = dummy_handler
     if isinstance(model, torchDDP):
+        context_handler = model.no_sync
+
+    if isinstance(model, baguaDDP):
         context_handler = model.no_sync
 
     losses_reduced = []

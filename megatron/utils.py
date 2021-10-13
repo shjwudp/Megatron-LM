@@ -19,6 +19,7 @@ import sys
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
+from bagua.torch_api.ddp_compatible import DistributedDataParallel as baguaDDP
 
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
@@ -31,7 +32,7 @@ from megatron.model.module import param_is_not_shared
 from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
 
 
-def unwrap_model(model, module_instances=(torchDDP)):
+def unwrap_model(model, module_instances=(baguaDDP, torchDDP)):
     return_list = True
     if not isinstance(model, list):
         model = [model]

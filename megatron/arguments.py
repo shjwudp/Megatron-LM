@@ -165,6 +165,9 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.DDP_impl == 'torch':
         args.use_contiguous_buffers_in_local_ddp = False
 
+    if args.DDP_impl == 'bagua':
+        args.use_contiguous_buffers_in_local_ddp = False
+
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
 
@@ -605,7 +608,7 @@ def _add_distributed_args(parser):
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
     group.add_argument('--DDP-impl', default='local',
-                       choices=['local', 'torch'],
+                       choices=['local', 'torch', 'bagua'],
                        help='which DistributedDataParallel implementation '
                        'to use.')
     group.add_argument('--no-contiguous-buffers-in-local-ddp',

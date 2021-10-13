@@ -34,6 +34,7 @@ from .datasets import build_dataset
 
 # These are needed to unwrap the model, would be nice to put these in megatron.utils if possible?
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from bagua.torch_api.ddp_compatible import DistributedDataParallel as baguaDDP
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
 
@@ -97,7 +98,7 @@ def forward_step(batch, model, eval_metric):
 
     # Forward pass through the model.
     unwrapped_model = unwrap_model(
-        model, (torchDDP, LocalDDP, Float16Module))
+        model, (baguaDDP, torchDDP, LocalDDP, Float16Module))
     unwrapped_model.set_input_tensor(input_tensor)
     output = model(tokens, position_ids, attention_mask)
 
