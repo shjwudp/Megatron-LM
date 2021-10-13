@@ -179,6 +179,7 @@ def _initialize_distributed():
             torch.cuda.set_device(device)
 
         if args.DDP_impl == 'torch':
+            print('rank={}'.format(args.rank))
             # Call the init process
             torch.distributed.init_process_group(
                 backend=args.distributed_backend,
