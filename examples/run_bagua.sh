@@ -16,6 +16,8 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $
 
 python -m bagua.distributed.launch --set_additional_flag $DISTRIBUTED_ARGS \
        pretrain_bert.py \
+       --tensor-model-parallel-size 2 \
+       --pipeline-model-parallel-size 1 \
        --DDP-impl bagua \
        --num-layers 24 \
        --hidden-size 1024 \
