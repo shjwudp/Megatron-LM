@@ -1,12 +1,12 @@
 #!/bin/bash
 
-GPUS_PER_NODE=8
+GPUS_PER_NODE=1
 # Change for multinode config
 MASTER_ADDR=localhost
 MASTER_PORT=19001
 NNODES=1
 NODE_RANK=0
-# WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
+WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 DATA_PATH="/share/liuchengjun/megatron_data/my-bert_text_sentence"
 VOCAB_FILE="/share/liuchengjun/megatron_data/bert-large-cased-vocab.txt"
@@ -16,14 +16,12 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $
 
 python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        pretrain_bert.py \
-       --tensor-model-parallel-size 2 \
-       --pipeline-model-parallel-size 1 \
        --DDP-impl torch \
        --num-layers 24 \
        --hidden-size 1024 \
        --num-attention-heads 16 \
        --micro-batch-size 4 \
-       --global-batch-size 32 \
+       --global-batch-size 8 \
        --seq-length 512 \
        --max-position-embeddings 512 \
        --train-iters 1000000 \
@@ -46,3 +44,6 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --eval-interval 1000 \
        --eval-iters 10 \
        --fp16
+
+    #    --tensor-model-parallel-size 2 \
+    #    --pipeline-model-parallel-size 1 \
