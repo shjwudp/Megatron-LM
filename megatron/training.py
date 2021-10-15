@@ -571,6 +571,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             elapsed_time_per_iteration * 1000.0)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
+        log_string += ' speed: {:5d} data/sec |'.format(
+            batch_size / elapsed_time_per_iteration)
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key,
                            nan_iters_key]:
