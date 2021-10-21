@@ -37,8 +37,10 @@ from megatron import update_num_microbatches
 from megatron import mpu
 from megatron import print_rank_0
 from megatron import print_rank_last
-from megatron.checkpointing import load_checkpoint
-from megatron.checkpointing import save_checkpoint
+#from megatron.checkpointing import load_checkpoint
+#from megatron.checkpointing import save_checkpoint
+from bagua.torch_api.model_parallel.moe.megatron import load_checkpoint
+from bagua.torch_api.model_parallel.moe.megatron import save_checkpoint
 from megatron.model import FP16Module
 from megatron.optimizer import get_megatron_optimizer
 
@@ -138,7 +140,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
                                    iteration, False)
 
     if args.save and iteration != 0:
-        save_checkpoint(iteration, model, optimizer, lr_scheduler)
+        save_checkpoint(iteration, model, optimizer, lr_scheduler, version22=True)
 
     if args.do_test:
         # Run on test data.
@@ -290,7 +292,7 @@ def setup_model_and_optimizer(model_provider_func):
         # max time.
         torch.distributed.barrier()
         timers('load checkpoint').start()
-        args.iteration = load_checkpoint(model, optimizer, lr_scheduler)
+        args.iteration = load_checkpoint(model, optimizer, lr_scheduler, version22=True)
         torch.distributed.barrier()
         timers('load checkpoint').stop()
         timers.log(['load checkpoint'])
@@ -783,7 +785,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, lr_scheduler):
     # all ranks report the max time.
     torch.distributed.barrier()
     timers('save checkpoint').start()
-    save_checkpoint(iteration, model, optimizer, lr_scheduler)
+    save_checkpoint(iteration, model, optimizer, lr_scheduler, version22=True)
     torch.distributed.barrier()
     timers('save checkpoint').stop()
     timers.log(['save checkpoint'])

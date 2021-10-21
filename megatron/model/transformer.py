@@ -18,6 +18,7 @@
 import math
 import torch
 import torch.nn.functional as F
+import bagua.torch_api as bagua
 
 from megatron import get_args
 from megatron import mpu
@@ -422,8 +423,10 @@ class ParallelTransformerLayer(MegatronModule):
             eps=args.layernorm_epsilon)
 
         # MLP
-        self.mlp = ParallelMLP(init_method,
-                               output_layer_init_method)
+        if args.num_local_experts > 0:
+            self.mlp = bagua.moe.megatron.MegatronMLP(args.hidden_size, 4 * args.hidden_size, args.num_local_experts, args.top_k)
+        else:
+            self.mlp = ParallelMLP(init_method, output_layer_init_method)
 
     def forward(self, hidden_states, attention_mask, layer_past=None,
                 get_key_value=False):

@@ -40,6 +40,8 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
     parser = _add_realm_args(parser)
+    import bagua.torch_api as bagua
+    parser = bagua.moe.megatron._add_moe_args(parser)
 
     parser.add_argument("--ddp-impl", type=str, default="torch")
 
