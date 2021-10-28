@@ -22,7 +22,8 @@ import numpy as np
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
-from bagua.torch_api.ddp_compatible import DistributedDataParallel as baguaDDP
+from bagua.torch_api.data_parallel import DistributedDataParallel as baguaDDP
+
 
 from megatron import mpu, get_args, update_num_microbatches
 from megatron import get_args

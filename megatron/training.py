@@ -25,7 +25,8 @@ _TRAIN_START_TIME = time.time()
 import torch
 import bagua.torch_api as bagua
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
-from bagua.torch_api.ddp_compatible import DistributedDataParallel as baguaDDP
+from bagua.torch_api.data_parallel import DistributedDataParallel as baguaDDP
+
 
 from megatron import get_args
 from megatron import get_timers
