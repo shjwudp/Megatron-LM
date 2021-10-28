@@ -16,10 +16,12 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $
 
 python -m bagua.distributed.launch --set_additional_flag $DISTRIBUTED_ARGS \
        pretrain_bert.py \
-       --num-local-experts 1 \
        --tensor-model-parallel-size 1 \
        --pipeline-model-parallel-size 1 \
        --DDP-impl bagua \
+       --top-k 2 \
+       --fmoefy \
+       --num-experts 2 \
        --num-layers 1 \
        --hidden-size 4 \
        --num-attention-heads 2 \

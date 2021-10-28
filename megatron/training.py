@@ -40,19 +40,24 @@ from megatron import print_rank_0
 from megatron import print_rank_last
 #from megatron.checkpointing import load_checkpoint
 #from megatron.checkpointing import save_checkpoint
-from bagua.torch_api.model_parallel.moe.megatron import load_checkpoint
-from bagua.torch_api.model_parallel.moe.megatron import save_checkpoint
+#from bagua.torch_api.model_parallel.moe.megatron import load_checkpoint
+#from bagua.torch_api.model_parallel.moe.megatron import save_checkpoint
+from fmoe.megatron.checkpoint import load_checkpoint
+from fmoe.megatron.checkpoint import save_checkpoint
 from megatron.model import FP16Module
 from megatron.optimizer import get_megatron_optimizer
 
 from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
 from megatron.learning_rates import AnnealingLR
-from megatron.model import DistributedDataParallel as LocalDDP
+#from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model.realm_model import ICTBertModel
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.data.data_loaders import build_pretraining_data_loader
 from megatron.utils import report_memory
+
+from fmoe.megatron import DistributedDataParallel as LocalDDP
+from fmoe.megatron import add_balance_log
 
 
 def print_datetime(string):
@@ -106,6 +111,11 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
 
     args = get_args()
     timers = get_timers()
+    # Initialize FastMoE
+    if args.fmoefy:
+        from fmoe.megatron import patch_forward_step, patch_model_provider
+        forward_step_func = patch_forward_step(forward_step_func)
+        model_provider = patch_model_provider(model_provider) 
 
     # Model, optimizer, and learning rate.
     timers('model and optimizer').start()
@@ -141,7 +151,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
                                    iteration, False)
 
     if args.save and iteration != 0:
-        save_checkpoint(iteration, model, optimizer, lr_scheduler, version22=True)
+        save_checkpoint(iteration, model, optimizer, lr_scheduler)
 
     if args.do_test:
         # Run on test data.
@@ -293,7 +303,7 @@ def setup_model_and_optimizer(model_provider_func):
         # max time.
         torch.distributed.barrier()
         timers('load checkpoint').start()
-        args.iteration = load_checkpoint(model, optimizer, lr_scheduler, version22=True)
+        args.iteration = load_checkpoint(model, optimizer, lr_scheduler)
         torch.distributed.barrier()
         timers('load checkpoint').stop()
         timers.log(['load checkpoint'])
@@ -657,7 +667,7 @@ def train_step(forward_step_func, data_iterator,
 
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
-                 loss_scale, report_memory_flag, skipped_iter):
+                 loss_scale, report_memory_flag, skipped_iter, model):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -739,6 +749,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                           args.consumed_train_samples)
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
+        if args.fmoefy and args.balance_strategy and args.balance_strategy != 'naive':
+            add_balance_log(model, writer, iteration)
 
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval time').elapsed()
@@ -786,7 +798,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, lr_scheduler):
     # all ranks report the max time.
     torch.distributed.barrier()
     timers('save checkpoint').start()
-    save_checkpoint(iteration, model, optimizer, lr_scheduler, version22=True)
+    save_checkpoint(iteration, model, optimizer, lr_scheduler)
     torch.distributed.barrier()
     timers('save checkpoint').stop()
     timers.log(['save checkpoint'])
@@ -830,7 +842,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,
-                                          report_memory_flag, skipped_iter)
+                                          report_memory_flag, skipped_iter, model)
 
         # Autoresume
         if args.adlr_autoresume and \

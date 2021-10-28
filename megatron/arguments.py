@@ -21,6 +21,8 @@ import os
 import torch
 from megatron import fused_kernels
 
+from fmoe.megatron import add_fmoe_args as _add_fmoe_args
+
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
     """Parse all arguments."""
@@ -40,8 +42,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
     parser = _add_realm_args(parser)
-    import bagua.torch_api as bagua
-    parser = bagua.moe.megatron._add_moe_args(parser)
+    parser = _add_fmoe_args(parser)
 
     parser.add_argument("--ddp-impl", type=str, default="torch")
 
@@ -231,6 +232,11 @@ def _add_network_size_args(parser):
                        help='Number of transformer layers.')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
+    group.add_argument('--expert-hidden-size', type=int, default=None,
+                       help='Tansformer expert hidden size.')
+    group.add_argument('--skip-layer-dist', type=int, default=None)
+    group.add_argument('--all-comm-layer-dist', type=int, default=None)
+    group.add_argument('--inner-gpu-cnt', type=int, default=4)
     group.add_argument('--num-attention-heads', type=int, default=None,
                        help='Number of transformer attention heads.')
     group.add_argument('--max-position-embeddings', type=int, default=None,

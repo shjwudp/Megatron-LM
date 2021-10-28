@@ -121,7 +121,7 @@ def _initialize_distributed():
                 args.local_rank = device
             torch.cuda.set_device(device)
 
-        if args.DDP_impl == 'torch':
+        if args.DDP_impl == 'torch' or args.DDP_impl == 'local':
             # Call the init process
             torch.distributed.init_process_group(
                 backend=args.distributed_backend,
