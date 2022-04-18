@@ -181,10 +181,30 @@ def CrossEntropy(output, labels):
 
     args = get_args()
 
-    losses = mpu.vocab_parallel_cross_entropy(output.contiguous().float(), labels)
+    lm_output, acc_moe_loss = output
+    losses = mpu.vocab_parallel_cross_entropy(lm_output.contiguous().float(), labels)
     loss_mask = loss_mask.view(-1)
-    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
-    return loss
+    lm_loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    moe_loss = acc_moe_loss * args.moe_loss_coeff
+
+    if "lm loss" not in args.loss_counter:
+        args.loss_counter["lm loss"] = 0.
+    args.loss_counter["lm loss"] += lm_loss
+
+    if "moe loss" not in args.loss_counter:
+        args.loss_counter["moe loss"] = 0.
+    args.loss_counter["moe loss"] += moe_loss
+
+    return lm_loss + moe_loss
+
+
+class MoELayerNormPipe(LayerNorm):
+    """Extends LayerNorm to forward accumulated moe_loss through the pipeline.
+    """
+
+    def forward(self, inputs, **kwargs):
+        hidden_states, acc_moe_loss = inputs
+        return super().forward(hidden_states, **kwargs), acc_moe_loss
 
 
 class GPTModelPipe(PipelineModule,MegatronModule):
@@ -195,6 +215,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                  parallel_output=True):
         args = get_args()
         self.parallel_output = parallel_output
+        args.loss_counter = {}
 
         init_method = init_method_normal(args.init_method_std)
 
@@ -237,20 +258,21 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                 
         
         # Undo data format change
-        self.specs.append(lambda x: x.transpose(0, 1).contiguous())
+        self.specs.append(lambda x: (x[0].transpose(0, 1).contiguous(), x[1]))
 
         # Final layernorm after transformer layers
         self.specs.append(
-            LayerSpec(LayerNorm,
+            LayerSpec(MoELayerNormPipe,
                       args.hidden_size,
                       eps=args.layernorm_epsilon))
 
         def _logits_helper(embedding, lm_output):
             """A wrapper to massage inputs/outputs from pipeline. """
+            lm_output, acc_moe_loss = lm_output
             return parallel_lm_logits(
                 lm_output,
                 embedding.word_embeddings_weight,
-                self.parallel_output)
+                self.parallel_output), acc_moe_loss
 
         self.specs.append(
             TiedLayerSpec('embed',
@@ -267,7 +289,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
 
         # Convert to fp32 if needed
         if args.fp16 or args.bf16:
-            self.specs.append(float16_to_fp32)
+            self.specs.append(lambda x: (float16_to_fp32(x[0]), x[1]))
 
         if args.checkpoint_activations:
             interval = args.checkpoint_num_layers

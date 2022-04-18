@@ -593,15 +593,17 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
             if not hasattr(self, '_args'):
                 self._args = get_args()
             hidden_states, attention_mask = inputs, self._args.attn_mask
-            # HACK: currently MoE model does not support pipeline parallel, so
-            # here we just ignore the moe_loss returned by forward()
-            return super().forward(hidden_states, attention_mask, **kwargs)[0]
+            output, moe_loss = super().forward(hidden_states, attention_mask, **kwargs)
+            return output, moe_loss, self._args.attn_mask
         elif len(inputs) == 2:
             # Attention mask is an activation.
             hidden_states, attention_mask = inputs[0], inputs[1]
-            # HACK: currently MoE model does not support pipeline parallel, so
-            # here we just ignore the moe_loss returned by forward()
-            return super().forward(*inputs, **kwargs)[0], attention_mask
+            output, moe_loss = super().forward(hidden_states, attention_mask, **kwargs)
+            return output, moe_loss, attention_mask
+        elif len(inputs) == 3:
+            hidden_states, acc_moe_loss, attention_mask = inputs
+            output, moe_loss = super().forward(hidden_states, attention_mask, **kwargs)
+            return output, acc_moe_loss + moe_loss, attention_mask
         else:
             raise RuntimeError('Received more inputs than understood.')
 

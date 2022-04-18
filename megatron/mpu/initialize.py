@@ -17,6 +17,7 @@
 """Model and data parallel groups."""
 
 import torch
+from types import List
 
 from .utils import ensure_divisibility
 
@@ -44,6 +45,11 @@ _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
 # A list of global ranks for each pipeline group to ease calculation of the source
 # rank when broadcasting from the first or last pipeline stage
 _PIPELINE_GLOBAL_RANKS = None
+
+# A three-level nested array that holds the rank list of all data-parallel groups.
+# _ALL_DATA_PARALLEL_GROUP_RANKS[i][j] represents the data parallel group rank list
+# of the j-th tensor slice in the i-th pipeline stage.
+_ALL_DATA_PARALLEL_GROUP_RANKS = None
 
 def is_unitialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
@@ -107,14 +113,20 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
     global _DATA_PARALLEL_GROUP
     assert _DATA_PARALLEL_GROUP is None, \
         'data parallel group is already initialized'
-    all_data_parallel_group_ranks = []
+    global _ALL_DATA_PARALLEL_GROUP_RANKS
+    assert _ALL_DATA_PARALLEL_GROUP_RANKS is None, \
+        "all data parallel group is already initialized"
+    _ALL_DATA_PARALLEL_GROUP_RANKS = []
+    my_data_parallel_group_ranks = []
     for i in range(pipeline_model_parallel_size):
         start_rank = i * num_pipeline_model_parallel_groups
         end_rank = (i + 1) * num_pipeline_model_parallel_groups
+        _ALL_DATA_PARALLEL_GROUP_RANKS.append([])
         for j in range(tensor_model_parallel_size):
             ranks = range(start_rank + j, end_rank,
                           tensor_model_parallel_size)
-            all_data_parallel_group_ranks.append(list(ranks))
+            my_data_parallel_group_ranks.append(list(ranks))
+            _ALL_DATA_PARALLEL_GROUP_RANKS[-1].append(list(ranks))
             group = torch.distributed.new_group(ranks)
             if rank in ranks:
                 _DATA_PARALLEL_GROUP = group
@@ -125,7 +137,7 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
         'model parallel group is already initialized'
     for i in range(data_parallel_size):
         ranks = [data_parallel_group_ranks[i]
-                 for data_parallel_group_ranks in all_data_parallel_group_ranks]
+                 for data_parallel_group_ranks in my_data_parallel_group_ranks]
         group = torch.distributed.new_group(ranks)
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
@@ -166,6 +178,20 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
         group = torch.distributed.new_group(embedding_ranks)
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
+
+
+def get_all_data_parallel_group_ranks() -> List[List[List]]:
+    """Return a three-level nested array that holds the rank list of all
+        data-parallel groups. _ALL_DATA_PARALLEL_GROUP_RANKS[i][j]
+        represents the data parallel group rank list of the j-th
+        tensor slice in the i-th pipeline stage.
+
+    Returns:
+        List[List[List]]: all data parallel group ranks.
+    """
+    assert _ALL_DATA_PARALLEL_GROUP_RANKS is not None, \
+            "all data parallel group ranks is not initialized!"
+    return _ALL_DATA_PARALLEL_GROUP_RANKS
 
 
 def model_parallel_is_initialized():
