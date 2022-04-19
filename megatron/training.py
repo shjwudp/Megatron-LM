@@ -867,6 +867,22 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     # Iterations.
     iteration = args.iteration
 
+    from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
+
+    if torch.distributed.get_rank() == 0:
+        profiler = torch.profiler.profile(
+            profile_memory=True,
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(
+                wait=1,
+                warmup=1,
+                active=1,
+                repeat=1),
+            on_trace_ready=tensorboard_trace_handler("./log/gpt-moe"),
+            with_flops=True,
+        )
+        profiler.start()
+
     timers('interval-time').start()
     print_datetime('before the start of training step')
     report_memory_flag = True
@@ -891,6 +907,10 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                        lr_scheduler,
                        teacher_model=teacher_model)
         iteration += 1
+        if torch.distributed.get_rank() == 0:
+            profiler.step()
+            if iteration > 10:
+                profiler.stop()
         args.iteration = iteration
         new_samples = mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
