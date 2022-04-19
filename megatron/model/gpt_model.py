@@ -186,7 +186,6 @@ def CrossEntropy(output, labels):
     loss_mask = loss_mask.view(-1)
     lm_loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
     moe_loss = acc_moe_loss * args.moe_loss_coeff
-    print("acc_moe_loss", acc_moe_loss, args.moe_loss_coeff, moe_loss)
 
     if "lm loss" not in args.moe_loss_dict:
         args.moe_loss_dict["lm loss"] = 0.
