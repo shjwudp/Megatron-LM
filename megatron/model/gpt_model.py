@@ -186,14 +186,15 @@ def CrossEntropy(output, labels):
     loss_mask = loss_mask.view(-1)
     lm_loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
     moe_loss = acc_moe_loss * args.moe_loss_coeff
+    print("acc_moe_loss", acc_moe_loss, args.moe_loss_coeff, moe_loss)
 
-    if "lm loss" not in args.loss_counter:
-        args.loss_counter["lm loss"] = 0.
-    args.loss_counter["lm loss"] += lm_loss
+    if "lm loss" not in args.moe_loss_dict:
+        args.moe_loss_dict["lm loss"] = 0.
+    args.moe_loss_dict["lm loss"] += lm_loss.detach()
 
-    if "moe loss" not in args.loss_counter:
-        args.loss_counter["moe loss"] = 0.
-    args.loss_counter["moe loss"] += moe_loss
+    if "moe loss" not in args.moe_loss_dict:
+        args.moe_loss_dict["moe loss"] = 0.
+    args.moe_loss_dict["moe loss"] += moe_loss.detach()
 
     return lm_loss + moe_loss
 
@@ -215,7 +216,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                  parallel_output=True):
         args = get_args()
         self.parallel_output = parallel_output
-        args.loss_counter = {}
+        args.moe_loss_dict = {}
 
         init_method = init_method_normal(args.init_method_std)
 
@@ -247,14 +248,29 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         else:
             self.specs.append(lambda x: x.transpose(0, 1).contiguous())
 
+        num_experts = args.num_experts
+        assert len(num_experts) == 1 or len(num_experts) == args.num_layers // args.expert_interval, \
+        'num_experts must be either a single value or a list of the same length as the number of MoE layers'
+
+        # Create the list of MoE experts
+        if len(num_experts) == 1:
+            num_experts = num_experts * (args.num_layers // args.expert_interval)
+
         for layer_idx in range(args.num_layers):
+            layer_num = layer_idx + 1
+            if layer_num % args.expert_interval == 0:
+                n_e = num_experts[(layer_num - 1) // args.expert_interval]
+            else:
+                n_e = 1
+
             self.specs.append(
                 LayerSpec(ParallelTransformerLayerPipe,
                     init_method=init_method,
                     output_layer_init_method=scaled_init_method_normal(args.init_method_std,
                                                                        args.num_layers),
                     layer_number=layer_idx,
-                    self_attn_mask_type=AttnMaskType.causal))
+                    self_attn_mask_type=AttnMaskType.causal,
+                    num_experts=n_e))
                 
         
         # Undo data format change

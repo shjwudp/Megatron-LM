@@ -17,7 +17,7 @@
 """Model and data parallel groups."""
 
 import torch
-from types import List
+from typing import List
 
 from .utils import ensure_divisibility
 
@@ -180,14 +180,14 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
             _EMBEDDING_GROUP = group
 
 
-def get_all_data_parallel_group_ranks() -> List[List[List]]:
+def get_all_data_parallel_group_ranks() -> List[List[List[int]]]:
     """Return a three-level nested array that holds the rank list of all
         data-parallel groups. _ALL_DATA_PARALLEL_GROUP_RANKS[i][j]
         represents the data parallel group rank list of the j-th
         tensor slice in the i-th pipeline stage.
 
     Returns:
-        List[List[List]]: all data parallel group ranks.
+        List[List[List[int]]]: all data parallel group ranks.
     """
     assert _ALL_DATA_PARALLEL_GROUP_RANKS is not None, \
             "all data parallel group ranks is not initialized!"

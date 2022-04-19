@@ -476,7 +476,17 @@ def train_step(forward_step_func, data_iterator,
         assert isinstance(model[0], deepspeed.PipelineEngine)
         loss = model[0].train_batch(data_iter=data_iterator)
         grad_norm = model[0].get_global_grad_norm()
-        return {'lm loss' : loss}, skipped_iter, grad_norm, num_zeros_in_grad
+
+        dp_group = mpu.get_data_parallel_group()
+        pipe_engine = model[0]
+        loss_dict = args.moe_loss_dict
+        args.moe_loss_dict = {}
+        for key in loss_dict:
+            loss_dict[key] /= pipe_engine.gradient_accumulation_steps()
+            torch.distributed.all_reduce(loss_dict[key], group=dp_group)
+            loss_dict[key] /=  dp_group.size()
+
+        return loss_dict, skipped_iter, grad_norm, num_zeros_in_grad
 
     # Set grad to zero.
     if not args.deepspeed:
@@ -996,7 +1006,12 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                 # DeepSpeed uses eval_batch() and already aggregates losses.
                 assert isinstance(model, list) and len(model) == 1
                 loss = model[0].eval_batch(data_iterator)
-                loss_dicts = [{'lm loss' : loss}] * get_num_microbatches()
+                loss_dict = args.moe_loss_dict
+                args.moe_loss_dict = {}
+                pipe_engine = model[0]
+                for key in loss_dict:
+                    loss_dict[key] /= pipe_engine.gradient_accumulation_steps()
+                loss_dicts = [loss_dict] * get_num_microbatches()
             else:
                 loss_dicts = forward_backward_func(
                     forward_step_func, data_iterator, model, optimizer=None,
