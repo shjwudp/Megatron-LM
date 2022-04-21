@@ -882,6 +882,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             with_flops=True,
         )
         profiler.start()
+        profile_step_count = 0
 
     timers('interval-time').start()
     print_datetime('before the start of training step')
@@ -909,7 +910,8 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         iteration += 1
         if torch.distributed.get_rank() == 0:
             profiler.step()
-            if iteration > 10:
+            profile_step_count += 1
+            if profile_step_count > 10:
                 profiler.stop()
         args.iteration = iteration
         new_samples = mpu.get_data_parallel_world_size() * \
@@ -1025,12 +1027,15 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
             if args.deepspeed and args.ds_pipeline_enabled:
                 # DeepSpeed uses eval_batch() and already aggregates losses.
                 assert isinstance(model, list) and len(model) == 1
-                loss = model[0].eval_batch(data_iterator)
+                model[0].eval_batch(data_iterator)
+                dp_group = mpu.get_data_parallel_group()
+                pipe_engine = model[0]
                 loss_dict = args.moe_loss_dict
                 args.moe_loss_dict = {}
-                pipe_engine = model[0]
                 for key in loss_dict:
                     loss_dict[key] /= pipe_engine.gradient_accumulation_steps()
+                    torch.distributed.all_reduce(loss_dict[key], group=dp_group)
+                    loss_dict[key] /=  dp_group.size()
                 loss_dicts = [loss_dict] * get_num_microbatches()
             else:
                 loss_dicts = forward_backward_func(
