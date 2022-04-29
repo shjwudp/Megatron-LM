@@ -1,4 +1,5 @@
-from functools import reduce
+from ensurepip import bootstrap
+from functools import reduce, partial
 from logging import logMultiprocessing
 import os
 import sys
@@ -34,6 +35,44 @@ from megatron.model.distributed import DistributedDataParallel as LocalDDP
 from megatron.model.module import Float16Module
 from deepspeed.runtime.pipe import schedule
 
+
+def get_batch_pipe(data, tokenizer_eod):
+    """A modification of get_batch() to work with the latest batch instead of an iterator."""
+    args = get_args()
+
+    # Items and their type.
+    keys = ["text"]
+    datatype = torch.int64
+
+    tokens, labels, loss_mask, attention_mask, position_ids = _get_batch(
+        args.eod_mask_loss, tokenizer_eod, keys, data, datatype
+    )
+
+    # unpack data
+    return (tokens, position_ids, attention_mask), (labels, loss_mask)
+
+def _get_batch(eod_mask_loss, tokenizer_eod, keys, data, datatype):
+    """Support function for get_batch / get_batch pipe (to avoid code repetition)"""
+    data_b = mpu.broadcast_data(keys, data, datatype)
+    args = get_args()
+
+    # Unpack.
+    tokens_ = data_b["text"].long()
+    labels = tokens_[:, 1:].contiguous()
+    tokens = tokens_[:, :-1].contiguous()
+
+    # Get the masks and position ids.
+    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+        data=tokens,
+        eod_token=tokenizer_eod,
+        eod_mask_loss=eod_mask_loss,
+        reset_position_ids=args.reset_position_ids,
+        reset_attention_mask=args.reset_attention_mask,
+    )
+
+    return tokens, labels, loss_mask, attention_mask, position_ids
+
+
 class EvalHarnessAdaptor(GPT2LM):
     def __init__(self, model, tokenizer):
         args = get_args()
@@ -45,9 +84,12 @@ class EvalHarnessAdaptor(GPT2LM):
 
         self._max_length = args.seq_length
 
+        self.dp_rank = mpu.get_data_parallel_rank()
+        self.dp_world_size = mpu.get_data_parallel_world_size()
+
         # For ds we split into mini batches and then micro batches to keep pipelining api happy.
         # With Megatron we just go to micro_batches directly
-        self._batch_size = args.micro_batch_size
+        self._batch_size = args.micro_batch_size * self.dp_world_size
 
         self.cache_hook = CacheHook(None)
         self.is_main = args.rank == 0
@@ -57,9 +99,6 @@ class EvalHarnessAdaptor(GPT2LM):
         self.is_pipe_parallel = mpu.get_pipeline_model_parallel_world_size() > 1
         self.is_data_parallel = mpu.get_data_parallel_world_size() > 1
         self.adaptive_seq_len = args.adaptive_seq_len
-        if self.is_data_parallel and args.moe_expert_parallel_size == 1: # For MoE model, allow a "fake data parallel" in order to partition model into multiple gpus 
-            raise NotImplementedError("Data parallelism is currently not supported for evaluation")
-
         self.is_last_stage = True if not self.is_pipe_parallel else mpu.is_pipeline_last_stage()  # only the last stage of the pipeline model will receive the logits
 
     @property
@@ -182,6 +221,51 @@ class EvalHarnessAdaptor(GPT2LM):
 
         return reord.get_original(res)
 
+    def _dp_scatter(self, inps):
+        """
+        Scatters the inputs to all data parallel ranks.
+        """
+
+        batch_size = inps.shape[0]
+        padded = False
+        if batch_size % self.dp_world_size != 0:
+            # The last batch could potentially not fill the full batch size (if the dataset size is not divisible by batch size)
+            # In this case we pad the batch
+            padded_size = self.dp_world_size - (batch_size % self.dp_world_size)
+
+            print_rank_0(
+                f"WARNING: Batch size ({batch_size}) must be divisible by dp world size ({self.dp_world_size}). Padding inputs to {padded_size}."
+            )
+
+            inps = torch.cat(
+                [inps] + [inps[0:1, ...] for _ in range(padded_size)], dim=0
+            )  # pad with first inp item
+            padded = True
+
+        assert (
+            inps.shape[0] % self.dp_world_size == 0
+        ), f"batch size ({inps.shape[0]}) must be divisible by dp world size ({self.dp_world_size})"
+
+        # get a chunk for each data parallel rank
+        chunk_size = inps.shape[0] // self.dp_world_size
+        inps = inps[self.dp_rank * chunk_size : (self.dp_rank + 1) * chunk_size]
+        # make a dummy dataloader / iterator to pass to model
+        # we need to do this because deepspeed pipe parallel only takes an iterator
+        # in this format
+        return iter([{"text": F.pad(inps, pad=(0, 1))}]), padded
+
+    def _dp_gather(self, logits):
+        """
+        Gather logits from all data parallel ranks
+        """
+        if logits is not None:
+            tensor_list = [torch.zeros_like(logits) for _ in range(self.dp_world_size)]
+            torch.distributed.all_gather(
+                tensor_list, logits, group=mpu.get_data_parallel_group()
+            )
+            logits = torch.cat(tensor_list, dim=0)
+            return logits
+
     def create_model_inputs(self, tokens):
         args = get_args()
 
@@ -196,6 +280,11 @@ class EvalHarnessAdaptor(GPT2LM):
 
     def _model_call(self, inps):
         args = get_args()
+
+        batch_size = inps.shape[0]
+
+        # scatter inputs to all dp ranks:
+        inps, padded = self._dp_scatter(inps)
 
         if args.deepspeed:
             if args.no_pipeline_parallel:
@@ -231,18 +320,18 @@ class EvalHarnessAdaptor(GPT2LM):
                 if args.adaptive_seq_len:
                     self.model.total_loss = None
             else:
-                self.model.set_batch_fn(self.create_model_inputs)
-                # round up to multiple of micro_batch_size
-                new_size = ((len(inps) + args.micro_batch_size-1)  // args.micro_batch_size) * args.micro_batch_size
-                padded = F.pad(inps, (0, 0, 0, new_size-len(inps)), value = 0)
-                # dummy data iterator for pipelining.
-                data_iterator = list((torch.stack(inp) for inp in utils.chunks(padded, args.micro_batch_size)))
-                self.model.micro_batches = len(data_iterator)
-                output = self.model.eval_batch(iter(data_iterator), compute_loss = False, reduce_output = None)
+                self.model.set_batch_fn(partial(get_batch_pipe, tokenizer_eod=self.tokenizer.eod))
 
+                # need these flags to stop deepspeed pipe parallel from hanging
+                self.model.first_output_send = True
+                self.model.pipe_recv_buf = None
+
+                output = self.model.eval_batch(inps, compute_loss=False, reduce_output=None)
 
                 if output is not None:
-                    output = torch.cat(output, 0)[:len(inps)]
+                    if isinstance(output[0], (tuple, list)):
+                        output = [x[0] for x in output]
+                    output = torch.cat(output, 0)
                 else:
                     output = None
 
@@ -267,10 +356,22 @@ class EvalHarnessAdaptor(GPT2LM):
             output = self.model(*self.create_model_inputs(inps)[0])
             send_forward(output)
 
-        if mpu.is_pipeline_last_stage():
-            return gather_from_tensor_model_parallel_region(output)[..., :self.tokenizer.vocab_size]
-        else:
-            return None
+        logits = output
+
+        # gather outputs from all dp ranks:
+        logits = self._dp_gather(logits)
+
+        # if logits have been padded (normally just last item where batch size is unequal)
+        # restore to original shape
+        if padded and logits is not None:
+            logits = logits[:batch_size, ...]
+
+        return logits
+
+        # if mpu.is_pipeline_last_stage():
+        #     return gather_from_tensor_model_parallel_region(output)[..., :self.tokenizer.vocab_size]
+        # else:
+        #     return None
 
     def tokenizer_encode(self, text):
         """Tokenize text *without* adding special tokens."""
@@ -416,7 +517,13 @@ def main():
 
     tokenizer = get_tokenizer()
     adaptor = EvalHarnessAdaptor(model, tokenizer)
-    results = evaluator.evaluate(adaptor, task_dict, False, 0, None)
+    adaptor.model.micro_batches = 1
+    results = evaluator.evaluate(
+        lm=adaptor,
+        task_dict=task_dict,
+        limit=None,
+        bootstrap_iters=10000,
+    )
 
     if mpu.is_pipeline_last_stage() and mpu.get_tensor_model_parallel_rank() == 0:
         print(json.dumps(results, indent=2))
