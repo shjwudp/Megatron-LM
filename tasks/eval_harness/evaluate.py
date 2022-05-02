@@ -36,43 +36,6 @@ from megatron.model.module import Float16Module
 from deepspeed.runtime.pipe import schedule
 
 
-def get_batch_pipe(data, tokenizer_eod):
-    """A modification of get_batch() to work with the latest batch instead of an iterator."""
-    args = get_args()
-
-    # Items and their type.
-    keys = ["text"]
-    datatype = torch.int64
-
-    tokens, labels, loss_mask, attention_mask, position_ids = _get_batch(
-        args.eod_mask_loss, tokenizer_eod, keys, data, datatype
-    )
-
-    # unpack data
-    return (tokens, position_ids, attention_mask), (labels, loss_mask)
-
-def _get_batch(eod_mask_loss, tokenizer_eod, keys, data, datatype):
-    """Support function for get_batch / get_batch pipe (to avoid code repetition)"""
-    data_b = mpu.broadcast_data(keys, data, datatype)
-    args = get_args()
-
-    # Unpack.
-    tokens_ = data_b["text"].long()
-    labels = tokens_[:, 1:].contiguous()
-    tokens = tokens_[:, :-1].contiguous()
-
-    # Get the masks and position ids.
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        data=tokens,
-        eod_token=tokenizer_eod,
-        eod_mask_loss=eod_mask_loss,
-        reset_position_ids=args.reset_position_ids,
-        reset_attention_mask=args.reset_attention_mask,
-    )
-
-    return tokens, labels, loss_mask, attention_mask, position_ids
-
-
 class EvalHarnessAdaptor(GPT2LM):
     def __init__(self, model, tokenizer):
         args = get_args()
@@ -80,7 +43,7 @@ class EvalHarnessAdaptor(GPT2LM):
         self.model = model
         self.tokenizer = tokenizer
         self.VOCAB_SIZE = tokenizer.vocab_size
-        self.EOT_TOKEN_ID = tokenizer.eod
+        self._eot_token_id = tokenizer.eod_id
 
         self._max_length = args.seq_length
 
@@ -113,61 +76,24 @@ class EvalHarnessAdaptor(GPT2LM):
     def device(self):
         return self._device
 
-
-    def loglikelihood(self, requests):
-        new_reqs = []
-        for context, continuation in requests:
-            if context == "":
-                # end of text as context
-                context_enc = [self.EOT_TOKEN_ID]
-            else:
-                context_enc = self.tokenizer_encode(context)
-
-            continuation_enc = self.tokenizer_encode(continuation)
-
-            new_reqs.append(((context, continuation), context_enc, continuation_enc))
-
-        return self._loglikelihood_tokens(new_reqs)
-
-    def loglikelihood_rolling(self, requests):
-        # TODO: Implement caching once we've confirmed the perplexity implementation
-        # TODO: automatic batch size detection for vectorization
-
-        loglikelihoods = []
-        with torch.no_grad():
-            for string, in tqdm(requests):
-                rolling_token_windows = list(map(utils.make_disjoint_window, utils.get_rolling_token_windows(
-                    token_list=self.tokenizer_encode(string),
-                    prefix_token=self.EOT_TOKEN_ID,
-                    max_seq_len=self.max_length,
-                    context_len=1,
-                )))
-
-                rolling_token_windows = [(None,) + x for x in rolling_token_windows]
-
-                # TODO: extract out this call so it only gets called once and also somehow figure out partial caching for that
-                string_nll = self._loglikelihood_tokens(rolling_token_windows, disable_tqdm=True)
-
-                # discard is_greedy
-                string_nll = [x[0] for x in string_nll]
-
-                string_nll = sum(string_nll)
-                loglikelihoods.append(string_nll)
-
-        return loglikelihoods
+    @property
+    def eot_token_id(self):
+        # we use EOT because end of *text* is more accurate for what we're doing than end of *sentence*
+        return self._eos_token_id
 
     def _loglikelihood_tokens(self, requests, disable_tqdm=False):
         disable_tqdm = disable_tqdm if self.is_main else True
         res = []
         res_len = 0  # storing the result length for later
-        self.model.eval()
         with torch.no_grad():
             def _collate(x):
                 toks = x[1] + x[2]
                 return (-len(toks), tuple(toks))
 
             reord = utils.Reorderer(requests, _collate)
-            for chunk in utils.chunks(tqdm(reord.get_reordered(), disable=disable_tqdm), self.batch_size):
+            for chunk in utils.chunks(
+                tqdm(reord.get_reordered(), disable=disable_tqdm), self.batch_size
+            ):
                 inps, contlens, inplens, padding_length = [], [], [], None
                 for _, context_enc, continuation_enc in chunk:
                     # when too long to fit in context, truncate from the left
@@ -198,7 +124,9 @@ class EvalHarnessAdaptor(GPT2LM):
                 if logits is not None:
                     multi_logits = F.log_softmax(logits, dim=-1).cpu()  # [batch, seq, vocab]
 
-                    for (cache_key, _, _), logits, inp, inplen, cont_toks in zip(chunk, multi_logits, inps, inplens, contlens):
+                    for (cache_key, _, _), logits, inp, inplen, cont_toks in zip(
+                        chunk, multi_logits, inps, inplens, contlens
+                    ):
                         contlen = len(cont_toks)
                         logits = logits[inplen - contlen:inplen].unsqueeze(0)  # [1, seq, vocab]
                         greedy_tokens = logits.argmax(dim=-1)
@@ -214,10 +142,27 @@ class EvalHarnessAdaptor(GPT2LM):
                             self.cache_hook.add_partial("loglikelihood", cache_key, answer)
                         res.append(answer)
 
-        if not mpu.is_pipeline_last_stage():
-            # @HACK: To make the eval harness happy on threads that don't have access to the results.
-            #        We just randomly generate some data.
-            res = [(np.random.rand(), np.random.rand()>0.5) for _ in requests]
+            # broadcast results to all ranks
+            if self.is_pipe_parallel:
+                src_rank = self.model.grid.stage_to_global(self.model.num_stages - 1)
+                if res:
+                    logits_sums, max_equals = list(zip(*res))
+                    logits_sums = torch.FloatTensor(logits_sums).cuda()
+                    max_equals = torch.LongTensor(max_equals).cuda()
+                else:
+                    logits_sums = torch.zeros(res_len, dtype=torch.float32).cuda()
+                    max_equals = torch.zeros(res_len, dtype=torch.int64).cuda()
+                torch.distributed.broadcast(
+                    tensor=logits_sums,
+                    src=src_rank,
+                    group=mpu.get_pipeline_model_parallel_group(),
+                )
+                torch.distributed.broadcast(
+                    tensor=max_equals, src=src_rank, group=mpu.get_pipeline_model_parallel_group()
+                )
+                max_equals = [bool(i) for i in max_equals.tolist()]
+                logits_sums = logits_sums.tolist()
+                res = list(zip(logits_sums, max_equals))
 
         return reord.get_original(res)
 
@@ -266,18 +211,6 @@ class EvalHarnessAdaptor(GPT2LM):
             logits = torch.cat(tensor_list, dim=0)
             return logits
 
-    def create_model_inputs(self, tokens):
-        args = get_args()
-
-        attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-            tokens,
-            self.EOT_TOKEN_ID,
-            args.reset_position_ids,
-            args.reset_attention_mask,
-            args.eod_mask_loss)
-
-        return (tokens, position_ids, attention_mask), (tokens, loss_mask)
-
     def _model_call(self, inps):
         args = get_args()
 
@@ -320,8 +253,6 @@ class EvalHarnessAdaptor(GPT2LM):
                 if args.adaptive_seq_len:
                     self.model.total_loss = None
             else:
-                self.model.set_batch_fn(partial(get_batch_pipe, tokenizer_eod=self.tokenizer.eod))
-
                 # need these flags to stop deepspeed pipe parallel from hanging
                 self.model.first_output_send = True
                 self.model.pipe_recv_buf = None
@@ -368,12 +299,7 @@ class EvalHarnessAdaptor(GPT2LM):
 
         return logits
 
-        # if mpu.is_pipeline_last_stage():
-        #     return gather_from_tensor_model_parallel_region(output)[..., :self.tokenizer.vocab_size]
-        # else:
-        #     return None
-
-    def tokenizer_encode(self, text):
+    def tok_encode(self, text):
         """Tokenize text *without* adding special tokens."""
         # Splitting this into its own method in case we need to handle special cases for different tokenizers
         from megatron.tokenizer.gpt2_tokenization import GPT2Tokenizer
@@ -381,6 +307,73 @@ class EvalHarnessAdaptor(GPT2LM):
             return self.tokenizer.tokenizer.encode(text)
         else:
             return self.tokenizer.tokenizer.encode(text, add_special_tokens=False)
+
+    def tok_decode(self, tokens):
+        return self.tokenizer.decode(tokens)
+
+    @torch.no_grad()
+    def run_eval(
+        self,
+        eval_tasks=None,
+        num_fewshot=0,
+        bootstrap_iters=2,
+        description_dict=None,
+        name="deepspeed",
+        limit=None
+    ):
+        was_training = self.model.training
+        self.model.eval()
+        in_micro_batches = (
+            self.model.micro_batches
+        )  # store input microbatches - we need to set to 1 during eval, but want to return to its original value after
+        self.model.micro_batches = 1
+        if eval_tasks is None:
+            eval_tasks = [
+                "lambada",
+                "piqa",
+                "hellaswag",
+                "winogrande",
+                "mathqa",
+                "pubmedqa",
+            ]
+
+        # **HACK INCOMING**:
+        # first get task dict on local main rank
+        # the tasks are downloaded *as they are initialized*, and the downloads don't like multithreading.
+        # so we download them once on the local main rank, wait, and then initialize them on all other ranks, which *should* load from the cache.
+        if self.is_local_main:
+            task_dict = tasks.get_task_dict(eval_tasks)
+        # torch barrier
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        task_dict = tasks.get_task_dict(eval_tasks)
+
+        lm = self
+
+        results = evaluator.evaluate(
+            lm=lm,
+            task_dict=tasks.get_task_dict(eval_tasks),
+            description_dict=description_dict,
+            num_fewshot=num_fewshot,
+            limit=limit,
+            bootstrap_iters=bootstrap_iters,
+        )
+
+        results["config"] = {
+            "model": name,
+            "num_fewshot": num_fewshot,
+            "batch_size": self.batch_size,
+            "device": str(self.device),
+            "limit": limit,
+            "bootstrap_iters": bootstrap_iters,
+            "description_dict": description_dict
+        }
+
+        if was_training:
+            self.model.train()
+        self.model.micro_batches = in_micro_batches
+        return results
+
 
 
 from megatron.initialize import initialize_megatron
@@ -449,35 +442,19 @@ def load_ds_checkpoint_and_setup_megatron(extra_args_provider):
     # Initializing megatron will update eg. tokenizer size. Override again.
     override_args(args, cp_args, skip_keys, skip_if_specified)
 
+    if args.deepspeed and args.adaptive_seq_len:
+        # adaptive_seq_len hack #1:
+        # CL automatically enables reset_activation_shape() which allows us to change input shapes
+        # and it also reshapes the attenion scores in attention_mask_func
+        args.curriculum_learning = 1
+        args.curriculum_seqlen = args.seq_length
+
     # print final arguments.
     _print_args(args)
-    if args.deepspeed:
 
-        # Hack #3:
-        # Loading pipelined models in deepspeed with different TP than it was originally trained on fails
-        # due to a sanity check, that makes sure that all state_dicts that we merge contains attention layers.
-        # This, however, is not true for pipelining when we will merge the state_dict for the embeddings which
-        # which does not contain these attention-specific keys.
-        #
-        # Deepspeed does however manage to load the model if we just turn off this sanity check.
-        import deepspeed
-        deepspeed.runtime.state_dict_factory.MegatronSDLoader.sanity_check = lambda self, ckpt_file_name: None
-
-
-        cp_path = args.load
-        args.load = None
-        model, _, _ = setup_model_and_optimizer(model_provider)
-        model = model[0]
-        zero_enabled = model._config.zero_enabled
-        model._config.zero_enabled = False
-        _, _ = model.load_checkpoint(cp_path, tag = '.', load_optimizer_states=False, load_lr_scheduler_states=False, load_module_only=True)
-        model._config.zero_enabled = zero_enabled
-    else:
-        model = get_model(model_provider)[0]
-        # Initialize megatron model using the parsed state dict.
-        sd = _create_rank_checkpoint(ds_checkpoint, None, mpu.get_tensor_model_parallel_rank(), mpu.get_pipeline_model_parallel_rank(), True)
-
-        model.load_state_dict(sd['model'], strict=True)
+    model, _, _ = setup_model_and_optimizer(model_provider)
+    model = model[0]
+    print_rank_0("Finished loading model")
 
     if args.eval_fp32:
         model = model.float()
@@ -502,14 +479,8 @@ def main():
     model = load_ds_checkpoint_and_setup_megatron(extra_args_provider=tasks_args)
 
     args = get_args()
-    if args.deepspeed and args.adaptive_seq_len:
-        # adaptive_seq_len hack #1:
-        # CL automatically enables reset_activation_shape() which allows us to change input shapes
-        # and it also reshapes the attenion scores in attention_mask_func
-        args.curriculum_learning = 1
 
     task_list = ALL_TASKS if args.task_list == 'all' else args.task_list.split(',')
-    task_dict = tasks.get_task_dict(task_list)
 
     model.module.activation_checkpoint_interval = 0
     model._compute_loss = False
@@ -517,11 +488,9 @@ def main():
 
     tokenizer = get_tokenizer()
     adaptor = EvalHarnessAdaptor(model, tokenizer)
-    adaptor.model.micro_batches = 1
-    results = evaluator.evaluate(
-        lm=adaptor,
-        task_dict=task_dict,
-        limit=None,
+    results = adaptor.run_eval(
+        eval_tasks=task_list,
+        num_fewshot=0,
         bootstrap_iters=10000,
     )
 
@@ -530,7 +499,7 @@ def main():
         with open(args.results_path, 'w') as outfile:
             json.dump(results, outfile, indent = 4)
     end = time.time()
-    print("evaluation of {} ends in {:.2f} sec, or {:.2f} min, or {:.2f} hr".format(args.task_list, end-start, (end-start)/60.0, (end-start)/3600.0))
+    print_rank_0("evaluation of {} ends in {:.2f} sec, or {:.2f} min, or {:.2f} hr".format(args.task_list, end-start, (end-start)/60.0, (end-start)/3600.0))
 
 if __name__ == '__main__':
     main()

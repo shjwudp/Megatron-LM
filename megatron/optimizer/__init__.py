@@ -21,6 +21,7 @@ from megatron.model import LayerNorm
 
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
+from .adafactor import Adafactor
 
 def _get_params_for_weight_decay_optimization(modules):
     """Divide params into with-weight-decay and without-weight-decay groups.
@@ -68,6 +69,9 @@ def get_megatron_optimizer(model):
                         lr=args.lr,
                         weight_decay=args.weight_decay,
                         momentum=args.sgd_momentum)
+    elif args.optimizer == "adafactor":
+        optimizer = Adafactor(param_groups, beta1=0.9, dynamic_weight_decay=True)
+        args.log_learning_rate_to_tensorboard = False
     else:
         raise Exception('{} optimizer is not supported.'.format(
             args.optimizer))

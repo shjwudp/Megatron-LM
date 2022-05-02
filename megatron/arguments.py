@@ -16,6 +16,7 @@
 """Megatron arguments."""
 
 import argparse
+from multiprocessing.dummy import active_children
 import os
 
 import torch
@@ -316,6 +317,9 @@ def _add_network_size_args(parser):
     group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with '
                        'Torch ONNX exporter')
+    group.add_argument('--swi-glu', action='store_true',
+                       help="Use Noam Shazeer's SwiGLU, mentioned in the PaLM paper (see https://arxiv.org/abs/2204.02311) "
+                       "to significantly improve performance.")
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
@@ -470,7 +474,7 @@ def _add_training_args(parser):
                        help='Create separate groups for MoE params.'
                        'This is necessary for techniques like ZeRO.')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd'],
+                       choices=['adam', 'sgd', 'adafactor'],
                        help='Optimizer function')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],

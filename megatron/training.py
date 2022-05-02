@@ -321,6 +321,10 @@ def get_learning_rate_scheduler(optimizer):
     """Build the learning rate scheduler."""
     args = get_args()
 
+    if args.optimizer == "adafactor":
+        # Adafactor has its own learning-rate adjustment function, and does not need an additional lr-scheduler.
+        return None
+
     # Iteration-based training.
     if args.train_iters:
         if args.lr_decay_iters is None:
@@ -405,8 +409,10 @@ def setup_model_and_optimizer(model_provider_func, teacher=False):
                                    (torchDDP, LocalDDP, Float16Module))
 
     if args.inference:
-        optimizer = None
-        lr_scheduler = None
+        # Setting optimizer to None will cause deepspeed initialization
+        # to fail, set a default value to avoid
+        optimizer = get_megatron_optimizer(unwrapped_model)
+        lr_scheduler = get_learning_rate_scheduler(optimizer)
     else:
         if teacher:
             optimizer = None
@@ -1137,6 +1143,7 @@ def build_train_valid_test_data_iterators(
         # Number of train/valid/test samples.
         if args.train_samples:
             train_samples = args.train_samples
+            update_train_iters(args)
         else:
             train_samples = args.train_iters * args.global_batch_size
         eval_iters = (args.train_iters // args.eval_interval + 1) * \
