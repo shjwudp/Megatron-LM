@@ -203,6 +203,9 @@ class EvalHarnessAdaptor(GPT2LM):
         """
         Gather logits from all data parallel ranks
         """
+        if self.dp_world_size == 1:
+            return logits
+
         if logits is not None:
             tensor_list = [torch.zeros_like(logits) for _ in range(self.dp_world_size)]
             torch.distributed.all_gather(
@@ -219,75 +222,33 @@ class EvalHarnessAdaptor(GPT2LM):
         # scatter inputs to all dp ranks:
         inps, padded = self._dp_scatter(inps)
 
-        if args.deepspeed:
-            if args.no_pipeline_parallel:
-                # self.model.set_batch_fn(self.create_model_inputs)
-                # round up to multiple of micro_batch_size
-                new_size = ((len(inps) + args.micro_batch_size-1)  // args.micro_batch_size) * args.micro_batch_size
-                padded = F.pad(inps, (0, 0, 0, new_size-len(inps)), value = 0)
-                # dummy data iterator for pipelining.
-                data_iterator = list((torch.stack(inp) for inp in utils.chunks(padded, args.micro_batch_size)))
-                self.model.micro_batches = len(data_iterator)
-                # output = self.model.eval_batch(iter(data_iterator), compute_loss = False, reduce_output = None)
-                output = []
-                for tokens in data_iterator:
-                    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-                                                                tokens,
-                                                                self.EOT_TOKEN_ID,
-                                                                args.reset_position_ids,
-                                                                args.reset_attention_mask,
-                                                                args.eod_mask_loss)
-                    a_output, *other_losses = self.model(tokens,
-                        position_ids,
-                        attention_mask,
-                        tokentype_ids=None,
-                        forward_method_parallel_output=False)
-                    output.append(a_output)
+        # need these flags to stop deepspeed pipe parallel from hanging
+        self.model.first_output_send = True
+        self.model.pipe_recv_buf = None
+        self.model.grad_layer = None
+        self.model.meta_buffer = None
 
-                if output is not None:
-                    output = torch.cat(output, 0)[:len(inps)]
-                else:
-                    output = None
+        _, logits = self.model.eval_batch(
+            inps,
+            compute_loss=False,
+            reduce_output=None,
+            return_logits=True)
 
-                # hack #2 for adaptive_seq_len to work as total_loss gets appended to and shapes aren't the same
-                if args.adaptive_seq_len:
-                    self.model.total_loss = None
-            else:
-                # need these flags to stop deepspeed pipe parallel from hanging
-                self.model.first_output_send = True
-                self.model.pipe_recv_buf = None
+        if logits is not None:
+            logits = logits[0]
 
-                output = self.model.eval_batch(inps, compute_loss=False, reduce_output=None)
+        # if logits is not None:
+        #     if isinstance(output[0], (tuple, list)):
+        #         output = [x[0] for x in output]
+        #     output = torch.cat(output, 0)
+        # else:
+        #     output = None
 
-                if output is not None:
-                    if isinstance(output[0], (tuple, list)):
-                        output = [x[0] for x in output]
-                    output = torch.cat(output, 0)
-                else:
-                    output = None
+        # hack #2 for adaptive_seq_len to work as total_loss gets appended to and shapes aren't the same
+        if args.adaptive_seq_len:
+            self.model.total_loss = None
 
-                # hack #2 for adaptive_seq_len to work as total_loss gets appended to and shapes aren't the same
-                if args.adaptive_seq_len:
-                    self.model.total_loss = None
-        else:
-            # Since the shape of the micro-batch will change
-            # We need set the correct shapes here
-            # So that latter pipeline stages knows which shapes to expect.
-            # Otherwise we will deadlock.
-
-            args.micro_batch_size = len(inps)
-            args.seq_length = len(inps[0])
-            args.max_position_embeddings = args.seq_length
-
-            input_tensor = recv_forward()
-
-            # Forward pass through the model.
-            unwrapped_model = unwrap_model(self.model, (torchDDP, LocalDDP, Float16Module))
-            unwrapped_model.set_input_tensor(input_tensor)
-            output = self.model(*self.create_model_inputs(inps)[0])
-            send_forward(output)
-
-        logits = output
+        # logits = output
 
         # gather outputs from all dp ranks:
         logits = self._dp_gather(logits)
@@ -421,7 +382,8 @@ def load_ds_checkpoint_and_setup_megatron(extra_args_provider):
     cp_args = ds_checkpoint.get_args()
     # Merge the current args with the checkpoint args.
     skip_keys = ['world_size', 'rank', 'local_rank','device_count', 'micro_batch_size','global_batch_size', 'batch_size', 'tensorboard_dir', 'deepspeed', 'deepspeed_config',
-                     'data_parallel_size', 'pipeline_model_parallel_size', 'tensor_model_parallel_size', 'moe_expert_parallel_size', 'moe_token_dropping', 'load', 'rampup_batch_size', 'iteration', 'inference']
+                     'data_parallel_size', 'pipeline_model_parallel_size', 'tensor_model_parallel_size', 'moe_expert_parallel_size', 'moe_token_dropping', 'load', 'rampup_batch_size', 'iteration', 'inference',
+                     'consumed_train_samples', 'consumed_valid_samples']
 
     skip_if_specified = ['merge_file', 'vocab_file']
 
