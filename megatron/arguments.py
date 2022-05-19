@@ -585,6 +585,7 @@ def _add_checkpointing_args(parser):
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
                        'Assumed when loading a release checkpoint.')
+    group.add_argument('--load-tag', default=None, help="Checkpoint tag to load.")
 
     return parser
 
