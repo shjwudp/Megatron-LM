@@ -24,6 +24,7 @@ import json
 _TRAIN_START_TIME = time.time()
 
 import torch
+from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import get_args
@@ -857,6 +858,21 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     # Iterations.
     iteration = args.iteration
 
+    if args.torch_profile and torch.distributed.get_rank() == 0:
+        profiler = torch.profiler.profile(
+            profile_memory=True,
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(
+                wait=1,
+                warmup=1,
+                active=1,
+                repeat=1),
+            on_trace_ready=tensorboard_trace_handler("./profile"),
+            with_flops=True,
+        )
+        profiler.start()
+        profile_step_count = 0
+
     timers('interval-time').start()
     print_datetime('before the start of training step')
     report_memory_flag = True
@@ -881,6 +897,13 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                        lr_scheduler,
                        teacher_model=teacher_model)
         iteration += 1
+
+        if args.torch_profile and torch.distributed.get_rank() == 0:
+            profiler.step()
+            profile_step_count += 1
+            if profile_step_count > 10:
+                profiler.stop()
+
         args.iteration = iteration
         new_samples = mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
