@@ -322,6 +322,10 @@ def get_learning_rate_scheduler(optimizer):
     """Build the learning rate scheduler."""
     args = get_args()
 
+    if args.optimizer == "adafactor":
+        # Adafactor has its own learning-rate adjustment function, and does not need an additional lr-scheduler.
+        return None
+
     # Iteration-based training.
     if args.train_iters:
         if args.lr_decay_iters is None:

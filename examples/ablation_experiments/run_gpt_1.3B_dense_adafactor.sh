@@ -42,8 +42,6 @@ NUM_LAYERS=24
 HIDDEN_SIZE=2048
 NUM_ATTN_HEADS=16
 GLOBAL_BATCH_SIZE=512
-LR=2.0e-4
-MIN_LR=2.0e-5
 
 ## GPT-3 2.7B
 # MODEL_SIZE=2.7
@@ -256,9 +254,7 @@ data_options=" \
          --data-impl mmap"
         
 megatron_options=" \
-        --override-lr-scheduler \
-        --adam-beta1 0.9 \
-        --adam-beta2 0.95 \
+        --optimizer adafactor \
         --tensor-model-parallel-size ${MP_SIZE} \
         --moe-expert-parallel-size ${EP_PARALLEL_SIZE} \
         --num-experts ${EP_SIZE} \
@@ -267,8 +263,6 @@ megatron_options=" \
         --moe-eval-capacity-factor ${MOE_EVAL_CAP_FACTOR} \
         --moe-min-capacity ${MOE_MIN_CAP} \
         --init-method-std ${INIT_STD} \
-        --lr-decay-tokens ${LR_DECAY_TOKENS} \
-        --lr-warmup-tokens ${WARMUP_TOKENS} \
         --micro-batch-size ${BATCH_SIZE} \
         --exit-duration-in-mins ${EXIT_DURATION} \
         --rampup-batch-size 32 32 1953125 \
@@ -280,15 +274,11 @@ megatron_options=" \
         --max-position-embeddings ${SEQ_LEN} \
         --train-tokens ${TRAIN_TOKENS} \
         --train-samples ${TRAIN_SAMPLES} \
-        --lr ${LR} \
-        --min-lr ${MIN_LR} \
-        --lr-decay-style cosine \
         --split 98,2,0 \
         --log-interval ${LOG_INTERVAL} \
         --eval-interval ${EVAL_INTERVAL} \
         --eval-iters ${EVAL_ITERS} \
         --save-interval ${SAVE_INTERVAL} \
-        --weight-decay 0.1 \
         --clip-grad 1.0 \
         --hysteresis 2 \
         --num-workers 2 \

@@ -257,6 +257,8 @@ data_options=" \
         
 megatron_options=" \
         --override-lr-scheduler \
+        --attention-dropout 0. \
+        --hidden-dropout 0. \
         --adam-beta1 0.9 \
         --adam-beta2 0.95 \
         --tensor-model-parallel-size ${MP_SIZE} \

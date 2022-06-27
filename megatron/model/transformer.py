@@ -26,6 +26,7 @@ from megatron.model import LayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+from megatron.model.SwiGLU import SwiGLU
 from torch import distributed as dist
 import deepspeed
 from deepspeed.moe.layer import MoE
@@ -79,6 +80,8 @@ class ParallelMLP(MegatronModule):
             self.activation_func = openai_gelu
         elif args.onnx_safe:
             self.activation_func = erf_gelu
+        elif args.swi_glu:
+            self.activation_func = SwiGLU()
 
         # Project back to h.
         self.dense_4h_to_h = mpu.RowParallelLinear(
