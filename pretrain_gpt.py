@@ -27,14 +27,70 @@ from megatron.model import GPTModel, GPTModelPipe
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
+from megatron.data.char_dataset import CharDataset
 
 import deepspeed
 from deepspeed.runtime.utils import see_memory_usage
 import os
 import subprocess
+import numpy as np
+import copy
 
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import mup
+
+
+def coord_check(mup, plotdir='', legend=False):
+    args = get_args()
+    text = open("input.txt", "r").read()
+    train_dataset = CharDataset(text, block_size=2048)
+
+    batch_size = 32
+    lr = 0.01
+    coord_check_nseeds = 3
+    coord_check_nsteps = 3
+
+    def gen(w, standparam=False):
+        def f():
+            args.hidden_size = w
+            args.ffn_hidden_size = 4 * args.hidden_size
+            args.kv_channels = args.hidden_size // args.num_attention_heads
+
+            model = GPTModelPipe(
+                num_tokentypes=0,
+                parallel_output=True
+            )
+
+            if standparam:
+                mup.set_base_shapes(model, None)
+            else:
+                mup.set_base_shapes(model, args.load_base_shapes)
+            return model
+        return f
+
+    optimizer = copy.deepcopy("adam")
+    optimizer = optimizer.replace("mu", "")
+
+    widths = 2 ** np.arange(7, 12)
+    models = {w: gen(w, standparam=not mup) for w in widths}
+
+    train_loader = DataLoader(
+        train_dataset,
+        shuffle=True,
+        pin_memory=True,
+        batch_size=batch_size,
+    )
+    df = mup.coord_check.get_coord_data(models, train_loader, mup=mup, lr=lr, optimizer=optimizer,
+        nseeds=coord_check_nseeds, nsteps=coord_check_nsteps)
+
+    prm = 'μP' if mup else 'SP'
+    return  mup.coord_check.plot_coord_data(df, legend=legend,
+        save_to=os.path.join(plotdir, f'{prm.lower()}_trsfmr_{optimizer}_coord.png'),
+        suptitle=f'{prm} Transformer {optimizer} lr={lr} nseeds={coord_check_nseeds}',
+        face_color='xkcd:light grey' if not mup else None)
+
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -73,6 +129,8 @@ def model_provider(pre_process=True, post_process=True):
 
             # Attention mask must be bool.
             args.attn_mask = attention_mask.to(torch.bool)
+
+            coord_check(False, plotdir='coord_checks')
 
         else:
             model = GPTModel(

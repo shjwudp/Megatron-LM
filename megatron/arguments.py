@@ -907,3 +907,15 @@ def _add_distillation_args(parser):
                        help='Directory containing a teacher model checkpoint.')
 
     return parser
+
+
+def _add_mup_args(parser):
+    group = parser.add_argument_group(title='mup')
+
+    parser.add_argument("--mup", action="store_true", default=False)
+    parser.add_argument('--save_base_shapes', type=str, default='',
+                        help='file location to save base shapes at')
+    parser.add_argument('--load_base_shapes', type=str, default='',
+                        help='file location to load base shapes from')
+
+    return parser
