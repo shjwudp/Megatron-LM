@@ -18,6 +18,7 @@
 import math
 
 import torch
+import mup
 
 from megatron import get_args
 
@@ -25,6 +26,13 @@ def init_method_normal(sigma):
     """Init method based on N(0, sigma)."""
     def init_(tensor):
         return torch.nn.init.normal_(tensor, mean=0.0, std=sigma)
+
+    def mup_init_(tensor):
+        return mup.init.normal_(tensor, mean=0.0, std=sigma)
+
+    args = get_args()
+    if args.mup:
+        return mup_init_
 
     return init_
 
@@ -35,6 +43,13 @@ def scaled_init_method_normal(sigma, num_layers):
 
     def init_(tensor):
         return torch.nn.init.normal_(tensor, mean=0.0, std=std)
+
+    def mup_init_(tensor):
+        return mup.init.normal_(tensor, mean=0.0, std=std)
+
+    args = get_args()
+    if args.mup:
+        return mup_init_
 
     return init_
 

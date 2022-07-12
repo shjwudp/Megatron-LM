@@ -247,6 +247,9 @@ class GPTModelPipe(PipelineModule,MegatronModule):
 
         def _logits_helper(embedding, lm_output):
             """A wrapper to massage inputs/outputs from pipeline. """
+            if args.mup:
+                lm_output = lm_output / embedding.word_embeddings_weight.infshape.width_mult()
+
             return parallel_lm_logits(
                 lm_output,
                 embedding.word_embeddings_weight,

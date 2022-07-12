@@ -33,8 +33,6 @@ import deepspeed
 from deepspeed.runtime.utils import see_memory_usage
 import os
 import subprocess
-import numpy as np
-import copy
 
 from torch import nn
 import torch.nn.functional as F
@@ -42,54 +40,30 @@ from torch.utils.data import DataLoader
 import mup
 
 
-def coord_check(mup, plotdir='', legend=False):
+def save_base_shapes():
     args = get_args()
-    text = open("input.txt", "r").read()
-    train_dataset = CharDataset(text, block_size=2048)
 
-    batch_size = 32
-    lr = 0.01
-    coord_check_nseeds = 3
-    coord_check_nsteps = 3
+    base_shapes = mup.get_shapes(GPTModelPipe(
+        num_tokentypes=0,
+        parallel_output=True
+    ))
+    print(f'saving base shapes at {args.save_base_shapes}')
+    hidden_size_backup = args.hidden_size
+    args.hidden_size = args.hidden_size * 2
+    args.ffn_hidden_size = 4 * args.hidden_size
+    args.kv_channels = args.hidden_size // args.num_attention_heads
 
-    def gen(w, standparam=False):
-        def f():
-            args.hidden_size = w
-            args.ffn_hidden_size = 4 * args.hidden_size
-            args.kv_channels = args.hidden_size // args.num_attention_heads
+    delta_shapes = mup.get_shapes(GPTModelPipe(
+        num_tokentypes=0,
+        parallel_output=True
+    ))
+    # hidden_size change back
+    args.hidden_size = hidden_size_backup
+    args.ffn_hidden_size = 4 * args.hidden_size
+    args.kv_channels = args.hidden_size // args.num_attention_heads
 
-            model = GPTModelPipe(
-                num_tokentypes=0,
-                parallel_output=True
-            )
-
-            if standparam:
-                mup.set_base_shapes(model, None)
-            else:
-                mup.set_base_shapes(model, args.load_base_shapes)
-            return model
-        return f
-
-    optimizer = copy.deepcopy("adam")
-    optimizer = optimizer.replace("mu", "")
-
-    widths = 2 ** np.arange(7, 12)
-    models = {w: gen(w, standparam=not mup) for w in widths}
-
-    train_loader = DataLoader(
-        train_dataset,
-        shuffle=True,
-        pin_memory=True,
-        batch_size=batch_size,
-    )
-    df = mup.coord_check.get_coord_data(models, train_loader, mup=mup, lr=lr, optimizer=optimizer,
-        nseeds=coord_check_nseeds, nsteps=coord_check_nsteps)
-
-    prm = 'μP' if mup else 'SP'
-    return  mup.coord_check.plot_coord_data(df, legend=legend,
-        save_to=os.path.join(plotdir, f'{prm.lower()}_trsfmr_{optimizer}_coord.png'),
-        suptitle=f'{prm} Transformer {optimizer} lr={lr} nseeds={coord_check_nseeds}',
-        face_color='xkcd:light grey' if not mup else None)
+    save_shapes = f"{args.save_base_shapes}.{torch.distributed.get_rank()}"
+    mup.make_base_shapes(base_shapes, delta_shapes, savefile=save_shapes)
 
 
 def model_provider(pre_process=True, post_process=True):
@@ -129,9 +103,8 @@ def model_provider(pre_process=True, post_process=True):
 
             # Attention mask must be bool.
             args.attn_mask = attention_mask.to(torch.bool)
-
-            coord_check(False, plotdir='coord_checks')
-
+            if args.save_base_shapes:
+                save_base_shapes()
         else:
             model = GPTModel(
                 num_tokentypes=0,

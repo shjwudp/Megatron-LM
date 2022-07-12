@@ -171,6 +171,8 @@ class ParallelAttention(MegatronModule):
         if self.apply_query_key_layer_scaling:
             coeff = self.layer_number
             self.norm_factor *= coeff
+        if args.mup:
+            self.norm_factor = self.hidden_size_per_attention_head / 8
 
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
             self.fp16, self.bf16,
