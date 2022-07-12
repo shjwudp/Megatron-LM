@@ -27,7 +27,6 @@ from megatron.model import GPTModel, GPTModelPipe
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
-from megatron.data.char_dataset import CharDataset
 
 import deepspeed
 from deepspeed.runtime.utils import see_memory_usage
@@ -105,6 +104,8 @@ def model_provider(pre_process=True, post_process=True):
             args.attn_mask = attention_mask.to(torch.bool)
             if args.save_base_shapes:
                 save_base_shapes()
+            if args.mup:
+                mup.set_base_shapes(model, args.load_base_shapes)
         else:
             model = GPTModel(
                 num_tokentypes=0,

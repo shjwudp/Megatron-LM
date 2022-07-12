@@ -37,6 +37,7 @@ from megatron import update_num_microbatches
 from megatron import mpu
 from megatron import print_rank_0
 from megatron import print_rank_last
+from megatron import mup_utils
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
@@ -160,8 +161,8 @@ def pretrain(train_valid_test_dataset_provider,
     print_rank_0('training ...')
 
     if args.mup and args.coord_check:
-        coord_check(False, train_data_iterator, batch_fn=model[0].module._megatron_batch_fn, plotdir="coord_checks")
-        coord_check(True, train_data_iterator, batch_fn=model[0].module._megatron_batch_fn, plotdir="coord_checks")
+        mup_utils.coord_check(False, train_data_iterator, lr=args.lr, batch_fn=model[0].module._megatron_batch_fn, plotdir="coord_checks")
+        mup_utils.coord_check(True, train_data_iterator, lr=args.lr, batch_fn=model[0].module._megatron_batch_fn, plotdir="coord_checks")
 
     iteration = 0
     if args.do_train and args.train_iters > 0:
@@ -1195,66 +1196,3 @@ def build_train_valid_test_data_iterators(
         test_data_iterator = None
 
     return train_data_iterator, valid_data_iterator, test_data_iterator
-
-
-def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
-    import numpy as np
-    import copy
-    import os
-
-    import mup
-    from mup.optim import MuAdam as Adam
-    from mup.coord_check import get_coord_data, plot_coord_data
-    from megatron.model import GPTModel, GPTModelPipe
-
-    args = get_args()
-
-    lr = 0.01
-    coord_check_nseeds = args.coord_check_nseeds
-    coord_check_nsteps = args.coord_check_nsteps
-
-    def gen(w, standparam=False):
-        def f():
-            args.hidden_size = w
-            args.ffn_hidden_size = 4 * args.hidden_size
-            args.kv_channels = args.hidden_size // args.num_attention_heads
-
-            model = GPTModelPipe(
-                num_tokentypes=0,
-                parallel_output=True
-            )
-            if standparam:
-                mup.set_base_shapes(model, None)
-            else:
-                load_base_shapes = f"{args.load_base_shapes}.{torch.distributed.get_rank()}"
-                mup.set_base_shapes(model, load_base_shapes)
-            optimizer = Adam(model.parameters(), lr=0.001)
-
-            model, _, _, _ = deepspeed.initialize(
-                model=model,
-                optimizer=optimizer,
-                args=args,
-                mpu=None,
-            )
-            model.set_batch_fn(batch_fn)
-            return model
-        return f
-
-
-    widths = 2 ** np.arange(7, 11)
-    models = {w: gen(w, standparam=not mup_flag) for w in widths}
-
-    optimizer = copy.deepcopy("adam")
-
-    df = get_coord_data(models, data_iterator, mup=mup_flag, lr=lr, optimizer=optimizer,
-        nseeds=coord_check_nseeds, nsteps=coord_check_nsteps)
-
-    prm = 'μP' if mup_flag else 'SP'
-    if torch.distributed.get_rank() == 0:
-        plot_coord_data(df, legend=legend,
-            save_to=os.path.join(plotdir, f'{prm.lower()}_trsfmr_{optimizer}_coord.png'),
-            suptitle=f'{prm} Transformer {optimizer} lr={lr} nseeds={coord_check_nseeds}',
-            face_color='xkcd:light grey' if not mup_flag else None)
-    torch.distributed.barrier()
-
-    return
