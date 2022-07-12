@@ -31,7 +31,7 @@ def init_method_normal(sigma):
         return mup.init.normal_(tensor, mean=0.0, std=sigma)
 
     args = get_args()
-    if args.mup:
+    if False and args.mup:
         return mup_init_
 
     return init_
@@ -48,7 +48,7 @@ def scaled_init_method_normal(sigma, num_layers):
         return mup.init.normal_(tensor, mean=0.0, std=std)
 
     args = get_args()
-    if args.mup:
+    if False and args.mup:
         return mup_init_
 
     return init_

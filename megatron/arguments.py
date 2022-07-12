@@ -918,5 +918,11 @@ def _add_mup_args(parser):
                         help='file location to save base shapes at')
     parser.add_argument('--load_base_shapes', type=str, default='',
                         help='file location to load base shapes from')
+    parser.add_argument('--coord_check', action='store_true',
+                        help='test μ parametrization is correctly implemented by collecting statistics on coordinate distributions for a few steps of training.')
+    parser.add_argument('--coord_check_nsteps', type=int, default=3,
+                        help='Do coord check with this many steps.')
+    parser.add_argument('--coord_check_nseeds', type=int, default=3,
+                        help='number of seeds for testing correctness of μ parametrization')
 
     return parser

@@ -159,7 +159,7 @@ def pretrain(train_valid_test_dataset_provider,
     timers.log(['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'])
     print_rank_0('training ...')
 
-    if args.mup:
+    if args.mup and args.coord_check:
         coord_check(False, train_data_iterator, batch_fn=model[0].module._megatron_batch_fn, plotdir="coord_checks")
         coord_check(True, train_data_iterator, batch_fn=model[0].module._megatron_batch_fn, plotdir="coord_checks")
 
@@ -1210,8 +1210,8 @@ def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
     args = get_args()
 
     lr = 0.01
-    coord_check_nseeds = 3
-    coord_check_nsteps = 5
+    coord_check_nseeds = args.coord_check_nseeds
+    coord_check_nsteps = args.coord_check_nsteps
 
     def gen(w, standparam=False):
         def f():
