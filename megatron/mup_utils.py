@@ -9,7 +9,7 @@ import pandas as pd
 import deepspeed
 import mup
 from mup.optim import MuAdam as Adam
-from mup import coord_check
+from mup import coord_check as mup_coord_check
 
 
 def coord_check(mup_flag, data_iterator, batch_fn, lr, plotdir='', legend=False):
@@ -57,7 +57,7 @@ def coord_check(mup_flag, data_iterator, batch_fn, lr, plotdir='', legend=False)
 
     prm = 'μP' if mup_flag else 'SP'
     if torch.distributed.get_rank() == 0:
-        coord_check.plot_coord_data(df, legend=legend,
+        mup_coord_check.plot_coord_data(df, legend=legend,
             save_to=os.path.join(plotdir, f'{prm.lower()}_trsfmr_{optimizer}_coord.png'),
             suptitle=f'{prm} Transformer {optimizer} lr={lr} nseeds={coord_check_nseeds}',
             face_color='xkcd:light grey' if not mup_flag else None)
@@ -257,7 +257,7 @@ def _get_coord_data(models, dataloader, optcls, nsteps=3,
                     if filter_module_by_name and not filter_module_by_name(name):
                         continue
                     remove_hooks.append(module.register_forward_hook(
-                       coord_check._record_coords(df, width, name, batch_idx + 1,
+                       mup_coord_check._record_coords(df, width, name, batch_idx + 1,
                             output_fdict=output_fdict,
                             input_fdict=input_fdict,
                             param_fdict=param_fdict)))

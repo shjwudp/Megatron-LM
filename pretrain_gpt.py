@@ -105,7 +105,8 @@ def model_provider(pre_process=True, post_process=True):
             if args.save_base_shapes:
                 save_base_shapes()
             if args.mup:
-                mup.set_base_shapes(model, args.load_base_shapes)
+                load_base_shapes = f"{args.load_base_shapes}.{torch.distributed.get_rank()}"
+                mup.set_base_shapes(model, load_base_shapes)
         else:
             model = GPTModel(
                 num_tokentypes=0,
