@@ -294,9 +294,8 @@ megatron_options=" \
         --num-workers 2 \
         --fp16 \
         --mup \
-        --coord_check \
-        --save_base_shapes width2048.bsh \
-        --load_base_shapes width2048.bsh \
+        --save_base_shapes mup_baseline/width2048.bsh \
+        --load_base_shapes mup_baseline/width2048.bsh \
         --load ${CHECKPOINT_PATH} \
         --save ${CHECKPOINT_PATH} \
         --tensorboard-queue-size 1 \
