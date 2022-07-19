@@ -185,13 +185,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         import functools
         args = get_args()
         init_method = functools.partial(mup.init.normal_, mean=0.0, std=init_method_std)
-        if args.use_cpu_initialization:
-            _initialize_affine_weight_cpu(
-                self.weight, self.num_embeddings, self.embedding_dim,
-                self.num_embeddings_per_partition, 0, init_method)
-        else:
-            _initialize_affine_weight_gpu(self.weight, init_method,
-                                            partition_dim=0, stride=1)
+        assert not args.use_cpu_initialization
+        init_method(self.weight)
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
@@ -298,14 +293,8 @@ class ColumnParallelLinear(torch.nn.Module):
         import functools
         args = get_args()
         init_method = functools.partial(mup.init.normal_, mean=0.0, std=init_method_std)
-        if args.use_cpu_initialization:
-            self.master_weight = _initialize_affine_weight_cpu(
-                self.weight, self.output_size, self.input_size,
-                self.output_size_per_partition, 0, init_method,
-                stride=self.stride, return_master_weight=self.keep_master_weight_for_test)
-        else:
-            _initialize_affine_weight_gpu(self.weight, init_method,
-                                          partition_dim=0, stride=self.stride)
+        assert not args.use_cpu_initialization
+        init_method(self.weight)
 
     def forward(self, input_):
         # Set up backprop all-reduce.
@@ -410,14 +399,8 @@ class RowParallelLinear(torch.nn.Module):
         args = get_args()
         std = init_method_std / math.sqrt(2.0 * args.num_layers)
         init_method = functools.partial(mup.init.normal_, mean=0.0, std=std)
-        if args.use_cpu_initialization:
-            self.master_weight = _initialize_affine_weight_cpu(
-                self.weight, self.output_size, self.input_size,
-                self.input_size_per_partition, 1, init_method,
-                stride=self.stride, return_master_weight=self.keep_master_weight_for_test)
-        else:
-            _initialize_affine_weight_gpu(self.weight, init_method,
-                                          partition_dim=0, stride=self.stride)
+        assert not args.use_cpu_initialization
+        init_method(self.weight)
 
     def forward(self, input_):
         # Set up backprop all-reduce.
