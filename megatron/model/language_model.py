@@ -159,6 +159,12 @@ class Embedding(MegatronModule):
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
 
+    def mup_initialize(self, init_method_std):
+        import mup
+        mup.init.normal_(self.position_embeddings.weight, mean=0.0, std=init_method_std)
+        if self.num_tokentypes > 0:
+            mup.init.normal_(self.tokentype_embeddings.weight, mean=0.0, std=init_method_std)
+
     def add_tokentype_embeddings(self, num_tokentypes):
         """Add token-type embedding. This function is provided so we can add
         token-type embeddings in case the pretrained model does not have it.

@@ -82,6 +82,7 @@ def model_provider(pre_process=True, post_process=True):
                 num_tokentypes=0,
                 parallel_output=True
             )
+
             # This is a hack to give us a reference to get_batch_pipe from within training.py
             # We need to call model.set_batch_fn after deepspeed.initialize
             model._megatron_batch_fn = get_batch_pipe
@@ -107,6 +108,11 @@ def model_provider(pre_process=True, post_process=True):
             if args.mup:
                 load_base_shapes = f"{args.load_base_shapes}.{torch.distributed.get_rank()}"
                 mup.set_base_shapes(model, load_base_shapes)
+
+                # mup parameter initialization
+                for _, sub_module in model.named_modules():
+                    if hasattr(sub_module, "mup_initialize"):
+                        sub_module.mup_initialize(init_method_std=args.init_method_std)
         else:
             model = GPTModel(
                 num_tokentypes=0,

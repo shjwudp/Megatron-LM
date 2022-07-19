@@ -15,6 +15,8 @@ from mup import coord_check as mup_coord_check
 def coord_check(mup_flag, data_iterator, batch_fn, lr, plotdir='', legend=False):
     args = get_args()
 
+    hidden_size_copy = args.hidden_size
+
     lr = 0.01
     coord_check_nseeds = args.coord_check_nseeds
     coord_check_nsteps = args.coord_check_nsteps
@@ -34,6 +36,11 @@ def coord_check(mup_flag, data_iterator, batch_fn, lr, plotdir='', legend=False)
             else:
                 load_base_shapes = f"{args.load_base_shapes}.{torch.distributed.get_rank()}"
                 mup.set_base_shapes(model, load_base_shapes)
+
+                # mup parameter initialization
+                for _, sub_module in model.named_modules():
+                    if hasattr(sub_module, "mup_initialize"):
+                        sub_module.mup_initialize(init_method_std=args.init_method_std)
             optimizer = Adam(model.parameters(), lr=lr)
 
             model, _, _, _ = deepspeed.initialize(
@@ -63,7 +70,10 @@ def coord_check(mup_flag, data_iterator, batch_fn, lr, plotdir='', legend=False)
             face_color='xkcd:light grey' if not mup_flag else None)
     torch.distributed.barrier()
 
-    return
+    # recovery model setting
+    args.hidden_size = hidden_size_copy
+    args.ffn_hidden_size = 4 * args.hidden_size
+    args.kv_channels = args.hidden_size // args.num_attention_heads
 
 
 def get_coord_data(models, dataloader, optimizer='sgd', lr=None, mup=True,

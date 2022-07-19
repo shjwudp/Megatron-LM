@@ -27,13 +27,6 @@ def init_method_normal(sigma):
     def init_(tensor):
         return torch.nn.init.normal_(tensor, mean=0.0, std=sigma)
 
-    def mup_init_(tensor):
-        return mup.init.normal_(tensor, mean=0.0, std=sigma)
-
-    args = get_args()
-    if False and args.mup:
-        return mup_init_
-
     return init_
 
 
@@ -43,13 +36,6 @@ def scaled_init_method_normal(sigma, num_layers):
 
     def init_(tensor):
         return torch.nn.init.normal_(tensor, mean=0.0, std=std)
-
-    def mup_init_(tensor):
-        return mup.init.normal_(tensor, mean=0.0, std=std)
-
-    args = get_args()
-    if False and args.mup:
-        return mup_init_
 
     return init_
 
