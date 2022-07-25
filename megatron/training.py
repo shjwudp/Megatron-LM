@@ -672,7 +672,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                               args.consumed_train_samples)
             writer.add_scalar(f"lm-loss-training/{key}" + ' vs tokens', loss_dict[key],
                               args.consumed_train_tokens)
-        if args.log_loss_scale_to_tensorboard:
+        if args.log_loss_scale_to_tensorboard and args.fp16:
             writer.add_scalar('loss-scale/loss-scale', loss_scale, iteration)
             writer.add_scalar('loss-scale/loss-scale vs samples', loss_scale,
                               args.consumed_train_samples)
