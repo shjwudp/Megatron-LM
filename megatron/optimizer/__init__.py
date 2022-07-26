@@ -22,6 +22,7 @@ from megatron.model import LayerNorm
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
 from .adafactor import Adafactor
+from .shampoo import ShampooHyperParams, Shampoo
 
 def _get_params_for_weight_decay_optimization(modules):
     """Divide params into with-weight-decay and without-weight-decay groups.
@@ -72,6 +73,10 @@ def get_megatron_optimizer(model):
     elif args.optimizer == "adafactor":
         optimizer = Adafactor(param_groups, beta1=0.9, dynamic_weight_decay=True)
         args.log_learning_rate_to_tensorboard = False
+    elif args.optimizer == "shampoo":
+        hp = ShampooHyperParams()
+        hp.weight_decay = args.weight_decay
+        optimizer = Shampoo(param_groups, lr=args.lr, hyperparams=hp)
     else:
         raise Exception('{} optimizer is not supported.'.format(
             args.optimizer))
