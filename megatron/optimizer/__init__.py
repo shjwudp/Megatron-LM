@@ -79,7 +79,7 @@ def get_megatron_optimizer(model):
                         weight_decay=args.weight_decay,
                         momentum=args.sgd_momentum)
     elif args.optimizer == "adafactor":
-        optimizer = Adafactor(param_groups, beta1=0.9, dynamic_weight_decay=True)
+        optimizer = Adafactor(param_groups, mup=args.mup, beta1=0.9, dynamic_weight_decay=True)
         args.log_learning_rate_to_tensorboard = False
     else:
         raise Exception('{} optimizer is not supported.'.format(

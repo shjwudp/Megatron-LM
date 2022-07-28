@@ -1,5 +1,6 @@
 from megatron.model import GPTModelPipe
 from megatron import get_args
+from megatron.optimizer import Adafactor
 
 import copy
 import os
@@ -8,7 +9,7 @@ import numpy as np
 import pandas as pd
 import deepspeed
 import mup
-from mup.optim import MuAdam as Adam
+from mup.optim import MuAdam
 from mup import coord_check as mup_coord_check
 
 
@@ -41,7 +42,12 @@ def coord_check(mup_flag, data_iterator, batch_fn, lr, plotdir='', legend=False)
                 for _, sub_module in model.named_modules():
                     if hasattr(sub_module, "mup_initialize"):
                         sub_module.mup_initialize(init_method_std=args.init_method_std)
-            optimizer = Adam(model.parameters(), lr=lr)
+            if args.optimizer == "adafactor":
+                optimizer = Adafactor(model.parameters(), mup=True, beta1=0.9, dynamic_weight_decay=True)
+            elif args.optimizer == "adam":
+                optimizer = MuAdam(model.parameters(), lr=lr)
+            else:
+                raise Exception("Unexpected optimizer {}".format(args.optimizer))
 
             model, _, _, _ = deepspeed.initialize(
                 model=model,

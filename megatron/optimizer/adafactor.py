@@ -1,6 +1,13 @@
 import math
-
 import torch
+
+
+def process_param_groups(params, **kwargs):
+    param_groups = list(params)
+    if not isinstance(param_groups[0], dict):
+        param_groups = [{'params': param_groups}]
+    return param_groups
+
 
 class Adafactor(torch.optim.Optimizer):
     """Implements Adafactor algorithm.
@@ -46,11 +53,39 @@ class Adafactor(torch.optim.Optimizer):
         relative_step=True,
         warmup_init=False,
         dynamic_weight_decay=False,
+        mup=False,
     ):
         if lr is not None and relative_step:
             raise ValueError("Cannot combine manual lr and relative_step options")
         if warmup_init and not relative_step:
             raise ValueError("warmup_init requires relative_step=True")
+
+        if mup is True:
+            new_param_groups = []
+            for param_group in process_param_groups(params):
+                # For every existing param group, we split into several new groups
+                def new_group():
+                    new_g = {k:v for k, v in param_group.items() if k != 'params'}
+                    new_g['params'] = []
+                    return new_g
+                # The matrix-like weights might need multiple groups since weights
+                # might have different width multipliers
+                matrix_like_p = defaultdict(new_group) # key is width_mult
+                vector_like_p = new_group()
+                for p in param_group['params']:
+                    assert hasattr(p, 'infshape'), (
+                        f'A parameter with shape {p.shape} does not have `infshape` attribute. '
+                        'Did you forget to call `mup.set_base_shapes` on the model?')
+                    if p.infshape.ninf() == 2:
+                        matrix_like_p[p.infshape.width_mult()]['params'].append(p)
+                    elif p.infshape.ninf() > 2:
+                        raise NotImplementedError('more than 2 inf dimensions')
+                    else:
+                        vector_like_p['params'].append(p)
+                for width_mult, group in matrix_like_p.items():
+                    group["width_mult"] = width_mult
+                new_param_groups.extend(list(matrix_like_p.values()) + [vector_like_p])
+            params = new_param_groups
 
         defaults = dict(
             lr=lr,
@@ -63,6 +98,7 @@ class Adafactor(torch.optim.Optimizer):
             relative_step=relative_step,
             warmup_init=warmup_init,
             dynamic_weight_decay=dynamic_weight_decay,
+            mup=mup,
         )
         super(Adafactor, self).__init__(params, defaults)
 
@@ -84,6 +120,10 @@ class Adafactor(torch.optim.Optimizer):
         param_scale = 1.0
         if param_group["scale_parameter"]:
             param_scale = max(param_group["eps"][1], param_state["RMS"])
+
+        if self.mup and "width_mult" in param_group:
+            param_scale /= param_group["width_mult"]
+
         return param_scale * rel_step_sz
 
     def _get_options(self, param_group, param_shape):
