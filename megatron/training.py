@@ -161,8 +161,8 @@ def pretrain(train_valid_test_dataset_provider,
     print_rank_0('training ...')
 
     if args.mup and args.coord_check:
-        mup_utils.coord_check(False, train_data_iterator, lr=args.lr, batch_fn=model[0].module._megatron_batch_fn, plotdir="coord_checks")
-        mup_utils.coord_check(True, train_data_iterator, lr=args.lr, batch_fn=model[0].module._megatron_batch_fn, plotdir="coord_checks")
+        mup_utils.coord_check(False, train_data_iterator, batch_fn=model[0].module._megatron_batch_fn, plotdir="coord_checks")
+        mup_utils.coord_check(True, train_data_iterator, batch_fn=model[0].module._megatron_batch_fn, plotdir="coord_checks")
 
     iteration = 0
     if args.do_train and args.train_iters > 0:

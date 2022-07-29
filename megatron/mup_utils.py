@@ -14,12 +14,11 @@ from mup.optim import MuAdam
 from mup import coord_check as mup_coord_check
 
 
-def coord_check(mup_flag, data_iterator, batch_fn, lr, plotdir='', legend=False):
+def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
     args = get_args()
 
     hidden_size_copy = args.hidden_size
 
-    lr = 0.01
     coord_check_nseeds = args.coord_check_nseeds
     coord_check_nsteps = args.coord_check_nsteps
 
@@ -47,7 +46,7 @@ def coord_check(mup_flag, data_iterator, batch_fn, lr, plotdir='', legend=False)
             if args.optimizer == "adafactor":
                 optimizer = Adafactor(model.parameters(), mup=True, beta1=0.9, dynamic_weight_decay=True)
             elif args.optimizer == "adam":
-                optimizer = MuAdam(model.parameters(), lr=lr)
+                optimizer = MuAdam(model.parameters(), lr=args.lr)
                 lr_scheduler = AnnealingLR(
                     optimizer,
                     max_lr=args.lr,
