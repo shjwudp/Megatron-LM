@@ -117,14 +117,17 @@ class AnnealingLR(object):
 
     def step(self, increment, token_num=None):
         """Set lr for all parameters groups."""
+        args = get_args()
         if token_num is None:
-            args = get_args()
             token_num = args.consumed_train_tokens
         self.num_tokens = token_num
         self.num_steps += increment
         new_lr = self.get_lr()
         for group in self.optimizer.param_groups:
-            group['lr'] = new_lr
+            if args.mup and "width_mult" in group:
+                group["lr"] = new_lr / group["width_mult"]
+            else:
+                group['lr'] = new_lr
 
 
     def state_dict(self):

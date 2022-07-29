@@ -185,9 +185,10 @@ class Embedding(MegatronModule):
     def forward(self, input_ids, position_ids, tokentype_ids=None):
         args = get_args()
         # Embeddings.
-        words_embeddings = self.word_embeddings(input_ids)
         if args.mup:
-            words_embeddings *= 10
+            words_embeddings = self.word_embeddings(input_ids) * 10
+        else:
+            words_embeddings = self.word_embeddings(input_ids)
         position_embeddings = self.position_embeddings(position_ids)
         embeddings = words_embeddings + position_embeddings
         if tokentype_ids is not None:

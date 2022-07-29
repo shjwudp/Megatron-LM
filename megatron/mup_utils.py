@@ -175,6 +175,8 @@ def get_coord_data(models, dataloader, optimizer='sgd', lr=None, mup=True,
         optcls = lambda model: Adam(get_trainable(model), lr=lr)
     elif optimizer == 'adamw':
         optcls = lambda model: AdamW(get_trainable(model), lr=lr)
+    elif optimizer == "adafactor":
+        optcls = lambda model: Adafactor(get_trainable(model), mup=True, beta1=0.9, dynamic_weight_decay=True)
     elif optimizer is None:
         raise ValueError('optimizer should be sgd|adam|adamw or a custom function')
     
