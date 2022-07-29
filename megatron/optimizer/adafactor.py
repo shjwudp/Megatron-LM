@@ -1,5 +1,6 @@
 import math
 import torch
+from collections import defaultdict
 
 
 def process_param_groups(params, **kwargs):
@@ -60,7 +61,8 @@ class Adafactor(torch.optim.Optimizer):
         if warmup_init and not relative_step:
             raise ValueError("warmup_init requires relative_step=True")
 
-        if mup is True:
+        self.mup = mup
+        if self.mup is True:
             new_param_groups = []
             for param_group in process_param_groups(params):
                 # For every existing param group, we split into several new groups
@@ -98,7 +100,6 @@ class Adafactor(torch.optim.Optimizer):
             relative_step=relative_step,
             warmup_init=warmup_init,
             dynamic_weight_decay=dynamic_weight_decay,
-            mup=mup,
         )
         super(Adafactor, self).__init__(params, defaults)
 

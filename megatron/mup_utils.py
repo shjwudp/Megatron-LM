@@ -63,7 +63,7 @@ def coord_check(mup_flag, data_iterator, batch_fn, lr, plotdir='', legend=False)
     widths = 2 ** np.arange(7, 11)
     models = {w: gen(w, standparam=not mup_flag) for w in widths}
 
-    optimizer = copy.deepcopy("adam")
+    optimizer = copy.deepcopy(args.optimizer)
 
     df = get_coord_data(models, data_iterator, mup=mup_flag, lr=lr, optimizer=optimizer,
         nseeds=coord_check_nseeds, nsteps=coord_check_nsteps)
