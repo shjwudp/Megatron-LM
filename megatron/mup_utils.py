@@ -1,6 +1,7 @@
 from megatron.model import GPTModelPipe
 from megatron import get_args
 from megatron.optimizer import Adafactor
+from megatron.learning_rates import AnnealingLR
 
 import copy
 import os
@@ -42,17 +43,29 @@ def coord_check(mup_flag, data_iterator, batch_fn, lr, plotdir='', legend=False)
                 for _, sub_module in model.named_modules():
                     if hasattr(sub_module, "mup_initialize"):
                         sub_module.mup_initialize(init_method_std=args.init_method_std)
+            lr_scheduler = None
             if args.optimizer == "adafactor":
                 optimizer = Adafactor(model.parameters(), mup=True, beta1=0.9, dynamic_weight_decay=True)
             elif args.optimizer == "adam":
                 optimizer = MuAdam(model.parameters(), lr=lr)
+                lr_scheduler = AnnealingLR(
+                    optimizer,
+                    max_lr=args.lr,
+                    min_lr=args.min_lr,
+                    warmup_steps=1,
+                    decay_steps=args.coord_check_nsteps,
+                    decay_style=args.lr_decay_style,
+                    use_checkpoint_lr_scheduler=args.use_checkpoint_lr_scheduler,
+                    override_lr_scheduler=args.override_lr_scheduler,
+                )
             else:
                 raise Exception("Unexpected optimizer {}".format(args.optimizer))
 
-            model, _, _, _ = deepspeed.initialize(
+            model, _, _, lr_scheduler = deepspeed.initialize(
                 model=model,
                 optimizer=optimizer,
                 args=args,
+                lr_scheduler=lr_scheduler,
                 mpu=None,
             )
             model.set_batch_fn(batch_fn)
