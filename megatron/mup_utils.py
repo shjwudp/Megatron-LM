@@ -1,7 +1,8 @@
 from megatron.model import GPTModelPipe
 from megatron import get_args
-from megatron.optimizer import Adafactor
 from megatron.learning_rates import AnnealingLR
+from megatron.optimizer import get_megatron_optimizer
+from megatron.utils import unwrap_model
 
 import copy
 import os
@@ -10,7 +11,6 @@ import numpy as np
 import pandas as pd
 import deepspeed
 import mup
-from mup.optim import MuAdam
 from mup import coord_check as mup_coord_check
 
 
@@ -42,11 +42,10 @@ def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
                 for _, sub_module in model.named_modules():
                     if hasattr(sub_module, "mup_initialize"):
                         sub_module.mup_initialize(init_method_std=args.init_method_std)
+            unwrapped_model = unwrap_model(model)
+            optimizer = get_megatron_optimizer(unwrapped_model)
             lr_scheduler = None
-            if args.optimizer == "adafactor":
-                optimizer = Adafactor(model.parameters(), mup=True, beta1=0.9, dynamic_weight_decay=True)
-            elif args.optimizer == "adam":
-                optimizer = MuAdam(model.parameters(), lr=args.lr)
+            if args.optimizer != "adafactor":
                 lr_scheduler = AnnealingLR(
                     optimizer,
                     max_lr=args.lr,
@@ -77,14 +76,14 @@ def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
 
     optimizer = copy.deepcopy(args.optimizer)
 
-    df = get_coord_data(models, data_iterator, mup=mup_flag, lr=lr, optimizer=optimizer,
+    df = get_coord_data(models, data_iterator, mup=mup_flag, lr=args.lr, optimizer=optimizer,
         nseeds=coord_check_nseeds, nsteps=coord_check_nsteps)
 
     prm = 'μP' if mup_flag else 'SP'
     if torch.distributed.get_rank() == 0:
         mup_coord_check.plot_coord_data(df, legend=legend,
             save_to=os.path.join(plotdir, f'{prm.lower()}_trsfmr_{optimizer}_coord.png'),
-            suptitle=f'{prm} Transformer {optimizer} lr={lr} nseeds={coord_check_nseeds}',
+            suptitle=f'{prm} Transformer {optimizer} lr={args.lr} nseeds={coord_check_nseeds}',
             face_color='xkcd:light grey' if not mup_flag else None)
     torch.distributed.barrier()
 
@@ -272,6 +271,8 @@ def _get_coord_data(models, dataloader, optcls, nsteps=3,
         from tqdm import tqdm
         pbar = tqdm(total=nseeds * len(models))
 
+    args = get_args()
+
     for i in range(nseeds):
         torch.manual_seed(i)
         for width, model in models.items():
@@ -279,24 +280,25 @@ def _get_coord_data(models, dataloader, optcls, nsteps=3,
             model.train()
             if cuda:
                 model = model.cuda()
-            optimizer = optcls(model)
-            for batch_idx in range(nsteps):
-                remove_hooks = []
-                # add hooks
-                for name, module in model.named_modules():
-                    if filter_module_by_name and not filter_module_by_name(name):
-                        continue
-                    remove_hooks.append(module.register_forward_hook(
-                       mup_coord_check._record_coords(df, width, name, batch_idx + 1,
-                            output_fdict=output_fdict,
-                            input_fdict=input_fdict,
-                            param_fdict=param_fdict)))
+            for batch_idx in range(nsteps * args.sampling_interval):
+                if batch_idx % args.sampling_interval == 0:
+                    remove_hooks = []
+                    # add hooks
+                    for name, module in model.named_modules():
+                        if filter_module_by_name and not filter_module_by_name(name):
+                            continue
+                        remove_hooks.append(module.register_forward_hook(
+                        mup_coord_check._record_coords(df, width, name, batch_idx / args.sampling_interval + 1,
+                                output_fdict=output_fdict,
+                                input_fdict=input_fdict,
+                                param_fdict=param_fdict)))
 
                 model.train_batch(data_iter=iter(dataloader))
 
                 # remove hooks
-                for handle in remove_hooks:
-                    handle.remove()
+                if batch_idx % args.sampling_interval == 0:
+                    for handle in remove_hooks:
+                        handle.remove()
             if show_progress:
                 pbar.update(1)
 

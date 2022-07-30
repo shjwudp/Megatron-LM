@@ -474,7 +474,7 @@ def _add_training_args(parser):
                        help='Create separate groups for MoE params.'
                        'This is necessary for techniques like ZeRO.')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'adafactor'],
+                       choices=['adam', 'sgd', 'adafactor', 'adamw'],
                        help='Optimizer function')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],
@@ -924,5 +924,7 @@ def _add_mup_args(parser):
                         help='Do coord check with this many steps.')
     parser.add_argument('--coord_check_nseeds', type=int, default=3,
                         help='number of seeds for testing correctness of μ parametrization')
+    parser.add_argument('--coord_check_sampling_interval', type=int, default=1,
+                        help='step interval for coord check sampling')
 
     return parser
