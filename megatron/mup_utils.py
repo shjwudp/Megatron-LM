@@ -270,6 +270,7 @@ def _get_coord_data(models, dataloader, optcls, nsteps=3,
         pbar = tqdm(total=nseeds * len(models))
 
     args = get_args()
+    sampling_interval = args.coord_check_sampling_interval
 
     for i in range(nseeds):
         torch.manual_seed(i)
@@ -278,15 +279,15 @@ def _get_coord_data(models, dataloader, optcls, nsteps=3,
             model.train()
             if cuda:
                 model = model.cuda()
-            for batch_idx in range(nsteps * args.sampling_interval):
-                if batch_idx % args.sampling_interval == 0:
+            for batch_idx in range(nsteps * sampling_interval):
+                if batch_idx % sampling_interval == 0:
                     remove_hooks = []
                     # add hooks
                     for name, module in model.named_modules():
                         if filter_module_by_name and not filter_module_by_name(name):
                             continue
                         remove_hooks.append(module.register_forward_hook(
-                        mup_coord_check._record_coords(df, width, name, batch_idx / args.sampling_interval + 1,
+                        mup_coord_check._record_coords(df, width, name, int(batch_idx / sampling_interval + 1),
                                 output_fdict=output_fdict,
                                 input_fdict=input_fdict,
                                 param_fdict=param_fdict)))
@@ -294,7 +295,7 @@ def _get_coord_data(models, dataloader, optcls, nsteps=3,
                 model.train_batch(data_iter=iter(dataloader))
 
                 # remove hooks
-                if batch_idx % args.sampling_interval == 0:
+                if batch_idx % sampling_interval == 0:
                     for handle in remove_hooks:
                         handle.remove()
             if show_progress:

@@ -63,6 +63,7 @@ def get_megatron_optimizer(model):
     if args.optimizer == 'adam':
         if args.mup:
             optimizer = MuAdam(param_groups, impl=Adam,
+                            decoupled_wd=True,
                             lr=args.lr,
                             weight_decay=args.weight_decay,
                             betas=(args.adam_beta1, args.adam_beta2),
