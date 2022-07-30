@@ -2,7 +2,6 @@ from megatron.model import GPTModelPipe
 from megatron import get_args
 from megatron.learning_rates import AnnealingLR
 from megatron.optimizer import get_megatron_optimizer
-from megatron.utils import unwrap_model
 
 import copy
 import os
@@ -42,8 +41,7 @@ def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
                 for _, sub_module in model.named_modules():
                     if hasattr(sub_module, "mup_initialize"):
                         sub_module.mup_initialize(init_method_std=args.init_method_std)
-            unwrapped_model = unwrap_model(model)
-            optimizer = get_megatron_optimizer(unwrapped_model)
+            optimizer = get_megatron_optimizer([model])
             lr_scheduler = None
             if args.optimizer != "adafactor":
                 lr_scheduler = AnnealingLR(
