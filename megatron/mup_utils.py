@@ -20,6 +20,7 @@ def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
 
     coord_check_nseeds = args.coord_check_nseeds
     coord_check_nsteps = args.coord_check_nsteps
+    plot_coord_check = False
 
     def gen(w, standparam=False):
         def f():
@@ -65,6 +66,11 @@ def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
                 mpu=None,
             )
             model.set_batch_fn(batch_fn)
+
+            # Take one rank for plot coord cehck, the last stage of the pipeline
+            if model.is_last_stage() and model.grid.data_parallel_id == 0:
+                plot_coord_check = True
+
             return model
         return f
 
@@ -78,7 +84,7 @@ def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
         nseeds=coord_check_nseeds, nsteps=coord_check_nsteps)
 
     prm = 'μP' if mup_flag else 'SP'
-    if torch.distributed.get_rank() == 0:
+    if plot_coord_check:
         mup_coord_check.plot_coord_data(df, legend=legend,
             save_to=os.path.join(plotdir, f'{prm.lower()}_trsfmr_{optimizer}_coord.png'),
             suptitle=f'{prm} Transformer {optimizer} lr={args.lr} nseeds={coord_check_nseeds}',
