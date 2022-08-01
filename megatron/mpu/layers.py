@@ -187,6 +187,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         init_method = functools.partial(mup.init.normal_, mean=0.0, std=init_method_std)
         assert not args.use_cpu_initialization
         init_method(self.weight)
+        width_mult = self.weight.infshape.width_mult()
+        self.weight *= width_mult ** 0.5
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
