@@ -126,6 +126,7 @@ class AnnealingLR(object):
         for group in self.optimizer.param_groups:
             if args.mup and "width_mult" in group:
                 group["lr"] = new_lr / group["width_mult"]
+                print("step lr", new_lr, group["width_mult"])
             else:
                 group['lr'] = new_lr
 

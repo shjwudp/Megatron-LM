@@ -1,5 +1,5 @@
 from megatron.model import GPTModelPipe
-from megatron import get_args
+from megatron import get_args, mpu, get_num_microbatches
 from megatron.learning_rates import AnnealingLR
 from megatron.optimizer import get_megatron_optimizer
 
@@ -43,20 +43,7 @@ def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
                     if hasattr(sub_module, "mup_initialize"):
                         sub_module.mup_initialize(init_method_std=args.init_method_std)
             optimizer = get_megatron_optimizer([model])
-            lr_scheduler = None
-            if args.optimizer != "adafactor":
-                lr_scheduler = AnnealingLR(
-                    optimizer,
-                    max_lr=args.lr,
-                    min_lr=args.min_lr,
-                    warmup_steps=1,
-                    decay_steps=args.coord_check_nsteps,
-                    decay_style=args.lr_decay_style,
-                    use_checkpoint_lr_scheduler=args.use_checkpoint_lr_scheduler,
-                    override_lr_scheduler=args.override_lr_scheduler,
-                )
-            else:
-                raise Exception("Unexpected optimizer {}".format(args.optimizer))
+            lr_scheduler = get_learning_rate_scheduler(optimizer)
 
             model, _, _, lr_scheduler = deepspeed.initialize(
                 model=model,
@@ -278,6 +265,9 @@ def _get_coord_data(models, dataloader, optcls, nsteps=3,
     args = get_args()
     sampling_interval = args.coord_check_sampling_interval
 
+    # backup args.consumed_train_samples & args.consumed_train_tokens
+    consumed_train_samples = args.consumed_train_samples
+    consumed_train_tokens = args.consumed_train_tokens
     for i in range(nseeds):
         torch.manual_seed(i)
         for width, model in models.items():
@@ -285,6 +275,10 @@ def _get_coord_data(models, dataloader, optcls, nsteps=3,
             model.train()
             if cuda:
                 model = model.cuda()
+
+            # reset consumed samples & tokens
+            args.consumed_train_samples = consumed_train_samples
+            args.consumed_train_tokens = consumed_train_tokens
             for batch_idx in range(nsteps * sampling_interval):
                 if batch_idx % sampling_interval == 0:
                     remove_hooks = []
@@ -299,6 +293,10 @@ def _get_coord_data(models, dataloader, optcls, nsteps=3,
                                 param_fdict=param_fdict)))
 
                 model.train_batch(data_iter=iter(dataloader))
+                new_samples = mpu.get_data_parallel_world_size() * \
+                        args.micro_batch_size * get_num_microbatches()
+                args.consumed_train_samples += new_samples
+                args.consumed_train_tokens += new_samples * args.seq_length
 
                 # remove hooks
                 if batch_idx % sampling_interval == 0:
@@ -313,4 +311,66 @@ def _get_coord_data(models, dataloader, optcls, nsteps=3,
             gc.collect()
     if show_progress:
         pbar.close()
+
+    # reset consumed samples & tokens
+    args.consumed_train_samples = consumed_train_samples
+    args.consumed_train_tokens = consumed_train_tokens
+
     return pd.DataFrame(df)
+
+
+def get_learning_rate_scheduler(optimizer):
+    """Build the learning rate scheduler."""
+    args = get_args()
+
+    if args.optimizer == "adafactor":
+        # Adafactor has its own learning-rate adjustment function, and does not need an additional lr-scheduler.
+        return None
+
+    # Iteration-based training.
+    if args.train_iters:
+        if args.lr_decay_iters is None:
+            args.lr_decay_iters = args.train_iters
+        decay_steps = args.lr_decay_iters * args.global_batch_size
+        if args.lr_warmup_fraction is not None:
+            warmup_steps = args.lr_warmup_fraction * decay_steps
+        else:
+            warmup_steps = args.lr_warmup_iters * args.global_batch_size
+    # Sample-based training.
+    elif args.train_samples:
+        # We need to set training iters for later use. Technically
+        # we need to adjust the training samples too (due to last
+        # batch being incomplete) but we leave it as is for now.
+        update_train_iters(args)
+        if args.lr_decay_samples is None:
+            args.lr_decay_samples = args.train_samples
+        decay_steps = args.lr_decay_samples
+        if args.lr_warmup_fraction is not None:
+            warmup_steps = args.lr_warmup_fraction * decay_steps
+        else:
+            warmup_steps = args.lr_warmup_samples
+    else:
+        raise Exception(
+            'either train-iters or train-samples should be provided.')
+
+    lr_scheduler = AnnealingLR(
+        optimizer,
+        max_lr=args.lr,
+        min_lr=args.min_lr,
+        warmup_steps=warmup_steps,
+        decay_steps=decay_steps,
+        decay_style=args.lr_decay_style,
+        use_checkpoint_lr_scheduler=args.use_checkpoint_lr_scheduler,
+        override_lr_scheduler=args.override_lr_scheduler)
+
+    return lr_scheduler
+
+
+def update_train_iters(args):
+
+    # For iteration-based training, we don't need to do anything
+    if args.train_iters:
+        return
+
+    # Constant batch size with sample-based training.
+    args.train_iters = args.train_samples // args.global_batch_size
