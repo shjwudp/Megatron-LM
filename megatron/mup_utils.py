@@ -4,6 +4,7 @@ from megatron.learning_rates import AnnealingLR
 from megatron.optimizer import get_megatron_optimizer
 
 import copy
+import time
 import os
 import torch
 import numpy as np
@@ -11,6 +12,7 @@ import pandas as pd
 import deepspeed
 import mup
 from mup import coord_check as mup_coord_check
+from torch import nn
 
 
 def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
@@ -40,8 +42,14 @@ def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
 
                 # mup parameter initialization
                 for _, sub_module in model.named_modules():
-                    if hasattr(sub_module, "mup_initialize"):
-                        sub_module.mup_initialize(init_method_std=args.init_method_std)
+                    if isinstance(sub_module, (nn.Linear)):
+                        if hasattr(sub_module.weight, "infshape"):
+                            mup.init.normal_(sub_module.weight, mean=0.0, std=args.init_method_std)
+                        else:
+                            sub_module.weight.data.normal_(mean=0.0, std=args.init_method_std)
+                        if sub_module.bias is not None:
+                            sub_module.bias.data.zero_()
+
             optimizer = get_megatron_optimizer([model])
             lr_scheduler = get_learning_rate_scheduler(optimizer)
 
@@ -50,7 +58,7 @@ def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
                 optimizer=optimizer,
                 args=args,
                 lr_scheduler=lr_scheduler,
-                mpu=None,
+                mpu=mpu if args.no_pipeline_parallel else None,
             )
             model.set_batch_fn(batch_fn)
 
@@ -73,9 +81,10 @@ def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
     prm = 'μP' if mup_flag else 'SP'
     if args.plot_coord_check:
         mup_coord_check.plot_coord_data(df, legend=legend,
-            save_to=os.path.join(plotdir, f'{prm.lower()}_trsfmr_{optimizer}_coord.png'),
+            save_to=os.path.join(plotdir, f'{time.time()}.{prm.lower()}_trsfmr_{optimizer}_coord.png'),
             suptitle=f'{prm} Transformer {optimizer} lr={args.lr} nseeds={coord_check_nseeds}',
             face_color='xkcd:light grey' if not mup_flag else None)
+        # df.to_pickle(os.path.join(plotdir, f'{time.time()}.{prm.lower()}_trsfmr_{optimizer}_coord.pkl'))
     torch.distributed.barrier()
 
     # recovery model setting

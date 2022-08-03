@@ -18,9 +18,9 @@
 # repo: https://github.com/pytorch/pytorch
 
 
-import math
-
+import functools
 import torch
+from torch import nn
 import torch.nn.functional as F
 import torch.nn.init as init
 from torch.nn.parameter import Parameter
@@ -180,16 +180,6 @@ class VocabParallelEmbedding(torch.nn.Module):
             _initialize_affine_weight_gpu(self.weight, init_method,
                                           partition_dim=0, stride=1)
 
-    def mup_initialize(self, init_method_std):
-        import mup
-        import functools
-        args = get_args()
-        width_mult = self.weight.infshape.width_mult()
-        init_method_std = init_method_std * width_mult ** 0.5
-        init_method = functools.partial(mup.init.normal_, mean=0.0, std=init_method_std)
-        assert not args.use_cpu_initialization
-        init_method(self.weight)
-
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
             # Build the mask.
@@ -242,6 +232,10 @@ class ColumnParallelLinear(torch.nn.Module):
                  keep_master_weight_for_test=False,
                  skip_bias_add=False, MOE=False, MoE_mp_size=1):
         super(ColumnParallelLinear, self).__init__()
+        args = get_args()
+
+        if args.mup:
+            init_method = functools.partial(nn.init.normal_, mean=0.0, std=(args.init_method_std / args.hidden_size) ** 0.5)
 
         # Keep input parameters
         self.input_size = input_size
@@ -289,14 +283,6 @@ class ColumnParallelLinear(torch.nn.Module):
                 self.bias.zero_()
         else:
             self.register_parameter('bias', None)
-
-    def mup_initialize(self, init_method_std):
-        import mup
-        import functools
-        args = get_args()
-        init_method = functools.partial(mup.init.normal_, mean=0.0, std=init_method_std)
-        assert not args.use_cpu_initialization
-        init_method(self.weight)
 
     def forward(self, input_):
         # Set up backprop all-reduce.
@@ -350,6 +336,10 @@ class RowParallelLinear(torch.nn.Module):
                  keep_master_weight_for_test=False,
                  skip_bias_add=False, MOE=False, MoE_mp_size=1):
         super(RowParallelLinear, self).__init__()
+        args = get_args()
+
+        if args.mup:
+            init_method = functools.partial(nn.init.normal_, mean=0.0, std=(args.init_method_std / args.hidden_size) ** 0.5)
 
         # Keep input parameters
         self.input_size = input_size
@@ -394,15 +384,6 @@ class RowParallelLinear(torch.nn.Module):
                 self.bias.zero_()
         else:
             self.register_parameter('bias', None)
-
-    def mup_initialize(self, init_method_std):
-        import mup
-        import functools
-        args = get_args()
-        std = init_method_std / math.sqrt(2.0 * args.num_layers)
-        init_method = functools.partial(mup.init.normal_, mean=0.0, std=std)
-        assert not args.use_cpu_initialization
-        init_method(self.weight)
 
     def forward(self, input_):
         # Set up backprop all-reduce.
