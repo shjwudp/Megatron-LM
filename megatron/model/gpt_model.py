@@ -15,7 +15,7 @@
 
 """GPT-2 model."""
 
-from functools
+import functools
 import torch
 import math
 from torch import nn
