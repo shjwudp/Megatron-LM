@@ -128,10 +128,6 @@ class ParallelAttention(MegatronModule):
         self.fp16 = args.fp16
         self.bf16 = args.bf16
 
-        if args.mup:
-            init_method = functools.partial(nn.init.normal_, mean=0.0, std=(args.init_method_std / args.hidden_size) ** 0.5)
-            output_layer_init_method = init_method
-
         self.apply_query_key_layer_scaling = args.apply_query_key_layer_scaling
         self.attention_softmax_in_fp32 = args.attention_softmax_in_fp32
         if self.apply_query_key_layer_scaling:

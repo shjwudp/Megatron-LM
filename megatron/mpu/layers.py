@@ -182,7 +182,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
     def mup_rescale_parameters(self):
         width_mult = self.weight.infshape.width_mult()
-        self.weight.data *= width_mult ** 5
+        self.weight.data *= width_mult ** 0.5
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
@@ -237,10 +237,6 @@ class ColumnParallelLinear(torch.nn.Module):
                  skip_bias_add=False, MOE=False, MoE_mp_size=1):
         super(ColumnParallelLinear, self).__init__()
         args = get_args()
-
-        if args.mup:
-            width_mult = 1. / args.hidden_size
-            init_method = functools.partial(nn.init.normal_, mean=0.0, std=args.init_method_std * width_mult ** 0.5)
 
         # Keep input parameters
         self.input_size = input_size
@@ -341,11 +337,6 @@ class RowParallelLinear(torch.nn.Module):
                  keep_master_weight_for_test=False,
                  skip_bias_add=False, MOE=False, MoE_mp_size=1):
         super(RowParallelLinear, self).__init__()
-        args = get_args()
-
-        if args.mup:
-            width_mult = 1. / args.hidden_size
-            init_method = functools.partial(nn.init.normal_, mean=0.0, std=args.init_method_std * width_mult ** 0.5)
 
         # Keep input parameters
         self.input_size = input_size

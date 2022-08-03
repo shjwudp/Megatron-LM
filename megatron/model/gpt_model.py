@@ -15,8 +15,10 @@
 
 """GPT-2 model."""
 
-from functools import partial
+from functools
 import torch
+import math
+from torch import nn
 
 from megatron import get_args
 from megatron import mpu
@@ -197,6 +199,15 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         self.parallel_output = parallel_output
 
         init_method = init_method_normal(args.init_method_std)
+        output_layer_init_method = scaled_init_method_normal(args.init_method_std,
+                                                                       args.num_layers)
+
+        if args.mup:
+            width_mult = 1. / args.hidden_size
+            init_method = functools.partial(nn.init.normal_, mean=0.0, std=(args.init_method_std / width_mult) ** 0.5)
+            std = args.init_method_std / math.sqrt(2.0 * args.num_layers)
+            output_layer_init_method = functools.partial(nn.init.normal_, mean=0.0, std=std * width_mult ** -0.5)
+
 
         self.specs = []
 
