@@ -203,10 +203,9 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                                                                        args.num_layers)
 
         if args.mup:
-            width_mult = 1. / args.hidden_size
-            init_method = functools.partial(nn.init.normal_, mean=0.0, std=(args.init_method_std / width_mult) ** 0.5)
+            init_method = functools.partial(nn.init.normal_, mean=0.0, std=(args.init_method_std / args.hidden_size) ** 0.5)
             std = args.init_method_std / math.sqrt(2.0 * args.num_layers)
-            output_layer_init_method = functools.partial(nn.init.normal_, mean=0.0, std=(std / width_mult) ** 0.5)
+            output_layer_init_method = functools.partial(nn.init.normal_, mean=0.0, std=(std / args.hidden_size) ** 0.5)
 
 
         self.specs = []
