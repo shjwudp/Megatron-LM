@@ -111,8 +111,8 @@ def model_provider(pre_process=True, post_process=True):
 
                 # mup parameter initialization
                 for _, sub_module in model.named_modules():
-                    if hasattr(sub_module, "mup_initialize"):
-                        sub_module.mup_initialize(init_method_std=args.init_method_std)
+                    if hasattr(sub_module, "mup_rescale_parameters"):
+                       sub_module.mup_rescale_parameters()
         else:
             model = GPTModel(
                 num_tokentypes=0,

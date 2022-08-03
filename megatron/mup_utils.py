@@ -42,13 +42,8 @@ def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
 
                 # mup parameter initialization
                 for _, sub_module in model.named_modules():
-                    if isinstance(sub_module, (nn.Linear)):
-                        if hasattr(sub_module.weight, "infshape"):
-                            mup.init.normal_(sub_module.weight, mean=0.0, std=args.init_method_std)
-                        else:
-                            sub_module.weight.data.normal_(mean=0.0, std=args.init_method_std)
-                        if sub_module.bias is not None:
-                            sub_module.bias.data.zero_()
+                    if hasattr(sub_module, "mup_rescale_parameters"):
+                       sub_module.mup_rescale_parameters()
 
             optimizer = get_megatron_optimizer([model])
             lr_scheduler = get_learning_rate_scheduler(optimizer)

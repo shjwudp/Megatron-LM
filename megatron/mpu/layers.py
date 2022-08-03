@@ -166,10 +166,6 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         # Allocate weights and initialize.
         args = get_args()
-        if args.mup:
-            width_mult = 1. / args.hidden_size
-            init_method = functools.partial(nn.init.normal_, mean=0.0, std=args.init_method_std * width_mult ** 0.5)
-
         if args.use_cpu_initialization:
             self.weight = Parameter(torch.empty(
                 self.num_embeddings_per_partition, self.embedding_dim,
@@ -183,6 +179,10 @@ class VocabParallelEmbedding(torch.nn.Module):
                 device=torch.cuda.current_device(), dtype=args.params_dtype))
             _initialize_affine_weight_gpu(self.weight, init_method,
                                           partition_dim=0, stride=1)
+
+    def mup_rescale_parameters(self):
+        width_mult = self.weight.infshape.width_mult()
+        self.weight.data *= width_mult ** 5
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
