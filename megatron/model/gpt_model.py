@@ -206,7 +206,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
             width_mult = 1. / args.hidden_size
             init_method = functools.partial(nn.init.normal_, mean=0.0, std=(args.init_method_std / width_mult) ** 0.5)
             std = args.init_method_std / math.sqrt(2.0 * args.num_layers)
-            output_layer_init_method = functools.partial(nn.init.normal_, mean=0.0, std=std * width_mult ** -0.5)
+            output_layer_init_method = functools.partial(nn.init.normal_, mean=0.0, std=(std / width_mult) ** 0.5)
 
 
         self.specs = []
@@ -241,8 +241,7 @@ class GPTModelPipe(PipelineModule,MegatronModule):
             self.specs.append(
                 LayerSpec(ParallelTransformerLayerPipe,
                     init_method=init_method,
-                    output_layer_init_method=scaled_init_method_normal(args.init_method_std,
-                                                                       args.num_layers),
+                    output_layer_init_method=output_layer_init_method,
                     layer_number=layer_idx,
                     self_attn_mask_type=AttnMaskType.causal))
                 

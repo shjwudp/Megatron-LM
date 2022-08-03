@@ -166,6 +166,9 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         # Allocate weights and initialize.
         args = get_args()
+        if args.mup:
+            width_mult = 1. / args.hidden_size
+            init_method = functools.partial(nn.init.normal_, mean=0.0, std=args.init_method_std * width_mult ** 0.5)
         if args.use_cpu_initialization:
             self.weight = Parameter(torch.empty(
                 self.num_embeddings_per_partition, self.embedding_dim,
