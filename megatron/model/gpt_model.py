@@ -16,6 +16,8 @@
 """GPT-2 model."""
 
 import functools
+
+import mup
 import torch
 import math
 from torch import nn
@@ -23,6 +25,7 @@ from torch import nn
 from megatron import get_args
 from megatron import mpu
 from .module import MegatronModule, fp32_to_float16
+from megatron.mpu import ColumnParallelLinear, RowParallelLinear, VocabParallelEmbedding
 
 from .enums import AttnMaskType
 from .language_model import parallel_lm_logits
@@ -297,3 +300,37 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                          topology=topo,
                          activation_checkpoint_interval=interval,
                          partition_method='type:transformer')
+
+    def _init_weights(self, module):
+        args = get_args()
+
+        if isinstance(module, (nn.Linear, ColumnParallelLinear, RowParallelLinear)):
+            # Slightly different from the TF version which uses truncated_normal for initialization
+            # cf https://github.com/pytorch/pytorch/pull/5617
+            if hasattr(module.weight, 'infshape'):
+                mup.normal_(module.weight, mean=0.0, std=args.init_method_std)
+            else:
+                module.weight.data.normal_(mean=0.0, std=args.init_method_std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=args.init_method_std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        elif isinstance(module, VocabParallelEmbedding):
+            module.weight.data.normal_(mean=0.0, std=args.init_method_std)
+
+            # Perform MuReadout's rescale_parameters operation
+            width_mult = module.weight.infshape.width_mult()
+            module.weight.data *= width_mult ** 0.5
+
+        depth_std = args.init_method_std / math.sqrt(2.0 * args.num_layers)
+        for name, p in module.named_parameters():
+            if ("c_proj_dense" in name or "dense_4h_to_h" in name) and "weight" in name:
+                if hasattr(p, "infshape"):
+                    mup.normal_(p, mean=0.0, std=depth_std)
+                else:
+                    p.data.normal_(mean=0.0, std=depth_std)

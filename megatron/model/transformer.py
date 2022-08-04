@@ -190,7 +190,7 @@ class ParallelAttention(MegatronModule):
         self.attention_dropout = torch.nn.Dropout(args.attention_dropout)
 
         # Output.
-        self.dense = mpu.RowParallelLinear(
+        self.c_proj_dense = mpu.RowParallelLinear(
             projection_size,
             args.hidden_size,
             input_is_parallel=True,
@@ -363,7 +363,7 @@ class ParallelAttention(MegatronModule):
         # Output. [sq, b, h]
         # =================
 
-        output, bias = self.dense(context_layer)
+        output, bias = self.c_proj_dense(context_layer)
 
         if get_key_value:
             output = [output, present]
