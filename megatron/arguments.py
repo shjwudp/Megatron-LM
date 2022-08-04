@@ -926,5 +926,6 @@ def _add_mup_args(parser):
                         help='number of seeds for testing correctness of μ parametrization')
     parser.add_argument('--coord_check_sampling_interval', type=int, default=1,
                         help='step interval for coord check sampling')
+    parser.add_argument("--embd_mult", type=int, default=1)
 
     return parser

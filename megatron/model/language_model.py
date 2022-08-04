@@ -179,7 +179,7 @@ class Embedding(MegatronModule):
     def forward(self, input_ids, position_ids, tokentype_ids=None):
         args = get_args()
         # Embeddings.
-        words_embeddings = self.word_embeddings(input_ids)
+        words_embeddings = self.word_embeddings(input_ids) * args.embd_mult
         position_embeddings = self.position_embeddings(position_ids)
         embeddings = words_embeddings + position_embeddings
         if tokentype_ids is not None:
