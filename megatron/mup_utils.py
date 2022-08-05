@@ -40,10 +40,7 @@ def coord_check(mup_flag, data_iterator, batch_fn, plotdir='', legend=False):
                 load_base_shapes = f"{args.load_base_shapes}.{torch.distributed.get_rank()}"
                 mup.set_base_shapes(model, load_base_shapes)
 
-                # mup parameter initialization
-                for _, sub_module in model.named_modules():
-                    if hasattr(sub_module, "mup_rescale_parameters"):
-                       sub_module.mup_rescale_parameters()
+                model.apply(model._init_weights)
 
             optimizer = get_megatron_optimizer([model])
             lr_scheduler = get_learning_rate_scheduler(optimizer)

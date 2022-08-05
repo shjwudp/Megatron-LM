@@ -108,11 +108,6 @@ def model_provider(pre_process=True, post_process=True):
             if args.mup:
                 load_base_shapes = f"{args.load_base_shapes}.{torch.distributed.get_rank()}"
                 mup.set_base_shapes(model, load_base_shapes)
-
-                # mup parameter initialization
-                for _, sub_module in model.named_modules():
-                    if hasattr(sub_module, "mup_rescale_parameters"):
-                       sub_module.mup_rescale_parameters()
         else:
             model = GPTModel(
                 num_tokentypes=0,

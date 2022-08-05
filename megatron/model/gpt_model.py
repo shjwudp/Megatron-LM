@@ -210,7 +210,6 @@ class GPTModelPipe(PipelineModule,MegatronModule):
             std = args.init_method_std / math.sqrt(2.0 * args.num_layers)
             output_layer_init_method = functools.partial(nn.init.normal_, mean=0.0, std=(std / args.hidden_size) ** 0.5)
 
-
         self.specs = []
 
         def _to_float16(inputs):
@@ -304,6 +303,10 @@ class GPTModelPipe(PipelineModule,MegatronModule):
     def _init_weights(self, module):
         args = get_args()
 
+        init_method = functools.partial(nn.init.normal_, mean=0.0, std=(args.init_method_std / args.hidden_size) ** 0.5)
+        std = args.init_method_std / math.sqrt(2.0 * args.num_layers)
+        output_layer_init_method = functools.partial(nn.init.normal_, mean=0.0, std=(std / args.hidden_size) ** 0.5)
+
         if isinstance(module, (nn.Linear, ColumnParallelLinear, RowParallelLinear)):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
@@ -322,6 +325,8 @@ class GPTModelPipe(PipelineModule,MegatronModule):
             module.weight.data.fill_(1.0)
         elif isinstance(module, VocabParallelEmbedding):
             module.weight.data.normal_(mean=0.0, std=args.init_method_std)
+            # mup.normal_(module.weight, mean=0.0, std=args.init_method_std)
+            init_method(module.weight)
 
             # Perform MuReadout's rescale_parameters operation
             width_mult = module.weight.infshape.width_mult()
@@ -332,5 +337,6 @@ class GPTModelPipe(PipelineModule,MegatronModule):
             if ("c_proj_dense" in name or "dense_4h_to_h" in name) and "weight" in name:
                 if hasattr(p, "infshape"):
                     mup.normal_(p, mean=0.0, std=depth_std)
+                    init_method(p)
                 else:
                     p.data.normal_(mean=0.0, std=depth_std)
