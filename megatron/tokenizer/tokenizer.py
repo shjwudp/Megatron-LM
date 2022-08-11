@@ -20,6 +20,7 @@ from abc import abstractmethod
 
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
+from transformers import AutoTokenizer
 
 
 def build_tokenizer(args):
@@ -28,22 +29,25 @@ def build_tokenizer(args):
         print('> building {} tokenizer ...'.format(args.tokenizer_type),
               flush=True)
 
-    # Select and instantiate the tokenizer.
-    assert args.vocab_file is not None
-    if args.tokenizer_type == 'BertWordPieceLowerCase':
-        tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
-                                            lower_case=True,
-                                            vocab_extra_ids=args.vocab_extra_ids)
-    elif args.tokenizer_type == 'BertWordPieceCase':
-        tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
-                                            lower_case=False,
-                                            vocab_extra_ids=args.vocab_extra_ids)
-    elif args.tokenizer_type == 'GPT2BPETokenizer':
-        assert args.merge_file is not None
-        tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
+    if args.vocabulary_experiment:
+        tokenizer = AutoTokenizer.from_pretrained(args.experimental_tokenizer_path)
     else:
-        raise NotImplementedError('{} tokenizer is not '
-                                  'implemented.'.format(args.tokenizer_type))
+        # Select and instantiate the tokenizer.
+        assert args.vocab_file is not None
+        if args.tokenizer_type == 'BertWordPieceLowerCase':
+            tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
+                                                lower_case=True,
+                                                vocab_extra_ids=args.vocab_extra_ids)
+        elif args.tokenizer_type == 'BertWordPieceCase':
+            tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
+                                                lower_case=False,
+                                                vocab_extra_ids=args.vocab_extra_ids)
+        elif args.tokenizer_type == 'GPT2BPETokenizer':
+            assert args.merge_file is not None
+            tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
+        else:
+            raise NotImplementedError('{} tokenizer is not '
+                                    'implemented.'.format(args.tokenizer_type))
 
     # Add vocab size.
     args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,

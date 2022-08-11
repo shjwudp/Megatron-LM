@@ -134,10 +134,15 @@ def get_batch_pipe(data):
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
 
+    if args.vocabulary_experiment:
+        eod_id = get_tokenizer().eos_token_id
+    else:
+        eod_id = tokenizer.eod
+
     # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
         tokens,
-        tokenizer.eod,
+        eod_id,
         args.reset_position_ids,
         args.reset_attention_mask,
         args.eod_mask_loss)
@@ -231,11 +236,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     if args.vocabulary_experiment:
         from datasets import load_dataset
-        from transformers import AutoTokenizer
-        from .megatron.data.megatron_text_dataset import MegatronTextDataset
+        from megatron.data.megatron_text_dataset import MegatronTextDataset
 
         dataset = load_dataset("/cephfs/gpt/huggingface.co/datasets/allenai/c4/c4.py", "realnewslike")
-        tokenizer = AutoTokenizer.from_pretrained(args.experimental_tokenizer_path)
+        tokenizer = get_tokenizer()
         train_ds = MegatronTextDataset(dataset["train"], tokenizer)
         valid_ds = MegatronTextDataset(dataset["validation"], tokenizer)
         test_ds = MegatronTextDataset(dataset["validation"], tokenizer)
