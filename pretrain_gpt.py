@@ -229,6 +229,19 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
 
+    if args.vocabulary_experiment:
+        from datasets import load_dataset
+        from transformers import AutoTokenizer
+        from .megatron.data.megatron_text_dataset import MegatronTextDataset
+
+        dataset = load_dataset("/cephfs/gpt/huggingface.co/datasets/allenai/c4/c4.py", "realnewslike")
+        tokenizer = AutoTokenizer.from_pretrained(args.experimental_tokenizer_path)
+        train_ds = MegatronTextDataset(dataset["train"], tokenizer)
+        valid_ds = MegatronTextDataset(dataset["validation"], tokenizer)
+        test_ds = MegatronTextDataset(dataset["validation"], tokenizer)
+
+        return train_ds, valid_ds, test_ds
+
     print_rank_0('> building train, validation, and test datasets '
                  'for GPT ...')
     train_ds, valid_ds, test_ds = build_train_valid_test_datasets(

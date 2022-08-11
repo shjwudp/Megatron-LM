@@ -17,6 +17,7 @@
 
 import argparse
 import os
+from secrets import choice
 
 import torch
 import deepspeed
@@ -729,6 +730,8 @@ def _add_data_args(parser):
                                 'BertWordPieceCase',
                                 'GPT2BPETokenizer'],
                        help='What type of tokenizer to use.')
+    group.add_argument("--vocabulary_experiment", action="store_true")
+    group.add_argument("--experimental_tokenizer_path", type=str)
     group.add_argument('--data-impl', type=str, default='infer',
                        choices=['lazy', 'cached', 'mmap', 'infer'],
                        help='Implementation of indexed datasets.')
