@@ -29,7 +29,7 @@ def build_tokenizer(args):
         print('> building {} tokenizer ...'.format(args.tokenizer_type),
               flush=True)
 
-    if args.vocabulary_experiment:
+    if args.experimental_tokenizer_path:
         tokenizer = AutoTokenizer.from_pretrained(args.experimental_tokenizer_path)
     else:
         # Select and instantiate the tokenizer.

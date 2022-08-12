@@ -134,7 +134,7 @@ def get_batch_pipe(data):
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
 
-    if args.vocabulary_experiment:
+    if args.experimental_tokenizer_path:
         eod_id = get_tokenizer().eos_token_id
     else:
         eod_id = tokenizer.eod

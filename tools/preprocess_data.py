@@ -82,11 +82,17 @@ class Encoder(object):
             text = data[key]
             doc_ids = []
             for sentence in Encoder.splitter.tokenize(text):
-                sentence_ids = Encoder.tokenizer.tokenize(sentence)
+                if self.args.experimental_tokenizer_path:
+                    sentence_ids = Encoder.tokenizer(sentence)["input_ids"]
+                else:
+                    sentence_ids = Encoder.tokenizer.tokenize(sentence)
                 if len(sentence_ids) > 0:
                     doc_ids.append(sentence_ids)
             if len(doc_ids) > 0 and self.args.append_eod:
-                doc_ids[-1].append(Encoder.tokenizer.eod)
+                if self.args.experimental_tokenizer_path:
+                    doc_ids[-1].append(Encoder.tokenizer.eos_token_id)
+                else:
+                    doc_ids[-1].append(Encoder.tokenizer.eod)
             ids[key] = doc_ids
         return ids, len(json_line)
 
@@ -120,6 +126,8 @@ def get_args():
                        help='Path to binary output file without suffix')
     group.add_argument('--dataset-impl', type=str, default='mmap',
                        choices=['lazy', 'cached', 'mmap'])
+    group.add_argument("--vocabulary_experiment", action="store_true")
+    group.add_argument("--experimental_tokenizer_path", type=str)
 
     group = parser.add_argument_group(title='runtime')
     group.add_argument('--workers', type=int, default=1,
