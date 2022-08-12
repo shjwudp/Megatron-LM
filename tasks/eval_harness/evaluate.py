@@ -45,6 +45,9 @@ class EvalHarnessAdaptor(GPT2LM):
         self.VOCAB_SIZE = tokenizer.vocab_size
         self._eot_token_id = tokenizer.eod_id
 
+        if args.experimental_tokenizer_path:
+            self._eot_token_id = tokenizer.eos_token_id
+
         self._max_length = args.seq_length
 
         self.dp_rank = mpu.get_data_parallel_rank()
@@ -262,6 +265,10 @@ class EvalHarnessAdaptor(GPT2LM):
 
     def tok_encode(self, text):
         """Tokenize text *without* adding special tokens."""
+        args = get_args()
+        if args.experimental_tokenizer_path:
+            return self.tokenizer.encode(text)
+
         # Splitting this into its own method in case we need to handle special cases for different tokenizers
         from megatron.tokenizer.gpt2_tokenization import GPT2Tokenizer
         if isinstance(self.tokenizer.tokenizer, GPT2Tokenizer):
@@ -432,6 +439,7 @@ def tasks_args(parser):
     group.add_argument('--adaptive_seq_len',  default = False, action='store_true',
                        help='Should the sequence length be adapted to the batch during evaluation, if in fp16 the results will be slightly different due to numerical errors but greatly speed up evaluation.')
     group.add_argument('--eval_fp32',  default = False, action='store_true', help='Should the evaluation run in fp32')
+    group.add_argument("--experimental_tokenizer_path", type=str)
     return parser
 
 from megatron.global_vars import _parse_args
