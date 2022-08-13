@@ -383,7 +383,7 @@ def load_ds_checkpoint_and_setup_megatron(extra_args_provider):
     # Merge the current args with the checkpoint args.
     skip_keys = ['world_size', 'rank', 'local_rank','device_count', 'micro_batch_size','global_batch_size', 'batch_size', 'tensorboard_dir', 'deepspeed', 'deepspeed_config',
                      'data_parallel_size', 'pipeline_model_parallel_size', 'tensor_model_parallel_size', 'moe_expert_parallel_size', 'moe_token_dropping', 'load', 'rampup_batch_size', 'iteration', 'inference',
-                     'consumed_train_samples', 'consumed_valid_samples']
+                     'consumed_train_samples', 'consumed_valid_samples', 'load_tag']
 
     skip_if_specified = ['merge_file', 'vocab_file']
 
