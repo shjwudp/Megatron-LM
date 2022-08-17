@@ -732,6 +732,7 @@ def _add_data_args(parser):
     group.add_argument('--data-impl', type=str, default='infer',
                        choices=['lazy', 'cached', 'mmap', 'infer'],
                        help='Implementation of indexed datasets.')
+    group.add_argument("--sqlite_dataset", default=None)
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',

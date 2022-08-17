@@ -23,6 +23,7 @@ from megatron import get_timers
 from megatron import get_tokenizer
 from megatron import mpu
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
+from megatron.data.sqlite_dataset import GPTSqliteDataset
 from megatron.model import GPTModel, GPTModelPipe
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
@@ -262,6 +263,22 @@ def forward_step(data_iterator, model, teacher_model=None):
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
+
+    if args.sqlite_dataset:
+        print_rank_0('> Using GPTSqliteDataset, data path = {}'.format(args.sqlite_dataset))
+        dataset = GPTSqliteDataset(dbfile=args.sqlite_dataset, seq_len=args.seq_length)
+        split = [int(x) for x in args.split.split(",")]
+        assert len(split) == 3, "dataset split must be 3"
+        train_size = int(len(dataset) * (split[0] / sum(split)))
+        valid_size = int(len(dataset) * (split[1] / sum(split)))
+        test_size = int(len(dataset) * (split[2] / sum(split)))
+        print("sqlite_dataset", train_size, valid_size, test_size)
+
+        train_ds, valid_ds, test_ds = torch.utils.data.random_split(
+            dataset, lengths=[train_size, valid_size, test_size],
+            generator=torch.Generator().manual_seed(args.seed))
+
+        return train_ds, valid_ds, test_ds
 
     print_rank_0('> building train, validation, and test datasets '
                  'for GPT ...')
