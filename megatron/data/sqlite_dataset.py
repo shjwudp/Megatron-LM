@@ -1,15 +1,3 @@
-
-import sqlite3
-import torch
-from transformers import AutoTokenizer
-import pandas as pd
-import numpy as np
-import json
-from tqdm import tqdm
-import time
-import functools
-import argparse
-
 """GPT dataset backend by SQLite, provides text preprocessing functions and datasets.
 
 Example of preprocessing jsonl text:
@@ -20,6 +8,16 @@ python sqlite_dataset.py \
     --output gpt.sqlite
 ```
 """
+
+import sqlite3
+import torch
+from transformers import AutoTokenizer
+import pandas as pd
+import numpy as np
+import json
+from tqdm import tqdm
+import functools
+import argparse
 
 
 def preprocess_data(data, tokenizer_path, dbfile, bucket_size=32 * 1024 ** 2, tokenizer_batch=320 * 1024 ** 2):
@@ -99,13 +97,17 @@ class GPTSqliteDataset(torch.utils.data.Dataset):
 
     def __init__(self, dbfile, seq_len=1) -> None:
         super().__init__()
-        self.conn = sqlite3.connect(dbfile)
+        self.conn = sqlite3.connect(dbfile, isolation_level='DEFERRED')
         self.cursor = self.conn.cursor()
         self.seq_len = seq_len
 
+        self.cursor.execute('''PRAGMA synchronous = OFF''')
+        self.cursor.execute('''PRAGMA journal_mode = OFF''')
+        self.cursor.execute('''PRAGMA mmap_size=268435456;''')
+
     def __len__(self):
         coord_end = self.cursor.execute(
-            "SELECT coord_end FROM gpt_tokens ORDER BY coord_end DESC LIMIT 1;").fetchall()
+            "SELECT coord_end FROM gpt_tokens ORDER BY coord_end DESC LIMIT 1;").fetchone()
         # -1 due to we always fetch seq_len + 1 tokens
         return (coord_end - 1) // self.seq_len
 
@@ -141,9 +143,7 @@ class GPTSqliteDataset(torch.utils.data.Dataset):
             chunks.append(chunk)
         chunks = np.concatenate(chunks)
 
-        t = torch.from_numpy(chunks)
-
-        return t
+        return {"text": chunks[:self.seq_len + 1]}
 
 
 def drop_and_rebuild_table_gpt_tokens(dbfile):

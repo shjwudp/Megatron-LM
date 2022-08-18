@@ -242,12 +242,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         assert len(split) == 3, "dataset split must be 3"
         train_size = int(len(dataset) * (split[0] / sum(split)))
         valid_size = int(len(dataset) * (split[1] / sum(split)))
-        test_size = int(len(dataset) * (split[2] / sum(split)))
-        print("sqlite_dataset", train_size, valid_size, test_size)
 
-        train_ds, valid_ds, test_ds = torch.utils.data.random_split(
-            dataset, lengths=[train_size, valid_size, test_size],
-            generator=torch.Generator().manual_seed(args.seed))
+        train_ds = torch.utils.data.Subset(dataset, range(train_size))
+        valid_ds = torch.utils.data.Subset(dataset, range(train_size, train_size + valid_size))
+        test_ds = torch.utils.data.Subset(dataset, range(train_size + valid_size, len(dataset)))
 
         return train_ds, valid_ds, test_ds
 
