@@ -184,6 +184,7 @@ def main():
     parser.add_argument("--input", nargs='+')
     parser.add_argument("--tokenizer_path", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--bucket_size", default=32 * 1024 ** 2, type=int)
 
     args = parser.parse_args()
 
@@ -194,7 +195,7 @@ def main():
     open_web_text2 = open_web_text2_gen(file_list)
 
     drop_and_rebuild_table_gpt_tokens(dbfile)
-    preprocess_data(open_web_text2, tokenizer_path, dbfile)
+    preprocess_data(open_web_text2, tokenizer_path, dbfile, bucket_size=args.bucket_size)
 
 
 if __name__ == "__main__":
