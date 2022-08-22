@@ -20,7 +20,7 @@ import functools
 import argparse
 
 
-def preprocess_data(data, tokenizer_path, dbfile, bucket_size=32 * 1024 ** 2, tokenizer_batch=320 * 1024 ** 2):
+def preprocess_data(data, tokenizer_path, dbfile, bucket_size=1 * 1024 ** 2, tokenizer_batch=320 * 1024 ** 2):
     conn = sqlite3.connect(dbfile, isolation_level='DEFERRED')
 
     # turn `synchronous` and `journal_mode` to off can significantly improve performance
@@ -184,7 +184,7 @@ def main():
     parser.add_argument("--input", nargs='+')
     parser.add_argument("--tokenizer_path", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--bucket_size", default=32 * 1024 ** 2, type=int)
+    parser.add_argument("--bucket_size", default=1 * 1024 ** 2, type=int)
 
     args = parser.parse_args()
 
