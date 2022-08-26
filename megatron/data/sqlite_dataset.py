@@ -107,7 +107,7 @@ class GPTSqliteDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         coord_end = self.cursor.execute(
-            "SELECT coord_end FROM gpt_tokens ORDER BY coord_end DESC LIMIT 1;").fetchone()
+            "SELECT coord_end FROM gpt_tokens ORDER BY coord_end DESC LIMIT 1;").fetchone()[0]
         # -1 due to we always fetch seq_len + 1 tokens
         return (coord_end - 1) // self.seq_len
 
