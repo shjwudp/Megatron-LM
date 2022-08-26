@@ -31,6 +31,8 @@ def build_tokenizer(args):
 
     if args.experimental_tokenizer_path:
         tokenizer = AutoTokenizer.from_pretrained(args.experimental_tokenizer_path)
+        # In the implementation of transformers, len(tokenizer) = tokenizer.vocab_size + len(added_tokens)
+        vocab_size = len(tokenizer)
     else:
         # Select and instantiate the tokenizer.
         assert args.vocab_file is not None
@@ -49,9 +51,10 @@ def build_tokenizer(args):
             raise NotImplementedError('{} tokenizer is not '
                                     'implemented.'.format(args.tokenizer_type))
 
+        vocab_size = tokenizer.vocab_size
+
     # Add vocab size.
-    args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,
-                                                      args)
+    args.padded_vocab_size = _vocab_size_with_padding(vocab_size, args)
 
     return tokenizer
 
