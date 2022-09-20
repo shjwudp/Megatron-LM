@@ -86,6 +86,7 @@ class ParallelMLP(MegatronModule):
             self.activation_func = erf_gelu
         elif args.swi_glu:
             self.activation_func = SwiGLU()
+            self.bias_gelu_fusion = False
 
         # Project back to h.
         self.dense_4h_to_h = mpu.RowParallelLinear(
