@@ -64,10 +64,14 @@ class ParallelMLP(MegatronModule):
         super(ParallelMLP, self).__init__()
         args = get_args()
 
+        activation_mult = 1
+        if args.swi_glu:
+            activation_mult *= 2
+
         # Project to 4h.
         self.dense_h_to_4h = mpu.ColumnParallelLinear(
             args.hidden_size,
-            args.ffn_hidden_size,
+            args.ffn_hidden_size * activation_mult,
             gather_output=False,
             init_method=init_method,
             skip_bias_add=True,
