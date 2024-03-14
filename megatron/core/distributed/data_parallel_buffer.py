@@ -12,11 +12,15 @@ BucketIndex = namedtuple('BucketIndex', ['global_data_index', 'size'])
 ShardBucketIndex = namedtuple('ShardBucketIndex', ['global_data_index', 'local_data_index', 'size'])
 
 
+def bucket_size_pad(x: int, x_based: int) -> int:
+    return int(math.ceil(x / x_based)) * x_based
+
+
 def build_data_parallel_buffer_index(
     elements: List[torch.Tensor.shape],
     data_parallel_rank: int,
     data_parallel_world_size: int,
-    guide_bucket_size: int = 40_000_000,
+    guide_bucket_size: int,
 ) -> tuple[int, List[tuple], List[tuple], List[tuple]]:
     """
     Assuming that all input tensor elements are consecutively compose a global 
@@ -88,6 +92,7 @@ class DataParallelBuffer:
         data_parallel_world_size: int,
         dtype: torch.dtype,
         elements: List[torch.Tensor.shape],
+        guide_bucket_size: int = 40_000_000,
     ):
         self.data_parallel_rank = data_parallel_rank
         self.data_parallel_world_size = data_parallel_world_size
@@ -97,6 +102,7 @@ class DataParallelBuffer:
                 elements,
                 data_parallel_rank,
                 data_parallel_world_size,
+                guide_bucket_size,
             )
         local_buffer_size = sum([x.size for x in self.shard_bucket_index_map])
         self.buffer = torch.zeros(local_buffer_size, dtype=dtype)

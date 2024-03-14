@@ -9,6 +9,7 @@ from .. import parallel_state
 from ..transformer.module import MegatronModule
 from ..transformer.transformer_config import TransformerConfig
 from .grad_buffer import GradBuffer
+from .data_parallel_buffer import DataParallelBuffer
 
 
 class DistributedDataParallel(MegatronModule):
@@ -49,6 +50,9 @@ class DistributedDataParallel(MegatronModule):
         disable_bucketing: bool = False,
         check_for_nan_in_grad: bool = False,
         bucket_size: int = 40000000,
+        zero_stage: int = 0,
+        param_dtype: torch.dtype = torch.float32,
+        grad_dtype: torch.dtype = torch.float32,
     ):
         super().__init__(config=config)
         self.module = module
@@ -71,25 +75,66 @@ class DistributedDataParallel(MegatronModule):
 
         self.check_for_nan_in_grad = check_for_nan_in_grad
         self.bucket_size = bucket_size
-
-        self.module = module
-        self.param_to_grad_buffer = {}
+        self.zero_stage = zero_stage
+        self.param_dtype = param_dtype
+        self.grad_dtype = grad_dtype
 
         # Group parameters by their gradient type.
-        param_to_name = {}
-        dense_params = []
-        expert_parallel_params = []
+        self.param_to_name = {}
+        self.dense_params = []
+        self.expert_parallel_params = []
         for name, param in self.module.named_parameters():
-            if not param.requires_grad:
+            if zero_stage in [0, 1] and not param.requires_grad:
                 continue
 
-            param.grad_added_to_main_grad = False
-            param_to_name[param] = name
+            if zero_stage in [0, 1]:
+                param.grad_added_to_main_grad = False
+            self.param_to_name[param] = name
 
             if getattr(param, 'allreduce', True):
-                dense_params.append(param)
+                self.dense_params.append(param)
             else:
-                expert_parallel_params.append(param)
+                self.expert_parallel_params.append(param)
+
+        if zero_stage in [0, 1]:
+            self.allocate_grad_buffer(
+                data_parallel_group,
+                expert_data_parallel_group,
+                accumulate_allreduce_grads_in_fp32,
+                bucket_size,
+            )
+        elif zero_stage == 2:
+            self.allocate_data_parallel_buffer_for_zero2(
+                data_parallel_group,
+                expert_data_parallel_group,
+            )
+        else:
+            raise ValueError(f'Invalid zero_stage: {zero_stage}')
+
+        self.module = module
+
+        # Register backward hook.
+        # Accumulation function for the gradients need to be stored so they
+        # don't go out of scope.
+        self.grad_accs = []
+        for param in self.module.parameters():
+            if param.requires_grad:
+                # Expand so we get access to grad_fn.
+                param_tmp = param.expand_as(param)
+                # Get the gradient accumulator function.
+                grad_acc = param_tmp.grad_fn.next_functions[0][0]
+                grad_acc.register_hook(self._make_param_hook(param, self.param_to_grad_buffer))
+                self.grad_accs.append(grad_acc)
+
+
+    def allocate_grad_buffer(
+        self,
+        data_parallel_group,
+        expert_data_parallel_group,
+        accumulate_allreduce_grads_in_fp32,
+        bucket_size
+    ):
+        self.param_to_grad_buffer = {}
 
         def allocate_grad_buffers_for_parameters(
             input_params, data_parallel_group, gradient_scaling_factor=1.0,
@@ -116,7 +161,7 @@ class DistributedDataParallel(MegatronModule):
                         params,
                         data_parallel_group,
                         bucket_size,
-                        param_to_name,
+                        self.param_to_name,
                         self.overlap_grad_reduce,
                         self.use_distributed_optimizer,
                         gradient_scaling_factor,
@@ -132,30 +177,55 @@ class DistributedDataParallel(MegatronModule):
 
         # Allocate the grad buffers for dense params' grads.
         self.grad_buffers = allocate_grad_buffers_for_parameters(
-            dense_params,
+            self.dense_params,
             data_parallel_group,
             gradient_scaling_factor=1.0 / data_parallel_world_size,
         )
 
         # Allocate separate grad buffers for expert parallel params' grads.
         self.expert_parallel_grad_buffers = allocate_grad_buffers_for_parameters(
-            expert_parallel_params,
+            self.expert_parallel_params,
             expert_data_parallel_group,
             gradient_scaling_factor=1.0 / data_parallel_world_size,
         )
 
-        # Register backward hook.
-        # Accumulation function for the gradients need to be stored so they
-        # don't go out of scope.
-        self.grad_accs = []
-        for param in self.module.parameters():
-            if param.requires_grad:
-                # Expand so we get access to grad_fn.
-                param_tmp = param.expand_as(param)
-                # Get the gradient accumulator function.
-                grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                grad_acc.register_hook(self._make_param_hook(param, self.param_to_grad_buffer))
-                self.grad_accs.append(grad_acc)
+    def allocate_data_parallel_buffer_for_zero2(
+        self,
+        data_parallel_group: torch.distributed.ProcessGroup,
+        expert_data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        # Iterate through parameters in reverse order to roughly follow backprop order.
+        self.dense_params = list(reversed(self.dense_params))
+        self.expert_parallel_params = list(reversed(self.expert_parallel_params))
+        self.dense_param_idx = {param: i for i, param in enumerate(self.dense_params)}
+        self.expert_parallel_param_idx = {param: i for i, param in enumerate(self.expert_parallel_params)}
+
+        def allocate_param_buffer_and_grad_buffer(input_params, dp_group):
+            elements = [param.shape for param in input_params]
+            data_parallel_rank = torch.distributed.get_rank(dp_group)
+            data_parallel_world_size = torch.distributed.get_world_size(dp_group)
+            param_buffer = DataParallelBuffer(
+                data_parallel_rank=data_parallel_rank,
+                data_parallel_world_size=data_parallel_world_size,
+                dtype=self.param_dtype,
+                elements=elements,
+            )
+            grad_buffer = DataParallelBuffer(
+                data_parallel_rank=data_parallel_rank,
+                data_parallel_world_size=data_parallel_world_size,
+                dtype=self.grad_dtype,
+                elements=elements,
+            )
+            return param_buffer, grad_buffer
+        
+        self.dense_param_buffer, self.dense_grad_buffer = allocate_param_buffer_and_grad_buffer(
+            self.dense_params,
+            data_parallel_group,
+        )
+        self.ep_param_buffer, self.ep_grad_buffer = allocate_param_buffer_and_grad_buffer(
+            self.expert_parallel_params,
+            expert_data_parallel_group,
+        )
 
     def forward(self, *inputs, **kwargs):
         """
