@@ -123,7 +123,7 @@ class DistributedDataParallel(MegatronModule):
                 param_tmp = param.expand_as(param)
                 # Get the gradient accumulator function.
                 grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                grad_acc.register_hook(self._make_param_hook(param, self.param_to_grad_buffer))
+                grad_acc.register_hook(self._make_param_hook(param))
                 self.grad_accs.append(grad_acc)
 
 
@@ -200,7 +200,7 @@ class DistributedDataParallel(MegatronModule):
         self.dense_param_idx = {param: i for i, param in enumerate(self.dense_params)}
         self.expert_parallel_param_idx = {param: i for i, param in enumerate(self.expert_parallel_params)}
 
-        def allocate_param_buffer_and_grad_buffer(input_params, dp_group):
+        def allocate_data_parallel_shard_buffer(input_params, dp_group):
             elements = [param.shape for param in input_params]
             data_parallel_rank = torch.distributed.get_rank(dp_group)
             data_parallel_world_size = torch.distributed.get_world_size(dp_group)
@@ -217,12 +217,14 @@ class DistributedDataParallel(MegatronModule):
                 elements=elements,
             )
             return param_buffer, grad_buffer
-        
-        self.dense_param_buffer, self.dense_grad_buffer = allocate_param_buffer_and_grad_buffer(
+
+        # Allocate the data parallel buffer's local sharding buffer for both the
+        # dense and expert parallel parameters.
+        self.dense_param_buffer, self.dense_grad_buffer = allocate_data_parallel_shard_buffer(
             self.dense_params,
             data_parallel_group,
         )
-        self.ep_param_buffer, self.ep_grad_buffer = allocate_param_buffer_and_grad_buffer(
+        self.expert_param_buffer, self.expert_grad_buffer = allocate_data_parallel_shard_buffer(
             self.expert_parallel_params,
             expert_data_parallel_group,
         )
@@ -234,13 +236,13 @@ class DistributedDataParallel(MegatronModule):
         return self.module(*inputs, **kwargs)
 
     def _make_param_hook(
-        self, param: torch.nn.Parameter, param_to_grad_buffer: Dict[torch.nn.Parameter, GradBuffer]
+        self, param: torch.nn.Parameter,
     ):
         """
         Creates the all-reduce / reduce-scatter hook for backprop.
         """
 
-        def param_hook(*unused):
+        def zero_01_param_hook(*unused):
             if param.requires_grad:
                 if self.overlap_grad_reduce:
                     assert (
@@ -253,9 +255,27 @@ class DistributedDataParallel(MegatronModule):
                 param.grad = None
 
                 if self.overlap_grad_reduce:
-                    param_to_grad_buffer[param].register_grad_ready(param)
+                    self.param_to_grad_buffer[param].register_grad_ready(param)
 
-        return param_hook
+        def zero_2_param_hook(*unused):
+            if not param.requires_grad:
+                return
+
+            expert_parallel = not getattr(param, 'allreduce', True)
+            if expert_parallel:
+                idx = self.expert_parallel_param_idx[param]
+                self.expert_grad_buffer.put_into_bucket(idx, param.grad.data)
+            else:
+                idx = self.dense_param_idx[param]
+                self.dense_grad_buffer.put_into_bucket(idx, param.grad.data)
+            param.grad = None
+
+        if self.zero_stage in [0, 1]:
+            return zero_01_param_hook
+        elif self.zero_stage == 2:
+            return zero_2_param_hook
+        else:
+            raise ValueError(f'Invalid zero_stage: {self.zero_stage}')
 
     @contextmanager
     def no_sync(self):
