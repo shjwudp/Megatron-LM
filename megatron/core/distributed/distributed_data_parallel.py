@@ -201,20 +201,22 @@ class DistributedDataParallel(MegatronModule):
         self.expert_parallel_param_idx = {param: i for i, param in enumerate(self.expert_parallel_params)}
 
         def allocate_data_parallel_shard_buffer(input_params, dp_group):
-            elements = [param.shape for param in input_params]
             data_parallel_rank = torch.distributed.get_rank(dp_group)
             data_parallel_world_size = torch.distributed.get_world_size(dp_group)
+            device = input_params[0].device if len(input_params) > 0 else torch.cuda.current_device()
             param_buffer = DataParallelBuffer(
                 data_parallel_rank=data_parallel_rank,
                 data_parallel_world_size=data_parallel_world_size,
                 dtype=self.param_dtype,
-                elements=elements,
+                device=device,
+                parameters=input_params,
             )
             grad_buffer = DataParallelBuffer(
                 data_parallel_rank=data_parallel_rank,
                 data_parallel_world_size=data_parallel_world_size,
                 dtype=self.grad_dtype,
-                elements=elements,
+                device=device,
+                parameters=input_params,
             )
             return param_buffer, grad_buffer
 
@@ -311,8 +313,11 @@ class DistributedDataParallel(MegatronModule):
         calls to complete. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
-            grad_buffer.finish_grad_sync()
+        if self.zero_stage in [0, 1]:
+            for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
+                grad_buffer.finish_grad_sync()
+        elif self.zero_stage == 2:
+            pass
 
     def zero_grad_buffer(self, zero_buffer):
         """
@@ -321,11 +326,16 @@ class DistributedDataParallel(MegatronModule):
 
         When zero_buffer is set to True, the underlying grad buffer is zeroed out.
         """
-        for param in self.module.parameters():
-            if param.requires_grad:
-                param.grad_added_to_main_grad = False
-        for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
-            grad_buffer.reset(zero_buffer)
+        if self.zero_stage in [0, 1]:
+            for param in self.module.parameters():
+                if param.requires_grad:
+                    param.grad_added_to_main_grad = False
+            for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
+                grad_buffer.reset(zero_buffer)
+        elif self.zero_stage == 2:
+            # In ZeRO-2, we zero out the grad buffers in the data parallel buffer.
+            self.dense_grad_buffer.buffer.zero_()
+            self.expert_grad_buffer.buffer.zero_()
 
     def broadcast_params(self):
         """
