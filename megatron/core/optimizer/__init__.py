@@ -42,7 +42,15 @@ def get_param_groups(model_chunks, no_weight_decay_cond, scale_lr_cond, lr_mult)
     }
 
     for model_chunk in model_chunks:
-        for name, param in model_chunk.named_parameters():
+        named_parameters = None
+        # If the model chunk has named_parameter_shardings, use it to get the
+        # named parameters. (ZeRO-2/3)
+        if hasattr(model_chunk, "named_parameter_shardings"):
+            named_parameters = model_chunk.named_parameter_shardings()
+        if named_parameters is None:
+            named_parameters = model_chunk.named_parameters()
+
+        for name, param in named_parameters:
             if not param.requires_grad:
                 continue
 
