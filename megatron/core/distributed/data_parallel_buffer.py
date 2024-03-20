@@ -113,6 +113,7 @@ class DataParallelBuffer:
         device: torch.device = torch.cuda.current_device(),
         guide_bucket_size: int = 40_000_000,
     ):
+        self.data_parallel_group = data_parallel_group
         self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
         self.data_parallel_world_size = torch.distributed.get_world_size(group=data_parallel_group)
         self.dtype = dtype
@@ -125,8 +126,8 @@ class DataParallelBuffer:
             self.shard_bucket_index_map,
         ) = build_data_parallel_buffer_index(
             [p.shape for p in parameters],
-            data_parallel_rank,
-            data_parallel_world_size,
+            self.data_parallel_rank,
+            self.data_parallel_world_size,
             guide_bucket_size,
         )
         local_buffer_size = sum([x.size for x in self.shard_bucket_index_map])
@@ -139,6 +140,7 @@ class DataParallelBuffer:
         index = self.shard_bucket_index_map[bucket_id]
         return self.data[index.local_data_index : index.local_data_index + index.size]
 
+    @torch.no_grad()
     def put_into_bucket(self, item_id: int, data: torch.Tensor) -> None:
         item_index = self.item_index_map[item_id]
         bucket_id = item_index.bucket_id
@@ -186,3 +188,43 @@ class DataParallelBuffer:
             items=[],
             requires_grad_items=requires_grad_items,
         )
+
+    def _get_item_slice(self, item_id: int) -> Tuple[int, int]:
+        item_index = self.item_index_map[item_id]
+        shard_bucket_index = self.shard_bucket_index_map[item_index.bucket_id]
+
+        item_global_start = item_index.global_data_index
+        item_global_end = item_index.global_data_index + item_index.size
+        shard_bucket_start = shard_bucket_index.global_data_index
+        shard_bucket_end = shard_bucket_index.global_data_index + shard_bucket_index.size
+
+        if item_global_start > shard_bucket_end or item_global_end < shard_bucket_start:
+            return (-1, -1)
+
+        start = max(item_global_start, shard_bucket_start) - item_global_start
+        end = min(item_global_end, shard_bucket_end) - item_global_start
+
+        return (start, end)
+
+    def _get_item_local_index(self, item_id: int) -> Tuple[int, int]:
+        item_index = self.item_index_map[item_id]
+        shard_bucket_index = self.shard_bucket_index_map[item_index.bucket_id]
+        slice_start, slice_end = self._get_item_slice(item_id)
+
+        if slice_start == -1 or slice_end == -1:
+            return (-1, -1)
+
+        index_diff = item_index.global_data_index - shard_bucket_index.global_data_index + shard_bucket_index.local_data_index
+
+        return (slice_start + index_diff, slice_end + index_diff)
+
+    def get_item(self, item_id: int) -> torch.Tensor:
+        start, end = self._get_item_local_index(item_id)
+        return self.data[start:end]
+
+    @torch.no_grad()
+    def set_item(self, item_id: int, item_data: torch.Tensor) -> None:
+        slice_start, slice_end = self._get_item_slice(item_id)
+        local_index_start, local_index_end = self._get_item_local_index(item_id)
+
+        self.data[local_index_start:local_index_end] = item_data.flatten()[slice_start:slice_end]

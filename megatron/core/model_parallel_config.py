@@ -193,6 +193,7 @@ class ModelParallelConfig:
 
     # Parallelism
     finalize_model_grads_func: Callable = None
+    zero_stage: int = 0
 
     # Pipeline Parallel
     pipeline_dtype: torch.dtype = None

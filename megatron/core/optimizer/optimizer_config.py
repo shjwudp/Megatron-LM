@@ -107,6 +107,7 @@ class OptimizerConfig:
     # Distributed optimizer.
     use_distributed_optimizer: bool = False
     overlap_param_gather: bool = False
+    zero_stage: int = 0
 
     # Miscellaneous.
     clip_grad: float = 1.0

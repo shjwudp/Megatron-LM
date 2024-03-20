@@ -111,6 +111,7 @@ class DistributedDataParallel(MegatronModule):
             raise ValueError(f'Invalid zero_stage: {zero_stage}')
 
         self.module = module
+        self._named_parameter_shardings_cache = None
 
         # Register backward hook.
         # Accumulation function for the gradients need to be stored so they
@@ -210,6 +211,9 @@ class DistributedDataParallel(MegatronModule):
                 device=device,
                 parameters=input_params,
             )
+            for i, param in enumerate(input_params):
+                param_buffer.set_item(i, param.data)
+
             grad_buffer = DataParallelBuffer(
                 data_parallel_group=dp_group,
                 dtype=self.grad_dtype,
@@ -235,33 +239,24 @@ class DistributedDataParallel(MegatronModule):
             return self._named_parameter_shardings_cache
 
         def _named_parameter_shardings(params, param_buffer, grad_buffer):
-            item_index_map = param_buffer.item_index_map
-            shard_bucket_index_map = param_buffer.shard_bucket_index_map
             named_param_shardings = []
-            for param, item_index in zip(params, item_index_map):
-                item_start_index = item_index.global_data_index
-                item_end_index = item_start_index + item_index.size
-                for shard_bucket in shard_bucket_index_map:
-                    bucket_start_index = shard_bucket.global_data_index
-                    bucket_end_index = shard_bucket.global_data_index + shard_bucket.size
-                    intersec_start_index = max(item_start_index, bucket_start_index)
-                    intersec_end_index = min(item_end_index, bucket_end_index)
+            for item_id, param in enumerate(params):
+                param_shard = param_buffer.get_item(item_id)
+                if param_shard.numel() == 0:
+                    # parameter not in this rank
+                    continue
 
-                    if intersec_start_index >= intersec_end_index:
-                        # parameter has no intersection with this shard bucket
-                        continue
+                def closure(param_shard, grad_shard, param):
+                    def reset_attribute():
+                        setattr(param_shard, 'grad', grad_shard)
+                        setattr(param_shard, 'requires_grad', param.requires_grad)
 
-                    # Convert global range to local range.
-                    start_index = (
-                        shard_bucket.local_data_index + intersec_start_index - bucket_start_index
-                    )
-                    end_index = start_index + intersec_end_index - intersec_start_index
+                    return reset_attribute
 
-                    param_shard = param_buffer.data[start_index:end_index]
-                    grad_shard = grad_buffer.data[start_index:end_index]
-                    setattr(param_shard, 'grad', grad_shard)
-                    named_param_shardings.append((self.param_to_name[param], param_shard))
-                    break
+                setattr(param_shard, 'reset_attribute', closure(param_shard, grad_buffer.get_item(item_id), param))
+                param_shard.reset_attribute()
+                named_param_shardings.append((self.param_to_name[param], param_shard))
+
             return named_param_shardings
 
         self._named_parameter_shardings_cache = _named_parameter_shardings(
@@ -276,6 +271,12 @@ class DistributedDataParallel(MegatronModule):
         """
         Calls the wrapped module's forward() method.
         """
+        if self.is_first_microbatch:
+            self.model_parameters_allgather()
+
+            # reset the attribute of the parameters before the forward pass
+            for _, param_shard in self.named_parameter_shardings():
+                param_shard.reset_attribute()
         return self.module(*inputs, **kwargs)
 
     def _make_param_hook(
@@ -320,25 +321,38 @@ class DistributedDataParallel(MegatronModule):
         else:
             raise ValueError(f'Invalid zero_stage: {self.zero_stage}')
 
+    @torch.no_grad()
     def model_parameters_allgather(self):
-        if self.zero_stage != 2:
-            return
-
         def _params_allgather(param_buffer, param_dtype):
             for i, shard_bucket_index in enumerate(param_buffer.shard_bucket_index_map):
                 local_data_index = shard_bucket_index.local_data_index
                 offset = shard_bucket_index.bucket_data_index
                 shard_size = shard_bucket_index.size
 
+                # do parameter all-gather in temporary buffer
                 bucket = param_buffer.allocate_bucket(i, param_dtype)
-                bucket[offset : offset + shard_size] = param_buffer.data[
+                bucket.data[offset : offset + shard_size] = param_buffer.data[
                     local_data_index : local_data_index + shard_size
                 ]
                 torch.distributed.all_gather_into_tensor(
-                    output_tensor=bucket,
-                    input_tensor=bucket[offset : offset + shard_size],
+                    output_tensor=bucket.data,
+                    input_tensor=bucket.data[offset : offset + shard_size],
                     group=param_buffer.data_parallel_group,
                 )
+
+                # copy bucket data back to local parameters
+                bucket_index = param_buffer.bucket_index_map[i]
+                for item_index in bucket_index.items:
+                    param = param_buffer.parameters[item_index.item_id]
+                    start_index = item_index.global_data_index - bucket_index.global_data_index
+                    end_index = start_index + item_index.size
+                    if torch.distributed.get_rank() == 0:
+                        print(param.data, bucket.data[start_index:end_index].view_as(param))
+                    param.data.set_(
+                        bucket.data[start_index:end_index].view_as(param)
+                    )
+                    if torch.distributed.get_rank() == 0:
+                        print(param.data, bucket.data[start_index:end_index].view_as(param))
 
         dense_param_dtype = self.dense_params[0].dtype if len(self.dense_params) else torch.float32
         expert_param_dtype = (
@@ -347,14 +361,13 @@ class DistributedDataParallel(MegatronModule):
             else torch.float32
         )
         _params_allgather(self.dense_param_buffer, dense_param_dtype)
-        _params_allgather(self.expert_parallel_params, expert_param_dtype)
+        _params_allgather(self.expert_param_buffer, expert_param_dtype)
 
     @contextmanager
     def no_sync(self):
         """
         Context manager that turns off gradient synchronization.
         """
-        self.model_parameters_allgather()
         for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
             grad_buffer.is_last_microbatch = False
         try:
@@ -405,8 +418,8 @@ class DistributedDataParallel(MegatronModule):
                 grad_buffer.reset(zero_buffer)
         elif self.zero_stage == 2:
             # In ZeRO-2, we zero out the grad buffers in the data parallel buffer.
-            self.dense_grad_buffer.buffer.zero_()
-            self.expert_grad_buffer.buffer.zero_()
+            self.dense_grad_buffer.data.zero_()
+            self.expert_grad_buffer.data.zero_()
 
     def broadcast_params(self):
         """

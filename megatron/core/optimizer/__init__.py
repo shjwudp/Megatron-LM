@@ -133,6 +133,11 @@ def get_megatron_optimizer_based_on_param_groups(
     else:
         raise Exception('{} optimizer is not supported.'.format(config.optimizer))
 
+    if config.zero_stage == 2:
+        return FP32Optimizer(
+            optimizer, config.clip_grad, config.log_num_zeros_in_grad, params_have_main_grad=False,
+        )
+
     # Determine whether the params have main-grad field.
     params_have_main_grad = True
 
