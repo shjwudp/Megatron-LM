@@ -162,6 +162,7 @@ class DataParallelBuffer:
             bucket.data *= 1.0 / self.data_parallel_world_size
             torch.distributed.reduce_scatter_tensor(
                 output=shard, input=bucket.data, op=torch.distributed.ReduceOp.SUM,
+                group=self.data_parallel_group,
             )
 
             # gradient accumulation on local buffer

@@ -253,6 +253,8 @@ class DistributedDataParallel(MegatronModule):
                     def reset_attribute():
                         setattr(param_shard, 'grad', grad_shard)
                         setattr(param_shard, 'requires_grad', param.requires_grad)
+                        if hasattr(param, 'sequence_parallel'):
+                            setattr(param_shard, 'sequence_parallel', param.sequence_parallel)
 
                     return reset_attribute
 
