@@ -104,7 +104,7 @@ class DistributedDataParallel(MegatronModule):
                 bucket_size,
             )
         elif data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
-            self.allocate_data_parallel_buffer_for_zero2(
+            self.allocate_data_parallel_buffer(
                 data_parallel_group, expert_data_parallel_group,
             )
         else:
@@ -191,7 +191,7 @@ class DistributedDataParallel(MegatronModule):
             gradient_scaling_factor=1.0 / data_parallel_world_size,
         )
 
-    def allocate_data_parallel_buffer_for_zero2(
+    def allocate_data_parallel_buffer(
         self,
         data_parallel_group: torch.distributed.ProcessGroup,
         expert_data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -276,6 +276,7 @@ class DistributedDataParallel(MegatronModule):
         """
         if self.is_first_microbatch:
             self.model_parameters_allgather()
+            self.register_backward_hook()
 
             # reset the attribute of the parameters before the forward pass
             for _, param_shard in self.named_parameter_shardings():
@@ -289,7 +290,7 @@ class DistributedDataParallel(MegatronModule):
         Creates the all-reduce / reduce-scatter hook for backprop.
         """
 
-        def zero_01_param_hook(*unused):
+        def grad_buffer_param_hook(*unused):
             if param.requires_grad:
                 if self.overlap_grad_reduce:
                     assert (
@@ -304,7 +305,7 @@ class DistributedDataParallel(MegatronModule):
                 if self.overlap_grad_reduce:
                     self.param_to_grad_buffer[param].register_grad_ready(param)
 
-        def zero_2_param_hook(*unused):
+        def dp_buffer_param_hook(*unused):
             if not param.requires_grad:
                 return
 
@@ -318,9 +319,9 @@ class DistributedDataParallel(MegatronModule):
             param.grad = None
 
         if self.data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
-            return zero_01_param_hook
+            return grad_buffer_param_hook
         elif self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
-            return zero_2_param_hook
+            return dp_buffer_param_hook
         else:
             raise ValueError(f'Invalid data_parallel_sharding_strategy: {self.data_parallel_sharding_strategy}')
 
@@ -349,13 +350,9 @@ class DistributedDataParallel(MegatronModule):
                     param = param_buffer.parameters[item_index.item_id]
                     start_index = item_index.global_data_index - bucket_index.global_data_index
                     end_index = start_index + item_index.size
-                    if torch.distributed.get_rank() == 0:
-                        print(param.data, bucket.data[start_index:end_index].view_as(param))
                     param.set_(
                         bucket.data[start_index:end_index].view_as(param)
                     )
-                    if torch.distributed.get_rank() == 0:
-                        print(param.data, bucket.data[start_index:end_index].view_as(param))
 
         dense_param_dtype = self.dense_params[0].dtype if len(self.dense_params) else torch.float32
         expert_param_dtype = (
@@ -365,7 +362,6 @@ class DistributedDataParallel(MegatronModule):
         )
         _params_allgather(self.dense_param_buffer, dense_param_dtype)
         _params_allgather(self.expert_param_buffer, expert_param_dtype)
-        self.register_backward_hook()
 
     @contextmanager
     def no_sync(self):
@@ -421,7 +417,7 @@ class DistributedDataParallel(MegatronModule):
             for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
                 grad_buffer.reset(zero_buffer)
         elif self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
-            # In ZeRO-2, we zero out the grad buffers in the data parallel buffer.
+            # Zero out the grad buffers.
             self.dense_grad_buffer.data.zero_()
             self.expert_grad_buffer.data.zero_()
 
@@ -438,11 +434,19 @@ class DistributedDataParallel(MegatronModule):
                     src=torch.distributed.get_process_group_ranks(self.expert_data_parallel_group),
                     group=self.expert_data_parallel_group,
                 )
+                self.expert_param_buffer.set_item(
+                    item_id=self.expert_parallel_param_idx[param],
+                    item_data=param.data,
+                )
             else:
                 torch.distributed.broadcast(
                     param.data,
                     src=torch.distributed.get_process_group_ranks(self.data_parallel_group),
                     group=self.data_parallel_group,
+                )
+                self.dense_param_buffer.set_item(
+                    item_id=self.dense_param_idx[param],
+                    item_data=param.data,
                 )
 
     def state_dict(self, prefix='', keep_vars=False):

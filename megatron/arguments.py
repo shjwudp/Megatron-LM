@@ -177,13 +177,13 @@ def validate_args(args, defaults={}):
             '--overlap-param-gather only supported with MCore models'
 
     if args.use_distributed_optimizer:
-        assert args.data_parallel_sharding_strategy not in ["OPTIMIZER_STATES_AND_GRADIENTS", "FULLY_SHARD"], \
+        assert args.data_parallel_sharding_strategy not in ["OPTIMIZER_STATES_AND_GRADS", "FULLY_SHARD"], \
             'Distributed optimizer is used for OPTIMIZER_STATES sharding strategy'
         args.data_parallel_sharding_strategy = "OPTIMIZER_STATES"
 
-    if args.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADIENTS":
+    if args.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
         assert args.gradient_accumulation_fusion is False, \
-            'Gradient accumulation fusion is not supported with OPTIMIZER_STATES_AND_GRADIENTS sharding strategy'
+            'Gradient accumulation fusion is not supported with OPTIMIZER_STATES_AND_GRADS sharding strategy'
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -1205,8 +1205,8 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
-    group.add_argument('--data-parallel-sharding-strategy', type=int,
-                       choice=["NO_OP", "OPTIMIZER_STATES_AND_GRADIENTS",
+    group.add_argument('--data-parallel-sharding-strategy', type=str,
+                       choices=["NO_OP", "OPTIMIZER_STATES_AND_GRADS",
                            "OPTIMIZER_STATES", "FULLY_SHARD"],
                           help='Sharding strategy of data parallelism.')
     group.add_argument('--context-parallel-size', type=int, default=1,
