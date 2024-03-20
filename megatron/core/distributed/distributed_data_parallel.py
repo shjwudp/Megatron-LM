@@ -50,7 +50,7 @@ class DistributedDataParallel(MegatronModule):
         disable_bucketing: bool = False,
         check_for_nan_in_grad: bool = False,
         bucket_size: int = 40000000,
-        zero_stage: int = 0,
+        data_parallel_sharding_strategy: str = "NO_OP",
         in_optimizer_param_dtype: torch.dtype = torch.float32,
         grad_dtype: torch.dtype = torch.float32,
     ):
@@ -75,7 +75,7 @@ class DistributedDataParallel(MegatronModule):
 
         self.check_for_nan_in_grad = check_for_nan_in_grad
         self.bucket_size = bucket_size
-        self.zero_stage = zero_stage
+        self.data_parallel_sharding_strategy = data_parallel_sharding_strategy
         self.in_optimizer_param_dtype = in_optimizer_param_dtype
         self.grad_dtype = grad_dtype
 
@@ -84,10 +84,10 @@ class DistributedDataParallel(MegatronModule):
         self.dense_params = []
         self.expert_parallel_params = []
         for name, param in self.module.named_parameters():
-            if zero_stage in [0, 1] and not param.requires_grad:
+            if data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"] and not param.requires_grad:
                 continue
 
-            if zero_stage in [0, 1]:
+            if data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
                 param.grad_added_to_main_grad = False
             self.param_to_name[param] = name
 
@@ -96,19 +96,19 @@ class DistributedDataParallel(MegatronModule):
             else:
                 self.expert_parallel_params.append(param)
 
-        if zero_stage in [0, 1]:
+        if data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
             self.allocate_grad_buffer(
                 data_parallel_group,
                 expert_data_parallel_group,
                 accumulate_allreduce_grads_in_fp32,
                 bucket_size,
             )
-        elif zero_stage == 2:
+        elif data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
             self.allocate_data_parallel_buffer_for_zero2(
                 data_parallel_group, expert_data_parallel_group,
             )
         else:
-            raise ValueError(f'Invalid zero_stage: {zero_stage}')
+            raise ValueError(f'Invalid data_parallel_sharding_strategy: {data_parallel_sharding_strategy}')
 
         self.module = module
         self._named_parameter_shardings_cache = None
@@ -116,6 +116,9 @@ class DistributedDataParallel(MegatronModule):
         # Register backward hook.
         # Accumulation function for the gradients need to be stored so they
         # don't go out of scope.
+        self.register_backward_hook()
+
+    def register_backward_hook(self):
         self.grad_accs = []
         for param in self.module.parameters():
             if param.requires_grad:
@@ -232,7 +235,7 @@ class DistributedDataParallel(MegatronModule):
         )
 
     def named_parameter_shardings(self):
-        if self.zero_stage != 2:
+        if self.data_parallel_sharding_strategy != "OPTIMIZER_STATES_AND_GRADS":
             return None
 
         if self._named_parameter_shardings_cache:
@@ -314,12 +317,12 @@ class DistributedDataParallel(MegatronModule):
                 self.dense_grad_buffer.put_into_bucket(idx, param.grad.data)
             param.grad = None
 
-        if self.zero_stage in [0, 1]:
+        if self.data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
             return zero_01_param_hook
-        elif self.zero_stage == 2:
+        elif self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
             return zero_2_param_hook
         else:
-            raise ValueError(f'Invalid zero_stage: {self.zero_stage}')
+            raise ValueError(f'Invalid data_parallel_sharding_strategy: {self.data_parallel_sharding_strategy}')
 
     @torch.no_grad()
     def model_parameters_allgather(self):
@@ -348,7 +351,7 @@ class DistributedDataParallel(MegatronModule):
                     end_index = start_index + item_index.size
                     if torch.distributed.get_rank() == 0:
                         print(param.data, bucket.data[start_index:end_index].view_as(param))
-                    param.data.set_(
+                    param.set_(
                         bucket.data[start_index:end_index].view_as(param)
                     )
                     if torch.distributed.get_rank() == 0:
@@ -362,6 +365,7 @@ class DistributedDataParallel(MegatronModule):
         )
         _params_allgather(self.dense_param_buffer, dense_param_dtype)
         _params_allgather(self.expert_param_buffer, expert_param_dtype)
+        self.register_backward_hook()
 
     @contextmanager
     def no_sync(self):
@@ -397,10 +401,10 @@ class DistributedDataParallel(MegatronModule):
         calls to complete. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        if self.zero_stage in [0, 1]:
+        if self.data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
             for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
                 grad_buffer.finish_grad_sync()
-        elif self.zero_stage == 2:
+        elif self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
             pass
 
     def zero_grad_buffer(self, zero_buffer):
@@ -410,13 +414,13 @@ class DistributedDataParallel(MegatronModule):
 
         When zero_buffer is set to True, the underlying grad buffer is zeroed out.
         """
-        if self.zero_stage in [0, 1]:
+        if self.data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
             for param in self.module.parameters():
                 if param.requires_grad:
                     param.grad_added_to_main_grad = False
             for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
                 grad_buffer.reset(zero_buffer)
-        elif self.zero_stage == 2:
+        elif self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
             # In ZeRO-2, we zero out the grad buffers in the data parallel buffer.
             self.dense_grad_buffer.data.zero_()
             self.expert_grad_buffer.data.zero_()

@@ -411,7 +411,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                      accumulate_allreduce_grads_in_fp32=args.accumulate_allreduce_grads_in_fp32,
                      overlap_grad_reduce=args.overlap_grad_reduce,
                      use_distributed_optimizer=args.use_distributed_optimizer,
-                     zero_stage=args.zero_stage,
+                     data_parallel_sharding_strategy=args.data_parallel_sharding_strategy,
                      # Turn off bucketing for model_chunk 2 onwards, since communication for these
                      # model chunks is overlapped with compute anyway.
                      disable_bucketing=(model_chunk_idx > 0),

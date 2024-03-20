@@ -175,7 +175,7 @@ def forward_step(
     if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
         model.set_is_first_microbatch()
 
-    if config.zero_stage == 2:
+    if config.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
         model.is_first_microbatch = is_first_microbatch
 
     unwrap_output_tensor = False

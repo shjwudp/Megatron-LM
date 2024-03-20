@@ -175,15 +175,15 @@ def validate_args(args, defaults={}):
             '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
         assert args.use_mcore_models, \
             '--overlap-param-gather only supported with MCore models'
-        
-    if args.use_distributed_optimizer:
-        assert args.zero_stage != 2, \
-            'ZeRO stage 2 is not supported with distributed optimizer'
-        args.zero_stage = 1
 
-    if args.zero_stage == 2:
+    if args.use_distributed_optimizer:
+        assert args.data_parallel_sharding_strategy not in ["OPTIMIZER_STATES_AND_GRADIENTS", "FULLY_SHARD"], \
+            'Distributed optimizer is used for OPTIMIZER_STATES sharding strategy'
+        args.data_parallel_sharding_strategy = "OPTIMIZER_STATES"
+
+    if args.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADIENTS":
         assert args.gradient_accumulation_fusion is False, \
-            'Gradient accumulation fusion is not supported with ZeRO stage 2'
+            'Gradient accumulation fusion is not supported with OPTIMIZER_STATES_AND_GRADIENTS sharding strategy'
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -1205,8 +1205,10 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
-    group.add_argument('--zero-stage', type=int, default=0,
-                          help='ZeRO stage for data parallelism.')
+    group.add_argument('--data-parallel-sharding-strategy', type=int,
+                       choice=["NO_OP", "OPTIMIZER_STATES_AND_GRADIENTS",
+                           "OPTIMIZER_STATES", "FULLY_SHARD"],
+                          help='Sharding strategy of data parallelism.')
     group.add_argument('--context-parallel-size', type=int, default=1,
                        help='Degree of context parallelism.')
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,

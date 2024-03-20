@@ -133,7 +133,7 @@ def get_megatron_optimizer_based_on_param_groups(
     else:
         raise Exception('{} optimizer is not supported.'.format(config.optimizer))
 
-    if config.zero_stage == 2:
+    if config.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
         return FP32Optimizer(
             optimizer, config.clip_grad, config.log_num_zeros_in_grad, params_have_main_grad=False,
         )
