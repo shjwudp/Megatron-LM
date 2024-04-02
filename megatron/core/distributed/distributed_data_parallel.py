@@ -9,7 +9,7 @@ from .. import parallel_state
 from ..transformer.module import MegatronModule
 from ..transformer.transformer_config import TransformerConfig
 from .data_parallel_buffer import DataParallelBuffer
-from .grad_buffer import GradBuffer
+from .param_and_grad_buffer import ParamAndGradBuffer
 
 
 class DistributedDataParallel(MegatronModule):
@@ -20,7 +20,7 @@ class DistributedDataParallel(MegatronModule):
     also provides the option to do the gradient accumulation in a type other than the param type
     (e.g., fp32 for a bf16 model).
 
-    Arguments:
+    Args:
         config: Transformer config object.
         module: Underlying model.
         data_parallel_group: Data-parallel process group.
@@ -79,6 +79,9 @@ class DistributedDataParallel(MegatronModule):
         self.in_optimizer_param_dtype = in_optimizer_param_dtype
         self.grad_dtype = grad_dtype
 
+        self.module = module
+        self.param_to_buffer = {}
+
         # Group parameters by their gradient type.
         self.param_to_name = {}
         self.dense_params = []
@@ -113,6 +116,19 @@ class DistributedDataParallel(MegatronModule):
         self.module = module
         self._named_parameter_shardings_cache = None
 
+        # Delete references to weight_tensor if they exist since we don't want two parameter copies
+        # if we re-mapped parameters (which happens when we use the distributed optimizer).
+        # This is a temporary workaround around a TE bug that is fixed with
+        # https://github.com/NVIDIA/TransformerEngine/pull/719.
+        if self.use_distributed_optimizer:
+
+            @torch.no_grad()
+            def unmap_weight_tensor(m):
+                if hasattr(m, 'weight_tensor'):
+                    m.weight_tensor = None
+
+            self.module.apply(unmap_weight_tensor)
+
         # Register backward hook.
         # Accumulation function for the gradients need to be stored so they
         # don't go out of scope.
@@ -138,28 +154,30 @@ class DistributedDataParallel(MegatronModule):
     ):
         self.param_to_grad_buffer = {}
 
-        def allocate_grad_buffers_for_parameters(
+        def allocate_buffers_for_parameters(
             input_params, data_parallel_group, gradient_scaling_factor=1.0,
         ):
-            grad_dtype_to_params = {}
+            param_and_grad_dtype_to_params = {}
 
             # Group parameters by their gradient type.
             for param in input_params:
                 if not param.requires_grad:
                     continue
 
-                dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
+                param_dtype = param.dtype
+                grad_dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
 
-                params = grad_dtype_to_params.get(dtype, [])
+                params = param_and_grad_dtype_to_params.get((param_dtype, grad_dtype), [])
                 params.append(param)
-                grad_dtype_to_params[dtype] = params
+                param_and_grad_dtype_to_params[(param_dtype, grad_dtype)] = params
 
             # Allocate the grad buffers and map the grads.
-            grad_buffers = []
-            for dtype, params in grad_dtype_to_params.items():
-                grad_buffers.append(
-                    GradBuffer(
-                        dtype,
+            buffers = []
+            for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
+                buffers.append(
+                    ParamAndGradBuffer(
+                        param_dtype,
+                        grad_dtype,
                         params,
                         data_parallel_group,
                         bucket_size,
@@ -171,21 +189,21 @@ class DistributedDataParallel(MegatronModule):
                     )
                 )
                 for param in params:
-                    self.param_to_grad_buffer[param] = grad_buffers[-1]
+                    self.param_to_buffer[param] = buffers[-1]
 
-            return grad_buffers
+            return buffers
 
         data_parallel_world_size = torch.distributed.get_world_size(data_parallel_group)
 
-        # Allocate the grad buffers for dense params' grads.
-        self.grad_buffers = allocate_grad_buffers_for_parameters(
+        # Allocate the param+grad buffers for dense params' grads.
+        self.buffers = allocate_buffers_for_parameters(
             self.dense_params,
             data_parallel_group,
             gradient_scaling_factor=1.0 / data_parallel_world_size,
         )
 
-        # Allocate separate grad buffers for expert parallel params' grads.
-        self.expert_parallel_grad_buffers = allocate_grad_buffers_for_parameters(
+        # Allocate separate param+grad buffers for expert parallel params' grads.
+        self.expert_parallel_buffers = allocate_buffers_for_parameters(
             self.expert_parallel_params,
             expert_data_parallel_group,
             gradient_scaling_factor=1.0 / data_parallel_world_size,
@@ -305,7 +323,7 @@ class DistributedDataParallel(MegatronModule):
                 param.grad = None
 
                 if self.overlap_grad_reduce:
-                    self.param_to_grad_buffer[param].register_grad_ready(param)
+                    self.param_to_buffer[param].register_grad_ready(param)
 
         def dp_buffer_param_hook(*unused):
             if not param.requires_grad:
@@ -370,13 +388,13 @@ class DistributedDataParallel(MegatronModule):
         """
         Context manager that turns off gradient synchronization.
         """
-        for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
-            grad_buffer.is_last_microbatch = False
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.is_last_microbatch = False
         try:
             yield
         finally:
-            for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
-                grad_buffer.is_last_microbatch = True
+            for buffer in self.buffers + self.expert_parallel_buffers:
+                buffer.is_last_microbatch = True
 
     def start_grad_sync(self, *unused):
         """
@@ -387,8 +405,8 @@ class DistributedDataParallel(MegatronModule):
         calls. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
-            grad_buffer.start_grad_sync()
+        for buffer in self.buffers + self.expert_parallel_buffers:
+            buffer.start_grad_sync()
 
     def finish_grad_sync(self):
         """
@@ -400,24 +418,22 @@ class DistributedDataParallel(MegatronModule):
         communication ops.
         """
         if self.data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
-            for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
-                grad_buffer.finish_grad_sync()
+            for buffer in self.buffers + self.expert_parallel_buffers:
+                buffer.finish_grad_sync()
         elif self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
             pass
 
-    def zero_grad_buffer(self, zero_buffer):
+    def zero_grad_buffer(self):
         """
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
-
-        When zero_buffer is set to True, the underlying grad buffer is zeroed out.
         """
         if self.data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
             for param in self.module.parameters():
                 if param.requires_grad:
                     param.grad_added_to_main_grad = False
-            for grad_buffer in self.grad_buffers + self.expert_parallel_grad_buffers:
-                grad_buffer.reset(zero_buffer)
+            for buffer in self.buffers + self.expert_parallel_buffers:
+                buffer.reset()
         elif self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
             # Zero out the grad buffers.
             self.dense_grad_buffer.data.zero_()

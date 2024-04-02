@@ -74,7 +74,9 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
 
     # All-reduce layernorm parameters across model parallel nodes
     # when sequence parallelism is used
-    if parallel_state.get_tensor_model_parallel_world_size() > 1 and config.sequence_parallel:
+    if parallel_state.get_tensor_model_parallel_world_size() > 1 and (
+        config.sequence_parallel or config.qk_layernorm
+    ):
         grads = []
         for model_chunk in model:
             named_parameters = None
@@ -83,23 +85,28 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
             if hasattr(model_chunk, "named_parameter_shardings"):
                 named_parameters = model_chunk.named_parameter_shardings()
             if named_parameters is None:
-                named_parameters = model_chunk.named_parameters()
+                named_parameters = get_attr_wrapped_model(model_chunk, 'named_parameters')()
 
             use_main_grad = not getattr(model_chunk, 'named_parameter_shardings', False)
 
             for _, param in named_parameters:
-                if getattr(param, 'sequence_parallel', False):
+                if (
+                    getattr(param, 'sequence_parallel', False)
+                    or 'q_layernorm' in name
+                    or 'k_layernorm' in name
+                ):
                     if use_main_grad:
                         grad = param.main_grad
                     else:
                         grad = param.grad
                     grads.append(grad.data)
-        coalesced = _flatten_dense_tensors(grads)
-        torch.distributed.all_reduce(
-            coalesced, group=parallel_state.get_tensor_model_parallel_group()
-        )
-        for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
-            buf.copy_(synced)
+        if grads:
+            coalesced = _flatten_dense_tensors(grads)
+            torch.distributed.all_reduce(
+                coalesced, group=parallel_state.get_tensor_model_parallel_group()
+            )
+            for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
+                buf.copy_(synced)
 
 
 def finalize_model_grads(model: List[torch.nn.Module]):
