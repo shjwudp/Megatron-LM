@@ -307,6 +307,9 @@ def get_megatron_optimizer(
         decoupled_min_lr=config.decoupled_min_lr,
     )
 
+    if config.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
+        return _get_megatron_optimizer_based_on_param_groups(config, param_groups)
+
     # Collect grad buffers for distributed optimizer.
     per_model_buffers = {}
     per_model_ep_buffers = {}

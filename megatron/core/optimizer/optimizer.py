@@ -685,6 +685,12 @@ class FP32Optimizer(MegatronOptimizer):
     def reload_model_params(self):
         pass
 
+    def sharded_state_dict(
+        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+    ):
+        # FIXME: need to be implemented
+        pass
+
     def state_dict(self):
         return self.optimizer.state_dict()
 
