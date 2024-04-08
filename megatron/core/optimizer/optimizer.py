@@ -631,6 +631,12 @@ class FP32Optimizer(MegatronOptimizer):
         """FP32 optimizer does not do any scaling."""
         return self._scale
 
+    def sharded_state_dict(
+        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+    ):
+        # FIXME: This is a temporary solution to avoid breaking the code.        
+        pass
+
     @torch.no_grad()
     def step(self):
         """Clip gradients (if needed) and step the base optimizer.

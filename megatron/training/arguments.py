@@ -1312,6 +1312,7 @@ def _add_distributed_args(parser):
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
     group.add_argument('--data-parallel-sharding-strategy', type=str,
+                       default="NO_OP",
                        choices=["NO_OP", "OPTIMIZER_STATES_AND_GRADS",
                            "OPTIMIZER_STATES", "FULLY_SHARD"],
                           help='Sharding strategy of data parallelism.')

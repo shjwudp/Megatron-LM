@@ -294,7 +294,7 @@ class DistributedDataParallel(MegatronModule):
         """
         Calls the wrapped module's forward() method.
         """
-        if self.is_first_microbatch:
+        if self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS" and self.is_first_microbatch:
             self.model_parameters_allgather()
             self.register_backward_hook()
 

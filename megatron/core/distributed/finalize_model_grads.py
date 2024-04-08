@@ -80,16 +80,17 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
         grads = []
         for model_chunk in model:
             named_parameters = None
+            use_main_grad = True
             # If the model chunk has named_parameter_shardings, use it to get the
             # named parameters. (e.g., for gradient sharding data parallelism)
             if hasattr(model_chunk, "named_parameter_shardings"):
                 named_parameters = model_chunk.named_parameter_shardings()
+                if named_parameters is not None:
+                    use_main_grad = False
             if named_parameters is None:
                 named_parameters = get_attr_wrapped_model(model_chunk, 'named_parameters')()
 
-            use_main_grad = not getattr(model_chunk, 'named_parameter_shardings', False)
-
-            for _, param in named_parameters:
+            for name, param in named_parameters:
                 if (
                     getattr(param, 'sequence_parallel', False)
                     or 'q_layernorm' in name
