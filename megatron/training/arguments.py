@@ -256,14 +256,6 @@ def validate_args(args, defaults={}):
             print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
                   'schedule does not support overlapping p2p communication')
 
-    if args.overlap_param_gather:
-        assert args.use_distributed_optimizer, \
-            '--overlap-param-gather only supported with distributed optimizer'
-        assert args.overlap_grad_reduce, \
-            '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
-        assert args.use_mcore_models, \
-            '--overlap-param-gather only supported with MCore models'
-
     if args.use_distributed_optimizer:
         assert args.data_parallel_sharding_strategy not in ["OPTIMIZER_STATES_AND_GRADS", "FULLY_SHARD"], \
             'Distributed optimizer is used for OPTIMIZER_STATES sharding strategy'
@@ -272,6 +264,16 @@ def validate_args(args, defaults={}):
     if args.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
         assert args.gradient_accumulation_fusion is False, \
             'Gradient accumulation fusion is not supported with OPTIMIZER_STATES_AND_GRADS sharding strategy'
+    elif args.data_parallel_sharding_strategy == "OPTIMIZER_STATES":
+        args.use_distributed_optimizer = True
+
+    if args.overlap_param_gather:
+        assert args.use_distributed_optimizer, \
+            '--overlap-param-gather only supported with distributed optimizer'
+        assert args.overlap_grad_reduce, \
+            '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
+        assert args.use_mcore_models, \
+            '--overlap-param-gather only supported with MCore models'
 
     # Parameters dtype.
     args.params_dtype = torch.float
