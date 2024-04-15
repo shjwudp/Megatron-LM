@@ -184,6 +184,13 @@ def pretrain(train_valid_test_dataset_provider,
             to set already parse arguments.
     """
 
+    torch.cuda.memory._record_memory_history(True,
+        # keep 100,000 alloc/free events from before the snapshot
+        trace_alloc_max_entries=100000,
+
+        # record stack information for the trace events
+        trace_alloc_record_context=True)
+
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(extra_args_provider=extra_args_provider,
                         args_defaults=args_defaults)
@@ -749,6 +756,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             )
 
     if iteration % args.log_interval == 0:
+        if is_last_rank():
+            from pickle import dump
+            snapshot = torch.cuda.memory._snapshot()
+            with open('snapshot.pickle', 'wb') as f:
+                dump(snapshot, f)
+
         elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
