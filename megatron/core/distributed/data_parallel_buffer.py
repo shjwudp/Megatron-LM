@@ -136,7 +136,7 @@ class DataParallelBuffer:
         self.buckets = {}
         self.reduce_scatter_queue = []
 
-    def get_bucket_local_sharding(self, bucket_id: int) -> torch.Tensor:
+    def get_shard_from_local_buffer(self, bucket_id: int) -> torch.Tensor:
         """Get the local sharding of a bucket by bucket id."""
         index = self.shard_bucket_index_map[bucket_id]
         return self.data[index.local_data_index : index.local_data_index + index.size]
@@ -155,33 +155,38 @@ class DataParallelBuffer:
         bucket.items.append(item_id)
 
         return bucket
-    
+
     def wait_for_previous_reduce_scatter(self, recommeded_capacity: int = 1):
         while len(self.reduce_scatter_queue) > recommeded_capacity:
             async_work_handler, bucket_id = self.reduce_scatter_queue.pop(0)
             async_work_handler.wait()
 
-            # # gradient accumulation on local buffer
-            # local_buffer = self.get_bucket_local_sharding(bucket_id)
-            # local_buffer += self.get_bucket_local_shard(bucket_id)
+            local_buffer = self.get_shard_from_local_buffer(bucket_id)
+            local_buffer += self.get_shard_from_bucket(self.buckets[bucket_id])
 
-            # del self.buckets[bucket_id]
-            # self.finished_reduce_scatter += 1
+            del self.buckets[bucket_id]
 
-    def get_bucket_local_shard(self, bucket):
+    def get_shard_from_bucket(self, bucket):
         shard_bucket_index = self.shard_bucket_index_map[bucket.id]
         offset = shard_bucket_index.bucket_data_index
         shard_size = shard_bucket_index.size
         shard = bucket.data[offset : offset + shard_size]
-
         return shard
+
+    def get_item_from_bucket(self, bucket, item_id):
+        item_index = self.item_index_map[item_id]
+        bucket_index = self.bucket_index_map[bucket.id]
+        start_index = item_index.global_data_index - bucket_index.global_data_index
+        end_index = start_index + item_index.size
+        item = bucket.data[start_index:end_index]
+        return item
 
     @torch.no_grad()
     def reduce_scatter_bucket_and_add_on_local_shard(
         self, bucket_id: int, async_op: bool = False
     ) -> None:
         bucket = self.buckets[bucket_id]
-        shard = self.get_bucket_local_shard(bucket)
+        shard = self.get_shard_from_bucket(bucket)
 
         bucket.data *= 1.0 / self.data_parallel_world_size
         reduce_scatter_handler = torch.distributed.reduce_scatter_tensor(
@@ -193,9 +198,10 @@ class DataParallelBuffer:
         )
         if async_op:
             self.reduce_scatter_queue.append((reduce_scatter_handler, bucket_id))
+            return
 
         # gradient accumulation on local buffer
-        local_buffer = self.get_bucket_local_sharding(bucket_id)
+        local_buffer = self.get_shard_from_local_buffer(bucket_id)
         local_buffer += shard
 
         del self.buckets[bucket_id]

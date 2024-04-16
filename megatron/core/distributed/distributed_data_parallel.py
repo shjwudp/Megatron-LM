@@ -299,7 +299,7 @@ class DistributedDataParallel(MegatronModule):
         )
 
         return self._named_parameter_shardings_cache
-    
+
     def register_forward_hook(self):
         """
         Registers forward hooks to be called before and after the forward pass.
@@ -315,7 +315,10 @@ class DistributedDataParallel(MegatronModule):
 
             return forward_pre_hook
 
-        if self.overlap_param_gather and self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
+        if (
+            self.overlap_param_gather
+            and self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS"
+        ):
             self.module.register_forward_pre_hook(distog_forward_pre_hook_closure())
 
     def forward(self, *inputs, **kwargs):
@@ -400,15 +403,15 @@ class DistributedDataParallel(MegatronModule):
                     async_op=self.overlap_param_gather,
                 )
 
-                # copy bucket data back to local parameters
                 bucket_index = param_buffer.bucket_index_map[i]
                 for item_index in bucket_index.items:
                     param = param_buffer.parameters[item_index.item_id]
-                    start_index = item_index.global_data_index - bucket_index.global_data_index
-                    end_index = start_index + item_index.size
-                    param.copy_(bucket.data[start_index:end_index].view_as(param))
 
                     self.param_all_gather_handler_map[param] = all_gather_handler
+
+                    # copy bucket data back to local parameters
+                    item = param_buffer.get_item_from_bucket(bucket, item_index.item_id)
+                    param.copy_(item.view_as(param))
 
         dense_param_dtype = self.dense_params[0].dtype if len(self.dense_params) else torch.float32
         expert_param_dtype = (

@@ -16,8 +16,8 @@ from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
     FP32Optimizer,
-    NaiveOptimizer,
     MegatronOptimizer,
+    NaiveOptimizer,
 )
 from .optimizer_config import OptimizerConfig
 
