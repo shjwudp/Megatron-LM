@@ -634,7 +634,7 @@ class FP32Optimizer(MegatronOptimizer):
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
     ):
-        # FIXME: This is a temporary solution to avoid breaking the code.        
+        # FIXME: This is a temporary solution to avoid breaking the code.
         pass
 
     @torch.no_grad()

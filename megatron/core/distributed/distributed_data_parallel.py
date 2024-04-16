@@ -87,7 +87,10 @@ class DistributedDataParallel(MegatronModule):
         self.dense_params = []
         self.expert_parallel_params = []
         for name, param in self.module.named_parameters():
-            if data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"] and not param.requires_grad:
+            if (
+                data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]
+                and not param.requires_grad
+            ):
                 continue
 
             if data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
@@ -111,7 +114,9 @@ class DistributedDataParallel(MegatronModule):
                 data_parallel_group, expert_data_parallel_group,
             )
         else:
-            raise ValueError(f'Invalid data_parallel_sharding_strategy: {data_parallel_sharding_strategy}')
+            raise ValueError(
+                f'Invalid data_parallel_sharding_strategy: {data_parallel_sharding_strategy}'
+            )
 
         self.module = module
         self._named_parameter_shardings_cache = None
@@ -217,10 +222,6 @@ class DistributedDataParallel(MegatronModule):
         # Iterate through parameters in reverse order to roughly follow backprop order.
         self.dense_params = list(reversed(self.dense_params))
         self.expert_parallel_params = list(reversed(self.expert_parallel_params))
-        self.dense_param_idx = {param: i for i, param in enumerate(self.dense_params)}
-        self.expert_parallel_param_idx = {
-            param: i for i, param in enumerate(self.expert_parallel_params)
-        }
 
         def allocate_data_parallel_shard_buffer(input_params, dp_group):
             device = (
@@ -276,7 +277,11 @@ class DistributedDataParallel(MegatronModule):
 
                     return reset_attribute
 
-                setattr(param_shard, 'reset_attribute', closure(param_shard, grad_buffer.get_item(item_id), param))
+                setattr(
+                    param_shard,
+                    'reset_attribute',
+                    closure(param_shard, grad_buffer.get_item(item_id), param),
+                )
                 param_shard.reset_attribute()
                 named_param_shardings.append((self.param_to_name[param], param_shard))
 
@@ -294,13 +299,13 @@ class DistributedDataParallel(MegatronModule):
         """
         Calls the wrapped module's forward() method.
         """
-        if self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS" and self.is_first_microbatch:
+        if (
+            self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS"
+            and self.is_first_microbatch
+            and self.module.training
+        ):
             self.model_parameters_allgather()
-            self.register_backward_hook()
 
-            # reset the attribute of the parameters before the forward pass
-            for _, param_shard in self.named_parameter_shardings():
-                param_shard.reset_attribute()
         return self.module(*inputs, **kwargs)
 
     def _make_param_hook(
@@ -329,13 +334,15 @@ class DistributedDataParallel(MegatronModule):
             if not param.requires_grad:
                 return
 
+            def gradient_accumulate(grad_buffer, param):
+                item_idx = grad_buffer.param_idx[param]
+                bucket = grad_buffer.put_into_bucket(item_idx, param.grad.data)
+                if len(bucket.items) == len(bucket.requires_grad_items):
+                    grad_buffer.reduce_scatter_bucket_and_add_on_local_shard(bucket.bucket_id)
+
             expert_parallel = not getattr(param, 'allreduce', True)
-            if expert_parallel:
-                idx = self.expert_parallel_param_idx[param]
-                self.expert_grad_buffer.put_into_bucket(idx, param.grad.data)
-            else:
-                idx = self.dense_param_idx[param]
-                self.dense_grad_buffer.put_into_bucket(idx, param.grad.data)
+            grad_buffer = self.expert_grad_buffer if expert_parallel else self.dense_grad_buffer
+            gradient_accumulate(grad_buffer, param)
             param.grad = None
 
         if self.data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
@@ -343,7 +350,9 @@ class DistributedDataParallel(MegatronModule):
         elif self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
             return dp_buffer_param_hook
         else:
-            raise ValueError(f'Invalid data_parallel_sharding_strategy: {self.data_parallel_sharding_strategy}')
+            raise ValueError(
+                f'Invalid data_parallel_sharding_strategy: {self.data_parallel_sharding_strategy}'
+            )
 
     @torch.no_grad()
     def model_parameters_allgather(self):
@@ -370,9 +379,7 @@ class DistributedDataParallel(MegatronModule):
                     param = param_buffer.parameters[item_index.item_id]
                     start_index = item_index.global_data_index - bucket_index.global_data_index
                     end_index = start_index + item_index.size
-                    param.set_(
-                        bucket.data[start_index:end_index].view_as(param)
-                    )
+                    param.data.copy_(bucket.data[start_index:end_index].view_as(param))
 
         dense_param_dtype = self.dense_params[0].dtype if len(self.dense_params) else torch.float32
         expert_param_dtype = (
@@ -453,8 +460,7 @@ class DistributedDataParallel(MegatronModule):
                     group=self.expert_data_parallel_group,
                 )
                 self.expert_param_buffer.set_item(
-                    item_id=self.expert_parallel_param_idx[param],
-                    item_data=param.data,
+                    item_id=self.expert_param_buffer.param_idx[param], item_data=param.data,
                 )
             else:
                 torch.distributed.broadcast(
@@ -463,8 +469,7 @@ class DistributedDataParallel(MegatronModule):
                     group=self.data_parallel_group,
                 )
                 self.dense_param_buffer.set_item(
-                    item_id=self.dense_param_idx[param],
-                    item_data=param.data,
+                    item_id=self.dense_param_buffer.param_idx[param], item_data=param.data,
                 )
 
     def state_dict(self, prefix='', keep_vars=False):
