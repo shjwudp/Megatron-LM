@@ -16,6 +16,7 @@ from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
     FP32Optimizer,
+    NaiveOptimizer,
     MegatronOptimizer,
 )
 from .optimizer_config import OptimizerConfig
@@ -208,7 +209,7 @@ def _get_megatron_optimizer_based_on_param_groups(
         raise Exception('{} optimizer is not supported.'.format(config.optimizer))
 
     if config.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
-        return FP32Optimizer(optimizer, config, init_state_fn,)
+        return NaiveOptimizer(optimizer, config, init_state_fn,)
 
     # Mixed precision optimizer.
     # - Note: both the Float16Optimizer and the DistributedOptimizer inherit

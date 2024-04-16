@@ -704,6 +704,87 @@ class FP32Optimizer(MegatronOptimizer):
         self.optimizer.load_state_dict(state_dict)
 
 
+class NaiveOptimizer(MegatronOptimizer):
+    """Naive optimizer that does not do anything.
+
+    Args:
+        optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
+        config (OptimizerConfig): configuration object for optimizer.
+        init_state_fn (Callable, optional): function to initialize state in the optimizer.
+    """
+
+    def __init__(
+        self, optimizer: torch.optim.Optimizer, config: OptimizerConfig, init_state_fn: Callable,
+    ):
+
+        super(NaiveOptimizer, self).__init__(
+            optimizer, config, init_state_fn,
+        )
+
+    def zero_grad(self, set_to_none=True):
+        for group in self.optimizer.param_groups:
+            _zero_grad_group_helper(group['params'], set_to_none)
+
+    def get_loss_scale(self):
+        return torch.tensor([1.0], dtype=torch.float, device='cuda')
+
+    def reload_model_params(self):
+        pass
+
+    def sharded_state_dict(
+        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+    ):
+        pass
+
+    def state_dict(self):
+        return self.optimizer.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.optimizer.load_state_dict(state_dict)
+
+    def get_model_parallel_group(self) -> Optional[torch.distributed.ProcessGroup]:
+        return None
+
+    @torch.no_grad()
+    def step(self):
+        """Clip gradients (if needed) and step the base optimizer.
+        Always return successful since there is no overflow."""
+
+        timers = self.config.timers
+
+        # Clip gradients.
+        if timers is not None:
+            timers('optimizer-clip-main-grad', log_level=1).start(
+                barrier=self.config.barrier_with_L1_time
+            )
+        grad_norm = None
+        if self.config.clip_grad > 0.0:
+            grad_norm = self.clip_grad_norm(self.config.clip_grad)
+        if timers is not None:
+            timers('optimizer-clip-main-grad').stop()
+
+        # Count the zeros in the grads.
+        if timers is not None:
+            timers('optimizer-count-zeros', log_level=1).start(
+                barrier=self.config.barrier_with_L1_time
+            )
+        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
+        if timers is not None:
+            timers('optimizer-count-zeros').stop()
+
+        # Update parameters.
+        if timers is not None:
+            timers('optimizer-inner-step', log_level=1).start(
+                barrier=self.config.barrier_with_L1_time
+            )
+        self.optimizer.step()
+        if timers is not None:
+            timers('optimizer-inner-step').stop()
+
+        # No overflow for FP32 optimizer.
+        return True, grad_norm, num_zeros_in_grad
+
+
 class ChainedOptimizer(MegatronOptimizer):
     """ChainedOptimizer is designed for a collection of optimizers.
     

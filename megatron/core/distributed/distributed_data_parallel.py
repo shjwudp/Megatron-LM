@@ -45,6 +45,7 @@ class DistributedDataParallel(MegatronModule):
         data_parallel_group: torch.distributed.ProcessGroup,
         accumulate_allreduce_grads_in_fp32: bool,
         overlap_grad_reduce: bool,
+        overlap_param_gather: bool,
         use_distributed_optimizer: bool,
         expert_data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         disable_bucketing: bool = False,
@@ -59,7 +60,9 @@ class DistributedDataParallel(MegatronModule):
 
         # Set bucket_size to infinity if overlap_grad_reduce is False.
         self.overlap_grad_reduce = overlap_grad_reduce
+        self.overlap_param_gather = overlap_param_gather
         self.use_distributed_optimizer = use_distributed_optimizer
+        self.param_all_gather_handler_map = {}
 
         # Turn off bucketing if overlap_grad_reduce is False, if we are on a pipeline stage
         # that is not the first (since data-parallel communication on these stages is not on
@@ -133,6 +136,8 @@ class DistributedDataParallel(MegatronModule):
                     m.weight_tensor = None
 
             self.module.apply(unmap_weight_tensor)
+
+        self.register_forward_hook()
 
         # Register backward hook.
         # Accumulation function for the gradients need to be stored so they
@@ -294,6 +299,24 @@ class DistributedDataParallel(MegatronModule):
         )
 
         return self._named_parameter_shardings_cache
+    
+    def register_forward_hook(self):
+        """
+        Registers forward hooks to be called before and after the forward pass.
+        """
+
+        def distog_forward_pre_hook_closure():
+            def forward_pre_hook(module, input):
+                for param in module.parameters(recurse=False):
+                    handler = self.param_all_gather_handler_map[param]
+                    if handler:
+                        handler.wait()
+                    del self.param_all_gather_handler_map[param]
+
+            return forward_pre_hook
+
+        if self.overlap_param_gather and self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
+            self.module.register_forward_pre_hook(distog_forward_pre_hook_closure())
 
     def forward(self, *inputs, **kwargs):
         """
@@ -305,11 +328,6 @@ class DistributedDataParallel(MegatronModule):
             and self.module.training
         ):
             self.model_parameters_allgather()
-            self.register_backward_hook()
-
-            # reset the attribute of the parameters before the forward pass
-            for _, param_shard in self.named_parameter_shardings():
-                param_shard.reset_attribute()
 
         return self.module(*inputs, **kwargs)
 
@@ -343,6 +361,7 @@ class DistributedDataParallel(MegatronModule):
                 item_idx = grad_buffer.param_idx[param]
                 bucket = grad_buffer.put_into_bucket(item_idx, param.grad.data)
                 if len(bucket.items) == len(bucket.requires_grad_items):
+                    grad_buffer.wait_for_previous_reduce_scatter()
                     grad_buffer.reduce_scatter_bucket_and_add_on_local_shard(
                         bucket.id, async_op=self.overlap_grad_reduce
                     )
@@ -374,10 +393,11 @@ class DistributedDataParallel(MegatronModule):
                 bucket.data[offset : offset + shard_size] = param_buffer.data[
                     local_data_index : local_data_index + shard_size
                 ]
-                torch.distributed.all_gather_into_tensor(
+                all_gather_handler = torch.distributed.all_gather_into_tensor(
                     output_tensor=bucket.data,
                     input_tensor=bucket.data[offset : offset + shard_size],
                     group=param_buffer.data_parallel_group,
+                    async_op=self.overlap_param_gather,
                 )
 
                 # copy bucket data back to local parameters
@@ -386,7 +406,9 @@ class DistributedDataParallel(MegatronModule):
                     param = param_buffer.parameters[item_index.item_id]
                     start_index = item_index.global_data_index - bucket_index.global_data_index
                     end_index = start_index + item_index.size
-                    param.data.copy_(bucket.data[start_index:end_index].view_as(param))
+                    param.copy_(bucket.data[start_index:end_index].view_as(param))
+
+                    self.param_all_gather_handler_map[param] = all_gather_handler
 
         dense_param_dtype = self.dense_params[0].dtype if len(self.dense_params) else torch.float32
         expert_param_dtype = (
@@ -402,13 +424,15 @@ class DistributedDataParallel(MegatronModule):
         """
         Context manager that turns off gradient synchronization.
         """
-        for buffer in self.buffers + self.expert_parallel_buffers:
-            buffer.is_last_microbatch = False
+        if self.data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
+            for buffer in self.buffers + self.expert_parallel_buffers:
+                buffer.is_last_microbatch = False
         try:
             yield
         finally:
-            for buffer in self.buffers + self.expert_parallel_buffers:
-                buffer.is_last_microbatch = True
+            if self.data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
+                for buffer in self.buffers + self.expert_parallel_buffers:
+                    buffer.is_last_microbatch = True
 
     def start_grad_sync(self, *unused):
         """
@@ -419,8 +443,11 @@ class DistributedDataParallel(MegatronModule):
         calls. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for buffer in self.buffers + self.expert_parallel_buffers:
-            buffer.start_grad_sync()
+        if self.data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
+            for buffer in self.buffers + self.expert_parallel_buffers:
+                buffer.start_grad_sync()
+        elif self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
+            pass
 
     def finish_grad_sync(self):
         """
@@ -435,7 +462,9 @@ class DistributedDataParallel(MegatronModule):
             for buffer in self.buffers + self.expert_parallel_buffers:
                 buffer.finish_grad_sync()
         elif self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
-            pass
+            # reset the attribute of the parameters when the grad sync is finished
+            for _, param_shard in self.named_parameter_shardings():
+                param_shard.reset_attribute()
 
     def zero_grad_buffer(self):
         """

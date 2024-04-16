@@ -422,6 +422,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                      expert_data_parallel_group=mpu.get_data_modulo_expert_parallel_group(),
                      accumulate_allreduce_grads_in_fp32=args.accumulate_allreduce_grads_in_fp32,
                      overlap_grad_reduce=args.overlap_grad_reduce,
+                     overlap_param_gather=args.overlap_param_gather,
                      use_distributed_optimizer=args.use_distributed_optimizer,
                      data_parallel_sharding_strategy=args.data_parallel_sharding_strategy,
                      # Turn off bucketing for model_chunk 2 onwards, since communication for these

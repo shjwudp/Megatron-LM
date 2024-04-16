@@ -268,8 +268,8 @@ def validate_args(args, defaults={}):
         args.use_distributed_optimizer = True
 
     if args.overlap_param_gather:
-        assert args.use_distributed_optimizer, \
-            '--overlap-param-gather only supported with distributed optimizer'
+        assert args.data_parallel_sharding_strategy in ["OPTIMIZER_STATES", "OPTIMIZER_STATES_AND_GRADS"], \
+            'Overlap param gather is only supported with OPTIMIZER_STATES sharding strategy or OPTIMIZER_STATES_AND_GRADS sharding strategy'
         assert args.overlap_grad_reduce, \
             '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
         assert args.use_mcore_models, \
