@@ -305,6 +305,11 @@ class DistributedDataParallel(MegatronModule):
             and self.module.training
         ):
             self.model_parameters_allgather()
+            self.register_backward_hook()
+
+            # reset the attribute of the parameters before the forward pass
+            for _, param_shard in self.named_parameter_shardings():
+                param_shard.reset_attribute()
 
         return self.module(*inputs, **kwargs)
 
@@ -338,7 +343,9 @@ class DistributedDataParallel(MegatronModule):
                 item_idx = grad_buffer.param_idx[param]
                 bucket = grad_buffer.put_into_bucket(item_idx, param.grad.data)
                 if len(bucket.items) == len(bucket.requires_grad_items):
-                    grad_buffer.reduce_scatter_bucket_and_add_on_local_shard(bucket.bucket_id)
+                    grad_buffer.reduce_scatter_bucket_and_add_on_local_shard(
+                        bucket.id, async_op=self.overlap_grad_reduce
+                    )
 
             expert_parallel = not getattr(param, 'allreduce', True)
             grad_buffer = self.expert_grad_buffer if expert_parallel else self.dense_grad_buffer

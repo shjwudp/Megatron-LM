@@ -157,20 +157,24 @@ class DataParallelBuffer:
         return bucket
 
     @torch.no_grad()
-    def reduce_scatter_bucket_and_add_on_local_shard(self, bucket_id: int) -> None:
-        bucket = self.bucket[bucket_id]
+    def reduce_scatter_bucket_and_add_on_local_shard(
+        self, bucket_id: int, async_op: bool = False
+    ) -> None:
+        bucket = self.buckets[bucket_id]
         shard_bucket_index = self.shard_bucket_index_map[bucket_id]
         offset = shard_bucket_index.bucket_data_index
         shard_size = shard_bucket_index.size
         shard = bucket.data[offset : offset + shard_size]
 
         bucket.data *= 1.0 / self.data_parallel_world_size
-        torch.distributed.reduce_scatter_tensor(
+        reduce_scatter_handler = torch.distributed.reduce_scatter_tensor(
             output=shard,
             input=bucket.data,
             op=torch.distributed.ReduceOp.SUM,
             group=self.data_parallel_group,
+            async_op=async_op,
         )
+        reduce_scatter_handler.wait()
 
         # gradient accumulation on local buffer
         local_buffer = self.get_bucket_local_sharding(bucket_id)
