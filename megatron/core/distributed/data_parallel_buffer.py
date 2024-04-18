@@ -158,13 +158,9 @@ class DataParallelBuffer:
 
     def wait_for_previous_reduce_scatter(self, recommeded_capacity: int = 1):
         while len(self.reduce_scatter_queue) > recommeded_capacity:
-            async_work_handler, bucket_id = self.reduce_scatter_queue.pop(0)
+            async_work_handler, callback = self.reduce_scatter_queue.pop(0)
             async_work_handler.wait()
-
-            local_buffer = self.get_shard_from_local_buffer(bucket_id)
-            local_buffer += self.get_shard_from_bucket(self.buckets[bucket_id])
-
-            del self.buckets[bucket_id]
+            callback()
 
     def get_shard_from_bucket(self, bucket):
         shard_bucket_index = self.shard_bucket_index_map[bucket.id]
@@ -196,15 +192,22 @@ class DataParallelBuffer:
             group=self.data_parallel_group,
             async_op=async_op,
         )
+
+        def ga_closure():
+            def gradient_accumulate():
+                # gradient accumulation on local buffer
+                local_buffer = self.get_shard_from_local_buffer(bucket_id)
+                local_buffer += shard
+                del self.buckets[bucket_id]
+
+            return gradient_accumulate
+        gradient_accumulate = ga_closure()
+
         if async_op:
-            self.reduce_scatter_queue.append((reduce_scatter_handler, bucket_id))
+            self.reduce_scatter_queue.append((reduce_scatter_handler, gradient_accumulate))
             return
 
-        # gradient accumulation on local buffer
-        local_buffer = self.get_shard_from_local_buffer(bucket_id)
-        local_buffer += shard
-
-        del self.buckets[bucket_id]
+        gradient_accumulate()
 
     def allocate_bucket(self, bucket_id: int, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         """Allocate a full size bucket by bucket id."""

@@ -363,6 +363,7 @@ class DistributedDataParallel(MegatronModule):
             def gradient_accumulate(grad_buffer, param):
                 item_idx = grad_buffer.param_idx[param]
                 bucket = grad_buffer.put_into_bucket(item_idx, param.grad.data)
+                param.grad = None
                 if len(bucket.items) == len(bucket.requires_grad_items):
                     grad_buffer.wait_for_previous_reduce_scatter()
                     grad_buffer.reduce_scatter_bucket_and_add_on_local_shard(
@@ -372,7 +373,6 @@ class DistributedDataParallel(MegatronModule):
             expert_parallel = not getattr(param, 'allreduce', True)
             grad_buffer = self.expert_grad_buffer if expert_parallel else self.dense_grad_buffer
             gradient_accumulate(grad_buffer, param)
-            param.grad = None
 
         if self.data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
             return grad_buffer_param_hook
@@ -412,6 +412,8 @@ class DistributedDataParallel(MegatronModule):
                     # copy bucket data back to local parameters
                     item = param_buffer.get_item_from_bucket(bucket, item_index.item_id)
                     param.copy_(item.view_as(param))
+
+                del bucket
 
         dense_param_dtype = self.dense_params[0].dtype if len(self.dense_params) else torch.float32
         expert_param_dtype = (
@@ -465,6 +467,10 @@ class DistributedDataParallel(MegatronModule):
             for buffer in self.buffers + self.expert_parallel_buffers:
                 buffer.finish_grad_sync()
         elif self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
+            # wait for the previous reduce-scatter to finish
+            self.expert_grad_buffer.wait_for_previous_reduce_scatter(0)
+            self.dense_grad_buffer.wait_for_previous_reduce_scatter(0)
+
             # reset the attribute of the parameters when the grad sync is finished
             for _, param_shard in self.named_parameter_shardings():
                 param_shard.reset_attribute()
