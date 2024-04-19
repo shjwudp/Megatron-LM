@@ -132,9 +132,11 @@ class DataParallelBuffer:
             guide_bucket_size,
         )
         local_buffer_size = sum([x.size for x in self.shard_bucket_index_map])
-        self.data = torch.zeros(local_buffer_size, dtype=dtype, device=device)
+        self.data = torch.empty(local_buffer_size, dtype=dtype, device=device)
         self.buckets = {}
         self.reduce_scatter_queue = []
+        self.all_gather_handler_map = {}
+        self.all_gather_queue = []
 
     def get_shard_from_local_buffer(self, bucket_id: int) -> torch.Tensor:
         """Get the local sharding of a bucket by bucket id."""
@@ -177,6 +179,62 @@ class DataParallelBuffer:
         item = bucket.data[start_index:end_index]
         return item
 
+    def get_item_index(self, item: torch.Tensor):
+        return self.item_index_map[self.param_idx[item]]
+
+    def get_bucket_params(self, bucket_id):
+        bucket_index = self.bucket_index_map[bucket_id]
+        params = [self.parameters[item_index.item_id] for item_index in bucket_index.items]
+        return params
+
+    def wait_for_all_gather_and_set_items(self, bucket_id: int):
+        if bucket_id not in self.all_gather_handler_map:
+            return
+        async_work_handler, callback = self.all_gather_handler_map[bucket_id]
+        async_work_handler.wait()
+        callback()
+        del self.all_gather_handler_map[bucket_id]
+
+    def has_bucket(self, bucket_id: int) -> bool:
+        return bucket_id in self.buckets
+
+    @torch.no_grad()
+    def allgather_bucket_and_set_items(
+        self,
+        bucket_id: int,
+        items: List[torch.Tensor],
+        async_op: bool = False,
+        bucket_dtype=torch.float32,
+    ) -> None:
+        bucket = self.allocate_bucket(bucket_id, dtype=bucket_dtype)
+        self.buckets[bucket_id] = bucket
+        shard = self.get_shard_from_bucket(bucket)
+        shard.copy_(self.get_shard_from_local_buffer(bucket_id))
+        all_gather_handler = torch.distributed.all_gather_into_tensor(
+            output_tensor=bucket.data,
+            input_tensor=shard,
+            group=self.data_parallel_group,
+            async_op=async_op,
+        )
+
+        def get_closure():
+            @torch.no_grad()
+            def copy_bucket_to_items():
+                bucket_index = self.bucket_index_map[bucket.id]
+                for item_index, item in zip(bucket_index.items, items):
+                    item.copy_(self.get_item_from_bucket(bucket, item_index.item_id).view_as(item))
+                del self.buckets[bucket_id]
+
+            return copy_bucket_to_items
+
+        copy_bucket_to_items = get_closure()
+
+        if async_op:
+            self.all_gather_handler_map[bucket_id] = (all_gather_handler, copy_bucket_to_items)
+            return
+
+        copy_bucket_to_items()
+
     @torch.no_grad()
     def reduce_scatter_bucket_and_add_on_local_shard(
         self, bucket_id: int, async_op: bool = False
@@ -193,7 +251,7 @@ class DataParallelBuffer:
             async_op=async_op,
         )
 
-        def ga_closure():
+        def get_closure():
             def gradient_accumulate():
                 # gradient accumulation on local buffer
                 local_buffer = self.get_shard_from_local_buffer(bucket_id)
@@ -201,7 +259,8 @@ class DataParallelBuffer:
                 del self.buckets[bucket_id]
 
             return gradient_accumulate
-        gradient_accumulate = ga_closure()
+
+        gradient_accumulate = get_closure()
 
         if async_op:
             self.reduce_scatter_queue.append((reduce_scatter_handler, gradient_accumulate))
@@ -222,7 +281,7 @@ class DataParallelBuffer:
         return Bucket(
             bucket_id,
             False,
-            torch.zeros(bucket_index.size, dtype=dtype, device=self.device),
+            torch.empty(bucket_index.size, dtype=dtype, device=self.device),
             items=[],
             requires_grad_items=requires_grad_items,
         )

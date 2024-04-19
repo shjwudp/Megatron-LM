@@ -224,9 +224,9 @@ class DistributedDataParallel(MegatronModule):
         data_parallel_group: torch.distributed.ProcessGroup,
         expert_data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        # Iterate through parameters in reverse order to roughly follow backprop order.
-        self.dense_params = list(reversed(self.dense_params))
-        self.expert_parallel_params = list(reversed(self.expert_parallel_params))
+        # # Iterate through parameters in reverse order to roughly follow backprop order.
+        # self.dense_params = list(reversed(self.dense_params))
+        # self.expert_parallel_params = list(reversed(self.expert_parallel_params))
 
         def allocate_data_parallel_shard_buffer(input_params, dp_group):
             device = (
@@ -257,6 +257,11 @@ class DistributedDataParallel(MegatronModule):
         self.expert_param_buffer, self.expert_grad_buffer = allocate_data_parallel_shard_buffer(
             self.expert_parallel_params, expert_data_parallel_group,
         )
+        if self.overlap_param_gather:
+            for param_buffer in [self.dense_param_buffer, self.expert_param_buffer]:
+                setattr(param_buffer, "AG_in_queue_bucket_id", -1)
+                setattr(param_buffer, "AG_completed_bucket_id", -1)
+                setattr(param_buffer, "AG_target_bucket_id", -1)
 
     def named_parameter_shardings(self):
         if self.data_parallel_sharding_strategy != "OPTIMIZER_STATES_AND_GRADS":
@@ -307,30 +312,80 @@ class DistributedDataParallel(MegatronModule):
 
         def distog_forward_pre_hook_closure():
             def forward_pre_hook(module, input):
+                any_stale = False
                 for param in module.parameters(recurse=False):
-                    handler = self.param_all_gather_handler_map[param]
-                    if handler:
-                        handler.wait()
-                    del self.param_all_gather_handler_map[param]
+                    if not getattr(param, "stale", False):
+                        continue
+
+                    any_stale = True
+                    setattr(param, "stale", False)
+                    expert_parallel = not getattr(param, 'allreduce', True)
+                    param_buffer = (
+                        self.expert_param_buffer if expert_parallel else self.dense_param_buffer
+                    )
+                    param_buffer.AG_target_bucket_id = max(
+                        param_buffer.AG_target_bucket_id,
+                        param_buffer.get_item_index(param).bucket_id,
+                    )
+
+                # Async launch all-gather and update the model parameters task.
+                for param_buffer in [self.dense_param_buffer, self.expert_param_buffer]:
+                    if any_stale:
+                        target_bucket_id = min(
+                            param_buffer.AG_target_bucket_id + 1,
+                            len(param_buffer.bucket_index_map) - 1,
+                        )
+                    else:
+                        target_bucket_id = param_buffer.AG_target_bucket_id
+
+                    while param_buffer.AG_in_queue_bucket_id < target_bucket_id:
+                        param_buffer.AG_in_queue_bucket_id += 1
+                        param_buffer.allgather_bucket_and_set_items(
+                            param_buffer.AG_in_queue_bucket_id,
+                            items=param_buffer.get_bucket_params(
+                                param_buffer.AG_in_queue_bucket_id
+                            ),
+                            async_op=self.overlap_param_gather,
+                            bucket_dtype=torch.bfloat16,
+                        )
+
+                # Wait for this forward pass related parameter all-gather to finish.
+                for param_buffer in [self.dense_param_buffer, self.expert_param_buffer]:
+                    while param_buffer.AG_completed_bucket_id < param_buffer.AG_target_bucket_id:
+                        param_buffer.AG_completed_bucket_id += 1
+                        param_buffer.wait_for_all_gather_and_set_items(
+                            param_buffer.AG_completed_bucket_id
+                        )
 
             return forward_pre_hook
 
+        self.forward_pre_hooks = {}
         if (
             self.overlap_param_gather
             and self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS"
         ):
-            self.module.register_forward_pre_hook(distog_forward_pre_hook_closure())
+            hook_fn = distog_forward_pre_hook_closure()
+            for name, module in self.module.named_modules():
+                self.forward_pre_hooks[name] = module.register_forward_pre_hook(hook_fn)
 
     def forward(self, *inputs, **kwargs):
         """
         Calls the wrapped module's forward() method.
         """
+        # All-gather and update the model parameters.
         if (
             self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS"
             and self.is_first_microbatch
+            and not self.overlap_param_gather
             and self.module.training
         ):
-            self.model_parameters_allgather()
+            for param_buffer in [self.dense_param_buffer, self.expert_param_buffer]:
+                for bucket_id, _ in enumerate(param_buffer.bucket_index_map):
+                    param_buffer.allgather_bucket_and_set_items(
+                        bucket_id,
+                        items=param_buffer.get_bucket_params(bucket_id),
+                        bucket_dtype=torch.bfloat16,
+                    )
 
         return self.module(*inputs, **kwargs)
 
@@ -360,19 +415,15 @@ class DistributedDataParallel(MegatronModule):
             if not param.requires_grad:
                 return
 
-            def gradient_accumulate(grad_buffer, param):
-                item_idx = grad_buffer.param_idx[param]
-                bucket = grad_buffer.put_into_bucket(item_idx, param.grad.data)
-                param.grad = None
-                if len(bucket.items) == len(bucket.requires_grad_items):
-                    grad_buffer.wait_for_previous_reduce_scatter()
-                    grad_buffer.reduce_scatter_bucket_and_add_on_local_shard(
-                        bucket.id, async_op=self.overlap_grad_reduce
-                    )
-
             expert_parallel = not getattr(param, 'allreduce', True)
             grad_buffer = self.expert_grad_buffer if expert_parallel else self.dense_grad_buffer
-            gradient_accumulate(grad_buffer, param)
+            bucket = grad_buffer.put_into_bucket(grad_buffer.param_idx[param], param.grad.data)
+            param.grad = None
+            if len(bucket.items) == len(bucket.requires_grad_items):
+                grad_buffer.wait_for_previous_reduce_scatter()
+                grad_buffer.reduce_scatter_bucket_and_add_on_local_shard(
+                    bucket.id, async_op=self.overlap_grad_reduce
+                )
 
         if self.data_parallel_sharding_strategy in ["NO_OP", "OPTIMIZER_STATES"]:
             return grad_buffer_param_hook
@@ -382,47 +433,6 @@ class DistributedDataParallel(MegatronModule):
             raise ValueError(
                 f'Invalid data_parallel_sharding_strategy: {self.data_parallel_sharding_strategy}'
             )
-
-    @torch.no_grad()
-    def model_parameters_allgather(self):
-        def _params_allgather(param_buffer, param_dtype):
-            for i, shard_bucket_index in enumerate(param_buffer.shard_bucket_index_map):
-                local_data_index = shard_bucket_index.local_data_index
-                offset = shard_bucket_index.bucket_data_index
-                shard_size = shard_bucket_index.size
-
-                # do parameter all-gather in temporary buffer
-                bucket = param_buffer.allocate_bucket(i, param_dtype)
-                bucket.data[offset : offset + shard_size] = param_buffer.data[
-                    local_data_index : local_data_index + shard_size
-                ]
-                all_gather_handler = torch.distributed.all_gather_into_tensor(
-                    output_tensor=bucket.data,
-                    input_tensor=bucket.data[offset : offset + shard_size],
-                    group=param_buffer.data_parallel_group,
-                    async_op=self.overlap_param_gather,
-                )
-
-                bucket_index = param_buffer.bucket_index_map[i]
-                for item_index in bucket_index.items:
-                    param = param_buffer.parameters[item_index.item_id]
-
-                    self.param_all_gather_handler_map[param] = all_gather_handler
-
-                    # copy bucket data back to local parameters
-                    item = param_buffer.get_item_from_bucket(bucket, item_index.item_id)
-                    param.copy_(item.view_as(param))
-
-                del bucket
-
-        dense_param_dtype = self.dense_params[0].dtype if len(self.dense_params) else torch.float32
-        expert_param_dtype = (
-            self.expert_parallel_params[0].dtype
-            if len(self.expert_parallel_params)
-            else torch.float32
-        )
-        _params_allgather(self.dense_param_buffer, dense_param_dtype)
-        _params_allgather(self.expert_param_buffer, expert_param_dtype)
 
     @contextmanager
     def no_sync(self):
@@ -468,12 +478,24 @@ class DistributedDataParallel(MegatronModule):
                 buffer.finish_grad_sync()
         elif self.data_parallel_sharding_strategy == "OPTIMIZER_STATES_AND_GRADS":
             # wait for the previous reduce-scatter to finish
-            self.expert_grad_buffer.wait_for_previous_reduce_scatter(0)
-            self.dense_grad_buffer.wait_for_previous_reduce_scatter(0)
+            for grad_buffer in [self.expert_grad_buffer, self.dense_grad_buffer]:
+                grad_buffer.wait_for_previous_reduce_scatter(0)
 
             # reset the attribute of the parameters when the grad sync is finished
             for _, param_shard in self.named_parameter_shardings():
                 param_shard.reset_attribute()
+
+            if self.overlap_param_gather:
+                # After the gradient synchronization is complete, the optimizer will
+                # update the parameters. We need to set the stale flag to True for
+                # all parameters, and the after program will check the stale flag
+                # and update them by parameter shard.
+                for param in self.module.parameters():
+                    setattr(param, "stale", True)
+                for param_buffer in [self.dense_param_buffer, self.expert_param_buffer]:
+                    setattr(param_buffer, "AG_in_queue_bucket_id", -1)
+                    setattr(param_buffer, "AG_completed_bucket_id", -1)
+                    setattr(param_buffer, "AG_target_bucket_id", -1)
 
     def zero_grad_buffer(self):
         """
