@@ -9,6 +9,8 @@ import logging
 import math
 import os
 import sys
+
+import torch.distributed
 from .log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
@@ -562,14 +564,39 @@ def train_step(forward_step_func, data_iterator,
         from megatron.core.models.gpt.gpt_layer_specs import (
             TransformerLayer, MoELayer
         )
-        from megatron.core.optimizer.optimizer import param_is_not_shared
+        from megatron.core.optimizer.optimizer import param_is_not_shared, ChainedOptimizer
+        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
         from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
-        from megatron.core.optimizer.clip_grads import get_tensor_norm_fp32
+        from megatron.core.optimizer.clip_grads import get_tensor_norm
 
 
-        tracing_modules = [TransformerLayer, MoELayer]
+        tracing_modules = (TransformerLayer, MoELayer)
         model_parallel_group = mpu.get_tensor_and_data_parallel_group(with_context_parallel=True)
+        tensor_parallel_group = mpu.get_tensor_model_parallel_group()
         per_layer_metrics = {}
+        optimizer_named_parameters = {}
+
+        def get_distopt_named_parameters(distopt):
+            named_parameters = {}
+            for pg in distopt.param_groups:
+                for p in pg["params"]:
+                    name = ''
+                    for buf in distopt.buffers:
+                        if p in buf.param_to_name:
+                            name = buf.param_to_name[p]
+                            break
+
+                    named_parameters[name] = p
+            return named_parameters
+
+        if isinstance(optimizer, ChainedOptimizer):
+            for opt in optimizer.optimizers:
+                if isinstance(opt, DistributedOptimizer):
+                    optimizer_named_parameters.update(get_distopt_named_parameters(opt))
+        else:
+            if isinstance(optimizer, DistributedOptimizer):
+                optimizer_named_parameters.update(get_distopt_named_parameters(optimizer))
+            
         for model_chunk in model:
             for name, module in model_chunk.named_modules():
                 if isinstance(module, tracing_modules):
@@ -581,10 +608,13 @@ def train_step(forward_step_func, data_iterator,
 
                         if is_not_shared and is_not_tp_duplicate:
                             params_for_norm.append(param)
-                            if param.grad is not None:
-                                grads_for_norm.append(param.grad)
-                    this_layer_param_norm = get_tensor_norm_fp32(params_for_norm, model_parallel_group=model_parallel_group)
-                    this_layer_grad_norm = get_tensor_norm_fp32(grads_for_norm, model_parallel_group=model_parallel_group)
+
+                            name = module.param_to_name[param]
+                            grad = optimizer_named_parameters[name].grad
+                            if grad is not None:
+                                grads_for_norm.append(grad)
+                    this_layer_param_norm = get_tensor_norm(params_for_norm, model_parallel_group=tensor_parallel_group)
+                    this_layer_grad_norm = get_tensor_norm(grads_for_norm, model_parallel_group=model_parallel_group)
                     per_layer_metrics[name] = {
                         "param_norm": this_layer_param_norm,
                         "grad_norm": this_layer_grad_norm,
@@ -598,7 +628,7 @@ def train_step(forward_step_func, data_iterator,
         local_dict = per_layer_metrics
 
         # List to store gathered dictionaries
-        gathered_dicts = [None] * pp_group.get_world_size()
+        gathered_dicts = [None] * torch.distributed.get_world_size(pp_group)
 
         # Gather all dictionaries
         torch.distributed.all_gather_object(gathered_dicts, local_dict, group=pp_group)
@@ -660,7 +690,7 @@ def train_step(forward_step_func, data_iterator,
                     numerator += val
                     denominator += 1
             loss_reduced[key] = numerator / denominator
-        return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
+        return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad, per_layer_metrics
     return {}, skipped_iter, grad_norm, num_zeros_in_grad, per_layer_metrics
 
 
@@ -751,7 +781,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
     if writer and (iteration % args.tensorboard_log_interval == 0):
-        if per_layer_metrics:
+        if wandb_writer and per_layer_metrics:
             wandb_writer.log({'per_layer_metrics': per_layer_metrics}, iteration)
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples},

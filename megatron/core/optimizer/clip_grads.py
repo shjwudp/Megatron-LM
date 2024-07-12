@@ -14,7 +14,7 @@ from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
 
 
-def get_tensor_norm(tensors, norm_type=2.0, model_parallel_group=None):
+def get_tensor_norm(tensors, norm_type=2.0, max_norm=1., model_parallel_group=None):
     # Norm parameters.
     max_norm = float(max_norm)
     norm_type = float(norm_type)

@@ -91,6 +91,7 @@ class DistributedDataParallel(MegatronModule):
                 dense_params.append(param)
             else:
                 expert_parallel_params.append(param)
+        self.param_to_name = param_to_name
 
         def allocate_buffers_for_parameters(
             input_params, data_parallel_group, gradient_scaling_factor,

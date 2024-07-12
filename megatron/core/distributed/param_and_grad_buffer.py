@@ -227,6 +227,7 @@ class ParamAndGradBuffer:
         self.buckets = []
         self.param_to_bucket = {}  # Param -> bucket mapping.
         self.param_index_map = {}  # Param -> location in buffer mapping (used in dist. optimizer).
+        self.param_to_name = param_to_name
 
         def _pad(number_to_be_padded: int, divisor: int) -> int:
             return int(math.ceil(number_to_be_padded / divisor) * divisor)
