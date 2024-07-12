@@ -578,15 +578,19 @@ def train_step(forward_step_func, data_iterator,
 
         def get_distopt_named_parameters(distopt):
             named_parameters = {}
-            for pg in distopt.param_groups:
-                for p in pg["params"]:
-                    name = ''
+            group_pairs = list(zip(distopt.shard_fp32_from_float16_groups, distopt.model_float16_groups)) + list(zip(distopt.shard_fp32_groups, distopt.model_fp32_groups))
+            for shard_main_group, model_group in group_pairs:
+                for shard_main_param, model_param in zip(shard_main_group, model_group):
                     for buf in distopt.buffers:
-                        if p in buf.param_to_name:
-                            name = buf.param_to_name[p]
-                            break
+                        if model_param in buf.param_to_name:
+                            name = buf.param_to_name[model_param]
+                            param_range_map = distopt._get_model_param_range_map(model_param)
+                            param_range = param_range_map["param"]
 
-                    named_parameters[name] = p
+                            model_grad = model_param.main_grad
+                            shard_model_grad = model_grad.view(-1)[param_range.start: param_range.end]
+
+                            named_parameters[name] = (shard_main_param, shard_model_grad)
             return named_parameters
 
         if isinstance(optimizer, ChainedOptimizer):
@@ -609,8 +613,8 @@ def train_step(forward_step_func, data_iterator,
                         if is_not_shared and is_not_tp_duplicate:
                             params_for_norm.append(param)
 
-                            name = module.param_to_name[param]
-                            grad = optimizer_named_parameters[name].grad
+                            name = model_chunk.param_to_name[param]
+                            grad = optimizer_named_parameters[name][1]
                             if grad is not None:
                                 grads_for_norm.append(grad)
                     this_layer_param_norm = get_tensor_norm(params_for_norm, model_parallel_group=tensor_parallel_group)
