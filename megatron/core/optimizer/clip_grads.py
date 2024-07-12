@@ -14,6 +14,55 @@ from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
 
 
+def get_tensor_norm(tensors, norm_type=2.0, model_parallel_group=None):
+    # Norm parameters.
+    max_norm = float(max_norm)
+    norm_type = float(norm_type)
+    total_norm = 0.0
+
+    # Calculate norm.
+    if norm_type == inf:
+        total_norm = max(grad.abs().max() for grad in tensors)
+        total_norm_cuda = torch.tensor([float(total_norm)], dtype=torch.float, device='cuda')
+        # Take max across all model-parallel GPUs.
+        torch.distributed.all_reduce(
+            total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=model_parallel_group
+        )
+        total_norm = total_norm_cuda[0].item()
+
+    else:
+        if norm_type == 2.0:
+            dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+            # Use apex's multi-tensor applier for efficiency reasons.
+            # Multi-tensor applier takes a function and a list of list
+            # and performs the operation on that list all in one kernel.
+            if tensors:
+                norm, _ = multi_tensor_applier(
+                    amp_C.multi_tensor_l2norm,
+                    dummy_overflow_buf,
+                    [tensors],
+                    False,  # no per-parameter norm
+                )
+            else:
+                norm = torch.tensor([0], dtype=torch.float, device='cuda')
+            # Since we will be summing across data parallel groups,
+            # we need the pow(norm-type).
+            total_norm = norm ** norm_type
+
+        else:
+            for t in tensors:
+                norm = torch.norm(t, norm_type)
+                total_norm += norm ** norm_type
+
+        # Sum across all model-parallel GPUs.
+        torch.distributed.all_reduce(
+            total_norm, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group
+        )
+        total_norm = total_norm.item() ** (1.0 / norm_type)
+
+    return total_norm
+
+
 def clip_grad_norm_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],

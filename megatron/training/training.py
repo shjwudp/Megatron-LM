@@ -557,6 +557,57 @@ def train_step(forward_step_func, data_iterator,
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False)
 
+    # Collect per-layer metrics.
+    if args.curr_iteration % args.tensorboard_log_interval == 0:
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            TransformerLayer, MoELayer
+        )
+        from megatron.core.optimizer.optimizer import param_is_not_shared
+        from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+        from megatron.core.optimizer.clip_grads import get_tensor_norm_fp32
+
+
+        tracing_modules = [TransformerLayer, MoELayer]
+        model_parallel_group = mpu.get_tensor_and_data_parallel_group(with_context_parallel=True)
+        per_layer_metrics = {}
+        for model_chunk in model:
+            for name, module in model_chunk.named_modules():
+                if isinstance(module, tracing_modules):
+                    params_for_norm = []
+                    grads_for_norm = []
+                    for param in module.parameters():
+                        is_not_shared = param_is_not_shared(param)
+                        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+
+                        if is_not_shared and is_not_tp_duplicate:
+                            params_for_norm.append(param)
+                            if param.grad is not None:
+                                grads_for_norm.append(param.grad)
+                    this_layer_param_norm = get_tensor_norm_fp32(params_for_norm, model_parallel_group=model_parallel_group)
+                    this_layer_grad_norm = get_tensor_norm_fp32(grads_for_norm, model_parallel_group=model_parallel_group)
+                    per_layer_metrics[name] = {
+                        "param_norm": this_layer_param_norm,
+                        "grad_norm": this_layer_grad_norm,
+                    }
+                    if isinstance(module, MoELayer):
+                        if module.router is not None:
+                            per_layer_metrics[name]["aux_loss"] = getattr(module.router, "aux_loss", -1)
+                            per_layer_metrics[name]["z_loss"] = getattr(module.router, "z_loss", -1)
+        pp_group = mpu.get_pipeline_model_parallel_group()
+        # Your local dictionary
+        local_dict = per_layer_metrics
+
+        # List to store gathered dictionaries
+        gathered_dicts = [None] * pp_group.get_world_size()
+
+        # Gather all dictionaries
+        torch.distributed.all_gather_object(gathered_dicts, local_dict, group=pp_group)
+        per_layer_metrics = {}
+        for d in gathered_dicts:
+            per_layer_metrics.update(d)
+    else:
+        per_layer_metrics = {}
+
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
         torch.cuda.empty_cache()
@@ -610,12 +661,13 @@ def train_step(forward_step_func, data_iterator,
                     denominator += 1
             loss_reduced[key] = numerator / denominator
         return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
-    return {}, skipped_iter, grad_norm, num_zeros_in_grad
+    return {}, skipped_iter, grad_norm, num_zeros_in_grad, per_layer_metrics
 
 
 def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
-                 grad_norm, params_norm, num_zeros_in_grad):
+                 grad_norm, params_norm, num_zeros_in_grad,
+                 per_layer_metrics):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -699,6 +751,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
     if writer and (iteration % args.tensorboard_log_interval == 0):
+        if per_layer_metrics:
+            wandb_writer.log({'per_layer_metrics': per_layer_metrics}, iteration)
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples},
                              iteration)
@@ -1023,7 +1077,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         update_num_microbatches(args.consumed_train_samples, consistency_check=True)
 
         args.curr_iteration = iteration
-        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad, per_layer_metrics = \
             train_step(forward_step_func,
                        train_data_iterator,
                        model,
@@ -1060,7 +1114,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           decoupled_learning_rate,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
-                                          grad_norm, params_norm, num_zeros_in_grad)
+                                          grad_norm, params_norm, num_zeros_in_grad,
+                                          per_layer_metrics)
         # StragglerDetector
         if iteration % args.log_interval == 0 and args.log_straggler:
             stimer.report(total_flops, args.log_interval)

@@ -185,6 +185,7 @@ class TopKRouter(Router):
             self.layer_number,
             self.config.num_layers,
         )
+        self.aux_loss = aux_loss
         activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
         return activation
 
@@ -203,6 +204,7 @@ class TopKRouter(Router):
                 self.config.moe_z_loss_coeff / parallel_state.get_tensor_model_parallel_world_size()
             )
             z_loss = z_loss_func(logits, moe_z_loss_coeff)
+            self.z_loss = z_loss
             logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
             save_to_aux_losses_tracker(
                 "z_loss",
