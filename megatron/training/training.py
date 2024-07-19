@@ -614,10 +614,11 @@ def train_step(forward_step_func, data_iterator,
                             params_for_norm.append(param)
 
                             name = model_chunk.param_to_name[param]
-                            grad = optimizer_named_parameters[name][1]
-                            if grad is not None:
-                                grads_for_norm.append(grad)
-                    this_layer_param_norm = get_tensor_norm(params_for_norm, model_parallel_group=tensor_parallel_group)
+                            if name in optimizer_named_parameters:
+                                grad = optimizer_named_parameters[name][1]
+                                if grad is not None:
+                                    grads_for_norm.append(grad)
+                    this_layer_param_norm = get_tensor_norm(params_for_norm, model_parallel_group=model_parallel_group)
                     this_layer_grad_norm = get_tensor_norm(grads_for_norm, model_parallel_group=model_parallel_group)
                     per_layer_metrics[name] = {
                         "param_norm": this_layer_param_norm,
