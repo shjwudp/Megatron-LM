@@ -620,7 +620,7 @@ def train_step(forward_step_func, data_iterator,
                                     grads_for_norm.append(grad)
                     this_layer_param_norm = get_tensor_norm(params_for_norm, model_parallel_group=model_parallel_group)
                     this_layer_grad_norm = get_tensor_norm(grads_for_norm, model_parallel_group=model_parallel_group)
-                    per_layer_metrics[name] = {
+                    per_layer_metrics[f"PP{mpu.get_pipeline_model_parallel_rank()}_{name}"] = {
                         "param_norm": this_layer_param_norm,
                         "grad_norm": this_layer_grad_norm,
                     }
