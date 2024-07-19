@@ -602,7 +602,7 @@ def train_step(forward_step_func, data_iterator,
                 optimizer_named_parameters.update(get_distopt_named_parameters(optimizer))
             
         for model_chunk in model:
-            for name, module in model_chunk.named_modules():
+            for module_name, module in model_chunk.named_modules():
                 if isinstance(module, tracing_modules):
                     params_for_norm = []
                     grads_for_norm = []
@@ -618,7 +618,7 @@ def train_step(forward_step_func, data_iterator,
                                 grad = optimizer_named_parameters[name][1]
                                 if grad is not None:
                                     grads_for_norm.append(grad)
-                    this_layer_param_norm = get_tensor_norm(params_for_norm, model_parallel_group=model_parallel_group)
+                    this_layer_param_norm = get_tensor_norm(params_for_norm, model_parallel_group=tensor_parallel_group)
                     this_layer_grad_norm = get_tensor_norm(grads_for_norm, model_parallel_group=model_parallel_group)
                     per_layer_metrics[f"PP{mpu.get_pipeline_model_parallel_rank()}_{name}"] = {
                         "param_norm": this_layer_param_norm,
@@ -626,8 +626,10 @@ def train_step(forward_step_func, data_iterator,
                     }
                     if isinstance(module, MoELayer):
                         if module.router is not None:
-                            per_layer_metrics[name]["aux_loss"] = getattr(module.router, "aux_loss", -1)
-                            per_layer_metrics[name]["z_loss"] = getattr(module.router, "z_loss", -1)
+                            per_layer_metrics[f"PP{mpu.get_pipeline_model_parallel_rank()}_{module_name}"] = {
+                                "aux_loss": getattr(module.router, "aux_loss", -1),
+                                "z_loss": getattr(module.router, "z_loss", -1),
+                            }
         pp_group = mpu.get_pipeline_model_parallel_group()
         # Your local dictionary
         local_dict = per_layer_metrics
