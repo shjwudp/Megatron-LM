@@ -16,6 +16,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         cpu_optimizer_cls=None, 
         gpu_optimizer_cls=None, 
         pin_cpu_grads: bool=True, 
+        pin_cpu_params: bool=True,
         overlap: bool=False, 
         multi_streams: bool = True,
         **kwargs
@@ -30,6 +31,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
         self.offload_fraction = offload_fraction
         self.pin_cpu_grads = pin_cpu_grads
+        self.pin_cpu_params = pin_cpu_params
 
         (
             self.cpu_params,
@@ -221,7 +223,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         for param in params:
             if offloaded_params_numel + param.numel() <= offload_threshold:
                 assert param.is_cuda
-                param_cpu_copy = param.detach().cpu().pin_memory()
+                param_cpu_copy = param.detach().cpu()
+                if self.pin_cpu_params:
+                    param_cpu_copy = param_cpu_copy.pin_memory()
                 param_cpu_copy.requires_grad = True
                 gpu_params_map_cpu_copy[param] = param_cpu_copy
                 cpu_copys_map_gpu_param[param_cpu_copy] = param

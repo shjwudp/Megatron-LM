@@ -264,6 +264,8 @@ def _get_megatron_optimizer_based_on_param_groups(
     if config.optimizer_cpu_offloading:
         gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
         cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
+        if config.use_torch_optimizer:
+            gpu_optimizer_cls = cpu_optimizer_cls
         if config.optimizer == 'adam':
             gpu_optimizer_cls = Adam
             cpu_optimizer_cls = CPUAdam
@@ -286,6 +288,10 @@ def _get_megatron_optimizer_based_on_param_groups(
             offload_fraction=config.optimizer_offload_fraction,
             cpu_optimizer_cls=cpu_optimizer_cls,
             gpu_optimizer_cls=gpu_optimizer_cls,
+            overlap=config.overlap_optimizer,
+            multi_streams=config.multi_streams,
+            pin_cpu_grads=config.pin_cpu_grads,
+            pin_cpu_params=config.pin_cpu_params,
             **optimizer_defaults,
         )
         init_state_fn = None
