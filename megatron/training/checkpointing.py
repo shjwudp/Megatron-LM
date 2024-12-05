@@ -1149,21 +1149,11 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     # Model.
     strict = False if args.retro_add_retriever else strict
     if len(model) == 1:
-        missing_keys, unexpected_keys = model[0].load_state_dict(state_dict['model'], strict=False)
+        model[0].load_state_dict(state_dict['model'], strict=strict)
     else:
-        missing_keys, unexpected_keys = [], []
         for i in range(len(model)):
             mpu.set_virtual_pipeline_model_parallel_rank(i)
-            _missing, _unexpected = model[i].load_state_dict(state_dict['model%d' % i], strict=False)
-            missing_keys.extend(_missing)
-            unexpected_keys.extend(_unexpected)
-    if strict:
-        assert len(unexpected_keys) == 0, f"Find unsupported keys in checkpoint: {str(unexpected_keys)}"
-        flag = False
-        for k in missing_keys:
-            if 'extra_state' not in k:
-                flag = True
-        assert not flag, f"Missing keys: {str(missing_keys)}"
+            model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
 
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
