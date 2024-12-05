@@ -187,10 +187,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             optimizer.load_state_dict({"state": state, "param_groups": param_groups})
 
     def step(self, closure=None):
-        self._step_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self._step_stream):
-            self.gpu_optimizer.step(closure)
-        self._step_stream.record_event().wait(torch.cuda.current_stream())
+        if self.gpu_optimizer:
+            self._step_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._step_stream):
+                self.gpu_optimizer.step(closure)
+            self._step_stream.record_event().wait(torch.cuda.current_stream())
         for cpu_optimizer in self.cpu_optimizers:
             d2h_event = self._cpu_optimizer_map_data_event.pop(cpu_optimizer, None)
             if d2h_event is not None:
@@ -218,7 +219,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         cpu_copys_map_gpu_param = {}
         offloaded_params_numel = 0
         for param in params:
-            if offloaded_params_numel < offload_threshold:
+            if offloaded_params_numel + param.numel() <= offload_threshold:
                 assert param.is_cuda
                 param_cpu_copy = param.detach().cpu().pin_memory()
                 param_cpu_copy.requires_grad = True
