@@ -103,9 +103,6 @@ class OptimizerConfig:
 
     optimizer_cpu_offloading: bool = False
 
-    optimizer_offload_policy: str = 'static'
-    """CPU Offload Policy used by OffloadDistributedOptimizer, valid if base optimizer is HybridAdam"""
-
     optimizer_offload_fraction: float = 0.0
     """CPU Offload Fraction used by static offload policy, valid if base optimizer is HybridAdam"""
     
