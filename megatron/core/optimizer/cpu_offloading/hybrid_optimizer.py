@@ -1,7 +1,6 @@
 import copy
 from collections import defaultdict
 from typing import Any, Dict, Iterable, Union, TypeAlias, List
-
 import torch
 
 
@@ -25,6 +24,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             "cpu_optimizer_cls": cpu_optimizer_cls,
             "gpu_optimizer_cls": gpu_optimizer_cls,
             "offload_fraction": offload_fraction,
+            "pin_cpu_grads": pin_cpu_grads,
+            "pin_cpu_params": pin_cpu_params, 
+            "overlap": overlap,
+            "multi_streams": multi_streams,
             **kwargs,
         })
         assert not overlap or multi_streams, "Overlap CPU optimizers must be used with multi CUDA streams!"
@@ -43,12 +46,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if overlap and len(self.cpu_params) > 0:
             (
                 self.cpu_optimizers, 
-                self.param_optimizer_mapping, 
                 self.n_params
             ) = self.build_cpu_optimizer_list(cpu_optimizer_cls, self.cpu_params, **kwargs)
         else:
             self.cpu_optimizers: List[torch.optim.Optimizer] = [cpu_optimizer_cls(self.cpu_params, **kwargs)] if len(self.cpu_params) > 0 else list()
-            self.param_optimizer_mapping = lambda _: 0
             self.n_params = [len(self.cpu_params)]
 
         if len(self.gpu_params) > 0:
@@ -75,11 +76,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             cpu_params (List[torch.Tensor]): The CPU parameters Tensor list
         """
         cpu_optimizers = []
-        param_optimizer_mapping = dict()
         n_params = []
 
         if len(cpu_params) == 0:
-            return cpu_optimizers, param_optimizer_mapping, n_params
+            return cpu_optimizers, n_params
         
         if not isinstance(cpu_params[0], torch.Tensor):
             for group in cpu_params:
@@ -88,22 +88,20 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 if isinstance(params, torch.Tensor):
                     params = [params]
                 for param in params:
-                    param_optimizer_mapping[param] = len(cpu_optimizers)
                     _cpu_param_group = group_defaults.copy()
                     _cpu_param_group["params"] = [param]
                     cpu_optimizers.append(
                         cpu_optimizer_cls([_cpu_param_group], **kwargs)
                     )
                     n_params.append(1)
-            return cpu_optimizers, param_optimizer_mapping, n_params
+            return cpu_optimizers,  n_params
 
         for param in cpu_params:
-            param_optimizer_mapping[param] = len(cpu_optimizers)
             cpu_optimizers.append(
                 cpu_optimizer_cls([param], **kwargs)
             )
             n_params.append(1)
-        return cpu_optimizers, param_optimizer_mapping, n_params
+        return cpu_optimizers, n_params
 
     def register_grad_cpu_copy_hook(self):
         def grad_cpu_copy_hook_closure():
@@ -136,11 +134,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
     def register_param_copy_back_gpu_hook(self):
         def param_copy_back_gpu_hook_closure():
-            def param_copy_back_gpu_hook(optimizer, args, kwargs):
+            def param_copy_back_gpu_hook(optimizer: torch.optim.Optimizer, args, kwargs):
                 self._h2d_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self._h2d_stream):      
-                    for cpu_copy, gpu_param in self.cpu_copys_map_gpu_param.items():
-                        gpu_param.data.copy_(cpu_copy.data, non_blocking=True)
+                    for group in optimizer.param_groups:
+                        for cpu_copy in group['params']:
+                            self.cpu_copys_map_gpu_param[cpu_copy].data.copy_(cpu_copy.data, non_blocking=True)
                 self._d2h_stream.record_event().wait(
                     torch.cuda.current_stream()
                 )
