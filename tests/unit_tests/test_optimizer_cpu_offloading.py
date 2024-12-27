@@ -30,26 +30,23 @@ class Net(nn.Module):
         return x
 
 
-@pytest.mark.parametrize('with_param_groups', [False, True])
-def test_multi_device_hybrid_optimizer(with_param_groups):
+def test_multi_device_hybrid_optimizer():
     net = Net().cuda()
 
     params = list(net.parameters())
-    if with_param_groups:
-        param_groups = [
-            {"params": params[: len(params) // 2],
-            "wd_mult": 0.1,
-            "lr_mult": 0.1,
-            },
-            {"params": params[len(params) // 2 :],
-            "wd_mult": 0.2,
-            "lr_mult": 0.2,},
-        ]
-        params = param_groups
+    param_groups = [
+        {"params": params[: len(params) // 2],
+        "wd_mult": 0.1,
+        "lr_mult": 0.1,
+        "device": "cpu",
+        },
+        {"params": params[len(params) // 2 :],
+        "wd_mult": 0.2,
+        "lr_mult": 0.2,},
+    ]
 
     hdo = HybridDeviceOptimizer(
-        params,
-        offload_fraction=0.5,
+        param_groups,
         cpu_optimizer_cls=Adam,
         gpu_optimizer_cls=FusedAdam,
         lr=0.1,

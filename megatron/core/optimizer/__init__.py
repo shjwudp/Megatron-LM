@@ -52,6 +52,7 @@ def _get_param_groups(
     min_lr: float,
     decoupled_lr: Optional[float],
     decoupled_min_lr: Optional[float],
+    cpu_offload_fraction: Optional[float] = None,
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
@@ -79,6 +80,10 @@ def _get_param_groups(
     """
 
     use_decoupled_learning_rate = decoupled_lr is not None
+    total_params_numel = sum([param.numel() for model_chunk in model_chunks for param in model_chunk.parameters() if param.requires_grad])
+    offload_threshold = cpu_offload_fraction * total_params_numel if cpu_offload_fraction is not None else None
+    offload_params_numel = 0
+
 
     # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
     params_map = {}
@@ -86,6 +91,13 @@ def _get_param_groups(
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
+
+            if offload_threshold is not None:
+                offload_params_numel += param.numel()
+                if offload_params_numel < offload_threshold:
+                    device = "cpu"
+                else:
+                    device = "gpu"
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
@@ -117,13 +129,13 @@ def _get_param_groups(
             ):
                 is_decoupled_lr = True
 
-            key = (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
+            key = (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr, device)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
 
     param_groups = []
-    for (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr), params in params_map.items():
+    for (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr, device), params in params_map.items():
         assert len(params) > 0
         param_group = {
             'params': params,
@@ -132,6 +144,8 @@ def _get_param_groups(
             'is_expert_parallel': is_expert_parallel,
             'is_decoupled_lr': is_decoupled_lr,
         }
+        if device == "cpu":
+            param_group["device"] = "cpu"
         param_groups.append(param_group)
 
     param_groups = _update_min_and_max_lr_in_param_groups(
@@ -283,7 +297,6 @@ def _get_megatron_optimizer_based_on_param_groups(
             )
         optimizer = HybridDeviceOptimizer(
             param_groups,
-            offload_fraction=config.optimizer_offload_fraction,
             cpu_optimizer_cls=cpu_optimizer_cls,
             gpu_optimizer_cls=gpu_optimizer_cls,
             **optimizer_defaults,
