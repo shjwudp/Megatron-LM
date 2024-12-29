@@ -28,7 +28,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.pin_cpu_grads = pin_cpu_grads
         self.sub_optimizer_kwargs = kwargs
 
-        self._init_sub_optimizers(params)
+        self._init_sub_optimizers()
         self._register_state_dict_hooks()
         self._register_optimizer_step_hooks()
 
@@ -90,7 +90,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if self.cpu_optimizer:
             self.cpu_optimizer.step(closure)
 
-    def _init_sub_optimizers(self, params):
+    def _init_sub_optimizers(self):
         cpu_optimizer_cls = self.defaults["cpu_optimizer_cls"]
         gpu_optimizer_cls = self.defaults["gpu_optimizer_cls"]
 
@@ -99,7 +99,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self.gpu_param_groups,
             self.gpu_params_map_cpu_copy,
             self.cpu_copys_map_gpu_param,
-        ) = self._get_sub_optimizer_param_groups(params)
+        ) = self._get_sub_optimizer_param_groups()
 
         self.sub_optimizers = []
         if len(self.cpu_param_groups) > 0:
@@ -182,14 +182,15 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         for optimizer in self.sub_optimizers:
             new_param_groups = []
             for group in optimizer.param_groups:
+                if len(group["params"]) == 0:
+                    continue
+
                 new_group = group.copy()
                 # After sync-up the sub-optimizer last update, we need to sync-up the
                 # HDO new param_groups attributes to the sub-optimizer.
-                assert len(group["params"]) > 0, "param_groups should not be empty"
                 group_id, _ = param_in_param_group_index[group["params"][0]]
                 update_group_attrs = self.param_groups[group_id].copy()
                 del update_group_attrs["params"]
-                update_group_attrs.pop("_param_sub_optimizer_attrs", None)
                 new_group.update(update_group_attrs)
 
                 new_param_groups.append(new_group)
@@ -212,7 +213,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             # After loading state_dict, the parameters may change, and we need to
             # reinitialize the sub-optimizers to regenerate the new parameters and
             # cpu copy pairs.
-            self._init_sub_optimizers(self.param_groups)
+            self._init_sub_optimizers()
             self._sync_hdo_param_groups_to_sub_optimizers()
             self._sync_hdo_state_to_sub_optimizers()
 
@@ -233,10 +234,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self._sync_sub_optimizers_state_to_hdo()
 
         self.register_step_post_hook(post_step_hook)
-
-    def zero_grad(self, set_to_none: bool = True):
-        for optimizer in self.sub_optimizers:
-            optimizer.zero_grad(set_to_none)
 
     def dummy_step(self):
         """

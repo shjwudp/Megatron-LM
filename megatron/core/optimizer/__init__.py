@@ -92,12 +92,11 @@ def _get_param_groups(
             if not param.requires_grad:
                 continue
 
+            device = "gpu"
             if offload_threshold is not None:
                 offload_params_numel += param.numel()
                 if offload_params_numel < offload_threshold:
                     device = "cpu"
-                else:
-                    device = "gpu"
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
