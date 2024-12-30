@@ -237,6 +237,7 @@ def _get_param_groups_and_buffers(
         min_lr=config.min_lr,
         decoupled_lr=config.decoupled_lr,
         decoupled_min_lr=config.decoupled_min_lr,
+        cpu_offload_fraction=config.optimizer_offload_fraction,
     )
     param_groups = list(filter(filter_fn, param_groups))
     buffers = {}
