@@ -600,6 +600,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
             assert len(steps) == 1
             step = steps[0]
+        elif isinstance(self.optimizer, HybridDeviceOptimizer):
+            step = None
+            for optimizer in self.optimizer.sub_optimizers:
+                if isinstance(optimizer, torch.optim.AdamW):
+                    if len(optimizer.state) == 0:
+                        continue
+                    steps = list(set([s["step"].item() for s in optimizer.state.values()]))
+                    assert len(steps) == 1, f"steps: {optimizer.state}"
+                    step = steps[0]
+                    break
 
         # Optimizer state (do not store parameter state here).
         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}
@@ -608,6 +618,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if not HAVE_APEX_OR_TE:
                 # Native PyTorch param group requires step (i.e., iteration).
                 param_group["step"] = step
+            elif isinstance(self.optimizer, HybridDeviceOptimizer) and step is not None:
+                param_group["step"] = int(step)
 
         # Grad scaler state.
         if self.grad_scaler:
@@ -707,6 +719,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for s in state_dict_state.values():
                 # Native PyTorch state dict requires step (i.e., iteration).
                 s["step"] = step
+        elif isinstance(self.optimizer, HybridDeviceOptimizer):
+            # Handle Torch AdamW special case, which, unlike FusedAdam, Torch AdamW
+            # has an extra optimizer state “step”.
+            steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"] if "step" in g]))
+            if len(steps) != 0:
+                assert len(steps) == 1, f"steps: {steps}"
+                step = torch.tensor(steps[0], dtype=torch.float32, device="cpu")
+                for v in self.optimizer.state.values():
+                    v["step"] = step.detach().clone()
 
         # Optimizer.
         self.optimizer.load_state_dict(
@@ -1128,25 +1149,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         prefix = 'optimizer.state'
         state = {}
 
-        if isinstance(self.optimizer, HybridDeviceOptimizer):
-            # Prepare a map of each parameter and layer offset to be used for
-            # dist-checkpoint sharded tensor creation for special state "step".
-            param_prepend_offsets = {}
-
-            # Initialize the map with zeros for all parameters.
-            for model_chunk in self.model_chunks:
-                for module in model_chunk.modules():
-                    for param in module.parameters():
-                        param_prepend_offsets[param] = []
-
-            # Update the map with the actual layer offset for TransformerLayer parameters.
-            for model_chunk in self.model_chunks:
-                for module in model_chunk.modules():
-                    if hasattr(module, 'layer_number'):
-                        offset = module.layer_number - 1
-                        for name, param in module.named_parameters():
-                            param_prepend_offsets[param] = [(0, offset, module.config.num_layers)]
-
         # Not stored in the checkpoint, used only to identify params in
         # `sharded_param_state_fs_model_space`.
         param_idx = 0
@@ -1180,27 +1182,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # params.
                         for state_key, state_ten in tensors.items():
                             if state_key == 'step':
-                                assert isinstance(self.optimizer, HybridDeviceOptimizer), (
-                                    f"Unexpected optimizer type: {type(self.optimizer).__name__}. "
-                                    "This branch is specifically designed for HybridDeviceOptimizer. "
-                                )
                                 # Note that step is a 0-dim tensor, unlike other
                                 # states have the same size as the parameter.
-                                # Here a specially constructed replica_id is used
-                                # to ensure that only one rank in the DP ranks
-                                # will hold the step tensor.
-                                prepend_offsets = param_prepend_offsets[model_param]
-                                tensors[state_key] = ShardedTensor.from_rank_offsets(
-                                    f'{prefix}.{state_key}.{sharded_metadata.key}',
-                                    state_ten,
-                                    *prepend_offsets,
-                                    replica_id=(
-                                        *replica_id[:2],
-                                        0 if param_range.start == 0 else -1,
-                                    ),
-                                    prepend_axis_num=len(prepend_offsets),
-                                )
-                                tensors[state_key].validate_metadata_integrity()
+                                # The optimizer state of STEP is handled 
+                                # specifically and is read from param_groups.
                                 continue
 
                             replace_kwargs = dict(

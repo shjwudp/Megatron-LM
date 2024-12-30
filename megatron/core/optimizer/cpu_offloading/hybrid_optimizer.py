@@ -30,7 +30,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.pin_cpu_grads = pin_cpu_grads
         self.sub_optimizer_kwargs = kwargs
 
-        self._init_sub_optimizers(params)
+        self._init_sub_optimizers()
         self._register_state_dict_hooks()
         self._register_optimizer_step_hooks()
 
@@ -92,27 +92,26 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if self.cpu_optimizer:
             self.cpu_optimizer.step(closure)
 
-    def _init_sub_optimizers(self, params):
+    def _init_sub_optimizers(self):
         offload_fraction = self.defaults["offload_fraction"]
         cpu_optimizer_cls = self.defaults["cpu_optimizer_cls"]
         gpu_optimizer_cls = self.defaults["gpu_optimizer_cls"]
-        kwargs = self.sub_optimizer_kwargs
 
         (
-            self.cpu_params,
-            self.gpu_params,
+            self.cpu_param_groups,
+            self.gpu_param_groups,
             self.gpu_params_map_cpu_copy,
             self.cpu_copys_map_gpu_param,
-        ) = self._split_parameters_updated_on_the_cpu_and_gpu(params, offload_fraction)
+        ) = self._split_parameters_updated_on_the_cpu_and_gpu(self.param_groups, offload_fraction)
 
         self.sub_optimizers = []
-        if len(self.cpu_params) > 0:
-            self.cpu_optimizer = cpu_optimizer_cls(self.cpu_params, **kwargs)
+        if len(self.cpu_param_groups) > 0:
+            self.cpu_optimizer = cpu_optimizer_cls(self.cpu_param_groups)
             self.sub_optimizers.append(self.cpu_optimizer)
         else:
             self.cpu_optimizer = None
-        if len(self.gpu_params) > 0:
-            self.gpu_optimizer = gpu_optimizer_cls(self.gpu_params, **kwargs)
+        if len(self.gpu_param_groups) > 0:
+            self.gpu_optimizer = gpu_optimizer_cls(self.gpu_param_groups)
             self.sub_optimizers.append(self.gpu_optimizer)
         else:
             self.gpu_optimizer = None
@@ -166,7 +165,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             for group in param_groups:
                 group_defaults = group.copy()
                 del group_defaults["params"]
-                group_defaults.pop("_param_sub_optimizer_attrs", None)
                 _cpu_params = []
                 _gpu_params = []
                 for param in group["params"]:
@@ -234,7 +232,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 group_id, _ = param_in_param_group_index[group["params"][0]]
                 update_group_attrs = self.param_groups[group_id].copy()
                 del update_group_attrs["params"]
-                update_group_attrs.pop("_param_sub_optimizer_attrs", None)
                 new_group.update(update_group_attrs)
 
                 new_param_groups.append(new_group)
@@ -257,7 +254,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             # After loading state_dict, the parameters may change, and we need to
             # reinitialize the sub-optimizers to regenerate the new parameters and
             # cpu copy pairs.
-            self._init_sub_optimizers(self.param_groups)
+            self._init_sub_optimizers()
             self._sync_hdo_param_groups_to_sub_optimizers()
             self._sync_hdo_state_to_sub_optimizers()
 
@@ -267,6 +264,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         def pre_step_hook(self, args, kwargs):
             # Sync param_groups to sub-optimizers before each step to make sure
             # the lr, wd, etc. are up-to-date.
+            step = self.sub_optimizers[0].param_groups[0].get("step", torch.zeros(1)).item()
+            if step == 5 and torch.distributed.get_rank() == 0:
+                print("pre-step-5:", self.param_groups, self.state, [(opt.param_groups, opt.state) for opt in self.sub_optimizers])
             self._sync_hdo_param_groups_to_sub_optimizers()
 
         self.register_step_pre_hook(pre_step_hook)
@@ -278,10 +278,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self._sync_sub_optimizers_state_to_hdo()
 
         self.register_step_post_hook(post_step_hook)
-
-    def zero_grad(self, set_to_none: bool = True):
-        for optimizer in self.sub_optimizers:
-            optimizer.zero_grad(set_to_none)
 
     def dummy_step(self):
         """
