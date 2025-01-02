@@ -297,6 +297,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         gbuf_ranges: List[Dict],
         param_gbuf_map: Dict[torch.nn.Parameter, Tuple],
         opt_group_ranges: List,
+        make_param_fp32_copy: bool = True,
     ):
         """
         Create main parameter groups needed for the optimizer step.
@@ -343,6 +344,32 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 gbuf_index, dtype, bucket_index = param_gbuf_map[model_param]
                 gbuf_range = gbuf_ranges[gbuf_index][dtype][bucket_index]
                 param_range = gbuf_range["param_map"][model_param]["param"]
+
+                if not make_param_fp32_copy:
+                    shard_model_param = model_param.detach().view(-1)[
+                        param_range.start : param_range.end
+                    ]
+                    tensor_parallel.copy_tensor_model_parallel_attributes(
+                        shard_model_param, model_param
+                    )
+                    if hasattr(model_param, 'shared'):
+                        shard_model_param.shared = model_param.shared
+
+                    if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                        model_float16_params_this_group.append(model_param)
+                        shard_float16_params_this_group.append(shard_model_param)
+                    elif model_param.type() == 'torch.cuda.FloatTensor':
+                        model_fp32_params_this_group.append(model_param)
+                        shard_fp32_params_this_group.append(shard_model_param)
+                    else:
+                        raise TypeError(
+                            'Wrapped parameters must be one of '
+                            'torch.cuda.FloatTensor,  '
+                            'torch.cuda.HalfTensor, or '
+                            'torch.cuda.BFloat16Tensor. '
+                            'Received {}'.format(model_param.type())
+                        )
+                    continue
 
                 # fp16, bf16 params.
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
@@ -406,6 +433,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
 
             # Update optimizer's params.
+            if not make_param_fp32_copy:
+                group_range["orig_group"]["params"] = [
+                    *shard_float16_groups,
+                    *shard_fp32_groups,
+                ]
+                continue
+
             group_range["orig_group"]["params"] = [
                 *shard_fp32_params_this_group,
                 *shard_fp32_from_float16_params_this_group,
@@ -533,16 +567,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.shard_fp32_groups,
             self.shard_fp32_from_float16_groups,
         ) = self._build_model_and_main_param_groups(
-            self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges
+            self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges,
+            make_param_fp32_copy=not isinstance(self.optimizer, HybridDeviceOptimizer)
         )
 
-        if isinstance(self.optimizer, HybridDeviceOptimizer):
-            self.optimizer = HybridDeviceOptimizer(
-                params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
-            )
-        else:
-            self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
-            self.optimizer.load_state_dict(self.optimizer.state_dict())
+        self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
+        self.optimizer.load_state_dict(self.optimizer.state_dict())
 
     def enable_pre_hook(self):
         """
@@ -1266,6 +1296,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         src_tensors = state_dict[param_idx]
                         dst_tensors = {"fp32_param": main_param, **optim_state}
                         for key in dst_tensors:
+                            if key == "step":
+                                # Handle step separately.
+                                continue
                             dst_tensors[key].copy_(src_tensors[key])
 
                         if isinstance(self.optimizer, HybridDeviceOptimizer):
@@ -1718,6 +1751,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         buffer, this method is responsible for copying the updated grads
         from the grad buffer to the main shard's grad field.
         """
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            shard_groups = self.shard_fp32_groups + self.shard_float16_groups
+            model_groups = self.model_fp32_groups + self.model_float16_groups
+            for model_group, shard_group in zip(model_groups, shard_groups):
+                for model_param, shard_param in zip(model_group, shard_group):
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    param_range = param_range_map["param"]
+                    assert param_range.size == shard_param.nelement()
+
+                    model_grad = model_param.main_grad
+                    shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]
+                    shard_param.main_grad = shard_model_grad.float()
+            return
 
         # Utility method for copying group grads.
         def copy_group_grads(model_groups, shard_main_groups):
@@ -1744,6 +1790,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         buffer, this method is responsible for copying the updated params
         from the main shards into the correct position in the grad buffer.
         """
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            return
 
         # Utility method for copying group params.
         def copy_group_params(shard_main_groups, model_groups):
@@ -1795,6 +1843,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         the model params. This copy does not make use of the grad buffer as
         an intermediary.
         """
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            return
 
         # Utility method for copying group params.
         def copy_group_params(model_groups, shard_main_groups):

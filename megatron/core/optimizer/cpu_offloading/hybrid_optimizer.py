@@ -15,19 +15,16 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         cpu_optimizer_cls=None,
         gpu_optimizer_cls=None,
         pin_cpu_grads: bool = True,
+        param_update_in_fp32: bool = False,
         **kwargs
     ):
-        super(HybridDeviceOptimizer, self).__init__(
-            params,
-            defaults={
-                "cpu_optimizer_cls": cpu_optimizer_cls,
-                "gpu_optimizer_cls": gpu_optimizer_cls,
-                "offload_fraction": offload_fraction,
-                "pin_cpu_grads": pin_cpu_grads,
-                **kwargs,
-            },
-        )
+        super(HybridDeviceOptimizer, self).__init__(params, defaults=kwargs)
+
+        self.offload_fraction = offload_fraction
+        self.cpu_optimizer_cls = cpu_optimizer_cls
+        self.gpu_optimizer_cls = gpu_optimizer_cls
         self.pin_cpu_grads = pin_cpu_grads
+        self.param_update_in_fp32 = param_update_in_fp32
         self.sub_optimizer_kwargs = kwargs
 
         self._init_sub_optimizers()
@@ -93,16 +90,17 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self.cpu_optimizer.step(closure)
 
     def _init_sub_optimizers(self):
-        offload_fraction = self.defaults["offload_fraction"]
-        cpu_optimizer_cls = self.defaults["cpu_optimizer_cls"]
-        gpu_optimizer_cls = self.defaults["gpu_optimizer_cls"]
+        offload_fraction = self.offload_fraction
+        cpu_optimizer_cls = self.cpu_optimizer_cls
+        gpu_optimizer_cls = self.gpu_optimizer_cls
 
         (
             self.cpu_param_groups,
             self.gpu_param_groups,
             self.gpu_params_map_cpu_copy,
             self.cpu_copys_map_gpu_param,
-        ) = self._split_parameters_updated_on_the_cpu_and_gpu(self.param_groups, offload_fraction)
+            self.param_to_fp32_param,
+        ) = self._get_sub_optimizer_param_groups(offload_fraction)
 
         self.sub_optimizers = []
         if len(self.cpu_param_groups) > 0:
@@ -124,67 +122,45 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.register_grad_cpu_copy_hook()
         self.register_param_copy_back_gpu_hook()
 
-    def _split_parameters_updated_on_the_cpu_and_gpu(
-        self, params: ParamsT, offload_fraction: float
-    ):
-        if len(params) == 0:
-            return [], [], {}, {}
-
-        if not isinstance(params[0], torch.Tensor):
-            param_groups = params
-            params = []
-            for group in param_groups:
-                params.extend(group["params"])
-        else:
-            param_groups = None
-
-        total_params_numel = sum([param.numel() for param in params])
-        offload_threshold = total_params_numel * offload_fraction
-
-        cpu_params = []
-        gpu_params = []
+    def _get_sub_optimizer_param_groups(self, offload_fraction: float):
+        params = [p for p in group["params"] for group in self.param_groups]
+        params_total_numel = sum([param.numel() for param in params])
+        gpu_params_total_numel = sum([param.numel() for param in params if param.is_cuda])
+        cpu_params_total_numel = params_total_numel - gpu_params_total_numel
+        offload_threshold = gpu_params_total_numel * offload_fraction
+        offload_params_numel = 0
+        cpu_param_groups = []
+        gpu_param_groups = []
         gpu_params_map_cpu_copy = {}
         cpu_copys_map_gpu_param = {}
-        offloaded_params_numel = 0
-        for param in params:
-            if offloaded_params_numel < offload_threshold:
-                assert param.is_cuda
-                param_cpu_copy = param.detach().cpu().pin_memory()
-                param_cpu_copy.requires_grad = True
-                gpu_params_map_cpu_copy[param] = param_cpu_copy
-                cpu_copys_map_gpu_param[param_cpu_copy] = param
-                cpu_params.append(param_cpu_copy)
-            else:
-                gpu_params.append(param)
+        param_to_fp32_param = {}
+        for group in self.param_groups:
+            gpu_group = group.copy()
+            cpu_group = group.copy()
+            gpu_group["params"] = []
+            cpu_group["params"] = []
+            for i, param in enumerate(group["params"]):
+                orig_param = param
+                if offload_params_numel < offload_threshold and not param.is_cuda:
+                    param = param.detach().cpu().pin_memory()
+                    gpu_params_map_cpu_copy[orig_param] = param
+                    cpu_copys_map_gpu_param[param] = orig_param
+                    offload_params_numel += param.numel()
+                if self.param_update_in_fp32 and param.dtype != torch.float32:
+                    param = param.detach().clone().float32()
+                    self.state["fp32_param"] = param
+                    param_to_fp32_param[orig_param] = param
 
-            offloaded_params_numel += param.numel()
+                if param.is_cuda:
+                    gpu_group["params"].append(param)
+                else:
+                    cpu_group["params"].append(param)
+            if len(gpu_group["params"]) != 0:
+                gpu_param_groups.append(gpu_group)
+            if len(cpu_group["params"]) != 0:
+                cpu_param_groups.append(cpu_group)
 
-        if param_groups:
-            cpu_param_groups = []
-            gpu_param_groups = []
-            for group in param_groups:
-                group_defaults = group.copy()
-                del group_defaults["params"]
-                _cpu_params = []
-                _gpu_params = []
-                for param in group["params"]:
-                    if param in gpu_params_map_cpu_copy:
-                        _cpu_params.append(gpu_params_map_cpu_copy[param])
-                    else:
-                        _gpu_params.append(param)
-                if len(_cpu_params) > 0:
-                    cpu_param_groups.append({"params": _cpu_params, **group_defaults})
-                if len(_gpu_params) > 0:
-                    gpu_param_groups.append({"params": _gpu_params, **group_defaults})
-
-            return (
-                cpu_param_groups,
-                gpu_param_groups,
-                gpu_params_map_cpu_copy,
-                cpu_copys_map_gpu_param,
-            )
-
-        return cpu_params, gpu_params, gpu_params_map_cpu_copy, cpu_copys_map_gpu_param
+        return cpu_param_groups, gpu_param_groups, gpu_params_map_cpu_copy, cpu_copys_map_gpu_param, param_to_fp32_param
 
     def _sync_sub_optimizers_state_to_hdo(self):
         """
@@ -203,6 +179,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             for param in optimizer.state:
                 gpu_param = self.cpu_copys_map_gpu_param.get(param, param)
                 new_state[gpu_param] = optimizer.state[param]
+                if self.param_update_in_fp32:
+                    new_state["fp32_param"] = param
         self.state = new_state
 
     def _sync_hdo_state_to_sub_optimizers(self):
@@ -249,6 +227,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     else:
                         self.state[gpu_param] = state[k] = v.to("cuda")
 
+    def _update_fp32_params_by_new_state(self):
+        if not self.param_update_in_fp32:
+            return
+        for param, v in self.state.values():
+            fp32_param = self.param_to_fp32_param[param]
+            fp32_param.data.copy_(v["fp32_param"])
+
     def _register_state_dict_hooks(self):
         def post_load_state_dict_hook(self):
             # After loading state_dict, the parameters may change, and we need to
@@ -257,6 +242,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self._init_sub_optimizers()
             self._sync_hdo_param_groups_to_sub_optimizers()
             self._sync_hdo_state_to_sub_optimizers()
+            self._update_fp32_params_by_new_state()
 
         self.register_load_state_dict_post_hook(post_load_state_dict_hook)
 
@@ -264,9 +250,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         def pre_step_hook(self, args, kwargs):
             # Sync param_groups to sub-optimizers before each step to make sure
             # the lr, wd, etc. are up-to-date.
-            step = self.sub_optimizers[0].param_groups[0].get("step", torch.zeros(1)).item()
-            if step == 5 and torch.distributed.get_rank() == 0:
-                print("pre-step-5:", self.param_groups, self.state, [(opt.param_groups, opt.state) for opt in self.sub_optimizers])
             self._sync_hdo_param_groups_to_sub_optimizers()
 
         self.register_step_pre_hook(pre_step_hook)
