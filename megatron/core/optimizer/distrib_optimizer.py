@@ -1197,9 +1197,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         main_param = self.optimizer.param_groups[group_index]["params"][group_order]
                         optim_state = self.optimizer.state[main_param]
 
-                        tensors = {"fp32_param": main_param, **optim_state}
                         if isinstance(self.optimizer, HybridDeviceOptimizer):
-                            tensors = optim_state
+                            tensors = {**optim_state}
+                        else:
+                            tensors = {"fp32_param": main_param, **optim_state}
                         # Match optimizer parameter with model ShardedTensor (or
                         # ShardedTensorFactory).
                         try:
@@ -1301,7 +1302,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         optim_state = self.optimizer.state[main_param]
 
                         src_tensors = state_dict[param_idx]
-                        dst_tensors = {"fp32_param": main_param, **optim_state}
+                        if isinstance(self.optimizer, HybridDeviceOptimizer):
+                            dst_tensors = {**optim_state}
+                        else:
+                            dst_tensors = {"fp32_param": main_param, **optim_state}
                         for key in dst_tensors:
                             if key == "step":
                                 # Handle step separately.
@@ -1315,7 +1319,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         param_idx += 1
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer._sync_hdo_state_to_sub_optimizers()
-            self.optimizer._move_new_state_to_right_device()
 
     @classmethod
     def _update_legacy_world_tensors(cls, old_tensors, new_numels):

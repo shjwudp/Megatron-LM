@@ -34,7 +34,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.sub_optimizer_kwargs = kwargs
 
         self._init_sub_optimizers()
-        self._register_state_dict_hooks()
+        self._register_load_state_dict_hooks()
         self._register_optimizer_step_hooks()
 
     def _set_sub_optimizer_grads(self):
@@ -48,7 +48,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 if hasattr(param, "main_grad"):
                     fp32_param.grad = param.main_grad
                 else:
-                    fp32_param.grad = param.grad
+                    fp32_param.grad = param.grad.to(fp32_param.dtype)
 
         if self.cpu_optimizer is None:
             return
@@ -147,6 +147,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     inner_param = param
                 self.param_to_inner_param[param] = inner_param
                 self.inner_param_to_orig_param[inner_param] = param
+        self.fp32_param_to_orig_param = {v: k for k, v in self.param_to_fp32_param.items()}
 
         self.sub_optimizers = []
         if len(self.cpu_param_groups) > 0:
@@ -195,7 +196,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     cpu_copy = True
                 if self.param_update_in_fp32 and param.dtype != torch.float32:
                     param = param.detach().clone().float()
-                    self.state[orig_param]["fp32_param"] = param
                     param_to_fp32_param[orig_param] = param
 
                 if cpu_copy:
@@ -243,6 +243,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     new_state[param] = self.state[orig_param]
             optimizer.state = new_state
         self._update_fp32_params_by_new_state()
+        self._move_new_state_to_right_device()
 
     def _sync_hdo_param_groups_to_sub_optimizers(self):
         """Sync HDO new param_groups attribute (e.g. lr, wd, etc.) to sub-optimizers."""
@@ -286,9 +287,55 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             fp32_param = self.param_to_fp32_param[param]
             fp32_param.data.copy_(v["fp32_param"])
 
-    def _register_state_dict_hooks(self):
+    def _register_load_state_dict_hooks(self):
+        def pre_load_state_dict_hook(self, state_dict):
+            """
+            Pre-load state dictionary hook to prevent loss of precision in
+            mixed-precision training.
+
+            When loading a state dictionary with `torch.load_state_dict`,
+            optimizer states are reset and cast from `float32` to `bfloat16`/`float16`,
+            potentially losing precision. This hook replaces parameters with
+            their `float32` copies to mitigate this issue.
+
+            Args:
+                state_dict (dict): The state dictionary to be loaded.
+
+            Returns:
+                dict: The modified state dictionary with `float32` parameters.
+            """
+            if not self.param_update_in_fp32:
+                return state_dict
+
+            new_state = {}
+            for param, v in self.state.items():
+                param = self.param_to_fp32_param.get(param, param)
+                new_state[param] = v
+            self.state = new_state
+
+            for group in self.param_groups:
+                for i, param in enumerate(group["params"]):
+                    group["params"][i] = self.param_to_fp32_param.get(param, param)
+
+            return state_dict
+
+        self.register_load_state_dict_pre_hook(pre_load_state_dict_hook)
+
         def post_load_state_dict_hook(self):
-            # After loading state_dict, the parameters may change, and we need to
+            # 1. Replace the temporarily replaced fp32 parameters back. Please
+            # refer to the documentation in `pre_load_state_dict_hook`.
+            if self.param_update_in_fp32:
+                new_state = {}
+                for param, v in self.state.items():
+                    orig_param = self.fp32_param_to_orig_param.get(param, param)
+                    new_state[orig_param] = v
+                self.state = new_state
+
+                for group in self.param_groups:
+                    for i, param in enumerate(group["params"]):
+                        group["params"][i] = self.fp32_param_to_orig_param.get(param, param)
+
+            # 2. After loading state_dict, the parameters may change, and we need to
             # reinitialize the sub-optimizers to regenerate the new parameters and
             # cpu copy pairs.
             self._init_sub_optimizers()
