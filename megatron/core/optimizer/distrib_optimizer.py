@@ -435,8 +435,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Update optimizer's params.
             if not make_param_fp32_copy:
                 group_range["orig_group"]["params"] = [
-                    *shard_float16_groups,
-                    *shard_fp32_groups,
+                    *shard_float16_params_this_group,
+                    *shard_fp32_params_this_group,
                 ]
                 continue
 
@@ -571,8 +571,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             make_param_fp32_copy=not isinstance(self.optimizer, HybridDeviceOptimizer)
         )
 
-        self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
-        self.optimizer.load_state_dict(self.optimizer.state_dict())
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer = HybridDeviceOptimizer(
+                params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
+            )
+        else:
+            self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
+            self.optimizer.load_state_dict(self.optimizer.state_dict())
 
     def enable_pre_hook(self):
         """
@@ -1193,6 +1198,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         optim_state = self.optimizer.state[main_param]
 
                         tensors = {"fp32_param": main_param, **optim_state}
+                        if isinstance(self.optimizer, HybridDeviceOptimizer):
+                            tensors = optim_state
                         # Match optimizer parameter with model ShardedTensor (or
                         # ShardedTensorFactory).
                         try:
