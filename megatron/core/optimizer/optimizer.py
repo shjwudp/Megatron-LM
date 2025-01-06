@@ -32,6 +32,8 @@ except ImportError:
         l2_norm_impl = local_multi_tensor_l2_norm
         multi_tensor_scale_impl = local_multi_tensor_scale
 
+from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
@@ -45,7 +47,6 @@ from ..transformer.module import param_is_not_shared
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
-from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
 logger = getLogger(__name__)
 
