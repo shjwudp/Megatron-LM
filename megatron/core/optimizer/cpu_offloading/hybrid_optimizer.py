@@ -270,15 +270,15 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
     def _move_new_state_to_right_device(self):
         for optimizer in self.sub_optimizers:
-            for state in optimizer.state.values():
+            for param, state in optimizer.state.items():
                 for k, v in state.items():
                     if not isinstance(v, torch.Tensor):
                         continue
-                    orig_param = self.inner_param_to_orig_param.get(k, k)
+                    orig_param = self.inner_param_to_orig_param.get(param, param)
                     if isinstance(optimizer, self.defaults["cpu_optimizer_cls"]):
-                        self.state[orig_param] = state[k] = v.to("cpu")
+                        self.state[orig_param][k] = state[k] = v.to("cpu")
                     else:
-                        self.state[orig_param] = state[k] = v.to("cuda")
+                        self.state[orig_param][k] = state[k] = v.to("cuda")
 
     def _update_fp32_params_by_new_state(self):
         if not self.param_update_in_fp32:
