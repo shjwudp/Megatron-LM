@@ -62,13 +62,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 else:
                     fp32_param.grad = param.grad.to(fp32_param.dtype)
 
-        if self.cpu_optimizer is None:
-            return
-
         # Sync the grads from GPU to CPU.
-        for optimizer in self.sub_optimizers:
-            if optimizer is self.gpu_optimizer:
-                continue
+        for optimizer in self.cpu_optimizers:
             for param in _param_generator(optimizer):
                 gpu_param = self.cpu_copys_map_gpu_param[param]
                 if hasattr(gpu_param, "main_grad"):
@@ -194,7 +189,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             if self.cpu_optimizer_d2h_h2d_overlap
             else torch.cuda.current_stream()
         )
-        self._data_event: torch.cuda.Event = None
+        self._cpu_optimizer_map_data_event = dict()
 
         self.register_param_copy_back_gpu_hook()
 
