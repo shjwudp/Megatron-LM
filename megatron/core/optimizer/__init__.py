@@ -272,6 +272,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 weight_decay=config.weight_decay,
                 betas=(config.adam_beta1, config.adam_beta2),
                 eps=config.adam_eps,
+                bias_correction=True,
             )
         else:
             gpu_optimizer_cls = SGD
@@ -286,6 +287,7 @@ def _get_megatron_optimizer_based_on_param_groups(
             offload_fraction=config.optimizer_offload_fraction,
             cpu_optimizer_cls=cpu_optimizer_cls,
             gpu_optimizer_cls=gpu_optimizer_cls,
+            param_update_in_fp32=True,
             **optimizer_defaults,
         )
         init_state_fn = None

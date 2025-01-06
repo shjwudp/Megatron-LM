@@ -45,6 +45,7 @@ from ..transformer.module import param_is_not_shared
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
+from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
 logger = getLogger(__name__)
 
@@ -128,7 +129,16 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         grads_for_norm = []
         for param in params:
-            grad = param.grad
+            if hasattr(param, 'main_grad'):
+                # When the parameter is bf16 and the gradient is fp32, there is
+                # no way to use the native .grad (pytorch will check for it and
+                # throw a RuntimeError for dtype mismatch), in this case use a
+                # separate attribute "main_grad" instead.
+                # We always check if the parameter has a "main_grad" first, and
+                # prioritize the "main_grad" if it has one.
+                grad = param.main_grad
+            else:
+                grad = param.grad
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
@@ -164,12 +174,11 @@ class MegatronOptimizer(ABC):
 
     def clip_grad_norm(self, clip_grad: float) -> float:
         """Compute and return grad norm, also clip grads."""
-        params = self.get_parameters()
         grads_for_norm = self.get_main_grads_for_grad_norm()
         grad_norm = get_grad_norm_fp32(
             grads_for_norm, model_parallel_group=self.get_model_parallel_group()
         )
-        clip_grad_by_total_norm_fp32(params, clip_grad, grad_norm)
+        clip_grad_by_total_norm_fp32(grads_for_norm, clip_grad, grad_norm)
         return grad_norm
 
     def count_zeros(self) -> float:
@@ -1000,7 +1009,7 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer in self.chained_optimizers:
             if optimizer.config.clip_grad > 0.0:
                 clip_grad_by_total_norm_fp32(
-                    optimizer.get_parameters(),
+                    optimizer.get_main_grads_for_grad_norm(),
                     max_norm=optimizer.config.clip_grad,
                     total_norm=grad_norm,
                 )
