@@ -105,7 +105,7 @@ class OptimizerConfig:
 
     optimizer_offload_fraction: float = 0.0
     """CPU Offload Fraction used by static offload policy, valid if base optimizer is HybridAdam"""
-    
+
     ################
     # Miscellaneous
     ################
