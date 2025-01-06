@@ -37,6 +37,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         })
         assert not overlap or multi_streams, "Overlap CPU optimizers must be used with multi CUDA streams!"
         
+        self.pin_cpu_params = pin_cpu_params
         self.pin_cpu_grads = pin_cpu_grads
         self.sub_optimizer_kwargs = kwargs
 
@@ -49,7 +50,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             def param_copy_back_gpu_hook(optimizer, args, kwargs):
                 self._h2d_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self._h2d_stream):      
-                    for param in _param_generator(cpu_optimizer):
+                    for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
                         gpu_param.data.copy_(param.data, non_blocking=True)
                 self._d2h_stream.record_event().wait(
