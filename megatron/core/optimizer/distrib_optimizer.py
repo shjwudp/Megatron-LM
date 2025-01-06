@@ -567,8 +567,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.shard_fp32_groups,
             self.shard_fp32_from_float16_groups,
         ) = self._build_model_and_main_param_groups(
-            self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges,
-            make_param_fp32_copy=not isinstance(self.optimizer, HybridDeviceOptimizer)
+            self.gbuf_ranges,
+            self.model_param_gbuf_map,
+            self.opt_group_ranges,
+            make_param_fp32_copy=not isinstance(self.optimizer, HybridDeviceOptimizer),
         )
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
@@ -757,7 +759,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         elif isinstance(self.optimizer, HybridDeviceOptimizer):
             # Handle Torch AdamW special case, which, unlike FusedAdam, Torch AdamW
             # has an extra optimizer state “step”.
-            steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"] if "step" in g]))
+            steps = list(
+                set([g["step"] for g in state_dict["optimizer"]["param_groups"] if "step" in g])
+            )
             if len(steps) != 0:
                 assert len(steps) == 1, f"steps: {steps}"
                 step = torch.tensor(steps[0], dtype=torch.float32, device="cpu")
@@ -1241,7 +1245,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             if state_key == 'step':
                                 # Note that step is a 0-dim tensor, unlike other
                                 # states have the same size as the parameter.
-                                # The optimizer state of STEP is handled 
+                                # The optimizer state of STEP is handled
                                 # specifically and is read from param_groups.
                                 continue
 

@@ -117,7 +117,7 @@ class OptimizerConfig:
 
     pin_cpu_grads: bool = True
     pin_cpu_params: bool = True
-    
+
     ################
     # Miscellaneous
     ################

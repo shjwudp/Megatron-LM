@@ -121,9 +121,7 @@ def get_grad_norm_fp32(
 
 
 def clip_grad_by_total_norm_fp32(
-    grads: List[torch.Tensor],
-    max_norm: Union[int, float],
-    total_norm: float,
+    grads: List[torch.Tensor], max_norm: Union[int, float], total_norm: float
 ):
     """Clips iterable of gradients in fp32 by total norm.
 
