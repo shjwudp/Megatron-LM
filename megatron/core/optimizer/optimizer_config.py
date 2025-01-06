@@ -104,7 +104,19 @@ class OptimizerConfig:
     optimizer_cpu_offloading: bool = False
 
     optimizer_offload_fraction: float = 0.0
-    """CPU Offload Fraction used by static offload policy, valid if base optimizer is HybridAdam"""
+    """CPU Offload Fraction used by static offload policy, valid if base optimizer is HybriDeviceOptimizer"""
+
+    use_torch_optimizer: bool = False
+    """If True, force Megatron optimizer use Torch AdamW"""
+
+    multi_streams: bool = True
+    """If True, use multi-streams in CPU Update"""
+
+    overlap_optimizer: bool = False
+    """If True, split CPU optimizer to build a overlap pipeline, requires multi_streams tobe True """
+
+    pin_cpu_grads: bool = True
+    pin_cpu_params: bool = True
     
     ################
     # Miscellaneous
