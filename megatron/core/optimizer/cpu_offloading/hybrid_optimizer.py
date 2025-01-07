@@ -1,3 +1,4 @@
+# Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
 from collections import defaultdict
 from typing import Dict
 
