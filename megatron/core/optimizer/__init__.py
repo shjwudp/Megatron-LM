@@ -3,7 +3,8 @@ import logging
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-from torch.optim import AdamW as CPUAdam, SGD as CPUSGD
+from torch.optim import SGD as CPUSGD
+from torch.optim import AdamW as CPUAdam
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
@@ -25,6 +26,7 @@ except ImportError:
         from torch.optim import AdamW as Adam, SGD
 
 from megatron.core import mpu
+from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
@@ -38,7 +40,6 @@ from .optimizer import (
     MegatronOptimizer,
 )
 from .optimizer_config import OptimizerConfig
-from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 
 logger = logging.getLogger(__name__)
 
@@ -274,24 +275,23 @@ def _get_megatron_optimizer_based_on_param_groups(
                 weight_decay=config.weight_decay,
                 betas=(config.adam_beta1, config.adam_beta2),
                 eps=config.adam_eps,
+                bias_correction=True,
             )
         else:
             gpu_optimizer_cls = SGD
             cpu_optimizer_cls = CPUSGD
             optimizer_defaults = dict(
-                lr=config.lr,
-                weight_decay=config.weight_decay,
-                momentum=config.sgd_momentum,
+                lr=config.lr, weight_decay=config.weight_decay, momentum=config.sgd_momentum
             )
         optimizer = HybridDeviceOptimizer(
             param_groups,
             offload_fraction=config.optimizer_offload_fraction,
             cpu_optimizer_cls=cpu_optimizer_cls,
             gpu_optimizer_cls=gpu_optimizer_cls,
-            overlap=config.overlap_optimizer,
-            multi_streams=config.multi_streams,
+            overlap_cpu_optimizer_d2h_h2d=config.overlap_cpu_optimizer_d2h_h2d,
             pin_cpu_grads=config.pin_cpu_grads,
             pin_cpu_params=config.pin_cpu_params,
+            param_update_in_fp32=True,
             **optimizer_defaults,
         )
         init_state_fn = None
@@ -479,5 +479,6 @@ def get_megatron_optimizer(
         return optimizers[0]
     if config.optimizer == 'hybridadam':
         from .offload_chained_optimizer import ChainedOffloadOptimizer
+
         return ChainedOffloadOptimizer(optimizers)
     return ChainedOptimizer(optimizers)

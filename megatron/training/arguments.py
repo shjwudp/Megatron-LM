@@ -1242,8 +1242,8 @@ def _add_training_args(parser):
     group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,
                           help='Ratio of optimizer state to offload to CPU')
     group.add_argument('--use-torch-optimizer', action='store_true')
-    group.add_argument('--no-multi-streams', action='store_false', dest='multi_streams')    
-    group.add_argument('--overlap-optimizer', action='store_true')
+    group.add_argument('--overlap-cpu-optimizer-d2h-h2d', action='store_true', default=False,
+                       help='Overlap CPU optimizer step, gradients D2H and updated parameters H2D.')
     group.add_argument('--no-pin-cpu-grads', action='store_false', dest='pin_cpu_grads')   
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params')   
 

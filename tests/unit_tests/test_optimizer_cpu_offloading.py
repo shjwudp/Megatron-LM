@@ -1,5 +1,4 @@
 import pytest
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,6 +6,7 @@ from torch.optim import SGD, Adam
 from transformer_engine.pytorch.optimizers import FusedAdam, FusedSGD
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+
 
 class Net(nn.Module):
     def __init__(self):
@@ -27,17 +27,14 @@ class Net(nn.Module):
         x = self.fc3(x)
         return x
 
+
 @pytest.mark.parametrize('n_steps', [1, 10])
 @pytest.mark.parametrize('overlap_strategy', ['no_overlap', 'streams', 'overlap'])
 @pytest.mark.parametrize('offload_fraction', [0, 0.5, 1.0])
 @pytest.mark.parametrize('optimizer', ['sgd', 'adam'])
 @pytest.mark.parametrize('with_param_groups', [False, True])
 def test_multi_device_hybrid_optimizer(
-    with_param_groups, 
-    optimizer,
-    offload_fraction,
-    overlap_strategy,
-    n_steps
+    with_param_groups, optimizer, offload_fraction, overlap_strategy, n_steps
 ):
     net1 = Net().cuda()
     net2 = Net().cuda()
@@ -47,27 +44,17 @@ def test_multi_device_hybrid_optimizer(
     ref_params = list(net2.parameters())
     if with_param_groups:
         param_groups = [
-            {"params": params[: len(params) // 2],
-            "wd_mult": 0.1,
-            "lr_mult": 0.1,
-            },
-            {"params": params[len(params) // 2 :],
-            "wd_mult": 0.2,
-            "lr_mult": 0.2,},
+            {"params": params[: len(params) // 2], "wd_mult": 0.1, "lr_mult": 0.1},
+            {"params": params[len(params) // 2 :], "wd_mult": 0.2, "lr_mult": 0.2},
         ]
         params = param_groups
         ref_param_groups = [
-            {"params": ref_params[: len(ref_params) // 2],
-            "wd_mult": 0.1,
-            "lr_mult": 0.1,
-            },
-            {"params": ref_params[len(ref_params) // 2 :],
-            "wd_mult": 0.2,
-            "lr_mult": 0.2,},
-        ] 
-        ref_params = ref_param_groups    
+            {"params": ref_params[: len(ref_params) // 2], "wd_mult": 0.1, "lr_mult": 0.1},
+            {"params": ref_params[len(ref_params) // 2 :], "wd_mult": 0.2, "lr_mult": 0.2},
+        ]
+        ref_params = ref_param_groups
 
-    if optimizer =='adam':
+    if optimizer == 'adam':
         cls_kwargs = dict(cpu_optimizer_cls=Adam, gpu_optimizer_cls=FusedAdam)
     else:
         cls_kwargs = dict(cpu_optimizer_cls=SGD, gpu_optimizer_cls=FusedSGD)
@@ -78,19 +65,12 @@ def test_multi_device_hybrid_optimizer(
         overlap_kwargs = dict(overlap=False, multi_streams=True)
     else:
         overlap_kwargs = dict(overlap=True, multi_streams=True)
-       
+
     hdo = HybridDeviceOptimizer(
-        params,
-        offload_fraction=offload_fraction,
-        lr=base_lr,
-        **cls_kwargs,
-        **overlap_kwargs
+        params, offload_fraction=offload_fraction, lr=base_lr, **cls_kwargs, **overlap_kwargs
     )
 
-    ref_optimizer = cls_kwargs['gpu_optimizer_cls'](
-        ref_params,
-        lr=base_lr,
-    )
+    ref_optimizer = cls_kwargs['gpu_optimizer_cls'](ref_params, lr=base_lr)
 
     # 1. run step on optimizer, make sure there is state generated
     assert len(hdo.state_dict()["state"]) == 0  # state is empty
@@ -131,5 +111,6 @@ def test_multi_device_hybrid_optimizer(
         torch.nan_to_num_(v, 0)
         torch.nan_to_num_(ref_params[k], 0)
         tol = 1e-6 if n_steps > 1 else 1e-8
-        assert torch.allclose(v, ref_params[k], atol=tol), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
-    
+        assert torch.allclose(
+            v, ref_params[k], atol=tol
+        ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
