@@ -115,7 +115,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         for optimizer in self.sub_optimizers:
             if isinstance(optimizer, self.cpu_optimizer_cls):
                 optimizer.register_step_post_hook(param_copy_back_gpu_hook_closure())
-            elif self.param_update_in_fp32 and isinstance(optimizer, self.gpu_optimizer_cls):
+            # NOTE: Do not use `elif` here, because the cpu_optimizer_cls may be
+            # the same as gpu_optimizer_cls.
+            if self.param_update_in_fp32 and isinstance(optimizer, self.gpu_optimizer_cls):
                 optimizer.register_step_post_hook(fp32_param_copy_back_gpu_hook_closure())
 
     def step(self, closure=None):
