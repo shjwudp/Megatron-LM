@@ -13,23 +13,27 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 
 try:
-    from transformer_engine.pytorch.optimizers import multi_tensor_applier
+    from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
+
+    multi_tensor_scale_impl = multi_tensor_scale
 except ImportError:
     try:
-        from apex.multi_tensor_apply import multi_tensor_applier
-    except ImportError:
-        from megatron.core.utils import local_multi_tensor_applier
-
-        multi_tensor_applier = local_multi_tensor_applier
-    try:
         import amp_C
+        from apex.multi_tensor_apply import multi_tensor_applier
 
-        l2_norm_impl = amp_C.multi_tensor_l2norm
         multi_tensor_scale_impl = amp_C.multi_tensor_scale
     except ImportError:
-        from megatron.core.utils import local_multi_tensor_l2_norm, local_multi_tensor_scale
+        import warnings
 
-        l2_norm_impl = local_multi_tensor_l2_norm
+        warnings.warn(
+            'Transformer Engine and Apex are not installed. '
+            'Falling back to local implementations of '
+            'multi_tensor_applier and multi_tensor_scale'
+        )
+
+        from megatron.core.utils import local_multi_tensor_applier, local_multi_tensor_scale
+
+        multi_tensor_applier = local_multi_tensor_applier
         multi_tensor_scale_impl = local_multi_tensor_scale
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
@@ -51,21 +55,25 @@ from .optimizer_config import OptimizerConfig
 logger = getLogger(__name__)
 
 
-def _zero_grad_group_helper(group: List[torch.nn.Parameter], set_to_none: bool):
+def _zero_grad_group_helper(
+    group: List[torch.nn.Parameter], set_to_none: bool, use_decoupled_grad: bool = False
+):
     """
     Zero out the gradient for a group of parameters.
     Note: copied from torch.optim.optimizer.
     """
     for param in group:
-        if param.grad is not None:
+        grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
+        if hasattr(param, grad_attr) and getattr(param, grad_attr) is not None:
             if set_to_none:
-                param.grad = None
+                setattr(param, grad_attr, None)
             else:
-                if param.grad.grad_fn is not None:
-                    param.grad.detach_()
+                grad_obj = getattr(param, grad_attr)
+                if grad_obj.grad_fn is not None:
+                    grad_obj.detach_()
                 else:
-                    param.grad.requires_grad_(False)
-                param.grad.zero_()
+                    grad_obj.requires_grad_(False)
+                grad_obj.zero_()
 
 
 def _multi_tensor_copy_this_to_that(
@@ -77,7 +85,7 @@ def _multi_tensor_copy_this_to_that(
     is not provided, we default back to simple loop copy to be compatible
     with bfloat16.
     """
-    if overflow_buf:
+    if overflow_buf is not None:
         overflow_buf.fill_(0)
         # Scaling with factor `1.0` is equivalent to copy.
         multi_tensor_applier(multi_tensor_scale_impl, overflow_buf, [this, that], 1.0)
@@ -104,7 +112,11 @@ class MegatronOptimizer(ABC):
     ):
         """Input optimizer is the base optimizer (e.g., Adam)."""
         self.optimizer = optimizer
-        assert self.optimizer, 'no optimizer is provided.'
+        if self.optimizer is None:
+            warnings.warn(
+                f"WARNING: there is no optimizer on RANK {torch.distributed.get_rank()}. "
+                "This may be expected if you have frozen sub-models."
+            )
         self.config = config
         self.init_state_fn = init_state_fn
 
@@ -113,9 +125,10 @@ class MegatronOptimizer(ABC):
         Get list of parameters wrapped in optimizer.
         """
         params = []
-        for param_group in self.optimizer.param_groups:
-            for param in param_group['params']:
-                params.append(param)
+        if hasattr(self.optimizer, 'param_groups'):
+            for param_group in self.optimizer.param_groups:
+                for param in param_group['params']:
+                    params.append(param)
         return params
 
     def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
@@ -130,14 +143,8 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         grads_for_norm = []
         for param in params:
-            if hasattr(param, 'main_grad'):
-                # When the parameter is bf16 and the gradient is fp32, there is
-                # no way to use the native .grad (pytorch will check for it and
-                # throw a RuntimeError for dtype mismatch), in this case use a
-                # separate attribute "main_grad" instead.
-                # We always check if the parameter has a "main_grad" first, and
-                # prioritize the "main_grad" if it has one.
-                grad = param.main_grad
+            if self.config.use_precision_aware_optimizer:
+                grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
             else:
                 grad = param.grad
             grad_not_none = grad is not None
@@ -148,10 +155,24 @@ class MegatronOptimizer(ABC):
 
         return grads_for_norm
 
-    def get_model_parallel_group(self) -> torch.distributed.ProcessGroup:
-        """Default returned here, but the distributed optimizer overrides this."""
+    def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
+        """Process group for reducing gradient statistics (num_zeros & norm).
+
+        The two most common cases are:
+        - Non-distributed optimizer (default): Return the model-parallel group.
+        - Distributed optimizer (overridden in distrib_optimizer.py): Return the entire world.
+        """
         if hasattr(self, 'model_parallel_group'):
-            return self.model_parallel_group
+            warnings.warn(
+                "WARNING: `optimizer.model_parallel_group` deprecated and renamed to "
+                "`optimizer.grad_stats_parallel_group`. The previous name will be "
+                "removed in a future release."
+            )
+            self.grad_stats_parallel_group = self.model_parallel_group
+            delattr(self, "model_parallel_group")
+            return self.grad_stats_parallel_group
+        if hasattr(self, 'grad_stats_parallel_group'):
+            return self.grad_stats_parallel_group
         return parallel_state.get_model_parallel_group()
 
     @abstractmethod
@@ -169,23 +190,35 @@ class MegatronOptimizer(ABC):
         """Compute and return grad norm."""
         grads_for_norm = self.get_main_grads_for_grad_norm()
         total_norm = get_grad_norm_fp32(
-            grads_for_norm, model_parallel_group=self.get_model_parallel_group()
+            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
         return total_norm
 
     def clip_grad_norm(self, clip_grad: float) -> float:
         """Compute and return grad norm, also clip grads."""
-        grads_for_norm = self.get_main_grads_for_grad_norm()
+        params = self.get_parameters()
+        if params:
+            grads_for_norm = self.get_main_grads_for_grad_norm()
+        else:
+            grads_for_norm = []
         grad_norm = get_grad_norm_fp32(
-            grads_for_norm, model_parallel_group=self.get_model_parallel_group()
+            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
-        clip_grad_by_total_norm_fp32(grads_for_norm, clip_grad, grad_norm)
+
+        if params:
+            clip_grad_by_total_norm_fp32(
+                params, clip_grad, grad_norm, self.config.use_precision_aware_optimizer
+            )
         return grad_norm
 
     def count_zeros(self) -> float:
         """Count number of zeros in model's gradients."""
         params = self.get_parameters()
-        return count_zeros_fp32(params, model_parallel_group=self.get_model_parallel_group())
+        return count_zeros_fp32(
+            params,
+            grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
+            use_decoupled_grad=self.config.use_precision_aware_optimizer,
+        )
 
     @abstractmethod
     def zero_grad(self, set_to_none: bool = True):
@@ -203,13 +236,6 @@ class MegatronOptimizer(ABC):
     def scale_loss(self, loss: torch.Tensor) -> torch.Tensor:
         """Simple scaling."""
         return self.get_loss_scale() * loss
-
-    def start_param_sync(self, model_index: int, *unused):
-        """
-        Start parameter synchronization for all optimizers.
-        This is a no-op for all non-distributed optimizers.
-        """
-        pass
 
     @abstractmethod
     def reload_model_params(self):
@@ -244,7 +270,10 @@ class MegatronOptimizer(ABC):
     # "optimizer_instance.param_groups"
     # (for example, to adjust the learning rate)
     def _get_param_groups(self):
-        return self.optimizer.param_groups
+        if self.is_stub_optimizer:
+            return []
+        else:
+            return self.optimizer.param_groups
 
     def _set_param_groups(self, value):
         self.optimizer.param_groups = value
@@ -352,19 +381,23 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     def _unscale_main_grads_and_check_for_nan(self):
 
         # Collect main grads.
-        main_grads = self._collect_main_grad_data_for_unscaling()
+        if not self.is_stub_optimizer:
+            main_grads = self._collect_main_grad_data_for_unscaling()
 
         # Reset found inf.
         self.found_inf.fill_(0.0)
 
-        # Unscale and set found inf/nan
-        torch._amp_foreach_non_finite_check_and_unscale_(
-            main_grads, self.found_inf, self.grad_scaler.inv_scale
-        )
+        if not self.is_stub_optimizer:
+            # Unscale and set found inf/nan
+            torch._amp_foreach_non_finite_check_and_unscale_(
+                main_grads, self.found_inf, self.grad_scaler.inv_scale
+            )
 
         # Update across all model parallel instances.
         torch.distributed.all_reduce(
-            self.found_inf, op=torch.distributed.ReduceOp.MAX, group=self.get_model_parallel_group()
+            self.found_inf,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.get_grad_stats_parallel_group(),
         )
 
         # Check for nan.
@@ -382,7 +415,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-copy-to-main-grad', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        self._copy_model_grads_to_main_grads()
+        if not self.is_stub_optimizer:
+            self._copy_model_grads_to_main_grads()
         if timers is not None:
             timers('optimizer-copy-to-main-grad').stop()
 
@@ -416,7 +450,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-inner-step', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        self.optimizer.step()
+        if not self.is_stub_optimizer:
+            self.optimizer.step()
         if timers is not None:
             timers('optimizer-inner-step').stop()
 
@@ -425,7 +460,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-copy-main-to-model-params', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        self._copy_main_params_to_model_params()
+        if not self.is_stub_optimizer:
+            self._copy_main_params_to_model_params()
         if timers is not None:
             timers('optimizer-copy-main-to-model-params').stop()
 
@@ -444,7 +480,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-clip-main-grad', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        grad_norm = None
+        grad_norm = 0.0
         if self.config.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
         if timers is not None:
@@ -455,7 +491,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-count-zeros', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
+        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else 0
         if timers is not None:
             timers('optimizer-count-zeros').stop()
 
@@ -491,56 +527,63 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         # Handle main parameters.
 
-        # Three groups of parameters:
-        #   float16_groups: original float16 parameters
-        #   fp32_from_float16_groups: fp32 copy of float16 parameters
-        #   fp32_from_fp32_groups: original fp32 parameters
-        self.float16_groups = []
-        self.fp32_from_float16_groups = []
-        self.fp32_from_fp32_groups = []
+        if optimizer:
+            # Three groups of parameters:
+            #   float16_groups: original float16 parameters
+            #   fp32_from_float16_groups: fp32 copy of float16 parameters
+            #   fp32_from_fp32_groups: original fp32 parameters
+            self.float16_groups = []
+            self.fp32_from_float16_groups = []
+            self.fp32_from_fp32_groups = []
 
-        # For all the groups in the original optimizer:
-        for param_group in self.optimizer.param_groups:
-            float16_params_this_group = []
-            fp32_params_this_group = []
-            fp32_from_float16_params_this_group = []
-            # For all the parameters in this group:
-            for i, param in enumerate(param_group['params']):
-                if param.requires_grad:
+            # For all the groups in the original optimizer:
+            for param_group in self.optimizer.param_groups:
+                float16_params_this_group = []
+                fp32_params_this_group = []
+                fp32_from_float16_params_this_group = []
+                # For all the parameters in this group:
+                for i, param in enumerate(param_group['params']):
+                    if param.requires_grad:
 
-                    # float16 params:
-                    if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
-                        float16_params_this_group.append(param)
-                        # Create a copy
-                        main_param = param.detach().clone().float()
-                        # Copy tensor model parallel attributes.
-                        tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
-                        if hasattr(param, 'shared'):
-                            main_param.shared = param.shared
-                        # Replace the optimizer params with the new fp32 copy.
-                        param_group['params'][i] = main_param
+                        # float16 params:
+                        if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                            float16_params_this_group.append(param)
+                            # Create a copy
+                            main_param = param.detach().clone().float()
+                            # Copy tensor model parallel attributes.
+                            tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
+                            if hasattr(param, 'shared'):
+                                main_param.shared = param.shared
+                            # Replace the optimizer params with the new fp32 copy.
+                            param_group['params'][i] = main_param
 
-                        fp32_from_float16_params_this_group.append(main_param)
-                        # Reset existing state dict key to the new main param.
-                        if param in self.optimizer.state:
-                            self.optimizer.state[main_param] = self.optimizer.state.pop(param)
-                    # fp32 params.
-                    elif param.type() == 'torch.cuda.FloatTensor':
-                        fp32_params_this_group.append(param)
-                        param_group['params'][i] = param
+                            # Store handle to main_param.
+                            param.main_param = main_param
 
-                    else:
-                        raise TypeError(
-                            'Wrapped parameters must be one of '
-                            'torch.cuda.FloatTensor,  '
-                            'torch.cuda.HalfTensor, or '
-                            'torch.cuda.BFloat16Tensor. '
-                            'Received {}'.format(param.type())
-                        )
+                            fp32_from_float16_params_this_group.append(main_param)
+                            # Reset existing state dict key to the new main param.
+                            if param in self.optimizer.state:
+                                self.optimizer.state[main_param] = self.optimizer.state.pop(param)
+                        # fp32 params.
+                        elif param.type() == 'torch.cuda.FloatTensor':
+                            fp32_params_this_group.append(param)
+                            param_group['params'][i] = param
 
-            self.float16_groups.append(float16_params_this_group)
-            self.fp32_from_float16_groups.append(fp32_from_float16_params_this_group)
-            self.fp32_from_fp32_groups.append(fp32_params_this_group)
+                        else:
+                            raise TypeError(
+                                'Wrapped parameters must be one of '
+                                'torch.cuda.FloatTensor,  '
+                                'torch.cuda.HalfTensor, or '
+                                'torch.cuda.BFloat16Tensor. '
+                                'Received {}'.format(param.type())
+                            )
+
+                self.float16_groups.append(float16_params_this_group)
+                self.fp32_from_float16_groups.append(fp32_from_float16_params_this_group)
+                self.fp32_from_fp32_groups.append(fp32_params_this_group)
+            self.is_stub_optimizer = False
+        else:
+            self.is_stub_optimizer = True
 
     def zero_grad(self, set_to_none=True):
         """We only need to zero the model related parameters, i.e.,
@@ -548,6 +591,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         fp32_from_float16_groups as a memory optimization to reduce
         fragmentation; in the case of set_to_none==True, the space
         used by this field can be safely deallocated at this point."""
+        if self.is_stub_optimizer:
+            return
         for group in self.float16_groups:
             _zero_grad_group_helper(group, set_to_none)
         for group in self.fp32_from_float16_groups:
@@ -556,6 +601,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             _zero_grad_group_helper(group, set_to_none)
 
     def _collect_main_grad_data_for_unscaling(self):
+        if self.is_stub_optimizer:
+            return
 
         main_grads = []
 
@@ -629,7 +676,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     ):
 
         if is_loading:
-            self.init_state_fn(self.optimizer)
+            self.init_state_fn(self.optimizer, self.config)
 
         state_dict = self.state_dict()
 
@@ -675,7 +722,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
             optimizer_key = 'optimizer_state_dict'
-            logger.info('***WARNING*** loading optimizer from ' 'an old checkpoint ...')
+            logger.info('***WARNING*** loading optimizer from an old checkpoint ...')
         if 'common_step' in state_dict[optimizer_key]['state']:
             common_step = state_dict[optimizer_key]['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
@@ -684,9 +731,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
             if self.config.fp16:
-                logger.info(
-                    '***WARNING*** found an old checkpoint, will not ' 'load grad scaler ...'
-                )
+                logger.info('***WARNING*** found an old checkpoint, will not load grad scaler ...')
         else:
             if self.grad_scaler:
                 self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
@@ -726,9 +771,12 @@ class FP32Optimizer(MegatronOptimizer):
         super(FP32Optimizer, self).__init__(optimizer, config, init_state_fn)
 
         self._scale = torch.tensor([1.0], dtype=torch.float, device='cuda')
+        self.is_stub_optimizer = True if optimizer is None else False
 
     def zero_grad(self, set_to_none=True):
         """Copied from torch.optim.optimizer"""
+        if self.is_stub_optimizer:
+            return
         for group in self.optimizer.param_groups:
             _zero_grad_group_helper(group['params'], set_to_none)
 
@@ -739,6 +787,8 @@ class FP32Optimizer(MegatronOptimizer):
     @torch.no_grad()
     def prepare_grads(self) -> bool:
         """Pre-processing gradients before the optimizer step, returns whether inf/nan is found."""
+        if self.is_stub_optimizer:
+            return False
         timers = self.config.timers
 
         # Copy main_grads to grads.
@@ -748,7 +798,8 @@ class FP32Optimizer(MegatronOptimizer):
             )
         for param_group in self.optimizer.param_groups:
             for param in param_group['params']:
-                param.grad = param.main_grad
+                if hasattr(param, 'main_grad'):
+                    param.grad = param.main_grad
         if timers is not None:
             timers('optimizer-copy-to-main-grad').stop()
 
@@ -757,6 +808,8 @@ class FP32Optimizer(MegatronOptimizer):
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful."""
+        if self.is_stub_optimizer:
+            return True
         timers = self.config.timers
 
         # Update parameters.
@@ -822,7 +875,7 @@ class FP32Optimizer(MegatronOptimizer):
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
     ):
         if is_loading:
-            self.init_state_fn(self.optimizer)
+            self.init_state_fn(self.optimizer, self.config)
 
         state_dict = self.state_dict()
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
@@ -890,13 +943,19 @@ class ChainedOptimizer(MegatronOptimizer):
 
     def __init__(self, chained_optimizers: List[MegatronOptimizer]):
         self.model_chunks = []
-        self.config = getattr(chained_optimizers[0], 'config', None)
-        for optimizer in chained_optimizers:
-            if hasattr(optimizer, 'model_chunks'):
-                for model_chunk in optimizer.model_chunks:
-                    if model_chunk not in self.model_chunks:
-                        self.model_chunks.append(model_chunk)
-            assert self.config == getattr(optimizer, 'config', None)
+        # chained_optimizers would be empty in the case that a rank
+        # has no trainable parameters
+        if chained_optimizers:
+            self.config = getattr(chained_optimizers[0], 'config', None)
+            for optimizer in chained_optimizers:
+                if hasattr(optimizer, 'model_chunks'):
+                    for model_chunk in optimizer.model_chunks:
+                        if model_chunk not in self.model_chunks:
+                            self.model_chunks.append(model_chunk)
+                assert self.config == getattr(optimizer, 'config', None)
+            self.is_stub_optimizer = False
+        else:
+            self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
 
     @property
@@ -920,7 +979,10 @@ class ChainedOptimizer(MegatronOptimizer):
             optimizer.zero_grad(set_to_none)
 
     def get_loss_scale(self):
-        return self.chained_optimizers[0].get_loss_scale()
+        if self.chained_optimizers:
+            return self.chained_optimizers[0].get_loss_scale()
+        else:
+            return torch.tensor([1.0], dtype=torch.float32, device=torch.cuda.current_device())
 
     def reload_model_params(self):
         for optimizer in self.chained_optimizers:
@@ -974,27 +1036,11 @@ class ChainedOptimizer(MegatronOptimizer):
 
         return success
 
-    def disable_pre_hook(self):
-        """Disable pre-hooks for underlying distributed optimizers."""
-        warnings.warn(
-            "`ChainedOptimizer.disable_pre_hook` will be deprecated in a future release. "
-            "Use `DistributedDataParallel.disable_forward_pre_hook` directly."
-        )
-        for model_chunk in self.model_chunks:
-            model_chunk.disable_forward_pre_hook()
-
-    def enable_pre_hook(self):
-        """Enable pre-hooks for underlying distributed optimizers."""
-        warnings.warn(
-            "`ChainedOptimizer.enable_pre_hook` will be deprecated in a future release. "
-            "Use `DistributedDataParallel.enable_forward_pre_hook` directly."
-        )
-        for model_chunk in self.model_chunks:
-            model_chunk.enable_forward_pre_hook()
-
     @torch.no_grad()
     def step(self):
         """ChainedOptimizer will step all optimizers one by one."""
+        if self.is_stub_optimizer:
+            return True, 0.0, 0
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
             return False, None, None
@@ -1013,6 +1059,7 @@ class ChainedOptimizer(MegatronOptimizer):
                     optimizer.get_main_grads_for_grad_norm(),
                     max_norm=optimizer.config.clip_grad,
                     total_norm=grad_norm,
+                    use_decoupled_grad=optimizer.config.use_precision_aware_optimizer,
                 )
 
         # Count the zeros in the grads.
@@ -1070,8 +1117,3 @@ class ChainedOptimizer(MegatronOptimizer):
             optimizer.load_parameter_state_from_dp_zero(
                 state_dict, update_legacy_format=update_legacy_format
             )
-
-    def start_param_sync(self, model_index: int, *unused):
-        """Start parameter synchronization for all optimizers."""
-        for optimizer in self.chained_optimizers:
-            optimizer.start_param_sync(model_index, *unused)

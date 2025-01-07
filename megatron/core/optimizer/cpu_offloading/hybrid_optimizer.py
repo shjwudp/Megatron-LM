@@ -58,8 +58,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     # in the following part.
                     continue
                 fp32_param = self.param_to_fp32_param[param]
-                if hasattr(param, "main_grad"):
-                    fp32_param.grad = param.main_grad
+                if hasattr(param, "decoupled_grad"):
+                    fp32_param.grad = param.decoupled_grad
                 else:
                     fp32_param.grad = param.grad.to(fp32_param.dtype)
 
@@ -67,8 +67,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         for optimizer in self.cpu_optimizers:
             for param in _param_generator(optimizer):
                 gpu_param = self.cpu_copys_map_gpu_param[param]
-                if hasattr(gpu_param, "main_grad"):
-                    grad = gpu_param.main_grad
+                if hasattr(gpu_param, "decoupled_grad"):
+                    grad = gpu_param.decoupled_grad
                 elif hasattr(gpu_param, "grad"):
                     grad = gpu_param.grad
                 else:
@@ -411,8 +411,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         super(HybridDeviceOptimizer, self).zero_grad(set_to_none)
         for group in self.param_groups:
             for param in group["params"]:
-                if hasattr(param, "main_grad"):
-                    del param.main_grad
+                if hasattr(param, "decoupled_grad"):
+                    del param.decoupled_grad
 
     def dummy_step(self):
         """

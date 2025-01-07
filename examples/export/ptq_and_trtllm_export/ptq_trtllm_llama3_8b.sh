@@ -7,10 +7,6 @@ NAME="${1:-$DEFAULT_NAME}"
 DEFAULT_QUANT_CFG="int8_sq"
 QUANT_CFG="${2:-$DEFAULT_QUANT_CFG}"
 
-# NOTE: UNFUSED ATTENTION MUST BE USED TO AVOID ADDITIONAL STATE_DICT KEY MISMATCH.
-export NVTE_FLASH_ATTN=0
-export NVTE_FUSED_ATTN=0
-export NVTE_UNFUSED_ATTN=1
 
 # CHANGE THE FOLLOWING IF YOU MOUNT YOUR DATA AND CHECKPOINTS DIFFERENTLY IN THE CONTAINER.
 TP="1"
@@ -37,6 +33,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 options=" \
     --disable-bias-linear \
+    --attention-backend unfused \
     --swiglu \
     --no-rope-fusion \
     --untie-embeddings-and-output-weights \
@@ -64,8 +61,8 @@ options=" \
     --tokenizer-model meta-llama/Meta-Llama-3-8B \
     --save-interval 1000000 \
     --use-dist-ckpt \
-    --load ${CHECKPOINT_LOAD_DIR}
-    --rotary-base 500000
+    --load ${CHECKPOINT_LOAD_DIR} \
+    --rotary-base 500000 \
     --fp16"
 
 # Precompile CUDA extentions
@@ -75,4 +72,4 @@ python -c "import modelopt.torch.quantization.extensions as ext; print(ext.cuda_
 launch_config="--nproc_per_node=${TP}"
 
 # Launch multi-process with torchrun
-torchrun ${launch_config} examples/inference/quantization/text_generation_ptq.py ${options} ${additional_options}
+torchrun ${launch_config} examples/export/ptq_and_trtllm_export/text_generation_ptq.py ${options} ${additional_options}
