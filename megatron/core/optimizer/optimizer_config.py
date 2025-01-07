@@ -109,10 +109,7 @@ class OptimizerConfig:
     use_torch_optimizer: bool = False
     """If True, force Megatron optimizer use Torch AdamW"""
 
-    multi_streams: bool = True
-    """If True, use multi-streams in CPU Update"""
-
-    overlap_optimizer: bool = False
+    overlap_cpu_optimizer_d2h_h2d: bool = False
     """If True, split CPU optimizer to build a overlap pipeline, requires multi_streams tobe True """
 
     pin_cpu_grads: bool = True

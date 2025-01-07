@@ -20,7 +20,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         param_update_in_fp32: bool = False,
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
-        cpu_optimizer_d2h_h2d_overlap: bool = True,
+        overlap_cpu_optimizer_d2h_h2d: bool = True,
         **kwargs
     ):
         super(HybridDeviceOptimizer, self).__init__(
@@ -32,7 +32,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 "param_update_in_fp32": param_update_in_fp32,
                 "pin_cpu_grads": pin_cpu_grads,
                 "pin_cpu_params": pin_cpu_params,
-                "cpu_optimizer_d2h_h2d_overlap": cpu_optimizer_d2h_h2d_overlap,
+                "overlap_cpu_optimizer_d2h_h2d": overlap_cpu_optimizer_d2h_h2d,
                 **kwargs,
             },
         )
@@ -42,7 +42,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.gpu_optimizer_cls = gpu_optimizer_cls
         self.pin_cpu_grads = pin_cpu_grads
         self.pin_cpu_params = pin_cpu_params
-        self.cpu_optimizer_d2h_h2d_overlap = cpu_optimizer_d2h_h2d_overlap
+        self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
         self.param_update_in_fp32 = param_update_in_fp32
         self.sub_optimizer_kwargs = kwargs
 
@@ -164,7 +164,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 self.inner_param_to_orig_param[inner_param] = param
         self.fp32_param_to_orig_param = {v: k for k, v in self.param_to_fp32_param.items()}
 
-        if self.cpu_optimizer_d2h_h2d_overlap:
+        if self.overlap_cpu_optimizer_d2h_h2d:
             (self.cpu_optimizers, self.param_optimizer_mapping, self.n_params) = (
                 self.build_cpu_optimizer_list(self.cpu_optimizer_cls, self.cpu_param_groups)
             )
@@ -181,12 +181,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = defaultdict(torch.Tensor)
         self._d2h_stream = (
             torch.cuda.Stream()
-            if self.cpu_optimizer_d2h_h2d_overlap
+            if self.overlap_cpu_optimizer_d2h_h2d
             else torch.cuda.current_stream()
         )
         self._h2d_stream = (
             torch.cuda.Stream()
-            if self.cpu_optimizer_d2h_h2d_overlap
+            if self.overlap_cpu_optimizer_d2h_h2d
             else torch.cuda.current_stream()
         )
         self._cpu_optimizer_map_data_event = dict()

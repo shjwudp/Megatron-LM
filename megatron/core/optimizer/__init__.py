@@ -288,7 +288,7 @@ def _get_megatron_optimizer_based_on_param_groups(
             offload_fraction=config.optimizer_offload_fraction,
             cpu_optimizer_cls=cpu_optimizer_cls,
             gpu_optimizer_cls=gpu_optimizer_cls,
-            overlap=config.overlap_optimizer,
+            overlap_cpu_optimizer_d2h_h2d=config.overlap_cpu_optimizer_d2h_h2d,
             pin_cpu_grads=config.pin_cpu_grads,
             pin_cpu_params=config.pin_cpu_params,
             param_update_in_fp32=True,
