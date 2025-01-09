@@ -283,7 +283,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                     betas=(config.adam_beta1, config.adam_beta2),
                     eps=config.adam_eps,
                     bias_correction=True,
-                    fused=True, # this flag is used to improve the performance of the cpu optimizer
+                    fused=True,  # this flag is used to improve the performance of the cpu optimizer
                 )
             else:
                 gpu_optimizer_cls = SGD
