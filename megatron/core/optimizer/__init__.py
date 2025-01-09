@@ -265,53 +265,45 @@ def _get_megatron_optimizer_based_on_param_groups(
     Returns:
         Instance of MegatronOptimizer.
     """
-    if config.optimizer_cpu_offloading:
-        gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
-        cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
-        if config.use_torch_optimizer:
-            gpu_optimizer_cls = cpu_optimizer_cls
-        if config.optimizer == 'adam':
-            gpu_optimizer_cls = Adam
-            cpu_optimizer_cls = CPUAdam
-            optimizer_defaults = dict(
-                lr=config.lr,
-                weight_decay=config.weight_decay,
-                betas=(config.adam_beta1, config.adam_beta2),
-                eps=config.adam_eps,
-                bias_correction=True,
-            )
-        else:
-            gpu_optimizer_cls = SGD
-            cpu_optimizer_cls = CPUSGD
-            optimizer_defaults = dict(
-                lr=config.lr, weight_decay=config.weight_decay, momentum=config.sgd_momentum
-            )
-        optimizer = HybridDeviceOptimizer(
-            param_groups,
-            offload_fraction=config.optimizer_offload_fraction,
-            cpu_optimizer_cls=cpu_optimizer_cls,
-            gpu_optimizer_cls=gpu_optimizer_cls,
-            overlap_cpu_optimizer_d2h_h2d=config.overlap_cpu_optimizer_d2h_h2d,
-            pin_cpu_grads=config.pin_cpu_grads,
-            pin_cpu_params=config.pin_cpu_params,
-            param_update_in_fp32=True,
-            **optimizer_defaults,
-        )
-        init_state_fn = None
-    elif config.optimizer == 'adam':
-        optimizer = Adam(
-            param_groups,
-            lr=config.lr,
-            weight_decay=config.weight_decay,
-            betas=(config.adam_beta1, config.adam_beta2),
-            eps=config.adam_eps,
-        )
-
     # when freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
     # for the purposes of grad stats reductions
     if param_groups:
-        if config.optimizer == 'adam':
+        if config.optimizer_cpu_offloading:
+            gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
+            cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
+            if config.use_torch_optimizer:
+                gpu_optimizer_cls = cpu_optimizer_cls
+            if config.optimizer == 'adam':
+                gpu_optimizer_cls = Adam
+                cpu_optimizer_cls = CPUAdam
+                optimizer_defaults = dict(
+                    lr=config.lr,
+                    weight_decay=config.weight_decay,
+                    betas=(config.adam_beta1, config.adam_beta2),
+                    eps=config.adam_eps,
+                    bias_correction=True,
+                    fused=True, # this flag is used to improve the performance of the cpu optimizer
+                )
+            else:
+                gpu_optimizer_cls = SGD
+                cpu_optimizer_cls = CPUSGD
+                optimizer_defaults = dict(
+                    lr=config.lr, weight_decay=config.weight_decay, momentum=config.sgd_momentum
+                )
+            optimizer = HybridDeviceOptimizer(
+                param_groups,
+                offload_fraction=config.optimizer_offload_fraction,
+                cpu_optimizer_cls=cpu_optimizer_cls,
+                gpu_optimizer_cls=gpu_optimizer_cls,
+                overlap_cpu_optimizer_d2h_h2d=config.overlap_cpu_optimizer_d2h_h2d,
+                pin_cpu_grads=config.pin_cpu_grads,
+                pin_cpu_params=config.pin_cpu_params,
+                param_update_in_fp32=True,
+                **optimizer_defaults,
+            )
+            init_state_fn = None
+        elif config.optimizer == 'adam':
             kwargs = {
                 "params": param_groups,
                 "lr": config.lr,

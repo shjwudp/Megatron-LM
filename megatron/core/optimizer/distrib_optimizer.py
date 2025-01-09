@@ -1219,25 +1219,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         prefix = 'optimizer.state'
         state = {}
 
-        if isinstance(self.optimizer, HybridDeviceOptimizer):
-            # Prepare a map of each parameter and layer offset to be used for
-            # dist-checkpoint sharded tensor creation for special state "step".
-            param_prepend_offsets = {}
-
-            # Initialize the map with zeros for all parameters.
-            for model_chunk in self.model_chunks:
-                for module in model_chunk.modules():
-                    for param in module.parameters():
-                        param_prepend_offsets[param] = []
-
-            # Update the map with the actual layer offset for TransformerLayer parameters.
-            for model_chunk in self.model_chunks:
-                for module in model_chunk.modules():
-                    if hasattr(module, 'layer_number'):
-                        offset = module.layer_number - 1
-                        for name, param in module.named_parameters():
-                            param_prepend_offsets[param] = [(0, offset, module.config.num_layers)]
-
         # Not stored in the checkpoint, used only to identify params in
         # `sharded_param_state_fs_model_space`.
         param_idx = 0

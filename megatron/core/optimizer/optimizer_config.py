@@ -160,8 +160,10 @@ class OptimizerConfig:
                 self.use_distributed_optimizer
             ), '--use-precision-aware-optimizer only supported with distributed optimizer'
 
-            # Only the FusedAdam in TE supports --use-precision-aware-optimizer.
+            # Only the FusedAdam in TE and HybridDeviceOptimizer supports --use-precision-aware-optimizer.
             # TODO: Remove this check when apex's FusedAdam is no longer used.
+            if self.optimizer_cpu_offloading:
+                return
             try:
                 import inspect
 

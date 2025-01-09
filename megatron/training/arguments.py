@@ -754,7 +754,7 @@ def validate_args(args, defaults={}):
             print('Warning: disabling --no-load-rng for upcycling.')
 
     # Optimizer CPU offload check
-    if args.optimizer_cpu_offload:
+    if args.optimizer_cpu_offloading:
         args.use_precision_aware_optimizer = True
 
     # Print arguments.

@@ -294,7 +294,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 orig_param = self.inner_param_to_orig_param[param]
                 new_state[orig_param] = optimizer.state[param]
                 if self.param_update_in_fp32:
-                    new_state[orig_param]["fp32_param"] = param
+                    new_state[orig_param]["master_param"] = param
         self.state = new_state
 
     def _sync_hdo_state_to_sub_optimizers(self):
@@ -348,7 +348,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             return
         for param, v in self.state.items():
             fp32_param = self.param_to_fp32_param[param]
-            fp32_param.data.copy_(v["fp32_param"])
+            fp32_param.data.copy_(v["master_param"])
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
