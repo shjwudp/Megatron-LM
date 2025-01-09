@@ -114,11 +114,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             return fp32_param_copy_back_gpu_hook
 
         for optimizer in self.sub_optimizers:
-            if isinstance(optimizer, self.cpu_optimizer_cls):
+            if optimizer is not self.gpu_optimizer:
                 optimizer.register_step_post_hook(param_copy_back_gpu_hook_closure())
-            # NOTE: Do not use `elif` here, because the cpu_optimizer_cls may be
-            # the same as gpu_optimizer_cls.
-            if self.param_update_in_fp32 and isinstance(optimizer, self.gpu_optimizer_cls):
+            elif self.param_update_in_fp32:
                 optimizer.register_step_post_hook(fp32_param_copy_back_gpu_hook_closure())
 
     def step(self, closure=None):
@@ -168,13 +166,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.fp32_param_to_orig_param = {v: k for k, v in self.param_to_fp32_param.items()}
 
         if self.overlap_cpu_optimizer_d2h_h2d:
-            (self.cpu_optimizers, self.param_optimizer_mapping, self.n_params) = (
-                self.build_cpu_optimizer_list(self.cpu_optimizer_cls, self.cpu_param_groups)
-            )
+            self.cpu_optimizers = self.build_cpu_optimizer_list(self.cpu_optimizer_cls, self.cpu_param_groups)
         else:
             self.cpu_optimizers = [self.cpu_optimizer_cls(self.cpu_param_groups)]
-            self.param_optimizer_mapping = {}
-            self.n_params = []
 
         if len(self.gpu_param_groups) > 0:
             self.gpu_optimizer = self.gpu_optimizer_cls(self.gpu_param_groups)
@@ -182,16 +176,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self.gpu_optimizer = None
 
         self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = defaultdict(torch.Tensor)
-        self._d2h_stream = (
-            torch.cuda.Stream()
-            if self.overlap_cpu_optimizer_d2h_h2d
-            else torch.cuda.current_stream()
-        )
-        self._h2d_stream = (
-            torch.cuda.Stream()
-            if self.overlap_cpu_optimizer_d2h_h2d
-            else torch.cuda.current_stream()
-        )
+        self._d2h_stream = torch.cuda.current_stream()
+        self._h2d_stream = torch.cuda.current_stream()    
+        if self.overlap_cpu_optimizer_d2h_h2d:
+            self._d2h_stream = torch.cuda.Stream()
+            self._h2d_stream = torch.cuda.Stream()
         self._cpu_optimizer_map_data_event = dict()
 
         self.register_param_copy_back_gpu_hook()
@@ -206,24 +195,20 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             cpu_param_groups (List[Dict[str, Any]]): The CPU parameter groups
         """
         cpu_optimizers = []
-        param_optimizer_mapping = dict()
-        n_params = []
 
         if len(cpu_param_groups) == 0:
-            return cpu_optimizers, param_optimizer_mapping, n_params
+            return cpu_optimizers
 
         for group in cpu_param_groups:
             group_defaults = group.copy()
             params = group_defaults.pop("params")
             if isinstance(params, torch.Tensor):
                 params = [params]
-            for param in params:
-                param_optimizer_mapping[param] = len(cpu_optimizers)
+            for param in params: 
                 _cpu_param_group = group_defaults.copy()
                 _cpu_param_group["params"] = [param]
                 cpu_optimizers.append(cpu_optimizer_cls([_cpu_param_group]))
-                n_params.append(1)
-        return cpu_optimizers, param_optimizer_mapping, n_params
+        return cpu_optimizers
 
     def _get_sub_optimizer_param_groups(self, offload_fraction: float):
         params = []
