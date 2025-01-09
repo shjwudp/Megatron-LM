@@ -176,16 +176,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             self.gpu_optimizer = None
 
         self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = defaultdict(torch.Tensor)
-        self._d2h_stream = (
-            torch.cuda.Stream()
-            if self.overlap_cpu_optimizer_d2h_h2d
-            else torch.cuda.current_stream()
-        )
-        self._h2d_stream = (
-            torch.cuda.Stream()
-            if self.overlap_cpu_optimizer_d2h_h2d
-            else torch.cuda.current_stream()
-        )
+        self._d2h_stream = torch.cuda.current_stream()
+        self._h2d_stream = torch.cuda.current_stream()    
+        if self.overlap_cpu_optimizer_d2h_h2d:
+            self._d2h_stream = torch.cuda.Stream()
+            self._h2d_stream = torch.cuda.Stream()
         self._cpu_optimizer_map_data_event = dict()
 
         self.register_param_copy_back_gpu_hook()
