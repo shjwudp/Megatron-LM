@@ -165,9 +165,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 self.inner_param_to_orig_param[inner_param] = param
         self.fp32_param_to_orig_param = {v: k for k, v in self.param_to_fp32_param.items()}
 
+        self.cpu_optimizers = []
         if self.overlap_cpu_optimizer_d2h_h2d:
             self.cpu_optimizers = self.build_cpu_optimizer_list(self.cpu_optimizer_cls, self.cpu_param_groups)
-        else:
+        elif len(self.cpu_param_groups) > 0:
             self.cpu_optimizers = [self.cpu_optimizer_cls(self.cpu_param_groups)]
 
         if len(self.gpu_param_groups) > 0:
