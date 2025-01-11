@@ -4,7 +4,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import SGD, Adam
-from transformer_engine.pytorch.optimizers import FusedAdam, FusedSGD
+try:
+    from transformer_engine.pytorch.optimizers import FusedAdam, FusedSGD
+except:
+    # Handle environment where transformer_engine is not installed
+    from torch.optim import SGD as FusedSGD
+    from torch.optim import Adam as FusedAdam
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
