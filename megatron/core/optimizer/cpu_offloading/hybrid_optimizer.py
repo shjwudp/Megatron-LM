@@ -144,6 +144,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 optimizer.register_step_post_hook(fp32_param_copy_back_gpu_hook_closure())
 
     def step(self, closure=None):
+        """
+        Override the step method to perform the following operations:
+            1. Sync the HDO param_groups to sub-optimizers.
+            2. Sync the grads from GPU to CPU.
+            3. Step the sub-optimizers.
+            4. Sync the sub-optimizers state to HDO.
+        """
         # Sync param_groups to sub-optimizers before each step to make sure
         # the lr, wd, etc. are up-to-date.
         self._sync_hdo_param_groups_to_sub_optimizers()
