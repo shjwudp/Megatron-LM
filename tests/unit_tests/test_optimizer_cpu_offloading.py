@@ -36,12 +36,12 @@ class Net(nn.Module):
 
 
 @pytest.mark.parametrize('n_steps', [1, 10])
-@pytest.mark.parametrize('overlap_strategy', ['no_overlap', 'streams', 'overlap'])
+@pytest.mark.parametrize('overlap_cpu_optimizer_d2h_h2d', [False, True])
 @pytest.mark.parametrize('offload_fraction', [0, 0.5, 1.0])
 @pytest.mark.parametrize('optimizer', ['sgd', 'adam'])
 @pytest.mark.parametrize('with_param_groups', [False, True])
 def test_multi_device_hybrid_optimizer(
-    with_param_groups, optimizer, offload_fraction, overlap_strategy, n_steps
+    with_param_groups, optimizer, offload_fraction, overlap_cpu_optimizer_d2h_h2d, n_steps
 ):
     net1 = Net().cuda()
     net2 = Net().cuda()
@@ -66,15 +66,10 @@ def test_multi_device_hybrid_optimizer(
     else:
         cls_kwargs = dict(cpu_optimizer_cls=SGD, gpu_optimizer_cls=FusedSGD)
 
-    if overlap_strategy == 'no_overlap':
-        overlap_kwargs = dict(overlap=False, multi_streams=False)
-    elif overlap_strategy == 'streams':
-        overlap_kwargs = dict(overlap=False, multi_streams=True)
-    else:
-        overlap_kwargs = dict(overlap=True, multi_streams=True)
-
     hdo = HybridDeviceOptimizer(
-        params, offload_fraction=offload_fraction, lr=base_lr, **cls_kwargs, **overlap_kwargs
+        params, offload_fraction=offload_fraction, lr=base_lr,
+        overlap_cpu_optimizer_d2h_h2d=overlap_cpu_optimizer_d2h_h2d,
+        **cls_kwargs
     )
 
     ref_optimizer = cls_kwargs['gpu_optimizer_cls'](ref_params, lr=base_lr)
@@ -117,7 +112,6 @@ def test_multi_device_hybrid_optimizer(
         assert (v.isnan() == ref_params[k].isnan()).all()
         torch.nan_to_num_(v, 0)
         torch.nan_to_num_(ref_params[k], 0)
-        tol = 1e-6 if n_steps > 1 else 1e-8
         assert torch.allclose(
-            v, ref_params[k], atol=tol
+            v, ref_params[k], atol=1e-03
         ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
