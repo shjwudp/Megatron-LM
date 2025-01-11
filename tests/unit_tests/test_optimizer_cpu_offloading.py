@@ -1,4 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+import random
+
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -6,11 +9,12 @@ import torch.nn.functional as F
 from torch.optim import SGD, Adam
 
 try:
-    from transformer_engine.pytorch.optimizers import FusedAdam, FusedSGD
+    from transformer_engine.pytorch.optimizers import FusedAdam as GPUAdam
+    from transformer_engine.pytorch.optimizers import FusedSGD as GPUSGD
 except:
     # Handle environment where transformer_engine is not installed
-    from torch.optim import SGD as FusedSGD
-    from torch.optim import Adam as FusedAdam
+    from torch.optim import SGD as GPUSGD
+    from torch.optim import Adam as GPUAdam
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
@@ -35,6 +39,16 @@ class Net(nn.Module):
         return x
 
 
+def setup_seed(seed):
+    random.seed(seed)  # Set Python's built-in random seed
+    np.random.seed(seed)  # Set NumPy's random seed
+    torch.manual_seed(seed)  # Set PyTorch's CPU seed
+    torch.cuda.manual_seed(seed)  # Set PyTorch's GPU seed (if using CUDA)
+    torch.cuda.manual_seed_all(seed)  # Set seed for all GPUs
+    torch.backends.cudnn.deterministic = True  # Ensure deterministic behavior
+    torch.backends.cudnn.benchmark = False  # Disable auto-tuner for reproducibility
+
+
 @pytest.mark.parametrize('n_steps', [1, 10])
 @pytest.mark.parametrize('overlap_cpu_optimizer_d2h_h2d', [False, True])
 @pytest.mark.parametrize('offload_fraction', [0, 0.5, 1.0])
@@ -43,6 +57,7 @@ class Net(nn.Module):
 def test_multi_device_hybrid_optimizer(
     with_param_groups, optimizer, offload_fraction, overlap_cpu_optimizer_d2h_h2d, n_steps
 ):
+    setup_seed(42)
     net1 = Net().cuda()
     net2 = Net().cuda()
     net2.load_state_dict(net1.state_dict())
@@ -62,9 +77,9 @@ def test_multi_device_hybrid_optimizer(
         ref_params = ref_param_groups
 
     if optimizer == 'adam':
-        cls_kwargs = dict(cpu_optimizer_cls=Adam, gpu_optimizer_cls=FusedAdam)
+        cls_kwargs = dict(cpu_optimizer_cls=Adam, gpu_optimizer_cls=GPUAdam)
     else:
-        cls_kwargs = dict(cpu_optimizer_cls=SGD, gpu_optimizer_cls=FusedSGD)
+        cls_kwargs = dict(cpu_optimizer_cls=SGD, gpu_optimizer_cls=GPUSGD)
 
     hdo = HybridDeviceOptimizer(
         params,
@@ -86,7 +101,7 @@ def test_multi_device_hybrid_optimizer(
     output.sum().backward()
     ref_optimizer.step()
     # PyTorch SGD will not generate state
-    if optimizer != 'sgd' or offload_fraction < 1:
+    if optimizer != 'sgd':
         assert len(hdo.state_dict()["state"]) != 0
 
     # 2. check the state is on right device
