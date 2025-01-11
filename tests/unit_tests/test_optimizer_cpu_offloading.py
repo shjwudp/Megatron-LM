@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import SGD, Adam
+
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam, FusedSGD
 except:
