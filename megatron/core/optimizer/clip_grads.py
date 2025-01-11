@@ -141,7 +141,7 @@ def clip_grad_by_total_norm_fp32(
     total_norm: float,
     use_decoupled_grad: bool = False,
 ):
-    """Clips iterable of gradients in fp32 by total norm.
+    """Clips gradient of an iterable of parameters in fp32 by total norm.
 
     Note that the gradients are modified in place.
 

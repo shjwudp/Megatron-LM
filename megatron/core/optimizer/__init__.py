@@ -269,7 +269,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     # hence an empty param_groups. However, we still need to create an optimizer
     # for the purposes of grad stats reductions
     if param_groups:
-        if config.optimizer_cpu_offloading:
+        if config.optimizer_cpu_offload:
             gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
             cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
             if config.use_torch_optimizer:

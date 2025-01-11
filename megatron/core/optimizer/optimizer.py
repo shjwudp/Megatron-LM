@@ -36,8 +36,6 @@ except ImportError:
         multi_tensor_applier = local_multi_tensor_applier
         multi_tensor_scale_impl = local_multi_tensor_scale
 
-from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
-
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
@@ -1056,7 +1054,7 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer in self.chained_optimizers:
             if optimizer.config.clip_grad > 0.0:
                 clip_grad_by_total_norm_fp32(
-                    optimizer.get_main_grads_for_grad_norm(),
+                    optimizer.get_parameters(),
                     max_norm=optimizer.config.clip_grad,
                     total_norm=grad_norm,
                     use_decoupled_grad=optimizer.config.use_precision_aware_optimizer,

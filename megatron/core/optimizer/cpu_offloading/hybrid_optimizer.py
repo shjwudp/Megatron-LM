@@ -12,6 +12,32 @@ def _param_generator(cpu_optimizer):
 
 
 class HybridDeviceOptimizer(torch.optim.Optimizer):
+    """
+    HybridDeviceOptimizer is a custom optimizer designed to facilitate
+    hybrid parameter updates across GPU and CPU. This optimizer allows
+    users to adjust the fraction of parameters updated on the CPU and
+    GPU through the `offload_fraction` parameter.
+
+    It supports bf16 mixed-precision training. Additionally, the optimizer
+    implements overlapping operations for improved performance, including
+    gradient transfer from device to host (D2H) and parameter transfer
+    from host to device (H2D).
+
+    Example:
+        optimizer = HybridDeviceOptimizer(
+            param_groups,
+            offload_fraction=0.5,
+            param_update_in_fp32=True,
+            overlap_cpu_optimizer_d2h_h2d=True,
+        )
+        optimizer.step()
+
+    Note:
+        This optimizer is particularly useful in scenarios where memory
+        constraints are present or when leveraging both CPU and GPU resources
+        can lead to performance improvements.
+    """
+
     def __init__(
         self,
         params,
@@ -58,25 +84,23 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     # in the following part.
                     continue
                 fp32_param = self.param_to_fp32_param[param]
-                if hasattr(param, "decoupled_grad"):
-                    fp32_param.grad = param.decoupled_grad
+                grad = getattr(param, "decoupled_grad", param.grad)
+                if grad is not None:
+                    fp32_param.grad = grad.to(fp32_param.dtype)
+                    fp32_param.requires_grad = True
                 else:
-                    fp32_param.grad = param.grad.to(fp32_param.dtype)
+                    fp32_param.requires_grad = False
 
         # Sync the grads from GPU to CPU.
         for optimizer in self.cpu_optimizers:
             for param in _param_generator(optimizer):
                 gpu_param = self.cpu_copys_map_gpu_param[param]
-                if hasattr(gpu_param, "decoupled_grad"):
-                    grad = gpu_param.decoupled_grad
-                elif hasattr(gpu_param, "grad"):
-                    grad = gpu_param.grad
-                else:
-                    grad = None
+                grad = getattr(gpu_param, "decoupled_grad", gpu_param.grad)
+                if grad is None:
                     param.requires_grad = False
                     continue
 
-                param.requires_grad = True
+                param.requires_grad = False
                 if param not in self.cpu_copy_map_grad:
                     self.cpu_copy_map_grad[param] = torch.empty(
                         param.shape, dtype=param.dtype, pin_memory=self.pin_cpu_grads, device="cpu"
@@ -86,7 +110,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 self.cpu_copy_map_grad[param].data.copy_(grad, non_blocking=True)
             self._cpu_optimizer_map_data_event[optimizer] = self._d2h_stream.record_event()
 
-    def register_param_copy_back_gpu_hook(self):
+    def _register_param_copy_back_gpu_hook(self):
         def param_copy_back_gpu_hook_closure():
             def param_copy_back_gpu_hook(optimizer, args, kwargs):
                 self._h2d_stream.wait_stream(torch.cuda.current_stream())
@@ -167,7 +191,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
         self.cpu_optimizers = []
         if self.overlap_cpu_optimizer_d2h_h2d:
-            self.cpu_optimizers = self.build_cpu_optimizer_list(self.cpu_optimizer_cls, self.cpu_param_groups)
+            self.cpu_optimizers = self.build_cpu_optimizer_list(
+                self.cpu_optimizer_cls, self.cpu_param_groups
+            )
         elif len(self.cpu_param_groups) > 0:
             self.cpu_optimizers = [self.cpu_optimizer_cls(self.cpu_param_groups)]
 
@@ -178,13 +204,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
         self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = defaultdict(torch.Tensor)
         self._d2h_stream = torch.cuda.current_stream()
-        self._h2d_stream = torch.cuda.current_stream()    
+        self._h2d_stream = torch.cuda.current_stream()
         if self.overlap_cpu_optimizer_d2h_h2d:
             self._d2h_stream = torch.cuda.Stream()
             self._h2d_stream = torch.cuda.Stream()
         self._cpu_optimizer_map_data_event = dict()
 
-        self.register_param_copy_back_gpu_hook()
+        self._register_param_copy_back_gpu_hook()
 
     @staticmethod
     def build_cpu_optimizer_list(cpu_optimizer_cls, cpu_param_groups):
@@ -205,7 +231,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             params = group_defaults.pop("params")
             if isinstance(params, torch.Tensor):
                 params = [params]
-            for param in params: 
+            for param in params:
                 _cpu_param_group = group_defaults.copy()
                 _cpu_param_group["params"] = [param]
                 cpu_optimizers.append(cpu_optimizer_cls([_cpu_param_group]))
@@ -394,11 +420,17 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.register_load_state_dict_post_hook(post_load_state_dict_hook)
 
     def zero_grad(self, set_to_none: bool = True):
+        """
+        Zero or zero to none the gradients of all the parameters in the model.
+        """
         super(HybridDeviceOptimizer, self).zero_grad(set_to_none)
         for group in self.param_groups:
             for param in group["params"]:
                 if hasattr(param, "decoupled_grad"):
-                    del param.decoupled_grad
+                    if set_to_none:
+                        param.decoupled_grad = None
+                    else:
+                        param.decoupled_grad.zero_()
 
     def dummy_step(self):
         """
@@ -414,6 +446,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
     @property
     def sub_optimizers(self):
+        """
+        Return the list of sub-optimizers.
+        """
         if self.gpu_optimizer is not None:
             return self.cpu_optimizers + [self.gpu_optimizer]
         return self.cpu_optimizers

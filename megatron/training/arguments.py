@@ -754,7 +754,7 @@ def validate_args(args, defaults={}):
             print('Warning: disabling --no-load-rng for upcycling.')
 
     # Optimizer CPU offload check
-    if args.optimizer_cpu_offloading:
+    if args.optimizer_cpu_offload:
         args.use_precision_aware_optimizer = True
 
     # Print arguments.
@@ -1382,7 +1382,7 @@ def _add_training_args(parser):
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
-    group.add_argument('--optimizer-cpu-offloading', action='store_true',
+    group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,
                           help='Ratio of optimizer state to offload to CPU')
