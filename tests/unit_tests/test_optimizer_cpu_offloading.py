@@ -67,9 +67,11 @@ def test_multi_device_hybrid_optimizer(
         cls_kwargs = dict(cpu_optimizer_cls=SGD, gpu_optimizer_cls=FusedSGD)
 
     hdo = HybridDeviceOptimizer(
-        params, offload_fraction=offload_fraction, lr=base_lr,
+        params,
+        offload_fraction=offload_fraction,
+        lr=base_lr,
         overlap_cpu_optimizer_d2h_h2d=overlap_cpu_optimizer_d2h_h2d,
-        **cls_kwargs
+        **cls_kwargs,
     )
 
     ref_optimizer = cls_kwargs['gpu_optimizer_cls'](ref_params, lr=base_lr)
