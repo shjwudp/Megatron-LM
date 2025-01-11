@@ -115,19 +115,25 @@ class OptimizerConfig:
     """If true, overlap param all-gather of first bucket with optimizer step."""
 
     #######################
-    # Optimizer Offloading
+    # Optimizer Offload
     #######################
 
-    optimizer_cpu_offloading: bool = False
+    optimizer_cpu_offload: bool = False
 
     optimizer_offload_fraction: float = 0.0
-    """CPU Offload Fraction used by static offload policy, valid if base optimizer is HybriDeviceOptimizer"""
+    """Specifies the fraction of optimizer states to offload from GPU memory to CPU."""
 
     use_torch_optimizer: bool = False
-    """If True, force Megatron optimizer use Torch AdamW"""
+    """If True, Megatron optimizer use Torch AdamW"""
 
     overlap_cpu_optimizer_d2h_h2d: bool = False
-    """If True, split CPU optimizer to build a overlap pipeline, requires multi_streams tobe True """
+    """
+    When set to `True`, this flag enables overlapping of the CPU optimizer
+    update process with the data transfer operations. This can help improve
+    overall training efficiency by reducing idle time during data movement,
+    allowing the optimizer to perform updates while gradients and parameters
+    are being transferred between devices.
+    """
 
     pin_cpu_grads: bool = True
     pin_cpu_params: bool = True
@@ -160,9 +166,10 @@ class OptimizerConfig:
                 self.use_distributed_optimizer
             ), '--use-precision-aware-optimizer only supported with distributed optimizer'
 
-            # Only the FusedAdam in TE and HybridDeviceOptimizer supports --use-precision-aware-optimizer.
+            # Only the FusedAdam in TE and HybridDeviceOptimizer supports
+            # --use-precision-aware-optimizer.
             # TODO: Remove this check when apex's FusedAdam is no longer used.
-            if self.optimizer_cpu_offloading:
+            if self.optimizer_cpu_offload:
                 return
             try:
                 import inspect

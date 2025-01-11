@@ -21,7 +21,6 @@ except ImportError:
 
         HAVE_APEX_OR_TE = False
 
-from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
 from .. import tensor_parallel
@@ -490,9 +489,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
 
-        assert (
-            isinstance(optimizer, (Adam, HybridDeviceOptimizer)) or optimizer is None
-        ), "Only Adam and HybridDeviceOptimizer currently supported, due to checkpointing requirements."
+        assert isinstance(optimizer, (Adam, HybridDeviceOptimizer)) or optimizer is None, (
+            "Only Adam and HybridDeviceOptimizer currently supported, "
+            "due to checkpointing requirements."
+        )
 
         # when freezing sub-models we have no real optimizer
         # but still need a stub DistributedOptimizer class
