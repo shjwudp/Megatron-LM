@@ -96,13 +96,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             for param in _param_generator(optimizer):
                 gpu_param = self.cpu_copys_map_gpu_param[param]
                 grad = getattr(gpu_param, "decoupled_grad", gpu_param.grad)
-                if grad is not None:
-                    fp32_param.grad = grad.to(fp32_param.dtype)
-                    fp32_param.requires_grad = True
-                else:
-                    fp32_param.requires_grad = False
+                if grad is None:
+                    param.requires_grad = False
                     continue
 
+                param.requires_grad = False
                 if param not in self.cpu_copy_map_grad:
                     self.cpu_copy_map_grad[param] = torch.empty(
                         param.shape, dtype=param.dtype, pin_memory=self.pin_cpu_grads, device="cpu"
