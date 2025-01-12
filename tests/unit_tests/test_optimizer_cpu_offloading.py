@@ -49,6 +49,13 @@ def setup_seed(seed):
     torch.backends.cudnn.benchmark = False  # Disable auto-tuner for reproducibility
 
 
+@pytest.mark.skipif(
+    torch.__version__ < '2.3.0',
+    reason=(
+        "Requires PyTorch 2.3.0 or higher, lower versions of pytorch have "
+        "misaligned optimizer accuracy for CPU and GPU."
+    ),
+)
 @pytest.mark.parametrize('n_steps', [1, 10])
 @pytest.mark.parametrize('overlap_cpu_optimizer_d2h_h2d', [False, True])
 @pytest.mark.parametrize('offload_fraction', [0, 0.5, 1.0])
@@ -66,13 +73,13 @@ def test_multi_device_hybrid_optimizer(
     ref_params = list(net2.parameters())
     if with_param_groups:
         param_groups = [
-            {"params": params[: len(params) // 2], "wd_mult": 0.1, "lr_mult": 0.1},
-            {"params": params[len(params) // 2 :], "wd_mult": 0.2, "lr_mult": 0.2},
+            {"params": params[: len(params) // 2], "wd_mult": 1.0, "lr_mult": 1e-4},
+            {"params": params[len(params) // 2 :], "wd_mult": 0.0, "lr_mult": 2e-4},
         ]
         params = param_groups
         ref_param_groups = [
-            {"params": ref_params[: len(ref_params) // 2], "wd_mult": 0.1, "lr_mult": 0.1},
-            {"params": ref_params[len(ref_params) // 2 :], "wd_mult": 0.2, "lr_mult": 0.2},
+            {"params": ref_params[: len(ref_params) // 2], "wd_mult": 1.0, "lr_mult": 1e-4},
+            {"params": ref_params[len(ref_params) // 2 :], "wd_mult": 0.0, "lr_mult": 2e-4},
         ]
         ref_params = ref_param_groups
 
@@ -113,6 +120,7 @@ def test_multi_device_hybrid_optimizer(
         if offload_fraction < 1:
             assert hdo.state_dict()["state"][last_param_id]["exp_avg"].is_cuda
 
+    # 3. check parameters allclose
     for _ in range(1, n_steps):
         input = torch.randn(1, 3, 32, 32).cuda()
         output = net1(input)
@@ -122,7 +130,6 @@ def test_multi_device_hybrid_optimizer(
         output.sum().backward()
         ref_optimizer.step()
 
-    # 3. check parameters allclose
     params = net1.state_dict()
     ref_params = net2.state_dict()
     for k, v in params.items():
