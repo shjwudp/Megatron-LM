@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import logging
+import warnings
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -14,8 +15,6 @@ except ImportError:
         from apex.optimizers import FusedAdam as Adam
         from apex.optimizers import FusedSGD as SGD
     except ImportError:
-        import warnings
-
         warnings.warn(
             f'Transformer Engine and Apex are not installed. Falling back to Torch optimizers.'
         )
@@ -270,6 +269,11 @@ def _get_megatron_optimizer_based_on_param_groups(
     # for the purposes of grad stats reductions
     if param_groups:
         if config.optimizer_cpu_offload:
+            if torch.__version__ < '2.3.0':
+                warnings.warn(
+                    "CPU offload is recommended for PyTorch >= 2.3.0, "
+                    "untested versions below this may have convergence issues."
+                )
             gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
             cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
             if config.use_torch_optimizer:
