@@ -24,8 +24,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     from host to device (H2D).
 
     Example:
+        from transformer_engine.pytorch.optimizers import FusedAdam as GPUAdam
+        from torch.optim import AdamW as CPUAdam
         optimizer = HybridDeviceOptimizer(
             param_groups,
+            cpu_optimizer_cls=CPUAdam,
+            gpu_optimizer_cls=GPUAdam,
             offload_fraction=0.5,
             param_update_in_fp32=True,
             overlap_cpu_optimizer_d2h_h2d=True,
