@@ -21,7 +21,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
     It supports bf16 mixed-precision training. Additionally, the optimizer
     implements overlapping operations for improved performance, including
     gradient transfer from device to host (D2H) and parameter transfer
-    from host to device (H2D)..
+    from host to device (H2D).
 
     Example:
         from transformer_engine.pytorch.optimizers import FusedAdam as GPUAdam
