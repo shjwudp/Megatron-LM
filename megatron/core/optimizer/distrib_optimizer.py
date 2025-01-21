@@ -1074,7 +1074,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Fixed TPxPP. Save on DP rank 0 only
             param_state = ShardedObject(
                 f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}.param_state',
-                param_state_data,
+                param_state_data,  # pylint: disable=E0606
                 (1,),
                 (0,),
             )
