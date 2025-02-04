@@ -1,8 +1,11 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from typing import Dict, List
+import asyncio
+from collections import OrderedDict
+from typing import AsyncGenerator, Dict, List, Optional, Union
 
 import torch
 
+from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
@@ -31,20 +34,61 @@ class MCoreEngine(AbstractEngine):
         self,
         text_generation_controller: TextGenerationController,
         max_batch_size,
-        random_seed: int = None,
+        random_seed: Optional[int] = None,
     ):
         self.text_generation_controller = text_generation_controller
         self.random_seed = random_seed
         self.scheduler = Scheduler(max_batch_size=max_batch_size)
 
+    def add_request(
+        self,
+        prompt: str,
+        add_BOS: bool = False,
+        encoder_prompt: Optional[str] = None,
+        inference_parameters: Optional[SamplingParams] = None,
+        streaming: bool = False,
+    ) -> str:
+        """
+        Adds a request to the scheduler and returns the request ID.
+
+        Args:
+            prompt (str): A prompt string
+            add_BOS (bool): Whether to add BOS token to beginning of the prompt
+            encoder_prompt (str): The encoder prompt string
+            inference_parameters (SamplingParams): The inference parameters
+            streaming (bool): Whether to stream incremental outputs for this request
+
+        Returns:
+            The newly created request ID.
+        """
+
+        prompt_tokens = self.text_generation_controller.tokenize_prompt(prompt, add_BOS)
+
+        return self.scheduler.add_request(
+            prompt=prompt,
+            prompt_tokens=prompt_tokens,
+            encoder_prompt=encoder_prompt,
+            inference_parameters=inference_parameters,
+            streaming=streaming,
+        )
+
+    def get_stream_generator(
+        self, request_id: str
+    ) -> Union[AsyncGenerator[InferenceRequest, None], None]:
+        """Returns the stream generator for the given request ID if it exists."""
+        stream = self.scheduler.streams.get(request_id, None)
+        if stream is not None:
+            return stream.generator()
+        return None
+
     def generate(
         self,
         prompts: List[str],
         add_BOS: bool = False,
-        encoder_prompts: List[str] = None,
-        common_inference_params: SamplingParams = None,
-        sampling_params: SamplingParams = None,
-    ) -> dict:
+        encoder_prompts: Optional[List[str]] = None,
+        common_inference_params: Optional[SamplingParams] = None,
+        sampling_params: Optional[SamplingParams] = None,
+    ) -> List[InferenceRequest]:
         """The megatron core inference backend generate function
 
         This backend returns the output generations as a dictionary.
@@ -67,19 +111,19 @@ class MCoreEngine(AbstractEngine):
 
         if common_inference_params:
             sampling_params = common_inference_params
+        if sampling_params is None:
+            sampling_params = SamplingParams()
 
         if self.random_seed:
             torch.random.manual_seed(self.random_seed)
 
-        request_ids = []
+        request_ids: List[str] = []
         for i in range(len(prompts)):
             prompt = prompts[i]
             encoder_prompt = encoder_prompts[i] if encoder_prompts is not None else None
-            prompt_tokens = self.text_generation_controller.tokenize_prompt(prompt, add_BOS)
-
-            request_id = self.scheduler.add_request(
+            request_id = self.add_request(
                 prompt=prompt,
-                prompt_tokens=prompt_tokens,
+                add_BOS=add_BOS,
                 encoder_prompt=encoder_prompt,
                 inference_parameters=sampling_params,
             )
@@ -103,10 +147,15 @@ class MCoreEngine(AbstractEngine):
                 Defaults to False.
         """
         while self.scheduler.have_requests_pending():
-            active_requests: Dict[int, InferenceRequest] = self.scheduler.active_request_pool.copy()
-            result_dict: Dict[int, InferenceRequest] = (
+            active_requests: Dict[str, InferenceRequest] = self.scheduler.active_request_pool.copy()
+            active_streams: Dict[str, AsyncStream] = OrderedDict()
+            for request_id in active_requests:
+                if (stream := self.scheduler.streams.get(request_id, None)) is not None:
+                    assert isinstance(stream, AsyncStream), stream
+                    active_streams[request_id] = stream
+            result_dict: Dict[str, InferenceRequest] = (
                 self.text_generation_controller.generate_all_output_tokens_static_batch(
-                    active_requests
+                    active_requests, active_streams
                 )
             )
 
@@ -116,9 +165,25 @@ class MCoreEngine(AbstractEngine):
         """ 
             if dynamic_batching:
                 result_dict: Dict[
-                    int, InferenceRequest
+                    str, InferenceRequest
                 ] = self.text_generation_controller.generate_output_tokens_one_step_dynamic_batch(
                     active_requests
                 )
             self.scheduler.update_requests_pools(result_dict=result_dict)         
         """
+
+    def _wrapped_run_engine(self, cuda_device):
+        """
+        Explicitly sets the CUDA device before running the engine.
+
+        This is to ensure that the CUDA device is correctly propagated when running
+        in a new thread context.
+        """
+        torch.cuda.set_device(cuda_device)
+        self.run_engine()
+
+    async def run_engine_async(self):
+        """Runs the engine asynchronously using asyncio"""
+        loop = asyncio.get_running_loop()
+
+        await loop.run_in_executor(None, self._wrapped_run_engine, torch.cuda.current_device())

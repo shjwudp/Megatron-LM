@@ -19,7 +19,7 @@ from jetclient.services.dtos.pipeline import PipelineStatus
 from tests.test_utils.python_scripts import common
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
-
+GITLAB_PREFIX = "assets/basic/tests-unit-tests-data-{environment}-{tag}/"
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ def launch_and_wait_for_completion(
     container_tag: str,
     cluster: str,
     account: str,
+    record_checkpoints: str,
     partition: Optional[str],
     tag: Optional[str],
     run_name: Optional[str],
@@ -68,6 +69,7 @@ def launch_and_wait_for_completion(
                 container_image=container_image,
                 container_tag=container_tag,
                 environment=environment,
+                record_checkpoints=record_checkpoints,
             ),
             config_id=f"mcore/{common.resolve_cluster_config(cluster)}",
             custom_config={
@@ -84,6 +86,10 @@ def launch_and_wait_for_completion(
                             }
                         }
                     }
+                },
+                "outputs": {
+                    "enabled": True,
+                    "artifacts_storages": [common.resolve_artifact_config(cluster)],
                 },
             },
             wait_for_validation=True,
@@ -119,11 +125,18 @@ def download_job_assets(logs: List[jet_log.JETLog], iteration: int = 0) -> List[
         assets = log.get_assets()
         assets_path = assets_base_path / f"restart={restart_idx}"
         assets_path.mkdir(parents=True, exist_ok=True)
-        for log_filename in assets.keys():
-            with open(assets_path / log_filename, "w") as fh:
+        for asset in assets:
+            (assets_path / asset.source_path.removeprefix(GITLAB_PREFIX)).parent.mkdir(
+                parents=True, exist_ok=True
+            )
+            with open(assets_path / asset.source_path.removeprefix(GITLAB_PREFIX), "w") as fh:
                 dest = pathlib.Path(fh.name)
-                logger.info("Downloading log %s to %s", log_filename, str(dest))
-                assets[log_filename].download(dest)
+                logger.info(
+                    "Downloading log %s to %s",
+                    asset.source_path.removeprefix(GITLAB_PREFIX),
+                    str(dest),
+                )
+                asset.download(dest)
     return assets
 
 
@@ -133,7 +146,9 @@ def extract_logs_to_string(logs: List[jet_log.JETLog]) -> List[str]:
         return [""]
 
     with tempfile.NamedTemporaryFile() as tmp_file:
-        logs[-1].get_assets()["output_script-0.log"].download(pathlib.Path(tmp_file.name))
+        assets = logs[-1].get_assets()
+        asset = [asset for asset in assets if asset.name == "output_script-0.log"][0]
+        asset.download(pathlib.Path(tmp_file.name))
         with open(pathlib.Path(tmp_file.name), "r") as fh:
             return fh.readlines()
 
@@ -175,6 +190,7 @@ def parse_finished_training(logs: List[str]) -> Optional[bool]:
 @click.option("--container-tag", required=True, type=str, help="Base image of Mcore image")
 @click.option("--container-image", required=False, type=str, help="Base image of Mcore image")
 @click.option("--tag", required=False, type=str, help="Tag (only relevant for unit tests)")
+@click.option("--record-checkpoints", required=False, type=str, help="Values are 'true' or 'false'")
 @click.option(
     "--run-name", required=False, type=str, help="Run name (only relevant for release tests)"
 )
@@ -195,6 +211,7 @@ def main(
     partition: Optional[str],
     cluster: str,
     container_tag: str,
+    record_checkpoints: str,
     tag: Optional[str] = None,
     container_image: Optional[str] = None,
     run_name: Optional[str] = None,
@@ -202,6 +219,9 @@ def main(
 ):
     logging.basicConfig(level=logging.INFO)
     logger.info('Started')
+
+    global GITLAB_PREFIX
+    GITLAB_PREFIX = GITLAB_PREFIX.format(environment=environment, tag=tag)
 
     model_config_path = pathlib.Path(
         BASE_PATH
@@ -249,6 +269,7 @@ def main(
             tag=tag,
             run_name=run_name,
             wandb_experiment=wandb_experiment,
+            record_checkpoints=record_checkpoints,
         )
 
         main_job = [job for job in pipeline.get_jobs() if job.name.startswith("basic")][0]
@@ -261,18 +282,30 @@ def main(
                 download_job_assets(logs=jet_log, iteration=n_iteration)
                 no_log = False
                 break
-            except (requests.exceptions.ConnectionError, json.decoder.JSONDecodeError) as e:
+            except (
+                requests.exceptions.ConnectionError,
+                json.decoder.JSONDecodeError,
+                UnicodeDecodeError,
+            ) as e:
                 logger.error(e)
                 time.sleep((3**n_download_attempt) * 60)
                 n_download_attempt += 1
+                no_log = True
             except KeyError as e:
                 logger.error(e)
                 no_log = True
+                break
 
         if no_log:
+            logger.error("Did not find any logs to download, retry.")
             continue
 
         concat_logs = "\n".join(logs)
+        if concat_logs.strip() == "":
+            logger.error("No logs found. Try again.")
+            n_attempts += 1
+            continue
+
         print(f"Logs:\n{concat_logs}")
 
         success = pipeline.get_status() == PipelineStatus.SUCCESS
@@ -289,7 +322,7 @@ def main(
                 "Some NCCL operations have failed or timed out." in concat_logs
                 or "uncorrectable ECC error encountered" in concat_logs
                 or "illegal memory access" in concat_logs
-                or "illegal instruction" in concat_logs
+                or "illegal instruction" in concat_logs in concat_logs
             ):
                 logger.error("Detected NCCL failure, attempt restart.")
                 n_attempts += 1
@@ -299,6 +332,8 @@ def main(
                 logger.error("Non-determinism, let's try another node.")
                 n_nondeterminism_attemps += 1
                 continue
+
+            sys.exit(1)
 
         if parse_failed_job(logs=logs):
             n_attempts += 1

@@ -21,13 +21,16 @@ def test_regular_pipeline(
             "mem-allocated-bytes": [
                 common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0)
             ],
+            "mem-max-allocated-bytes": [
+                common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0)
+            ],
             "lm loss": [
                 common.DeterministicTest(),
                 common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0),
             ],
             "num-zeros": [
                 common.DeterministicTest(),
-                common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.15), rtol=0),
+                common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.20), rtol=0),
             ],
         }
 

@@ -28,9 +28,9 @@ test:build_image:
         BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
       - IMAGE: CI_MCORE_DEV_IMAGE
         FILE: Dockerfile.ci.dev
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.07-py3
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.10-py3
       - IMAGE: CI_NEMO_IMAGE
-        FILE: Dockerfile.ci.lts
+        FILE: Dockerfile.ci.dev
         BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
       - IMAGE: UTILITY_IMAGE
         FILE: Dockerfile.linting
@@ -75,7 +75,7 @@ test:build_image:
           --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
           --build-arg MCORE_REPO=${CI_REPOSITORY_URL} \
           --build-arg MCORE_REF=$CI_COMMIT_SHA \
-          --build-arg MCORE_BACKWARDS_REF="core_r0.9.0" \
+          --build-arg MCORE_BACKWARDS_REF="core_r0.10.0" \
           --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
           --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
           --cache-from type=registry,ref=${IMAGE}-buildcache:main \
@@ -195,13 +195,13 @@ test:unit_tests_pyt(DEV)_mcore(legacy):
 test:unit_tests_pyt(LTS)_mcore(legacy):
   extends: [.unit_tests_run]
   variables:
-    ENVIRONMENT: dev
+    ENVIRONMENT: lts
     TAG: legacy
 
 test:unit_tests_pyt(DEV)_mcore(latest):
   extends: [.unit_tests_run]
   variables:
-    ENVIRONMENT: lts
+    ENVIRONMENT: dev
     TAG: latest
 
 test:unit_tests_pyt(LTS)_mcore(latest):
@@ -262,13 +262,13 @@ test:formatting:
         exit 0
       fi
     - set +e
-    - git fetch origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
     - git fetch origin main:main
-    - git checkout $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
     - |
       if [[ "$CI_MERGE_REQUEST_PROJECT_PATH" == "$CI_MERGE_REQUEST_SOURCE_PROJECT_PATH" ]]; then 
         bash tools/autoformat.sh
         set -e
+        git fetch origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+        git checkout $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
         git config --global user.email "mcore-bot@nvidia.com"
         git config --global user.name "Mcore Bot"
         git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
@@ -322,7 +322,7 @@ test:pypi_build_wheel:
   tags: [mcore-docker-node-small]
   variables:
     PUBLISH_DRYRUN: 'yes'
-    PY_ENV: pytorch:24.07
+    PY_ENV: pytorch_24.10
   script:
     - echo $PUBLISH_DRYRUN
     - >
@@ -332,25 +332,31 @@ test:pypi_build_wheel:
       fi
 
 
-    - /opt/python/cp310-cp310/bin/python -m build
     - /opt/python/cp311-cp311/bin/python -m build
     - auditwheel repair dist/*.whl
+
+    # Install with no-deps since we
+    - /opt/python/cp311-cp311/bin/pip install --no-deps .
+    - /opt/python/cp311-cp311/bin/pip install numpy torch
+    - EXPECTED_RELEASE_NUMBER=$(/opt/python/cp311-cp311/bin/python -c "from megatron import core; print(core.__version__)")
+    - echo "EXPECTED_RELEASE_NUMBER=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
   artifacts:
     paths:
       - megatron/core/package_info.py
       - wheelhouse/
+    reports:
+      dotenv: build.env
 
 test:pypi_test_wheel:
   extends: [.test_rules]
-  image: nvcr.io/nvidia/pytorch:24.01-py3
+  image: python:3.11
   needs: [test:pypi_build_wheel]
   tags: [mcore-docker-node-small]
   variables:
     PUBLISH_DRYRUN: 'yes'
   script:
-    - EXPECTED_RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
     - rm -rf megatron
-    - pip install wheelhouse/*cp310*.whl
+    - pip install wheelhouse/*cp311*.whl
 
     - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
     - >
@@ -367,7 +373,7 @@ test:pypi_test_wheel:
 
 test:pypi_push_wheel:
   extends: [.test_rules]
-  image: python:3.10
+  image: python:3.11
   tags: [mcore-docker-node-small]
   needs: [test:pypi_test_wheel]
   variables:
