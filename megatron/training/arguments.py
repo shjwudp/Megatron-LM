@@ -802,7 +802,10 @@ def validate_args(args, defaults={}):
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
-        args.use_precision_aware_optimizer = True
+        assert args.use_precision_aware_optimizer, (
+            "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
+            "as the hybrid device optimizer reuses the code path of this flag."
+        )
 
     # MoE loss and include embedding and loss layer check
     if args.num_experts is not None:

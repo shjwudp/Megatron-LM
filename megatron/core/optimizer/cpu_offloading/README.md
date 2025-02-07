@@ -5,6 +5,7 @@ Add these flag to enable optimizer cpu offload in MCore.
 ```bash
 --optimizer-cpu-offload
 --optimizer-offload-fraction 1.0
+--use-precision-aware-optimizer
 ```
 
 ## Configuration Recommendataions
