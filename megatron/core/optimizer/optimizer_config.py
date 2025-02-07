@@ -119,6 +119,7 @@ class OptimizerConfig:
     #######################
 
     optimizer_cpu_offload: bool = False
+    """If True, offload optimizer states tensor and compute to CPU."""
 
     optimizer_offload_fraction: float = 0.0
     """Specifies the fraction of optimizer states to offload from GPU memory to CPU."""
@@ -136,7 +137,10 @@ class OptimizerConfig:
     """
 
     pin_cpu_grads: bool = True
+    """If True, pin the optimizer gradients to CPU memory."""
+
     pin_cpu_params: bool = True
+    """If True, pin the optimizer parameters to CPU memory."""
 
     ################
     # Miscellaneous

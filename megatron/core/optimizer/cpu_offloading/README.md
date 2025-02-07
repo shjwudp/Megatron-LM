@@ -1,6 +1,6 @@
 ## How to use ?
 
-Add these flag to enable optimizer cpu offload in MCore.
+Add these flags to enable optimizer cpu offload in MCore.
 
 ```bash
 --optimizer-cpu-offload
@@ -10,4 +10,4 @@ Add these flag to enable optimizer cpu offload in MCore.
 
 ## Configuration Recommendataions
 
-CPU Optimizer step, GPU gradient D2H and CPU optimizer updated parameter H2D are quite time-consuming operations, it is recommended to turn on the overlap switch to make them execute in parallel to reduce the end-to-end time. Enable this feature with the flag `--overlap-cpu-optimizer-d2h-h2d`.
+Gradient copy from GPU to CPU, CPU optimizer step, and subsequent parameter copy from CPU to GPU can be time-consuming operations, and it is recommended to use the flag `--overlap-cpu-optimizer-d2h-h2d` to execute them concurrently.
