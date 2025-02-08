@@ -276,7 +276,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 )
             gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
             cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
-            if config.use_torch_optimizer:
+            if config.use_torch_optimizer_for_cpu_offload:
                 gpu_optimizer_cls = cpu_optimizer_cls
             if config.optimizer == 'adam':
                 gpu_optimizer_cls = Adam

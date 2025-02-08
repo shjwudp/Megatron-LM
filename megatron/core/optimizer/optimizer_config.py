@@ -124,7 +124,7 @@ class OptimizerConfig:
     optimizer_offload_fraction: float = 0.0
     """Specifies the fraction of optimizer states to offload from GPU memory to CPU."""
 
-    use_torch_optimizer: bool = False
+    use_torch_optimizer_for_cpu_offload: bool = False
     """If True, Megatron optimizer use Torch AdamW"""
 
     overlap_cpu_optimizer_d2h_h2d: bool = False
