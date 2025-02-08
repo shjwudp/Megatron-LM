@@ -125,7 +125,7 @@ class OptimizerConfig:
     """Specifies the fraction of optimizer states to offload from GPU memory to CPU."""
 
     use_torch_optimizer_for_cpu_offload: bool = False
-    """If True, Megatron optimizer use Torch AdamW"""
+    """If True, use torch.optim.Optimizer for CPU offload."""
 
     overlap_cpu_optimizer_d2h_h2d: bool = False
     """
