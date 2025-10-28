@@ -60,7 +60,6 @@ def get_data_iterator(encoder_grid, llm_grid, image_seq_length, seq_length, imag
 
     if encoder_1_condition or llm_condition:
         dataset = MockVLMDataset(
-            size=256,
             image_size=224,
             seq_len=seq_length,
             image_seq_length=image_seq_length,

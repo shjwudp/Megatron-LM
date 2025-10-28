@@ -11,6 +11,7 @@ from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from examples.mimo.configs.llava_vlm import get_llava_projection_layer_spec, get_llava_projection_config
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from tests.unit_tests.pipeline_parallel.test_multimodule_schedules import create_hypercomm_grid, _get_pg_collection_with_embedding_groups
 
 def get_language_model_spec(num_layers, hidden_size, vocab_size, seq_len, pg_collection):
@@ -106,7 +107,8 @@ def get_vlm_mimo_model(
     vision_num_layers, vision_hidden_size, language_num_layers, language_hidden_size, 
     vocab_size, seq_len, special_token_ids, 
     vision_tp, vision_pp, vision_dp,
-    language_tp, language_pp, language_dp
+    language_tp, language_pp, language_dp,
+    use_megatron_fsdp
 ):
     # Calculate offsets for grids to avoid overlap (CP and EP are hardcoded to 1)
     vision_grid_size = vision_tp * vision_pp * vision_dp
@@ -134,10 +136,21 @@ def get_vlm_mimo_model(
 
 
     mimo_model.to(torch.device("cuda")).to(torch.bfloat16)
-    
+
     ddp_config = DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=10000)
+    if use_megatron_fsdp:
+        DDP = FullyShardedDataParallel
+        #https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/cac49dcd7c7475a15e982412dc67da4629392e4b/scripts/performance/utils/helpers.py#L70
+        ddp_config.use_megatron_fsdp = True
+        ddp_config.data_parallel_sharding_strategy = "optim_grads_params"
+        ddp_config.average_in_collective = False
+        ddp_config.keep_fp8_transpose_cache = False
+
+    else:
+        DDP = DistributedDataParallel
+
     if mimo_model.language_model is not None:
-        mimo_model.language_model = DistributedDataParallel(
+        mimo_model.language_model = DDP(
         config=mimo_model.language_model.config,
         ddp_config=ddp_config,
         module=mimo_model.language_model,
@@ -146,7 +159,7 @@ def get_vlm_mimo_model(
     submodule = mimo_model.modality_submodules['images']
 
     if submodule is not None:
-        submodule = DistributedDataParallel(
+        submodule = DDP(
             config=submodule.encoders['clip_encoder'].config,
             ddp_config=ddp_config,
             module=submodule,

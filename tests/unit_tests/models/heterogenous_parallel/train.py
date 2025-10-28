@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 from functools import partial
 import logging
-
+import argparse
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 
@@ -67,6 +67,7 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
     vision_tp, vision_pp, vision_dp,
     language_tp, language_pp, language_dp,
     batch_size, num_microbatches,
+    use_megatron_fsdp=False,
     num_iterations=1, profile_start_step=None, profile_end_step=None, enable_profiling=False
 ):
     """Test 1F1B schedule with VLM MIMO model using custom process groups.
@@ -100,6 +101,7 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
         language_tp=language_tp,
         language_pp=language_pp,
         language_dp=language_dp,
+        use_megatron_fsdp=use_megatron_fsdp,
     )
     
     logging.info(f"Rank {dist.get_rank()}: Model created successfully")
@@ -200,7 +202,7 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
 
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
-        print(f"for debug: Rank {dist.get_rank()}, at iteration {iteration}, update_successful: {update_successful}, grad_norm: {grad_norm}, num_zeros_in_grad: {num_zeros_in_grad}")
+        logging.info(f"for debug: Rank {dist.get_rank()}, at iteration {iteration}, update_successful: {update_successful}, grad_norm: {grad_norm}, num_zeros_in_grad: {num_zeros_in_grad}")
 
         zero_grad_buffer_for_multimodule(module_to_grid_tuple)
         
@@ -215,6 +217,17 @@ def test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
 
 
 if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--vision_tp', type=int, default=1)
+    parser.add_argument('--vision_pp', type=int, default=2)
+    parser.add_argument('--vision_dp', type=int, default=1)
+    parser.add_argument('--language_tp', type=int, default=1)
+    parser.add_argument('--language_pp', type=int, default=2)
+    parser.add_argument('--language_dp', type=int, default=1)
+    parser.add_argument('--use_megatron_fsdp', action="store_true")
+    args = parser.parse_args()
+
     # Initialize distributed training
     Utils.initialize_distributed()
 
@@ -237,19 +250,21 @@ if __name__ == "__main__":
     special_token_ids = {"images": 32000}
 
     # Model parallelisms (CP and EP are hardcoded to 1 in model_specs.py)
-    vision_tp, vision_pp, vision_dp = 1, 2, 1
-    language_tp, language_pp, language_dp = 1, 2, 2
+    vision_tp, vision_pp, vision_dp = args.vision_tp, args.vision_pp, args.vision_dp
+    language_tp, language_pp, language_dp = args.language_tp, args.language_pp, args.language_dp
     
     # Training parameters
     rank = dist.get_rank()
-    global_batch_size = 2
+    global_batch_size = 128
+    num_microbatches = 16
     if rank < vision_tp*vision_pp*vision_dp:
-        batch_size = global_batch_size//vision_dp
+        assert global_batch_size % vision_dp % num_microbatches == 0
+        batch_size = global_batch_size // vision_dp // num_microbatches
         print(f"for debug: Rank {rank}, is in vision module, batch_size: {batch_size}")
     else:
-        batch_size = global_batch_size//language_dp
+        assert global_batch_size % language_dp % num_microbatches == 0
+        batch_size = global_batch_size//language_dp // num_microbatches
         print(f"for debug: Rank {rank}, is in language module, batch_size: {batch_size}")
-    num_microbatches = 16
  
     losses = test_1f_1b_schedule_vlm_mimo_model_custom_pgs(
         vision_num_layers=vision_num_layers,
@@ -268,6 +283,7 @@ if __name__ == "__main__":
         language_dp=language_dp,
         batch_size=batch_size,
         num_microbatches=num_microbatches,
+        use_megatron_fsdp=args.use_megatron_fsdp,
         num_iterations=num_iterations,
         profile_start_step=profile_start_step,
         profile_end_step=profile_end_step,
