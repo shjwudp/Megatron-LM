@@ -373,6 +373,10 @@ class MegatronFSDP(torch.nn.Module):
         if self.data_parallel_sharding_strategy == "no_shard":
             return
 
+        # Ensure parameters are replaced with raw parameters.
+        self._replace_param_with_raw_if_needed()
+
+        # All-gather the parameters.
         ag_pipeline = self.all_gather_pipeline
         ag_pipeline.all_gather_params(
             params=params,

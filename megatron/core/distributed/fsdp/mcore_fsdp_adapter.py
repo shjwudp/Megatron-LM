@@ -275,28 +275,19 @@ def _get_hsdp_tp_mesh(inter_fsdp_dp_group, dp_cp_group, tp_group):
 
 
 def _get_dp_tp_mesh(dp_cp_group, tp_group):
-    assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
-    world_size = dist.get_world_size()
+    if tp_group is None:
+        tp_ranks = [dist.get_rank()]
+    else:
+        tp_ranks = dist.get_process_group_ranks(tp_group)
 
-    tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
-    # TODO: Supports configurable (dp, cp, tp) order.
-    mesh = einops.rearrange(torch.arange(world_size), "(dp_cp tp) -> dp_cp tp", tp=tp_size)
+    if dp_cp_group is None:
+        return torch.tensor([tp_ranks])
 
-    mesh_dp_ranks = einops.rearrange(mesh, 'dp_cp tp -> tp dp_cp', tp=tp_size)
-    dp_cp_group_ranks = dist.get_process_group_ranks(dp_cp_group)
-    assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_dp_ranks, dp_cp_group_ranks), (
-        f"[Megatron-FSDP] Data Parallel ranks in the mesh {mesh_dp_ranks} "
-        f"do not match the ranks in the DP group {dp_cp_group_ranks}."
-    )
+    dp_size = dist.get_world_size(dp_cp_group)
+    dp_cp_tp_ranks = [None for _ in range(dp_size)]
+    dist.all_gather_object(dp_cp_tp_ranks, tp_ranks, group=dp_cp_group)
 
-    mesh_tp_ranks = einops.rearrange(mesh, 'dp_cp tp -> (dp_cp) tp', tp=tp_size)
-    tp_group_ranks = dist.get_process_group_ranks(tp_group)
-    assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_tp_ranks, tp_group_ranks), (
-        f"[Megatron-FSDP] Tensor Parallel ranks in the mesh {mesh_tp_ranks} "
-        f"do not match the ranks in the TP group {tp_group_ranks}."
-    )
-
-    return mesh
+    return torch.tensor(dp_cp_tp_ranks)
 
 
 def _check_mesh_ranks_and_group_ranks_are_consistent(mesh_ranks, group_ranks):
