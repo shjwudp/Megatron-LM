@@ -292,6 +292,9 @@ class TransformerConfig(ModelParallelConfig):
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
+    fused_linear_cross_entropy: bool = False
+    """If True, uses fused linear cross entropy kernel."""
+
     ####################
     # activation recomputation
     ####################
