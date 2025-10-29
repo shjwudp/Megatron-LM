@@ -1,20 +1,19 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-import pytest
-import torch
-import numpy as np
 import contextlib
 from contextlib import ExitStack
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data import DataLoader
 
+import numpy as np
+import pytest
+import torch
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
+
+import megatron.core.parallel_state as ps
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-import megatron.core.parallel_state as ps
-
 from tests.unit_tests.a2a_overlap.utils import (
     deterministic_mode,
     get_test_config,
@@ -29,18 +28,18 @@ class MockDataset(Dataset):
     Mock dataset for torchtitan GPT training tests
     Generates synthetic tokenized sequences on-the-fly
     """
-    
+
     def __init__(
         self,
         num_samples=10000,
         micro_batch_size=4,
-        sequence_length=2048, 
+        sequence_length=2048,
         vocab_size=128256,
         seed=42,
     ):
         """
         Initialize mock dataset
-        
+
         Args:
             num_samples: Total number of samples
             sequence_length: Length of each sequence
@@ -52,17 +51,17 @@ class MockDataset(Dataset):
         self.sequence_length = sequence_length
         self.vocab_size = vocab_size
         self.seed = seed
-        
+
         # Set numpy seed for deterministic generation
         np.random.seed(seed)
-        
+
     def __len__(self):
         return self.num_samples
-    
+
     def __getitem__(self, idx):
         """
         Generate a single training sample
-        
+
         Returns:
             dict with 'tokens' and 'labels'
         """
@@ -78,7 +77,9 @@ class MockDataset(Dataset):
         return {
             'input_ids': torch.from_numpy(tokens.copy()),
             'labels': torch.from_numpy(labels.copy()),
-            "attention_mask": torch.ones((1, self.sequence_length, self.sequence_length), dtype=bool),
+            "attention_mask": torch.ones(
+                (1, self.sequence_length, self.sequence_length), dtype=bool
+            ),
         }
 
 
@@ -117,11 +118,7 @@ def init_model_parallel(tp=1, pp=1, ep=1):
 
 
 def init_gpt_dataloader(
-    dp_group,
-    micro_batch_size=1,
-    vocab_size=50257,
-    sequence_length=128,
-    batch_size=8,
+    dp_group, micro_batch_size=1, vocab_size=50257, sequence_length=128, batch_size=8
 ):
     dataset = MockDataset(
         num_samples=1000,

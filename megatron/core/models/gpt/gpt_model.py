@@ -610,9 +610,12 @@ class GPTModel(LanguageModule):
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
+        if has_config_logger_enabled(self.config) or labels is not None:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
+        else:
+            logits = None
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
@@ -639,7 +642,16 @@ class GPTModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        loss = self.compute_language_model_loss_without_logits(
+            hidden_states,
+            labels=labels,
+            weight=output_weight,
+            column_parallel_linear=self.output_layer,
+            col_linear_kwargs={
+                'weight': output_weight,
+                'runtime_gather_output': runtime_gather_output,
+            },
+        )
 
         return loss
 
