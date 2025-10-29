@@ -137,8 +137,8 @@ class LanguageModule(MegatronModule):
         Returns:
             Tuple[Tensor, Optional[Tensor]]: Logits tensor of dimensions [batch size, sequence_length, vocab size] and loss tensor of dimensions [batch size, sequence_length] if labels is provided else None
         """
-        if self.config.fused_linear_cross_entropy:
-            from megatron.core.fusions.fused_linear_cross_entropy import linear_cross_entropy
+        if self.config.linear_cross_entropy_fusion:
+            from megatron.core.fusions.linear_cross_entropy_fusion import linear_cross_entropy
 
             assert (
                 weight is not None
