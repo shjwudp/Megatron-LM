@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
@@ -203,13 +203,14 @@ class MambaStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
-        self.apply(
-            partial(
-                _init_weights,
-                n_layer=self.config.num_layers,
-                initializer_range=self.config.init_method_std,
+        if self.config.perform_initialization:
+            self.apply(
+                partial(
+                    _init_weights,
+                    n_layer=self.config.num_layers,
+                    initializer_range=self.config.init_method_std,
+                )
             )
-        )
 
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
         num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
@@ -299,7 +300,10 @@ class MambaStack(MegatronModule):
 
         if (
             (
-                (self.config.enable_cuda_graph and self.config.cuda_graph_scope != "full_iteration")
+                (
+                    self.config.cuda_graph_impl == "local"
+                    and "full_iteration" not in self.config.cuda_graph_scope
+                )
                 or self.config.flash_decode
             )
             and inference_context

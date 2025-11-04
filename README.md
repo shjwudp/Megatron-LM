@@ -2,6 +2,7 @@
 
 Megatron-LM & Megatron Core
 ===========================
+
 <h4>GPU-optimized library for training transformer models at scale</h4>
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://docs.nvidia.com/Megatron-Core/developer-guide/latest/index.html)
@@ -60,7 +61,8 @@ pip install -e .[mlm,dev]
 
 ## Performance & Benchmarking
 
-🚧 **Coming Soon** - We will update this section with performance benchmarks of experimental features as they become available.
+- 🚀 [2025/11] [Optimizing DeepSeek-V3 Training Performance on NVIDIA GB200 NVL72](docs/discussions/deepseek-v3-gb200-optimization/deepseek-v3-gb200-optimization.md).
+- ⚡ [2025/11] [A Guide to Reproduce DeepSeek-V3 Pre-training Performance on GB200](docs/discussions/deepseek-v3-gb200-optimization/deepseek-v3-gb200-reproduce-guide.md).
 
 ## Community & Support
 
@@ -70,6 +72,7 @@ pip install -e .[mlm,dev]
 
 ### Contributing
 We ❤️ contributions! Ways to contribute:
+
 - 🐛 **Report bugs** - Help us improve reliability
 - 💡 **Suggest features** - Shape the future of Megatron Core
 - 📝 **Improve docs** - Make Megatron Core more accessible

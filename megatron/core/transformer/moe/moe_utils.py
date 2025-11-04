@@ -1,12 +1,14 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
+from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -376,8 +378,20 @@ def unpermute(
     output_tokens = torch.zeros(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
-    # Scatter add the permuted_input back to the original positions
-    output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
+    if torch.are_deterministic_algorithms_enabled():
+        # Use index_add which is deterministic when deterministic algorithms are enabled
+        # and is CUDA graph compatible
+        output_tokens = torch.zeros(
+            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
+        )
+        # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
+        # and is CUDA graph compatible unlike scatter_add
+        output_tokens.index_add_(0, sorted_indices, permuted_tokens)
+    else:
+        # Scatter add the permuted_input back to the original positions
+        output_tokens.scatter_add_(
+            0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
+        )
     return output_tokens.to(dtype=input_dtype)
 
 
@@ -589,9 +603,21 @@ def topk_routing_with_score_function(
     if scaling_factor:
         probs = probs * scaling_factor
 
-    # TODO Try using element-wise operations instead of scatter?
-    routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
-    routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+    if torch.are_deterministic_algorithms_enabled():
+        # build [num_tokens, num_experts] from [num_tokens, topk]
+        routing_probs = torch.zeros_like(logits)
+        rows = torch.arange(num_tokens, device=logits.device).unsqueeze(1)
+        routing_probs.index_put_((rows, top_indices), probs, accumulate=False)
+
+        routing_map = torch.zeros_like(logits, dtype=logits.dtype)
+        routing_map.index_put_(
+            (rows, top_indices), torch.ones_like(probs, dtype=routing_map.dtype), accumulate=False
+        )
+        routing_map = routing_map.bool()
+    else:
+        # TODO Try using element-wise operations instead of scatter?
+        routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
+        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
     return routing_probs, routing_map
 
@@ -881,12 +907,16 @@ class RandomSTE(torch.autograd.Function):
     """
 
     generator = None
+    random_logits = None
 
     @staticmethod
     def forward(ctx, logits):
         """
         Forward pass returns random logits with rank-specific seed.
         """
+        if is_graph_capturing() and RandomSTE.random_logits is not None:
+            return RandomSTE.random_logits
+
         if RandomSTE.generator is None:
             global_rank = torch.distributed.get_rank()
             base_seed = 42
@@ -894,8 +924,8 @@ class RandomSTE(torch.autograd.Function):
             RandomSTE.generator = torch.Generator(device=logits.device)
             RandomSTE.generator.manual_seed(seed)
 
-        random_logits = logits.clone().normal_(generator=RandomSTE.generator)
-        return random_logits
+        RandomSTE.random_logits = logits.clone().normal_(generator=RandomSTE.generator)
+        return RandomSTE.random_logits
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -1004,3 +1034,242 @@ def get_default_pg_collection():
         with_context_parallel=True
     )
     return pg_collection
+
+
+class MoECudaGraphPartialCaptureSignal(Exception):
+    """
+    Used to early-return from a MoE layer forward pass in CUDA graph capture.
+    This signal is raised when we are partially capturing the CUDA graph of the MoE layer,
+    and the related intermediate tensors are recorded in self.kwargs.
+    Call self.get_early_return_outputs() to collect the CUDA graph outputs.
+    """
+
+    def __init__(self, moe_layer, return_step: str, **kwargs):
+        self.moe_layer = moe_layer
+        self.return_step = return_step
+        self.kwargs = kwargs
+
+    def get_early_return_outputs(
+        self, hidden_states: torch.Tensor, shared_expert_output: torch.Tensor
+    ):
+        """
+        Get the CUDA graph early return outputs for the MoE layer, including the intermediate
+        tensors and the intermediate attributes of the token dispatcher.
+        """
+        if self.return_step == "route":
+            # Capturing the router step returns three intermediate tensors:
+            # hidden states, routing probabilities, and routing map.
+            outputs = [hidden_states, self.kwargs['probs'], self.kwargs['routing_map']]
+        elif self.return_step == "preprocess":
+            # Capturing the preprocess step returns three intermediate tensors:
+            # hidden states, routing probabilities, and residual connection.
+            # It also returns the intermediate attributes of the token dispatcher, recorded in
+            # "token_dispatcher.cudagraph_attrs".
+            outputs = [self.kwargs['hidden_states'], self.kwargs['probs'], self.kwargs['residual']]
+            valid_cudagraph_attrs = []
+            for attr_name in self.moe_layer.token_dispatcher.cudagraph_attrs:
+                hier_attr_name = attr_name.split('.')
+                attr = self.moe_layer.token_dispatcher
+                for name in hier_attr_name:
+                    attr = getattr(attr, name, None)
+                    if attr is None:
+                        break
+                if isinstance(attr, torch.Tensor):
+                    outputs.append(attr)
+                    valid_cudagraph_attrs.append(attr_name)
+            if self.moe_layer.token_dispatcher.valid_cudagraph_attrs is None:
+                self.moe_layer.token_dispatcher.valid_cudagraph_attrs = valid_cudagraph_attrs
+            else:
+                assert (
+                    self.moe_layer.token_dispatcher.valid_cudagraph_attrs == valid_cudagraph_attrs
+                ), (
+                    "valid_cudagraph_attrs mismatch: "
+                    f"{self.moe_layer.token_dispatcher.valid_cudagraph_attrs} != "
+                    f"{valid_cudagraph_attrs}"
+                )
+        # Also return the shared expert output, if it is not None.
+        if shared_expert_output is not None:
+            outputs.append(shared_expert_output)
+        return outputs
+
+
+@dataclass
+class MoECudaGraphTensorStore:
+    """Storage for tensors used in CUDA graph replay for MoE layers.
+
+    This dataclass stores intermediate tensors computed during CUDA graph replay
+    that need to be resumed from the end of the CUDA graph scope to skip redundant computations.
+
+    Attributes:
+        hidden_states (Optional[torch.Tensor]): The hidden states output from the CUDA graph replay.
+        probs (Optional[torch.Tensor]): The routing probabilities for each token-expert pair.
+        routing_map (Optional[torch.Tensor]): The sparse mapping indicating which experts
+            were selected for each token. Used to skip the normal router step.
+        residual (Optional[torch.Tensor]): The residual connection tensor before routing.
+            Used to skip the normal preprocess step.
+        shared_expert_output (Optional[torch.Tensor]): The output from shared experts
+            computation. Used to skip the normal shared expert computation step.
+    """
+
+    hidden_states: Optional[torch.Tensor] = None
+    probs: Optional[torch.Tensor] = None
+    routing_map: Optional[torch.Tensor] = None
+    residual: Optional[torch.Tensor] = None
+    shared_expert_output: Optional[torch.Tensor] = None
+
+    def is_empty(self) -> bool:
+        """Check if the store has any non-None tensors.
+
+        Returns:
+            bool: True if all fields are None, False otherwise.
+        """
+        return all(
+            getattr(self, field_name) is None
+            for field_name in [
+                'hidden_states',
+                'probs',
+                'routing_map',
+                'residual',
+                'shared_expert_output',
+            ]
+        )
+
+    def set(self, **kwargs):
+        """Set the tensors in the store from keyword arguments."""
+        for field_name, value in kwargs.items():
+            assert field_name in [
+                'hidden_states',
+                'probs',
+                'routing_map',
+                'residual',
+                'shared_expert_output',
+            ], f"Invalid field name: {field_name}"
+            if value is not None:
+                assert isinstance(
+                    value, torch.Tensor
+                ), f"Value must be a torch.Tensor, got {type(value)} for field {field_name}"
+                setattr(self, field_name, value)
+
+    def clear(self):
+        """Reset all stored tensors to None."""
+        for field_name in [
+            'hidden_states',
+            'probs',
+            'routing_map',
+            'residual',
+            'shared_expert_output',
+        ]:
+            setattr(self, field_name, None)
+
+
+def maybe_skip_or_early_return_by_cudagraph(step_condition):
+    """
+    Decorator to skip certain codepaths in the MoE layer forward pass in CUDA graph replay,
+    or early return from the MoE layer forward pass in CUDA graph capture.
+
+    Args:
+        step_condition: The step condition to check. Can be "shared_experts_compute", "route",
+        or "preprocess". If "shared_experts_compute", the shared experts computation will be
+        skipped in replay if it is in the CUDA graph scope. If "route" or "preprocess", the
+        router or preprocess will be skipped in replay if it is in the CUDA graph scope, or
+        early return from the MoE layer forward pass if it is in CUDA graph capturing mode.
+
+    Returns:
+        A decorator function that wraps the MoE layer forward pass.
+    """
+
+    def maybe_raise_signal(moe_layer, **kwargs):
+        """
+        Check if the MoE layer should early return for CUDA graph capture.
+        If so, raise a MoECudaGraphPartialCaptureSignal.
+        """
+        if (
+            moe_layer.config.cuda_graph_impl == "transformer_engine"
+            and moe_layer.training
+            and is_graph_capturing()
+        ):
+            if (
+                step_condition == "route"
+                and 'moe_router' in moe_layer.config.cuda_graph_scope
+                and 'moe_preprocess' not in moe_layer.config.cuda_graph_scope
+            ):
+                raise MoECudaGraphPartialCaptureSignal(moe_layer, "route", **kwargs)
+            elif (
+                step_condition == "preprocess"
+                and 'moe_preprocess' in moe_layer.config.cuda_graph_scope
+            ):
+                raise MoECudaGraphPartialCaptureSignal(moe_layer, "preprocess", **kwargs)
+
+    def decorator(func):
+        def wrapped_func(moe_layer, *args, **kwargs):
+            """
+            Check if we should skip executing the original function based on the current
+            step condition and the tensor store status. If the tensor can be found in the store,
+            it indicates that it is already computed by the CUDA graph replay, so we can skip it.
+            Otherwise, we execute the original function and check if we should raise a signal to
+            early return in CUDA graph capture.
+            """
+            # The non-cudagraph codepath just calls the original function.
+            if not is_graph_capturing() and moe_layer.cudagraph_tensor_store.is_empty():
+                return func(moe_layer, *args, **kwargs)
+
+            assert (
+                not is_graph_capturing() or moe_layer.cudagraph_tensor_store.is_empty()
+            ), "cudagraph_tensor_store cannot be used when it is capturing cuda graph."
+            if step_condition == "shared_experts_compute":
+                if moe_layer.cudagraph_tensor_store.shared_expert_output is None:
+                    # Don't skip the shared expert computation.
+                    shared_expert_output = func(moe_layer, *args, **kwargs)
+                else:
+                    # Skip the shared expert computation and get value from store.
+                    shared_expert_output = moe_layer.cudagraph_tensor_store.shared_expert_output
+                return shared_expert_output
+            elif step_condition == "route":
+                if moe_layer.cudagraph_tensor_store.probs is None:
+                    # Don't skip the router.
+                    assert (
+                        moe_layer.cudagraph_tensor_store.routing_map is None
+                        and moe_layer.cudagraph_tensor_store.residual is None
+                    ), "both routing_map and residual must be None if probs is None"
+                    probs, routing_map = func(moe_layer, *args, **kwargs)
+
+                    # Maybe early return after the router.
+                    maybe_raise_signal(moe_layer, probs=probs, routing_map=routing_map)
+                else:
+                    # Skip the router and get value from store.
+                    assert (
+                        moe_layer.cudagraph_tensor_store.routing_map is not None
+                        or moe_layer.cudagraph_tensor_store.residual is not None
+                    ), "either routing_map or residual must be given if probs is given"
+                    probs, routing_map = (
+                        moe_layer.cudagraph_tensor_store.probs,
+                        moe_layer.cudagraph_tensor_store.routing_map,
+                    )
+                return probs, routing_map
+            elif step_condition == "preprocess":
+                if moe_layer.cudagraph_tensor_store.residual is None:
+                    # Don't skip the preprocess.
+                    hidden_states, probs, residual = func(moe_layer, *args, **kwargs)
+
+                    # Maybe early return after the preprocess.
+                    maybe_raise_signal(
+                        moe_layer, hidden_states=hidden_states, probs=probs, residual=residual
+                    )
+                else:
+                    # Skip the preprocess and get value from store.
+                    assert (
+                        moe_layer.cudagraph_tensor_store.probs is not None
+                    ), "probs must not be None if residual is not None"
+                    assert (
+                        moe_layer.cudagraph_tensor_store.routing_map is None
+                    ), "routing_map must be None if residual is not None"
+                    hidden_states, probs, residual = (
+                        moe_layer.cudagraph_tensor_store.hidden_states,
+                        moe_layer.cudagraph_tensor_store.probs,
+                        moe_layer.cudagraph_tensor_store.residual,
+                    )
+                return hidden_states, probs, residual
+
+        return wrapped_func
+
+    return decorator
