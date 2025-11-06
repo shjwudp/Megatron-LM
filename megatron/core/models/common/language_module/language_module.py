@@ -157,7 +157,7 @@ class LanguageModule(MegatronModule):
                 hidden,
                 weight,
                 labels,
-                dist_process_group=self.pg_collection.tp,
+                tp_group=self.pg_collection.tp,
                 reduction=reduction,
                 ignore_index=ignore_index,
             )
