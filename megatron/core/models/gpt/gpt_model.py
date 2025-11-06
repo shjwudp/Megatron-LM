@@ -557,7 +557,7 @@ class GPTModel(LanguageModule):
                 mtp_loss = self.compute_language_model_loss_without_logits(
                     hidden_states_list[mtp_layer_number + 1],
                     labels=mtp_labels,
-                    weight=output_weight,
+                    weight=self.shared_embedding_or_output_weight(),
                     column_parallel_linear=self.output_layer,
                     col_linear_kwargs={
                         'weight': output_weight,
@@ -645,7 +645,7 @@ class GPTModel(LanguageModule):
         loss = self.compute_language_model_loss_without_logits(
             hidden_states,
             labels=labels,
-            weight=output_weight,
+            weight=self.shared_embedding_or_output_weight(),
             column_parallel_linear=self.output_layer,
             col_linear_kwargs={
                 'weight': output_weight,
