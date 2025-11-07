@@ -675,6 +675,12 @@ def pretrain(
 
     timestamp_after_initialize_megatron = time.time()
 
+    # Log rank to physical node assignment.
+    if torch.distributed.get_rank() % torch.cuda.device_count() == 0:
+        min_rank = torch.distributed.get_rank()
+        max_rank = min_rank + (torch.cuda.device_count() - 1)
+        print(f"Ranks {list(range(min_rank, max_rank+1))} -> {os.uname()[1]}")
+
     args = get_args()
     timers = get_timers()
 
