@@ -29,6 +29,7 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
+from megatron.core.optimizer.utils import clip_output_grad_hook
 
 
 class MambaModel(LanguageModule):
@@ -171,6 +172,8 @@ class MambaModel(LanguageModule):
                 and self.share_embeddings_and_output_weights,
                 tp_group=self.pg_collection.tp,
             )
+            if self.config.apply_per_token_output_grad_clipping:
+                self.output_layer.register_full_backward_hook(clip_output_grad_hook)
 
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()

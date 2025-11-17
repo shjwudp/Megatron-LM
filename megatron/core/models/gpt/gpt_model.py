@@ -37,6 +37,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
+from megatron.core.optimizer.utils import clip_output_grad_hook
 
 
 class GPTModel(LanguageModule):
@@ -250,6 +251,8 @@ class GPTModel(LanguageModule):
                 grad_output_buffer=self.grad_output_buffer,
                 tp_group=self.pg_collection.tp,
             )
+            if self.config.apply_per_token_output_grad_clipping:
+                self.output_layer.register_full_backward_hook(clip_output_grad_hook)
 
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()

@@ -781,6 +781,13 @@ class TransformerConfig(ModelParallelConfig):
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
 
+    ####################
+    # Stability
+    ####################
+    apply_per_token_output_grad_clipping: bool = False
+    """Apply clipping at the output embeddings."""
+
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more

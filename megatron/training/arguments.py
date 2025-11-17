@@ -1384,6 +1384,7 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
 
     kw_args['moe_latent_size'] = args.moe_latent_size
+    kw_args['apply_per_token_output_grad_clipping'] = args.apply_per_token_output_grad_clipping
 
     if args.te_precision_config_file:
         assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
@@ -2001,6 +2002,8 @@ def _add_regularization_args(parser):
                        help='Weight decay increment function.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
+    group.add_argument('--apply-per-token-output-grad-clipping', action='store_true',
+                       help='Apply clipping at the output embeddings.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
                        help='First coefficient for computing running averages '
                        'of gradient and its square')
