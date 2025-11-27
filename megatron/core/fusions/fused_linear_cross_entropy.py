@@ -40,11 +40,13 @@ class Platform:
 
         self._initialized = True
 
+
 try:
     _platform = Platform()
 except Exception as e:
     _unsupported_architecture_error = e
     _platform = None
+
 
 class LinearCrossEntropy(torch.autograd.Function):
     """

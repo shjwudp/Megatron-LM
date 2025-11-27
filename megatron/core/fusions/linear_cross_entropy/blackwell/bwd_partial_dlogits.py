@@ -1,14 +1,19 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-from typing import Optional, Tuple, Type
+from typing import Any, Optional, Tuple, Type
 
-import cuda.bindings.driver as cuda  # type: ignore
-import cutlass
-import cutlass.cute as cute
-import cutlass.pipeline as pipeline  # type: ignore
-import cutlass.utils as utils  # type: ignore
-import cutlass.utils.blackwell_helpers as sm100_utils  # type: ignore
-from cutlass.cute.nvgpu import cpasync, tcgen05
+try:
+    import cuda.bindings.driver as cuda  # type: ignore
+    import cutlass
+    import cutlass.cute as cute
+    import cutlass.pipeline as pipeline  # type: ignore
+    import cutlass.utils as utils  # type: ignore
+    import cutlass.utils.blackwell_helpers as sm100_utils  # type: ignore
+    from cutlass.cute.nvgpu import cpasync, tcgen05
+
+    CUDA_CUTE_AVAILABLE = True
+except:
+    CUDA_CUTE_AVAILABLE = False
 
 SM100_TMEM_CAPACITY_COLUMNS: int = 512
 
@@ -17,6 +22,7 @@ def make_thread_cooperative_group(size: int, alignment: Optional[int] = None):
     """
     Create a thread cooperative group.
     """
+    assert CUDA_CUTE_AVAILABLE, "CUDA CUTE is not available"
     return pipeline.CooperativeGroup(
         pipeline.Agent.Thread, size, alignment=alignment if alignment is not None else size
     )
@@ -30,13 +36,14 @@ class BwdPartialDlogits:
     def __init__(
         self,
         reduction: int,
-        acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
+        acc_dtype: Any = None,
         use_2cta_instrs: bool = False,
         mma_tiler_mn: Tuple[int, int] = (128, 256),
         vocab_per_split: int = 512,
     ):
+        assert CUDA_CUTE_AVAILABLE, "CUDA CUTE is not available"
         self.REDUCTION: cutlass.Constexpr[cutlass.Int32] = cutlass.const_expr(reduction)
-        self.acc_dtype = acc_dtype
+        self.acc_dtype = acc_dtype if acc_dtype is not None else cutlass.Float32
         self.use_2cta_instrs = use_2cta_instrs
         self.mma_tiler = (*mma_tiler_mn, 1)
         self.vocab_per_split = vocab_per_split
