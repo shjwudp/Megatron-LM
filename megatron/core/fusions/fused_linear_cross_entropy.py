@@ -42,7 +42,7 @@ class Platform:
 
 try:
     _platform = Platform()
-except ValueError as e:
+except Exception as e:
     _unsupported_architecture_error = e
     _platform = None
 
