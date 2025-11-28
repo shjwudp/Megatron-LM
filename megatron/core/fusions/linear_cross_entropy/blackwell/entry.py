@@ -2,21 +2,14 @@
 
 import typing
 from dataclasses import dataclass, field
-from typing import Any
 
+import cuda.bindings.driver as cuda  # type: ignore
+import cutlass
+import cutlass.cute as cute
 import torch
 import torch.distributed as dist
 import triton  # type: ignore
-
-try:
-    import cuda.bindings.driver as cuda  # type: ignore
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
-
-    CUDA_CUTE_AVAILABLE = True
-except:
-    CUDA_CUTE_AVAILABLE = False
+from cutlass.cute.runtime import from_dlpack
 
 import megatron.core.fusions.linear_cross_entropy.utils as utils
 from megatron.core.fusions.linear_cross_entropy.blackwell import (
@@ -35,7 +28,7 @@ class FwdConfig:
     _dedicated_stream: torch.cuda.Stream = field(default_factory=torch.cuda.Stream)
     _dedicated_events: typing.List[torch.cuda.Event] = field(default_factory=list)
     _initialized: bool = field(default=False)
-    _fwd_mainloop_kernels: typing.Dict[str, Any] = field(default_factory=dict)
+    _fwd_mainloop_kernels: typing.Dict[str, cute.kernel] = field(default_factory=dict)
 
 
 @dataclass
@@ -44,7 +37,7 @@ class BwdConfig:
     The configuration for the backward pass.
     """
 
-    _bwd_kernel: typing.Dict[str, Any] = field(default_factory=dict)
+    _bwd_kernel: typing.Dict[str, cute.kernel] = field(default_factory=dict)
 
 
 _fwd_config = FwdConfig()
@@ -63,8 +56,6 @@ def forward(
     """
     forward host function
     """
-    assert CUDA_CUTE_AVAILABLE, "CUDA CUTE is not available"
-
     tp_rank = 0 if tp_group is None else torch.distributed.get_rank(tp_group)
     tp_world_size = 1 if tp_group is None else torch.distributed.get_world_size(tp_group)
     in_tp_mode = (tp_group is not None) and (tp_world_size > 1)
@@ -287,8 +278,6 @@ def backward(
     """
     backward host function
     """
-    assert CUDA_CUTE_AVAILABLE, "CUDA CUTE is not available"
-
     in_tp_mode = (tp_group is not None) and (tp_world_size > 1)
 
     hidden_view = global_hidden.view(-1, global_hidden.shape[-1])

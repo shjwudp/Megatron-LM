@@ -6,18 +6,13 @@ Implementations of the fusion lm_head(Linear) + Cross-Entropy kernel
 
 from typing import Tuple, Type
 
-try:
-    import cuda.bindings.driver as cuda  # type: ignore
-    import cutlass
-    import cutlass.cute as cute
-    import cutlass.pipeline as pipeline  # type: ignore
-    import cutlass.utils as utils  # type: ignore
-    import cutlass.utils.blackwell_helpers as sm100_utils  # type: ignore
-    from cutlass.cute.nvgpu import cpasync, tcgen05
-
-    CUDA_CUTE_AVAILABLE = True
-except:
-    CUDA_CUTE_AVAILABLE = False
+import cuda.bindings.driver as cuda  # type: ignore
+import cutlass
+import cutlass.cute as cute
+import cutlass.pipeline as pipeline  # type: ignore
+import cutlass.utils as utils  # type: ignore
+import cutlass.utils.blackwell_helpers as sm100_utils  # type: ignore
+from cutlass.cute.nvgpu import cpasync, tcgen05
 
 SM100_TMEM_CAPACITY_COLUMNS: int = 512
 
@@ -26,7 +21,6 @@ def make_thread_cooperative_group(size: int):
     """
     Create a thread cooperative group.
     """
-    assert CUDA_CUTE_AVAILABLE, "CUDA CUTE is not available"
     return pipeline.CooperativeGroup(pipeline.Agent.Thread, size, alignment=size)
 
 
@@ -51,8 +45,6 @@ class FwdMainLoop:
             - MMA instruction settings
             - Cluster Shape
         """
-        assert CUDA_CUTE_AVAILABLE, "CUDA CUTE is not available"
-
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         # This is the shape covered by tiledMMA, not just single MMA instruction
