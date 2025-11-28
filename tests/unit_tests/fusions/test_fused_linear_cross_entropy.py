@@ -683,6 +683,7 @@ class TestFusedLinearCrossEntropyTensorParallel:
     @pytest.mark.parametrize("reduction", ["mean", "sum", "none"])
     @pytest.mark.parametrize("problem", [(4096, 129280, 8192)])
     def test_torch_tp_vs_single_gpu(self, dtype, reduction, problem):
+        self.cleanup()
         num_tokens, vocabsize, dim = problem
 
         hidden = (
