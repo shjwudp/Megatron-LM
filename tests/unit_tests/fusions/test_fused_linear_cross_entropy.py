@@ -683,8 +683,8 @@ class TestFusedLinearCrossEntropyTensorParallel:
     @pytest.mark.parametrize("reduction", ["mean", "sum", "none"])
     @pytest.mark.parametrize("problem", [(4096, 129280, 8192)])
     def test_torch_tp_vs_single_gpu(self, dtype, reduction, problem):
-        self.cleanup()
         num_tokens, vocabsize, dim = problem
+        vocabsize = vocabsize // self.tp_world_size
 
         hidden = (
             torch.empty((num_tokens, dim), dtype=dtype, device="cuda")
@@ -1153,9 +1153,10 @@ class TestFusedLinearCrossEntropySequenceParallel:
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     @pytest.mark.parametrize("reduction", ["mean", "sum", "none"])
-    @pytest.mark.parametrize("problem", [(256, 12928, 8192)])
+    @pytest.mark.parametrize("problem", [(256, 129280, 8192)])
     def test_torch_sp_vs_single_gpu(self, dtype, reduction, problem):
         num_tokens, vocabsize, dim = problem
+        vocabsize = vocabsize // self.tp_world_size
 
         hidden = (
             torch.empty((num_tokens, dim), dtype=dtype, device="cuda")
