@@ -20,6 +20,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.a2a_overlap.utils import (
     deterministic_mode,
     get_test_config,
@@ -256,6 +257,9 @@ class TestFusedLinearCrossEntropyOnGptModel:
 
 @pytest.mark.skipif(
     "WORLD_SIZE" in os.environ and os.environ["WORLD_SIZE"] != "1", reason="Requires single GPU"
+)
+@pytest.mark.skipif(
+    get_device_arch_version() != 10, reason="Requires GPU architecture = 10"
 )
 class TestFusedLinearCrossEntropyDataParallel:
     def cleanup(self):
@@ -557,6 +561,9 @@ class TestFusedLinearCrossEntropyDataParallel:
 @pytest.mark.skipif(
     ("WORLD_SIZE" not in os.environ or int(os.environ["WORLD_SIZE"]) < 2),  # or True,
     reason="Requires torchrun with multiple GPUs",
+)
+@pytest.mark.skipif(
+    get_device_arch_version() != 10, reason="Requires GPU architecture = 10"
 )
 @pytest.mark.usefixtures("distributed_context")
 class TestFusedLinearCrossEntropyTensorParallel:
@@ -997,6 +1004,9 @@ class TestFusedLinearCrossEntropyTensorParallel:
 @pytest.mark.skipif(
     "WORLD_SIZE" not in os.environ or int(os.environ["WORLD_SIZE"]) < 2,
     reason="Requires torchrun with multiple GPUs",
+)
+@pytest.mark.skipif(
+    get_device_arch_version() != 10, reason="Requires GPU architecture = 10"
 )
 @pytest.mark.usefixtures("distributed_context")
 class TestFusedLinearCrossEntropySequenceParallel:
