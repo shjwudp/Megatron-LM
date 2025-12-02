@@ -4,9 +4,10 @@
 Implementations of the fusion lm_head(Linear) + Cross-Entropy kernel
 """
 
-try:
-    from typing import Tuple, Type
+from typing import Tuple, Type
+import logging
 
+try:
     import cuda.bindings.driver as cuda  # type: ignore
     import cutlass
     import cutlass.cute as cute
@@ -651,4 +652,4 @@ try:
             )
             return None
 except ImportError:
-    pass
+    logging.warning("Cutlass or CUDA Python bindings not found. FwdMainLoop will not be available.")

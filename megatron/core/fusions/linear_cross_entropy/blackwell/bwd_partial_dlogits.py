@@ -1,8 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-try:
-    from typing import Optional, Tuple, Type
+from typing import Optional, Tuple, Type
+import logging
 
+try:
     import cuda.bindings.driver as cuda  # type: ignore
     import cutlass
     import cutlass.cute as cute
@@ -635,4 +636,4 @@ try:
                 stream=stream,
             )
 except ImportError:
-    pass
+    logging.warning("Cutlass or CUDA bindings not found. BwdPartialDlogits will not be available.")

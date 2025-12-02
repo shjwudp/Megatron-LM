@@ -1,11 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-try:
-    import typing
-    from dataclasses import dataclass, field
-    from functools import lru_cache
-    import os
+import typing
+from dataclasses import dataclass, field
+from functools import lru_cache
+import os
+import logging
 
+try:
     import cuda.bindings.driver as cuda  # type: ignore
     import cutlass
     import cutlass.cute as cute
@@ -426,4 +427,4 @@ try:
 
         return d_hidden, d_weight
 except ImportError:
-    pass
+    logging.warning("Cutlass or CUDA bindings not found. LinearCrossEntropy Blackwell entry points will not be available.")
