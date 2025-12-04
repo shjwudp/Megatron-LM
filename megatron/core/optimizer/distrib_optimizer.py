@@ -604,6 +604,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
 
+        self.offload_optimizer_states = config.offload_optimizer_states
+        self.need_reload_optimizer_states = False
+
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
         Given a model param, get the index sub-range of the param that this
@@ -2580,6 +2583,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Under the hood, either launch synchronous param all-gathers or get ready to launch
         asynchorous all-gathers that get overlapped with the next forward pass.
         """
+        if self.offload_optimizer_states and self.need_reload_optimizer_states:
+            reload_states(self.optimizer.state)
         update_successful = super().step_with_ready_grads()
 
         timers = self.config.timers
@@ -2600,4 +2605,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if timers is not None:
             timers('params-all-gather').stop()
 
+        if self.offload_optimizer_states:
+            offload_states(self.optimizer.state)
+            self.need_reload_optimizer_states = True
         return update_successful
+
+
+def offload_states(states):
+    for param in states.keys():
+        for state_name in states[param].keys():
+            t = states[param][state_name]
+            cpu_backup = torch.empty(
+                t.size(),
+                dtype=t.dtype,
+                layout=t.layout,
+                device="cpu",
+                pin_memory=True,
+            )
+            cpu_backup.copy_(t, non_blocking=False)
+            states[param][state_name] = (cpu_backup, t.device)
+
+
+def reload_states(states):
+    for param in states.keys():
+        for state_name in states[param].keys():
+            cpu_backup, dev = states[param][state_name]
+            states[param][state_name] = cpu_backup.to(dev, non_blocking=False)
