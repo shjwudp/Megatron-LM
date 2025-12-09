@@ -31,7 +31,7 @@ from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.ssm.mlp_layer import MLPLayer
 
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
-
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
 
 @dataclass
 class MambaStackSubmodules:
@@ -277,12 +277,14 @@ class MambaStack(MegatronModule):
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
         with outer_fp8_context:
-            for layer in self.layers:
+            for layer_no, layer in enumerate(self.layers):
                 inner_fp8_context = (
                     get_fp8_context(self.config, layer.layer_number - 1)
                     if use_inner_fp8_context
                     else nullcontext()
                 )
+                if self.config.fine_grained_activation_offloading:
+                    PipelineOffloadManager.get_instance().set_last_layer(layer_no == self.num_layers_per_pipeline_rank - 1)
                 with inner_fp8_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, _ = layer(

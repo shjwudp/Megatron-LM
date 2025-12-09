@@ -28,6 +28,7 @@ from megatron.core.transformer.multi_token_prediction import (
     tie_word_embeddings_state_dict,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
 
 
 class MambaModel(LanguageModule):
@@ -113,6 +114,7 @@ class MambaModel(LanguageModule):
         # Cache for RoPE tensors which do not change between iterations.
         self.rotary_pos_emb_cache = {}
 
+        self.disable_param_offloading = False
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -301,6 +303,22 @@ class MambaModel(LanguageModule):
 
         It either returns the Loss values if labels are given or the final hidden units
         """
+        if self.config.fine_grained_activation_offloading:
+            PipelineOffloadManager.get_instance().init_model_chunk_offload_handler(
+                self.config.virtual_pipeline_model_parallel_size,
+                self.vp_stage,
+                self.config.min_offloaded_tensor_size,
+            )
+            if self.disable_param_offloading:
+                for param in self.decoder.parameters():
+                    param.offloading_activation = False
+                if self.mtp_process:
+                    for param in self.mtp.parameters():
+                        param.offloading_activation = False
+                if self.post_process:
+                    for param in self.output_layer.parameters():
+                        param.offloading_activation = False
+                self.disable_param_offloading = False
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 

@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Callable, Optional
 
+import warnings
 import torch
 from torch.autograd import Variable
 
@@ -78,6 +79,39 @@ def make_viewless(e):
     """Make_viewless util func"""
     e = make_viewless_tensor(inp=e, requires_grad=e.requires_grad, keep_graph=True)
     return e
+
+
+def set_ideal_affinity_for_current_gpu():
+    """Set CPU affinity for the current GPU to optimize host-device transfers."""
+    import uuid
+
+    try:
+        import cuda.bindings.driver as cuda_driver
+        import cuda.bindings.runtime as cuda_runtime
+    except ImportError:
+        try:
+            import cuda.cuda as cuda_driver
+            import cuda.cudart as cuda_runtime
+        except ImportError:
+            # print("cuda-python may not be installed, skipping GPU affinity setting")
+            warnings.warn("cuda-python may not be installed, skipping GPU affinity setting")
+            return
+    try:
+        import pynvml
+    except ImportError:
+        warnings.warn("pynvml is not installed, skipping GPU affinity setting")
+        return
+
+    # Get current CUDA device ID
+    err, device_id = cuda_runtime.cudaGetDevice()
+    assert err == cuda_runtime.cudaError_t.cudaSuccess
+    # Get device UUID
+    err, device_uuid = cuda_driver.cuDeviceGetUuid(device_id)
+    assert err == cuda_driver.CUresult.CUDA_SUCCESS
+    # Set CPU affinity based on GPU's NUMA node
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByUUID("GPU-" + str(uuid.UUID(bytes=device_uuid.bytes)))
+    pynvml.nvmlDeviceSetCpuAffinity(handle)
 
 
 @contextmanager
