@@ -2,7 +2,6 @@
 
 """Pretrain utilities."""
 
-import copy
 import dataclasses
 from datetime import datetime, timedelta
 import functools
@@ -12,7 +11,7 @@ import logging
 import math
 import os
 import sys
-from typing import Any, Optional
+from typing import List, Optional
 
 import torch.distributed
 
@@ -75,7 +74,7 @@ except ImportError:
 
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
+from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -1124,43 +1123,12 @@ def get_optimizer_param_scheduler(optimizer):
     return opt_param_scheduler
 
 
-def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
-    """Return a Megatron optimizer config object from Megatron's arguments."""
-
-    config = None
-    if args.optimizer == 'adam':
-        kwargs = {}
-        for f in dataclasses.fields(AdamOptimizerConfig):
-            if hasattr(args, f.name):
-                kwargs[f.name] = getattr(args, f.name)
-        config = AdamOptimizerConfig(**kwargs)
-    elif args.optimizer == 'sgd':
-        kwargs = {}
-        for f in dataclasses.fields(SGDOptimizerConfig):
-            if hasattr(args, f.name):
-                kwargs[f.name] = getattr(args, f.name)
-        config = SGDOptimizerConfig(**kwargs)
-    else:
-        raise ValueError("Invalid optimizer type!")
-
-    # Construct the appropriate config_overrides object.
-    # TODO: add more logic here as needed down the road.
-    if args.decoupled_lr is not None:
-        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
-        decoupled_optimizer_config = copy.deepcopy(config)
-        decoupled_optimizer_config.lr = args.decoupled_lr
-        if args.decoupled_min_lr is not None:
-            decoupled_optimizer_config.min_lr = args.decoupled_min_lr
-        config_overrides = {decoupled_param_key: decoupled_optimizer_config}
-    else:
-        config_overrides = None
-
-    return config, config_overrides
-
-
 def setup_model_and_optimizer(
     model_provider_func,
     model_type,
+    no_wd_decay_cond=None,
+    scale_lr_cond=None,
+    lr_mult=1.0,
     checkpointing_context=None,
 ):
     """Setup model and optimizer."""
@@ -1173,23 +1141,25 @@ def setup_model_and_optimizer(
     unwrapped_model = unwrap_model(model)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
-    if args.skip_train:
-        optimizer, opt_param_scheduler = None, None
-    else:
-        config, config_overrides = get_megatron_optimizer_config(args)
-        config.timers = timers
-
+    kwargs = {}
+    for f in dataclasses.fields(OptimizerConfig):
+        if hasattr(args, f.name):
+            kwargs[f.name] = getattr(args, f.name)
+    config = OptimizerConfig(**kwargs)
+    config.timers = timers
+    optimizer = get_megatron_optimizer(
+        config,
+        model,
+        no_wd_decay_cond,
+        scale_lr_cond,
+        lr_mult,
+        use_gloo_process_groups=args.enable_gloo_process_groups,
         # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
-        # to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
-        # default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
-        optimizer = get_megatron_optimizer(
-            config,
-            model,
-            config_overrides=config_overrides,
-            use_gloo_process_groups=args.enable_gloo_process_groups,
-            dump_param_to_param_group_map=args.dump_param_to_param_group_map,
-        )
-        opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+        #  to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
+        default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
+        dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+    )
+    opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
     if args.moe_use_upcycling:
@@ -1452,6 +1422,7 @@ def training_log(
     loss_dict,
     total_loss_dict,
     learning_rate,
+    decoupled_learning_rate,
     iteration,
     loss_scale,
     report_memory_flag,
@@ -1555,6 +1526,8 @@ def training_log(
         writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'learning-rate': learning_rate}, iteration)
+        if args.decoupled_lr is not None:
+            writer.add_scalar('decoupled-learning-rate', decoupled_learning_rate, iteration)
         if args.skipped_train_samples > 0:
             writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
             if wandb_writer:
@@ -1706,6 +1679,14 @@ def training_log(
                 wandb_writer.log({'power/gpu': power}, iteration)
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         log_string += f' learning rate: {learning_rate:.6E} |'
+        if args.decoupled_lr is not None and (
+            mpu.is_pipeline_first_stage(ignore_virtual=True)
+            or mpu.is_pipeline_last_stage(ignore_virtual=True)
+        ):
+            assert decoupled_learning_rate is not None
+            log_string += f' decoupled learning rate: {decoupled_learning_rate:.6E} |'
+        else:
+            assert decoupled_learning_rate is None
         log_string += f' global batch size: {batch_size:5d} |'
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
@@ -2469,15 +2450,19 @@ def train(
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
         learning_rate = None
+        decoupled_learning_rate = None
         for param_group in optimizer.param_groups:
             if len(param_group['params']) == 0:
                 continue
-            if param_group['default_config']:
+            if param_group['is_decoupled_lr']:
+                decoupled_learning_rate = param_group['lr']
+            else:
                 learning_rate = param_group['lr']
         report_memory_flag = training_log(
             loss_dict,
             total_loss_dict,
             learning_rate,
+            decoupled_learning_rate,
             iteration,
             loss_scale,
             report_memory_flag,
