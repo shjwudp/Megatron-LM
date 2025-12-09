@@ -675,7 +675,7 @@ class TransformerConfig(ModelParallelConfig):
 
     cuda_graph_scope: str = "full"
     """Determines the CUDA graphs capturing scope.
-    When cuda_graph_impl is set to "transformer_engine", valid values are "full" and "attn".
+    When cuda_graph_impl is set to "transformer_engine", valid values are: "full" "attn" "moe" "moe_router" "mlp".
     "Full" scope captures a whole Transformer layer. "Attn" scope only captures operations in
     TransformerLayer._forward_attention().
     When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
@@ -1516,23 +1516,16 @@ class TransformerConfig(ModelParallelConfig):
             if self.cpu_offloading:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
             if self.recompute_granularity:
-                if (
-                    self.recompute_granularity != "selective"
-                    or self.cuda_graph_impl != "transformer_engine"
-                    or self.cuda_graph_scope != "attn"
-                ):
-                    raise ValueError("CUDA graphs not supported with activation recomputation.")
-                else:
-                    for module in self.recompute_modules:
-                        if module in ['core_attn', 'mla_up_proj']:
-                            raise ValueError(
-                                f'attn cuda graph is not supported with {module} recompute.'
-                            )
-                    if "layernorm" in self.recompute_modules:
-                        warnings.warn(
-                            "input_layernorm recompute is not supported with attention "
-                            "cudagraph. Will only recompute the pre_mlp_layernorm."
+                for module in self.recompute_modules:
+                    if module in ['core_attn', 'mla_up_proj']:
+                        raise ValueError(
+                            f'attn cuda graph is not supported with {module} recompute.'
                         )
+                if "layernorm" in self.recompute_modules:
+                    warnings.warn(
+                        "input_layernorm recompute is not supported with attention "
+                        "cudagraph. Will only recompute the pre_mlp_layernorm."
+                    )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
