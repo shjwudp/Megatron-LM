@@ -12,6 +12,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -590,6 +591,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return hidden_states, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states):
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            get_fine_grained_offloading_context,
+        )
         # Optional Layer norm post the cross-attention.
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -604,6 +608,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return pre_mlp_layernorm_output
 
     def _forward_post_mlp(self, mlp_output_with_bias, residual):
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            fine_grained_offloading_group_commit,
+        )
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
@@ -641,9 +648,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
 
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            fine_grained_offloading_group_commit,
             fine_grained_offloading_group_start,
-            get_fine_grained_offloading_context,
         )
 
         # Residual connection.
