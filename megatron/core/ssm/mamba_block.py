@@ -15,7 +15,7 @@ from torch import Tensor, nn
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.extensions.transformer_engine import TENorm, qtype_debug_log
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -302,6 +302,7 @@ class MambaStack(MegatronModule):
                     PipelineOffloadManager.get_instance().set_last_layer(layer_no == self.num_layers_per_pipeline_rank - 1)
                 with inner_quant_context:
                     if isinstance(layer, TransformerLayer):
+                        qtype_debug_log(f"[{layer_no}] transformer layer (may be moe)")
                         hidden_states, _ = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -310,6 +311,7 @@ class MambaStack(MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                         )
                     elif isinstance(layer, MLPLayer):
+                        qtype_debug_log(f"[{layer_no}] mlp layer")
                         # MLPLayer (standalone MLP without attention)
                         hidden_states = layer(
                             hidden_states=hidden_states,
@@ -318,7 +320,8 @@ class MambaStack(MegatronModule):
                             rotary_pos_emb=rotary_pos_emb,
                             sequence_len_offset=sequence_len_offset,
                         )
-                    else:  # MambaLayer or Expert layer
+                    else:  # MambaLayer
+                        qtype_debug_log(f"[{layer_no}] mamba layer")
                         hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
