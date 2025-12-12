@@ -23,18 +23,12 @@ from .optimizer import (
 )
 from .optimizer_config import OptimizerConfig
 
-try:
-    from emerging_optimizers.orthogonalized_optimizers import (
-        OrthogonalizedOptimizer,
-        get_muon_scale_factor,
-    )
-    from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
 
-    HAVE_EMERGING_OPTIMIZERS = True
-except ImportError:
-    HAVE_EMERGING_OPTIMIZERS = False
-    OrthogonalizedOptimizer = object
-
+from .emerging_optimizers.orthogonalized_optimizers import (
+    OrthogonalizedOptimizer,
+    get_muon_scale_factor,
+)
+from .emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
 
 logger = logging.getLogger(__name__)
 
@@ -189,8 +183,6 @@ def get_megatron_muon_optimizer(
         layer_wise_distributed_optimizer (bool): if true, use layer-wise distributed optimizer.
             Defaults to False.
     """
-    assert HAVE_EMERGING_OPTIMIZERS, "Emerging Optimizers is not installed."
-
     # dist-optim is not supported due to strong coupling with how DDP init grad buffer
     # in thoery we can put some weight to use non-dist-muon and rest to dist-adam
     # but there are strong dependency and assumption in DDP that prevent it
