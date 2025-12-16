@@ -332,6 +332,7 @@ class PersistentAsyncCaller(AsyncCaller):
                     logger.getEffectiveLevel(),
                 ),
             )
+            self.process.daemon = True
             self.process.start()
             logger.info(
                 f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Started Async Caller"
