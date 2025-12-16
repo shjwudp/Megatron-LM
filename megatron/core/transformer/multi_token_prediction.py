@@ -507,13 +507,14 @@ class MultiTokenPredictionLayer(MegatronModule):
                     dtype=self.config.params_dtype,
                     pg_collection=pg_collection,
                     vp_stage=self.vp_stage,
-                    num_layers=self.config.mtp_num_layers_per_layer
+                    num_layers=self.config.mtp_num_layers_per_layer,
+                    is_mtp_layer=True
                 )
             else:
                 # Uses the transformer block spec for MTP layer. This option is only implemented for the 
                 # GPT model. In hybrid model, we model transformer block spec for MTP layers with the hybrid
                 # override pattern.
-                self.mtp_model_layer = build_module(self.submodules.mtp_model_layer, config=self.config, vp_stage=self.vp_stage)
+                self.mtp_model_layer = build_module(self.submodules.mtp_model_layer, config=self.config, vp_stage=self.vp_stage, is_mtp_layer=True)
 
         self.final_layernorm = build_module(
             self.submodules.layer_norm,
