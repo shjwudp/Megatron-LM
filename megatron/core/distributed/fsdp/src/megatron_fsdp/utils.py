@@ -739,3 +739,46 @@ def get_mcore_tensor_parallel_partition_dim(param: torch.Tensor) -> Optional[int
         else:
             return param.partition_dim
     return None
+
+
+def internal_api(func: Callable) -> Callable:
+    """
+    Mark a function or class as internal API (not for external use).
+
+    Use this decorator for:
+    - Internal APIs not intended for public consumption
+    - Experimental features that may change without notice
+    - Implementation details that are not part of the stable API
+
+    Objects marked with this decorator will be exempt from backward
+    compatibility checks.
+
+    Args:
+        func: The function or class to mark as internal
+
+    Returns:
+        The original function/class with an internal API marker
+
+    Example:
+        @internal_api
+        def _internal_helper():
+            '''For internal use only'''
+            pass
+
+        @internal_api
+        class ExperimentalFeature:
+            '''This API may change without notice'''
+            pass
+    """
+    func._internal_api = True
+    return func
+
+
+# Deprecated FP8 utilities placeholders
+HAVE_TE_FP8_TENSOR_CLASS = None
+multi_tensor_scale_impl = None
+local_multi_tensor_applier = None
+local_multi_tensor_scale = None
+is_float8tensor = None
+modify_underlying_storage = None
+quantize_param_shard = None

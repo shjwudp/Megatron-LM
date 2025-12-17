@@ -50,6 +50,7 @@ from .utils import (
     FSDPDistributedIndex,
     get_global_memory_buffer,
     get_mcore_tensor_parallel_partition_dim,
+    internal_api,
     is_mcore_tensor_model_parallel,
     is_mcore_tensor_parallel_duplicated,
 )
@@ -787,6 +788,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self.backup_allocator.free(bucket_id)
 
 
+@internal_api
 class DataParallelBuffer:
     """
     A class that manages the data parallel buffer for Fully Sharded Data Parallel (FSDP) training.
@@ -3527,7 +3529,7 @@ class AllGatherPipeline:
             for bucket_id in buckets:
                 self.wait_bucket_ready(bucket_id, bwd)
 
-    def wait_bucket_ready(self, bucket_id, bwd, empty_ok=False):
+    def wait_bucket_ready(self, bucket_id, bwd=False, empty_ok=False):
         """Wait for the bucket to be ready."""
         bucket_key = self.get_bucket_key(bucket_id, bwd)
 
@@ -3547,7 +3549,7 @@ class AllGatherPipeline:
         mark_bucket_ready_to_use()
 
     @torch.no_grad()
-    def release_bucket(self, bucket_id, bwd):
+    def release_bucket(self, bucket_id, bwd=False):
         """Release the bucket."""
         # TODO(mxfp8): In some cases, there won't be ag before bwd?
         bucket_key = self.get_bucket_key(bucket_id, bwd)
@@ -3589,7 +3591,7 @@ class AllGatherPipeline:
             return param_group.model_weight_buffer
 
     @torch.no_grad()
-    def async_bucket_gather(self, bucket_id, bwd) -> None:
+    def async_bucket_gather(self, bucket_id, bwd=False) -> None:
         """All-gather the bucket and set the items."""
         bucket_key = self.get_bucket_key(bucket_id, bwd)
 
