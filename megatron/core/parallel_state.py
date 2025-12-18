@@ -520,6 +520,7 @@ def initialize_model_parallel(
     virtual_pipeline_model_parallel_size: Optional[int] = None,
     pipeline_model_parallel_comm_backend: Optional[str] = None,
     use_sharp: bool = False,
+    init_symmetric_memory_buffer: bool = True,
     context_parallel_size: int = 1,
     hierarchical_context_parallel_sizes: Optional[List[int]] = None,
     expert_model_parallel_size: int = 1,
@@ -571,6 +572,9 @@ def initialize_model_parallel(
             data-parallel process groups. When `True`, run barrier
             within each data-parallel process group, which specifies
             the SHARP application target groups.
+
+        init_symmetric_memory_buffer (bool, default = True):
+            Initialize the global symmetric memory buffer for inference.
 
         context_parallel_size (int, default = 1):
             The number of tensor parallel GPU groups to split the
@@ -1288,8 +1292,9 @@ def initialize_model_parallel(
     # we could stick it there
     _set_global_memory_buffer()
 
-    # initialize global symmetric memory buffer
-    _set_global_symmetric_memory_buffer()
+    # initialize global symmetric memory buffer. Only available for inference.
+    if init_symmetric_memory_buffer:
+        _set_global_symmetric_memory_buffer()
 
 
 def is_initialized():
