@@ -1684,6 +1684,8 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
+
+    # Log MoE metrics.
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -1714,11 +1716,15 @@ def training_log(
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
         )
+
+    # Log MTP metrics.
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
+
+    # Dump memory snapshot.
     if iteration % args.log_interval == 0 or is_first_iteration:
         if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
             snapshot = torch.cuda.memory._snapshot()
@@ -1727,6 +1733,8 @@ def training_log(
             with open(args.memory_snapshot_path, 'wb') as f:
                 dump(snapshot, f)
 
+    # Print metrics to stdout.
+    if iteration % args.log_interval == 0 or is_first_iteration:
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
@@ -1895,6 +1903,10 @@ def save_checkpoint_and_time(
     one_logger_utils.track_e2e_metrics()
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
+
+    # Track memory before checkpoint save.
+    report_memory(f"(before save_checkpoint for iteration {iteration})")
+    # Save checkpoint.
     save_checkpoint(
         iteration,
         model,
@@ -1906,6 +1918,9 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
+    # Track memory after checkpoint save.
+    report_memory(f"(after save_checkpoint for iteration {iteration})")
+
     if args.fp8:
         # Run garbage collection after checkpoint saving to free memory from
         # dequantized bf16 tensors that were temporarily created during fp8
