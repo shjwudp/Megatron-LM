@@ -843,24 +843,30 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
             if self.config.fp16:
-                logger.info(
-                    '***WARNING*** found an old checkpoint, will not ' 'load grad scaler ...'
-                )
+                assert torch.distributed.is_initialized()
+                if torch.distributed.get_rank() == 0:
+                    logger.info(
+                        '***WARNING*** found an old checkpoint, will not ' 'load grad scaler ...'
+                    )
         else:
             if self.grad_scaler:
                 self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
             else:
-                logger.info(
-                    '***WARNING*** fould the grad scaler in the '
-                    'checkpoint but it is None in the class. '
-                    'Skipping loading grad scaler ...'
-                )
+                assert torch.distributed.is_initialized()
+                if torch.distributed.get_rank() == 0:
+                    logger.info(
+                        '***WARNING*** fould the grad scaler in the '
+                        'checkpoint but it is None in the class. '
+                        'Skipping loading grad scaler ...'
+                    )
 
         if 'param_state' in state_dict:
             assert 'param_state_sharding_type' in state_dict, state_dict.keys()
             param_state = state_dict['param_state']
             sharding_type = state_dict['param_state_sharding_type']
-            logger.info(f'Loading distributed optimizer sharded state of type {sharding_type}')
+            assert torch.distributed.is_initialized()
+            if torch.distributed.get_rank() == 0:
+                logger.info(f'Loading distributed optimizer sharded state of type {sharding_type}')
             if sharding_type == 'dp_zero_gather_scatter':
                 self.load_parameter_state_from_dp_zero(param_state)
             elif sharding_type == 'fully_reshardable':
@@ -1205,11 +1211,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
         if sharding_type is not None:
-            logger.warning(
-                'DistributedOptimizer.sharded_state_dict parameter `sharding_type`'
-                ' is deprecated and will be removed.'
-                ' Use `metadata["distrib_optim_sharding_type"] instead`.'
-            )
+            assert torch.distributed.is_initialized()
+            if torch.distributed.get_rank() == 0:
+                logger.warning(
+                    'DistributedOptimizer.sharded_state_dict parameter `sharding_type`'
+                    ' is deprecated and will be removed.'
+                    ' Use `metadata["distrib_optim_sharding_type"] instead`.'
+                )
         else:
             sharding_type = (metadata or {}).get(
                 'distrib_optim_sharding_type', 'fully_sharded_model_space'
@@ -1225,11 +1233,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return state_dict
 
         if not is_loading and sharding_type == 'fully_sharded_bucket_space':
-            logger.warning(
-                '`fully_sharded_bucket_space` sharding for DistributedOptimizer'
-                ' checkpoint is deprecated and will be removed in the future.'
-                ' Please switch to `full_sharded_model_space`.'
-            )
+            assert torch.distributed.is_initialized()
+            if torch.distributed.get_rank() == 0:
+                logger.warning(
+                    '`fully_sharded_bucket_space` sharding for DistributedOptimizer'
+                    ' checkpoint is deprecated and will be removed in the future.'
+                    ' Please switch to `full_sharded_model_space`.'
+                )
 
         state_dict = self.state_dict()
         if sharding_type not in self.checkpoint_fully_reshardable_formats:

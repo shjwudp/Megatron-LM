@@ -373,8 +373,9 @@ def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
     # Force pre-mcore 0.14 behavior for PyTorch versions below 2.6a0
     force_pre_mcore_014 = not is_torch_min_version("2.6a0")
     if force_pre_mcore_014 and not args.dist_ckpt_save_pre_mcore_014:
-        logger.warning(f"PyTorch version {get_torch_version()} below 2.6 detected."
-                       f" Forcing dist_ckpt_save_pre_mcore_014 behavior.")
+        if args.rank == 0:
+            logger.warning(f"PyTorch version {get_torch_version()} below 2.6 detected."
+                           f" Forcing dist_ckpt_save_pre_mcore_014 behavior.")
 
     if args.dist_ckpt_save_pre_mcore_014 or force_pre_mcore_014:
         if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
@@ -532,8 +533,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                         save_strategy.thread_count = args.dist_ckpt_workers
                     else:
                         # We don't allow per-rank parallel save for sync save
-                        logger.warning('Per-rank parallel save is not supported for sync save. '
-                                       'Setting args.dist_ckpt_workers to 1')
+                        if args.rank == 0:
+                            logger.warning('Per-rank parallel save is not supported for sync save. '
+                                           'Setting args.dist_ckpt_workers to 1')
                         save_strategy.thread_count = 1
                     if checkpointing_context is not None and 'load_strategy' in checkpointing_context:
                         cached_global_metadata = getattr(checkpointing_context['load_strategy'], 'cached_global_metadata', None)

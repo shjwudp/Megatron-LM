@@ -30,6 +30,7 @@ from megatron.training.arguments import parse_args, validate_args
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.checkpointing import load_args_from_checkpoint
 from megatron.training.global_vars import set_global_variables
+from megatron.training.utils import is_rank0
 from megatron.training.yaml_arguments import validate_yaml
 
 logger = logging.getLogger(__name__)
@@ -543,5 +544,6 @@ def setup_logging() -> None:
         logging_level = args.logging_level
 
     if logging_level is not None:
-        logger.info(f'Setting logging level to {logging_level}')
+        if is_rank0():
+            logger.info(f'Setting logging level to {logging_level}')
         logging.getLogger().setLevel(logging_level)

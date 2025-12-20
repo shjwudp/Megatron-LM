@@ -10,6 +10,7 @@ import inspect
 import logging
 import math
 import operator
+import os
 import queue
 import socket
 import sys
@@ -807,6 +808,19 @@ def scaled_init_method_normal(sigma, num_layers, multiplier=2.0):
     return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
 
 
+def safe_get_rank() -> int:
+    """Internal function that safely checks and returns the rank of the caller."""
+
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+
+    # If torch.distributed is not initialized, try to read environment variables.
+    try:
+        return int(os.environ.get("RANK", 0))
+    except (ValueError, TypeError):
+        return 0
+
+
 def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
     """If torch distributed is initialized, write log on only one rank
 
@@ -819,10 +833,7 @@ def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs:
 
         kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
     """
-    if torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == rank:
-            logger.log(*args, **kwargs)
-    else:
+    if safe_get_rank() == rank:
         logger.log(*args, **kwargs)
 
 

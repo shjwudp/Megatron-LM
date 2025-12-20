@@ -39,15 +39,18 @@ def reload_mergeable_ranks(
     """
 
     assert path.endswith(".json")
+    from megatron.core.utils import safe_get_rank
 
     # reload vocab
     with open(path, "r") as f:
         vocab = json.load(f)
     assert isinstance(vocab, list)
-    print(f"Vocab size: {len(vocab)}")
+    if safe_get_rank() == 0:
+        print(f"Vocab size: {len(vocab)}")
     if max_vocab is not None:
         vocab = vocab[:max_vocab]
-        print(f"Cutting vocab to first {len(vocab)} tokens.")
+        if safe_get_rank() == 0:
+            print(f"Cutting vocab to first {len(vocab)} tokens")
 
     # build ranks
     ranks: Dict[bytes, int] = {}
@@ -124,7 +127,8 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
             for i in range(len(special_tokens), num_special_tokens)
         ]
         self.special_filler = special_filler
-        if special_filler:
+        from megatron.core.utils import safe_get_rank
+        if special_filler and safe_get_rank() == 0:
             print(
                 "Adding special tokens: "
                 f"{', '.join(special_tokens)}, {special_filler[0]}, ..., {special_filler[-1]}"

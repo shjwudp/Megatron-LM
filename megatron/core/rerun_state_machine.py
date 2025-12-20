@@ -1059,12 +1059,13 @@ class RerunStateMachine:
         except Exception as e:
             logger.error(f"Could not parse iterations to skip in tracker file! ({e})")
         iterations_to_skip = sorted(iterations_to_potentially_skip - iterations_to_ignore)
-        logger.warning(f"Will skip these iterations from tracker file: {iterations_to_skip}")
-        if len(iterations_to_ignore) > 0:
-            logger.warning(
-                "Will not skip these iterations due to multiple rank errors: "
-                f"{sorted(iterations_to_ignore)}"
-            )
+        if _safe_get_rank() == 0:
+            logger.warning(f"Will skip these iterations from tracker file: {iterations_to_skip}")
+            if len(iterations_to_ignore) > 0:
+                logger.warning(
+                    "Will not skip these iterations due to multiple rank errors: "
+                    f"{sorted(iterations_to_ignore)}"
+                )
         return iterations_to_skip
 
 
@@ -1341,7 +1342,8 @@ def get_rerun_state_machine() -> RerunStateMachine:
     """Helper function to return the singleton instance of the rerun machine."""
 
     if _GLOBAL_RERUN_STATE_MACHINE is None:
-        logger.warning("Implicit initialization of Rerun State Machine!")
+        if _safe_get_rank() == 0:
+            logger.warning("Implicit initialization of Rerun State Machine!")
         initialize_rerun_state_machine()
         assert _GLOBAL_RERUN_STATE_MACHINE is not None
     return _GLOBAL_RERUN_STATE_MACHINE

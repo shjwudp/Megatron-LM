@@ -23,12 +23,14 @@ class MegatronLegacyTokenizer(ABC):
     """
 
     def __init__(self, *tokenizer_paths: str, **tokenizer_options: Any):
-        # Deprecation warning
-        logger.warning(
-            "You’re using the legacy tokenizer system, which is deprecated "
-            "and will be removed in a future release. Please migrate to the new tokenizer system "
-            "(`megatron.core.tokenizers.MegatronTokenizer`)."
-        )
+        from megatron.core.utils import safe_get_rank
+        if safe_get_rank() == 0:
+            # Deprecation warning
+            logger.warning(
+                "You’re using the legacy tokenizer system, which is deprecated "
+                "and will be removed in a future release. Please migrate to the new tokenizer system "
+                "(`megatron.core.tokenizers.MegatronTokenizer`)."
+            )
         self.unique_identifiers = OrderedDict()
         self.unique_identifiers["class"] = type(self).__name__
         self.unique_identifiers["tokenizer_path"] = list(tokenizer_paths)
