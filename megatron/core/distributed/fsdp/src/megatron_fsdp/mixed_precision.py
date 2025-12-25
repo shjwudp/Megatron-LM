@@ -490,7 +490,6 @@ def quantize(
             main_params,
             start_offsets,
             data_parallel_group,
-            fsdp_shard_model_params,
         )
     elif is_float8tensor(model_params[0]):
         assert all(

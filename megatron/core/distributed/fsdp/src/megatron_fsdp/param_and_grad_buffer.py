@@ -2172,9 +2172,9 @@ class ParamAndGradBuffer:
 
                     # Copy the model weight parameter tensor into the buffer.
                     # When distributed, this shards and preserves the data across all ranks.
-                    wbuf.set_item(item_id, p_local)
+                    wbuf.set_item(item_id, get_raw_data(p_local))
                     if tbuf:
-                        tbuf.set_item(item_id, p_local)
+                        tbuf.set_item(item_id, get_raw_data(p_local, True))
 
                     # Retrieve the newly allocated parameter data from the global bucket.
                     # Attach the bucket-allocated parameter data to the module parameter,
