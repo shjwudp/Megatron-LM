@@ -109,9 +109,9 @@ def get_forward_backward_func():
     decoder_seq_length (int, optional): The sequence length for the decoder in a dual-stack
         transformer. This is ignored for a single-stack transformer.
 
-    forward_only (optional, default = False): Perform only the forward step
+    forward_only (optional, default = False): Perform only the forward step.
 
-    collect_non_loss_data (optional, bool, default=False): TODO
+    collect_non_loss_data (optional, bool, default=False): TODO.
 
     first_val_step (bool, optional): Is the first step of the validation phase. Used by
         Transformer Engine modules to only update their fp8 weights only on the first validation
@@ -122,6 +122,9 @@ def get_forward_backward_func():
         Takes in a list of receive shapes and a list of send shapes and returns the adjusted
         respective list of shapes. Thus it is not used in the other forward-backward functions
         which have different shape handling.
+
+    force_all_reduce (bool, optional): Run all-reduce for this iteration instead of maybe
+        reduce-scatter to ensure all ranks have fully reduced gradients.
 
     """
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
@@ -514,6 +517,7 @@ def forward_backward_no_pipelining(
     first_val_step: Optional[bool] = None,
     adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
     pg_collection: Optional[ProcessGroupCollection] = None,
+    force_all_reduce: Optional[bool] = False,
 ):
     """Run forward and backward passes with no pipeline parallelism"""
 
@@ -649,6 +653,7 @@ def forward_backward_no_pipelining(
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
+            force_all_reduce=force_all_reduce,
         )
 
     if config.timers is not None:
@@ -830,6 +835,7 @@ def forward_backward_pipelining_with_interleaving(
     adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    force_all_reduce: Optional[bool] = False,
 ):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
@@ -1912,6 +1918,7 @@ def forward_backward_pipelining_with_interleaving(
             model,
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
+            force_all_reduce=force_all_reduce,
         )
 
     # Restore config.grad_sync_func and config.param_sync_func.
@@ -1973,6 +1980,7 @@ def forward_backward_pipelining_without_interleaving(
     adjust_tensor_shapes_fn: Optional[Callable] = None,
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    force_all_reduce: Optional[bool] = False,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
@@ -2303,6 +2311,7 @@ def forward_backward_pipelining_without_interleaving(
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
+            force_all_reduce=force_all_reduce,
         )
 
     if config.timers is not None:
