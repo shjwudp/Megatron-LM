@@ -388,7 +388,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
     #   from the MixedPrecisionOptimizer, which manages any optimizer where
     #   the model params and main params are distinct.
-    if config.fp16 or config.bf16 or config.use_distributed_optimizer:
+    if config.fp16 or config.bf16 or config.use_distributed_optimizer or config.use_distributed_optimizer_v2:
 
         # Grad scaler:
         #    if loss-scale is provided, instantiate the constant scaler.
@@ -415,7 +415,12 @@ def _get_megatron_optimizer_based_on_param_groups(
                 )
 
         optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
-        if config.use_distributed_optimizer:
+        if config.use_distributed_optimizer_v2:
+            optimizer = DistributedOptimizer(
+                *optimizer_args,
+                model_chunks=model_chunks,
+            )
+        elif config.use_distributed_optimizer:
             optimizer = DistributedOptimizer(
                 *optimizer_args,
                 model_chunks=model_chunks,

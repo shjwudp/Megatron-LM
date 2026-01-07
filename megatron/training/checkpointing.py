@@ -867,12 +867,7 @@ def generate_state_dict(
                     })
                 )
             elif args.ckpt_format == "fsdp_dtensor":
-                if optim_sd_kwargs is None:
-                    optim_sd_kwargs = {}
-                if "metadata" not in optim_sd_kwargs:
-                    optim_sd_kwargs["metadata"] = {}
-                optim_sd_kwargs['metadata'].update(_build_sharded_state_dict_metadata(args))
-                optimizer_sd = optimizer.sharded_state_dict(state_dict, **optim_sd_kwargs)
+                optimizer_sd = optimizer.state_dict()
             else:
                 optimizer_sd = optimizer.state_dict()
 

@@ -161,6 +161,9 @@ class OptimizerConfig:
     use_distributed_optimizer: bool = False
     """Distribute optimizer state over data-parallel replicas."""
 
+    use_distributed_optimizer_v2: bool = False
+    """Distribute optimizer state over data-parallel replicas use DTensor."""
+
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
         This argument is intended to have the same value as the "overlap_param_gather" argument 
