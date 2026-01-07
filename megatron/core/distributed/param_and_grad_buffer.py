@@ -162,6 +162,8 @@ class _ParamAndGradBucketGroup:
         global dist_reduce_scatter_func
         if self.ddp_config.reduce_scatter_with_fp32_accumulation:
             dist_reduce_scatter_func = reduce_scatter_with_fp32_accumulation
+            if torch.distributed.get_rank() == 0:
+                logger.info("Using reduce_scatter_with_fp32_accumulation as reduce-scatter implementation")
 
         # per_param_grad_ready_counts is a dict mapping parameters to number of times
         # `register_grad_ready` is called for that parameter *when
