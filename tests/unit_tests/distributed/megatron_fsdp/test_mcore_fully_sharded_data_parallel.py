@@ -11,7 +11,12 @@ import megatron.core.parallel_state as mpu
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.optimizer import OptimizerConfig
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_mtp_block_spec,
+)
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -493,3 +498,80 @@ class TestFullyShardedDataParallel:
                 atol=0,
                 msg=f"Parameter gradients for {name1} and {name2} don't match",
             )
+
+
+class TestMegatronFSDPE2E:
+
+    @pytest.mark.skipif(
+        is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize(
+        "nd_topology", [{"TP": 2, "PP": 2, "VPP": 2}, {"EP": 2, "ETP": 2}, {"OUTER_DP": 2, "EP": 2}]
+    )
+    def test_compatible_with_nd_parallel(
+        self,
+        nd_topology,
+        moe_model_factory,
+        gpt_mock_data_iterator_factory,
+        pretrain_forward_backward_factory,
+    ):
+        VOCAB_SIZE = 1000
+        MAX_SEQ_LEN = 128
+        MICRO_BATCH_SIZE = 2
+        NUM_MICRO_BATCHES = 2
+        NUM_TRAINING_STEPS = 3
+
+        try:
+            TP = nd_topology.get("TP", 1)
+            PP = nd_topology.get("PP", 1)
+            EP = nd_topology.get("EP", 1)
+            ETP = nd_topology.get("ETP", 1)
+            OUTER_DP = nd_topology.get("OUTER_DP", 1)
+
+            # Initialize model parallel with ND shape
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=TP,
+                pipeline_model_parallel_size=PP,
+                expert_model_parallel_size=EP,
+                expert_tensor_parallel_size=ETP,
+                num_distributed_optimizer_instances=OUTER_DP,
+            )
+            DP_GROUP = mpu.get_data_parallel_group()
+
+            # Build model
+            gpt_model = moe_model_factory(
+                pipeline_model_parallel_size=PP,
+                tensor_model_parallel_size=TP,
+                expert_model_parallel_size=EP,
+            )
+
+            # Build optimizer
+            optim = get_megatron_optimizer(
+                config=OptimizerConfig(
+                    optimizer='adam', lr=0.01, bf16=True, use_distributed_optimizer=True
+                ),
+                model_chunks=[gpt_model],
+            )
+
+            # Prepare data iterator
+            data_iterator = gpt_mock_data_iterator_factory(
+                dp_group=DP_GROUP,
+                vocab_size=VOCAB_SIZE,
+                sequence_length=MAX_SEQ_LEN,
+                micro_batch_size=MICRO_BATCH_SIZE,
+                num_samples=1000,
+            )
+
+            # Training loop
+            for _ in range(NUM_TRAINING_STEPS):
+                optim.zero_grad()
+                pretrain_forward_backward_factory(
+                    model=gpt_model,
+                    data_iterator=data_iterator,
+                    sequence_length=MAX_SEQ_LEN,
+                    micro_batch_size=MICRO_BATCH_SIZE,
+                    num_micro_batches=NUM_MICRO_BATCHES,
+                )
+                optim.step()
+        finally:
+            Utils.destroy_model_parallel()
