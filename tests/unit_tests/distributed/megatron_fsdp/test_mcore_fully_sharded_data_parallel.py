@@ -11,7 +11,7 @@ import megatron.core.parallel_state as mpu
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -363,7 +363,7 @@ class TestFullyShardedDataParallel:
         # And proceed one more step to check the results
         if fsdp_manual_registration:
             out1, loss1 = train_step(baseline_fsdp_model, optimizer1, input_data)
-            target_fsdp_model.manual_buffer_registration()
+            target_fsdp_model.param_and_grad_buffer.manual_buffer_registration()
             out2, loss2 = train_step(target_fsdp_model, optimizer2, input_data)
 
         testing.assert_close(out1, out2, rtol=0, atol=0)
@@ -493,3 +493,96 @@ class TestFullyShardedDataParallel:
                 atol=0,
                 msg=f"Parameter gradients for {name1} and {name2} don't match",
             )
+
+
+class TestMegatronFSDPE2E:
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize(
+        "nd_topology",
+        [
+            pytest.param({"TP": 2}, id="TP2"),
+            pytest.param({"EP": 2, "ETP": 2}, id="EP2_ETP2"),
+            pytest.param({"OUTER_DP": 2, "EP": 2}, id="OUTER_DP2_EP2"),
+        ],
+    )
+    @pytest.mark.parametrize("fsdp_sharding_strategy", ["optim_grads_params", "optim_grads", "optim"])
+    def test_compatible_with_nd_parallel(
+        self,
+        nd_topology,
+        fsdp_sharding_strategy,
+        manual_seed_factory,
+        moe_model_and_optimizer_factory,
+        gpt_mock_data_iterator_factory,
+        pretrain_forward_backward_factory,
+    ):
+        VOCAB_SIZE = 100
+        MAX_SEQ_LEN = 128
+        MICRO_BATCH_SIZE = 2
+        NUM_MICRO_BATCHES = 2
+        NUM_TRAINING_STEPS = 3
+
+        TP = nd_topology.get("TP", 1)
+        PP = nd_topology.get("PP", 1)
+        VPP = nd_topology.get("VPP", None)
+        EP = nd_topology.get("EP", 1)
+        ETP = nd_topology.get("ETP", 1)
+        OUTER_DP = nd_topology.get("OUTER_DP", 1)
+
+        # Initialize model parallel with ND shape
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=TP,
+            pipeline_model_parallel_size=PP,
+            expert_model_parallel_size=EP,
+            expert_tensor_parallel_size=ETP,
+            num_distributed_optimizer_instances=OUTER_DP,
+        )
+        DP_GROUP = mpu.get_data_parallel_group()
+
+        # Set manual seed for reproducibility
+        manual_seed_factory(32)
+
+        # Build model and optimizer
+        global_batch_size = MICRO_BATCH_SIZE * NUM_MICRO_BATCHES * DP_GROUP.size()
+        gpt_model, optim = moe_model_and_optimizer_factory(
+            ut_filename="test_mcore_fully_sharded_data_parallel.py",
+            micro_batch_size=MICRO_BATCH_SIZE,
+            global_batch_size=global_batch_size,
+            vocab_size=VOCAB_SIZE,
+            padded_vocab_size=VOCAB_SIZE,
+            seq_length=MAX_SEQ_LEN,
+            sequence_parallel=TP > 1,
+            tensor_model_parallel_size=TP,
+            pipeline_model_parallel_size=PP,
+            num_layers_per_virtual_pipeline_stage=VPP,
+            train_iters=NUM_TRAINING_STEPS,
+            use_megatron_fsdp=True,
+            data_parallel_sharding_strategy=fsdp_sharding_strategy,
+            init_model_with_meta_device=True,
+            ckpt_format="fsdp_dtensor",
+            gradient_accumulation_fusion=False,
+        )
+
+        # Prepare data iterator
+        data_iterator = gpt_mock_data_iterator_factory(
+            dp_group=DP_GROUP,
+            vocab_size=VOCAB_SIZE,
+            sequence_length=MAX_SEQ_LEN,
+            batch_size=MICRO_BATCH_SIZE,
+            num_samples=global_batch_size * NUM_TRAINING_STEPS,
+        )
+
+        # Training loop
+        for _ in range(NUM_TRAINING_STEPS):
+            optim.zero_grad()
+            pretrain_forward_backward_factory(
+                model=gpt_model,
+                data_iterator=data_iterator,
+                sequence_length=MAX_SEQ_LEN,
+                micro_batch_size=MICRO_BATCH_SIZE,
+                num_micro_batches=NUM_MICRO_BATCHES,
+            )
+            optim.step()
+        Utils.destroy_model_parallel()

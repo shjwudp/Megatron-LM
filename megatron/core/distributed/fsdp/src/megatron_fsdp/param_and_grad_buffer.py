@@ -2416,6 +2416,17 @@ class ParamAndGradBuffer:
                     buf.param_idx[new_p] = buf.param_idx[p]
                     del buf.param_idx[p]
 
+        # Copy the new param data to the buffer.
+        for param in new_params:
+            param_group = self.parameter_groups[self.param_to_param_group[param]]
+            item_id = param_group.params.index(param)
+            wbuf = param_group.model_weight_buffer
+            if wbuf:
+                wbuf.set_item(item_id, to_local_if_dtensor(param))
+            tbuf = param_group.transpose_weight_buffer
+            if tbuf:
+                tbuf.set_item(item_id, to_local_if_dtensor(param))
+
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""
         for group in self.parameter_groups:

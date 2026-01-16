@@ -504,18 +504,6 @@ class MegatronFSDP(torch.nn.Module):
         """
         fsdp_unit_modules = self.fsdp_unit_modules
 
-        def release_module_parameters(module, bwd, *unused):
-            for param in module.parameters():
-                bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
-                self.all_gather_pipeline.release_bucket(bucket_id, bwd)
-            if not self.ddp_config.keep_fp8_transpose_cache:
-                release_params_fp8_transpose_cache(module.parameters())
-
-        def release_params_fp8_transpose_cache(params):
-            for param in params:
-                if is_float8tensor(param):
-                    fp8_discard_transpose_cache(param)
-
         def _grad_acc(param):
             """
             Accumulate the gradient in the main_grad buffer.
@@ -571,7 +559,7 @@ class MegatronFSDP(torch.nn.Module):
                 if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
                     # Deallocate the module parameters after the backward pass,
                     # because we have our data-parallel gradients computed.
-                    release_module_parameters(module, bwd=True)
+                    self._release_module_parameters(module, bwd=True)
                     module._training_state = TrainingState.IDLE
                 param_list = list(module.parameters())
             else:
@@ -810,13 +798,15 @@ class MegatronFSDP(torch.nn.Module):
             ), "_post_forward hook should only be registered on FSDP unit modules."
 
             # Release the module parameters after the forward pass to save memory.
-            release_module_parameters(module, bwd=False)
+            self._release_module_parameters(module)
             module._training_state = TrainingState.IDLE
 
             return output
 
         def _release_module_fp8_transpose_cache(module: nn.Module, *unused):
-            release_params_fp8_transpose_cache(module.parameters(recurse=False))
+            for param in module.parameters(recurse=False):
+                if is_float8tensor(param):
+                    fp8_discard_transpose_cache(param)
 
         def create_custom_backward_hook(module, custom_backward_handler):
             """
@@ -958,6 +948,15 @@ class MegatronFSDP(torch.nn.Module):
             module.register_state_dict_pre_hook(
                 lambda *args, **kwargs: self._replace_param_with_distributed_if_needed()
             )
+
+    def _release_module_parameters(self, module, bwd=False, *unused):
+        for param in module.parameters():
+            bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+            self.all_gather_pipeline.release_bucket(bucket_id, bwd)
+        if not self.ddp_config.keep_fp8_transpose_cache:
+            for param in module.parameters():
+                if is_float8tensor(param):
+                    fp8_discard_transpose_cache(param)
 
     @contextmanager
     def no_sync(self):
@@ -1241,6 +1240,109 @@ class MegatronFSDP(torch.nn.Module):
             # Call the forward pass of the wrapped module.
             output = self.module.forward(*inputs, **kwargs)
             return output
+
+    @contextlib.contextmanager
+    def summon_full_params(
+        self,
+        module: nn.Module,
+        recurse: bool = True,
+        writeback: bool = True,
+    ):
+        """
+        Context manager that temporarily all-gathers full parameters for a Megatron-FSDP
+        submodule tree and restores sharded parameters on exit.
+
+        Inside this context, callers may modify parameter *values* (e.g., reinitialize
+        weights) but must not change the parameter set or dtypes. In particular:
+            * The set of parameter names must remain identical.
+            * The dtype of each parameter must remain identical.
+
+        Args:
+            module (nn.Module): A Megatron-FSDP submodule whose parameters should be
+                all-gathered. Must be part of this Megatron-FSDP instance.
+            recurse (bool, optional): If True, also all-gathers parameters for all
+                nested Megatron-FSDP submodules under ``module``. Defaults to True.
+            writeback (bool, optional): If True, validates that the parameter set has
+                not structurally changed and writes any in-place value changes back
+                into the param-and-grad buffer. Defaults to True.
+        """
+        if self.data_parallel_sharding_strategy != "optim_grads_params":
+            # Parameters are not sharded under this strategy, so they are already full.
+            yield
+            return
+
+        # Validate that `module` is a Megatron-FSDP sub-module of this instance.
+        is_megatron_fsdp_sub_module = False
+        if not is_megatron_fsdp_sub_module:
+            for m in self.modules():
+                if m is module:
+                    is_megatron_fsdp_sub_module = True
+                    break
+        if not is_megatron_fsdp_sub_module:
+            raise ValueError("summon_full_params can only be used with MegatronFSDP sub-modules.")
+
+        # Collect all Megatron-FSDP modules whose parameters should be all-gathered.
+        fsdp_modules = [module]
+        if recurse:
+            fsdp_modules.extend(module.modules())
+
+        # Switch to raw (unsharded) parameters during the context.
+        self._replace_param_with_raw_if_needed()
+
+        # All-gather parameters for each Megatron-FSDP module.
+        param_list = []
+        for fsdp_module in fsdp_modules:
+            param_list.extend(fsdp_module.module.parameters(recurse=False))
+        self.all_gather_pipeline.all_gather_params(
+            params=param_list, prefetch=False,
+            outer_fsdp_group_param_gather=self.dist_index.use_hybrid_fsdp,
+        )
+        for param in param_list:
+            bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+            self.all_gather_pipeline.wait_bucket_ready(bucket_id, bwd=False)
+
+        try:
+            yield
+        finally:
+            if writeback:
+                # Validate that the parameter *set* has not changed.
+                new_param_names = {name for name, _ in self.module.named_parameters()}
+                old_param_names = set(self.raw_param.keys())
+                assert new_param_names == old_param_names, (
+                    "Model parameters changed during `summon_full_params`, which is "
+                    "not allowed; you cannot add/remove/rename parameters while using "
+                    "Megatron-FSDP at runtime. "
+                    f"New params: {new_param_names}, old params: {old_param_names}"
+                )
+
+                # Map parameters to their names for easy lookup.
+                param_to_name = {
+                    param: name for name, param in self.module.named_parameters()
+                }
+
+                # Build old/new param lists and validate dtypes.
+                old_params = param_list
+                new_params = []
+                for param in old_params:
+                    name = param_to_name[param]
+                    raw_param = self.raw_param[name]
+                    assert param.dtype == raw_param.dtype, (
+                        "Parameter dtype changed during `summon_full_params`, which is "
+                        "not allowed. "
+                        f"Param: {name}, new dtype: {param.dtype}, "
+                        f"original dtype: {raw_param.dtype}"
+                    )
+                    new_params.append(raw_param)
+
+                # Write back any in-place parameter value updates into the buffer.
+                self.param_and_grad_buffer._reset_parameters(old_params, new_params)
+
+            # Release all-gathered parameters for each Megatron-FSDP module.
+            for fsdp_module in fsdp_modules:
+                self._release_module_parameters(fsdp_module.module)
+
+            # Restore distributed parameters after the context.
+            self._replace_param_with_distributed_if_needed()
 
 
 class RegisterFSDPBackwardFunction(torch.autograd.Function):
