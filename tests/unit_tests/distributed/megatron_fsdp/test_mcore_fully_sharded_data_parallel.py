@@ -508,7 +508,9 @@ class TestMegatronFSDPE2E:
             pytest.param({"OUTER_DP": 2, "EP": 2}, id="OUTER_DP2_EP2"),
         ],
     )
-    @pytest.mark.parametrize("fsdp_sharding_strategy", ["optim_grads_params", "optim_grads", "optim"])
+    @pytest.mark.parametrize(
+        "fsdp_sharding_strategy", ["optim_grads_params", "optim_grads", "optim"]
+    )
     def test_compatible_with_nd_parallel(
         self,
         nd_topology,
@@ -564,6 +566,13 @@ class TestMegatronFSDPE2E:
             ckpt_format="fsdp_dtensor",
             gradient_accumulation_fusion=False,
         )
+
+        # Reset model parameters for test consistency
+        manual_seed_factory(42)
+        for m in gpt_model.modules():
+            with m._summon_full_params():
+                if hasattr(m, "reset_parameters"):
+                    m.reset_parameters()
 
         # Prepare data iterator
         data_iterator = gpt_mock_data_iterator_factory(

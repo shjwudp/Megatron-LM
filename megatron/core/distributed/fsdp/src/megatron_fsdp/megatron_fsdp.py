@@ -277,6 +277,7 @@ class MegatronFSDP(torch.nn.Module):
             # and gradients.
             assert self.ddp_config.overlap_grad_reduce
 
+        # Bind Megatron-FSDP specific attributes to each parameter.
         for param in self.module.parameters():
             if not hasattr(param, "grad_added_to_main_grad"):
                 # This is to ensure that the param.grad_added_to_main_grad is set to False
@@ -287,15 +288,22 @@ class MegatronFSDP(torch.nn.Module):
                 # when the parameter is created.
                 param.__fsdp_param__ = True
 
+        # Bind the `_summon_full_params` method to each sub-module.
+        for m in self.modules():
+            setattr(m, "_summon_full_params", self.summon_full_params)
+
         self._init_fsdp_param_and_grad_buffer()
         self._register_fsdp_hooks(self.module)
         self.microbatch_count = 0
 
+        # Flag indicating if the parameters are already replaced with sharded versions.
+        self.is_param_fsdp_distributed = False
+        # Ensure the parameters are replaced with sharded versions.
+        self._replace_param_with_distributed_if_needed()
+
         # Add a reference from the distributed parameters to self for API
         # accessibility, e.g. when attaching MegatronFSDP scheduled ops
         # to the distributed optimizer.step() and optimizer.zero_grad().
-        self.is_param_fsdp_distributed = False
-        self._replace_param_with_distributed_if_needed()
         for param in self.module.parameters():
             # Attach MegatronFSDP reference to the parameter.
             setattr(param, "_megatron_fsdp_model", self)
@@ -1242,12 +1250,7 @@ class MegatronFSDP(torch.nn.Module):
             return output
 
     @contextlib.contextmanager
-    def summon_full_params(
-        self,
-        module: nn.Module,
-        recurse: bool = True,
-        writeback: bool = True,
-    ):
+    def summon_full_params(self, module: nn.Module, recurse: bool = True, writeback: bool = True):
         """
         Context manager that temporarily all-gathers full parameters for a Megatron-FSDP
         submodule tree and restores sharded parameters on exit.
@@ -1294,7 +1297,8 @@ class MegatronFSDP(torch.nn.Module):
         for fsdp_module in fsdp_modules:
             param_list.extend(fsdp_module.module.parameters(recurse=False))
         self.all_gather_pipeline.all_gather_params(
-            params=param_list, prefetch=False,
+            params=param_list,
+            prefetch=False,
             outer_fsdp_group_param_gather=self.dist_index.use_hybrid_fsdp,
         )
         for param in param_list:
@@ -1316,9 +1320,7 @@ class MegatronFSDP(torch.nn.Module):
                 )
 
                 # Map parameters to their names for easy lookup.
-                param_to_name = {
-                    param: name for name, param in self.module.named_parameters()
-                }
+                param_to_name = {param: name for name, param in self.module.named_parameters()}
 
                 # Build old/new param lists and validate dtypes.
                 old_params = param_list
