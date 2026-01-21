@@ -2,23 +2,16 @@ import sys
 from functools import partial
 
 import numpy as np
-import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-import megatron.core.parallel_state as mpu
 from gpt_builders import gpt_builder
+from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_decoder_block_spec,
-    get_gpt_mtp_block_spec,
-)
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -27,103 +20,88 @@ from megatron.training.utils import is_first_or_last_pipeline_stage
 from model_provider import model_provider
 
 
-@pytest.fixture
-def pretrain_forward_backward_factory():
-    """Factory fixture that returns a get_batch-like callable + iterator."""
-
-    def _make_forward_backward_func(
-        *, model, data_iterator, sequence_length=128, micro_batch_size=2, num_micro_batches=1
-    ):
-        forward_backward_func = get_forward_backward_func()
-        forward_backward_func(
-            forward_step_func=_forward_step_func,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=num_micro_batches,
-            seq_length=sequence_length,
-            micro_batch_size=micro_batch_size,
-            forward_only=False,
-        )
-
-    return _make_forward_backward_func
+def pretrain_forward_backward(
+    *, model, data_iterator, sequence_length=128, micro_batch_size=2, num_micro_batches=1
+):
+    forward_backward_func = get_forward_backward_func()
+    output = forward_backward_func(
+        forward_step_func=_forward_step_func,
+        data_iterator=data_iterator,
+        model=model,
+        num_microbatches=num_micro_batches,
+        seq_length=sequence_length,
+        micro_batch_size=micro_batch_size,
+        forward_only=False,
+    )
+    return output
 
 
-@pytest.fixture
-def gpt_mock_data_iterator_factory():
-    def _make_gpt_mock_data_iterator(
-        dp_group, num_samples=1000, vocab_size=50257, sequence_length=128, batch_size=8, seed=42
-    ):
-        dataset = GPTMockDataset(
-            num_samples=num_samples,
-            sequence_length=sequence_length,
-            vocab_size=vocab_size,
-            seed=seed,
-        )
-        sampler = DistributedSampler(dataset, num_replicas=dp_group.size(), rank=dp_group.rank())
-        dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
-        for batch in dataloader:
-            batch["position_ids"] = torch.arange(sequence_length, dtype=torch.int64)
-            yield batch
-
-    return _make_gpt_mock_data_iterator
+def make_gpt_mock_data_iterator(
+    dp_group, num_samples=1000, vocab_size=50257, sequence_length=128, batch_size=8, seed=42
+):
+    dataset = GPTMockDataset(
+        num_samples=num_samples,
+        sequence_length=sequence_length,
+        vocab_size=vocab_size,
+        seed=seed,
+    )
+    sampler = DistributedSampler(dataset, num_replicas=dp_group.size(), rank=dp_group.rank())
+    dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler)
+    for batch in dataloader:
+        batch["position_ids"] = torch.arange(sequence_length, dtype=torch.int64)
+        yield batch
 
 
-@pytest.fixture
-def moe_model_and_optimizer_factory():
-    def _make_moe_model_and_optimizer(ut_filename, **overrides):
-        sys.argv = [ut_filename]
-        base_args = dict(
-            num_layers=4,
-            mtp_num_layers=1,
-            hidden_size=128,
-            num_attention_heads=2,
-            max_position_embeddings=128,
-            bf16=True,
-            add_bias_linear=False,
-            swiglu=True,
-            position_embedding_type="rope",
-            rotary_percent=1.0,
-            hidden_dropout=0.0,
-            attention_dropout=0.0,
-            num_experts=4,
-            moe_shared_expert_intermediate_size=256,
-            moe_layer_freq=[0, 0, 1, 1],
-            moe_permute_fusion=True,
-            moe_router_fusion=True,
-            moe_router_topk=2,
-            moe_router_dtype="fp32",
-            create_attention_mask_in_dataloader=True,
-            lr=3e-5,
-            use_distributed_optimizer=True,
-        )
+def make_moe_args_model_and_optimizer(ut_filename, **overrides):
+    sys.argv = [ut_filename]
+    base_args = dict(
+        num_layers=4,
+        mtp_num_layers=1,
+        hidden_size=128,
+        num_attention_heads=2,
+        max_position_embeddings=128,
+        bf16=False,
+        add_bias_linear=False,
+        swiglu=True,
+        position_embedding_type="rope",
+        rotary_percent=1.0,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        num_experts=4,
+        moe_shared_expert_intermediate_size=256,
+        moe_layer_freq=[0, 0, 1, 1],
+        moe_permute_fusion=True,
+        moe_router_fusion=True,
+        moe_router_topk=2,
+        moe_router_dtype="fp32",
+        create_attention_mask_in_dataloader=True,
+        lr=3e-5,
+        min_lr=3e-5,
+        use_distributed_optimizer=True,
+        finalize_model_grads_func=finalize_model_grads,
+    )
 
-        base_args.update(overrides)
-        args = parse_args()
-        for key, value in base_args.items():
-            setattr(args, key, value)
+    base_args.update(overrides)
+    args = parse_args()
+    for key, value in base_args.items():
+        setattr(args, key, value)
 
-        validate_args(args)
+    validate_args(args)
 
-        destroy_global_vars()
-        destroy_num_microbatches_calculator()
-        set_global_variables(args, build_tokenizer=False)
+    destroy_global_vars()
+    destroy_num_microbatches_calculator()
+    set_global_variables(args, build_tokenizer=False)
 
-        model, optimizer, _ = setup_model_and_optimizer(
-            model_provider_func=partial(model_provider, gpt_builder),
-            model_type=ModelType.encoder_or_decoder,
-        )
-        return model, optimizer
-
-    return _make_moe_model_and_optimizer
+    model, optimizer, _ = setup_model_and_optimizer(
+        model_provider_func=partial(model_provider, gpt_builder),
+        model_type=ModelType.encoder_or_decoder,
+    )
+    return model, optimizer
 
 
-@pytest.fixture
-def manual_seed_factory():
-    def _set_manual_seed(seed=42):
-        torch.manual_seed(seed)
-        model_parallel_cuda_manual_seed(seed)
-
-    return _set_manual_seed
+def set_manual_seed(seed=42):
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
 
 
 class GPTMockDataset(Dataset):

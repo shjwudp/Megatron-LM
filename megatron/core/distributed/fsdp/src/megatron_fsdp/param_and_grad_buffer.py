@@ -2182,7 +2182,7 @@ class ParamAndGradBuffer:
                             module_reset_flag[m_name] = True
                             new_params = list(m.parameters(recurse=False))
 
-                            self._reset_parameters(old_params, new_params)
+                            self._update_parameters(old_params, new_params)
                             p = group.params[item_id]
 
                             # After resetting parameters, delete fp8 transpose cache
@@ -2349,33 +2349,116 @@ class ParamAndGradBuffer:
                     gbuf.init_data(_alloc(gbuf.dtype, gbuf.data_size))
                     gbuf.data.zero_()
             gbuf.data.zero_()
-            for item_id, p in enumerate(group.params):
-                # Attach the main grad buffer data and metadata to the parameter.
-                p._gbuf = group.hsdp_gbuf if group.hsdp_gbuf else gbuf
-                p._item_id = item_id
-
-                def main_grad_getter(p):
-                    # Make sure main_grad memory is allocated when initially accessed.
-                    bucket = p._gbuf.fetch_bucket()
-                    gbuf = p._gbuf
-                    item_id = p._item_id
-                    # View it as p.shape so you can insert the param.grad into
-                    # the bucket seamlessly.
-                    return gbuf.get_item_from_bucket(bucket, item_id).view(
-                        to_local_if_dtensor(p).shape
-                    )
-
-                # Patch the parameter class to include a main_grad property.
-                # Utilized in the gradient reduction pipeline to save computed
-                # data-parallel gradients on every rank and reduce-scatter them.
-                p.get_main_grad = main_grad_getter.__get__(p)
+            for param in group.params:
+                self._set_main_grad_getter(param)
 
         # Clean up deallocated memory.
         gc.collect()
         torch.cuda.empty_cache()
 
-    def _reset_parameters(self, old_params, new_params):
-        assert len(old_params) == len(new_params)
+    def _set_main_grad_getter(self, param: torch.nn.Parameter):
+        """
+        Set up a main gradient getter for a parameter.
+        This method attaches metadata and a getter function to a parameter that allows
+        retrieving the main gradient from the gradient buffer. The main gradient is stored
+        in a contiguous buffer and this getter provides a view with the correct shape.
+
+        Args:
+            param (torch.nn.Parameter): The parameter for which to set up the main gradient getter.
+
+        Notes:
+            - The method attaches `_gbuf`, `_item_id`, and `get_main_grad` attributes
+              to the parameter.
+            - The `get_main_grad` property returns a view of the gradient from the buffer with the
+              same shape as the parameter.
+            - If no gradient buffer is available (i.e., gbuf is None), the method returns early
+              without modifying the parameter.
+            - The main gradient buffer is lazily allocated when first accessed through the getter.
+        """
+
+        def main_grad_getter(param):
+            # Make sure main_grad memory is allocated when initially accessed.
+            bucket = param._gbuf.fetch_bucket()
+            gbuf = param._gbuf
+            item_id = param._item_id
+            # View it as param.shape so you can insert the param.grad into
+            # the bucket seamlessly.
+            return gbuf.get_item_from_bucket(bucket, item_id).view(to_local_if_dtensor(param).shape)
+
+        param_group_idx = self.param_to_param_group[param]
+        group = self.parameter_groups[param_group_idx]
+        gbuf = group.hsdp_gbuf if group.hsdp_gbuf else group.main_grad_buffer
+        if gbuf is None:
+            return  # No gradient buffer available.
+
+        # Attach the main grad buffer data and metadata to the parameter.
+        param._gbuf = gbuf
+        _param_to_idx = {p: idx for idx, p in enumerate(group.params)}
+        param._item_id = _param_to_idx[param]
+
+        # Patch the parameter class to include a main_grad property.
+        # Utilized in the gradient reduction pipeline to save computed
+        # data-parallel gradients on every rank and reduce-scatter them.
+        param.get_main_grad = main_grad_getter.__get__(param)
+
+    def _update_parameters(self, old_params, new_params):
+        """
+        Update internal mappings and buffers when parameters are replaced with new instances.
+
+        This method handles the replacement of old parameters with new parameters while maintaining
+        all internal data structures and buffers. It ensures that parameter names, groups, modules,
+        and tensor parallel attributes are properly transferred, and that all buffer references are
+        updated accordingly.
+
+        Args:
+            old_params (list): List of old parameter tensors to be replaced.
+            new_params (list): List of new parameter tensors that will replace the old ones.
+
+        Raises:
+            AssertionError: If the number of old and new parameters don't match.
+            AssertionError: If any new parameter has a different dtype or shape than its
+                           corresponding old parameter.
+
+        Note:
+            - Parameters that haven't changed (new_p is old_p) are filtered out.
+            - Duplicate parameters in old_params are skipped to avoid redundant updates.
+            - The method updates:
+                * param_to_name mapping
+                * param_to_param_group mapping
+                * param_to_direct_module mapping
+                * Tensor parallel attributes (_mcore_tp, _tp_partition_dim, _tp_duplicated)
+                * Parameter references in self.params and parameter groups
+                * Buffer index mappings for all buffer types (model_weight_buffer,
+                  transpose_weight_buffer, main_weight_buffer, main_grad_buffer,
+                  hsdp_wbuf, hsdp_gbuf)
+            - After updating references, the new parameter data is copied to the
+              model_weight_buffer and transpose_weight_buffer if they exist.
+        """
+        assert len(old_params) == len(new_params), (
+            "Number of old and new parameters must be the same. "
+            f"Got {len(old_params)} old and {len(new_params)} new parameters."
+        )
+
+        # Filter out parameters that are not changed.
+        _old_params = []
+        _new_params = []
+        for old_p, new_p in zip(old_params, new_params):
+            if new_p is old_p:
+                continue
+            if any(old_p is p for p in _old_params):
+                continue  # Avoid duplicate parameters.
+            assert new_p.dtype == old_p.dtype and new_p.shape == old_p.shape, (
+                "Parameter reset must not change dtype or shape. "
+                f"Old param: dtype={old_p.dtype}, shape={old_p.shape}; "
+                f"New param: dtype={new_p.dtype}, shape={new_p.shape}"
+                f" Param name: {self.param_to_name[old_p]}"
+            )
+            _old_params.append(old_p)
+            _new_params.append(new_p)
+        old_params = _old_params
+        new_params = _new_params
+
+        # Map old parameters to new parameters and update all relevant mappings.
         param_map = {}
         for old_param, new_param in zip(old_params, new_params):
             param_map[old_param] = new_param
@@ -2392,11 +2475,13 @@ class ParamAndGradBuffer:
                 if getattr(old_param, tp_attr, None) is not None:
                     setattr(new_param, tp_attr, getattr(old_param, tp_attr))
 
+        # Update parameters in the main param list and parameter groups.
         for item_id, p in enumerate(self.params):
             if p in param_map:
                 new_p = param_map[p]
                 self.params[item_id] = new_p
 
+        # Update parameters in each parameter group and their buffers.
         for group in self.parameter_groups:
             for item_id, p in enumerate(group.params):
                 if p not in param_map:
@@ -2419,13 +2504,17 @@ class ParamAndGradBuffer:
         # Copy the new param data to the buffer.
         for param in new_params:
             param_group = self.parameter_groups[self.param_to_param_group[param]]
-            item_id = param_group.params.index(param)
+            param_to_item_idx = {p: idx for idx, p in enumerate(param_group.params)}
+            item_id = param_to_item_idx[param]
             wbuf = param_group.model_weight_buffer
             if wbuf:
                 wbuf.set_item(item_id, to_local_if_dtensor(param))
             tbuf = param_group.transpose_weight_buffer
             if tbuf:
                 tbuf.set_item(item_id, to_local_if_dtensor(param))
+
+            # Update main grad buffer references.
+            self._set_main_grad_getter(param)
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""

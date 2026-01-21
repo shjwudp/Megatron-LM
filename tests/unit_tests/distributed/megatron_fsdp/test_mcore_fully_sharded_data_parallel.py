@@ -6,16 +6,24 @@ import pytest
 import torch
 from packaging import version
 from torch import testing
+from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_torch_min_version
+from tests.unit_tests.a2a_overlap.utils import deterministic_mode
+from tests.unit_tests.distributed.megatron_fsdp.utils import (
+    make_gpt_mock_data_iterator,
+    make_moe_args_model_and_optimizer,
+    pretrain_forward_backward,
+    set_manual_seed,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -495,7 +503,96 @@ class TestFullyShardedDataParallel:
             )
 
 
+@pytest.fixture(scope="class")
+def ref_cache():
+    """
+    Shared read/write cache for an class.
+    Keys: arbitrary strings, values: anything (tensors, dicts, etc.).
+    """
+    return {}
+
+
 class TestMegatronFSDPE2E:
+
+    @staticmethod
+    def _training_loop(seed=42, **kwargs):
+        VOCAB_SIZE = kwargs.get("vocab_size", 100)
+        MAX_SEQ_LEN = kwargs.get("seq_length", 128)
+        MICRO_BATCH_SIZE = kwargs.get("micro_batch_size", 2)
+        GLOBAL_BATCH_SIZE = kwargs.get("global_batch_size", 32)
+        NUM_TRAINING_STEPS = kwargs.get("train_iters", 20)
+        TP = kwargs.get("tensor_model_parallel_size", 1)
+        PP = kwargs.get("pipeline_model_parallel_size", 1)
+        VPP = kwargs.get("num_layers_per_virtual_pipeline_stage", None)
+        EP = kwargs.get("expert_model_parallel_size", 1)
+        ETP = kwargs.get("expert_tensor_parallel_size", 1)
+        OUTER_DP = kwargs.get("num_distributed_optimizer_instances", 1)
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=TP,
+            pipeline_model_parallel_size=PP,
+            expert_model_parallel_size=EP,
+            expert_tensor_parallel_size=ETP,
+            num_distributed_optimizer_instances=OUTER_DP,
+        )
+        DP_GROUP = mpu.get_data_parallel_group()
+
+        # Deterministic mode context manager
+        if kwargs.get("deterministic_mode"):
+            deterministic_mode_ctx_mgr = deterministic_mode()
+            deterministic_mode_ctx_mgr.__enter__()
+
+        # Set manual seed for reproducibility
+        set_manual_seed(seed)
+
+        # Create model and optimizer
+        model_chunks, optim = make_moe_args_model_and_optimizer(
+            ut_filename="test_mcore_fully_sharded_data_parallel.py",
+            micro_batch_size=MICRO_BATCH_SIZE,
+            global_batch_size=GLOBAL_BATCH_SIZE,
+            vocab_size=VOCAB_SIZE,
+            padded_vocab_size=VOCAB_SIZE,
+            seq_length=MAX_SEQ_LEN,
+            sequence_parallel=TP > 1,
+            tensor_model_parallel_size=TP,
+            pipeline_model_parallel_size=PP,
+            num_layers_per_virtual_pipeline_stage=VPP,
+            train_iters=NUM_TRAINING_STEPS,
+            **kwargs,
+        )
+
+        # Prepare data iterator
+        data_iterator = make_gpt_mock_data_iterator(
+            dp_group=DP_GROUP,
+            vocab_size=VOCAB_SIZE,
+            sequence_length=MAX_SEQ_LEN,
+            batch_size=MICRO_BATCH_SIZE,
+            num_samples=GLOBAL_BATCH_SIZE * NUM_TRAINING_STEPS,
+        )
+
+        lm_losses = []
+
+        # Training loop
+        for _ in range(NUM_TRAINING_STEPS):
+            optim.zero_grad()
+            output = pretrain_forward_backward(
+                model=model_chunks,
+                data_iterator=data_iterator,
+                sequence_length=MAX_SEQ_LEN,
+                micro_batch_size=MICRO_BATCH_SIZE,
+                num_micro_batches=GLOBAL_BATCH_SIZE // MICRO_BATCH_SIZE // DP_GROUP.size(),
+            )
+            optim.step()
+
+            # Collect loss
+            lm_losses.append(output[-1])
+
+        Utils.destroy_model_parallel()
+
+        if kwargs.get("deterministic_mode"):
+            deterministic_mode_ctx_mgr.__exit__(None, None, None)
+
+        return lm_losses
 
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
@@ -511,87 +608,83 @@ class TestMegatronFSDPE2E:
     @pytest.mark.parametrize(
         "fsdp_sharding_strategy", ["optim_grads_params", "optim_grads", "optim"]
     )
-    def test_compatible_with_nd_parallel(
-        self,
-        nd_topology,
-        fsdp_sharding_strategy,
-        manual_seed_factory,
-        moe_model_and_optimizer_factory,
-        gpt_mock_data_iterator_factory,
-        pretrain_forward_backward_factory,
-    ):
-        VOCAB_SIZE = 100
-        MAX_SEQ_LEN = 128
-        MICRO_BATCH_SIZE = 2
-        NUM_MICRO_BATCHES = 2
-        NUM_TRAINING_STEPS = 3
+    def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, fsdp_sharding_strategy):
+        nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
+        if nd_topology_str not in ref_cache:
+            ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
+                deterministic_mode=True, attention_backend="fused", use_distributed_optimizer=True
+            )
 
-        TP = nd_topology.get("TP", 1)
-        PP = nd_topology.get("PP", 1)
-        VPP = nd_topology.get("VPP", None)
-        EP = nd_topology.get("EP", 1)
-        ETP = nd_topology.get("ETP", 1)
-        OUTER_DP = nd_topology.get("OUTER_DP", 1)
-
-        # Initialize model parallel with ND shape
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=TP,
-            pipeline_model_parallel_size=PP,
-            expert_model_parallel_size=EP,
-            expert_tensor_parallel_size=ETP,
-            num_distributed_optimizer_instances=OUTER_DP,
-        )
-        DP_GROUP = mpu.get_data_parallel_group()
-
-        # Set manual seed for reproducibility
-        manual_seed_factory(32)
-
-        # Build model and optimizer
-        global_batch_size = MICRO_BATCH_SIZE * NUM_MICRO_BATCHES * DP_GROUP.size()
-        gpt_model, optim = moe_model_and_optimizer_factory(
-            ut_filename="test_mcore_fully_sharded_data_parallel.py",
-            micro_batch_size=MICRO_BATCH_SIZE,
-            global_batch_size=global_batch_size,
-            vocab_size=VOCAB_SIZE,
-            padded_vocab_size=VOCAB_SIZE,
-            seq_length=MAX_SEQ_LEN,
-            sequence_parallel=TP > 1,
-            tensor_model_parallel_size=TP,
-            pipeline_model_parallel_size=PP,
-            num_layers_per_virtual_pipeline_stage=VPP,
-            train_iters=NUM_TRAINING_STEPS,
+        outputs = TestMegatronFSDPE2E._training_loop(
+            deterministic_mode=True,
+            attention_backend="fused",
             use_megatron_fsdp=True,
             data_parallel_sharding_strategy=fsdp_sharding_strategy,
             init_model_with_meta_device=True,
             ckpt_format="fsdp_dtensor",
             gradient_accumulation_fusion=False,
         )
+        reference_outputs = ref_cache[nd_topology_str]
 
-        # Reset model parameters for test consistency
-        manual_seed_factory(42)
-        for m in gpt_model.modules():
-            with m._summon_full_params():
-                if hasattr(m, "reset_parameters"):
-                    m.reset_parameters()
+        if torch.distributed.get_rank() == 0:
+            for step, (output, ref_output) in enumerate(zip(outputs, reference_outputs)):
+                loss = output["lm loss"]
+                ref_loss = ref_output["lm loss"]
+                assert_close(
+                    loss,
+                    ref_loss,
+                    atol=0,
+                    rtol=0.05,
+                    msg=(
+                        f"Loss mismatch at step {step}, FSDP Loss = {loss.item()}, "
+                        f"Reference Loss = {ref_loss.item()}"
+                        f", Compare = {compare_losses(loss.item(), ref_loss.item())}"
+                    ),
+                )
 
-        # Prepare data iterator
-        data_iterator = gpt_mock_data_iterator_factory(
-            dp_group=DP_GROUP,
-            vocab_size=VOCAB_SIZE,
-            sequence_length=MAX_SEQ_LEN,
-            batch_size=MICRO_BATCH_SIZE,
-            num_samples=global_batch_size * NUM_TRAINING_STEPS,
-        )
 
-        # Training loop
-        for _ in range(NUM_TRAINING_STEPS):
-            optim.zero_grad()
-            pretrain_forward_backward_factory(
-                model=gpt_model,
-                data_iterator=data_iterator,
-                sequence_length=MAX_SEQ_LEN,
-                micro_batch_size=MICRO_BATCH_SIZE,
-                num_micro_batches=NUM_MICRO_BATCHES,
-            )
-            optim.step()
-        Utils.destroy_model_parallel()
+def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
+    """
+    Compare two loss values with absolute and relative differences.
+
+    Parameters
+    ----------
+    loss_a : float
+        First loss value (e.g., baseline model).
+    loss_b : float
+        Second loss value (e.g., new model).
+    reference : {"a", "b"}, default "b"
+        Which loss to treat as the reference when computing the
+        relative difference. If "b", relative diff is vs loss_b;
+        if "a", vs loss_a.
+
+    Returns
+    -------
+    dict with keys:
+        "abs_diff" : float
+            |loss_a - loss_b|
+        "rel_diff" : float
+            |loss_a - loss_b| / reference_loss
+        "better" : str
+            "a" if loss_a < loss_b, "b" if loss_b < loss_a, "equal" otherwise.
+    """
+    abs_diff = abs(loss_a - loss_b)
+
+    if reference == "a":
+        ref = loss_a
+    else:
+        ref = loss_b
+
+    if ref == 0:
+        rel_diff = float("inf")  # or None, depending on your preference
+    else:
+        rel_diff = abs_diff / ref
+
+    if loss_a < loss_b:
+        better = "a"
+    elif loss_b < loss_a:
+        better = "b"
+    else:
+        better = "equal"
+
+    return {"abs_diff": abs_diff, "rel_diff": rel_diff, "better": better}
