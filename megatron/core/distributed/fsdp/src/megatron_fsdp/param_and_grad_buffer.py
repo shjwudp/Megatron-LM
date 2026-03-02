@@ -32,6 +32,12 @@ import torch
 from torch.distributed import _coalescing_manager
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+try:
+    import torch.distributed._symmetric_memory as symm_mem
+    HAVE_TORCH_SYMM_MEM = True
+except ImportError:
+    HAVE_TORCH_SYMM_MEM = False
+
 from .mixed_precision import (
     fp8_discard_transpose_cache,
     fp8_get_raw_data,
@@ -669,6 +675,11 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self.fsdp_param_groups = fsdp_param_groups
         self.size = size  # Number of buffers in the pool (default is 2 for double buffering)
         self.allocation_tracker = {}  # tracking the global buffer allocation status
+        self.use_torch_symm_mem_api = use_torch_symm_mem_api
+        if self.use_torch_symm_mem_api:
+            assert (
+                HAVE_TORCH_SYMM_MEM
+            ), "Torch symmetric memory API is not available. Please install the compatible version of PyTorch."
 
         # Build a mapping from FSDP unit id to its associated bucket ids.
         fsdp_unit_buckets = defaultdict(list)
@@ -1697,6 +1708,12 @@ class ParamAndGradBuffer:
             groups=self.ubr_groups, symmetric=not self.ddp_config.disable_symmetric_registration
         )
 
+        # Initialize the parameter gather hooks and gradient reduce hooks.
+        self.param_gather_pre_hooks = []
+        self.param_gather_post_hooks = []
+        self.grad_reduce_pre_hooks = []
+        self.grad_reduce_post_hooks = []
+
         # Mark FP8 params. If TransformerEngine is not installed, we can skip this.
         meta_device_init_fp8_params = {}
         if reset_parameters_for_meta_device_init_module and HAVE_TE:
@@ -1725,6 +1742,22 @@ class ParamAndGradBuffer:
         self.optimizer_named_parameters = self._init_optimizer_named_parameters()
 
         self._log_parameter_groups()
+
+    def register_param_gather_pre_hook(self, hook: Callable[["ParamAndGradBuffer", List[int], bool], None]):
+        """Register a pre-hook called before param all-gather/shard."""
+        self.param_gather_pre_hooks.append(hook)
+
+    def register_param_gather_post_hook(self, hook: Callable[["ParamAndGradBuffer", List[int], bool], None]):
+        """Register a post-hook called after param all-gather/shard."""
+        self.param_gather_post_hooks.append(hook)
+
+    def register_grad_reduce_pre_hook(self, hook: Callable[["ParamAndGradBuffer", List[int], bool], None]):
+        """Register a pre-hook called before gradient reduce-scatter/all-reduce."""
+        self.grad_reduce_pre_hooks.append(hook)
+
+    def register_grad_reduce_post_hook(self, hook: Callable[["ParamAndGradBuffer", List[int], bool], None]):
+        """Register a post-hook called after gradient reduce-scatter/all-reduce."""
+        self.grad_reduce_post_hooks.append(hook)
 
     def get_mem_alloc_context(self, groups=None, symmetric=True):
         """
@@ -3241,6 +3274,9 @@ class GradReducePipeline:
         if ddp_config.fsdp_double_buffer:
             self._enforce_double_buffer_limit(bucket_group)
 
+        for grad_reduce_pre_hook in self.buffer.grad_reduce_pre_hooks:
+            grad_reduce_pre_hook(self.buffer, bucket_group)
+
         current_stream = torch.cuda.current_stream()
         reduce_scatter_stream = (
             self.rs_stream if self.rs_stream is not None else torch.cuda.current_stream()
@@ -3366,6 +3402,9 @@ class GradReducePipeline:
                 return free_up_grad_bucket
 
             free_up_grad_bucket_func[bucket_id] = get_closure(bucket_id)
+
+        for grad_reduce_post_hook in self.buffer.grad_reduce_post_hooks:
+            grad_reduce_post_hook(self.buffer, bucket_group)
 
         if async_op:
             for bucket_id, free_up_grad_bucket in free_up_grad_bucket_func.items():
@@ -3620,6 +3659,8 @@ class AllGatherPipeline:
             all_gather_stream = (
                 self.ag_stream if self.ag_stream is not None else torch.cuda.current_stream()
             )
+            for param_gather_pre_hook in self.buffer.param_gather_pre_hooks:
+                param_gather_pre_hook(self.buffer, buckets, bwd)
             if outer_fsdp_group_param_gather:
                 # TODO(mxfp8): Support hsdp
                 self.outer_fsdp_group_param_gather_stream.wait_stream(torch.cuda.current_stream())
@@ -3650,6 +3691,9 @@ class AllGatherPipeline:
                         # All-gather the module weights from each FSDP buffer shard
                         # into an allocated bucket containing unsharded weights.
                         self.async_bucket_gather(bucket_id, bwd)
+
+            for param_gather_post_hook in self.buffer.param_gather_post_hooks:
+                param_gather_post_hook(self.buffer, buckets, bwd)
 
             # Replace the parameter all-gather event with coalescing event.
             for bucket_id in buckets:
