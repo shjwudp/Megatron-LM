@@ -675,11 +675,6 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self.fsdp_param_groups = fsdp_param_groups
         self.size = size  # Number of buffers in the pool (default is 2 for double buffering)
         self.allocation_tracker = {}  # tracking the global buffer allocation status
-        self.use_torch_symm_mem_api = use_torch_symm_mem_api
-        if self.use_torch_symm_mem_api:
-            assert (
-                HAVE_TORCH_SYMM_MEM
-            ), "Torch symmetric memory API is not available. Please install the compatible version of PyTorch."
 
         # Build a mapping from FSDP unit id to its associated bucket ids.
         fsdp_unit_buckets = defaultdict(list)

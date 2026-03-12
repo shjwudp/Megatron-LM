@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import random
+import contextlib
 
 import numpy as np
 import pytest
@@ -514,7 +515,14 @@ def ref_cache():
 class TestMegatronFSDPE2E:
 
     @staticmethod
-    def _training_loop(seed=42, **kwargs):
+    def _training_loop(
+        seed=42,
+        mfsdp_param_gather_pre_hooks=[],
+        mfsdp_param_gather_post_hooks=[],
+        mfsdp_grad_reduce_pre_hooks=[],
+        mfsdp_grad_reduce_post_hooks=[],
+        **kwargs
+    ):
         """
         Run a small deterministic (optional) training loop using a mocked MoE/GPT model and optimizer.
         This helper initializes model-parallel state, creates a model and optimizer via
@@ -593,6 +601,18 @@ class TestMegatronFSDPE2E:
             **kwargs,
         )
 
+        if kwargs.get("use_megatron_fsdp", False):
+            # Register FSDP hooks if provided
+            for model_chunk in model_chunks:
+                for hook in mfsdp_param_gather_pre_hooks:
+                    model_chunk.param_and_grad_buffer.register_param_gather_pre_hook(hook)
+                for hook in mfsdp_param_gather_post_hooks:
+                    model_chunk.param_and_grad_buffer.register_param_gather_post_hook(hook)
+                for hook in mfsdp_grad_reduce_pre_hooks:
+                    model_chunk.param_and_grad_buffer.register_grad_reduce_pre_hook(hook)
+                for hook in mfsdp_grad_reduce_post_hooks:
+                    model_chunk.param_and_grad_buffer.register_grad_reduce_post_hook(hook)
+
         # Prepare data iterator
         data_iterator = make_gpt_mock_data_iterator(
             dp_group=DP_GROUP,
@@ -650,7 +670,8 @@ class TestMegatronFSDPE2E:
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         if nd_topology_str not in ref_cache:
             ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
-                use_distributed_optimizer=True
+                use_distributed_optimizer=True,
+                **nd_topology,
             )
 
         outputs = TestMegatronFSDPE2E._training_loop(
@@ -660,6 +681,7 @@ class TestMegatronFSDPE2E:
             ckpt_format="fsdp_dtensor",
             gradient_accumulation_fusion=False,
             fsdp_double_buffer=use_double_buffer,
+            **nd_topology,
         )
         reference_outputs = ref_cache[nd_topology_str]
 
@@ -678,6 +700,103 @@ class TestMegatronFSDPE2E:
                         f", Compare = {compare_losses(loss.item(), ref_loss.item())}"
                     ),
                 )
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.7.0"), reason="nccl_ub requires PyTorch 2.7.0 or later"
+    )
+    @pytest.mark.parametrize(
+        "nd_topology",
+        [
+            pytest.param({"TP": 2}, id="TP2"),
+            pytest.param({"EP": 2, "ETP": 2}, id="EP2_ETP2"),
+            pytest.param({"OUTER_DP": 2, "EP": 2}, id="OUTER_DP2_EP2"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "fsdp_sharding_strategy", ["optim_grads_params", "optim_grads", "optim"]
+    )
+    def test_nccl_ub_effective(self, nd_topology, fsdp_sharding_strategy):
+        """
+        Test that enabling nccl_ub in FSDP config leads to actual kernel used met expectations.
+        """
+        try:
+            from cupti import cupti
+        except ImportError:
+            pytest.skip("cupti module is required for this test")
+
+        kernel_names = []
+
+        @contextlib.contextmanager
+        def cupti_activity_capture():
+            """Collect kernel names from CUPTI activity records."""
+            # Configure CUPTI to collect kernel activities only.
+            # cupti.activity_enable(cupti.ActivityKind.KERNEL)
+
+            def func_buffer_requested():
+                buffer_size = 8 * 1024 * 1024
+                max_num_records = 0  # Limiting it to 10 records was causing BufferRequested callback to be called multiple times.Have disabled max_num_records
+                return buffer_size, max_num_records
+
+            def func_buffer_completed(activities: list):
+                for activity in activities:
+                    name = getattr(activity, "name", None)
+                    if isinstance(name, str):
+                        kernel_names.append(name)
+                        if torch.distributed.get_rank() == 0:
+                            print(f"CUPTI recorded kernel: {name}")
+
+            cupti.activity_enable(cupti.ActivityKind.CONCURRENT_KERNEL)
+            cupti.activity_register_callbacks(
+                func_buffer_requested, func_buffer_completed
+            )
+            try:
+                yield
+            finally:
+                torch.cuda.synchronize()
+                cupti.activity_flush_all(1)
+                # cupti.activity_disable(cupti.ActivityKind.KERNEL)
+                cupti.activity_disable(cupti.ActivityKind.CONCURRENT_KERNEL)
+
+        # Hooks: start capture just before param/grad comms, stop after.
+        def param_gather_pre_hook(*_args, **_kwargs):
+            nonlocal param_capture_cm
+            param_capture_cm = cupti_activity_capture()
+            param_capture_cm.__enter__()
+
+        def param_gather_post_hook(*_args, **_kwargs):
+            nonlocal param_capture_cm
+            if param_capture_cm is not None:
+                param_capture_cm.__exit__(None, None, None)
+                param_capture_cm = None
+
+        def grad_reduce_pre_hook(*_args, **_kwargs):
+            nonlocal grad_capture_cm
+            grad_capture_cm = cupti_activity_capture()
+            grad_capture_cm.__enter__()
+
+        def grad_reduce_post_hook(*_args, **_kwargs):
+            nonlocal grad_capture_cm
+            if grad_capture_cm is not None:
+                grad_capture_cm.__exit__(None, None, None)
+                grad_capture_cm = None
+
+        param_capture_cm = None
+        grad_capture_cm = None
+
+        TestMegatronFSDPE2E._training_loop(
+            use_megatron_fsdp=True,
+            data_parallel_sharding_strategy=fsdp_sharding_strategy,
+            init_model_with_meta_device=True,
+            ckpt_format="fsdp_dtensor",
+            gradient_accumulation_fusion=False,
+            fsdp_double_buffer=True,
+            nccl_ub=True,
+            mfsdp_param_gather_pre_hooks=[param_gather_pre_hook],
+            mfsdp_param_gather_post_hooks=[param_gather_post_hook],
+            mfsdp_grad_reduce_pre_hooks=[grad_reduce_pre_hook],
+            mfsdp_grad_reduce_post_hooks=[grad_reduce_post_hook],
+            **nd_topology,
+        )
 
 
 def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
