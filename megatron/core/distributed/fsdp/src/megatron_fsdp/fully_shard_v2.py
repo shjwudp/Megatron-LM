@@ -40,7 +40,6 @@ def fully_shard(
     _register_backward_hook(module)
 
     module.reshard()
-    # _register_post_accumulate_grad_hooks(module)
 
     return module
 
@@ -91,36 +90,66 @@ class FSDPModule(nn.Module):
                 child._fsdp_state._is_root = False
 
     def unshard(self):
-        self.param_to_name = {p: n for n, p in self.named_parameters()}
-        for param_names, fsdp_param_group in self._named_param_groups:
-            fsdp_param_group.unshard()
+        for param_names, param_group in self._named_param_groups:
+            param_group.unshard()
 
-            for name, param in zip(param_names, fsdp_param_group.params):
+            for name, param in zip(param_names, param_group.params):
                 _replace_module_parameter(self, name, param)
+
+                if getattr(self, "_enable_nan_checks", False):
+                    assert not torch.isnan(param).any(), f"NaN detected in parameter {name} in unshard for module {self}"
+
+        for name, param in self.named_parameters():
+            if name not in param_names:
+                continue
+            from torch.distributed.tensor import DTensor
+            assert not isinstance(param, DTensor), (
+                f"Parameter {name} is expected to be unsharded in unshard for module {self}, but got a sharded tensor. "
+            )
 
     def reshard(self):
-        self.param_to_name = {p: n for n, p in self.named_parameters()}
-        for param_names, fsdp_param_group in self._named_param_groups:
-            fsdp_param_group.reshard()
+        for param_names, param_group in self._named_param_groups:
+            param_group.reshard()
 
-            for name, param in zip(param_names, fsdp_param_group.dist_params):
-                _replace_module_parameter(self, name, param)
+            for name, param, dist_param, dist_grad in zip(
+                param_names, param_group.params, param_group.dist_params, param_group.dist_grads
+            ):
+                _replace_module_parameter(self, name, dist_param)
+                if param.requires_grad:
+                    setattr(param, "grad", dist_grad.to(param.dtype))
 
     def _scale_gradients(self, scaling_factor: float):
         for _, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue
-            for fsdp_param_group in child._fsdp_param_groups:
-                if fsdp_param_group.main_grad_buffer is not None:
-                    fsdp_param_group.main_grad_buffer.data.mul_(scaling_factor)
+            for param_group in child._fsdp_param_groups:
+                if param_group.main_grad_buffer is not None:
+                    param_group.main_grad_buffer.data.mul_(scaling_factor)
 
     def _zero_grad_buffer(self):
         for _, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue
-            for fsdp_param_group in child._fsdp_param_groups:
-                if fsdp_param_group.main_grad_buffer is not None:
-                    fsdp_param_group.main_grad_buffer.data.zero_()
+            for param_group in child._fsdp_param_groups:
+                if param_group.main_grad_buffer is not None:
+                    param_group.main_grad_buffer.data.zero_()
+
+    def _copy_main_weights_to_model_weights(self):
+        for _, child in self.named_modules():
+            if not isinstance(child, FSDPModule):
+                continue
+            for param_group in child._fsdp_param_groups:
+                if param_group.main_weight_buffer is None:
+                    continue
+                param_group.model_weight_buffer.data.copy_(
+                    param_group.main_weight_buffer.data
+                )
+
+    def _set_nan_check(self, enable_nan_checks: bool):
+        for _, child in self.named_modules():
+            if not isinstance(child, FSDPModule):
+                continue
+            setattr(self, "_enable_nan_checks", enable_nan_checks)
 
 
 class _FSDPState:
@@ -216,7 +245,18 @@ def _register_backward_hook(module: FSDPModule):
     def post_backward(module):
         module.reshard()
         for fsdp_param_group in module._fsdp_param_groups:
+            if getattr(module, "_enable_nan_checks", False):
+                for param in fsdp_param_group.params:
+                    assert not torch.isnan(param.grad).any(), f"NaN detected in parameter {param} in post_backward for module {module}"
+
             fsdp_param_group.reduce_grad()
+
+            if getattr(module, "_enable_nan_checks", False):
+                for name, dist_grad in zip(
+                    fsdp_param_group.param_names,
+                    fsdp_param_group.dist_grads,
+                ):
+                    assert not torch.isnan(dist_grad._local_tensor).any(), f"NaN detected in dist grad for parameter {name} in post_backward for module {module}"
 
     @torch.compiler.disable
     def _register_post_backward_hook(
@@ -300,19 +340,6 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
     Variable._execution_engine.queue_callback(
         functools.partial(_post_backward_final_callback, state, module)
     )
-
-
-def _register_post_accumulate_grad_hooks(module: FSDPModule):
-
-    def process_post_accumulate_gradients(param_list):
-        pass
-
-    for param_group in module._fsdp_param_groups:
-        for param in param_group.params:
-            if param.requires_grad:
-                param.register_post_accumulate_grad_hook(
-                    lambda p: process_post_accumulate_gradients([p])
-                )
 
 
 class RegisterFSDPBackwardFunction(torch.autograd.Function):
