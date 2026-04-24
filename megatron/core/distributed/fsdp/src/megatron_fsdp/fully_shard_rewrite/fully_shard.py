@@ -208,7 +208,7 @@ class FSDPModule(nn.Module):
             ag_stream=torch.cuda.Stream(),
             rs_stream=torch.cuda.Stream(),
             forward_module_order=forward_module_order,
-            reduce_events=[[] for _ in range(len(forward_module_order))],
+            reduce_events=[None for _ in range(len(forward_module_order))],
         )
         setattr(self, "_fsdp_state", _FSDPState())
         setattr(self, "_fsdp_root_context", root_context)

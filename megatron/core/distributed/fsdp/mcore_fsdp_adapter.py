@@ -240,7 +240,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     fully_shard(m, mesh=dp_mesh)
         fully_shard(module, mesh=dp_mesh)
 
-        if ddp_config.check_for_nan_in_loss_and_grad:
+        if ddp_config.check_for_nan_in_grad:
             module._set_nan_check(True)
 
         super().__init__(config=config, module=module)
