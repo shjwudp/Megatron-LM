@@ -144,14 +144,14 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
-    def unshard(self):
+    def unshard(self, async_op: bool = False):
         """
         Unshard model weights by all-gathering from sharded buffer.
 
         After unshard, self.params.data points to full (unsharded) tensors.
         """
-        _, async_op = self.model_weight_buffer.unshard()
-        async_op.wait()
+        _, work = self.model_weight_buffer.unshard(async_op=async_op)
+        return work
 
     def reshard(self):
         """Reshard model weights by releasing unsharded buffer."""
@@ -164,7 +164,8 @@ class ParameterGroup:
         For distributed buffers: reduce-scatter the full gradient
         For non-distributed buffers: all-reduce in-place
         """
-        self.main_grad_buffer.reduce_grad(async_op=async_op)
+        work = self.main_grad_buffer.reduce_grad(async_op=async_op)
+        return work
 
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""
@@ -193,14 +194,15 @@ class ParameterGroup:
         placements = [Shard(dim=0)] if is_param_shard else [Replicate()]
 
         # Create parameter DTensor views
-        for p in self.params:
+        for param in self.params:
             wbuf = self.model_weight_buffer
-            data = wbuf.get_item(self.param_idx[p], only_shard=is_param_shard)
+            data = wbuf.get_item(self.param_idx[param], only_shard=is_param_shard)
 
             dist_param = torch.nn.Parameter(
-                make_uneven_dtensor(data, p.shape, self.mesh, placements)
+                make_uneven_dtensor(data, param.shape, self.mesh, placements)
             )
             # Mark as FSDP parameter for special handling
+            setattr(param, "__fsdp_param__", True)
             setattr(dist_param, "__fsdp_param__", True)
             self.dist_params.append(dist_param)
 

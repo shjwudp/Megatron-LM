@@ -19,7 +19,7 @@ Sharding Strategies:
 """
 
 import functools
-from dataclasses import field
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -228,33 +228,35 @@ class FSDPModule(nn.Module):
         """
         ctx = self._fsdp_root_context
         stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
-        for param_names, param_group in self._named_param_groups:
-            # Optional NaN checking for debugging
-            if getattr(self, "_enable_nan_checks", False):
-                for name, dist_param in zip(param_names, param_group.dist_params):
-                    assert not torch.isnan(
-                        dist_param._local_tensor
-                    ).any(), f"NaN detected in dist param for parameter {name}"
-
-            with torch.cuda.stream(stream):
-                param_group.unshard()
-
-            if async_op:
-                event = stream.record_event()
-                ctx.unshard_events[id(self)] = event
-
-            # Replace module parameters with unsharded versions
-            for name, param in zip(param_names, param_group.params):
-                _replace_module_parameter(self, name, param)
-
-            if getattr(self, "_enable_nan_checks", False):
-                for name, param in zip(param_names, param_group.params):
-                    assert not torch.isnan(param).any(), f"NaN detected in parameter {name}"
 
         if async_op:
-            self._prefetch_next_module(bwd_pass=bwd_pass)
+            prefetch_modules = self._get_prefetch_next_modules(bwd_pass=bwd_pass)
+        else:
+            prefetch_modules = []
+        for module in [self] + prefetch_modules:
+            for param_names, param_group in module._named_param_groups:
+                # Optional NaN checking for debugging
+                if getattr(module, "_enable_nan_checks", False):
+                    for name, dist_param in zip(param_names, param_group.dist_params):
+                        assert not torch.isnan(
+                            dist_param._local_tensor
+                        ).any(), f"NaN detected in dist param for parameter {name}"
 
-    def _prefetch_next_module(self, bwd_pass: bool = False):
+                with torch.cuda.stream(stream):
+                    param_group.unshard(async_op=async_op)
+                event = stream.record_event()
+                ctx.unshard_events[id(module)] = event
+
+                # Replace module parameters with unsharded versions
+                for name, param in zip(param_names, param_group.params):
+                    _replace_module_parameter(module, name, param)
+
+                if getattr(module, "_enable_nan_checks", False):
+                    ctx.unshard_events[id(module)].wait()
+                    for name, param in zip(param_names, param_group.params):
+                        assert not torch.isnan(param).any(), f"NaN detected in parameter {name}"
+
+    def _get_prefetch_next_modules(self, bwd_pass: bool = False) -> List["FSDPModule"]:
         """Prefetch the next module in the forward/backward pass."""
         ctx = self._fsdp_root_context
         assert self in ctx.forward_module_order, "Current module not found in forward module order"
@@ -270,10 +272,9 @@ class FSDPModule(nn.Module):
                 break
         assert i is not None, "Current module index not found in forward module order"
         if i + 1 >= len(module_order):
-            return  # No next module to prefetch
+            return []  # No next module to prefetch
 
-        next_module = module_order[i + 1]
-        next_module.unshard(async_op=True, bwd_pass=bwd_pass)
+        return [module_order[i + 1]]
 
     def reshard(self):
         """Reshard parameters by replacing with sharded DTensors."""
@@ -303,13 +304,14 @@ class FSDPModule(nn.Module):
                         assert not torch.isnan(param.grad).any(), "NaN in parameter grad"
 
             # Handle pending reduce events before this module to ensure proper ordering and overlap
-            for i, module in enumerate(reversed(ctx.forward_module_order)):
-                if i - 2 >= 0:
-                    event, param_group = ctx.reduce_events[i].pop()
-                    event.wait()
-                    param_group.release_grad_buffer()
-                if module is self:
-                    break
+            if async_op:
+                for i, module in enumerate(reversed(ctx.forward_module_order)):
+                    if i - 2 >= 0 and ctx.reduce_events[i - 2] is not None:
+                        event, param_group = ctx.reduce_events[i - 2]
+                        event.wait()
+                        param_group.release_grad_buffer()
+                    if module is self:
+                        break
 
             # Copy .grad → main grad buffer on main stream (fast memcpy)
             for name, param in zip(param_names, param_group.params):
@@ -329,9 +331,7 @@ class FSDPModule(nn.Module):
                     event = torch.cuda.Event()
                     event.record()
 
-                    ctx.reduce_events[ctx.forward_module_order.index(self)].append(
-                        (event, param_group)
-                    )
+                    ctx.reduce_events[ctx.forward_module_order.index(self)] = (event, param_group)
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
@@ -389,6 +389,24 @@ class FSDPModule(nn.Module):
             if not isinstance(child, FSDPModule):
                 continue
             setattr(child, "_enable_nan_checks", enable_nan_checks)
+
+        if enable_nan_checks:
+            for name, param in self.named_parameters():
+                if isinstance(param, DTensor):
+                    param_data = param.data._local_tensor
+                else:
+                    param_data = param.data
+                assert not torch.isnan(param_data).any(), f"NaN detected in parameter {name}"
+            for child in self.modules():
+                if not isinstance(child, FSDPModule):
+                    continue
+                for param_group in child._fsdp_param_groups:
+                    for param in param_group.params:
+                        wbuf = param_group.model_weight_buffer
+                        param_data = wbuf.get_item(param_group.param_idx[param], only_shard=False)
+                        assert not torch.isnan(
+                            param_data
+                        ).any(), "NaN detected in model weight buffer"
 
 
 class _FSDPState:
@@ -512,7 +530,7 @@ def _register_backward_hook(module: FSDPModule):
         """Hook called after backward pass for this module."""
         module.reshard()
         if getattr(module, "needs_grad_reduce", False):
-            module.reduce_grad()
+            module.reduce_grad(async_op=True)
 
     @torch.compiler.disable
     def _register_post_backward_hook(
@@ -582,12 +600,18 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
 
     def _post_backward_final_callback(root_state: _FSDPState, root_module: nn.Module):
         """Final callback: reshard all modules and reduce gradients."""
-        for name, module in root_module.named_modules():
+        for module in root_module.modules():
             if not isinstance(module, FSDPModule):
                 continue
             module.reshard()
             if getattr(module, "needs_grad_reduce", False):
-                module.reduce_grad()
+                module.reduce_grad(async_op=True)
+        ctx = root_module._fsdp_root_context
+        for module, reduce_event in zip(ctx.forward_module_order, ctx.reduce_events):
+            if reduce_event is not None:
+                event, param_group = reduce_event
+                event.wait()
+                param_group.release_grad_buffer()
         root_state._post_backward_callback_queued = False
 
     state._post_backward_callback_queued = True
@@ -645,9 +669,9 @@ class _FSDPRootContext:
     unshard_events: Dict[int, torch.cuda.Event] = field(default_factory=dict)
 
     # Reduce-grad overlap tracking
-    # Per FSDPModule → list of (cuda Event, ParameterGroup) waiting for RS completion
+    # Per FSDPModule → tuple of (cuda Event, ParameterGroup) waiting for RS completion
     # FSDPModule list is same as forward_module_order to ensure proper ordering and overlap
-    reduce_events: List[List[Tuple[torch.cuda.Event, "ParameterGroup"]]] = field(
+    reduce_events: List[Optional[Tuple[torch.cuda.Event, "ParameterGroup"]]] = field(
         default_factory=list
     )
 

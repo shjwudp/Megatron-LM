@@ -240,7 +240,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     fully_shard(m, mesh=dp_mesh)
         fully_shard(module, mesh=dp_mesh)
 
-        module._set_nan_check(True)
+        if ddp_config.check_for_nan_in_loss_and_grad:
+            module._set_nan_check(True)
 
         super().__init__(config=config, module=module)
 
@@ -259,7 +260,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.module._copy_main_weights_to_model_weights
         )
         self.ddp_config = ddp_config
-        self.no_sync = nullcontext()
+        self.no_sync = nullcontext
         self.start_param_sync = noop
         self.start_grad_sync = noop
         self.finish_grad_sync = noop
