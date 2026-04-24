@@ -13,9 +13,9 @@ import torch
 from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from ..uneven_dtensor import make_uneven_dtensor
 from .allocator import TemporaryBucketAllocator
 from .dp_buffer import DataParallelBuffer
-from ..uneven_dtensor import make_uneven_dtensor
 
 
 class ParameterGroup:
@@ -89,9 +89,7 @@ class ParameterGroup:
         # Initialize buffers and distributed parameters
         self._init_buffers()
 
-    def _create_buffer(
-        self, dtype: torch.dtype, is_distributed: bool
-    ) -> DataParallelBuffer:
+    def _create_buffer(self, dtype: torch.dtype, is_distributed: bool) -> DataParallelBuffer:
         """Create a DataParallelBuffer with the given settings."""
         return DataParallelBuffer(
             params=self.params,
@@ -167,6 +165,11 @@ class ParameterGroup:
         For non-distributed buffers: all-reduce in-place
         """
         self.main_grad_buffer.reduce_grad(async_op=async_op)
+
+    def release_grad_buffer(self):
+        """Release the main gradient buffer to free memory."""
+        if self.main_grad_buffer is not None:
+            self.main_grad_buffer.reshard()
 
     def _init_dist_params(self):
         """

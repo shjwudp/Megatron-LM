@@ -19,6 +19,7 @@ Sharding Strategies:
 """
 
 import functools
+from dataclasses import field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -37,7 +38,9 @@ def fully_shard(
     *,
     mesh: Optional[DeviceMesh] = None,
     reshard_after_forward: Optional[bool | int] = None,  # TODO: implement
-    shard_placement_fn: Optional[Callable[[nn.Parameter], Optional[Shard]]] = None,  # TODO: implement
+    shard_placement_fn: Optional[
+        Callable[[nn.Parameter], Optional[Shard]]
+    ] = None,  # TODO: implement
     mp_policy: Optional["MixedPrecisionPolicy"] = None,  # TODO: implement
     offload_policy: Optional["OffloadPolicy"] = None,  # TODO: implement
     ignored_params: Optional[set[nn.Parameter]] = None,
@@ -153,6 +156,7 @@ class FSDPModule(nn.Module):
         gradient buffer when accessed. It handles both sharded and
         unsharded gradient buffers.
         """
+
         def main_grad_getter(p):
             """Get main gradient from buffer with proper offset/size."""
             gbuf = p._gbuf
@@ -164,7 +168,7 @@ class FSDPModule(nn.Module):
 
             # Get offset and size from buffer index
             offset, size = gbuf.buffer_index._get_item_offset(item_id)
-            grad_data = gbuf_data[offset: offset + size].view(p.shape)
+            grad_data = gbuf_data[offset : offset + size].view(p.shape)
 
             return grad_data
 
@@ -199,13 +203,22 @@ class FSDPModule(nn.Module):
 
     def _init_fsdp_state(self):
         """Initialize FSDP state and mark nested FSDP modules as non-root."""
+        forward_module_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
+        root_context = _FSDPRootContext(
+            ag_stream=torch.cuda.Stream(),
+            rs_stream=torch.cuda.Stream(),
+            forward_module_order=forward_module_order,
+            reduce_events=[[] for _ in range(len(forward_module_order))],
+        )
         setattr(self, "_fsdp_state", _FSDPState())
+        setattr(self, "_fsdp_root_context", root_context)
         for child in self.modules():
             if child is not self and isinstance(child, FSDPModule):
                 child._init_fsdp_state()
                 child._fsdp_state._is_root = False
+                setattr(child, "_fsdp_root_context", root_context)
 
-    def unshard(self):
+    def unshard(self, async_op: bool = False, bwd_pass: bool = False):
         """
         Unshard parameters by all-gathering from the sharded buffer.
 
@@ -213,18 +226,22 @@ class FSDPModule(nn.Module):
         computation. After unsharding, each param.data points to
         the full (unsharded) tensor.
         """
-        unsharded_param_names = set()
+        ctx = self._fsdp_root_context
+        stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
         for param_names, param_group in self._named_param_groups:
-            unsharded_param_names.update(param_names)
-
             # Optional NaN checking for debugging
             if getattr(self, "_enable_nan_checks", False):
                 for name, dist_param in zip(param_names, param_group.dist_params):
-                    assert not torch.isnan(dist_param._local_tensor).any(), (
-                        f"NaN detected in dist param for parameter {name}"
-                    )
+                    assert not torch.isnan(
+                        dist_param._local_tensor
+                    ).any(), f"NaN detected in dist param for parameter {name}"
 
-            param_group.unshard()
+            with torch.cuda.stream(stream):
+                param_group.unshard()
+
+            if async_op:
+                event = stream.record_event()
+                ctx.unshard_events[id(self)] = event
 
             # Replace module parameters with unsharded versions
             for name, param in zip(param_names, param_group.params):
@@ -234,13 +251,29 @@ class FSDPModule(nn.Module):
                 for name, param in zip(param_names, param_group.params):
                     assert not torch.isnan(param).any(), f"NaN detected in parameter {name}"
 
-        # Verify parameters are no longer DTensor
-        for name, param in self.named_parameters():
-            if name not in unsharded_param_names:
-                continue
-            assert not isinstance(param, DTensor), (
-                f"Parameter {name} should be unsharded but is DTensor"
-            )
+        if async_op:
+            self._prefetch_next_module(bwd_pass=bwd_pass)
+
+    def _prefetch_next_module(self, bwd_pass: bool = False):
+        """Prefetch the next module in the forward/backward pass."""
+        ctx = self._fsdp_root_context
+        assert self in ctx.forward_module_order, "Current module not found in forward module order"
+
+        if bwd_pass:
+            module_order = list(reversed(ctx.forward_module_order))
+        else:
+            module_order = ctx.forward_module_order
+
+        i = None
+        for i, module in enumerate(module_order):
+            if module is self:
+                break
+        assert i is not None, "Current module index not found in forward module order"
+        if i + 1 >= len(module_order):
+            return  # No next module to prefetch
+
+        next_module = module_order[i + 1]
+        next_module.unshard(async_op=True, bwd_pass=bwd_pass)
 
     def reshard(self):
         """Reshard parameters by replacing with sharded DTensors."""
@@ -249,7 +282,7 @@ class FSDPModule(nn.Module):
             for name, dist_param in zip(param_names, param_group.dist_params):
                 _replace_module_parameter(self, name, dist_param)
 
-    def reduce_grad(self):
+    def reduce_grad(self, async_op: bool = False):
         """
         Reduce gradients across data-parallel ranks.
 
@@ -258,6 +291,7 @@ class FSDPModule(nn.Module):
         2. Perform all-reduce or reduce-scatter
         3. Install reduced gradients to distributed parameters
         """
+        ctx = self._fsdp_root_context
         for param_names, param_group in self._named_param_groups:
             if not param_group.requires_grad:
                 continue
@@ -268,7 +302,16 @@ class FSDPModule(nn.Module):
                     if param.grad is not None:
                         assert not torch.isnan(param.grad).any(), "NaN in parameter grad"
 
-            # Copy gradients to main buffer
+            # Handle pending reduce events before this module to ensure proper ordering and overlap
+            for i, module in enumerate(reversed(ctx.forward_module_order)):
+                if i - 2 >= 0:
+                    event, param_group = ctx.reduce_events[i].pop()
+                    event.wait()
+                    param_group.release_grad_buffer()
+                if module is self:
+                    break
+
+            # Copy .grad → main grad buffer on main stream (fast memcpy)
             for name, param in zip(param_names, param_group.params):
                 main_grad = param.get_main_grad()
                 if param.grad is None:
@@ -277,8 +320,23 @@ class FSDPModule(nn.Module):
                     main_grad.copy_(param.grad.detach())
                     del param.grad
 
-            # Reduce gradients
-            param_group.reduce_grad(async_op=False)
+            if async_op:
+                # ---- Overlapped path ----
+                # Switch to rs_stream for the reduce-scatter kernel
+                ctx.rs_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(ctx.rs_stream):
+                    param_group.reduce_grad(async_op=True)
+                    event = torch.cuda.Event()
+                    event.record()
+
+                    ctx.reduce_events[ctx.forward_module_order.index(self)].append(
+                        (event, param_group)
+                    )
+            else:
+                # ---- Non-overlapped path ----
+                # Reduce gradients immediately and release grad buffer
+                param_group.reduce_grad(async_op=False)
+                param_group.release_grad_buffer()
 
             # Install reduced gradients to distributed parameters
             for name, param, dist_param, dist_grad in zip(
@@ -291,12 +349,9 @@ class FSDPModule(nn.Module):
             if getattr(self, "_enable_nan_checks", False):
                 for name, dist_grad in zip(param_names, param_group.dist_grads):
                     if dist_grad is not None:
-                        assert not torch.isnan(dist_grad._local_tensor).any(), (
-                            f"NaN in dist grad for parameter {name}"
-                        )
-
-            # Reshard gradient buffer
-            param_group.main_grad_buffer.reshard()
+                        assert not torch.isnan(
+                            dist_grad._local_tensor
+                        ).any(), f"NaN in dist grad for parameter {name}"
 
         setattr(self, "needs_grad_reduce", False)
 
@@ -383,8 +438,9 @@ def _get_module_fsdp_param_groups(
 
 def _register_forward_pre_hook(module: FSDPModule):
     """Register pre-forward hook to unshard parameters."""
+
     def unshard_param_groups(module, *unused):
-        module.unshard()
+        module.unshard(async_op=True, bwd_pass=False)
 
     module._mfsdp_forward_pre_hook = module.register_forward_pre_hook(
         unshard_param_groups, prepend=True
@@ -393,6 +449,7 @@ def _register_forward_pre_hook(module: FSDPModule):
 
 def _register_forward_hook(module: FSDPModule):
     """Register post-forward hook to reshard parameters."""
+
     def reshard_param_groups(module, *unused):
         module.reshard()
 
@@ -406,16 +463,14 @@ def _register_backward_pre_hook(module: FSDPModule):
     This uses a custom backward hook that attaches to output tensors
     to trigger unshard at the right time during backward pass.
     """
+
     def create_custom_backward_hook(module: FSDPModule, custom_backward_handler: Callable):
         """Create a custom backward hook attached to output tensors."""
 
         @torch.compiler.disable
         def forward_hook(_module, inputs, output):
             # View-as to avoid output being the same tensor object
-            output = tree_map(
-                lambda t: t.view_as(t) if torch.is_tensor(t) else t,
-                output
-            )
+            output = tree_map(lambda t: t.view_as(t) if torch.is_tensor(t) else t, output)
 
             # Collect tensor outputs
             output_list = []
@@ -427,9 +482,7 @@ def _register_backward_pre_hook(module: FSDPModule):
             # Register pre-backward hook on output tensors
             # This triggers when gradients are computed
             torch.autograd.graph.register_multi_grad_hook(
-                output_list,
-                lambda grads: custom_backward_handler(_module, grads),
-                mode="any"
+                output_list, lambda grads: custom_backward_handler(_module, grads), mode="any"
             )
             return output
 
@@ -440,7 +493,7 @@ def _register_backward_pre_hook(module: FSDPModule):
         setattr(module, "needs_grad_reduce", True)
         if module._fsdp_state._is_root and not module._fsdp_state._post_backward_callback_queued:
             _register_post_backward_final_callback(module._fsdp_state, module)
-        module.unshard()
+        module.unshard(async_op=True, bwd_pass=True)
 
     module._mfsdp_backward_pre_hook = create_custom_backward_hook(
         module, custom_backward_handler=pre_backward_hook
@@ -454,10 +507,12 @@ def _register_backward_hook(module: FSDPModule):
     This inserts a RegisterFSDPBackwardFunction in the backward pass
     that triggers reshard and reduce_grad after gradients are computed.
     """
+
     def post_backward(module: FSDPModule):
         """Hook called after backward pass for this module."""
         module.reshard()
-        module.reduce_grad()
+        if getattr(module, "needs_grad_reduce", False):
+            module.reduce_grad()
 
     @torch.compiler.disable
     def _register_post_backward_hook(
@@ -495,23 +550,21 @@ def _register_backward_hook(module: FSDPModule):
         # Wrap inputs in autograd Function
         # The Function's backward will call post_backward_hook
         inp_tensors = RegisterFSDPBackwardFunction.apply(
-            functools.partial(post_backward_hook, module),
-            *inp_tensors
+            functools.partial(post_backward_hook, module), *inp_tensors
         )
 
         # Restore args and kwargs
         for inp_tensor_idx, inp_tensor in zip(inp_tensor_indices, inp_tensors):
             args_kwargs_list[inp_tensor_idx] = inp_tensor
         args_list = args_kwargs_list[: len(args_list)]
-        kwargs_list = args_kwargs_list[len(args_list):]
+        kwargs_list = args_kwargs_list[len(args_list) :]
         args = tree_unflatten(args_list, args_spec)
         kwargs = tree_unflatten(kwargs_list, kwargs_spec)
 
         return args, kwargs
 
     module._mfsdp_backward_hook = module.register_forward_pre_hook(
-        functools.partial(_register_post_backward_hook, post_backward),
-        with_kwargs=True
+        functools.partial(_register_post_backward_hook, post_backward), with_kwargs=True
     )
 
 
@@ -576,3 +629,27 @@ def _replace_module_parameter(module: nn.Module, name: str, new_param: nn.Parame
     for part in parts[:-1]:
         parent = getattr(parent, part)
     setattr(parent, parts[-1], new_param)
+
+
+@dataclass
+class _FSDPRootContext:
+    # CUDA streams
+    ag_stream: torch.cuda.Stream  # all-gather / unshard stream
+    rs_stream: torch.cuda.Stream  # reduce-scatter stream
+
+    # Forward execution order
+    forward_module_order: List[FSDPModule] = field(default_factory=list)
+
+    # Unshard prefetch tracking
+    # Maps FSDPModule id → cuda Event that signals unshard completion
+    unshard_events: Dict[int, torch.cuda.Event] = field(default_factory=dict)
+
+    # Reduce-grad overlap tracking
+    # Per FSDPModule → list of (cuda Event, ParameterGroup) waiting for RS completion
+    # FSDPModule list is same as forward_module_order to ensure proper ordering and overlap
+    reduce_events: List[List[Tuple[torch.cuda.Event, "ParameterGroup"]]] = field(
+        default_factory=list
+    )
+
+    # Set of module ids that have had reduce_grad fired asynchronously
+    pending_reduce_ids: set = field(default_factory=set)
