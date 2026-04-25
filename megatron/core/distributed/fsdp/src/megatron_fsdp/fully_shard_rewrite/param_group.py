@@ -157,15 +157,14 @@ class ParameterGroup:
         """Reshard model weights by releasing unsharded buffer."""
         self.model_weight_buffer.reshard()
 
-    def reduce_grad(self, async_op: bool = False):
+    def reduce_grad(self):
         """
         Reduce gradients across DP ranks.
 
         For distributed buffers: reduce-scatter the full gradient
         For non-distributed buffers: all-reduce in-place
         """
-        work = self.main_grad_buffer.reduce_grad(async_op=async_op)
-        return work
+        self.main_grad_buffer.reduce_grad()
 
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""

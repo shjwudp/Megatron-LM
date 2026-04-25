@@ -203,12 +203,15 @@ class FSDPModule(nn.Module):
 
     def _init_fsdp_state(self):
         """Initialize FSDP state and mark nested FSDP modules as non-root."""
-        forward_module_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
+        forward_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
         root_context = _FSDPRootContext(
             ag_stream=torch.cuda.Stream(),
             rs_stream=torch.cuda.Stream(),
-            forward_module_order=forward_module_order,
-            reduce_events=[None for _ in range(len(forward_module_order))],
+            forward_order=forward_order,
+            reduce_grad_buckets=[[] for _ in range(len(forward_order))],
+            unshard_done_events={id(module): None for module in forward_order},
+            enable_unshard_prefetch=True,
+            enable_async_reduce_grad=True,
         )
         setattr(self, "_fsdp_state", _FSDPState())
         setattr(self, "_fsdp_root_context", root_context)
@@ -229,11 +232,16 @@ class FSDPModule(nn.Module):
         ctx = self._fsdp_root_context
         stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
 
+        # Unshard this module and optionally prefetch next modules in the forward/backward pass
         if async_op:
             prefetch_modules = self._get_prefetch_next_modules(bwd_pass=bwd_pass)
         else:
             prefetch_modules = []
         for module in [self] + prefetch_modules:
+            if ctx.unshard_done_events[id(module)] is not None:
+                continue # Skip if unshard already issued for this module
+
+            # Unshard parameters for this module
             for param_names, param_group in module._named_param_groups:
                 # Optional NaN checking for debugging
                 if getattr(module, "_enable_nan_checks", False):
@@ -244,27 +252,37 @@ class FSDPModule(nn.Module):
 
                 with torch.cuda.stream(stream):
                     param_group.unshard(async_op=async_op)
+
+            # Record event to track when unshard is done for this module
+            if async_op:
                 event = stream.record_event()
-                ctx.unshard_events[id(module)] = event
+                ctx.unshard_done_events[id(module)] = event
 
-                # Replace module parameters with unsharded versions
+        # Ensure unshard is complete before forward
+        assert ctx.unshard_done_events[id(self)] is not None
+        if ctx.unshard_done_events[id(self)] is not None:
+            ctx.unshard_done_events[id(self)].wait()
+            ctx.unshard_done_events[id(self)] = None
+
+        # Replace module parameters with unsharded versions
+        for param_names, param_group in self._named_param_groups:
+            for name, param in zip(param_names, param_group.params):
+                _replace_module_parameter(self, name, param)
+
+            # Optional NaN checking for debugging
+            if getattr(self, "_enable_nan_checks", False):
                 for name, param in zip(param_names, param_group.params):
-                    _replace_module_parameter(module, name, param)
-
-                if getattr(module, "_enable_nan_checks", False):
-                    ctx.unshard_events[id(module)].wait()
-                    for name, param in zip(param_names, param_group.params):
-                        assert not torch.isnan(param).any(), f"NaN detected in parameter {name}"
+                    assert not torch.isnan(param).any(), f"NaN detected in parameter {name}"
 
     def _get_prefetch_next_modules(self, bwd_pass: bool = False) -> List["FSDPModule"]:
         """Prefetch the next module in the forward/backward pass."""
         ctx = self._fsdp_root_context
-        assert self in ctx.forward_module_order, "Current module not found in forward module order"
+        assert self in ctx.forward_order, "Current module not found in forward module order"
 
         if bwd_pass:
-            module_order = list(reversed(ctx.forward_module_order))
+            module_order = list(reversed(ctx.forward_order))
         else:
-            module_order = ctx.forward_module_order
+            module_order = ctx.forward_order
 
         i = None
         for i, module in enumerate(module_order):
@@ -293,6 +311,21 @@ class FSDPModule(nn.Module):
         3. Install reduced gradients to distributed parameters
         """
         ctx = self._fsdp_root_context
+        stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
+
+        # Handle pending reduce events before this module to ensure memory is freed in a timely manner
+        if async_op:
+            for i, module in enumerate(reversed(ctx.forward_order)):
+                if i - 2 >= 0:
+                    buckets = ctx.reduce_grad_buckets[i - 2]
+                    while len(buckets) > 0:
+                        event, param_group = buckets.pop()
+                        event.wait()
+                        param_group.release_grad_buffer()
+                if module is self:
+                    break
+
+        # Perform reduction for this module
         for param_names, param_group in self._named_param_groups:
             if not param_group.requires_grad:
                 continue
@@ -302,16 +335,6 @@ class FSDPModule(nn.Module):
                 for param in param_group.params:
                     if param.grad is not None:
                         assert not torch.isnan(param.grad).any(), "NaN in parameter grad"
-
-            # Handle pending reduce events before this module to ensure proper ordering and overlap
-            if async_op:
-                for i, module in enumerate(reversed(ctx.forward_module_order)):
-                    if i - 2 >= 0 and ctx.reduce_events[i - 2] is not None:
-                        event, param_group = ctx.reduce_events[i - 2]
-                        event.wait()
-                        param_group.release_grad_buffer()
-                    if module is self:
-                        break
 
             # Copy .grad → main grad buffer on main stream (fast memcpy)
             for name, param in zip(param_names, param_group.params):
@@ -325,17 +348,19 @@ class FSDPModule(nn.Module):
             if async_op:
                 # ---- Overlapped path ----
                 # Switch to rs_stream for the reduce-scatter kernel
-                ctx.rs_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(ctx.rs_stream):
-                    param_group.reduce_grad(async_op=True)
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    param_group.reduce_grad()
                     event = torch.cuda.Event()
                     event.record()
 
-                    ctx.reduce_events[ctx.forward_module_order.index(self)] = (event, param_group)
+                    ctx.reduce_grad_buckets[ctx.forward_order.index(self)].append((event, param_group))
+                event.wait()
+                param_group.release_grad_buffer()
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
-                param_group.reduce_grad(async_op=False)
+                param_group.reduce_grad()
                 param_group.release_grad_buffer()
 
             # Install reduced gradients to distributed parameters
@@ -343,7 +368,9 @@ class FSDPModule(nn.Module):
                 param_names, param_group.params, param_group.dist_params, param_group.dist_grads
             ):
                 if param.requires_grad and dist_grad is not None:
-                    setattr(dist_param, "grad", dist_grad.to(param.dtype))
+                    with torch.cuda.stream(stream):
+                        dist_grad = dist_grad.to(param.dtype)
+                    setattr(dist_param, "grad", dist_grad)
 
             # NaN check after reduction
             if getattr(self, "_enable_nan_checks", False):
@@ -458,7 +485,8 @@ def _register_forward_pre_hook(module: FSDPModule):
     """Register pre-forward hook to unshard parameters."""
 
     def unshard_param_groups(module, *unused):
-        module.unshard(async_op=True, bwd_pass=False)
+        ctx = module._fsdp_root_context
+        module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 
     module._mfsdp_forward_pre_hook = module.register_forward_pre_hook(
         unshard_param_groups, prepend=True
@@ -508,10 +536,11 @@ def _register_backward_pre_hook(module: FSDPModule):
 
     def pre_backward_hook(module: FSDPModule, grads):
         """Hook called before backward pass for this module."""
+        ctx = module._fsdp_root_context
         setattr(module, "needs_grad_reduce", True)
         if module._fsdp_state._is_root and not module._fsdp_state._post_backward_callback_queued:
             _register_post_backward_final_callback(module._fsdp_state, module)
-        module.unshard(async_op=True, bwd_pass=True)
+        module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
 
     module._mfsdp_backward_pre_hook = create_custom_backward_hook(
         module, custom_backward_handler=pre_backward_hook
@@ -528,9 +557,10 @@ def _register_backward_hook(module: FSDPModule):
 
     def post_backward(module: FSDPModule):
         """Hook called after backward pass for this module."""
+        ctx = module._fsdp_root_context
         module.reshard()
         if getattr(module, "needs_grad_reduce", False):
-            module.reduce_grad(async_op=True)
+            module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
 
     @torch.compiler.disable
     def _register_post_backward_hook(
@@ -600,16 +630,16 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
 
     def _post_backward_final_callback(root_state: _FSDPState, root_module: nn.Module):
         """Final callback: reshard all modules and reduce gradients."""
-        for module in root_module.modules():
-            if not isinstance(module, FSDPModule):
-                continue
+        ctx = root_module._fsdp_root_context
+        stream = ctx.rs_stream
+        for module in reversed(ctx.forward_order):
             module.reshard()
             if getattr(module, "needs_grad_reduce", False):
-                module.reduce_grad(async_op=True)
-        ctx = root_module._fsdp_root_context
-        for module, reduce_event in zip(ctx.forward_module_order, ctx.reduce_events):
-            if reduce_event is not None:
-                event, param_group = reduce_event
+                with torch.cuda.stream(stream):
+                    module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+        for buckets in ctx.reduce_grad_buckets:
+            while len(buckets) > 0:
+                event, param_group = buckets.pop()
                 event.wait()
                 param_group.release_grad_buffer()
         root_state._post_backward_callback_queued = False
@@ -657,23 +687,63 @@ def _replace_module_parameter(module: nn.Module, name: str, new_param: nn.Parame
 
 @dataclass
 class _FSDPRootContext:
-    # CUDA streams
+    """
+    Runtime context shared across all FSDP modules within a single root.
+
+    This object coordinates CUDA streams, execution ordering, and async
+    communication overlap (all-gather / reduce-scatter) during forward
+    and backward passes.
+    """
+
+    # ------------------------------------------------------------------
+    # CUDA streams (communication overlap)
+    # ------------------------------------------------------------------
     ag_stream: torch.cuda.Stream  # all-gather / unshard stream
     rs_stream: torch.cuda.Stream  # reduce-scatter stream
 
-    # Forward execution order
-    forward_module_order: List[FSDPModule] = field(default_factory=list)
+    # ------------------------------------------------------------------
+    # Forward execution ordering
+    # ------------------------------------------------------------------
+    forward_order: List[FSDPModule] = field(default_factory=list)
+    """
+    FSDP modules in actual forward execution order.
 
-    # Unshard prefetch tracking
-    # Maps FSDPModule id → cuda Event that signals unshard completion
-    unshard_events: Dict[int, torch.cuda.Event] = field(default_factory=dict)
+    This ordering is used to:
+    - Schedule prefetching of parameters (unshard)
+    - Ensure correct overlap between compute and communication
+    """
 
-    # Reduce-grad overlap tracking
-    # Per FSDPModule → tuple of (cuda Event, ParameterGroup) waiting for RS completion
-    # FSDPModule list is same as forward_module_order to ensure proper ordering and overlap
-    reduce_events: List[Optional[Tuple[torch.cuda.Event, "ParameterGroup"]]] = field(
+    # ------------------------------------------------------------------
+    # Unshard (all-gather) tracking
+    # ------------------------------------------------------------------
+    unshard_done_events: Dict[int, torch.cuda.Event] = field(default_factory=dict)
+    """
+    Maps module_id -> CUDA event signaling completion of parameter unshard.
+
+    Used to enforce correct dependency between all-gather and compute.
+    """
+
+    enable_unshard_prefetch: bool = True
+    """Whether to prefetch (pipeline) parameter unshard for upcoming modules."""
+
+    # ------------------------------------------------------------------
+    # Reduce-scatter (gradient sync) tracking
+    # ------------------------------------------------------------------
+    reduce_grad_buckets: List[List[Tuple[torch.cuda.Event, "ParameterGroup"]]] = field(
         default_factory=list
     )
+    """
+    Per-module reduce-scatter tracking aligned with `forward_order`.
 
-    # Set of module ids that have had reduce_grad fired asynchronously
-    pending_reduce_ids: set = field(default_factory=set)
+    Each entry corresponds to a module and contains a list of:
+        (event, parameter_group)
+
+    - event: signals gradient readiness
+    - parameter_group: gradients to be reduced
+
+    This structure enables ordered overlap of backward compute and
+    gradient synchronization.
+    """
+
+    enable_async_reduce_grad: bool = True
+    """Whether to overlap gradient reduction with backward computation."""
