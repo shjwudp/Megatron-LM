@@ -259,7 +259,6 @@ class FSDPModule(nn.Module):
                 ctx.unshard_done_events[id(module)] = event
 
         # Ensure unshard is complete before forward
-        assert ctx.unshard_done_events[id(self)] is not None
         if ctx.unshard_done_events[id(self)] is not None:
             ctx.unshard_done_events[id(self)].wait()
             ctx.unshard_done_events[id(self)] = None
@@ -270,9 +269,10 @@ class FSDPModule(nn.Module):
                 _replace_module_parameter(self, name, param)
 
             # Optional NaN checking for debugging
-            if getattr(self, "_enable_nan_checks", False):
-                for name, param in zip(param_names, param_group.params):
-                    assert not torch.isnan(param).any(), f"NaN detected in parameter {name}"
+            # FIXME: Need cuda synchronization before checking for NaN to ensure data is ready.
+            # if getattr(self, "_enable_nan_checks", False):
+            #     for name, param in zip(param_names, param_group.params):
+            #         assert not torch.isnan(param).any(), f"NaN detected in parameter {name}"
 
     def _get_prefetch_next_modules(self, bwd_pass: bool = False) -> List["FSDPModule"]:
         """Prefetch the next module in the forward/backward pass."""
@@ -296,10 +296,12 @@ class FSDPModule(nn.Module):
 
     def reshard(self):
         """Reshard parameters by replacing with sharded DTensors."""
+        ctx = self._fsdp_root_context
         for param_names, param_group in self._named_param_groups:
             param_group.reshard()
             for name, dist_param in zip(param_names, param_group.dist_params):
                 _replace_module_parameter(self, name, dist_param)
+        ctx.unshard_done_events[id(self)] = None  # Clear unshard event for this module
 
     def reduce_grad(self, async_op: bool = False):
         """
