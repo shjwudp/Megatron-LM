@@ -174,6 +174,12 @@ class ParameterGroup:
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""
         if self.main_grad_buffer is not None:
+            # Drop weight.main_grad views that layers.py stores during gradient-accumulation-fusion
+            # backward.  Those views keep _unsharded_buffer alive even after reshard() sets the
+            # internal reference to None, causing the grad buffer to leak until the next backward.
+            for param in self.params:
+                if hasattr(param, 'main_grad'):
+                    del param.main_grad
             self.main_grad_buffer.reshard()
 
     def _init_dist_params(self):
