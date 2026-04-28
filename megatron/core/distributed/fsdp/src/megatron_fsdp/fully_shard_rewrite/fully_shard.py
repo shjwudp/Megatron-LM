@@ -31,6 +31,7 @@ from torch.distributed.tensor.placement_types import Shard
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from .param_group import ParameterGroup
+from .utils import ParamGroupIdx, RegisterFSDPBackwardFunction, _replace_module_parameter
 
 
 def fully_shard(
@@ -217,8 +218,8 @@ class FSDPModule(nn.Module):
             forward_order=forward_order,
             reduce_grad_buckets={id(module): [] for module in forward_order},
             unshard_done_events={id(module): None for module in forward_order},
-            enable_unshard_prefetch=True,
-            enable_async_reduce_grad=True,
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
         )
         setattr(self, "_fsdp_state", _FSDPState())
         setattr(self, "_fsdp_root_context", root_context)
@@ -369,9 +370,7 @@ class FSDPModule(nn.Module):
                     event = torch.cuda.Event()
                     event.record()
 
-                    ctx.reduce_grad_buckets[id(self)].append(
-                        (event, param_group)
-                    )
+                    ctx.reduce_grad_buckets[id(self)].append((event, param_group))
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
@@ -424,6 +423,18 @@ class FSDPModule(nn.Module):
                 if param_group.main_weight_buffer is None:
                     continue
                 param_group.model_weight_buffer.data.copy_(param_group.main_weight_buffer.data)
+
+        # Also zero main grads to avoid stale gradients after weight copy
+        self._zero_main_grads()
+
+    def _zero_main_grads(self):
+        """Zero the main gradient buffer for all parameter groups."""
+        for _, child in self.named_modules():
+            if not isinstance(child, FSDPModule):
+                continue
+            for param_group in child._fsdp_param_groups:
+                if param_group.main_grad_buffer is not None:
+                    param_group.main_grad_buffer.data.zero_()
 
     def _set_nan_check(self, enable_nan_checks: bool):
         """Enable or disable NaN checking."""
@@ -491,11 +502,12 @@ def _get_module_fsdp_param_groups(
 
     # Create ParameterGroup for each group
     fsdp_param_groups = []
-    for params in param_groups.values():
+    for i, params in enumerate(param_groups.values()):
         fsdp_param_groups.append(
             ParameterGroup(
                 params,
                 mesh=mesh,
+                param_group_id=ParamGroupIdx(id(module), i),
                 main_params_dtype=mp_policy.main_params_dtype if mp_policy is not None else None,
                 main_grads_dtype=mp_policy.main_grads_dtype if mp_policy is not None else None,
             )
@@ -673,41 +685,6 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
     Variable._execution_engine.queue_callback(
         functools.partial(_post_backward_final_callback, state, module)
     )
-
-
-class RegisterFSDPBackwardFunction(torch.autograd.Function):
-    """
-    Autograd Function for registering post-backward hooks.
-
-    This Function simply passes inputs through in forward, but its
-    backward calls the post_backward_hook to perform reshard and
-    gradient reduction after gradients are computed.
-    """
-
-    @staticmethod
-    def forward(ctx, post_backward: Callable, *inputs: torch.Tensor):
-        ctx.post_backward = post_backward
-        return inputs
-
-    @staticmethod
-    def backward(ctx, *grads: torch.Tensor):
-        ctx.post_backward()
-        return (None,) + grads
-
-
-def _replace_module_parameter(module: nn.Module, name: str, new_param: nn.Parameter):
-    """
-    Replace a module's parameter while preserving module hierarchy.
-
-    Example:
-        If name="layers.0.linear1.weight", this finds module.layers[0].linear1
-        and replaces its weight parameter.
-    """
-    parts = name.split(".")
-    parent = module
-    for part in parts[:-1]:
-        parent = getattr(parent, part)
-    setattr(parent, parts[-1], new_param)
 
 
 @dataclass

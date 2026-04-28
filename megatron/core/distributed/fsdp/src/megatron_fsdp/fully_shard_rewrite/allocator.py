@@ -2,6 +2,8 @@ import dataclasses
 
 import torch
 
+from .utils import ParamGroupIdx
+
 
 @dataclasses.dataclass
 class Bucket:
@@ -19,7 +21,7 @@ class TemporaryBucketAllocator:
         self.buckets = {}
 
     def allocate(
-        self, param_group_id: int, size: int, dtype: torch.dtype, device: torch.device
+        self, param_group_id: ParamGroupIdx, size: int, dtype: torch.dtype, device: torch.device
     ) -> Bucket:
         if param_group_id not in self.buckets:
             self.buckets[param_group_id] = Bucket(
@@ -28,10 +30,10 @@ class TemporaryBucketAllocator:
         self.buckets[param_group_id].data._typed_storage()._resize_(size)
         return self.buckets[param_group_id]
 
-    def free(self, param_group_id: int) -> None:
+    def free(self, param_group_id: ParamGroupIdx) -> None:
         if param_group_id in self.buckets:
             with torch.no_grad():
                 storage = self.buckets[param_group_id].data._typed_storage()
                 if storage._size() != 0:
                     storage._resize_(0)
-            # del self.buckets[param_group_id]
+            del self.buckets[param_group_id]

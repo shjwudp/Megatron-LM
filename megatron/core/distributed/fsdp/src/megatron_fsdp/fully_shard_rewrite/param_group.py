@@ -16,6 +16,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from ..uneven_dtensor import make_uneven_dtensor
 from .allocator import TemporaryBucketAllocator
 from .dp_buffer import DataParallelBuffer
+from .utils import ParamGroupIdx
 
 
 class ParameterGroup:
@@ -38,10 +39,10 @@ class ParameterGroup:
     def __init__(
         self,
         params: List[torch.nn.Parameter],
+        param_group_id: ParamGroupIdx,
         *,
         mesh: Optional[DeviceMesh] = None,
         sharding_strategy: str = "optim_grads_params",
-        param_group_id: int = 0,
         main_params_dtype: Optional[torch.dtype] = None,
         main_grads_dtype: Optional[torch.dtype] = None,
         gradient_scaling_factor: Optional[float] = None,
