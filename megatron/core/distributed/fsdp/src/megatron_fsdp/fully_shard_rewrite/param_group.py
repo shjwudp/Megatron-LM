@@ -120,7 +120,7 @@ class ParameterGroup:
         s = self.sharding_strategy
         shard_weights = s == "optim_grads_params"
         shard_main_weights = s != "no_shard"
-        shard_grads = s in ("optim_grads", "optim_grads_params")
+        shard_grads = s in ("optim", "optim_grads", "optim_grads_params")
 
         # Create model weight buffer
         if s != "no_shard":
@@ -140,10 +140,13 @@ class ParameterGroup:
 
         # Create gradient buffer
         if self.requires_grad:
-            gbuf = self._create_buffer(
-                self.main_grads_dtype if self.main_grads_dtype is not None else self.dtype,
-                shard_grads,
-            )
+            if self.main_grads_dtype is not None:
+                gbuf_dtype = self.main_grads_dtype
+            elif self.main_params_dtype is not None:
+                gbuf_dtype = self.main_params_dtype
+            else:
+                gbuf_dtype = self.dtype
+            gbuf = self._create_buffer(gbuf_dtype, shard_grads)
             gbuf.init_data(torch.zeros(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
             self.main_grad_buffer = gbuf
 
@@ -197,9 +200,6 @@ class ParameterGroup:
         self.dist_grads = []
         s = self.sharding_strategy
 
-        if s == "no_shard":
-            return
-
         # Determine placement based on sharding strategy
         is_param_shard = s in ("optim", "optim_grads", "optim_grads_params")
         placements = [Shard(dim=0)] if is_param_shard else [Replicate()]
@@ -207,10 +207,13 @@ class ParameterGroup:
         # Create parameter DTensor views
         for param in self.params:
             if self.main_weight_buffer is not None:
-                wbuf = self.main_weight_buffer
-            else:
+                mbuf = self.main_weight_buffer
+                data = mbuf.get_item(self.param_idx[param], only_shard=is_param_shard)
+            elif self.model_weight_buffer is not None:
                 wbuf = self.model_weight_buffer
-            data = wbuf.get_item(self.param_idx[param], only_shard=is_param_shard)
+                data = wbuf.get_item(self.param_idx[param], only_shard=is_param_shard)
+            else:
+                data = param.data.detach()
 
             dist_param = torch.nn.Parameter(
                 make_uneven_dtensor(data, param.shape, self.mesh, placements)
