@@ -523,9 +523,10 @@ class FullyShardedDataParallel(_BaseDataParallel):
         Stop communication for the module.
         """
         if self.ddp_config.use_fully_shard_api:
-            raise NotImplementedError(
-                "stop_communication is not implemented for the fully_shard API path. "
-            )
+            ctx = self.module._fsdp_root_context
+            torch.cuda.current_stream().wait_stream(ctx.ag_stream)
+            torch.cuda.current_stream().wait_stream(ctx.rs_stream)
+            return
 
         self.module.synchronize_gradient_reduce()
         self.module.synchronize_param_gather()
