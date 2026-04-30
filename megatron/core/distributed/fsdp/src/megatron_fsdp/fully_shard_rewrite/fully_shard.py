@@ -30,6 +30,8 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import Shard
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, RegisterFSDPBackwardFunction, _replace_module_parameter
 
@@ -250,6 +252,7 @@ class FSDPModule(nn.Module):
         computation. After unsharding, each param.data points to
         the full (unsharded) tensor.
         """
+        nvtx_range_push()
         ctx = self._fsdp_root_context
         stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
 
@@ -295,6 +298,8 @@ class FSDPModule(nn.Module):
             #     for name, param in zip(param_names, param_group.params):
             #         assert not torch.isnan(param).any(), f"NaN detected in parameter {name}"
 
+        nvtx_range_pop()
+
     def _get_prefetch_next_modules(self, bwd_pass: bool = False) -> List["FSDPModule"]:
         """Prefetch the next module in the forward/backward pass."""
         ctx = self._fsdp_root_context
@@ -317,12 +322,14 @@ class FSDPModule(nn.Module):
 
     def reshard(self):
         """Reshard parameters by replacing with sharded DTensors."""
+        nvtx_range_push()
         ctx = self._fsdp_root_context
         for param_names, param_group in self._named_param_groups:
             param_group.reshard()
             for name, dist_param in zip(param_names, param_group.dist_params):
                 _replace_module_parameter(self, name, dist_param)
         ctx.unshard_done_events[id(self)] = None  # Clear unshard event for this module
+        nvtx_range_pop()
 
     def reduce_grad(self, async_op: bool = False):
         """
@@ -333,6 +340,7 @@ class FSDPModule(nn.Module):
         2. Perform all-reduce or reduce-scatter
         3. Install reduced gradients to distributed parameters
         """
+        nvtx_range_push()
         ctx = self._fsdp_root_context
         stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
 
@@ -406,6 +414,8 @@ class FSDPModule(nn.Module):
                         assert not torch.isnan(
                             dist_grad._local_tensor
                         ).any(), f"NaN in dist grad for parameter {name}"
+
+        nvtx_range_pop()
 
     @torch.no_grad()
     def _scale_gradients(self, scaling_factor: float):
