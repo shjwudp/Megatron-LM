@@ -14,7 +14,7 @@ from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from ..uneven_dtensor import make_uneven_dtensor
-from .allocator import TemporaryBucketAllocator
+from .allocator import TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
 from .utils import ParamGroupIdx
 
@@ -137,6 +137,12 @@ class ParameterGroup:
             for i, p in enumerate(self.params):
                 mbuf.set_item(i, p.detach().to(self.main_params_dtype))
             self.main_weight_buffer = mbuf
+
+        # Free original full parameter storage: replace p.data with shard view.
+        # The original full tensor is no longer needed since the module holds
+        # DTensor shard views and unshard rebinds .data to the all-gathered buffer.
+        for p in self.params:
+            _free_storage(p.data)
 
         # Create gradient buffer
         if self.requires_grad:
