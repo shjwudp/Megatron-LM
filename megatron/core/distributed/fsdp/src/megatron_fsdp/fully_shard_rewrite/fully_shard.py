@@ -473,6 +473,91 @@ class FSDPModule(nn.Module):
                 if param_group.main_grad_buffer is not None:
                     param_group.main_grad_buffer.data.zero_()
 
+    def _compute_per_module_norms(self) -> Dict[str, Dict[str, float]]:
+        """
+        Compute per-FSDP-module param and gradient L2 norms.
+
+        Returns a dict {module_name: {"param_norm": float, "grad_norm": float}}.
+        The norms are globally reduced across DP ranks so they are directly
+        comparable with the baseline.
+        """
+        results = {}
+        for name, child in self.named_modules():
+            if not isinstance(child, FSDPModule) or child is self:
+                continue
+            module_results = {"param_norm": 0.0, "grad_norm": 0.0}
+            for param_group in child._fsdp_param_groups:
+                # Param norm from dist_params (sharded views of weight buffer)
+                for dist_param in param_group.dist_params:
+                    module_results["param_norm"] += (
+                        dist_param._local_tensor.float().norm(p=2).item() ** 2
+                    )
+                # Grad norm from dist_grads (sharded views of gradient buffer)
+                for dist_grad in param_group.dist_grads:
+                    if dist_grad is not None:
+                        module_results["grad_norm"] += (
+                            dist_grad._local_tensor.float().norm(p=2).item() ** 2
+                        )
+            results[name] = module_results
+
+        # All-reduce norms across DP ranks to get global per-module norms
+        if self._fsdp_param_groups:
+            dp_group = self._fsdp_param_groups[0].dp_group
+            for module_name in results:
+                for key in ("param_norm", "grad_norm"):
+                    t = torch.tensor([results[module_name][key]], device="cuda")
+                    torch.distributed.all_reduce(t, group=dp_group)
+                    results[module_name][key] = t.sqrt().item()
+        return results
+
+    def _log_per_module_norms(self, iteration: int, prefix: str = ""):
+        """Log per-FSDP-module param and gradient norms via print."""
+        norms = self._compute_per_module_norms()
+        rank = torch.distributed.get_rank()
+        for module_name in sorted(norms.keys()):
+            p_norm = norms[module_name]["param_norm"]
+            g_norm = norms[module_name]["grad_norm"]
+            print(
+                f"[RANK {rank}] {prefix} iter={iteration} "
+                f"module={module_name} param_norm={p_norm:.6f} grad_norm={g_norm:.6f}"
+            )
+
+    def _print_fsdp_config(self):
+        """Print FSDP configuration for debugging (dp_group, mesh, buffer layouts)."""
+        rank = torch.distributed.get_rank()
+        for name, child in self.named_modules():
+            if not isinstance(child, FSDPModule) or child is self:
+                continue
+            for pg in child._fsdp_param_groups:
+                dp_size = torch.distributed.get_world_size(pg.dp_group)
+                dp_rank = torch.distributed.get_rank(pg.dp_group)
+                wbuf = pg.model_weight_buffer
+                gbuf = pg.main_grad_buffer
+                wbuf_info = ""
+                if wbuf is not None:
+                    wbuf_info = (
+                        f" weight_buf: data_size={wbuf.data_size} "
+                        f"bucket_meta.size={wbuf.buffer_index.bucket_meta.size} "
+                        f"shard_meta.size={wbuf.buffer_index.shard_meta.size} "
+                        f"is_distributed={wbuf.is_distributed}"
+                    )
+                gbuf_info = ""
+                if gbuf is not None:
+                    gbuf_info = (
+                        f" grad_buf: data_size={gbuf.data_size} "
+                        f"bucket_meta.size={gbuf.buffer_index.bucket_meta.size} "
+                        f"shard_meta.size={gbuf.buffer_index.shard_meta.size} "
+                        f"is_distributed={gbuf.is_distributed}"
+                    )
+                print(
+                    f"[RANK {rank}] FSDP module={name} "
+                    f"dp_group_size={dp_size} dp_group_rank={dp_rank} "
+                    f"num_params={len(pg.params)} "
+                    f"param_dtype={pg.dtype} "
+                    f"sharding_strategy={pg.sharding_strategy}"
+                    f"{wbuf_info}{gbuf_info}"
+                )
+
     def _set_nan_check(self, enable_nan_checks: bool):
         """Enable or disable NaN checking."""
         for _, child in self.named_modules():

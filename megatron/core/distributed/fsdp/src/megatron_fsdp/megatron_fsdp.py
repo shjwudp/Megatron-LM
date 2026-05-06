@@ -1411,6 +1411,68 @@ class MegatronFSDP(torch.nn.Module):
         """
         self.param_and_grad_buffer.copy_main_weights_to_model_weights()
 
+    def _compute_per_module_norms(self):
+        """
+        Compute per-FSDP-unit-module param and gradient L2 norms.
+
+        Returns a dict {module_name: {"param_norm": float, "grad_norm": float}}.
+        The norms are globally reduced across DP ranks for direct comparison.
+        """
+        from megatron.core.utils import to_local_if_dtensor
+
+        results = {}
+        pg_buffer = self.param_and_grad_buffer
+        param_to_group = pg_buffer.param_to_param_group
+        dp_group = self.dist_index.get_dp_group(is_expert_parallel=False)
+
+        for module_name, module in self.module.named_modules():
+            if not isinstance(module, tuple(self.fsdp_unit_modules)):
+                continue
+            module_results = {"param_norm": 0.0, "grad_norm": 0.0}
+            for param in module.parameters(recurse=False):
+                if not param.requires_grad:
+                    continue
+                # Param norm from local shard
+                local_param = to_local_if_dtensor(param)
+                module_results["param_norm"] += local_param.float().norm(p=2).item() ** 2
+
+                # Grad norm: look up the gradient in the buffer
+                if param in param_to_group:
+                    group = pg_buffer.parameter_groups[param_to_group[param]]
+                    if group.requires_grad:
+                        gbuf = (
+                            group.hfsdp_helper_gbuf
+                            if group.hfsdp_helper_gbuf
+                            else group.main_grad_buffer
+                        )
+                        if gbuf is not None and hasattr(gbuf, 'data') and gbuf.data is not None:
+                            local_grad = gbuf.get_item(group.param_idx[param], only_shard=True)
+                            if local_grad.numel() > 0:
+                                module_results["grad_norm"] += (
+                                    local_grad.float().norm(p=2).item() ** 2
+                                )
+            results[module_name] = module_results
+
+        # All-reduce norms across DP ranks
+        for module_name in results:
+            for key in ("param_norm", "grad_norm"):
+                t = torch.tensor([results[module_name][key]], device="cuda")
+                torch.distributed.all_reduce(t, group=dp_group)
+                results[module_name][key] = t.sqrt().item()
+        return results
+
+    def _log_per_module_norms(self, iteration: int, prefix: str = ""):
+        """Log per-FSDP-unit-module param and gradient norms via print."""
+        norms = self._compute_per_module_norms()
+        rank = torch.distributed.get_rank()
+        for module_name in sorted(norms.keys()):
+            p_norm = norms[module_name]["param_norm"]
+            g_norm = norms[module_name]["grad_norm"]
+            print(
+                f"[RANK {rank}] {prefix} iter={iteration} "
+                f"module={module_name} param_norm={p_norm:.6f} grad_norm={g_norm:.6f}"
+            )
+
     def broadcast_params(self):
         """
         Syncs parameters across all DP ranks.

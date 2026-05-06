@@ -3165,6 +3165,10 @@ def train(
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
+            # Log per-layer param/grad norms for FSDP-rewrite debugging
+            for model_chunk in model:
+                if hasattr(model_chunk, 'log_per_module_norms'):
+                    model_chunk.log_per_module_norms(iteration, prefix="[PER-LAYER]")
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
