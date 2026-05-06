@@ -48,6 +48,7 @@ def fully_shard(
     # --- Megatron-FSDP specific options ---
     enable_unshard_prefetch: bool = True,
     enable_async_reduce_grad: bool = True,
+    gradient_scaling_factor: Optional[float] = None,
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -87,7 +88,12 @@ def fully_shard(
     module.__class__ = new_cls
 
     # Initialize FSDP state and parameter groups
-    module._init_named_param_groups(mesh, ignored_params, mp_policy=mp_policy)
+    module._init_named_param_groups(
+        mesh,
+        ignored_params,
+        mp_policy=mp_policy,
+        gradient_scaling_factor=gradient_scaling_factor
+    )
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,
         enable_async_reduce_grad=enable_async_reduce_grad,
@@ -122,6 +128,7 @@ class FSDPModule(nn.Module):
         mesh: Optional[DeviceMesh],
         ignored_params: Optional[set],
         mp_policy: Optional["MixedPrecisionPolicy"] = None,
+        gradient_scaling_factor: Optional[float] = None,
     ):
         """
         Initialize parameter groups and build param name mapping.
@@ -147,7 +154,10 @@ class FSDPModule(nn.Module):
 
         # Create parameter groups
         fsdp_param_groups = _get_module_fsdp_param_groups(
-            self, mesh, ignored_params=ignored_params, mp_policy=mp_policy
+            self, mesh,
+            ignored_params=ignored_params,
+            mp_policy=mp_policy,
+            gradient_scaling_factor=gradient_scaling_factor,
         )
         setattr(self, "_fsdp_param_groups", fsdp_param_groups)
 
@@ -613,6 +623,7 @@ def _get_module_fsdp_param_groups(
     mesh: Optional[DeviceMesh] = None,
     ignored_params: Optional[set[nn.Parameter]] = None,
     mp_policy: Optional["MixedPrecisionPolicy"] = None,
+    gradient_scaling_factor: Optional[float] = None,
 ) -> List[ParameterGroup]:
     """
     Group module parameters by (device, dtype, requires_grad) and create ParameterGroups.
@@ -642,6 +653,7 @@ def _get_module_fsdp_param_groups(
                 param_group_id=ParamGroupIdx(id(module), i),
                 main_params_dtype=mp_policy.main_params_dtype if mp_policy is not None else None,
                 main_grads_dtype=mp_policy.main_grads_dtype if mp_policy is not None else None,
+                gradient_scaling_factor=gradient_scaling_factor,
             )
         )
 

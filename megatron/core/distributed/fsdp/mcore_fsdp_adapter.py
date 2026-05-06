@@ -252,10 +252,10 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "enable_unshard_prefetch": ddp_config.overlap_param_gather,
             "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
         }
-        if self.ddp_config.calculate_per_token_loss:
+        if config.calculate_per_token_loss:
             gradient_scaling_factor = None
             expert_gradient_scaling_factor = None
-        elif self.ddp_config.average_in_collective:
+        elif ddp_config.average_in_collective:
             dp_world_size = pg_collection.dp.size()
             expt_dp_world_size = pg_collection.expt_dp.size()
             gradient_scaling_factor = 1.0
@@ -289,7 +289,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 "This operation is not implemented for the fully_shard API path. "
             )
 
-        def finish_grad_sync():
+        def finish_grad_sync(force_all_reduce: Optional[bool] = False):
             """
             For the fully_shard API path, this is a no-op since gradient synchronization
             is handled automatically by the FSDP implementation. For the Megatron-FSDP
