@@ -289,6 +289,26 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 "This operation is not implemented for the fully_shard API path. "
             )
 
+        def finish_grad_sync():
+            """
+            For the fully_shard API path, this is a no-op since gradient synchronization
+            is handled automatically by the FSDP implementation. For the Megatron-FSDP
+            path, this calls synchronize_gradient_reduce to ensure all gradients are
+            reduced before the optimizer step.
+            """
+            ctx = self.module._fsdp_root_context
+            ctx.rs_stream.wait()
+
+        def synchronize_param_gather():
+            """
+            For the fully_shard API path, this is a no-op since parameter synchronization
+            is handled automatically by the FSDP implementation. For the Megatron-FSDP
+            path, this calls synchronize_param_gather to ensure all parameters are
+            gathered before the forward pass.
+            """
+            ctx = self.module._fsdp_root_context
+            ctx.ag_stream.wait()
+
         from unittest.mock import Mock
 
         self.param_and_grad_buffer = Mock()
@@ -300,14 +320,14 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.no_sync = nullcontext
         self.start_param_sync = noop
         self.start_grad_sync = noop
-        self.finish_grad_sync = noop
+        self.finish_grad_sync = finish_grad_sync
         self.scale_gradients = self.module._scale_gradients
         self.zero_grad_buffer = self.module._zero_grad_buffer
         self.log_per_module_norms = self.module._log_per_module_norms
         self.compute_per_module_norms = self.module._compute_per_module_norms
         self.print_fsdp_config = self.module._print_fsdp_config
         self.broadcast_params = not_implemented_op
-        self.synchronize_param_gather = noop
+        self.synchronize_param_gather = synchronize_param_gather
         self.module.state_dict_for_save_checkpoint = not_implemented_op
         self.state_dict_for_save_checkpoint = not_implemented_op
 
