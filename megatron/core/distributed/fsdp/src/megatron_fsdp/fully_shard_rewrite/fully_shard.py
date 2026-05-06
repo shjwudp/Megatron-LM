@@ -201,7 +201,7 @@ class FSDPModule(nn.Module):
         Meta parameters are moved to the current device and reset.
         """
         materialization_device = torch.cuda.current_device()
-        for m in self.modules():
+        for name, m in self.named_modules():
             if m in ignored_modules:
                 continue
             # Skip modules that don't have meta parameters
@@ -212,8 +212,12 @@ class FSDPModule(nn.Module):
             m.to_empty(device=materialization_device, recurse=False)
             if hasattr(m, "reset_parameters"):
                 m.reset_parameters()
-            if hasattr(m, "_reset_parameters"):
+            elif hasattr(m, "_reset_parameters"):
                 m._reset_parameters()
+            else:
+                raise ValueError(
+                    f"Module {name} contains meta parameters but does not have a reset_parameters method"
+                )
 
     def _init_fsdp_state(self, enable_unshard_prefetch, enable_async_reduce_grad):
         """Initialize FSDP state and mark nested FSDP modules as non-root."""
@@ -376,12 +380,15 @@ class FSDPModule(nn.Module):
             # When gradient_accumulation_fusion is active for FSDP params, the backward
             # kernel writes directly into main_grad (weight.main_grad = get_main_grad() in
             # layers.py) and sets grad_added_to_main_grad=True.  In that case we must NOT
-            # zero main_grad, and there is no .grad to copy.
+            # zero or overwrite main_grad; the dummy .grad tensor (set by layers.py to keep
+            # backprop hooks on the main thread) should simply be discarded.
             for name, param in zip(param_names, param_group.params):
                 main_grad = param.get_main_grad()
-                if param.grad is None:
-                    if not getattr(param, 'grad_added_to_main_grad', False):
-                        main_grad.zero_()
+                if getattr(param, 'grad_added_to_main_grad', False):
+                    if param.grad is not None:
+                        del param.grad
+                elif param.grad is None:
+                    main_grad.zero_()
                 else:
                     main_grad.copy_(param.grad.detach())
                     del param.grad
@@ -423,6 +430,8 @@ class FSDPModule(nn.Module):
     @torch.no_grad()
     def _scale_gradients(self, scaling_factor: float):
         """Scale gradients by a factor (e.g., for loss scaling)."""
+        ctx = self._fsdp_root_context
+        torch.cuda.current_stream().wait_stream(ctx.rs_stream)
         for _, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue
@@ -438,6 +447,9 @@ class FSDPModule(nn.Module):
             for param_group in child._fsdp_param_groups:
                 if param_group.main_grad_buffer is not None:
                     param_group.main_grad_buffer.data.zero_()
+                    for dist_param in param_group.dist_params:
+                        if dist_param.grad is not None:
+                            del dist_param.grad
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
@@ -696,7 +708,7 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
         ctx = root_module._fsdp_root_context
         stream = ctx.rs_stream
         for module in reversed(ctx.forward_order):
-            if module.post_backward_issued:
+            if getattr(module, "post_backward_issued", False):
                 continue
             module.reshard()
             module.reduce_grad(async_op=ctx.enable_async_reduce_grad)

@@ -361,10 +361,14 @@ class DataParallelBuffer:
         For non-distributed buffers: all-reduce in-place.
         """
         if not self.is_distributed:
+            if self.gradient_scaling_factor is not None and self.gradient_scaling_factor != 1.0:
+                full_grad.mul_(self.gradient_scaling_factor)
             torch.distributed.all_reduce(self.data, group=self.dp_group)
             return
 
         full_grad = self.fetch_unsharded_buffer()
+        if self.gradient_scaling_factor is not None and self.gradient_scaling_factor != 1.0:
+            full_grad.mul_(self.gradient_scaling_factor)   # pre-scale, then SUM-reduce
 
         sm = self.buffer_index.shard_meta
         grad_shard = full_grad[sm.bucket_data_index : sm.bucket_data_index + sm.size]

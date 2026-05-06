@@ -250,15 +250,27 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "enable_unshard_prefetch": ddp_config.overlap_param_gather,
             "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
         }
+        if self.ddp_config.calculate_per_token_loss:
+            gradient_scaling_factor = None
+            expert_gradient_scaling_factor = None
+        elif self.ddp_config.average_in_collective:
+            dp_world_size = pg_collection.dp.size()
+            expt_dp_world_size = pg_collection.expt_dp.size()
+            gradient_scaling_factor = 1.0
+            expert_gradient_scaling_factor = expt_dp_world_size / dp_world_size
+        else:
+            dp_world_size = pg_collection.dp.size()
+            gradient_scaling_factor = 1.0 / dp_world_size
+            expert_gradient_scaling_factor = 1.0 / dp_world_size
 
         for m in module.modules():
             if isinstance(m, (TEGroupedMLP, SequentialMLP)):
-                fully_shard(m, mesh=edp_mesh, **kwargs)
+                fully_shard(m, mesh=edp_mesh, gradient_scaling_factor=expert_gradient_scaling_factor, **kwargs)
         if fsdp_unit_modules is not None:
             for m in module.modules():
                 if isinstance(m, tuple(fsdp_unit_modules)):
-                    fully_shard(m, mesh=dp_mesh, **kwargs)
-        fully_shard(module, mesh=dp_mesh, **kwargs)
+                    fully_shard(m, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
+        fully_shard(module, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
 
         # Per-module NaN checking is disabled by default on the fully_shard
         # path to avoid the per-parameter synchronization overhead on every
