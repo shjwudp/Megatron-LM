@@ -315,7 +315,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         """
         Load the state dictionary into the module.
         """
-        if self.ddp_config.use_fully_shard_api:
+        if getattr(self, 'ddp_config', None) is not None and self.ddp_config.use_fully_shard_api:
             super().load_state_dict(state_dict, strict=strict)
             return
 
@@ -548,7 +548,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         For the Megatron-FSDP path: calls synchronize_gradient_reduce and
         synchronize_param_gather.
         """
-        if self.ddp_config.use_fully_shard_api:
+        if getattr(self, 'ddp_config', None) is not None and self.ddp_config.use_fully_shard_api:
             ctx = self.module._fsdp_root_context
             torch.cuda.current_stream().wait_stream(ctx.ag_stream)
             torch.cuda.current_stream().wait_stream(ctx.rs_stream)
