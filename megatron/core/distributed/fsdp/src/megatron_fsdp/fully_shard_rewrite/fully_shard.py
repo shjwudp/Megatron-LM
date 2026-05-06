@@ -482,27 +482,37 @@ class FSDPModule(nn.Module):
         comparable with the baseline.
         """
         results = {}
+        dp_group = None
         for name, child in self.named_modules():
             if not isinstance(child, FSDPModule) or child is self:
                 continue
             module_results = {"param_norm": 0.0, "grad_norm": 0.0}
             for param_group in child._fsdp_param_groups:
+                if dp_group is None and param_group.dp_group is not None:
+                    dp_group = param_group.dp_group
                 # Param norm from dist_params (sharded views of weight buffer)
                 for dist_param in param_group.dist_params:
-                    module_results["param_norm"] += (
-                        dist_param._local_tensor.float().norm(p=2).item() ** 2
-                    )
+                    if dist_param._local_tensor.numel() > 0:
+                        module_results["param_norm"] += (
+                            dist_param._local_tensor.float().norm(p=2).item() ** 2
+                        )
                 # Grad norm from dist_grads (sharded views of gradient buffer)
                 for dist_grad in param_group.dist_grads:
-                    if dist_grad is not None:
+                    if dist_grad is not None and dist_grad._local_tensor.numel() > 0:
                         module_results["grad_norm"] += (
                             dist_grad._local_tensor.float().norm(p=2).item() ** 2
                         )
             results[name] = module_results
 
+        # Fallback: also check root's own param groups for dp_group
+        if dp_group is None:
+            for pg in self._fsdp_param_groups:
+                if pg.dp_group is not None:
+                    dp_group = pg.dp_group
+                    break
+
         # All-reduce norms across DP ranks to get global per-module norms
-        if self._fsdp_param_groups:
-            dp_group = self._fsdp_param_groups[0].dp_group
+        if dp_group is not None:
             for module_name in results:
                 for key in ("param_norm", "grad_norm"):
                     t = torch.tensor([results[module_name][key]], device="cuda")

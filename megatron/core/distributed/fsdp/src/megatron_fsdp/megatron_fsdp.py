@@ -1418,8 +1418,6 @@ class MegatronFSDP(torch.nn.Module):
         Returns a dict {module_name: {"param_norm": float, "grad_norm": float}}.
         The norms are globally reduced across DP ranks for direct comparison.
         """
-        from megatron.core.utils import to_local_if_dtensor
-
         results = {}
         pg_buffer = self.param_and_grad_buffer
         param_to_group = pg_buffer.param_to_param_group
@@ -1429,14 +1427,27 @@ class MegatronFSDP(torch.nn.Module):
             if not isinstance(module, tuple(self.fsdp_unit_modules)):
                 continue
             module_results = {"param_norm": 0.0, "grad_norm": 0.0}
-            for param in module.parameters(recurse=False):
+
+            # Walk all named params of the root module and pick those under
+            # this FSDP unit.  Using self.param_to_name (identity -> name)
+            # and self.module.named_parameters() to get the original params.
+            for full_name, param in self.module.named_parameters():
+                if not full_name.startswith(module_name + "."):
+                    continue
                 if not param.requires_grad:
                     continue
-                # Param norm from local shard
-                local_param = to_local_if_dtensor(param)
-                module_results["param_norm"] += local_param.float().norm(p=2).item() ** 2
+                # Param norm: use _local_tensor for DTensors (same as
+                # calc_dtensor_params_l2_norm)
+                if hasattr(param, '_local_tensor'):
+                    local_param = param._local_tensor
+                else:
+                    local_param = param
+                if local_param.numel() > 0:
+                    module_results["param_norm"] += (
+                        local_param.float().norm(p=2).item() ** 2
+                    )
 
-                # Grad norm: look up the gradient in the buffer
+                # Grad norm: look up in the param_and_grad_buffer
                 if param in param_to_group:
                     group = pg_buffer.parameter_groups[param_to_group[param]]
                     if group.requires_grad:
@@ -1446,14 +1457,14 @@ class MegatronFSDP(torch.nn.Module):
                             else group.main_grad_buffer
                         )
                         if gbuf is not None and hasattr(gbuf, 'data') and gbuf.data is not None:
-                            local_grad = gbuf.get_item(group.param_idx[param], only_shard=True)
+                            item_id = group.param_idx[param]
+                            local_grad = gbuf.get_item(item_id, only_shard=True)
                             if local_grad.numel() > 0:
                                 module_results["grad_norm"] += (
                                     local_grad.float().norm(p=2).item() ** 2
                                 )
             results[module_name] = module_results
 
-        # All-reduce norms across DP ranks
         for module_name in results:
             for key in ("param_norm", "grad_norm"):
                 t = torch.tensor([results[module_name][key]], device="cuda")
