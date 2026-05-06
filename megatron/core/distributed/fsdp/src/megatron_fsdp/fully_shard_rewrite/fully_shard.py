@@ -254,6 +254,9 @@ class FSDPModule(nn.Module):
         ctx = self._fsdp_root_context
         stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
 
+        if async_op:
+            stream.wait_stream(torch.cuda.current_stream())  # Ensure ordering with main
+
         # Unshard this module and optionally prefetch next modules in the forward/backward pass
         if async_op:
             prefetch_modules = self._get_prefetch_next_modules(bwd_pass=bwd_pass)
@@ -273,7 +276,7 @@ class FSDPModule(nn.Module):
                         ).any(), f"NaN detected in dist param for parameter {name}"
 
                 with torch.cuda.stream(stream):
-                    param_group.unshard(async_op=async_op)
+                    param_group.unshard()
 
             # Record event to track when unshard is done for this module
             if async_op:
@@ -292,9 +295,9 @@ class FSDPModule(nn.Module):
 
             # Optional NaN checking for debugging
             # FIXME: Need cuda synchronization before checking for NaN to ensure data is ready.
-            # if getattr(self, "_enable_nan_checks", False):
-            #     for name, param in zip(param_names, param_group.params):
-            #         assert not torch.isnan(param).any(), f"NaN detected in parameter {name}"
+            if getattr(self, "_enable_nan_checks", False):
+                for name, param in zip(param_names, param_group.params):
+                    assert not torch.isnan(param).any(), f"NaN detected in parameter {name}"
 
         torch.cuda.nvtx.range_pop()
 
@@ -386,10 +389,9 @@ class FSDPModule(nn.Module):
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
                     param_group.reduce_grad()
-                    event = torch.cuda.Event()
-                    event.record()
 
-                    ctx.reduce_grad_buckets[id(self)].append((event, param_group))
+                event = stream.record_event()
+                ctx.reduce_grad_buckets[id(self)].append((event, param_group))
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
