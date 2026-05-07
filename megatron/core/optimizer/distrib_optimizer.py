@@ -2698,7 +2698,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Under the hood, either launch synchronous param all-gathers or get ready to launch
         asynchorous all-gathers that get overlapped with the next forward pass.
         """
+        for param_group in self.optimizer.param_groups:
+            for param in param_group["params"]:
+                name = getattr(param, "_unique_name", None)
+                if torch.distributed.get_rank() == 0:
+                    print(
+                        f"Before optimizer step, param {name} has grad norm {param.grad._local_tensor.norm()}"
+                    )
         update_successful = super().step_with_ready_grads()
+        for param_group in self.optimizer.param_groups:
+            for param in param_group["params"]:
+                name = getattr(param, "_unique_name", None)
+                if torch.distributed.get_rank() == 0:
+                    print(
+                        f"After optimizer step, param {name} has param norm {param._local_tensor.norm()}"
+                    )
 
         timers = self.config.timers
         if timers is not None:

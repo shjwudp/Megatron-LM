@@ -100,6 +100,14 @@ def fully_shard(
     )
     module._init_param_main_grad_func()
 
+    for name, child in module.named_modules():
+        if not isinstance(child, FSDPModule):
+            continue
+        for param_names, param_group in child._named_param_groups:
+            for pname, dist_param in zip(param_names, param_group.dist_params):
+                unique_name = f"{name}.{pname}" if name else pname
+                setattr(dist_param, "_unique_name", unique_name)
+
     # Register hooks for unshard/reshard during forward/backward
     _register_forward_pre_hook(module)
     _register_forward_hook(module)
@@ -399,9 +407,6 @@ class FSDPModule(nn.Module):
             # zero or overwrite main_grad; the dummy .grad tensor (set by layers.py to keep
             # backprop hooks on the main thread) should simply be discarded.
             for name, param in zip(param_names, param_group.params):
-                if torch.distributed.get_rank() == 0:
-                    print(f"[rank0] reduce_grad for param {name} grad shape={param.grad.shape if param.grad is not None else None} ")
-
                 main_grad = param.get_main_grad()
                 if getattr(param, 'grad_added_to_main_grad', False):
                     if param.grad is not None:
@@ -459,6 +464,19 @@ class FSDPModule(nn.Module):
                 for dist_grad in param_group.dist_grads:
                     dist_grad._local_tensor.mul_(scaling_factor)
 
+        for name, child in self.named_modules():
+            if not isinstance(child, FSDPModule):
+                continue
+
+            for param_names, param_group in child._named_param_groups:
+                for pname, param in zip(param_names, param_group.dist_params):
+                    full_name = f"{name}.{pname}" if name else pname
+                    if "layers.0.self_attention.linear_qkv.layer_norm_weight" in full_name:
+                        torch.distributed.barrier()  # Sync before printing for readability
+                        rank = torch.distributed.get_rank()
+                        import time; time.sleep(0.01 * rank)
+                        print(f"[DEBUG grad scaling] rank={rank} param={full_name} grad_nz_before={torch.count_nonzero(param.grad._local_tensor).item()}")
+
     def _zero_grad_buffer(self):
         """Zero the gradient buffer for all parameter groups."""
         for _, child in self.named_modules():
@@ -497,18 +515,6 @@ class FSDPModule(nn.Module):
                               f"mw_min={mw.min().item():.6f} mw_max={mw.max().item():.6f} | "
                               f"w_nel={w.numel()} w_nz={torch.count_nonzero(w).item()} "
                               f"w_min={w.min().item():.6f} w_max={w.max().item():.6f}")
-
-        # Also zero main grads to avoid stale gradients after weight copy
-        self._zero_main_grads()
-
-    def _zero_main_grads(self):
-        """Zero the main gradient buffer for all parameter groups."""
-        for _, child in self.named_modules():
-            if not isinstance(child, FSDPModule):
-                continue
-            for param_group in child._fsdp_param_groups:
-                if param_group.main_grad_buffer is not None:
-                    param_group.main_grad_buffer.data.zero_()
 
     def _compute_per_param_norms(self) -> Dict[str, Dict[str, float]]:
         """

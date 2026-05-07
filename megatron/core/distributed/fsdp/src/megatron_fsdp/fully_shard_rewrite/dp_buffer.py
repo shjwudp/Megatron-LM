@@ -281,6 +281,18 @@ class DataParallelBuffer:
         if shard.numel() > 0:
             shard.data.copy_(item_data.flatten())
 
+        # Debug: trace set_item for small params
+        if item_id in (1, 3) and item_data.numel() <= 4096:
+            idx = self.buffer_index.item_index_map[item_id]
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+            print(f"[DEBUG set_item] rank={rank} item_id={item_id} "
+                  f"g_off={idx.global_data_index} sz={idx.size} "
+                  f"slice=({slice_start},{slice_end}) "
+                  f"local=({local_start},{local_end}) "
+                  f"shard_nel={shard.numel()} "
+                  f"data_nz={torch.count_nonzero(item_data).item()} "
+                  f"data_min={item_data.min().item():.6f} data_max={item_data.max().item():.6f}")
+
     def get_item(self, item_id: int, only_shard: bool = False) -> torch.Tensor:
         """Read a parameter tensor (or its shard) from the buffer."""
         if only_shard:

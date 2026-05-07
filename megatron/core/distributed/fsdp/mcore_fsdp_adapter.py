@@ -800,41 +800,34 @@ def _debug_grad(module):
 
 
 def _debug_init_buf(module):
-    """Check buffer data for layer_norm_weight params right after FSDP init."""
+    """Check buffer data and data_ptr offsets for layer_norm_weight params."""
     from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import FSDPModule
 
     for name, child in module.named_modules():
         if not isinstance(child, FSDPModule) or "layers.0" not in name:
             continue
         for param_names, param_group in child._named_param_groups:
-            wbuf = param_group.model_weight_buffer
-            mwbuf = param_group.main_weight_buffer
             for pname, param in zip(param_names, param_group.params):
                 if "layer_norm_weight" not in pname:
                     continue
                 idx = param_group.param_idx[param]
-                ii = wbuf.buffer_index.item_index_map[idx]
-                dp = param_group.dist_params[idx]
+                ii = param_group.main_weight_buffer.buffer_index.item_index_map[idx]
                 rank = torch.distributed.get_rank()
-                dp_ptr = dp._local_tensor.data_ptr()
-                w_ptr = wbuf.data.data_ptr() if wbuf else 0
-                mw_ptr = mwbuf.data.data_ptr() if mwbuf else 0
-                w_end = w_ptr + wbuf.data.numel() * 2 if wbuf else 0
-                mw_end = mw_ptr + mwbuf.data.numel() * 4 if mwbuf else 0
-                dp_in_mw = mw_ptr <= dp_ptr < mw_end if mwbuf else False
-                dp_in_w = w_ptr <= dp_ptr < w_end if wbuf else False
-                # read via get_item
-                bf16 = wbuf.get_item(idx, only_shard=True) if wbuf else None
-                fp32 = mwbuf.get_item(idx, only_shard=True) if mwbuf else None
+                mwbuf = param_group.main_weight_buffer
+
+                # Direct read at global offset via get_item (handles local/global correctly)
+                data = mwbuf.get_item(idx, only_shard=True)
+                # Also read via dist_param
+                dp = param_group.dist_params[idx]
+
                 torch.distributed.barrier()
                 import time; time.sleep(0.01 * rank)
-                print(f"[DEBUG init] rank={rank} {name}.{pname} "
-                      f"g_off={ii.global_data_index} sz={ii.size} "
-                      f"dp_ptr={dp_ptr:#x} dp_in_mw={dp_in_mw} dp_in_w={dp_in_w} "
-                      f"w_range=[{w_ptr:#x},{w_end:#x}] "
-                      f"mw_range=[{mw_ptr:#x},{mw_end:#x}] "
-                      f"bf16_nz={torch.count_nonzero(bf16).item() if bf16 is not None and bf16.numel() > 0 else 0} "
-                      f"fp32_nz={torch.count_nonzero(fp32).item() if fp32 is not None and fp32.numel() > 0 else 0}")
+
+                if data.numel() > 0:
+                    print(f"[DEBUG init2] rank={rank} {pname} g_off={ii.global_data_index} sz={ii.size} "
+                          f"get_item_nel={data.numel()} get_item_nz={torch.count_nonzero(data).item()} "
+                          f"dp_nel={dp._local_tensor.numel()} dp_nz={torch.count_nonzero(dp._local_tensor).item()} "
+                          f"dp_is_mw={mwbuf.data.data_ptr() <= dp._local_tensor.data_ptr() < mwbuf.data.data_ptr() + mwbuf.data.numel() * 4}")
             break
         break
 
