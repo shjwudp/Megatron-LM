@@ -475,7 +475,7 @@ class FSDPModule(nn.Module):
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
-        for _, child in self.named_modules():
+        for name, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue
             for param_names, param_group in child._named_param_groups:
@@ -492,7 +492,7 @@ class FSDPModule(nn.Module):
                     w = param_group.model_weight_buffer.get_item(idx, only_shard=True)
                     rank = torch.distributed.get_rank()
                     if mw.numel() > 0 or w.numel() > 0:
-                        print(f"[DEBUG copy_mw] rank={rank} param={pname} "
+                        print(f"[DEBUG copy_mw] rank={rank} param={name}.{pname} "
                               f"mw_nel={mw.numel()} mw_nz={torch.count_nonzero(mw).item()} "
                               f"mw_min={mw.min().item():.6f} mw_max={mw.max().item():.6f} | "
                               f"w_nel={w.numel()} w_nz={torch.count_nonzero(w).item()} "

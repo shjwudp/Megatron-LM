@@ -815,23 +815,26 @@ def _debug_init_buf(module):
                 idx = param_group.param_idx[param]
                 ii = wbuf.buffer_index.item_index_map[idx]
                 dp = param_group.dist_params[idx]
+                rank = torch.distributed.get_rank()
+                dp_ptr = dp._local_tensor.data_ptr()
                 w_ptr = wbuf.data.data_ptr() if wbuf else 0
                 mw_ptr = mwbuf.data.data_ptr() if mwbuf else 0
-                dp_ptr = dp._local_tensor.data_ptr()
-                rank = torch.distributed.get_rank()
+                w_end = w_ptr + wbuf.data.numel() * 2 if wbuf else 0
+                mw_end = mw_ptr + mwbuf.data.numel() * 4 if mwbuf else 0
+                dp_in_mw = mw_ptr <= dp_ptr < mw_end if mwbuf else False
+                dp_in_w = w_ptr <= dp_ptr < w_end if wbuf else False
+                # read via get_item
+                bf16 = wbuf.get_item(idx, only_shard=True) if wbuf else None
+                fp32 = mwbuf.get_item(idx, only_shard=True) if mwbuf else None
                 torch.distributed.barrier()
                 import time; time.sleep(0.01 * rank)
-                bf16 = wbuf.get_item(idx, only_shard=True)
-                fp32 = mwbuf.get_item(idx, only_shard=True) if mwbuf else None
-                def _s(t, label):
-                    if t is None or t.numel() == 0:
-                        return f"{label}=empty"
-                    return f"{label}_nz={torch.count_nonzero(t).item()} min={t.min().item():.6f} max={t.max().item():.6f}"
-                print(f"[DEBUG init] rank={rank} param={name}.{pname} g_off={ii.global_data_index} sz={ii.size} | "
-                      f"{_s(bf16, 'bf16')} | {_s(fp32, 'fp32')} | "
-                      f"dp_ptr={dp_ptr:#x} w_ptr={w_ptr:#x} mw_ptr={mw_ptr:#x} "
-                      f"dp_in_mw={(mw_ptr <= dp_ptr < mw_ptr + mwbuf.data.numel() * 4) if mwbuf else False} "
-                      f"dp_in_w={(w_ptr <= dp_ptr < w_ptr + wbuf.data.numel() * 2) if wbuf else False}")
+                print(f"[DEBUG init] rank={rank} {name}.{pname} "
+                      f"g_off={ii.global_data_index} sz={ii.size} "
+                      f"dp_ptr={dp_ptr:#x} dp_in_mw={dp_in_mw} dp_in_w={dp_in_w} "
+                      f"w_range=[{w_ptr:#x},{w_end:#x}] "
+                      f"mw_range=[{mw_ptr:#x},{mw_end:#x}] "
+                      f"bf16_nz={torch.count_nonzero(bf16).item() if bf16 is not None and bf16.numel() > 0 else 0} "
+                      f"fp32_nz={torch.count_nonzero(fp32).item() if fp32 is not None and fp32.numel() > 0 else 0}")
             break
         break
 
