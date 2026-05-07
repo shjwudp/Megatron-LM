@@ -297,7 +297,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             reduced before the optimizer step.
             """
             ctx = self.module._fsdp_root_context
-            ctx.rs_stream.wait()
+            torch.cuda.current_stream().wait_stream(ctx.rs_stream)
 
         def synchronize_param_gather():
             """
@@ -307,7 +307,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             gathered before the forward pass.
             """
             ctx = self.module._fsdp_root_context
-            ctx.ag_stream.wait()
+            torch.cuda.current_stream().wait_stream(ctx.ag_stream)
 
         from unittest.mock import Mock
 
@@ -335,7 +335,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         """
         Load the state dictionary into the module.
         """
-        if getattr(self, 'ddp_config', None) is not None and self.ddp_config.use_fully_shard_api:
+        if self.ddp_config.use_fully_shard_api:
             super().load_state_dict(state_dict, strict=strict)
             return
 
@@ -568,7 +568,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         For the Megatron-FSDP path: calls synchronize_gradient_reduce and
         synchronize_param_gather.
         """
-        if getattr(self, 'ddp_config', None) is not None and self.ddp_config.use_fully_shard_api:
+        if self.ddp_config.use_fully_shard_api:
             ctx = self.module._fsdp_root_context
             torch.cuda.current_stream().wait_stream(ctx.ag_stream)
             torch.cuda.current_stream().wait_stream(ctx.rs_stream)
