@@ -478,10 +478,25 @@ class FSDPModule(nn.Module):
         for _, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue
-            for param_group in child._fsdp_param_groups:
+            for param_names, param_group in child._named_param_groups:
                 if param_group.main_weight_buffer is None:
                     continue
                 param_group.model_weight_buffer.data.copy_(param_group.main_weight_buffer.data)
+
+                # Debug: verify main→model copy for layer_norm_weight
+                for pname, param in zip(param_names, param_group.params):
+                    if "layer_norm_weight" not in pname:
+                        continue
+                    idx = param_group.param_idx[param]
+                    mw = param_group.main_weight_buffer.get_item(idx, only_shard=True)
+                    w = param_group.model_weight_buffer.get_item(idx, only_shard=True)
+                    rank = torch.distributed.get_rank()
+                    if mw.numel() > 0 or w.numel() > 0:
+                        print(f"[DEBUG copy_mw] rank={rank} param={pname} "
+                              f"mw_nel={mw.numel()} mw_nz={torch.count_nonzero(mw).item()} "
+                              f"mw_min={mw.min().item():.6f} mw_max={mw.max().item():.6f} | "
+                              f"w_nel={w.numel()} w_nz={torch.count_nonzero(w).item()} "
+                              f"w_min={w.min().item():.6f} w_max={w.max().item():.6f}")
 
         # Also zero main grads to avoid stale gradients after weight copy
         self._zero_main_grads()

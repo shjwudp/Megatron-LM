@@ -299,6 +299,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
             ctx = self.module._fsdp_root_context
             torch.cuda.current_stream().wait_stream(ctx.rs_stream)
 
+            # Debug: check layer_norm_weight grads before optimizer step
+            _debug_grad(self.module)
+
         def synchronize_param_gather():
             """
             For the fully_shard API path, this is a no-op since parameter synchronization
@@ -766,6 +769,34 @@ def _check_mesh_ranks_and_group_ranks_are_consistent(mesh_ranks, group_ranks):
         f"{mesh_ranks.tolist()} does not match the group ranks {group_ranks}."
     )
     return sorted(current_ranks[0]) == sorted(group_ranks)
+
+
+def _debug_grad(module):
+    """Check layer_norm_weight grads (all ranks)."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import FSDPModule
+
+    for name, child in module.named_modules():
+        if not isinstance(child, FSDPModule) or "layers.0" not in name:
+            continue
+        for param_names, param_group in child._named_param_groups:
+            for pname, dist_param, dist_grad in zip(
+                param_names, param_group.dist_params, param_group.dist_grads
+            ):
+                if "layer_norm_weight" not in pname:
+                    continue
+                rank = torch.distributed.get_rank()
+                p_nel = dist_param._local_tensor.numel()
+                g_nel = dist_grad._local_tensor.numel() if dist_grad is not None else 0
+                g_nz = torch.count_nonzero(dist_grad._local_tensor).item() if dist_grad is not None and dist_grad._local_tensor.numel() > 0 else 0
+                dg_nel = dist_param.grad._local_tensor.numel() if dist_param.grad is not None else 0
+                dg_nz = torch.count_nonzero(dist_param.grad._local_tensor).item() if dist_param.grad is not None and dist_param.grad._local_tensor.numel() > 0 else 0
+                torch.distributed.barrier()
+                import time; time.sleep(0.01 * rank)
+                print(f"[DEBUG grad_sync] rank={rank} param={name}.{pname} "
+                      f"p_nel={p_nel} dg_nel={dg_nel} dg_nz={dg_nz} "
+                      f"dist_g_nel={g_nel} dist_g_nz={g_nz}")
+            break
+        break
 
 
 def _debug_init_buf(module):
