@@ -493,13 +493,11 @@ class FSDPModule(nn.Module):
         The norms are globally reduced across DP ranks.
         """
         results = {}
-        dp_group = None
         for name, child in self.named_modules():
-            if not isinstance(child, FSDPModule) or child is self:
+            if not isinstance(child, FSDPModule):
                 continue
             for param_names, param_group in child._named_param_groups:
-                if dp_group is None and param_group.dp_group is not None:
-                    dp_group = param_group.dp_group
+                dp_group = param_group.dp_group
                 for pname, dist_param, dist_grad in zip(
                     param_names, param_group.dist_params, param_group.dist_grads
                 ):
@@ -513,19 +511,12 @@ class FSDPModule(nn.Module):
                         results[full_name]["grad_norm"] = (
                             dist_grad._local_tensor.float().norm(p=2).item() ** 2
                         )
-
-        if dp_group is None:
-            for pg in self._fsdp_param_groups:
-                if pg.dp_group is not None:
-                    dp_group = pg.dp_group
-                    break
-
-        if dp_group is not None:
-            for param_name in results:
-                for key in ("param_norm", "grad_norm"):
-                    t = torch.tensor([results[param_name][key]], device="cuda")
-                    torch.distributed.all_reduce(t, group=dp_group)
-                    results[param_name][key] = t.sqrt().item()
+                    # Reduce each parameter's local squared-norm across its DP group
+                    if dp_group is not None:
+                        for key in ("param_norm", "grad_norm"):
+                            t = torch.tensor([results[full_name][key]], device="cuda")
+                            torch.distributed.all_reduce(t, group=dp_group)
+                            results[full_name][key] = t.sqrt().item()
         return results
 
     def _log_per_param_norms(self, iteration: int, prefix: str = ""):

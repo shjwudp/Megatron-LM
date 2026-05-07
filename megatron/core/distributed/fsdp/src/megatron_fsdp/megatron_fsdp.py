@@ -1421,7 +1421,6 @@ class MegatronFSDP(torch.nn.Module):
         results = {}
         pg_buffer = self.param_and_grad_buffer
         param_to_group = pg_buffer.param_to_param_group
-        dp_group = self.dist_index.get_dp_group(is_expert_parallel=False)
 
         for full_name, param in self.module.named_parameters():
             if not param.requires_grad:
@@ -1437,6 +1436,7 @@ class MegatronFSDP(torch.nn.Module):
                     local_param.float().norm(p=2).item() ** 2
                 )
 
+            dp_group = None
             if param in param_to_group:
                 group = pg_buffer.parameter_groups[param_to_group[param]]
                 if group.requires_grad:
@@ -1446,6 +1446,7 @@ class MegatronFSDP(torch.nn.Module):
                         else group.main_grad_buffer
                     )
                     if gbuf is not None and hasattr(gbuf, 'data') and gbuf.data is not None:
+                        dp_group = gbuf.data_parallel_group
                         item_id = group.param_idx[param]
                         local_grad = gbuf.get_item(item_id, only_shard=True)
                         if local_grad.numel() > 0:
@@ -1453,11 +1454,14 @@ class MegatronFSDP(torch.nn.Module):
                                 local_grad.float().norm(p=2).item() ** 2
                             )
 
-        for param_name in results:
-            for key in ("param_norm", "grad_norm"):
-                t = torch.tensor([results[param_name][key]], device="cuda")
-                torch.distributed.all_reduce(t, group=dp_group)
-                results[param_name][key] = t.sqrt().item()
+            # All-reduce per-parameter squared norms across its DP group
+            default_dp = self.dist_index.get_dp_group(is_expert_parallel=False)
+            reduce_group = dp_group if dp_group is not None else default_dp
+            if reduce_group is not None:
+                for key in ("param_norm", "grad_norm"):
+                    t = torch.tensor([results[full_name][key]], device="cuda")
+                    torch.distributed.all_reduce(t, group=reduce_group)
+                    results[full_name][key] = t.sqrt().item()
         return results
 
     def _log_per_param_norms(self, iteration: int, prefix: str = ""):
