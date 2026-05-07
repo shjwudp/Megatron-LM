@@ -485,65 +485,59 @@ class FSDPModule(nn.Module):
                 if param_group.main_grad_buffer is not None:
                     param_group.main_grad_buffer.data.zero_()
 
-    def _compute_per_module_norms(self) -> Dict[str, Dict[str, float]]:
+    def _compute_per_param_norms(self) -> Dict[str, Dict[str, float]]:
         """
-        Compute per-FSDP-module param and gradient L2 norms.
+        Compute per-parameter L2 norms for params and grads.
 
-        Returns a dict {module_name: {"param_norm": float, "grad_norm": float}}.
-        The norms are globally reduced across DP ranks so they are directly
-        comparable with the baseline.
+        Returns a dict {param_name: {"param_norm": float, "grad_norm": float}}.
+        The norms are globally reduced across DP ranks.
         """
         results = {}
         dp_group = None
         for name, child in self.named_modules():
             if not isinstance(child, FSDPModule) or child is self:
                 continue
-            module_results = {"param_norm": 0.0, "grad_norm": 0.0}
-            for param_group in child._fsdp_param_groups:
+            for param_names, param_group in child._named_param_groups:
                 if dp_group is None and param_group.dp_group is not None:
                     dp_group = param_group.dp_group
-                # Param norm from dist_params (sharded views of weight buffer)
-                for dist_param in param_group.dist_params:
+                for pname, dist_param, dist_grad in zip(
+                    param_names, param_group.dist_params, param_group.dist_grads
+                ):
+                    full_name = f"{name}.{pname}" if name else pname
+                    results[full_name] = {"param_norm": 0.0, "grad_norm": 0.0}
                     if dist_param._local_tensor.numel() > 0:
-                        module_results["param_norm"] += (
+                        results[full_name]["param_norm"] = (
                             dist_param._local_tensor.float().norm(p=2).item() ** 2
                         )
-                # Grad norm from dist_grads (sharded views of gradient buffer)
-                for dist_grad in param_group.dist_grads:
                     if dist_grad is not None and dist_grad._local_tensor.numel() > 0:
-                        module_results["grad_norm"] += (
+                        results[full_name]["grad_norm"] = (
                             dist_grad._local_tensor.float().norm(p=2).item() ** 2
                         )
-            results[name] = module_results
 
-        # Fallback: also check root's own param groups for dp_group
         if dp_group is None:
             for pg in self._fsdp_param_groups:
                 if pg.dp_group is not None:
                     dp_group = pg.dp_group
                     break
 
-        # All-reduce norms across DP ranks to get global per-module norms
         if dp_group is not None:
-            for module_name in results:
+            for param_name in results:
                 for key in ("param_norm", "grad_norm"):
-                    t = torch.tensor([results[module_name][key]], device="cuda")
+                    t = torch.tensor([results[param_name][key]], device="cuda")
                     torch.distributed.all_reduce(t, group=dp_group)
-                    results[module_name][key] = t.sqrt().item()
+                    results[param_name][key] = t.sqrt().item()
         return results
 
-    def _log_per_module_norms(self, iteration: int, prefix: str = ""):
-        """Log per-FSDP-module param and gradient norms via print."""
-        norms = self._compute_per_module_norms()
-        rank = torch.distributed.get_rank()
-        for module_name in sorted(norms.keys()):
-            p_norm = norms[module_name]["param_norm"]
-            g_norm = norms[module_name]["grad_norm"]
-            if torch.distributed.get_rank() == 0:
-                print(
-                    f"[RANK {rank}] {prefix} iter={iteration} "
-                    f"module={module_name} param_norm={p_norm:.6f} grad_norm={g_norm:.6f}"
-                )
+    def _log_per_param_norms(self, iteration: int, prefix: str = ""):
+        """Log per-parameter param and gradient L2 norms via print (rank 0 only)."""
+        if torch.distributed.get_rank() != 0:
+            return
+        norms = self._compute_per_param_norms()
+        for param_name in sorted(norms.keys()):
+            pn = norms[param_name]["param_norm"]
+            gn = norms[param_name]["grad_norm"]
+            print(f"{prefix} iter={iteration} param={param_name} "
+                  f"param_norm={pn:.6f} grad_norm={gn:.6f}")
 
     def _print_fsdp_config(self):
         """Print FSDP configuration for debugging (dp_group, mesh, buffer layouts)."""
@@ -607,7 +601,7 @@ class FSDPModule(nn.Module):
         gid = 0
 
         for name, child in self.named_modules():
-            if not isinstance(child, FSDPModule) or child is self:
+            if not isinstance(child, FSDPModule):
                 continue
             for param_names, param_group in child._named_param_groups:
                 numel = sum(p.numel() for p in param_group.params)

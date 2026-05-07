@@ -197,8 +197,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.finish_grad_sync = self.module.finish_grad_sync
         self.scale_gradients = self.module.scale_gradients
         self.zero_grad_buffer = self.module.zero_grad_buffer
-        self.log_per_module_norms = self.module._log_per_module_norms
-        self.compute_per_module_norms = self.module._compute_per_module_norms
+        self.log_per_param_norms = self.module._log_per_param_norms
+        self.compute_per_param_norms = self.module._compute_per_param_norms
         self.broadcast_params = self.module.broadcast_params
         self.synchronize_param_gather = self.module.synchronize_param_gather
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
@@ -323,8 +323,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.finish_grad_sync = finish_grad_sync
         self.scale_gradients = self.module._scale_gradients
         self.zero_grad_buffer = self.module._zero_grad_buffer
-        self.log_per_module_norms = self.module._log_per_module_norms
-        self.compute_per_module_norms = self.module._compute_per_module_norms
+        self.log_per_param_norms = self.module._log_per_param_norms
+        self.compute_per_param_norms = self.module._compute_per_param_norms
         self.print_fsdp_config = self.module._print_fsdp_config
         self.log_parameter_groups = self.module._log_parameter_groups
         self.broadcast_params = not_implemented_op

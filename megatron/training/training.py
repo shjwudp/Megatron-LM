@@ -3169,8 +3169,8 @@ def train(
             model_chunks = model if isinstance(model, list) else [model]
             for model_chunk in model_chunks:
                 try:
-                    if hasattr(model_chunk, 'log_per_module_norms'):
-                        model_chunk.log_per_module_norms(iteration, prefix="[PER-LAYER]")
+                    if hasattr(model_chunk, 'log_per_param_norms'):
+                        model_chunk.log_per_param_norms(iteration, prefix="[PER-PARAM]")
                 except Exception as e:
                     print(f"[PER-LAYER] logging failed for {model_chunk}: {e}")
         if optimizer is not None:
