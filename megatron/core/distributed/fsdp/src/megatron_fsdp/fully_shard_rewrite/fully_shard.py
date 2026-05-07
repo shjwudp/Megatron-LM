@@ -508,14 +508,17 @@ class FSDPModule(nn.Module):
                 continue
             for param_names, param_group in child._named_param_groups:
                 dp_group = param_group.dp_group
+                dp_ranks = torch.distributed.get_process_group_ranks(dp_group) if dp_group is not None else []
                 for pname, dist_param, dist_grad in zip(
                     param_names, param_group.dist_params, param_group.dist_grads
                 ):
                     full_name = f"{name}.{pname}" if name else pname
-                    pn = dist_param._local_tensor.float().norm(p=2).item() ** 2
+                    local_nel = dist_param._local_tensor.numel()
+                    pn = dist_param._local_tensor.float().norm(p=2).item() ** 2 if local_nel > 0 else 0.0
                     gn = 0.0
                     if dist_grad is not None:
-                        gn = dist_grad._local_tensor.float().norm(p=2).item() ** 2
+                        local_gnel = dist_grad._local_tensor.numel()
+                        gn = dist_grad._local_tensor.float().norm(p=2).item() ** 2 if local_gnel > 0 else 0.0
                     results[full_name] = {"param_norm": pn, "grad_norm": gn}
 
                     # Reduce per-parameter local squared-norm across its DP group
@@ -524,11 +527,51 @@ class FSDPModule(nn.Module):
                             t = torch.tensor([val], device="cuda")
                             torch.distributed.all_reduce(t, group=dp_group)
                             results[full_name][key] = t.sqrt().item()
+
+                    # Debug: log for known-zero params (first occurrence per rank)
+                    if "layer_norm_weight" in pname and full_name.count("layers.0.") > 0:
+                        torch.distributed.barrier()  # Sync before printing for readability
+                        import time
+                        rank = torch.distributed.get_rank()
+                        time.sleep(0.01 * rank)  # Stagger prints by rank for readability
+                        print(f"[DEBUG norm] rank={rank} param={full_name} "
+                              f"local_nel={local_nel} local_norm2={pn:.6f} "
+                              f"global_norm={results[full_name]['param_norm']:.6f} "
+                              f"dp_ranks={dp_ranks}")
         return results
 
     def _log_per_param_norms(self, iteration: int, prefix: str = ""):
         """Log per-parameter param and gradient L2 norms via print (rank 0 only)."""
+        # Compute first (all ranks participate in all_reduce)
         norms = self._compute_per_param_norms()
+
+        # Debug: dump buffer data for first layer_norm_weight (all ranks, one specified layer)
+        for name, child in self.named_modules():
+            if not isinstance(child, FSDPModule) or "layers.0" not in name:
+                continue
+            for param_names, param_group in child._named_param_groups:
+                wbuf = param_group.model_weight_buffer
+                mwbuf = param_group.main_weight_buffer
+                for pname, param in zip(param_names, param_group.params):
+                    if "linear_qkv.layer_norm_weight" in pname:
+                        idx = param_group.param_idx[param]
+                        ii = wbuf.buffer_index.item_index_map[idx]
+                        rank = torch.distributed.get_rank()
+                        torch.distributed.barrier()
+                        import time; time.sleep(0.01 * rank)
+                        gi = wbuf.get_item(idx, only_shard=True)
+                        mwgi = mwbuf.get_item(idx, only_shard=True) if mwbuf else None
+                        dp = param_group.dist_params[idx]
+                        def _fmt(t, label):
+                            if t is None or t.numel() == 0:
+                                return f"{label}=empty"
+                            return f"{label}_nel={t.numel()} nz={torch.count_nonzero(t).item()} min={t.min().item():.8f} max={t.max().item():.8f}"
+                        print(f"[DEBUG buf] rank={rank} iter={iteration} param={name}.{pname} "
+                              f"g_offset={ii.global_data_index} size={ii.size} "
+                              f"{_fmt(gi, 'buf')} | {_fmt(mwgi, 'mwbuf')} | {_fmt(dp._local_tensor, 'dist')}")
+                break
+            break
+
         if torch.distributed.get_rank() != 0:
             return
         for param_name in sorted(norms.keys()):
@@ -541,7 +584,7 @@ class FSDPModule(nn.Module):
         """Print FSDP configuration for debugging (dp_group, mesh, buffer layouts)."""
         rank = torch.distributed.get_rank()
         for name, child in self.named_modules():
-            if not isinstance(child, FSDPModule) or child is self:
+            if not isinstance(child, FSDPModule):
                 continue
             for pg in child._fsdp_param_groups:
                 dp_size = torch.distributed.get_world_size(pg.dp_group)
@@ -564,6 +607,9 @@ class FSDPModule(nn.Module):
                         f"shard_meta.size={gbuf.buffer_index.shard_meta.size} "
                         f"is_distributed={gbuf.is_distributed}"
                     )
+                torch.distributed.barrier()  # Sync before printing for readability
+                import time
+                time.sleep(0.01 * rank)  # Stagger prints by rank for readability
                 print(
                     f"[RANK {rank}] FSDP module={name} "
                     f"dp_group_size={dp_size} dp_group_rank={dp_rank} "

@@ -334,6 +334,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self.module._log_parameter_groups()
 
+        # Debug: verify buffer data immediately after init (before any training)
+        _debug_init_buf(self.module)
+
     def load_state_dict(self, state_dict, strict=True):
         """
         Load the state dictionary into the module.
@@ -763,6 +766,43 @@ def _check_mesh_ranks_and_group_ranks_are_consistent(mesh_ranks, group_ranks):
         f"{mesh_ranks.tolist()} does not match the group ranks {group_ranks}."
     )
     return sorted(current_ranks[0]) == sorted(group_ranks)
+
+
+def _debug_init_buf(module):
+    """Check buffer data for layer_norm_weight params right after FSDP init."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import FSDPModule
+
+    for name, child in module.named_modules():
+        if not isinstance(child, FSDPModule) or "layers.0" not in name:
+            continue
+        for param_names, param_group in child._named_param_groups:
+            wbuf = param_group.model_weight_buffer
+            mwbuf = param_group.main_weight_buffer
+            for pname, param in zip(param_names, param_group.params):
+                if "layer_norm_weight" not in pname:
+                    continue
+                idx = param_group.param_idx[param]
+                ii = wbuf.buffer_index.item_index_map[idx]
+                dp = param_group.dist_params[idx]
+                w_ptr = wbuf.data.data_ptr() if wbuf else 0
+                mw_ptr = mwbuf.data.data_ptr() if mwbuf else 0
+                dp_ptr = dp._local_tensor.data_ptr()
+                rank = torch.distributed.get_rank()
+                torch.distributed.barrier()
+                import time; time.sleep(0.01 * rank)
+                bf16 = wbuf.get_item(idx, only_shard=True)
+                fp32 = mwbuf.get_item(idx, only_shard=True) if mwbuf else None
+                def _s(t, label):
+                    if t is None or t.numel() == 0:
+                        return f"{label}=empty"
+                    return f"{label}_nz={torch.count_nonzero(t).item()} min={t.min().item():.6f} max={t.max().item():.6f}"
+                print(f"[DEBUG init] rank={rank} param={name}.{pname} g_off={ii.global_data_index} sz={ii.size} | "
+                      f"{_s(bf16, 'bf16')} | {_s(fp32, 'fp32')} | "
+                      f"dp_ptr={dp_ptr:#x} w_ptr={w_ptr:#x} mw_ptr={mw_ptr:#x} "
+                      f"dp_in_mw={(mw_ptr <= dp_ptr < mw_ptr + mwbuf.data.numel() * 4) if mwbuf else False} "
+                      f"dp_in_w={(w_ptr <= dp_ptr < w_ptr + wbuf.data.numel() * 2) if wbuf else False}")
+            break
+        break
 
 
 def _get_rng_state_dict():
