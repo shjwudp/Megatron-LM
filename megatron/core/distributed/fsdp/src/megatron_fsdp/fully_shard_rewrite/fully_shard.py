@@ -349,6 +349,22 @@ class FSDPModule(nn.Module):
         ctx.unshard_done_events[id(self)] = None  # Clear unshard event for this module
         torch.cuda.nvtx.range_pop()
 
+    def _wait_for_previous_async_reduce_grad(self):
+        """Wait for the previous async reduce_grad to complete before reducing gradients for this module."""
+        ctx = self._fsdp_root_context
+        if ctx.enable_async_reduce_grad:
+            return # No need to wait if async reduce_grad is not enabled
+        backward_order = list(reversed(ctx.forward_order))
+        for i, module in enumerate(backward_order):
+            if i - 2 >= 0:
+                buckets = ctx.reduce_grad_buckets[id(backward_order[i - 2])]
+                while len(buckets) > 0:
+                    event, param_group = buckets.pop()
+                    event.wait()
+                    param_group.release_grad_buffer()
+            if module is self:
+                break
+
     def reduce_grad(self, async_op: bool = False):
         """
         Reduce gradients across data-parallel ranks.
@@ -363,17 +379,7 @@ class FSDPModule(nn.Module):
         stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
 
         # Handle pending reduce events before this module to ensure memory is freed in a timely manner.
-        if async_op:
-            backward_order = list(reversed(ctx.forward_order))
-            for i, module in enumerate(backward_order):
-                if i - 2 >= 0:
-                    buckets = ctx.reduce_grad_buckets[id(backward_order[i - 2])]
-                    while len(buckets) > 0:
-                        event, param_group = buckets.pop()
-                        event.wait()
-                        param_group.release_grad_buffer()
-                if module is self:
-                    break
+        self._wait_for_previous_async_reduce_grad()
 
         # Perform reduction for this module
         for param_names, param_group in self._named_param_groups:
@@ -393,6 +399,9 @@ class FSDPModule(nn.Module):
             # zero or overwrite main_grad; the dummy .grad tensor (set by layers.py to keep
             # backprop hooks on the main thread) should simply be discarded.
             for name, param in zip(param_names, param_group.params):
+                if torch.distributed.get_rank() == 0:
+                    print(f"[rank0] reduce_grad for param {name} grad shape={param.grad.shape if param.grad is not None else None} ")
+
                 main_grad = param.get_main_grad()
                 if getattr(param, 'grad_added_to_main_grad', False):
                     if param.grad is not None:
@@ -409,9 +418,6 @@ class FSDPModule(nn.Module):
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
                     param_group.reduce_grad()
-
-                event = stream.record_event()
-                ctx.reduce_grad_buckets[id(self)].append((event, param_group))
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
@@ -426,6 +432,10 @@ class FSDPModule(nn.Module):
                     with torch.cuda.stream(stream):
                         dist_grad = dist_grad.to(dist_param.dtype)
                     setattr(dist_param, "grad", dist_grad)
+
+            if async_op:
+                event = stream.record_event()
+                ctx.reduce_grad_buckets[id(self)].append((event, param_group))
 
             # NaN check after reduction
             if getattr(self, "_enable_nan_checks", False):
