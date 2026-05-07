@@ -502,28 +502,25 @@ class FSDPModule(nn.Module):
                     param_names, param_group.dist_params, param_group.dist_grads
                 ):
                     full_name = f"{name}.{pname}" if name else pname
-                    results[full_name] = {"param_norm": 0.0, "grad_norm": 0.0}
-                    if dist_param._local_tensor.numel() > 0:
-                        results[full_name]["param_norm"] = (
-                            dist_param._local_tensor.float().norm(p=2).item() ** 2
-                        )
-                    if dist_grad is not None and dist_grad._local_tensor.numel() > 0:
-                        results[full_name]["grad_norm"] = (
-                            dist_grad._local_tensor.float().norm(p=2).item() ** 2
-                        )
-                    # Reduce each parameter's local squared-norm across its DP group
+                    pn = dist_param._local_tensor.float().norm(p=2).item() ** 2
+                    gn = 0.0
+                    if dist_grad is not None:
+                        gn = dist_grad._local_tensor.float().norm(p=2).item() ** 2
+                    results[full_name] = {"param_norm": pn, "grad_norm": gn}
+
+                    # Reduce per-parameter local squared-norm across its DP group
                     if dp_group is not None:
-                        for key in ("param_norm", "grad_norm"):
-                            t = torch.tensor([results[full_name][key]], device="cuda")
+                        for key, val in [("param_norm", pn), ("grad_norm", gn)]:
+                            t = torch.tensor([val], device="cuda")
                             torch.distributed.all_reduce(t, group=dp_group)
                             results[full_name][key] = t.sqrt().item()
         return results
 
     def _log_per_param_norms(self, iteration: int, prefix: str = ""):
         """Log per-parameter param and gradient L2 norms via print (rank 0 only)."""
+        norms = self._compute_per_param_norms()
         if torch.distributed.get_rank() != 0:
             return
-        norms = self._compute_per_param_norms()
         for param_name in sorted(norms.keys()):
             pn = norms[param_name]["param_norm"]
             gn = norms[param_name]["grad_norm"]

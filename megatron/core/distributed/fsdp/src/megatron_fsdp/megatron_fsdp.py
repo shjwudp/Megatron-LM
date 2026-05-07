@@ -1466,9 +1466,9 @@ class MegatronFSDP(torch.nn.Module):
 
     def _log_per_param_norms(self, iteration: int, prefix: str = ""):
         """Log per-parameter param and gradient L2 norms via print (rank 0 only)."""
+        norms = self._compute_per_param_norms()
         if torch.distributed.get_rank() != 0:
             return
-        norms = self._compute_per_param_norms()
         for param_name in sorted(norms.keys()):
             pn = norms[param_name]["param_norm"]
             gn = norms[param_name]["grad_norm"]
