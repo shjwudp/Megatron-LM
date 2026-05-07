@@ -326,10 +326,13 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.log_per_module_norms = self.module._log_per_module_norms
         self.compute_per_module_norms = self.module._compute_per_module_norms
         self.print_fsdp_config = self.module._print_fsdp_config
+        self.log_parameter_groups = self.module._log_parameter_groups
         self.broadcast_params = not_implemented_op
         self.synchronize_param_gather = synchronize_param_gather
         self.module.state_dict_for_save_checkpoint = not_implemented_op
         self.state_dict_for_save_checkpoint = not_implemented_op
+
+        self.module._log_parameter_groups()
 
     def load_state_dict(self, state_dict, strict=True):
         """
