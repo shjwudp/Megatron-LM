@@ -457,9 +457,11 @@ class FSDPModule(nn.Module):
             for param_group in child._fsdp_param_groups:
                 if param_group.main_grad_buffer is not None:
                     param_group.main_grad_buffer.data.zero_()
-                    for dist_param in param_group.dist_params:
-                        if dist_param.grad is not None:
-                            del dist_param.grad
+                    param_group.release_grad_buffer()
+
+                for dist_param in param_group.dist_params:
+                    if dist_param.grad is not None:
+                        del dist_param.grad
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
@@ -537,10 +539,11 @@ class FSDPModule(nn.Module):
         for module_name in sorted(norms.keys()):
             p_norm = norms[module_name]["param_norm"]
             g_norm = norms[module_name]["grad_norm"]
-            print(
-                f"[RANK {rank}] {prefix} iter={iteration} "
-                f"module={module_name} param_norm={p_norm:.6f} grad_norm={g_norm:.6f}"
-            )
+            if torch.distributed.get_rank() == 0:
+                print(
+                    f"[RANK {rank}] {prefix} iter={iteration} "
+                    f"module={module_name} param_norm={p_norm:.6f} grad_norm={g_norm:.6f}"
+                )
 
     def _print_fsdp_config(self):
         """Print FSDP configuration for debugging (dp_group, mesh, buffer layouts)."""

@@ -360,21 +360,29 @@ class DataParallelBuffer:
         rank's shard, then accumulate into self.data.
         For non-distributed buffers: all-reduce in-place.
         """
+        if self.gradient_scaling_factor in (None, 1.0):
+            op = torch.distributed.ReduceOp.SUM
+        elif self.dtype != torch.bfloat16:
+            op = torch.distributed._make_nccl_premul_sum(self.gradient_scaling_factor)
+        else:
+            full_grad.mul_(self.gradient_scaling_factor)
+            op = torch.distributed.ReduceOp.SUM
+
         if not self.is_distributed:
-            if self.gradient_scaling_factor is not None and self.gradient_scaling_factor != 1.0:
+            if self.gradient_scaling_factor not in (None, 1.0):
                 full_grad.mul_(self.gradient_scaling_factor)
-            torch.distributed.all_reduce(self.data, group=self.dp_group)
+            torch.distributed.all_reduce(self.data, group=self.dp_group, op=op)
             return
 
         full_grad = self.fetch_unsharded_buffer()
-        if self.gradient_scaling_factor is not None and self.gradient_scaling_factor != 1.0:
+        if self.gradient_scaling_factor not in (None, 1.0):
             full_grad.mul_(self.gradient_scaling_factor)   # pre-scale, then SUM-reduce
 
         sm = self.buffer_index.shard_meta
         grad_shard = full_grad[sm.bucket_data_index : sm.bucket_data_index + sm.size]
 
         torch.distributed.reduce_scatter_tensor(
-            output=grad_shard, input=full_grad, group=self.dp_group
+            output=grad_shard, input=full_grad, group=self.dp_group, op=op
         )
 
         # Accumulate the reduced shard into the persistent local shard buffer. This is needed

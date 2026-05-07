@@ -1479,10 +1479,11 @@ class MegatronFSDP(torch.nn.Module):
         for module_name in sorted(norms.keys()):
             p_norm = norms[module_name]["param_norm"]
             g_norm = norms[module_name]["grad_norm"]
-            print(
-                f"[RANK {rank}] {prefix} iter={iteration} "
-                f"module={module_name} param_norm={p_norm:.6f} grad_norm={g_norm:.6f}"
-            )
+            if torch.distributed.get_rank() == 0:
+                print(
+                    f"[RANK {rank}] {prefix} iter={iteration} "
+                    f"module={module_name} param_norm={p_norm:.6f} grad_norm={g_norm:.6f}"
+                )
 
     def broadcast_params(self):
         """
