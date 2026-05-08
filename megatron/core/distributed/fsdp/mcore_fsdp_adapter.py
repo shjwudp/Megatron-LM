@@ -197,6 +197,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.finish_grad_sync = self.module.finish_grad_sync
         self.scale_gradients = self.module.scale_gradients
         self.zero_grad_buffer = self.module.zero_grad_buffer
+        self.log_per_param_norms = self.module._log_per_param_norms
+        self.compute_per_param_norms = self.module._compute_per_param_norms
         self.broadcast_params = self.module.broadcast_params
         self.synchronize_param_gather = self.module.synchronize_param_gather
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
@@ -272,6 +274,35 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     fully_shard(m, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
         fully_shard(module, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
 
+        # Propagate relevant attributes from original parameters to the new
+        # distributed parameters created by FSDP.  This is REQUIRED for
+        # correctness: the optimizer's param group builder
+        # (_get_param_groups) relies on attributes like
+        # is_embedding_parameter and is_embedding_or_output_parameter to
+        # classify parameters into groups.  If these attributes are missing
+        # on the DTensor dist_params, the optimizer may assign a param to
+        # the wrong group, causing skipped weight decay on embeddings or
+        # incorrect learning-rate multipliers, which leads to convergence
+        # divergence.
+        for child in module.modules():
+            if not isinstance(child, FSDPModule):
+                continue
+            for param_group in child._fsdp_param_groups:
+                for param, dist_param in zip(param_group.params, param_group.dist_params):
+                    for attr_name in [
+                        "requires_grad",
+                        "sequence_parallel",
+                        "shared",
+                        "tensor_model_parallel",
+                        "partition_dim",
+                        "partition_stride",
+                        "is_embedding_or_output_parameter",
+                        "is_embedding_parameter",
+                        "_tensor_parallel_mode",
+                    ]:
+                        if hasattr(param, attr_name):
+                            setattr(dist_param, attr_name, getattr(param, attr_name))
+
         # Per-module NaN checking is disabled by default on the fully_shard
         # path to avoid the per-parameter synchronization overhead on every
         # unshard. Enable via a manual call to module._set_nan_check(True).
@@ -310,10 +341,16 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.finish_grad_sync = finish_grad_sync
         self.scale_gradients = self.module._scale_gradients
         self.zero_grad_buffer = self.module._zero_grad_buffer
+        self.log_per_param_norms = self.module._log_per_param_norms
+        self.compute_per_param_norms = self.module._compute_per_param_norms
+        self.log_parameter_groups = self.module._log_parameter_groups
         self.broadcast_params = not_implemented_op
         self.synchronize_param_gather = synchronize_param_gather
         self.module.state_dict_for_save_checkpoint = not_implemented_op
         self.state_dict_for_save_checkpoint = not_implemented_op
+
+        if torch.distributed.get_rank() == 0:
+            self.module._log_parameter_groups()
 
     def load_state_dict(self, state_dict, strict=True):
         """

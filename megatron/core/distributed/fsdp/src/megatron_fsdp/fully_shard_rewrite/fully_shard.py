@@ -484,6 +484,146 @@ class FSDPModule(nn.Module):
                     continue
                 param_group.model_weight_buffer.data.copy_(param_group.main_weight_buffer.data)
 
+    def _compute_per_param_norms(self) -> Dict[str, Dict[str, float]]:
+        """
+        Compute per-parameter L2 norms for params and grads.
+
+        Returns a dict {param_name: {"param_norm": float, "grad_norm": float}}.
+        The norms are globally reduced across DP ranks.
+        """
+        results = {}
+        dp_group = None
+        for name, child in self.named_modules():
+            if not isinstance(child, FSDPModule) or child is self:
+                continue
+            for param_names, param_group in child._named_param_groups:
+                if dp_group is None and param_group.dp_group is not None:
+                    dp_group = param_group.dp_group
+                for pname, dist_param, dist_grad in zip(
+                    param_names, param_group.dist_params, param_group.dist_grads
+                ):
+                    full_name = f"{name}.{pname}" if name else pname
+                    results[full_name] = {"param_norm": 0.0, "grad_norm": 0.0}
+                    if dist_param._local_tensor.numel() > 0:
+                        results[full_name]["param_norm"] = (
+                            dist_param._local_tensor.float().norm(p=2).item() ** 2
+                        )
+                    if dist_grad is not None and dist_grad._local_tensor.numel() > 0:
+                        results[full_name]["grad_norm"] = (
+                            dist_grad._local_tensor.float().norm(p=2).item() ** 2
+                        )
+
+        if dp_group is None:
+            for pg in self._fsdp_param_groups:
+                if pg.dp_group is not None:
+                    dp_group = pg.dp_group
+                    break
+
+        if dp_group is not None:
+            for param_name in results:
+                for key in ("param_norm", "grad_norm"):
+                    t = torch.tensor([results[param_name][key]], device="cuda")
+                    torch.distributed.all_reduce(t, group=dp_group)
+                    results[param_name][key] = t.sqrt().item()
+        return results
+
+    def _log_per_param_norms(self, iteration: int, prefix: str = ""):
+        """Log per-parameter param and gradient L2 norms via print (rank 0 only)."""
+        if torch.distributed.get_rank() != 0:
+            return
+        norms = self._compute_per_param_norms()
+        for param_name in sorted(norms.keys()):
+            pn = norms[param_name]["param_norm"]
+            gn = norms[param_name]["grad_norm"]
+            print(f"{prefix} iter={iteration} param={param_name} "
+                  f"param_norm={pn:.6f} grad_norm={gn:.6f}")
+
+    def _log_parameter_groups(self):
+        """Compact log of FSDP parameter groups and their parameters (rewrite path)."""
+
+        def _dtype_size(dtype: torch.dtype) -> int:
+            if dtype == torch.float32:
+                return 4
+            elif dtype == torch.float16:
+                return 2
+            elif dtype == torch.bfloat16:
+                return 2
+            elif dtype == torch.int64:
+                return 8
+            elif dtype == torch.int32:
+                return 4
+            elif dtype == torch.uint8:
+                return 1
+            return 1
+
+        def _bytes_to_mb(bytes_val: int) -> str:
+            return f"{bytes_val / 1_000_000:.2f} MB"
+
+        rank = torch.distributed.get_rank()
+        total_padded_bytes = 0
+        total_comm_bytes = 0
+        total_model_elements = 0
+        lines = []
+        group_idx = 0
+
+        for name, child in self.named_modules():
+            if not isinstance(child, FSDPModule) or child is self:
+                continue
+            for param_names, param_group in child._named_param_groups:
+                lines.append(f"[RANK {rank}] ===== FSDP Module: {name} Group {group_idx} =====")
+                numel = sum(p.numel() for p in param_group.params)
+                total_model_elements += numel
+                buffers = {
+                    "weight": param_group.model_weight_buffer,
+                    "main_weight": param_group.main_weight_buffer,
+                    "grad": param_group.main_grad_buffer,
+                }
+                group_padded = 0
+                group_comm = 0
+                buf_flags = []
+                for buf_key, buf in buffers.items():
+                    if buf is not None:
+                        global_size = buf.buffer_index.bucket_meta.size
+                        elem_size = _dtype_size(buf.dtype)
+                        group_padded += (global_size - numel) * elem_size
+                        group_comm += global_size * elem_size
+                        buf_flags.append(f"{buf_key}(sz={buf.data_size},dist={buf.is_distributed})")
+                total_padded_bytes += group_padded
+                total_comm_bytes += group_comm
+
+                dp_size = torch.distributed.get_world_size(param_group.dp_group)
+                dp_rank = torch.distributed.get_rank(param_group.dp_group)
+                lines.append(
+                    f"  dp_group(size={dp_size},rank={dp_rank}) "
+                    f"elems={numel} dtype={param_group.dtype} "
+                    f"strategy={param_group.sharding_strategy} "
+                    f"chunk_factor={param_group.chunk_size_factor} "
+                    f"pad={_bytes_to_mb(group_padded)} "
+                    f"comm={_bytes_to_mb(group_comm)} "
+                    f"bufs=[{', '.join(buf_flags)}]"
+                )
+                for pname, param in zip(param_names, param_group.params):
+                    dist_idx = param_group.param_idx.get(param)
+                    wbuf = param_group.model_weight_buffer
+                    shard_info = ""
+                    if wbuf is not None and dist_idx is not None:
+                        item_idx = wbuf.buffer_index.item_index_map.get(dist_idx)
+                        if item_idx is not None:
+                            shard_info = (
+                                f" global_offset={item_idx.global_data_index} "
+                                f"size={item_idx.size}"
+                            )
+                    lines.append(f"    {pname} shape={tuple(param.shape)}{shard_info}")
+                group_idx += 1
+
+        lines.append(
+            f"[RANK {rank}] ===== SUMMARY: groups={group_idx} "
+            f"model_elems={total_model_elements} "
+            f"comm={_bytes_to_mb(total_comm_bytes)} "
+            f"pad={_bytes_to_mb(total_padded_bytes)} ====="
+        )
+        print("\n".join(lines))
+
     def _set_nan_check(self, enable_nan_checks: bool):
         """Enable or disable NaN checking."""
         for _, child in self.named_modules():
