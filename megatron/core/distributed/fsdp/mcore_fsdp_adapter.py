@@ -206,6 +206,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.module.config = config
 
         self.sync_rng_states_across_tp_group()
+        self._set_dist_param_unique_names(self.module)
 
     def _init_with_fully_shard(
         self,
@@ -274,6 +275,26 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     fully_shard(m, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
         fully_shard(module, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
 
+        # Propagate relevant attributes from original parameters to the new distributed parameters created by FSDP.
+        for child in module.modules():
+            if not isinstance(child, FSDPModule):
+                continue
+            for param_group in child._fsdp_param_groups:
+                for param, dist_param in zip(param_group.params, param_group.dist_params):
+                    for attr_name in [
+                        "requires_grad",
+                        "sequence_parallel",
+                        "shared",
+                        "tensor_model_parallel",
+                        "partition_dim",
+                        "partition_stride",
+                        "is_embedding_or_output_parameter",
+                        "is_embedding_parameter",
+                        "_tensor_parallel_mode",
+                    ]:
+                        if hasattr(param, attr_name):
+                            setattr(dist_param, attr_name, getattr(param, attr_name))
+
         # Per-module NaN checking is disabled by default on the fully_shard
         # path to avoid the per-parameter synchronization overhead on every
         # unshard. Enable via a manual call to module._set_nan_check(True).
@@ -339,6 +360,29 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         # Debug: verify buffer data immediately after init (before any training)
         _debug_init_buf(self.module)
+
+        self._set_dist_param_unique_names(self.module)
+
+    def _set_dist_param_unique_names(self, module: nn.Module, prefix: str = "") -> None:
+        """
+        Recursively set a _unique_name attribute on all distributed parameters in the module.
+
+        This is useful for debugging and logging purposes, as it allows us to identify parameters
+        by a consistent name regardless of sharding or wrapping. The unique name is constructed
+        based on the module hierarchy and parameter name.
+
+        Args:
+            module (nn.Module): The module to annotate.
+            prefix (str): The prefix to use for the unique name, typically the module hierarchy.
+        """
+        from torch.distributed.tensor import DTensor
+        for name, param in module.named_parameters():
+            assert isinstance(param, DTensor), (
+                f"Expected parameter {name} to be a DTensor after sharding, but got {type(param)}. "
+                "This may indicate that the parameter was not properly sharded or that the module was not fully wrapped with FSDP."
+            )
+            unique_name = f"{prefix}.{name}" if prefix else name
+            setattr(param, "_unique_name", unique_name)
 
     def load_state_dict(self, state_dict, strict=True):
         """
@@ -800,13 +844,25 @@ def _debug_grad(module):
 
 
 def _debug_init_buf(module):
-    """Check buffer data and data_ptr offsets for layer_norm_weight params."""
+    """Check buffer data, data_ptr offsets, AND local slice overlap for layer_norm_weight params."""
     from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite import FSDPModule
 
     for name, child in module.named_modules():
         if not isinstance(child, FSDPModule) or "layers.0" not in name:
             continue
         for param_names, param_group in child._named_param_groups:
+            # --- run the runtime overlap checker on all buffers ---
+            gid = f"init_buf mod={name} pg={param_group.param_group_id}"
+            if param_group.model_weight_buffer is not None:
+                param_group.model_weight_buffer.check_no_local_overlap(gid + " wbuf")
+                param_group.model_weight_buffer.check_no_global_overlap(gid + " wbuf")
+            if param_group.main_weight_buffer is not None:
+                param_group.main_weight_buffer.check_no_local_overlap(gid + " mbuf")
+                param_group.main_weight_buffer.check_no_global_overlap(gid + " mbuf")
+            if param_group.main_grad_buffer is not None:
+                param_group.main_grad_buffer.check_no_local_overlap(gid + " gbuf")
+                param_group.main_grad_buffer.check_no_global_overlap(gid + " gbuf")
+
             for pname, param in zip(param_names, param_group.params):
                 if "layer_norm_weight" not in pname:
                     continue

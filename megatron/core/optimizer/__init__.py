@@ -1007,6 +1007,8 @@ def get_megatron_optimizer(
                 mw_val = getattr(opt, "master_weights", "N/A")
                 target_name = "layer_norm_weight"
                 for gid, group in enumerate(opt.param_groups):
+                    if rank != 0:
+                        continue
                     num_params = len(group["params"])
                     all_1d = True
                     nz_before = 0
@@ -1041,6 +1043,8 @@ def get_megatron_optimizer(
                 ret = _base_step(opt, *a, **kw)
                 torch.cuda.synchronize()
                 for gid, group in enumerate(opt.param_groups):
+                    if rank != 0:
+                        continue
                     nz_after = 0
                     for p in group["params"]:
                         pname = getattr(p, "_unique_name", "?")

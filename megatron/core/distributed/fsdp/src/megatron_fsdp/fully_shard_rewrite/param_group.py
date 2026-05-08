@@ -160,6 +160,18 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
+        # --- runtime overlap sanity check ---
+        import os
+
+        if os.environ.get("MFSDP_CHECK_OVERLAP", "0") == "1":
+            gid = f"pg={self.param_group_id}"
+            if self.model_weight_buffer is not None:
+                self.model_weight_buffer.check_no_local_overlap(f"{gid} wbuf")
+            if self.main_weight_buffer is not None:
+                self.main_weight_buffer.check_no_local_overlap(f"{gid} mbuf")
+            if self.main_grad_buffer is not None:
+                self.main_grad_buffer.check_no_local_overlap(f"{gid} gbuf")
+
     def unshard(self, async_op: bool = False):
         """
         Unshard model weights by all-gathering from sharded buffer.

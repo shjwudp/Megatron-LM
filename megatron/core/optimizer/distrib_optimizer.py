@@ -519,6 +519,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
+        assert self._check_has_layer_norm_in_optimizer()
         self.model_chunks = model_chunks
         self.ddp_config = self.model_chunks[0].ddp_config
         for model_chunk in self.model_chunks:
@@ -2692,26 +2693,56 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
 
+    def _check_has_layer_norm_in_optimizer(self):
+        for param_group in self.optimizer.param_groups:
+            for param in param_group["params"]:
+                name = getattr(param, "_unique_name", None)
+                if "layer_norm" in name:
+                    return True
+        return False
+
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful.
         Under the hood, either launch synchronous param all-gathers or get ready to launch
         asynchorous all-gathers that get overlapped with the next forward pass.
         """
+        assert self._check_has_layer_norm_in_optimizer()
+        from megatron.core.utils import log_single_rank, to_local_if_dtensor
         for param_group in self.optimizer.param_groups:
             for param in param_group["params"]:
                 name = getattr(param, "_unique_name", None)
+                if "layer_norm" in name:
+                    not_skip = True
+                else:
+                    not_skip = False
+                grad_data = to_local_if_dtensor(param.grad)
+                if not not_skip:
+                    if grad_data is None or grad_data.numel() == 0:
+                        continue
+                grad_norm = grad_data.norm() if grad_data is not None and grad_data.numel() > 0 else 0.0
                 if torch.distributed.get_rank() == 0:
                     print(
-                        f"Before optimizer step, param {name} has grad norm {param.grad._local_tensor.norm()}"
+                        f"Before optimizer step, param {name} has grad norm {grad_norm}"
                     )
         update_successful = super().step_with_ready_grads()
         for param_group in self.optimizer.param_groups:
             for param in param_group["params"]:
                 name = getattr(param, "_unique_name", None)
                 if torch.distributed.get_rank() == 0:
+                    state = self.optimizer.state[param]
+                    local_param = to_local_if_dtensor(param)
+                    local_exp_avg = to_local_if_dtensor(state['exp_avg'])
+                    local_exp_avg_sq = to_local_if_dtensor(state['exp_avg_sq'])
+                    if local_param.numel() == 0:
+                        continue
                     print(
-                        f"After optimizer step, param {name} has param norm {param._local_tensor.norm()}"
+                        f"After optimizer step, param {name} has local_numel {local_param.numel()}"
+                        f" and param norm {local_param.norm() if local_param.numel() > 0 else 0.0}"
+                        f" and exp_avg_numel {local_exp_avg.numel()}"
+                        f" and exp_avg norm {local_exp_avg.norm() if local_exp_avg.numel() > 0 else 0.0}"
+                        f" and exp_avg_sq_numel {local_exp_avg_sq.numel()}"
+                        f" and exp_avg_sq norm {local_exp_avg_sq.norm() if local_exp_avg_sq.numel() > 0 else 0.0}"
                     )
 
         timers = self.config.timers

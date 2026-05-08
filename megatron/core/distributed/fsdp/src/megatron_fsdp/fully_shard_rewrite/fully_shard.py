@@ -412,7 +412,11 @@ class FSDPModule(nn.Module):
                     if param.grad is not None:
                         del param.grad
                 elif param.grad is None:
-                    main_grad.zero_()
+                    if hasattr(param, 'main_grad') and param.main_grad is not None:
+                        if param.main_grad.data_ptr() != main_grad.data_ptr():
+                            main_grad.copy_(param.main_grad.detach())
+                    else:
+                        main_grad.zero_()
                 else:
                     main_grad.copy_(param.grad.detach())
                     del param.grad
@@ -500,6 +504,22 @@ class FSDPModule(nn.Module):
                 if param_group.main_weight_buffer is None:
                     continue
                 param_group.model_weight_buffer.data.copy_(param_group.main_weight_buffer.data)
+
+        # --- runtime overlap sanity check after optimizer step ---
+        import os
+
+        if os.environ.get("MFSDP_CHECK_OVERLAP", "0") == "1":
+            for name, child in self.named_modules():
+                if not isinstance(child, FSDPModule):
+                    continue
+                for param_names, param_group in child._named_param_groups:
+                    gid = f"copy_mw_pg={param_group.param_group_id} mod={name}"
+                    if param_group.model_weight_buffer is not None:
+                        param_group.model_weight_buffer.check_no_local_overlap(gid + " wbuf")
+                    if param_group.main_weight_buffer is not None:
+                        param_group.main_weight_buffer.check_no_local_overlap(gid + " mbuf")
+                    if param_group.main_grad_buffer is not None:
+                        param_group.main_grad_buffer.check_no_local_overlap(gid + " gbuf")
 
                 # Debug: verify main→model copy for layer_norm_weight
                 for pname, param in zip(param_names, param_group.params):
