@@ -59,11 +59,6 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         for model_chunk in model:
             model_chunk.stop_communication()
             for name, param in model_chunk.named_parameters():
-                from torch.distributed.tensor import DTensor
-                assert isinstance(param, DTensor), (
-                    f"Megatron FSDP requires parameters are PyTorch DTensor. "
-                    f"Parameter {name} is not a DTensor."
-                )
                 if not hasattr(param, "_local_tensor"):
                     raise RuntimeError(
                         f"Megatron FSDP requires parameters are PyTorch DTensor. "

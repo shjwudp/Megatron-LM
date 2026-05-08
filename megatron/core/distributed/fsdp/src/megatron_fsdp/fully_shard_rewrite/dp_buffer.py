@@ -380,8 +380,6 @@ class DataParallelBuffer:
                           f"global_{n_id}=[{n_gstart}, {n_gstart + n_size}))")
                     valid = False
 
-        if valid:
-            print(f"{label_prefix}✅ no local slice overlap ({n_items} items, buf_size={data_nel})")
         return valid
 
     def check_no_global_overlap(self, label: str = "") -> bool:
@@ -415,7 +413,7 @@ class DataParallelBuffer:
                 valid = False
 
         if valid:
-            print(f"{label_prefix}✅ no global slice overlap ({n_items} items)")
+            pass  # silent on success
         return valid
 
     def set_item(self, item_id: int, item_data: torch.Tensor) -> None:

@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
 import logging
-import types
 import warnings
 from collections import defaultdict
 from dataclasses import astuple
@@ -329,16 +328,7 @@ def _get_param_groups(
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
-                if torch.distributed.get_rank() == 0:
-                    full_param_name = f"{model_chunk.__class__.__name__}.{name}"
-                    print(
-                        f"Skipping parameter {full_param_name} since requires_grad=False. "
-                        "If you want to include this parameter in optimization, set requires_grad=True."
-                    )
                 continue
-            if torch.distributed.get_rank() == 0:
-                full_param_name = f"{model_chunk.__class__.__name__}.{name}"
-                print(f"Adding parameter {full_param_name} to optimizer with shape {param.shape}")
 
             uses_default_config = False
             # Get optimizer config overrides for this parameter.
@@ -418,17 +408,6 @@ def _get_param_groups(
             **param_override,  # keep **param_override last so that users can override other fields.
         }
         param_groups.append(param_group)
-
-    for param_group in param_groups:
-        if torch.distributed.get_rank() == 0:
-            param_names = [getattr(param, "_unique_name", "unknown_param") for param in param_group['params']]
-            print(
-                f"Created param group with {len(param_group['params'])} params, "
-                f"is_expert_parallel={param_group['is_expert_parallel']}, "
-                f"default_config={param_group['default_config']} {default_config}, "
-                f"overrides={param_override}, "
-                f"params: {param_names[:]}"
-            )
 
     return param_groups
 
@@ -971,11 +950,6 @@ def get_megatron_optimizer(
                 filter_fn=lambda g: True,
                 buffer_name='buffers',
             )
-            for param_group in param_groups:
-                for param in param_group["params"]:
-                    param_name = getattr(param, "_unique_name", "unknown_param")
-                    if torch.distributed.get_rank() == 0:
-                        print(f"m-fsdp param group for param {param_name}" )
 
             optimizer_part = _get_megatron_optimizer_based_on_param_groups(
                 config=config,
@@ -998,74 +972,6 @@ def get_megatron_optimizer(
                 # FusedAdam's internal master_weights are redundant and cause
                 # correctness issues with 1D DTensor parameters. Always disable.
                 setattr(optimizer_part.optimizer, "master_weights", False)
-
-            # --- [DEBUG optim-step] Wrap FusedAdam.step for Megatron-FSDP diagnostics ---
-            _base_step = type(optimizer_part.optimizer).step
-
-            def _debug_step(opt, *a, **kw):
-                rank = torch.distributed.get_rank()
-                mw_val = getattr(opt, "master_weights", "N/A")
-                target_name = "layer_norm_weight"
-                for gid, group in enumerate(opt.param_groups):
-                    if rank != 0:
-                        continue
-                    num_params = len(group["params"])
-                    all_1d = True
-                    nz_before = 0
-                    for p in group["params"]:
-                        pname = getattr(p, "_unique_name", "?")
-                        pdata = p
-                        if hasattr(p, "_local_tensor"):
-                            pdata = p._local_tensor
-                        if pdata.ndim != 1:
-                            all_1d = False
-                        if pdata.numel() > 0 and torch.count_nonzero(pdata).item() > 0:
-                            nz_before += 1
-                        if target_name in pname and "layers.0" in pname:
-                            gdata = p.grad
-                            if hasattr(p, "_local_tensor") and gdata is not None and hasattr(gdata, "_local_tensor"):
-                                gdata = gdata._local_tensor
-                            gnz = torch.count_nonzero(gdata).item() if gdata is not None else -1
-                            gn = gdata.float().norm(p=2).item() if gdata is not None else -1.0
-                            state = opt.state.get(p, {})
-                            has_ea = "exp_avg" in state
-                            ea_nz = torch.count_nonzero(state["exp_avg"]).item() if has_ea else -1
-                            easq_nz = torch.count_nonzero(state["exp_avg_sq"]).item() if "exp_avg_sq" in state else -1
-                            print(f"[DEBUG adam-step] rank={rank} PRE  group={gid} param={pname} "
-                                  f"shape={pdata.shape} data_ptr={pdata.data_ptr()} "
-                                  f"data_nz={torch.count_nonzero(pdata).item()} "
-                                  f"grad_nz={gnz} grad_norm={gn:.6f} "
-                                  f"master_weights={mw_val} "
-                                  f"has_exp_avg={has_ea} ea_nz={ea_nz} ea_sq_nz={easq_nz}")
-                    print(f"[DEBUG adam-step] rank={rank} PRE  group={gid} "
-                          f"num_params={num_params} all_1d={all_1d} "
-                          f"nz_params={nz_before}/{num_params} lr={group.get('lr', -1)}")
-                ret = _base_step(opt, *a, **kw)
-                torch.cuda.synchronize()
-                for gid, group in enumerate(opt.param_groups):
-                    if rank != 0:
-                        continue
-                    nz_after = 0
-                    for p in group["params"]:
-                        pname = getattr(p, "_unique_name", "?")
-                        pdata = p
-                        if hasattr(p, "_local_tensor"):
-                            pdata = p._local_tensor
-                        if pdata.numel() > 0 and torch.count_nonzero(pdata).item() > 0:
-                            nz_after += 1
-                        if target_name in pname:
-                            state = opt.state.get(p, {})
-                            ea_nz = torch.count_nonzero(state["exp_avg"]).item() if "exp_avg" in state else -1
-                            print(f"[DEBUG adam-step] rank={rank} POST group={gid} param={pname} "
-                                  f"shape={pdata.shape} data_ptr={pdata.data_ptr()} "
-                                  f"data_nz={torch.count_nonzero(pdata).item()} "
-                                  f"ea_nz={ea_nz}")
-                    print(f"[DEBUG adam-step] rank={rank} POST group={gid} "
-                          f"nz_params={nz_after}/{num_params}")
-                return ret
-
-            optimizer_part.optimizer.step = types.MethodType(_debug_step, optimizer_part.optimizer)
-            # --- end debug ---
 
             optimizers.append(optimizer_part)
             model_chunk_offset += 1

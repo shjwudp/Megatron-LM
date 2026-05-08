@@ -509,80 +509,8 @@ def fully_shard_optimizer(
         if sync_grad_before_optimizer_step and not mfsdp_model.model_auto_sync:
             mfsdp_model.finish_grad_sync()
 
-        # --- [DEBUG optimizer] Log param groups and target params before step ---
-        rank = torch.distributed.get_rank()
-        mw_val = getattr(optimizer, "master_weights", "N/A")
-        num_groups = len(optimizer.param_groups)
-        target_name = "linear_qkv.layer_norm_weight"
-        for gid, group in enumerate(optimizer.param_groups):
-            all_1d = True
-            nz_params = 0
-            for p in group["params"]:
-                pdata = p
-                if hasattr(p, "_local_tensor"):
-                    pdata = p._local_tensor
-                if pdata.ndim != 1:
-                    all_1d = False
-                if pdata.numel() > 0 and torch.count_nonzero(pdata).item() > 0:
-                    nz_params += 1
-            print(f"[DEBUG optim-step] rank={rank} PRE-STEP "
-                  f"master_weights={mw_val} num_groups={num_groups} "
-                  f"group={gid} num_params={len(group['params'])} all_1d={all_1d} "
-                  f"nz_params={nz_params} lr={group.get('lr', -1)}")
-            # Log detail for target params in each group
-            for p in group["params"]:
-                pname = getattr(p, "_unique_name", None)
-                if pname is not None and target_name in str(pname):
-                    pdata = p
-                    gdata = p.grad
-                    if hasattr(p, "_local_tensor"):
-                        pdata = p._local_tensor
-                        gdata = p.grad._local_tensor if p.grad is not None else None
-                    nz_d = torch.count_nonzero(pdata).item()
-                    nz_g = torch.count_nonzero(gdata).item() if gdata is not None else -1
-                    pn = pdata.float().norm(p=2).item()
-                    gn = gdata.float().norm(p=2).item() if gdata is not None else -1.0
-                    state = optimizer.state.get(p, {})
-                    has_exp_avg = "exp_avg" in state
-                    exp_avg_nz = torch.count_nonzero(state["exp_avg"]).item() if has_exp_avg else -1
-                    exp_avg_sq_nz = torch.count_nonzero(state["exp_avg_sq"]).item() if "exp_avg_sq" in state else -1
-                    print(f"[DEBUG optim-step] rank={rank} PRE-STEP group={gid} "
-                          f"param={pname} shape={pdata.shape} "
-                          f"data_ptr={pdata.data_ptr()} data_nz={nz_d} data_norm={pn:.6f} "
-                          f"grad_nz={nz_g} grad_norm={gn:.6f} "
-                          f"has_exp_avg={has_exp_avg} exp_avg_nz={exp_avg_nz} "
-                          f"exp_avg_sq_nz={exp_avg_sq_nz}")
-        # --- end debug ---
-
         # Execute the base optimizer.step() on the model optimizer named parameters.
         optimizer_step_base_func(optimizer, *args, **kwargs)
-
-        # --- [DEBUG optim-step] Log same params after step ---
-        for gid, group in enumerate(optimizer.param_groups):
-            nz_params = 0
-            for p in group["params"]:
-                pdata = p
-                if hasattr(p, "_local_tensor"):
-                    pdata = p._local_tensor
-                if pdata.numel() > 0 and torch.count_nonzero(pdata).item() > 0:
-                    nz_params += 1
-            print(f"[DEBUG optim-step] rank={rank} POST-STEP "
-                  f"group={gid} num_params={len(group['params'])} nz_params={nz_params}")
-            for p in group["params"]:
-                pname = getattr(p, "_unique_name", None)
-                if pname is not None and target_name in str(pname):
-                    pdata = p
-                    if hasattr(p, "_local_tensor"):
-                        pdata = p._local_tensor
-                    nz_d = torch.count_nonzero(pdata).item()
-                    pn = pdata.float().norm(p=2).item()
-                    state = optimizer.state.get(p, {})
-                    exp_avg_nz = torch.count_nonzero(state["exp_avg"]).item() if "exp_avg" in state else -1
-                    print(f"[DEBUG optim-step] rank={rank} POST-STEP group={gid} "
-                          f"param={pname} shape={pdata.shape} "
-                          f"data_ptr={pdata.data_ptr()} data_nz={nz_d} data_norm={pn:.6f} "
-                          f"exp_avg_nz={exp_avg_nz}")
-        # --- end debug ---
 
         # Update the raw module training parameters with optimized values.
         if install_optimized_model_weights:
