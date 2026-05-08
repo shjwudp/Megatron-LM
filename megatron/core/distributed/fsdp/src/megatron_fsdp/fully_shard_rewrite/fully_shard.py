@@ -529,9 +529,9 @@ class FSDPModule(nn.Module):
 
     def _log_per_param_norms(self, iteration: int, prefix: str = ""):
         """Log per-parameter param and gradient L2 norms via print (rank 0 only)."""
+        norms = self._compute_per_param_norms()
         if torch.distributed.get_rank() != 0:
             return
-        norms = self._compute_per_param_norms()
         for param_name in sorted(norms.keys()):
             pn = norms[param_name]["param_norm"]
             gn = norms[param_name]["grad_norm"]
@@ -541,86 +541,81 @@ class FSDPModule(nn.Module):
     def _log_parameter_groups(self):
         """Compact log of FSDP parameter groups and their parameters (rewrite path)."""
 
-        def _dtype_size(dtype: torch.dtype) -> int:
-            if dtype == torch.float32:
-                return 4
-            elif dtype == torch.float16:
-                return 2
-            elif dtype == torch.bfloat16:
-                return 2
-            elif dtype == torch.int64:
-                return 8
-            elif dtype == torch.int32:
-                return 4
-            elif dtype == torch.uint8:
-                return 1
-            return 1
+        def _fmt_dtype(dt: torch.dtype) -> str:
+            short = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16",
+                     torch.int64: "i64", torch.int32: "i32", torch.uint8: "u8"}
+            return short.get(dt, str(dt).removeprefix("torch."))
 
-        def _bytes_to_mb(bytes_val: int) -> str:
-            return f"{bytes_val / 1_000_000:.2f} MB"
+        def _elem_size(dt: torch.dtype) -> int:
+            return {torch.float32: 4, torch.float16: 2, torch.bfloat16: 2,
+                    torch.int64: 8, torch.int32: 4, torch.uint8: 1}.get(dt, 1)
+
+        def _mb(b: int | float) -> str:
+            return f"{b / 1_000_000:.2f} MB"
 
         rank = torch.distributed.get_rank()
-        total_padded_bytes = 0
-        total_comm_bytes = 0
-        total_model_elements = 0
-        lines = []
+        lines = [f"╔══ FSDP Parameter Groups (rank {rank}) ══╗"]
         group_idx = 0
+        total_model_elems = 0
+        total_comm = 0
+        total_pad = 0
 
         for name, child in self.named_modules():
             if not isinstance(child, FSDPModule) or child is self:
                 continue
             for param_names, param_group in child._named_param_groups:
-                lines.append(f"[RANK {rank}] ===== FSDP Module: {name} Group {group_idx} =====")
                 numel = sum(p.numel() for p in param_group.params)
-                total_model_elements += numel
-                buffers = {
-                    "weight": param_group.model_weight_buffer,
-                    "main_weight": param_group.main_weight_buffer,
-                    "grad": param_group.main_grad_buffer,
-                }
-                group_padded = 0
-                group_comm = 0
-                buf_flags = []
-                for buf_key, buf in buffers.items():
-                    if buf is not None:
-                        global_size = buf.buffer_index.bucket_meta.size
-                        elem_size = _dtype_size(buf.dtype)
-                        group_padded += (global_size - numel) * elem_size
-                        group_comm += global_size * elem_size
-                        buf_flags.append(f"{buf_key}(sz={buf.data_size},dist={buf.is_distributed})")
-                total_padded_bytes += group_padded
-                total_comm_bytes += group_comm
+                total_model_elems += numel
+                dp_sz = torch.distributed.get_world_size(param_group.dp_group)
+                dp_rk = torch.distributed.get_rank(param_group.dp_group)
 
-                dp_size = torch.distributed.get_world_size(param_group.dp_group)
-                dp_rank = torch.distributed.get_rank(param_group.dp_group)
+                # Per-buffer metrics
+                buf_entries = []
+                group_pad = 0
+                group_comm = 0
+                for buf_label, buf in [
+                    ("W", param_group.model_weight_buffer),
+                    ("MW", param_group.main_weight_buffer),
+                    ("G", param_group.main_grad_buffer),
+                ]:
+                    if buf is None:
+                        continue
+                    gsize = buf.buffer_index.bucket_meta.size
+                    esize = _elem_size(buf.dtype)
+                    group_pad += max(0, (gsize - numel)) * esize
+                    group_comm += gsize * esize
+                    dist_flag = "D" if buf.is_distributed else "R"
+                    buf_entries.append(
+                        f"{buf_label}[{_fmt_dtype(buf.dtype)}:{buf.data_size}:{dist_flag}]"
+                    )
+                total_pad += group_pad
+                total_comm += group_comm
+
                 lines.append(
-                    f"  dp_group(size={dp_size},rank={dp_rank}) "
-                    f"elems={numel} dtype={param_group.dtype} "
-                    f"strategy={param_group.sharding_strategy} "
-                    f"chunk_factor={param_group.chunk_size_factor} "
-                    f"pad={_bytes_to_mb(group_padded)} "
-                    f"comm={_bytes_to_mb(group_comm)} "
-                    f"bufs=[{', '.join(buf_flags)}]"
+                    f"╟── {name}  (#{group_idx})  "
+                    f"dp={dp_sz}  strat={param_group.sharding_strategy}  "
+                    f"cf={param_group.chunk_size_factor}"
+                )
+                lines.append(
+                    f"║   {numel:,} elems × {_fmt_dtype(param_group.dtype)}  "
+                    f"comm={_mb(group_comm)}  pad={_mb(group_pad)}  "
+                    f"{'  '.join(buf_entries)}"
                 )
                 for pname, param in zip(param_names, param_group.params):
                     dist_idx = param_group.param_idx.get(param)
                     wbuf = param_group.model_weight_buffer
-                    shard_info = ""
+                    offset_info = ""
                     if wbuf is not None and dist_idx is not None:
-                        item_idx = wbuf.buffer_index.item_index_map.get(dist_idx)
-                        if item_idx is not None:
-                            shard_info = (
-                                f" global_offset={item_idx.global_data_index} "
-                                f"size={item_idx.size}"
-                            )
-                    lines.append(f"    {pname} shape={tuple(param.shape)}{shard_info}")
+                        ii = wbuf.buffer_index.item_index_map.get(dist_idx)
+                        if ii is not None:
+                            offset_info = f"  @{ii.global_data_index:,}+{ii.size:,}"
+                    lines.append(f"║     {pname:50s} {str(tuple(param.shape)):24s}{offset_info}")
                 group_idx += 1
 
         lines.append(
-            f"[RANK {rank}] ===== SUMMARY: groups={group_idx} "
-            f"model_elems={total_model_elements} "
-            f"comm={_bytes_to_mb(total_comm_bytes)} "
-            f"pad={_bytes_to_mb(total_padded_bytes)} ====="
+            f"╚══ SUMMARY: {group_idx} groups  "
+            f"{total_model_elems:,} model elems  "
+            f"comm={_mb(total_comm)}  pad={_mb(total_pad)} ══╝"
         )
         print("\n".join(lines))
 
