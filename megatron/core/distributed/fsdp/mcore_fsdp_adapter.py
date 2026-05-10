@@ -353,7 +353,14 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.log_per_param_norms = self.module._log_per_param_norms
         self.compute_per_param_norms = self.module._compute_per_param_norms
         self.log_parameter_groups = self.module._log_parameter_groups
-        self.broadcast_params = not_implemented_op
+        # Parameter broadcast is handled during _materialize_meta_module
+        # for the fully_shard path (params are synced across DP ranks
+        # immediately after meta-device init, before DTensor wrapping).
+        # For non-meta init, all ranks share the same seed so no sync is
+        # needed.  This is intentionally a no-op instead of
+        # not_implemented_op to avoid crashing when the training loop
+        # calls broadcast_params() with --data-parallel-random-init.
+        self.broadcast_params = noop
         self.synchronize_param_gather = synchronize_param_gather
         self.module.state_dict_for_save_checkpoint = not_implemented_op
         self.state_dict_for_save_checkpoint = not_implemented_op

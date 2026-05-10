@@ -147,7 +147,7 @@ class FSDPModule(nn.Module):
                     ignored_modules.add(child_submodule)
 
         # Materialize meta parameters to actual device
-        self._materialize_meta_module(ignored_modules)
+        self._materialize_meta_module(ignored_modules, mesh=mesh)
 
         # Create parameter groups
         fsdp_param_groups = _get_module_fsdp_param_groups(
@@ -201,12 +201,23 @@ class FSDPModule(nn.Module):
                 setattr(param, "_item_id", param_group.param_idx[param])
                 param.get_main_grad = main_grad_getter.__get__(param)
 
-    def _materialize_meta_module(self, ignored_modules: set):
+    def _materialize_meta_module(
+        self, ignored_modules: set, mesh: Optional[DeviceMesh] = None
+    ):
         """
         Materialize meta parameters to actual device and initialize.
 
         This is needed for large models that cannot fit in a single GPU.
         Meta parameters are moved to the current device and reset.
+
+        After materialization, all full (non-DTensor) parameters under this
+        FSDP unit are broadcast from DP rank 0 within *mesh*.  This ensures
+        every DP rank starts with identical parameter values even when the
+        random-number state differs across ranks (e.g., with
+        --data-parallel-random-init or when RNG divergence occurs during
+        meta-device model construction).  The broadcast happens **before**
+        FSDP param groups are built, so each rank subsequently receives the
+        correct shard of the same full parameter.
         """
         materialization_device = torch.cuda.current_device()
         for name, m in self.named_modules():
@@ -216,8 +227,14 @@ class FSDPModule(nn.Module):
             if all(not p.is_meta for p in m.parameters(recurse=False)):
                 continue
 
-            # Move to device and initialize
-            m.to_empty(device=materialization_device, recurse=False)
+            # Materialize only meta tensors in a module, preserving
+            # non-meta tensors that are already initialized on device.
+            m._apply(
+                lambda t: (
+                    torch.empty_like(t, device=materialization_device) if t.is_meta else t
+                ),
+                recurse=False,
+            )
             if hasattr(m, "reset_parameters"):
                 m.reset_parameters()
             elif hasattr(m, "_reset_parameters"):
@@ -225,6 +242,18 @@ class FSDPModule(nn.Module):
             else:
                 raise ValueError(
                     f"Module {name} contains meta parameters but does not have a reset_parameters method"
+                )
+
+        if mesh is not None and mesh.size() > 1:
+            dp_group = mesh.get_group()
+            src_rank = torch.distributed.get_global_rank(dp_group, 0)
+            for param_name, param in self.named_parameters():
+                if param.is_meta:
+                    continue
+                if isinstance(param, DTensor):
+                    continue
+                torch.distributed.broadcast(
+                    param.data, src=src_rank, group=dp_group, async_op=False
                 )
 
     def _init_fsdp_state(self, enable_unshard_prefetch, enable_async_reduce_grad):
