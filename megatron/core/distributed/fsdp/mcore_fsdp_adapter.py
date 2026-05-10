@@ -269,11 +269,18 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         for m in module.modules():
             if isinstance(m, (TEGroupedMLP, SequentialMLP)):
-                fully_shard(m, mesh=edp_mesh, gradient_scaling_factor=expert_gradient_scaling_factor, **kwargs)
+                fully_shard(
+                    m,
+                    mesh=edp_mesh,
+                    gradient_scaling_factor=expert_gradient_scaling_factor,
+                    **kwargs,
+                )
         if fsdp_unit_modules is not None:
             for m in module.modules():
                 if isinstance(m, tuple(fsdp_unit_modules)):
-                    fully_shard(m, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
+                    fully_shard(
+                        m, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs
+                    )
         fully_shard(module, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
 
         # Propagate relevant attributes from original parameters to the new

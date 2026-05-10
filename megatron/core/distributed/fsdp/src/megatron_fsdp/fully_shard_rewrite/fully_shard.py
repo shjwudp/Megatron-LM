@@ -89,10 +89,7 @@ def fully_shard(
 
     # Initialize FSDP state and parameter groups
     module._init_named_param_groups(
-        mesh,
-        ignored_params,
-        mp_policy=mp_policy,
-        gradient_scaling_factor=gradient_scaling_factor
+        mesh, ignored_params, mp_policy=mp_policy, gradient_scaling_factor=gradient_scaling_factor
     )
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,
@@ -154,7 +151,8 @@ class FSDPModule(nn.Module):
 
         # Create parameter groups
         fsdp_param_groups = _get_module_fsdp_param_groups(
-            self, mesh,
+            self,
+            mesh,
             ignored_params=ignored_params,
             mp_policy=mp_policy,
             gradient_scaling_factor=gradient_scaling_factor,
@@ -353,7 +351,7 @@ class FSDPModule(nn.Module):
         """Wait for the previous async reduce_grad to complete before reducing gradients for this module."""
         ctx = self._fsdp_root_context
         if ctx.enable_async_reduce_grad:
-            return # No need to wait if async reduce_grad is not enabled
+            return  # No need to wait if async reduce_grad is not enabled
         backward_order = list(reversed(ctx.forward_order))
         for i, module in enumerate(backward_order):
             if i - 2 >= 0:
@@ -537,20 +535,34 @@ class FSDPModule(nn.Module):
         for param_name in sorted(norms.keys()):
             pn = norms[param_name]["param_norm"]
             gn = norms[param_name]["grad_norm"]
-            print(f"{prefix} iter={iteration} param={param_name} "
-                  f"param_norm={pn:.6f} grad_norm={gn:.6f}")
+            print(
+                f"{prefix} iter={iteration} param={param_name} "
+                f"param_norm={pn:.6f} grad_norm={gn:.6f}"
+            )
 
     def _log_parameter_groups(self):
         """Compact log of FSDP parameter groups and their parameters (rewrite path)."""
 
         def _fmt_dtype(dt: torch.dtype) -> str:
-            short = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16",
-                     torch.int64: "i64", torch.int32: "i32", torch.uint8: "u8"}
+            short = {
+                torch.float32: "fp32",
+                torch.float16: "fp16",
+                torch.bfloat16: "bf16",
+                torch.int64: "i64",
+                torch.int32: "i32",
+                torch.uint8: "u8",
+            }
             return short.get(dt, str(dt).removeprefix("torch."))
 
         def _elem_size(dt: torch.dtype) -> int:
-            return {torch.float32: 4, torch.float16: 2, torch.bfloat16: 2,
-                    torch.int64: 8, torch.int32: 4, torch.uint8: 1}.get(dt, 1)
+            return {
+                torch.float32: 4,
+                torch.float16: 2,
+                torch.bfloat16: 2,
+                torch.int64: 8,
+                torch.int32: 4,
+                torch.uint8: 1,
+            }.get(dt, 1)
 
         def _mb(b: int | float) -> str:
             return f"{b / 1_000_000:.2f} MB"

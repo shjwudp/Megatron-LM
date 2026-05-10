@@ -127,8 +127,7 @@ class BufferIndex:
                 # Place the paired param so its LAST ``rhs_remain`` elements
                 # land in the same alignment grid as the current param's remainder.
                 # The bulk of the param extends backward from the grid boundary.
-                add_item(rhs_found_id, rhs_found_shape,
-                         data_index - rhs_remain, item_index_map)
+                add_item(rhs_found_id, rhs_found_shape, data_index - rhs_remain, item_index_map)
                 space -= rhs_remain
                 # Advance past the aligned portion of the paired param.
                 data_index += (rhs_found_shape.numel() // chunk_size_factor) * chunk_size_factor
@@ -363,9 +362,11 @@ class DataParallelBuffer:
 
             # Bounds check: end must not exceed data size
             if s_end > data_nel:
-                print(f"{label_prefix}❌ OVERFLOW: item {s_id} shape={list(shape)} "
-                      f"local=[{s_start}, {s_end}) but data.numel()={data_nel} "
-                      f"(global=[{g_start}, {g_start + size}))")
+                print(
+                    f"{label_prefix}❌ OVERFLOW: item {s_id} shape={list(shape)} "
+                    f"local=[{s_start}, {s_end}) but data.numel()={data_nel} "
+                    f"(global=[{g_start}, {g_start + size}))"
+                )
                 valid = False
 
             # Overlap check with next item
@@ -373,11 +374,13 @@ class DataParallelBuffer:
                 n_start, n_end, n_id, n_gstart, n_size = slices[i + 1]
                 if s_end > n_start:
                     overlap = s_end - n_start
-                    print(f"{label_prefix}❌ OVERLAP: item {s_id} shape={list(shape)} "
-                          f"local=[{s_start}, {s_end}) overlaps item {n_id} "
-                          f"local=[{n_start}, {n_end}) by {overlap} elements "
-                          f"(global_{s_id}=[{g_start}, {g_start + size}), "
-                          f"global_{n_id}=[{n_gstart}, {n_gstart + n_size}))")
+                    print(
+                        f"{label_prefix}❌ OVERLAP: item {s_id} shape={list(shape)} "
+                        f"local=[{s_start}, {s_end}) overlaps item {n_id} "
+                        f"local=[{n_start}, {n_end}) by {overlap} elements "
+                        f"(global_{s_id}=[{g_start}, {g_start + size}), "
+                        f"global_{n_id}=[{n_gstart}, {n_gstart + n_size}))"
+                    )
                     valid = False
 
         return valid
@@ -398,7 +401,9 @@ class DataParallelBuffer:
         ranges = []
         for item_id in range(n_items):
             idx = items[item_id]
-            ranges.append((idx.global_data_index, idx.global_data_index + idx.size, item_id, idx.shape))
+            ranges.append(
+                (idx.global_data_index, idx.global_data_index + idx.size, item_id, idx.shape)
+            )
 
         ranges.sort(key=lambda x: x[0])
 
@@ -407,9 +412,11 @@ class DataParallelBuffer:
             a_start, a_end, a_id, a_shape = ranges[i]
             b_start, b_end, b_id, b_shape = ranges[i + 1]
             if a_end > b_start:
-                print(f"{label_prefix}❌ GLOBAL OVERLAP: item {a_id} shape={list(a_shape)} "
-                      f"[{a_start}, {a_end}) vs item {b_id} shape={list(b_shape)} "
-                      f"[{b_start}, {b_end}) overlap={a_end - b_start}")
+                print(
+                    f"{label_prefix}❌ GLOBAL OVERLAP: item {a_id} shape={list(a_shape)} "
+                    f"[{a_start}, {a_end}) vs item {b_id} shape={list(b_shape)} "
+                    f"[{b_start}, {b_end}) overlap={a_end - b_start}"
+                )
                 valid = False
 
         if valid:
@@ -522,7 +529,7 @@ class DataParallelBuffer:
 
         full_grad = self.fetch_unsharded_buffer()
         if self.gradient_scaling_factor not in (None, 1.0):
-            full_grad.mul_(self.gradient_scaling_factor)   # pre-scale, then SUM-reduce
+            full_grad.mul_(self.gradient_scaling_factor)  # pre-scale, then SUM-reduce
 
         sm = self.buffer_index.shard_meta
         local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
@@ -548,8 +555,9 @@ def check_all_fsdp_buffers(module) -> bool:
     """
     import torch.distributed as dist
 
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite.fully_shard import \
-        FSDPModule
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard_rewrite.fully_shard import (
+        FSDPModule,
+    )
 
     rank = dist.get_rank() if dist.is_initialized() else -1
     all_ok = True

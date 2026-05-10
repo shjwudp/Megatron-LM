@@ -1433,9 +1433,7 @@ class MegatronFSDP(torch.nn.Module):
             else:
                 local_param = param
             if local_param.numel() > 0:
-                results[full_name]["param_norm"] = (
-                    local_param.float().norm(p=2).item() ** 2
-                )
+                results[full_name]["param_norm"] = local_param.float().norm(p=2).item() ** 2
 
             if param in param_to_group:
                 group = pg_buffer.parameter_groups[param_to_group[param]]
@@ -1468,8 +1466,10 @@ class MegatronFSDP(torch.nn.Module):
         for param_name in sorted(norms.keys()):
             pn = norms[param_name]["param_norm"]
             gn = norms[param_name]["grad_norm"]
-            print(f"{prefix} iter={iteration} param={param_name} "
-                  f"param_norm={pn:.6f} grad_norm={gn:.6f}")
+            print(
+                f"{prefix} iter={iteration} param={param_name} "
+                f"param_norm={pn:.6f} grad_norm={gn:.6f}"
+            )
 
     def broadcast_params(self):
         """
