@@ -351,17 +351,16 @@ class FSDPModule(nn.Module):
         """Wait for the previous async reduce_grad to complete before reducing gradients for this module."""
         ctx = self._fsdp_root_context
         if ctx.enable_async_reduce_grad:
-            return  # No need to wait if async reduce_grad is not enabled
-        backward_order = list(reversed(ctx.forward_order))
-        for i, module in enumerate(backward_order):
-            if i - 2 >= 0:
-                buckets = ctx.reduce_grad_buckets[id(backward_order[i - 2])]
-                while len(buckets) > 0:
-                    event, param_group = buckets.pop()
-                    event.wait()
-                    param_group.release_grad_buffer()
-            if module is self:
-                break
+            backward_order = list(reversed(ctx.forward_order))
+            for i, module in enumerate(backward_order):
+                if i - 2 >= 0:
+                    buckets = ctx.reduce_grad_buckets[id(backward_order[i - 2])]
+                    while len(buckets) > 0:
+                        event, param_group = buckets.pop()
+                        event.wait()
+                        param_group.release_grad_buffer()
+                if module is self:
+                    break
 
     def reduce_grad(self, async_op: bool = False):
         """
