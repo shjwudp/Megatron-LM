@@ -117,6 +117,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 device,
                 pg_collection,
             )
+            self._set_dist_param_unique_name()
             return
 
         if has_config_logger_enabled(config):
@@ -206,6 +207,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.module.config = config
 
         self.sync_rng_states_across_tp_group()
+        self._set_dist_param_unique_name()
 
     def _init_with_fully_shard(
         self,
@@ -351,6 +353,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         if torch.distributed.get_rank() == 0:
             self.module._log_parameter_groups()
+
+    def _set_dist_param_unique_name(self):
+        for name, param in self.module.named_parameters():
+            if not hasattr(param, "_unique_name"):
+                setattr(param, "_unique_name", name)
 
     def load_state_dict(self, state_dict, strict=True):
         """

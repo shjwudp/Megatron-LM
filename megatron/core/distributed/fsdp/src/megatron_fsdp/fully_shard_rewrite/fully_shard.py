@@ -458,6 +458,8 @@ class FSDPModule(nn.Module):
                 continue
             for param_group in child._fsdp_param_groups:
                 for dist_grad in param_group.dist_grads:
+                    if dist_grad is None:
+                        continue
                     dist_grad._local_tensor.mul_(scaling_factor)
 
     def _zero_grad_buffer(self):
