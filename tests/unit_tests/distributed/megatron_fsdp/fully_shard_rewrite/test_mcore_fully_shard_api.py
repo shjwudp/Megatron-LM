@@ -72,12 +72,12 @@ class TestMegatronFSDPE2E:
         MICRO_BATCH_SIZE = kwargs.get("micro_batch_size", 2)
         GLOBAL_BATCH_SIZE = kwargs.get("global_batch_size", 32)
         NUM_TRAINING_STEPS = kwargs.get("train_iters", 20)
-        TP = kwargs.get("tensor_model_parallel_size", 1)
-        PP = kwargs.get("pipeline_model_parallel_size", 1)
-        VPP = kwargs.get("num_layers_per_virtual_pipeline_stage", None)
-        EP = kwargs.get("expert_model_parallel_size", 1)
-        ETP = kwargs.get("expert_tensor_parallel_size", 1)
-        OUTER_DP = kwargs.get("num_distributed_optimizer_instances", 1)
+        TP = kwargs.get("TP", 1)
+        PP = kwargs.get("PP", 1)
+        VPP = kwargs.get("VPP", None)
+        EP = kwargs.get("EP", 1)
+        ETP = kwargs.get("ETP", 1)
+        OUTER_DP = kwargs.get("OUTER_DP", 1)
 
         # Initialize model parallel groups
         Utils.initialize_model_parallel(
