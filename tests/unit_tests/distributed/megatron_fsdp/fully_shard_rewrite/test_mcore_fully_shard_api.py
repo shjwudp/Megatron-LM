@@ -176,7 +176,9 @@ class TestMegatronFSDPE2E:
             distopt_spec_configs = copy.deepcopy(spec_configs)
             distopt_spec_configs["fp8_param_gather"] = False
             ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
-                use_distributed_optimizer=True, **distopt_spec_configs
+                use_distributed_optimizer=True,
+                **nd_topology,
+                **distopt_spec_configs,
             )
 
         outputs = TestMegatronFSDPE2E._training_loop(
@@ -184,6 +186,7 @@ class TestMegatronFSDPE2E:
             init_model_with_meta_device=True,
             ckpt_format="fsdp_dtensor",
             gradient_accumulation_fusion=False,
+            **nd_topology,
             **spec_configs,
         )
         reference_outputs = ref_cache[nd_topology_str]
