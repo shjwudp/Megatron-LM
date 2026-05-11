@@ -201,9 +201,9 @@ class TestMegatronFSDPE2E:
                     atol=0,
                     rtol=0.05,
                     msg=(
-                        f"Loss mismatch at step {step}, FSDP Loss = {loss.item()}, "
-                        f"Reference Loss = {ref_loss.item()}"
-                        f", Compare = {compare_losses(loss.item(), ref_loss.item())}"
+                        f"Loss mismatch at step {step}, FSDP Loss = {loss.detach().item()}, "
+                        f"Reference Loss = {ref_loss.detach().item()}"
+                        f", Compare = {compare_losses(loss.detach().item(), ref_loss.detach().item())}"
                         f", outputs = {outputs}, reference_outputs = {reference_outputs}"
                     ),
                 )
