@@ -90,6 +90,19 @@ class _FSDPRootContext:
     enable_async_reduce_grad: bool = True
     """Whether to overlap gradient reduction with backward computation."""
 
+    # ------------------------------------------------------------------
+    # Activation recompute / gradient checkpointing support
+    # ------------------------------------------------------------------
+    pre_backward_phase: bool = False
+    """
+    Whether the backward pass has begun and activation recompute may
+    re-enter forward hooks.
+
+    When True, forward post-hooks skip resharding (backward still needs
+    unsharded parameters) and forward pre-hooks avoid redundant unshard
+    when parameters are already unsharded.
+    """
+
     def get_prefetch_next_modules(
         self, module: "FSDPModule", bwd_pass: bool = False
     ) -> List["FSDPModule"]:
@@ -312,7 +325,6 @@ class FSDPModule(nn.Module):
         # Ensure unshard is complete before forward
         if ctx.unshard_done_events[id(self)] is not None:
             ctx.unshard_done_events[id(self)].wait()
-            ctx.unshard_done_events[id(self)] = None
 
         # Replace module parameters with unsharded versions
         for param_names, param_group in self._named_param_groups:
