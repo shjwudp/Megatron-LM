@@ -8,6 +8,7 @@ import torch.nn as nn
 from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
+from .allocator import TracePoolAllocator
 from .fsdp_module import FSDPModule, _FSDPState
 from .utils import RegisterFSDPBackwardFunction
 
@@ -190,6 +191,17 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
         ctx.backward_phase = False
         ctx.backward_module = None
         ctx.backward_done_modules.clear()
+
+        # After the first backward pass, we have the full trace of bucket allocations
+        # and releases. We can now plan the memory pool based on this trace.
+        if isinstance(ctx.weight_bucket_allocator, TracePoolAllocator) and (
+            ctx.weight_bucket_allocator.phase == "trace"
+        ):
+            ctx.weight_bucket_allocator.plan()
+        if isinstance(ctx.grad_bucket_allocator, TracePoolAllocator) and (
+            ctx.grad_bucket_allocator.phase == "trace"
+        ):
+            ctx.grad_bucket_allocator.plan()
 
     state._post_backward_callback_queued = True
     Variable._execution_engine.queue_callback(

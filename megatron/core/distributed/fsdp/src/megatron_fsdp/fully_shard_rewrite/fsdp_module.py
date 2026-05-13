@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from .allocator import BucketAllocator, StorageFreeingBucketAllocator, TemporaryBucketAllocator
+from .allocator import BucketAllocator, TracePoolAllocator
 from .mixed_precision import FullyShardMixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
@@ -302,6 +302,8 @@ class FSDPModule(nn.Module):
             enable_unshard_prefetch=enable_unshard_prefetch,
             enable_async_reduce_grad=enable_async_reduce_grad,
             _reversed_order=list(reversed(forward_order)),
+            weight_bucket_allocator=TracePoolAllocator(),
+            grad_bucket_allocator=TracePoolAllocator(),
         )
         setattr(self, "_fsdp_state", _FSDPState())
         setattr(self, "_fsdp_root_context", root_context)

@@ -646,3 +646,77 @@ fully-synchronized parameters and gradients.
 5. **Outer-DP / HSDP.** `_FSDPRootContext` does not carry an outer-DP stream for the second
    all-gather needed in hybrid-sharding (outer-DP × inner-FSDP) setups. This mirrors the
    `outer_fsdp_group_param_gather_stream` in the old `AllGatherPipeline`.
+
+---
+
+## Bucket Allocator Hierarchy
+
+`allocator.py` provides a polymorphic allocator family via the `BucketAllocator`
+interface, letting callers swap allocation strategies without changing
+`DataParallelBuffer` or `ParameterGroup`.
+
+```
+BucketAllocator  (interface)
+├── TemporaryBucketAllocator        — legacy: allocates per pg_id, frees + deletes
+├── StorageFreeingBucketAllocator   — allocates per pg_id, frees storage but keeps bucket
+│                                     (same tensor object reused on next allocation)
+└── TracePoolAllocator             — two-phase: trace → plan → static pool
+```
+
+### `TracePoolAllocator`
+
+**Purpose.**  During activation recompute and gradient reduction the FSDP
+framework allocates and frees temporary flat buffers (all-gather input/output,
+gradient accumulation) in a deterministic, repeatable order.  `TracePoolAllocator`
+replaces per-call `torch.empty` + `_free_storage` with a one-time planned pool
+that eliminates allocation overhead and fragmentation.
+
+**Design — two phases.**
+
+| Phase | Behaviour |
+|---|---|
+| **Trace** (``plan()`` not yet called) | Records every ``allocate`` / ``free`` call as a ``(seq, op, param_group_id)`` event.  Also stores ``(size, dtype, device)`` metadata for each ``param_group_id``.  Buckets are allocated via ``torch.empty`` as usual. |
+| **Optimized** (after ``plan()``) | ``plan()`` replays the trace to build intervals ``(alloc_seq, free_seq, size)`` for each ``param_group_id``, groups them by ``(dtype, device)``, and runs a greedy left-edge interval-coloring algorithm per group.  Each color is a **slot** in a contiguous flat pool tensor.  ``allocate`` returns a ``Bucket`` with a view into the pool; ``free`` marks the slot as unused. |
+
+**Greedy left-edge coloring.**  For each ``(dtype, device)`` group, intervals are
+sorted by ``alloc_seq``.  For each interval the algorithm tries to reuse a slot
+whose previous occupant has already freed (``slot_free_seq < alloc_seq``).  If no
+slot is free a new one is allocated.  The slot is sized to the maximum bucket
+assigned to it.  After coloring, slots are laid out contiguously and a single
+``torch.empty`` is issued per group.
+
+**Properties.**
+
+- **Optimal slot count:** left-edge produces the minimum number of slots for
+  interval graphs — it is impossible to use fewer without causing a conflict.
+- **Repeatable trace required:** the same allocate/free call sequence must
+  repeat across iterations / micro-batches.  If the pattern changes, call
+  ``reset()`` to re-profile.
+- **Defensive assertions in pool mode:** ``allocate`` checks that the slot is
+  not already in use and that the requested size fits; ``free`` checks that
+  the slot is in use.
+
+**API.**
+
+```python
+allocator = TracePoolAllocator()
+# … run one iteration (trace phase) …
+pool_elems = allocator.plan()          # returns total element count
+# … subsequent iterations use the pool …
+print(allocator.total_pool_bytes)       # bytes across all groups
+allocator.reset()                       # back to trace phase
+```
+
+**Lifecycle diagram for one ``param_group_id`` in a (dtype, device) group.**
+
+```
+Trace phase                          Optimized phase
+───────────                          ───────────────
+allocate(pg) → torch.empty  ─┐       allocate(pg) → pool[off:off+sz]
+free(pg)     → _free_storage  │ plan  free(pg)     → slot.in_use = False
+allocate(pg) → torch.empty  ─┘        allocate(pg) → pool[off:off+sz]  (same slot)
+free(pg)     → _free_storage          free(pg)     → slot.in_use = False
+```
+
+No ``torch.empty`` or storage resizing occurs after ``plan()`` — the pool owns
+all memory, and buckets are lightweight views.
