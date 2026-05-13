@@ -47,6 +47,31 @@ class _FSDPRootContext:
     # --- Feature flags ---
     enable_unshard_prefetch: bool
     enable_async_reduce_grad: bool
+
+    # --- Activation recompute support ---
+    backward_phase: bool = False
+    # True from the root backward pre-hook until the final callback.
+
+    backward_module: Optional[int] = None
+    # ``id(module)`` of the FSDP module whose backward is pending next.
+    # Derived from ``_reversed_order`` and ``backward_done_modules`` — NOT
+    # set by any hook directly.  Updated by ``_advance_backward_module()``.
+
+    backward_done_modules: set = field(default_factory=set)
+    # Set of ``id(module)`` for FSDP modules whose backward has completed.
+    # Populated in ``post_backward``, cleared in the root backward pre-hook.
+
+    _reversed_order: List[FSDPModule] = field(default_factory=list)
+    # ``list(reversed(forward_order))`` — precomputed backward processing order.
+
+    def _advance_backward_module(self) -> None:
+        """Set ``backward_module`` to the first module in ``_reversed_order``
+        that is NOT in ``backward_done_modules``."""
+        for m in self._reversed_order:
+            if id(m) not in self.backward_done_modules:
+                self.backward_module = id(m)
+                return
+        self.backward_module = None
 ```
 
 ### Initialization in `_init_fsdp_state()`
@@ -122,10 +147,12 @@ for module in [self] + prefetch:
         event = stream.record_event()
         ctx.unshard_done_events[id(module)] = event   # store completion signal
 
-# Synchronize self: block main stream until this module's AG is done
+# Synchronize self: block main stream until this module's AG is done.
+# The event is NOT cleared here — it persists as a "currently unsharded" flag
+# and is only cleared by reshard(). This prevents redundant all-gathers during
+# activation recompute and prefetch re-entry (see Feature 3 below).
 if ctx.unshard_done_events[id(self)] is not None:
     ctx.unshard_done_events[id(self)].wait()          # main stream waits on ag_stream event
-    ctx.unshard_done_events[id(self)] = None          # consume and reset
 
 # Install full parameter tensors into the nn.Module (safe after event.wait)
 for param_names, param_group in self._named_param_groups:
@@ -307,6 +334,136 @@ def _post_backward_final_callback(root_state, root_module):
 
     root_state._post_backward_callback_queued = False
 ```
+
+---
+
+## Feature 3: Activation Recomputation (Gradient Checkpointing)
+
+### Problem
+
+When activation checkpointing re-runs a forward pass during backward, the FSDP
+forward hooks fire again. Without mitigation this causes two problems:
+
+1. **Redundant all-gather**: `forward_pre_hook` → `unshard()` launches a second
+   all-gather even though parameters are already unsharded.
+2. **Premature reshard**: `forward_hook` → `reshard()` releases the unsharded
+   parameter buffer before backward gradient computation has consumed it.
+
+The baseline Megatron-FSDP addresses this by setting `TrainingState.PRE_BACKWARD`
+on all submodules before backprop (`megatron_fsdp.py:900-938`).
+
+### Solution Overview
+
+Two mechanisms:
+
+| Mechanism | Effect |
+|---|---|
+| **Derived `backward_module`** | `_advance_backward_module()` scans `_reversed_order` for the first module **not** in `backward_done_modules`. This identifies the pending module even when activation recompute fires **before** any layer's `pre_backward_hook` (which is always the case — the checkpoint wrapper triggers recompute, then backward flows through the recomputed graph). |
+| **Persistent `unshard_done_events`** | Event is only cleared by `reshard()`, never by `unshard()`. Prevents redundant all-gathers. |
+
+The `backward_phase` flag gates the forward post-hook check; `backward_done_modules`
+drives both the derived pointer and the prefetch guard.
+
+### Hook Entry Points
+
+```python
+# _register_forward_hook → reshard_param_groups:
+if ctx.backward_phase and id(module) == ctx.backward_module:
+    return                              # skip reshard — this is the pending module
+
+# _register_backward_pre_hook → pre_backward_hook (root only):
+ctx.backward_done_modules.clear()
+ctx.backward_phase = True
+ctx._advance_backward_module()          # picks first non-done in _reversed_order
+
+# _register_backward_hook → post_backward:
+ctx.backward_done_modules.add(id(module))
+ctx._advance_backward_module()          # advances to next pending module
+module.reshard()
+
+# _register_post_backward_final_callback:
+ctx.backward_phase = False
+ctx.backward_module = None
+ctx.backward_done_modules.clear()
+```
+
+### Prefetch Constraint
+
+During backward, `unshard(bwd_pass=True)` prefetches the next module in
+`_reversed_order`.  An extra guard skips modules whose backward is already done:
+
+```python
+# fsdp_module.py — unshard()
+if bwd_pass and id(module) in ctx.backward_done_modules:
+    continue        # backward already done — skip prefetch
+```
+
+### Timeline
+
+Consider two FSDP-wrapped layers L1, L2 checkpointed together.
+`forward_order = [root, L1, L2]`, `_reversed_order = [L2, L1, root]`.
+
+```
+━━━━━ FORWARD (normal) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+L1: pre → unshard(L1) → forward → reshard(L1)
+L2: pre → unshard(L2) → forward → reshard(L2)
+      (checkpoint drops intermediates)
+
+━━━━━ BACKWARD (root enters phase) ━━━━━━━━━━━━━━━━━━━━━━
+root pre_backward:
+  clear done_modules, backward_phase = True
+  _advance → backward_module = L2    (first not done)
+  unshard(root)
+
+━━━━━ ACTIVATION RECOMPUTE (L1→L2, inside checkpoint backward) ━━
+L1 pre → unshard(L1) → forward
+L1 post: L1 ≠ backward_module(L2) → reshard(L1)
+L2 pre → unshard(L2)                (event[L2] set, persistent)
+L2 post: L2 == backward_module → skip reshard
+
+━━━━━ L2 BACKWARD ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+L2 pre_backward → unshard(L2)       (event set → skip)
+L2 backward compute
+L2 post_backward:
+  done_modules.add(L2), _advance → L1, reshard
+
+━━━━━ L1 BACKWARD ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+L1 pre_backward → unshard(L1)       (re-allocates, all-gathers)
+L1 backward (gradients already computed → copies .grad)
+L1 post_backward:
+  done_modules.add(L1), _advance → root, reshard
+
+━━━━━ FINAL CALLBACK ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+backward_phase = False
+backward_module = None
+done_modules.clear()
+```
+
+### Key Design Decisions
+
+1. **`backward_module` is derived, not set by hooks.**  Activation recompute
+   always fires before any layer's `pre_backward_hook`.  Deriving from the done
+   set + `_reversed_order` correctly identifies the pending module regardless
+   of timing.
+
+2. **`_advance_backward_module()` is called at exactly two points:** root
+   `pre_backward_hook` (after clearing the done set) and `post_backward`
+   (after adding a done module).  These are the only mutations to `backward_done_modules`.
+
+3. **`backward_done_modules` serves dual purpose:** drives the derived pointer
+   AND gates the prefetch guard in `unshard()`.
+
+4. **Event persists between `unshard()` and `reshard()`.**  `unshard()` no
+   longer clears its own event.  Prevents redundant all-gathers.
+
+### Edge Cases
+
+- **Sync mode (`enable_unshard_prefetch=False`):** No event is recorded,
+  so the persistent-event mechanism does not apply.  `backward_module` still
+  prevents premature resharding.
+- **Module not reached by backward:** The final callback runs `reshard()`
+  for untouched modules.
+- **Multiple micro-batches:** All state is reset in the final callback.
 
 ---
 

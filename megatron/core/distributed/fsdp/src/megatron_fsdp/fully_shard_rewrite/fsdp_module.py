@@ -93,15 +93,29 @@ class _FSDPRootContext:
     # ------------------------------------------------------------------
     # Activation recompute / gradient checkpointing support
     # ------------------------------------------------------------------
-    pre_backward_phase: bool = False
-    """
-    Whether the backward pass has begun and activation recompute may
-    re-enter forward hooks.
+    backward_phase: bool = False
+    """True from the root backward pre-hook until the final callback."""
 
-    When True, forward post-hooks skip resharding (backward still needs
-    unsharded parameters) and forward pre-hooks avoid redundant unshard
-    when parameters are already unsharded.
-    """
+    backward_module: Optional[int] = None
+    """``id(module)`` of the FSDP module whose backward is pending next.
+    Derived from ``_reversed_order`` and ``backward_done_modules`` — NOT
+    set by any hook directly.  Updated by ``_advance_backward_module()``."""
+
+    backward_done_modules: set = field(default_factory=set)
+    """Set of ``id(module)`` for FSDP modules whose backward has completed.
+    Populated in ``post_backward``, cleared in the root backward pre-hook."""
+
+    _reversed_order: List["FSDPModule"] = field(default_factory=list)
+    """``list(reversed(forward_order))`` — precomputed backward processing order."""
+
+    def _advance_backward_module(self) -> None:
+        """Set ``backward_module`` to the first module in ``_reversed_order``
+        that is NOT in ``backward_done_modules``."""
+        for m in self._reversed_order:
+            if id(m) not in self.backward_done_modules:
+                self.backward_module = id(m)
+                return
+        self.backward_module = None
 
     def get_prefetch_next_modules(
         self, module: "FSDPModule", bwd_pass: bool = False
@@ -265,6 +279,7 @@ class FSDPModule(nn.Module):
             unshard_done_events={id(module): None for module in forward_order},
             enable_unshard_prefetch=enable_unshard_prefetch,
             enable_async_reduce_grad=enable_async_reduce_grad,
+            _reversed_order=list(reversed(forward_order)),
         )
         setattr(self, "_fsdp_state", _FSDPState())
         setattr(self, "_fsdp_root_context", root_context)
@@ -304,6 +319,8 @@ class FSDPModule(nn.Module):
         for module in [self] + prefetch_modules:
             if ctx.unshard_done_events[id(module)] is not None:
                 continue  # Skip if unshard already issued for this module
+            if bwd_pass and id(module) in ctx.backward_done_modules:
+                continue  # Skip prefetch for modules whose backward is already done
 
             # Unshard parameters for this module
             for param_names, param_group in module._named_param_groups:
@@ -322,7 +339,10 @@ class FSDPModule(nn.Module):
                 event = stream.record_event()
                 ctx.unshard_done_events[id(module)] = event
 
-        # Ensure unshard is complete before forward
+        # Ensure unshard is complete before forward.
+        # The event is NOT cleared here — it persists as a "currently unsharded"
+        # flag and is only cleared by reshard().  This prevents redundant
+        # all-gathers during activation recompute and prefetch re-entry.
         if ctx.unshard_done_events[id(self)] is not None:
             ctx.unshard_done_events[id(self)].wait()
 

@@ -29,7 +29,7 @@ def _register_forward_hook(module: FSDPModule):
 
     def reshard_param_groups(module, *unused):
         ctx = module._fsdp_root_context
-        if ctx.pre_backward_phase:
+        if ctx.backward_phase and id(module) == ctx.backward_module:
             return
         module.reshard()
 
@@ -72,7 +72,9 @@ def _register_backward_pre_hook(module: FSDPModule):
         """Hook called before backward pass for this module."""
         ctx = module._fsdp_root_context
         if module._fsdp_state._is_root:
-            ctx.pre_backward_phase = True
+            ctx.backward_done_modules.clear()
+            ctx.backward_phase = True
+            ctx._advance_backward_module()
         setattr(module, "post_backward_issued", False)
         for param_group in module._fsdp_param_groups:
             for param in param_group.params:
@@ -97,6 +99,8 @@ def _register_backward_hook(module: FSDPModule):
     def post_backward(module: FSDPModule):
         """Hook called after backward pass for this module."""
         ctx = module._fsdp_root_context
+        ctx.backward_done_modules.add(id(module))
+        ctx._advance_backward_module()
         module.reshard()
         module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
         module.post_backward_issued = True
@@ -183,7 +187,9 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
                 param_group.release_grad_buffer()
         torch.cuda.current_stream().wait_stream(stream)
         root_state._post_backward_callback_queued = False
-        ctx.pre_backward_phase = False
+        ctx.backward_phase = False
+        ctx.backward_module = None
+        ctx.backward_done_modules.clear()
 
     state._post_backward_callback_queued = True
     Variable._execution_engine.queue_callback(
