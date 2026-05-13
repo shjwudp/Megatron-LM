@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from .allocator import BucketAllocator, TracePoolAllocator
+from .allocator import BucketAllocator, StorageFreeingBucketAllocator, TracePoolAllocator
 from .mixed_precision import FullyShardMixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
@@ -287,10 +287,7 @@ class FSDPModule(nn.Module):
                 torch.distributed.broadcast(param.data, src=src_rank, group=dp_group)
 
     def _init_fsdp_state(
-        self,
-        enable_unshard_prefetch,
-        enable_async_reduce_grad,
-        fixed_mem_alloc=False,
+        self, enable_unshard_prefetch, enable_async_reduce_grad, enable_trace_pool=False
     ):
         """Initialize FSDP state and mark nested FSDP modules as non-root."""
         forward_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
@@ -307,8 +304,10 @@ class FSDPModule(nn.Module):
             enable_unshard_prefetch=enable_unshard_prefetch,
             enable_async_reduce_grad=enable_async_reduce_grad,
             _reversed_order=list(reversed(forward_order)),
-            weight_bucket_allocator=TracePoolAllocator() if fixed_mem_alloc else None,
-            grad_bucket_allocator=TracePoolAllocator() if fixed_mem_alloc else None,
+            weight_bucket_allocator=(
+                TracePoolAllocator() if enable_trace_pool else StorageFreeingBucketAllocator()
+            ),
+            grad_bucket_allocator=TracePoolAllocator() if enable_trace_pool else None,
         )
         setattr(self, "_fsdp_state", _FSDPState())
         setattr(self, "_fsdp_root_context", root_context)
@@ -320,14 +319,18 @@ class FSDPModule(nn.Module):
                 # Reset the bucket allocator. Since this requires certain global information,
                 # we need to update the bucket allocator for all child FSDP modules each time.
                 for param_group in child._fsdp_param_groups:
-                    if param_group.model_weight_buffer is not None:
+                    if (
+                        param_group.model_weight_buffer is not None
+                        and root_context.weight_bucket_allocator is not None
+                    ):
                         param_group.model_weight_buffer.allocator = (
                             root_context.weight_bucket_allocator
                         )
-                    if param_group.main_grad_buffer is not None:
-                        param_group.main_grad_buffer.allocator = (
-                            root_context.grad_bucket_allocator
-                        )
+                    if (
+                        param_group.main_grad_buffer is not None
+                        and root_context.grad_bucket_allocator is not None
+                    ):
+                        param_group.main_grad_buffer.allocator = root_context.grad_bucket_allocator
 
     def unshard(self, async_op: bool = False, bwd_pass: bool = False):
         """

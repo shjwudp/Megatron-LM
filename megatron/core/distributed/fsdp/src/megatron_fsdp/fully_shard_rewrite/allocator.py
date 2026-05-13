@@ -132,7 +132,7 @@ class TracePoolAllocator(BucketAllocator):
         # Pool state (populated by plan())
         self._pools: Dict[Tuple[torch.dtype, torch.device], torch.Tensor] = {}
         self._slot_map: Dict[ParamGroupIdx, List[int]] = {}  # pg_id -> [slot indices]
-        self._slot_cursors: Dict[ParamGroupIdx, int] = {}    # pg_id -> next index
+        self._slot_cursors: Dict[ParamGroupIdx, int] = {}  # pg_id -> next index
         self._slots: List["TracePoolAllocator._Slot"] = []
 
     # -- Phase 1: trace -------------------------------------------------- #
@@ -292,8 +292,7 @@ class TracePoolAllocator(BucketAllocator):
         slot_list = self._slot_map[param_group_id]
         cursor = self._slot_cursors.get(param_group_id, 0)
         assert cursor < len(slot_list), (
-            f"no slot available for pg={param_group_id} "
-            f"(cursor={cursor}, slots={slot_list})"
+            f"no slot available for pg={param_group_id} " f"(cursor={cursor}, slots={slot_list})"
         )
         slot_idx = slot_list[cursor]
         self._slot_cursors[param_group_id] = cursor + 1
@@ -301,26 +300,23 @@ class TracePoolAllocator(BucketAllocator):
         slot = self._slots[slot_idx]
         assert not slot.in_use, (
             f"slot {slot_idx} already in use (pg={param_group_id}, "
-            f"seq={self._seq}, cursor={cursor}, slot_list={slot_list})"
+            f"cursor={cursor}, slot_list={slot_list})"
         )
-        assert size <= slot.size, (
-            f"requested {size} > slot capacity {slot.size} (pg={param_group_id})"
-        )
+        assert (
+            size <= slot.size
+        ), f"requested {size} > slot capacity {slot.size} (pg={param_group_id})"
         pool = self._pools[(slot.dtype, slot.device)]
         slot.in_use = True
         self._seq += 1
         return Bucket(data=pool[slot.offset : slot.offset + size])
 
     def _pool_free(self, param_group_id: ParamGroupIdx) -> None:
-        slot_idx = self._slot_map[param_group_id][
-            self._slot_cursors.get(param_group_id, 1) - 1
-        ]
+        slot_idx = self._slot_map[param_group_id][self._slot_cursors.get(param_group_id, 1) - 1]
         slot = self._slots[slot_idx]
-        assert slot.in_use, (
-            f"slot {slot_idx} already free (pg={param_group_id}, seq={self._seq})"
-        )
-        slot.in_use = False
         self._seq += 1
+        if not slot.in_use:
+            return
+        slot.in_use = False
 
     # -- Lifecycle ------------------------------------------------------- #
 
@@ -355,6 +351,11 @@ class TracePoolAllocator(BucketAllocator):
                 lines.append(f"  {pg_id} -> {slot_list}  cursor={cursor}")
 
         return "\n".join(lines)
+
+    def reset_cursor(self) -> None:
+        """Reset all slot cursors to 0 for the next iteration / micro-batch."""
+        self._slot_cursors = {}
+        self._seq = 0
 
     def reset(self) -> None:
         """Reset to trace phase, discarding the pool and trace."""
