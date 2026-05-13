@@ -8,6 +8,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
+from .allocator import BucketAllocator, StorageFreeingBucketAllocator, TemporaryBucketAllocator
 from .mixed_precision import FullyShardMixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
@@ -107,6 +108,31 @@ class _FSDPRootContext:
 
     _reversed_order: List["FSDPModule"] = field(default_factory=list)
     """``list(reversed(forward_order))`` — precomputed backward processing order."""
+
+    # ------------------------------------------------------------------
+    # Bucket allocators (weight and gradient buffers)
+    # ------------------------------------------------------------------
+    weight_bucket_allocator: Optional[BucketAllocator] = None
+    """
+    Bucket allocator for weight (parameter) buffers used during all-gather.
+
+    When set, this allocator manages the lifecycle and reuse of flat
+    contiguous weight buffers across FSDP modules, enabling memory-efficient
+    double-buffering and custom allocation strategies for unsharded parameters.
+
+    If ``None``, each module allocates its own weight buffer independently.
+    """
+
+    grad_bucket_allocator: Optional[BucketAllocator] = None
+    """
+    Bucket allocator for gradient buffers used during reduce-scatter.
+
+    When set, this allocator manages the lifecycle and reuse of flat
+    contiguous gradient accumulation buffers across FSDP modules, enabling
+    memory-efficient pipelining of gradient reduction.
+
+    If ``None``, each module allocates its own gradient buffer independently.
+    """
 
     def _advance_backward_module(self) -> None:
         """Set ``backward_module`` to the first module in ``_reversed_order``
@@ -224,9 +250,7 @@ class FSDPModule(nn.Module):
                 setattr(param, "_item_id", param_group.param_idx[param])
                 param.get_main_grad = main_grad_getter.__get__(param)
 
-    def _materialize_meta_module(
-        self, ignored_modules: set, mesh: Optional[DeviceMesh] = None
-    ):
+    def _materialize_meta_module(self, ignored_modules: set, mesh: Optional[DeviceMesh] = None):
         """
         Materialize meta parameters to actual device and initialize.
 
@@ -252,9 +276,7 @@ class FSDPModule(nn.Module):
             elif hasattr(m, "_reset_parameters"):
                 m._reset_parameters()
             else:
-                raise ValueError(
-                    f"Module {name} contains meta parameters but cannot reset them"
-                )
+                raise ValueError(f"Module {name} contains meta parameters but cannot reset them")
 
         if mesh is not None and mesh.size() > 1:
             dp_group = mesh.get_group()
@@ -285,12 +307,20 @@ class FSDPModule(nn.Module):
         setattr(self, "_fsdp_root_context", root_context)
         for child in self.modules():
             if child is not self and isinstance(child, FSDPModule):
-                child._init_fsdp_state(
-                    enable_unshard_prefetch=enable_unshard_prefetch,
-                    enable_async_reduce_grad=enable_async_reduce_grad,
-                )
                 child._fsdp_state._is_root = False
                 setattr(child, "_fsdp_root_context", root_context)
+
+                # Reset the bucket allocator. Since this requires certain global information,
+                # we need to update the bucket allocator for all child FSDP modules each time.
+                for param_group in child._fsdp_param_groups:
+                    if param_group.model_weight_buffer is not None:
+                        param_group.model_weight_buffer.bucket_allocator = (
+                            root_context.weight_bucket_allocator
+                        )
+                    if param_group.main_grad_buffer is not None:
+                        param_group.main_grad_buffer.bucket_allocator = (
+                            root_context.grad_bucket_allocator
+                        )
 
     def unshard(self, async_op: bool = False, bwd_pass: bool = False):
         """
@@ -634,13 +664,13 @@ class FSDPModule(nn.Module):
                     dist_idx = param_group.param_idx.get(param)
                     offset_info = ""
                     if param_group.model_weight_buffer is not None and dist_idx is not None:
-                        item_index = param_group.model_weight_buffer.buffer_index.item_index_map.get(
-                            dist_idx
+                        item_index = (
+                            param_group.model_weight_buffer.buffer_index.item_index_map.get(
+                                dist_idx
+                            )
                         )
                         if item_index is not None:
-                            offset_info = (
-                                f" @{item_index.global_data_index:,}+{item_index.size:,}"
-                            )
+                            offset_info = f" @{item_index.global_data_index:,}+{item_index.size:,}"
                     lines.append(f"    {param_name:50s} {str(tuple(param.shape)):24s}{offset_info}")
                 group_idx += 1
 

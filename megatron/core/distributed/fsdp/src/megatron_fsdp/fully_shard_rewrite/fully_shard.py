@@ -63,10 +63,7 @@ def fully_shard(
     module.__class__ = new_cls
 
     module._init_named_param_groups(
-        mesh,
-        ignored_params,
-        mp_policy=mp_policy,
-        gradient_scaling_factor=gradient_scaling_factor,
+        mesh, ignored_params, mp_policy=mp_policy, gradient_scaling_factor=gradient_scaling_factor
     )
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,
