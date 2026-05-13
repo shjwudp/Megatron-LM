@@ -286,7 +286,12 @@ class FSDPModule(nn.Module):
                     continue
                 torch.distributed.broadcast(param.data, src=src_rank, group=dp_group)
 
-    def _init_fsdp_state(self, enable_unshard_prefetch, enable_async_reduce_grad):
+    def _init_fsdp_state(
+        self,
+        enable_unshard_prefetch,
+        enable_async_reduce_grad,
+        fixed_mem_alloc=False,
+    ):
         """Initialize FSDP state and mark nested FSDP modules as non-root."""
         forward_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
         root_context = _FSDPRootContext(
@@ -302,8 +307,8 @@ class FSDPModule(nn.Module):
             enable_unshard_prefetch=enable_unshard_prefetch,
             enable_async_reduce_grad=enable_async_reduce_grad,
             _reversed_order=list(reversed(forward_order)),
-            weight_bucket_allocator=TracePoolAllocator(),
-            grad_bucket_allocator=TracePoolAllocator(),
+            weight_bucket_allocator=TracePoolAllocator() if fixed_mem_alloc else None,
+            grad_bucket_allocator=TracePoolAllocator() if fixed_mem_alloc else None,
         )
         setattr(self, "_fsdp_state", _FSDPState())
         setattr(self, "_fsdp_root_context", root_context)
@@ -316,11 +321,11 @@ class FSDPModule(nn.Module):
                 # we need to update the bucket allocator for all child FSDP modules each time.
                 for param_group in child._fsdp_param_groups:
                     if param_group.model_weight_buffer is not None:
-                        param_group.model_weight_buffer.bucket_allocator = (
+                        param_group.model_weight_buffer.allocator = (
                             root_context.weight_bucket_allocator
                         )
                     if param_group.main_grad_buffer is not None:
-                        param_group.main_grad_buffer.bucket_allocator = (
+                        param_group.main_grad_buffer.allocator = (
                             root_context.grad_bucket_allocator
                         )
 

@@ -131,7 +131,8 @@ class TracePoolAllocator(BucketAllocator):
 
         # Pool state (populated by plan())
         self._pools: Dict[Tuple[torch.dtype, torch.device], torch.Tensor] = {}
-        self._slot_map: Dict[ParamGroupIdx, int] = {}
+        self._slot_map: Dict[ParamGroupIdx, List[int]] = {}  # pg_id -> [slot indices]
+        self._slot_cursors: Dict[ParamGroupIdx, int] = {}    # pg_id -> next index
         self._slots: List["TracePoolAllocator._Slot"] = []
 
     # -- Phase 1: trace -------------------------------------------------- #
@@ -219,6 +220,7 @@ class TracePoolAllocator(BucketAllocator):
             groups.setdefault(key, []).append(iv)
 
         self._slot_map.clear()
+        self._slot_cursors.clear()
         self._slots.clear()
         self._pools.clear()
 
@@ -257,7 +259,9 @@ class TracePoolAllocator(BucketAllocator):
                     if iv.size > slot.size:
                         slot.size = iv.size
                     free_slots[i] = (slot_idx, iv.free_seq)
-                    self._slot_map[iv.param_group_id] = local_to_global[slot_idx]
+                    self._slot_map.setdefault(iv.param_group_id, []).append(
+                        local_to_global[slot_idx]
+                    )
                     assigned = True
                     break
 
@@ -269,7 +273,7 @@ class TracePoolAllocator(BucketAllocator):
                 group_slots.append(slot)
                 self._slots.append(slot)
                 free_slots.append((local_idx, iv.free_seq))
-                self._slot_map[iv.param_group_id] = global_idx
+                self._slot_map.setdefault(iv.param_group_id, []).append(global_idx)
 
         offset = 0
         for slot in group_slots:
@@ -285,23 +289,72 @@ class TracePoolAllocator(BucketAllocator):
     def _pool_allocate(
         self, param_group_id: ParamGroupIdx, size: int, dtype: torch.dtype, device: torch.device
     ) -> Bucket:
-        slot_idx = self._slot_map[param_group_id]
+        slot_list = self._slot_map[param_group_id]
+        cursor = self._slot_cursors.get(param_group_id, 0)
+        assert cursor < len(slot_list), (
+            f"no slot available for pg={param_group_id} "
+            f"(cursor={cursor}, slots={slot_list})"
+        )
+        slot_idx = slot_list[cursor]
+        self._slot_cursors[param_group_id] = cursor + 1
+
         slot = self._slots[slot_idx]
-        assert not slot.in_use, f"slot {slot_idx} already in use (pg={param_group_id})"
-        assert (
-            size <= slot.size
-        ), f"requested {size} > slot capacity {slot.size} (pg={param_group_id})"
+        assert not slot.in_use, (
+            f"slot {slot_idx} already in use (pg={param_group_id}, "
+            f"seq={self._seq}, cursor={cursor}, slot_list={slot_list})"
+        )
+        assert size <= slot.size, (
+            f"requested {size} > slot capacity {slot.size} (pg={param_group_id})"
+        )
         pool = self._pools[(slot.dtype, slot.device)]
         slot.in_use = True
+        self._seq += 1
         return Bucket(data=pool[slot.offset : slot.offset + size])
 
     def _pool_free(self, param_group_id: ParamGroupIdx) -> None:
-        slot_idx = self._slot_map[param_group_id]
+        slot_idx = self._slot_map[param_group_id][
+            self._slot_cursors.get(param_group_id, 1) - 1
+        ]
         slot = self._slots[slot_idx]
-        assert slot.in_use, f"slot {slot_idx} already free (pg={param_group_id})"
+        assert slot.in_use, (
+            f"slot {slot_idx} already free (pg={param_group_id}, seq={self._seq})"
+        )
         slot.in_use = False
+        self._seq += 1
 
     # -- Lifecycle ------------------------------------------------------- #
+
+    def dump_trace(self) -> str:
+        """Return a human-readable dump of the recorded trace and pool plan.
+
+        Useful for debugging slot-conflict errors.
+        """
+        lines = []
+        lines.append(f"=== TracePoolAllocator trace (phase={self._phase}, seq={self._seq}) ===")
+        lines.append(f"trace events: {len(self._trace)}")
+        for ev in self._trace:
+            meta = self._trace_meta.get(ev.param_group_id)
+            size_str = f"size={meta[0]}" if meta else "size=?"
+            dtype_str = f"dtype={meta[1]}" if meta else "dtype=?"
+            device_str = f"device={meta[2]}" if meta else "device=?"
+            lines.append(
+                f"  seq={ev.seq:>4}  {ev.op:>5}  pg={ev.param_group_id}  "
+                f"{size_str}  {dtype_str}  {device_str}"
+            )
+
+        if self._phase == "optimized":
+            lines.append(f"\nslots: {len(self._slots)}")
+            for i, slot in enumerate(self._slots):
+                lines.append(
+                    f"  slot[{i}]: offset={slot.offset} size={slot.size} "
+                    f"dtype={slot.dtype} device={slot.device}"
+                )
+            lines.append(f"\nslot_map (pg_id -> [slot indices]):")
+            for pg_id, slot_list in self._slot_map.items():
+                cursor = self._slot_cursors.get(pg_id, 0)
+                lines.append(f"  {pg_id} -> {slot_list}  cursor={cursor}")
+
+        return "\n".join(lines)
 
     def reset(self) -> None:
         """Reset to trace phase, discarding the pool and trace."""
@@ -312,6 +365,7 @@ class TracePoolAllocator(BucketAllocator):
         self._buckets.clear()
         self._pools.clear()
         self._slot_map.clear()
+        self._slot_cursors.clear()
         self._slots.clear()
 
     @property

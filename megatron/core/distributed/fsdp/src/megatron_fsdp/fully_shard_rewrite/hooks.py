@@ -197,10 +197,14 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
         if isinstance(ctx.weight_bucket_allocator, TracePoolAllocator) and (
             ctx.weight_bucket_allocator.phase == "trace"
         ):
+            if torch.distributed.get_rank() == 0:
+                print(ctx.weight_bucket_allocator.dump_trace())
             ctx.weight_bucket_allocator.plan()
         if isinstance(ctx.grad_bucket_allocator, TracePoolAllocator) and (
             ctx.grad_bucket_allocator.phase == "trace"
         ):
+            if torch.distributed.get_rank() == 0:
+                print(ctx.grad_bucket_allocator.dump_trace())
             ctx.grad_bucket_allocator.plan()
 
     state._post_backward_callback_queued = True
