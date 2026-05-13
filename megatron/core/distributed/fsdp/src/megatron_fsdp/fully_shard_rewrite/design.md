@@ -9,7 +9,7 @@
 | `fully_shard.py` | `FSDPModule`, `_FSDPRootContext`, `_FSDPState`, all hooks, `unshard()`, `reshard()`, `reduce_grad()`, final callback |
 | `param_group.py` | `ParameterGroup.unshard(async_op)`, `reduce_grad()`, `release_grad_buffer()`, `_init_buffers()` (memory optimization) |
 | `dp_buffer.py` | `DataParallelBuffer.unshard(async_op)` (all-gather + `p.data` rebind), `reduce_grad()` (reduce-scatter + shard accumulation) |
-| `allocator.py` | `TemporaryBucketAllocator` — pooled memory for unsharded parameter and gradient buffers |
+| `allocator.py` | `BucketAllocator` hierarchy: `TemporaryBucketAllocator`, `StorageFreeingBucketAllocator`, `TracePoolAllocator` — pooled memory for unsharded parameter and gradient buffers |
 | `mcore_fsdp_adapter.py` | `FullyShardedDataParallel.stop_communication()` — synchronizes ag_stream and rs_stream into main stream |
 
 No changes to `utils.py` are needed for either overlap feature.
@@ -404,36 +404,36 @@ Consider two FSDP-wrapped layers L1, L2 checkpointed together.
 `forward_order = [root, L1, L2]`, `_reversed_order = [L2, L1, root]`.
 
 ```
-━━━━━ FORWARD (normal) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+----- FORWARD (normal) ----------------------------------
 L1: pre → unshard(L1) → forward → reshard(L1)
 L2: pre → unshard(L2) → forward → reshard(L2)
       (checkpoint drops intermediates)
 
-━━━━━ BACKWARD (root enters phase) ━━━━━━━━━━━━━━━━━━━━━━
+----- BACKWARD (root enters phase) ----------------------
 root pre_backward:
   clear done_modules, backward_phase = True
   _advance → backward_module = L2    (first not done)
   unshard(root)
 
-━━━━━ ACTIVATION RECOMPUTE (L1→L2, inside checkpoint backward) ━━
+----- ACTIVATION RECOMPUTE (L1→L2, inside checkpoint backward) --
 L1 pre → unshard(L1) → forward
 L1 post: L1 ≠ backward_module(L2) → reshard(L1)
 L2 pre → unshard(L2)                (event[L2] set, persistent)
 L2 post: L2 == backward_module → skip reshard
 
-━━━━━ L2 BACKWARD ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+----- L2 BACKWARD ----------------------------------------
 L2 pre_backward → unshard(L2)       (event set → skip)
 L2 backward compute
 L2 post_backward:
   done_modules.add(L2), _advance → L1, reshard
 
-━━━━━ L1 BACKWARD ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+----- L1 BACKWARD ----------------------------------------
 L1 pre_backward → unshard(L1)       (re-allocates, all-gathers)
 L1 backward (gradients already computed → copies .grad)
 L1 post_backward:
   done_modules.add(L1), _advance → root, reshard
 
-━━━━━ FINAL CALLBACK ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+----- FINAL CALLBACK --------------------------------------
 backward_phase = False
 backward_module = None
 done_modules.clear()
@@ -471,9 +471,9 @@ done_modules.clear()
 
 ```
 FORWARD PASS (enable_unshard_prefetch=True)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-main stream:  │← compute L[0] →│← compute L[1] →│← compute L[2] →│
-ag_stream:    │AG(L[0])  AG(L[1])│        AG(L[2])│                │
+---------------------------------------------------------
+main stream:  |← compute L[0] →|← compute L[1] →|← compute L[2] →|
+ag_stream:    |AG(L[0])  AG(L[1])|        AG(L[2])|                |
 
 pre-hook L[0]: async unshard L[0] + prefetch L[1] on ag_stream
                event[L[0]].wait() → main stream unblocks
@@ -487,10 +487,10 @@ pre-hook L[2]: event[L[2]].wait() → main stream unblocks
                _replace_module_parameter(L[2])
 
 BACKWARD PASS (enable_async_reduce_grad=True)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-main stream:  │bwd L[2]│copy grad[2]│bwd L[1]│copy grad[1]│bwd L[0]│copy grad[0]│
-ag_stream:    │AG(L[1]) prefetch    │AG(L[0]) prefetch     │                      │
-rs_stream:    │                RS(L[2]) ──────│     RS(L[1]) ──────│   RS(L[0])───│
+---------------------------------------------------------
+main stream:  |bwd L[2]|copy grad[2]|bwd L[1]|copy grad[1]|bwd L[0]|copy grad[0]|
+ag_stream:    |AG(L[1]) prefetch    |AG(L[0]) prefetch     |                      |
+rs_stream:    |                RS(L[2]) ------|     RS(L[1]) ------|   RS(L[0])---|
 
 post-bwd L[2]: reshard, copy grad[2]→main_grad, rs_stream.wait(main), RS(L[2]), event[2]
 post-bwd L[1]: drain event[2-2]? (i=1, no drain), copy grad[1], RS(L[1]), event[1]
@@ -657,10 +657,10 @@ interface, letting callers swap allocation strategies without changing
 
 ```
 BucketAllocator  (interface)
-├── TemporaryBucketAllocator        — legacy: allocates per pg_id, frees + deletes
-├── StorageFreeingBucketAllocator   — allocates per pg_id, frees storage but keeps bucket
-│                                     (same tensor object reused on next allocation)
-└── TracePoolAllocator             — two-phase: trace → plan → static pool
+|-- TemporaryBucketAllocator        — legacy: allocates per pg_id, frees + deletes
+|-- StorageFreeingBucketAllocator   — allocates per pg_id, frees storage but keeps bucket
+|                                     (same tensor object reused on next allocation)
+\-- TracePoolAllocator             — two-phase: trace → plan → static pool
 ```
 
 ### `TracePoolAllocator`
@@ -671,12 +671,21 @@ gradient accumulation) in a deterministic, repeatable order.  `TracePoolAllocato
 replaces per-call `torch.empty` + `_free_storage` with a one-time planned pool
 that eliminates allocation overhead and fragmentation.
 
-**Design — two phases.**
+**Design — three phases.**
 
 | Phase | Behaviour |
 |---|---|
-| **Trace** (``plan()`` not yet called) | Records every ``allocate`` / ``free`` call as a ``(seq, op, param_group_id)`` event.  Also stores ``(size, dtype, device)`` metadata for each ``param_group_id``.  Buckets are allocated via ``torch.empty`` as usual. |
-| **Optimized** (after ``plan()``) | ``plan()`` replays the trace to build intervals ``(alloc_seq, free_seq, size)`` for each ``param_group_id``, groups them by ``(dtype, device)``, and runs a greedy left-edge interval-coloring algorithm per group.  Each color is a **slot** in a contiguous flat pool tensor.  ``allocate`` returns a ``Bucket`` with a view into the pool; ``free`` marks the slot as unused. |
+| **Trace** (``plan()`` not yet called) | Records every ``allocate`` / ``free`` call as a ``(seq, op, param_group_id)`` event.  Also stores ``(size, dtype, device)`` metadata per ``param_group_id``.  Buckets are allocated via ``torch.empty`` as usual.  Duplicate allocs (without an intervening free) do not generate new trace events. |
+| **Plan** (``plan()``) | Replays the trace to build intervals ``(alloc_seq, free_seq, size)`` for each matched alloc/free pair, groups them by ``(dtype, device)``, and runs a greedy left-edge interval-coloring algorithm per group.  Each color is a **slot** in a contiguous flat pool tensor.  Because the same ``param_group_id`` may appear in multiple intervals, ``_slot_map[pg_id]`` is a **list** of slot indices in alloc order. |
+| **Optimized** (after ``plan()``) | ``allocate`` returns a ``Bucket`` with a slice-view into the pool, advancing a per-pg_id cursor through the slot list.  ``free`` marks the most recently allocated slot as unused (idempotent).  ``reset_cursor()`` rewinds all cursors between micro-batches so the same sequence replays. |
+
+**Slot lists and cursors.**  A single ``param_group_id`` can appear in multiple
+intervals — e.g., forward unshard → free → backward unshard → free.  The plan
+may assign these intervals to *different* slots (if they overlap) or *reuse*
+the same slot (if they don't).  ``_slot_map`` therefore maps each pg_id to a
+**list** of slot indices in the exact alloc order.  During optimized-phase
+runtime a per-pg_id **cursor** tracks which list entry to consume next; between
+micro-batches ``reset_cursor()`` rewinds all cursors to 0.
 
 **Greedy left-edge coloring.**  For each ``(dtype, device)`` group, intervals are
 sorted by ``alloc_seq``.  For each interval the algorithm tries to reuse a slot
@@ -690,11 +699,10 @@ assigned to it.  After coloring, slots are laid out contiguously and a single
 - **Optimal slot count:** left-edge produces the minimum number of slots for
   interval graphs — it is impossible to use fewer without causing a conflict.
 - **Repeatable trace required:** the same allocate/free call sequence must
-  repeat across iterations / micro-batches.  If the pattern changes, call
-  ``reset()`` to re-profile.
-- **Defensive assertions in pool mode:** ``allocate`` checks that the slot is
-  not already in use and that the requested size fits; ``free`` checks that
-  the slot is in use.
+  repeat across micro-batches.  Call ``reset_cursor()`` between micro-batches;
+  call ``reset()`` to re-profile if the pattern changes.
+- **Double-free safe:** ``free`` is idempotent (silently returns if the slot
+  is already free), matching ``TemporaryBucketAllocator``'s behavior.
 
 **API.**
 
@@ -702,21 +710,26 @@ assigned to it.  After coloring, slots are laid out contiguously and a single
 allocator = TracePoolAllocator()
 # … run one iteration (trace phase) …
 pool_elems = allocator.plan()          # returns total element count
-# … subsequent iterations use the pool …
+# … subsequent micro-batches use the pool …
+allocator.reset_cursor()                # between micro-batches
 print(allocator.total_pool_bytes)       # bytes across all groups
 allocator.reset()                       # back to trace phase
 ```
 
-**Lifecycle diagram for one ``param_group_id`` in a (dtype, device) group.**
+**Lifecycle diagram for one ``param_group_id`` across two micro-batches.**
 
 ```
-Trace phase                          Optimized phase
-───────────                          ───────────────
-allocate(pg) → torch.empty  ─┐       allocate(pg) → pool[off:off+sz]
-free(pg)     → _free_storage  │ plan  free(pg)     → slot.in_use = False
-allocate(pg) → torch.empty  ─┘        allocate(pg) → pool[off:off+sz]  (same slot)
-free(pg)     → _free_storage          free(pg)     → slot.in_use = False
+Trace phase                            Optimized phase
+-----------                            ---------------
+allocate(pg) → torch.empty  --.         allocate(pg) → pool slot 0   (cursor 0→1)
+free(pg)     → _free_storage  | plan    free(pg)     → slot free
+allocate(pg) → torch.empty  --'         allocate(pg) → pool slot 1   (cursor 1→2)
+free(pg)     → _free_storage           free(pg)     → slot free
+                                        -- reset_cursor() --
+                                        allocate(pg) → pool slot 0   (cursor 0→1)
+                                        free(pg)     → slot free
+                                        ...
 ```
 
-No ``torch.empty`` or storage resizing occurs after ``plan()`` — the pool owns
-all memory, and buckets are lightweight views.
+No ``torch.empty`` or storage resizing occurs in the optimized phase — the pool
+owns all memory, and buckets are lightweight views.
