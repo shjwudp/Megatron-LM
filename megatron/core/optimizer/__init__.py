@@ -61,6 +61,7 @@ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
 from .distrib_optimizer import DistributedOptimizer
+from .dtensor_optimizer import DTensorOptimizerAdapter
 from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
@@ -498,7 +499,10 @@ def _get_megatron_optimizer_based_on_param_groups(
     # When freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
     # for the purposes of grad stats reductions.
+    dtensor_param_groups = None
     if param_groups:
+        param_groups, dtensor_param_groups = _prepare_dtensor_param_groups(param_groups)
+
         if config.optimizer_cpu_offload:
             if torch.__version__ < '2.3.0':
                 warnings.warn(
@@ -628,6 +632,10 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = None
         init_state_fn = None
 
+    optimizer, init_state_fn = _wrap_dtensor_optimizer(
+        optimizer, init_state_fn, dtensor_param_groups
+    )
+
     if skip_megatron_wrapping:
         return optimizer, init_state_fn
 
@@ -692,6 +700,29 @@ def _get_megatron_optimizer_based_on_param_groups(
     setattr(optimizer, 'tp_group', tp_group)
 
     return optimizer
+
+
+def _prepare_dtensor_param_groups(param_groups: List[dict]):
+    dtensor_param_groups = DTensorOptimizerAdapter.prepare_param_groups(param_groups)
+    if dtensor_param_groups is None:
+        return param_groups, None
+    return dtensor_param_groups.local_param_groups, dtensor_param_groups
+
+
+def _wrap_dtensor_optimizer(optimizer, init_state_fn, dtensor_param_groups):
+    if optimizer is None or dtensor_param_groups is None:
+        return optimizer, init_state_fn
+
+    optimizer = DTensorOptimizerAdapter(optimizer, dtensor_param_groups)
+    if init_state_fn is None:
+        return optimizer, init_state_fn
+
+    def init_state_fn_with_inner_optimizer(opt, config=None):
+        if isinstance(opt, DTensorOptimizerAdapter):
+            opt = opt.inner_optimizer
+        return init_state_fn(opt, config)
+
+    return optimizer, init_state_fn_with_inner_optimizer
 
 
 def check_config_overrides_consistency(
@@ -799,8 +830,12 @@ def _get_megatron_emerging_optimizer(
         model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
 
         if opt_name in _EMERGING_OPTIMIZERS:
+            optimizer_groups, dtensor_param_groups = _prepare_dtensor_param_groups(groups)
             optimizer, init_state_fn = _create_emerging_optimizer(
-                config, groups, eopt_name, model_chunks, pg_collection
+                config, optimizer_groups, eopt_name, model_chunks, pg_collection
+            )
+            optimizer, init_state_fn = _wrap_dtensor_optimizer(
+                optimizer, init_state_fn, dtensor_param_groups
             )
             if use_layer_wise:
                 result = (optimizer, init_state_fn)

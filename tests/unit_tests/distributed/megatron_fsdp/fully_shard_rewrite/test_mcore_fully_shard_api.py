@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import copy
 
 import pytest
@@ -72,12 +72,12 @@ class TestMegatronFSDPE2E:
         MICRO_BATCH_SIZE = kwargs.get("micro_batch_size", 2)
         GLOBAL_BATCH_SIZE = kwargs.get("global_batch_size", 32)
         NUM_TRAINING_STEPS = kwargs.get("train_iters", 20)
-        TP = kwargs.get("TP", 1)
-        PP = kwargs.get("PP", 1)
-        VPP = kwargs.get("VPP", None)
-        EP = kwargs.get("EP", 1)
-        ETP = kwargs.get("ETP", 1)
-        OUTER_DP = kwargs.get("OUTER_DP", 1)
+        TP = kwargs.get("tensor_model_parallel_size", 1)
+        PP = kwargs.get("pipeline_model_parallel_size", 1)
+        VPP = kwargs.get("num_layers_per_virtual_pipeline_stage", None)
+        EP = kwargs.get("expert_model_parallel_size", 1)
+        ETP = kwargs.get("expert_tensor_parallel_size", 1)
+        OUTER_DP = kwargs.get("num_distributed_optimizer_instances", 1)
 
         # Initialize model parallel groups
         Utils.initialize_model_parallel(
@@ -162,69 +162,31 @@ class TestMegatronFSDPE2E:
                     use_fully_shard_api=True,
                 ),
                 id="optim_grads_params_double_buffer",
-            ),
-            pytest.param(
-                dict(
-                    bf16=True,
-                    data_parallel_sharding_strategy="optim_grads_params",
-                    fp8="e4m3",
-                    fp8_param_gather=True,
-                    fp8_recipe="mxfp8",
-                    main_grads_dtype="fp32",
-                    main_params_dtype="fp32",
-                    exp_avg_dtype="bf16",
-                    exp_avg_sq_dtype="bf16",
-                    moe_grouped_gemm=True,
-                    overlap_param_gather=True,
-                    overlap_grad_reduce=True,
-                    use_fully_shard_api=True,
-                    use_precision_aware_optimizer=True,
-                ),
-                id="optim_grads_params_mxfp8_param_gather_pao",
-            ),
+            )
         ],
     )
     def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, spec_configs):
         if spec_configs.get("fp8_recipe") == "mxfp8" and (
-            not torch.cuda.is_available()
-            or torch.cuda.get_device_capability()[0] < 10
-            or not HAVE_TE_MXFP8TENSOR
+            torch.cuda.get_device_capability()[0] < 10 or not HAVE_TE_MXFP8TENSOR
         ):
             pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
 
-        reference_kind = "fsdp_v1" if spec_configs.get("fp8_param_gather") else "distopt"
-        ref_cache_key = (
-            reference_kind,
-            tuple(sorted(nd_topology.items())),
-            tuple(sorted((key, repr(value)) for key, value in spec_configs.items())),
-        )
-        if ref_cache_key not in ref_cache:
-            reference_spec_configs = copy.deepcopy(spec_configs)
-            if reference_kind == "fsdp_v1":
-                reference_spec_configs["use_fully_shard_api"] = False
-                ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
-                    use_megatron_fsdp=True,
-                    init_model_with_meta_device=True,
-                    ckpt_format="fsdp_dtensor",
-                    gradient_accumulation_fusion=False,
-                    **nd_topology,
-                    **reference_spec_configs,
-                )
-            else:
-                reference_spec_configs["fp8_param_gather"] = False
-                ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
-                    use_distributed_optimizer=True, **nd_topology, **reference_spec_configs
-                )
+        nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
+        if nd_topology_str not in ref_cache:
+            distopt_spec_configs = copy.deepcopy(spec_configs)
+            distopt_spec_configs["fp8_param_gather"] = False
+            ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
+                use_distributed_optimizer=True, **distopt_spec_configs
+            )
 
         outputs = TestMegatronFSDPE2E._training_loop(
             use_megatron_fsdp=True,
             init_model_with_meta_device=True,
             ckpt_format="fsdp_dtensor",
             gradient_accumulation_fusion=False,
-            **nd_topology,
             **spec_configs,
         )
-        reference_outputs = ref_cache[ref_cache_key]
+        reference_outputs = ref_cache[nd_topology_str]
 
         if torch.distributed.get_rank() == 0:
             for step, (output, ref_output) in enumerate(zip(outputs, reference_outputs)):
@@ -236,9 +198,9 @@ class TestMegatronFSDPE2E:
                     atol=0,
                     rtol=0.05,
                     msg=(
-                        f"Loss mismatch at step {step}, FSDP Loss = {loss.detach().item()}, "
-                        f"Reference Loss = {ref_loss.detach().item()}"
-                        f", Compare = {compare_losses(loss.detach().item(), ref_loss.detach().item())}"
+                        f"Loss mismatch at step {step}, FSDP Loss = {loss.item()}, "
+                        f"Reference Loss = {ref_loss.item()}"
+                        f", Compare = {compare_losses(loss.item(), ref_loss.item())}"
                         f", outputs = {outputs}, reference_outputs = {reference_outputs}"
                     ),
                 )

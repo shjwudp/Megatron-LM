@@ -52,6 +52,7 @@ from ..fp4_utils import is_nvfp4tensor, quantize_nvfp4_param_shard
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
+from .dtensor_optimizer import DTensorOptimizerAdapter
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
@@ -526,7 +527,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
         assert (
-            isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
+            isinstance(
+                optimizer,
+                (Adam, torch.optim.AdamW, HybridDeviceOptimizer, DTensorOptimizerAdapter),
+            )
             or optimizer is None
         ), (
             "Only Adam and HybridDeviceOptimizer currently supported, "
@@ -2313,6 +2317,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for model_chunk in self.model_chunks:
                 # Zero gradients managed by Megatron-FSDP.
                 model_chunk.zero_grad_buffer()
+            if self.optimizer is not None:
+                self.optimizer.zero_grad(set_to_none=set_to_none)
             return
 
         if self.is_stub_optimizer:

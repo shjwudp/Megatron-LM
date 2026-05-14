@@ -5,7 +5,7 @@ This directory contains the **fully_shard_v2** implementation — a PyTorch FSDP
 ## Architecture
 
 ```
-v2/
+fully_shard_rewrite/
 ├── README.md                    # This file
 ├── __init__.py                  # Public exports
 ├── fully_shard.py               # Core fully_shard() API + FSDPModule class
@@ -113,10 +113,6 @@ See `examples/megatron_fsdp/fsdp_toy.py` for a standalone example showing:
 torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
     --model-dim 512 --n-layers 2 --batch-size 4
 ```
-
-## Gotchas / Pitfalls
-
-- **Zero-numel gradient shards and fused optimizers.** When a parameter's local shard is empty on some DP ranks (e.g., small biases on high DP counts), creating a `DTensor` gradient with `numel() == 0` and passing it to fused multi-tensor optimizers (TE `FusedAdam`) can silently corrupt updates for neighboring non-empty parameters. This manifests only as convergence divergence with no error — see [design.md § Pitfall](design.md) for details and the fix in `param_group.py`.
 
 ## Unit Tests
 
