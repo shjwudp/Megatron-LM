@@ -98,6 +98,13 @@ for child in self.modules():
 `forward_order` is **static** (module tree topology, computed once). There is no first-pass
 dynamic recording phase.
 
+**Safety constraint.** `_init_fsdp_state()` must be called **before** any forward/backward pass
+runs.  The method includes a runtime guard that rejects re-initialization if any child
+FSDPModule is still unsharded (`unshard_done_events` live) or has pending reduce-scatter
+operations (`reduce_grad_buckets` non-empty).  Violating this constraint would overwrite a
+running module's `_fsdp_root_context` while its hooks are still firing, causing undefined
+behavior.
+
 ---
 
 ## Feature 1: Unshard Prefetch

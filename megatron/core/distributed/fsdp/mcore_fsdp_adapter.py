@@ -303,6 +303,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             for param_group in child._fsdp_param_groups:
                 for param, dist_param in zip(param_group.params, param_group.dist_params):
                     for attr_name in [
+                        "allreduce",
                         "requires_grad",
                         "sequence_parallel",
                         "shared",
