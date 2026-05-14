@@ -14,8 +14,8 @@
 
 """FSDPModule implementation for Megatron-FSDP2."""
 
-from contextlib import nullcontext
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -283,7 +283,9 @@ class FSDPModule(nn.Module):
                 lambda t: torch.empty_like(t, device=materialization_device) if t.is_meta else t,
                 recurse=False,
             )
-            init_context = mp_policy.model_init_context() if mp_policy is not None else nullcontext()
+            init_context = (
+                mp_policy.model_init_context() if mp_policy is not None else nullcontext()
+            )
             with init_context:
                 if hasattr(m, "reset_parameters"):
                     m.reset_parameters()
@@ -303,10 +305,7 @@ class FSDPModule(nn.Module):
                 torch.distributed.broadcast(param.data, src=src_rank, group=dp_group)
 
     def _init_fsdp_state(
-        self,
-        enable_unshard_prefetch,
-        enable_async_reduce_grad,
-        bucket_allocator: BucketAllocator,
+        self, enable_unshard_prefetch, enable_async_reduce_grad, bucket_allocator: BucketAllocator
     ):
         """Initialize FSDP state and mark nested FSDP modules as non-root.
 
@@ -489,7 +488,9 @@ class FSDPModule(nn.Module):
             if getattr(self, "_enable_nan_checks", False):
                 for name, param in zip(param_names, param_group.params):
                     if param.grad is not None:
-                        assert not torch.isnan(param.grad).any(), f"NaN in parameter grad for {name}"
+                        assert not torch.isnan(
+                            param.grad
+                        ).any(), f"NaN in parameter grad for {name}"
 
             # Copy .grad -> main grad buffer on main stream (fast memcpy).
             # When gradient_accumulation_fusion is active for FSDP params, the backward
