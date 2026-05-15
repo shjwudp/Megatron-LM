@@ -83,13 +83,14 @@ class TestCheckpointOnlineConvert:
     """
 
     # ------------------------------------------------------------------
-    # Training loop helper (same pattern as test_mcore_fully_shard_api.py)
+    # Model init / training helpers (same pattern as test_mcore_nd_parallel.py)
     # ------------------------------------------------------------------
     @staticmethod
-    def _training_loop(seed=42, **kwargs):
+    def _init_model_and_optimizer(seed=42, **kwargs):
         """
-        Run a deterministic training loop and return the model together
-        with its state dict (captured BEFORE process groups are destroyed).
+        Initialize model-parallel groups, build model and optimizer.
+
+        Returns (model_chunks, optim).
 
         NOTE: Process groups are intentionally NOT destroyed here because
         the caller (e.g. DCP.load) may need them.  The caller is responsible
@@ -114,7 +115,6 @@ class TestCheckpointOnlineConvert:
             expert_tensor_parallel_size=ETP,
             num_distributed_optimizer_instances=OUTER_DP,
         )
-        DP_GROUP = mpu.get_data_parallel_group()
 
         set_manual_seed(seed)
 
@@ -132,6 +132,25 @@ class TestCheckpointOnlineConvert:
             train_iters=NUM_TRAINING_STEPS,
             **kwargs,
         )
+
+        return model_chunks, optim
+
+    @staticmethod
+    def _training_loop(seed=42, **kwargs):
+        """
+        Run _init_model_and_optimizer followed by a deterministic training
+        loop and return the model together with its state dict.
+        """
+        model_chunks, optim = TestCheckpointOnlineConvert._init_model_and_optimizer(
+            seed=seed, **kwargs
+        )
+
+        VOCAB_SIZE = kwargs.get("vocab_size", 100)
+        MAX_SEQ_LEN = kwargs.get("seq_length", 128)
+        MICRO_BATCH_SIZE = kwargs.get("micro_batch_size", 2)
+        GLOBAL_BATCH_SIZE = kwargs.get("global_batch_size", 32)
+        NUM_TRAINING_STEPS = kwargs.get("train_iters", 2)
+        DP_GROUP = mpu.get_data_parallel_group()
 
         data_iterator = make_gpt_mock_data_iterator(
             dp_group=DP_GROUP,
@@ -206,7 +225,7 @@ class TestCheckpointOnlineConvert:
         Utils.destroy_model_parallel()
 
         # ---- fully_shard v2: load and verify ----
-        v2_model, v2_sd = TestCheckpointOnlineConvert._training_loop(
+        v2_model_chunks, _ = TestCheckpointOnlineConvert._init_model_and_optimizer(
             use_megatron_fsdp=True,
             use_fully_shard_api=True,
             init_model_with_meta_device=True,
@@ -221,6 +240,8 @@ class TestCheckpointOnlineConvert:
             fp8_param_gather=False,
             **nd_topology,
         )
+        v2_model = _get_model_from_chunks(v2_model_chunks)
+        v2_sd = v2_model.state_dict()
 
         mapped_sd = _build_key_mapping(source_sd, v2_sd)
         dcp_load(state_dict=mapped_sd, checkpoint_id=str(ckpt_dir))
@@ -331,7 +352,11 @@ class TestCheckpointOnlineConvert:
                 recompute_num_layers=1,
             )
         )
-        v2_model, v2_sd = TestCheckpointOnlineConvert._training_loop(**nd_topology, **v2_configs)
+        v2_model_chunks, _ = TestCheckpointOnlineConvert._init_model_and_optimizer(
+            **nd_topology, **v2_configs
+        )
+        v2_model = _get_model_from_chunks(v2_model_chunks)
+        v2_sd = v2_model.state_dict()
 
         mapped_sd = _build_key_mapping(source_sd, v2_sd)
         dcp_load(state_dict=mapped_sd, checkpoint_id=str(ckpt_dir))
@@ -370,3 +395,4 @@ class TestCheckpointOnlineConvert:
         if torch.distributed.get_rank() == 0:
             shutil.rmtree(ckpt_dir)
         torch.distributed.barrier()
+
