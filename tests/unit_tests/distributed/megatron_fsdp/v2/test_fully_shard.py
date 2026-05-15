@@ -100,6 +100,9 @@ class SimpleMLP(nn.Module):
         super().__init__()
         self.fc = nn.Linear(hidden, hidden, bias=bias)
 
+    def forward(self, x):
+        return self.fc(x)
+
 
 class TinyLLM(nn.Module):
     """Simulates an LLM: embedding → block of layers → lm_head.
@@ -118,7 +121,7 @@ class TinyLLM(nn.Module):
     def forward(self, x):
         h = self.embedding(x)
         for layer in self.layers:
-            h = layer.fc(h)
+            h = layer(h)
         return self.lm_head(self.norm(h))
 
 
@@ -345,17 +348,22 @@ class TestMultimodalScenario:
 
         assert not torch.isnan(torch.tensor(loss.item()))
 
-    def test_frozen_params_not_in_param_groups(self):
-        """Frozen params should be excluded from FSDP param groups."""
+    def test_frozen_params_in_own_group(self):
+        """Frozen params are included but grouped separately (different requires_grad)."""
         torch.manual_seed(42)
         model = MultimodalModel(hidden=64).to(_device())
         for p in model.vision_encoder.parameters():
             p.requires_grad = False
         fully_shard(model)
 
+        # Frozen params should be in a group with requires_grad=False
+        has_frozen_group = False
         for param_group in model._fsdp_param_groups:
-            for p in param_group.params:
-                assert p.requires_grad, "Frozen params should not be in FSDP param groups"
+            if not param_group.requires_grad:
+                has_frozen_group = True
+                for p in param_group.params:
+                    assert not p.requires_grad, "Param in frozen group should have requires_grad=False"
+        assert has_frozen_group, "Frozen params should be in their own param group"
 
     def test_mixed_frozen_and_trainable(self):
         """Some parts frozen, some trainable — all sharded together."""
@@ -698,12 +706,15 @@ class TestCheckpoint:
         torch.manual_seed(42)
         model = SimpleMLP(64).to(_device())
         fully_shard(model)
+        opt = torch.optim.SGD(model.parameters(), lr=0.0)
 
         # Build a raw state dict via torch's state_dict
-        sd = torch_get_state_dict(model, StateDictOptions(full_state_dict=True, cpu_offload=True))
+        sd = torch_get_state_dict(
+            model, opt, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+        )
         preprocess_state_dict_for_uneven_dtensor(sd)
 
-        # Check that the state dict still contains parameter data (not modified)
+        # Check that the state dict still contains parameter data
         assert len(sd) > 0
 
     def test_get_state_dict_strict_all_dtensor(self):
