@@ -75,11 +75,14 @@ def _get_model_from_chunks(model_chunks):
     return model_chunks
 
 
-class TestCheckpointOnlineConvert:
+class TestMegatronFsdpV2Checkpoint:
     """
-    Verify that checkpoints from legacy Megatron model formats
-    (ND-parallel / Megatron-FSDP baseline) can be correctly loaded
-    by the fully_shard v2 implementation.
+    Megatron FSDP v2 checkpoint save/load and online format conversion tests.
+
+    Covers:
+    - Megatron FSDP v2 → Megatron FSDP v2 round-trip (save + load)
+    - ND-parallel → Megatron FSDP v2 online conversion
+    - Megatron FSDP v1 baseline → Megatron FSDP v2 online conversion
     """
 
     # ------------------------------------------------------------------
@@ -119,7 +122,7 @@ class TestCheckpointOnlineConvert:
         set_manual_seed(seed)
 
         model_chunks, optim = make_moe_args_model_and_optimizer(
-            ut_filename="test_checkpoint_online_convert.py",
+            ut_filename="test_checkpoint.py",
             micro_batch_size=MICRO_BATCH_SIZE,
             global_batch_size=GLOBAL_BATCH_SIZE,
             vocab_size=VOCAB_SIZE,
@@ -141,7 +144,7 @@ class TestCheckpointOnlineConvert:
         Run _init_model_and_optimizer followed by a deterministic training
         loop and return the model together with its state dict.
         """
-        model_chunks, optim = TestCheckpointOnlineConvert._init_model_and_optimizer(
+        model_chunks, optim = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
             seed=seed, **kwargs
         )
 
@@ -187,17 +190,115 @@ class TestCheckpointOnlineConvert:
         Utils.destroy_model_parallel()
 
     # ==================================================================
-    # Test: ND-parallel → fully_shard v2
+    # Test: Megatron FSDP v2 → Megatron FSDP v2 (round-trip)
+    # ==================================================================
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"),
+        reason="Requires DTensor and DeviceMesh support (PyTorch >= 2.4.0).",
+    )
+    @pytest.mark.parametrize(
+        "sharding_strategy",
+        [
+            pytest.param("optim_grads_params", id="optim_grads_params"),
+            pytest.param("optim_grads", id="optim_grads"),
+        ],
+    )
+    def test_megatron_fsdp_v2_round_trip(self, sharding_strategy):
+        """
+        Train a Megatron FSDP v2 model, save its state dict via DCP, load
+        into a fresh v2 model, and verify the parameters match.
+        """
+        from torch.distributed.checkpoint import load as dcp_load
+        from torch.distributed.checkpoint import save as dcp_save
+
+        v2_config = dict(
+            use_megatron_fsdp=True,
+            use_fully_shard_api=True,
+            init_model_with_meta_device=True,
+            ckpt_format="fsdp_dtensor",
+            gradient_accumulation_fusion=False,
+            overlap_param_gather=True,
+            overlap_grad_reduce=True,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+            data_parallel_sharding_strategy=sharding_strategy,
+            fp8_param_gather=False,
+        )
+
+        # ---- Train source v2 model and save ----
+        source_model, source_sd = TestMegatronFsdpV2Checkpoint._training_loop(
+            **v2_config,
+        )
+        source_full = _state_dict_to_full_tensor(source_sd)
+
+        ckpt_dir = (
+            Path(SHARED_TMP_DIR)
+            / TestMegatronFsdpV2Checkpoint.__name__
+            / f"v2_round_trip_{sharding_strategy}"
+        )
+        ckpt_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
+        dcp_save({"model": source_sd}, checkpoint_id=str(ckpt_dir))
+
+        Utils.destroy_model_parallel()
+
+        # ---- Load into fresh v2 model ----
+        v2_model_chunks, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
+            **v2_config,
+        )
+        v2_model = _get_model_from_chunks(v2_model_chunks)
+        v2_sd = v2_model.state_dict()
+
+        mapped_sd = _build_key_mapping(source_sd, v2_sd)
+        dcp_load(state_dict=mapped_sd, checkpoint_id=str(ckpt_dir))
+        v2_model.load_state_dict(v2_sd, strict=False)
+
+        # ---- Verify ----
+        loaded_sd = v2_model.state_dict()
+        loaded_full = _state_dict_to_full_tensor(loaded_sd)
+
+        nonempty = False
+        for s_key, s_val in source_full.items():
+            canonical = _normalize_key(s_key)
+            matched_key = None
+            for l_key in loaded_full:
+                if _normalize_key(l_key) == canonical:
+                    matched_key = l_key
+                    break
+            assert (
+                matched_key is not None
+            ), f"Key {s_key} (canonical: {canonical}) not found in v2 state dict"
+            l_val = loaded_full[matched_key]
+            if s_val.numel() > 0:
+                nonempty = True
+            assert (
+                s_val.shape == l_val.shape
+            ), f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
+            assert_close(s_val, l_val, atol=0, rtol=0, msg=f"Value mismatch for {s_key}")
+
+        world_size = torch.distributed.get_world_size()
+        all_nonempty = [False] * world_size
+        torch.distributed.all_gather_object(all_nonempty, nonempty)
+        assert any(all_nonempty), "All ranks had empty model state after load."
+
+        # Cleanup
+        Utils.destroy_model_parallel()
+        if torch.distributed.get_rank() == 0:
+            shutil.rmtree(ckpt_dir)
+        torch.distributed.barrier()
+
+    # ==================================================================
+    # Test: ND-parallel → Megatron-FSDP v2
     # ==================================================================
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"),
         reason="Requires DTensor and DeviceMesh support (PyTorch >= 2.4.0).",
     )
     @pytest.mark.parametrize("nd_topology", [pytest.param({"EP": 2}, id="EP2")])
-    def test_nd_parallel_to_fully_shard_v2(self, nd_topology):
+    def test_nd_parallel_to_megatron_fsdp_v2(self, nd_topology):
         """
         Save a checkpoint from an ND-parallel (distributed-optimizer) model
-        and load it into a fully_shard v2 model.  Verify the state dict.
+        and load it into a Megatron-FSDP v2 model.  Verify the state dict.
         """
         from torch.distributed.checkpoint import load as dcp_load
         from torch.distributed.checkpoint import save as dcp_save
@@ -205,7 +306,7 @@ class TestCheckpointOnlineConvert:
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
 
         # ---- ND-parallel: train and save ----
-        source_model, source_sd = TestCheckpointOnlineConvert._training_loop(
+        source_model, source_sd = TestMegatronFsdpV2Checkpoint._training_loop(
             use_distributed_optimizer=True,
             data_parallel_sharding_strategy="optim_grads_params",
             fp8_param_gather=False,
@@ -215,7 +316,7 @@ class TestCheckpointOnlineConvert:
 
         ckpt_dir = (
             Path(SHARED_TMP_DIR)
-            / TestCheckpointOnlineConvert.__name__
+            / TestMegatronFsdpV2Checkpoint.__name__
             / f"nd_parallel_{nd_topology_str}"
         )
         ckpt_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
@@ -225,7 +326,7 @@ class TestCheckpointOnlineConvert:
         Utils.destroy_model_parallel()
 
         # ---- fully_shard v2: load and verify ----
-        v2_model_chunks, _ = TestCheckpointOnlineConvert._init_model_and_optimizer(
+        v2_model_chunks, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
             use_megatron_fsdp=True,
             use_fully_shard_api=True,
             init_model_with_meta_device=True,
@@ -282,7 +383,7 @@ class TestCheckpointOnlineConvert:
         torch.distributed.barrier()
 
     # ==================================================================
-    # Test: Megatron-FSDP baseline → fully_shard v2
+    # Test: Megatron-FSDP baseline → Megatron-FSDP v2
     # ==================================================================
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"),
@@ -299,10 +400,10 @@ class TestCheckpointOnlineConvert:
             pytest.param(dict(data_parallel_sharding_strategy="optim"), id="optim"),
         ],
     )
-    def test_megatron_fsdp_baseline_to_fully_shard_v2(self, nd_topology, source_configs):
+    def test_megatron_fsdp_baseline_to_megatron_fsdp_v2(self, nd_topology, source_configs):
         """
         Save a checkpoint from a Megatron-FSDP baseline model and load it
-        into a fully_shard v2 model.  Verify the state dict.
+        into a Megatron-FSDP v2 model.  Verify the state dict.
         """
         from torch.distributed.checkpoint import load as dcp_load
         from torch.distributed.checkpoint import save as dcp_save
@@ -320,14 +421,14 @@ class TestCheckpointOnlineConvert:
                 gradient_accumulation_fusion=False,
             )
         )
-        source_model, source_sd = TestCheckpointOnlineConvert._training_loop(
+        source_model, source_sd = TestMegatronFsdpV2Checkpoint._training_loop(
             **nd_topology, **baseline_configs
         )
         source_full = _state_dict_to_full_tensor(source_sd)
 
         ckpt_dir = (
             Path(SHARED_TMP_DIR)
-            / TestCheckpointOnlineConvert.__name__
+            / TestMegatronFsdpV2Checkpoint.__name__
             / f"baseline_{shard_str}_{nd_topology_str}"
         )
         ckpt_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
@@ -336,7 +437,7 @@ class TestCheckpointOnlineConvert:
         # Destroy baseline's groups before creating the v2 model.
         Utils.destroy_model_parallel()
 
-        # ---- fully_shard v2: load and verify ----
+        # ---- Megatron-FSDP v2: load and verify ----
         v2_configs = copy.deepcopy(source_configs)
         v2_configs.update(
             dict(
@@ -352,7 +453,7 @@ class TestCheckpointOnlineConvert:
                 recompute_num_layers=1,
             )
         )
-        v2_model_chunks, _ = TestCheckpointOnlineConvert._init_model_and_optimizer(
+        v2_model_chunks, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
             **nd_topology, **v2_configs
         )
         v2_model = _get_model_from_chunks(v2_model_chunks)
