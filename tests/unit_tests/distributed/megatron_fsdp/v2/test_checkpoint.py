@@ -143,6 +143,9 @@ class TestMegatronFsdpV2Checkpoint:
         """
         Run _init_model_and_optimizer followed by a deterministic training
         loop and return the model together with its state dict.
+
+        If ``save`` is in kwargs, calls MCore's ``save_checkpoint`` at the
+        end to persist the trained model.
         """
         model_chunks, optim = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
             seed=seed, **kwargs
@@ -173,6 +176,17 @@ class TestMegatronFsdpV2Checkpoint:
                 num_micro_batches=GLOBAL_BATCH_SIZE // MICRO_BATCH_SIZE // DP_GROUP.size(),
             )
             optim.step()
+
+        if "save" in kwargs:
+            from megatron.training.checkpointing import save_checkpoint as mcore_save_checkpoint
+
+            mcore_save_checkpoint(
+                iteration=0,
+                model=model_chunks,
+                optimizer=optim,
+                opt_param_scheduler=None,
+                num_floating_point_operations_so_far=0,
+            )
 
         model = _get_model_from_chunks(model_chunks)
         state_dict = model.state_dict()
@@ -205,12 +219,10 @@ class TestMegatronFsdpV2Checkpoint:
     )
     def test_megatron_fsdp_v2_round_trip(self, sharding_strategy):
         """
-        Train a Megatron FSDP v2 model, save its state dict via DCP, load
-        into a fresh v2 model, and verify the parameters match.
+        Train a Megatron FSDP v2 model, save via MCore native
+        ``save_checkpoint``, load via ``setup_model_and_optimizer``, and
+        verify parameters match.
         """
-        from torch.distributed.checkpoint import load as dcp_load
-        from torch.distributed.checkpoint import save as dcp_save
-
         v2_config = dict(
             use_megatron_fsdp=True,
             use_fully_shard_api=True,
@@ -226,37 +238,28 @@ class TestMegatronFsdpV2Checkpoint:
             fp8_param_gather=False,
         )
 
-        # ---- Train source v2 model and save ----
-        source_model, source_sd = TestMegatronFsdpV2Checkpoint._training_loop(
-            **v2_config,
-        )
-        source_full = _state_dict_to_full_tensor(source_sd)
-
-        ckpt_dir = (
+        ckpt_base = (
             Path(SHARED_TMP_DIR)
             / TestMegatronFsdpV2Checkpoint.__name__
             / f"v2_round_trip_{sharding_strategy}"
         )
-        ckpt_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
-        dcp_save({"model": source_sd}, checkpoint_id=str(ckpt_dir))
 
+        # ---- Train and save via MCore save_checkpoint ----
+        # Passing save=<ckpt_base> triggers save_checkpoint inside _training_loop.
+        save_config = dict(save=str(ckpt_base), no_save_optim=True, no_save_rng=True, **v2_config)
+        _, source_sd = TestMegatronFsdpV2Checkpoint._training_loop(**save_config)
+        source_full = _state_dict_to_full_tensor(source_sd)
         Utils.destroy_model_parallel()
 
-        # ---- Load into fresh v2 model ----
+        # ---- Load via setup_model_and_optimizer's load_checkpoint ----
+        load_config = dict(load=str(ckpt_base), no_load_optim=True, no_load_rng=True, **v2_config)
         v2_model_chunks, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
-            **v2_config,
+            **load_config,
         )
         v2_model = _get_model_from_chunks(v2_model_chunks)
-        v2_sd = v2_model.state_dict()
-
-        mapped_sd = _build_key_mapping(source_sd, v2_sd)
-        dcp_load(state_dict=mapped_sd, checkpoint_id=str(ckpt_dir))
-        v2_model.load_state_dict(v2_sd, strict=False)
 
         # ---- Verify ----
-        loaded_sd = v2_model.state_dict()
-        loaded_full = _state_dict_to_full_tensor(loaded_sd)
-
+        loaded_full = _state_dict_to_full_tensor(v2_model.state_dict())
         nonempty = False
         for s_key, s_val in source_full.items():
             canonical = _normalize_key(s_key)
@@ -267,7 +270,7 @@ class TestMegatronFsdpV2Checkpoint:
                     break
             assert (
                 matched_key is not None
-            ), f"Key {s_key} (canonical: {canonical}) not found in v2 state dict"
+            ), f"Key {s_key} (canonical: {canonical}) not found in loaded state dict"
             l_val = loaded_full[matched_key]
             if s_val.numel() > 0:
                 nonempty = True
@@ -284,7 +287,7 @@ class TestMegatronFsdpV2Checkpoint:
         # Cleanup
         Utils.destroy_model_parallel()
         if torch.distributed.get_rank() == 0:
-            shutil.rmtree(ckpt_dir)
+            shutil.rmtree(ckpt_base)
         torch.distributed.barrier()
 
     # ==================================================================

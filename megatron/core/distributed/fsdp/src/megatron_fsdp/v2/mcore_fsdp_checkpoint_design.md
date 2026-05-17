@@ -46,13 +46,14 @@ format for both paths. It uses DCP directly, storing each parameter as a `DTenso
 | `uneven_dtensor.py` | `megatron/core/distributed/fsdp/src/megatron_fsdp/` | `get_state_dict`, `preprocess_state_dict_for_uneven_dtensor`, chunk metadata for uneven DTensors |
 | `fsdp_dtensor_checkpoint.py` | `megatron/core/transformer/` | SWiGLU split, GDN split, expert key remapping, FP8 cleanup |
 | `distrib_optimizer.py` | `megatron/core/optimizer/` | `state_dict()`, `load_state_dict()`, `sharded_state_dict()`, `sharded_param_state_fsdp_dtensor()` |
-| `checkpointing.py` | `megatron/training/` | High-level save/load orchestration, `preprocess_fsdp_dtensor_state_dict()` |
+| `checkpointing.py` | `megatron/training/` | High-level save/load orchestration, `_build_megatron_fsdp_v2_state_dict`, `preprocess_fsdp_dtensor_state_dict()` |
+| `checkpoint.py` | `megatron/core/distributed/fsdp/` | `MegatronFSDPStateful` wrapper, `save_checkpoint`, `load_checkpoint` for standalone FSDP v2 use |
 | `mcore_fsdp_adapter.py` | `megatron/core/distributed/fsdp/` | Routes to v1 `MegatronFSDP` or Megatron FSDP v2 `fully_shard` |
 
 ### 3.2 Current Save Flow
 
-> **Note:** This describes the current `generate_state_dict`-based flow. Section 6
-> proposes a torch-native replacement.
+> **Note:** This describes the current `generate_state_dict`-based flow. For FSDP v2,
+> ``_build_megatron_fsdp_v2_state_dict`` (Section 12) replaces this in the v2 code path.
 
 ```
 save_checkpoint()
@@ -79,8 +80,8 @@ save_checkpoint()
 
 ### 3.3 Current Load Flow
 
-> **Note:** This describes the current `generate_state_dict`-based flow. Section 6
-> proposes a torch-native replacement.
+> **Note:** This describes the current `generate_state_dict`-based flow. For FSDP v2,
+> ``_build_megatron_fsdp_v2_state_dict`` (Section 12) replaces this in the v2 code path.
 
 ```
 load_checkpoint()
@@ -169,9 +170,9 @@ which calls `optimizer.state_dict()` internally. For `DistributedOptimizer` with
 Megatron FSDP, `state_dict()` returns the inner optimizer's full state dict directly.
 
 This path is used by:
+- `checkpoint.py` (``MegatronFSDPStateful`` wrapper and standalone save/load helpers)
 - `test_checkpoint.py` (checkpoint save/load and online format conversion tests)
-- `fsdp_toy.py` example (standalone FSDP training)
-- Any code using the `AppState` wrapper pattern
+- `fsdp_toy.py` example (``AppState`` pattern for FSDP v2 checkpointing)
 
 ### 5.3 `DistributedOptimizer.__init__` — FSDP Short-Circuit
 
@@ -456,21 +457,33 @@ Megatron FSDP v2 model. Key structures differ:
 
 ### 7.2 Solution: Key Mapping via `get_state_dict`
 
-The `test_checkpoint.py` test implements this pattern:
+The `test_checkpoint.py` test implements round-trip via MCore native APIs:
+
+```python
+# ---- Save via MCore save_checkpoint ----
+save_config = dict(save=str(ckpt_base), no_save_optim=True, **v2_config)
+_, source_sd = _training_loop(**save_config)
+
+# ---- Load via setup_model_and_optimizer ----
+load_config = dict(load=str(ckpt_base), no_load_optim=True, **v2_config)
+v2_model_chunks, _ = _init_model_and_optimizer(**load_config)
+```
+
+And online conversion via DCP with key mapping:
 
 ```python
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import get_state_dict
 
 # 1. Save source checkpoint
-source_model, source_sd, source_optim = _training_loop(...)
+source_model, source_sd = _training_loop(...)
 dcp_save({"model": source_sd}, checkpoint_id=ckpt_dir)
 
 # 2. Init target Megatron FSDP v2 model
-v2_model_chunks, v2_optim = _init_model_and_optimizer(...)
+v2_model_chunks, _ = _init_model_and_optimizer(...)
 v2_model = _get_model_from_chunks(v2_model_chunks)
 
 # 3. Build key mapping (canonical names match across formats)
-v2_sd, _ = get_state_dict(v2_model, v2_optim)
+v2_sd = v2_model.state_dict()
 mapped_sd = _build_key_mapping(source_sd, v2_sd)
 
 # 4. DCP load with mapping
@@ -551,12 +564,12 @@ if `"param_to_group_meta"` is absent, it just calls `self.optimizer.load_state_d
 
 ## 9. Uneven DTensor Handling
 
-### 8.1 Problem
+### 9.1 Problem
 
 When a parameter's size is not evenly divisible by the DP world size, each rank
 holds a different-sized local shard. Standard DCP assumes uniform shard sizes.
 
-### 8.2 Solution: Chunk Metadata Patching
+### 9.2 Solution: Chunk Metadata Patching
 
 `preprocess_state_dict_for_uneven_dtensor()` walks the state dict, finds all
 `DTensor` values, and calls `update_uneven_dtensor_chunk_metadata()` on each.
@@ -617,18 +630,18 @@ and their consumers.
 
 ### Phase 2: Torch-Native `get_state_dict` Path
 
-- [x] Add `_is_fsdp_v2()` helper to detect FSDP v2 from model
-- [x] Add `_build_fsdp_v2_state_dict()` to `checkpointing.py` using `torch_get_state_dict`
-      for model + optimizer state dict generation
-- [x] Wire save path: when `_is_fsdp_v2(model)`, use `_build_fsdp_v2_state_dict`
+- [x] Add `_is_megatron_fsdp_v2()` helper to detect FSDP v2 from model
+- [x] Add `_build_megatron_fsdp_v2_state_dict()` to `checkpointing.py` using `get_state_dict`
+      from `uneven_dtensor.py` for model + optimizer state dict generation
+- [x] Wire save path: when `_is_megatron_fsdp_v2(model)`, use `_build_megatron_fsdp_v2_state_dict`
 - [x] Wire load path: same condition, pre-allocate optimizer states via
-      `_init_optimizer_states_with_dummy_values()`, then use `_build_fsdp_v2_state_dict`
+      `_init_optimizer_states_with_dummy_values()`, then use `_build_megatron_fsdp_v2_state_dict`
 - [ ] Handle PP: iterate model chunks, build per-chunk state dicts
 - [ ] Handle multi-optimizer (ChainedOptimizer: expert + non-expert optimizers)
 
 ### Testing
 
-- [ ] End-to-end test: Save checkpoint from Megatron FSDP v2, load into v2 (round-trip)
+- [x] Round-trip test: Save via MCore `save_checkpoint`, load via `setup_model_and_optimizer` → `load_checkpoint`
 - [ ] Optimizer state dict round-trip: save → load → verify values
 - [ ] Cross-format optimizer state conversion: ND-parallel → Megatron FSDP v2
 - [ ] Unskip and fix hanging `get_state_dict` tests in `test_fully_shard.py`
@@ -648,6 +661,7 @@ and their consumers.
 | Online convert: ND-parallel → Megatron FSDP v2 | `test_checkpoint.py` | Active |
 | Online convert: FSDP v1 baseline → Megatron FSDP v2 | `test_checkpoint.py` | Active |
 | Megatron FSDP v2 → v2 round-trip | `test_checkpoint.py` | Active |
+| `MegatronFSDPStateful` wrapper | `checkpoint.py` | Active |
 | `get_state_dict` strict DTensor assert | `test_fully_shard.py` | Active |
 | SWiGLU/expert key transforms | `test_fsdp_dtensor_checkpoint.py` | Active |
 | Megatron FSDP v2 E2E training | `test_mcore_nd_parallel.py` | Active |
