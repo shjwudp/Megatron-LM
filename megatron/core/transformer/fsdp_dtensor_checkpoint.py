@@ -31,6 +31,7 @@ try:
         make_fsdp_dtensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        make_uneven_dtensor,
         uneven_dtensor_to_full_tensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
@@ -270,6 +271,55 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             ]
         )
 
+    def _get_fsdp_slice_and_tp_world_size(dist_param):
+        """Return ``(fsdp_slice, tp_world_size)`` for v1 or v2 parameters.
+
+        For v1 (``MegatronFSDP``-wrapped), reads ``megatron_fsdp_slice`` and
+        ``megatron_fsdp_dist_index`` from the parameter.
+
+        For v2 (raw ``DTensor``), computes the FSDP slice from
+        ``__create_chunk_list__`` (set by ``update_uneven_dtensor_chunk_metadata``)
+        and derives the TP world size from the tensor-model-parallel attributes
+        propagated by the adapter.
+        """
+        if hasattr(dist_param, "megatron_fsdp_slice"):
+            tp_world_size = dist_param.megatron_fsdp_dist_index.get_submesh(
+                [dist_param.megatron_fsdp_dist_index.tp_dim],
+                is_expert_parallel=False,
+            ).mesh.numel()
+            return dist_param.megatron_fsdp_slice, tp_world_size
+
+        # v2 DTensor fallback
+        local_tensor = dist_param._local_tensor
+        local_numel = local_tensor.numel()
+        if local_numel == 0:
+            return slice(0, 0), 1
+
+        global_shape = dist_param.size()
+        # Try chunk metadata first (uneven sharding).
+        if hasattr(local_tensor, "__create_chunk_list__"):
+            chunk_meta = local_tensor.__create_chunk_list__()[0]
+            row_stride = global_shape[1:].numel() if global_shape[1:].numel() > 0 else 1
+            start = chunk_meta.offsets[0] * row_stride
+            end = start + chunk_meta.sizes[0] * row_stride
+            fsdp_slice = slice(start, end)
+        else:
+            # Even sharding: derive from DTensor placements.
+            mesh = dist_param.device_mesh
+            full_numel = global_shape.numel()
+            chunk_numel = full_numel // mesh.size()
+            rank = dist.get_rank(mesh.get_group())
+            start = rank * chunk_numel
+            fsdp_slice = slice(start, start + local_numel)
+
+        # TP world size: try propagated attribute first, fallback to 1.
+        tp_world_size = 1
+        if is_mcore_tensor_model_parallel(dist_param):
+            tp_dim = get_mcore_tensor_parallel_partition_dim(dist_param)
+            if tp_dim is not None:
+                tp_world_size = global_shape[tp_dim] // dist_param._local_tensor.shape[tp_dim]
+        return fsdp_slice, tp_world_size
+
     def split_swiglu_linear_fc1(data, dist_param, swiglu_shard_axis, is_expert_param):
         """
         Split the SWiGLU linear_fc1 parameter into two parts: weight_w and weight_v.
@@ -279,19 +329,15 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             f"got {data.shape[swiglu_shard_axis]}"
         )
 
-        fsdp_slice = dist_param.megatron_fsdp_slice
-        megatron_fsdp_dist_index = dist_param.megatron_fsdp_dist_index
+        fsdp_slice, tp_world_size = _get_fsdp_slice_and_tp_world_size(dist_param)
 
-        tp_mesh = megatron_fsdp_dist_index.get_submesh(
-            [megatron_fsdp_dist_index.tp_dim], is_expert_parallel=is_expert_param
-        )
-        data_size = data.numel() // tp_mesh.mesh.numel()
+        data_size = data.numel() // tp_world_size
         w_slice = slice(0, data_size // 2)
         v_slice = slice(data_size // 2, data_size)
 
         view_shape = list(data.shape)
         view_shape[swiglu_shard_axis] = -1
-        local_tensor = data.to_local()
+        local_tensor = data.to_local() if isinstance(data, DTensor) else data
         weight_w = local_tensor.view(-1)[
             offset_slice(intersection(fsdp_slice, w_slice), -fsdp_slice.start)
         ]
@@ -307,28 +353,51 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         if is_mcore_tensor_model_parallel(dist_param):
             tp_dim = get_mcore_tensor_parallel_partition_dim(dist_param)
             assert tp_dim is not None, "Tensor model parallel dimension not found"
-            per_tp_rank_shape[tp_dim] //= tp_mesh.mesh.numel()
+            per_tp_rank_shape[tp_dim] //= tp_world_size
         linear_fc1_meta = torch.empty(*per_tp_rank_shape, device="meta")
         w_meta, v_meta = torch.chunk(linear_fc1_meta, 2, dim=swiglu_shard_axis)
         copy_tensor_model_parallel_attributes(w_meta, dist_param)
         copy_tensor_model_parallel_attributes(v_meta, dist_param)
 
-        weight_w = make_fsdp_dtensor(
-            weight_w.data,
-            w_meta,
-            dist_index=megatron_fsdp_dist_index,
-            is_expert_param=is_expert_param,
-            run_check=True,
-            update_uneven_dtensor_chunk_meta=True,
-        )
-        weight_v = make_fsdp_dtensor(
-            weight_v.data,
-            v_meta,
-            dist_index=megatron_fsdp_dist_index,
-            is_expert_param=is_expert_param,
-            run_check=True,
-            update_uneven_dtensor_chunk_meta=True,
-        )
+        if hasattr(dist_param, "megatron_fsdp_dist_index"):
+            # v1 path: use make_fsdp_dtensor with dist_index
+            megatron_fsdp_dist_index = dist_param.megatron_fsdp_dist_index
+            weight_w = make_fsdp_dtensor(
+                weight_w.data,
+                w_meta,
+                dist_index=megatron_fsdp_dist_index,
+                is_expert_param=is_expert_param,
+                run_check=True,
+                update_uneven_dtensor_chunk_meta=True,
+            )
+            weight_v = make_fsdp_dtensor(
+                weight_v.data,
+                v_meta,
+                dist_index=megatron_fsdp_dist_index,
+                is_expert_param=is_expert_param,
+                run_check=True,
+                update_uneven_dtensor_chunk_meta=True,
+            )
+        else:
+            # v2 path: use make_uneven_dtensor with post_process_uneven
+            # so chunk metadata is computed for the new (split) shapes.
+            assert isinstance(dist_param, DTensor)
+            global_shape = list(dist_param.size())
+            global_shape[swiglu_shard_axis] //= 2
+            weight_w = make_uneven_dtensor(
+                weight_w,
+                shape=torch.Size(global_shape),
+                dp_mesh=dist_param.device_mesh,
+                placements=dist_param.placements,
+                post_process_uneven=True,
+            )
+            weight_v = make_uneven_dtensor(
+                weight_v,
+                shape=torch.Size(global_shape),
+                dp_mesh=dist_param.device_mesh,
+                placements=dist_param.placements,
+                post_process_uneven=True,
+            )
         return weight_w, weight_v
 
     model_state_dict = model_state_dict.copy()
@@ -472,25 +541,24 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
     def split_gdn_fused(data, dist_param, split_sizes, split_dim):
         """Split a fused GDN projection DTensor into per-component DTensors."""
-        fsdp_slice = dist_param.megatron_fsdp_slice
-        dist_index = dist_param.megatron_fsdp_dist_index
-        tp_mesh = dist_index.get_submesh([dist_index.tp_dim], is_expert_parallel=False)
+        fsdp_slice, tp_world_size = _get_fsdp_slice_and_tp_world_size(dist_param)
 
-        data_size = data.numel() // tp_mesh.mesh.numel()
+        data_size = data.numel() // tp_world_size
         total_split = sum(split_sizes)
         elems_per_unit = data_size // total_split
 
-        local_tensor = data.to_local()
+        local_tensor = data.to_local() if isinstance(data, DTensor) else data
         view_shape = list(data.shape)
 
         per_tp_rank_shape = list(data.shape)
         if is_mcore_tensor_model_parallel(dist_param):
             tp_dim = get_mcore_tensor_parallel_partition_dim(dist_param)
             assert tp_dim is not None, "Tensor model parallel dimension not found"
-            per_tp_rank_shape[tp_dim] //= tp_mesh.mesh.numel()
+            per_tp_rank_shape[tp_dim] //= tp_world_size
 
         results = []
         flat_offset = 0
+        is_v2 = not hasattr(dist_param, "megatron_fsdp_slice")
         for s in split_sizes:
             comp_flat = s * elems_per_unit
             comp_slice = slice(flat_offset, flat_offset + comp_flat)
@@ -507,14 +575,26 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             meta = torch.empty(*meta_shape, device="meta")
             copy_tensor_model_parallel_attributes(meta, dist_param)
 
-            dtensor = make_fsdp_dtensor(
-                comp_data.data,
-                meta,
-                dist_index=dist_index,
-                is_expert_param=False,
-                run_check=True,
-                update_uneven_dtensor_chunk_meta=True,
-            )
+            if is_v2:
+                assert isinstance(dist_param, DTensor)
+                global_shape = list(dist_param.size())
+                global_shape[split_dim] = s
+                dtensor = make_uneven_dtensor(
+                    comp_data,
+                    shape=torch.Size(global_shape),
+                    dp_mesh=dist_param.device_mesh,
+                    placements=dist_param.placements,
+                    post_process_uneven=True,
+                )
+            else:
+                dtensor = make_fsdp_dtensor(
+                    comp_data.data,
+                    meta,
+                    dist_index=dist_param.megatron_fsdp_dist_index,
+                    is_expert_param=False,
+                    run_check=True,
+                    update_uneven_dtensor_chunk_meta=True,
+                )
             results.append(dtensor)
             flat_offset += comp_flat
 
