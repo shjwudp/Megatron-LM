@@ -700,7 +700,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 ensure_directory_exists(checkpoint_name, check_parent=False)
 
             if ckpt_format == "fsdp_dtensor":
-                state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+                if not _is_megatron_fsdp_v2(model):
+                    state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+                # For FSDP v2, post-processing is already handled by
+                # MegatronFSDPStateful inside _build_megatron_fsdp_v2_state_dict.
 
             if args.async_save:
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
@@ -1012,18 +1015,17 @@ def _build_megatron_fsdp_v2_state_dict(
     iteration=None,
     rerun_state=None,
 ):
-    """Build state dict for Megatron FSDP v2 using
-    ``get_state_dict`` from ``uneven_dtensor``.
+    """Build state dict for Megatron FSDP v2 using ``MegatronFSDPStateful``.
 
-    Uses ``get_state_dict`` (which wraps PyTorch's native ``get_state_dict``
-    and handles uneven DTensor chunk metadata) for the optimizer state dict
-    and the existing ``state_dict_for_save_checkpoint`` (wired to
-    ``model.state_dict()`` in the adapter) for the model state dict.
+    The ``MegatronFSDPStateful.state_dict()`` calls ``get_state_dict`` from
+    ``uneven_dtensor`` (which attaches uneven DTensor chunk metadata) for
+    BOTH model and optimizer, then applies MCore post-processing (SwiGLU,
+    GDN, FP8, expert remapping).
 
     Returns a combined state dict with the same structure as
     ``generate_state_dict``.
     """
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import get_state_dict
+    from megatron.core.distributed.fsdp.checkpoint import MegatronFSDPStateful
 
     state_dict = {}
     state_dict['args'] = args
@@ -1031,22 +1033,12 @@ def _build_megatron_fsdp_v2_state_dict(
     if iteration is not None:
         state_dict['iteration'] = iteration
 
-    # Model state dict: DTensor state dict via the wired
-    # state_dict_for_save_checkpoint (returns model.state_dict() for v2).
-    for i in range(len(model)):
-        key = "model" if len(model) == 1 else f"model{i}"
-        state_dict[key] = model[i].state_dict_for_save_checkpoint()
-
-    # Optimizer state dict: use get_state_dict (via uneven_dtensor) for
-    # FQN-keyed states with uneven DTensor preprocessing.
-    # For loading, optimizer states must be pre-allocated via
-    # _init_optimizer_states_with_dummy_values() before this call.
-    if not args.no_save_optim and optimizer is not None and not optimizer.is_stub_optimizer:
-        # The raw (FSDPModule) model is needed by get_state_dict for
-        # FQN-to-tensor mapping.  model[i].module is the FSDPModule.
-        raw_model = model[0].module
-        _, optim_sd = get_state_dict(model=raw_model, optimizers=optimizer)
-        state_dict['optimizer'] = optim_sd
+    # Build model (+ optionally optimizer) state dict via MegatronFSDPStateful.
+    # This goes through get_state_dict → preprocess_state_dict_for_uneven_dtensor
+    # → MCore post-processing in a single call.
+    assert len(model) == 1, "Megatron FSDP v2 only supports a single model instance"
+    st = MegatronFSDPStateful(model[0], optimizer, args=args)
+    state_dict.update(st.state_dict())
 
     # Scheduler.
     if opt_param_scheduler is not None:
@@ -1499,7 +1491,10 @@ def _load_base_checkpoint(
         raw_optimizer_state_dict = state_dict["optimizer"].copy() if "optimizer" in state_dict else None
         raw_model_state_dict = state_dict["model"].copy() if "model" in state_dict else None
         model = state_dict.pop("_model")
-        state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+        if not _is_megatron_fsdp_v2(model):
+            state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+        # For FSDP v2, post-processing is already handled by
+        # MegatronFSDPStateful inside _build_megatron_fsdp_v2_state_dict.
 
         ckpt_type = CheckpointType.FSDP_DTENSOR
         fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)

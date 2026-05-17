@@ -631,11 +631,16 @@ and their consumers.
 ### Phase 2: Torch-Native `get_state_dict` Path
 
 - [x] Add `_is_megatron_fsdp_v2()` helper to detect FSDP v2 from model
-- [x] Add `_build_megatron_fsdp_v2_state_dict()` to `checkpointing.py` using `get_state_dict`
-      from `uneven_dtensor.py` for model + optimizer state dict generation
+- [x] Add `_build_megatron_fsdp_v2_state_dict()` to `checkpointing.py` using
+      ``MegatronFSDPStateful`` (which internally uses ``get_state_dict`` from
+      ``uneven_dtensor`` for both model and optimizer, then applies MCore
+      post-processing)
 - [x] Wire save path: when `_is_megatron_fsdp_v2(model)`, use `_build_megatron_fsdp_v2_state_dict`
 - [x] Wire load path: same condition, pre-allocate optimizer states via
       `_init_optimizer_states_with_dummy_values()`, then use `_build_megatron_fsdp_v2_state_dict`
+- [x] Skip `preprocess_fsdp_dtensor_state_dict` for v2 in both save and load paths
+      (post-processing already handled by ``_apply_mcore_postprocess`` inside
+      ``MegatronFSDPStateful.state_dict()``)
 - [ ] Handle PP: iterate model chunks, build per-chunk state dicts
 - [ ] Handle multi-optimizer (ChainedOptimizer: expert + non-expert optimizers)
 

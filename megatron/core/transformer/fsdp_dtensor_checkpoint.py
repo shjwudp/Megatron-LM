@@ -277,10 +277,10 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         For v1 (``MegatronFSDP``-wrapped), reads ``megatron_fsdp_slice`` and
         ``megatron_fsdp_dist_index`` from the parameter.
 
-        For v2 (raw ``DTensor``), computes the FSDP slice from
-        ``__create_chunk_list__`` (set by ``update_uneven_dtensor_chunk_metadata``)
-        and derives the TP world size from the tensor-model-parallel attributes
-        propagated by the adapter.
+        For v2 (raw ``DTensor``), computes the FSDP slice from the DTensor's
+        placements and device mesh.  Does NOT rely on ``__create_chunk_list__``
+        because that metadata may reflect a previously-split sub-tensor (e.g.
+        fragment from ``_w``/``_v`` splitting), not the original parameter.
         """
         if hasattr(dist_param, "megatron_fsdp_slice"):
             tp_world_size = dist_param.megatron_fsdp_dist_index.get_submesh(
@@ -289,35 +289,44 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             ).mesh.numel()
             return dist_param.megatron_fsdp_slice, tp_world_size
 
-        # v2 DTensor fallback
+        # v2 DTensor: derive slice from placements, not chunk metadata.
+        assert isinstance(dist_param, DTensor), (
+            f"Expected DTensor, got {type(dist_param).__name__}"
+        )
+        global_shape = dist_param.size()
         local_tensor = dist_param._local_tensor
         local_numel = local_tensor.numel()
         if local_numel == 0:
             return slice(0, 0), 1
 
-        global_shape = dist_param.size()
-        # Try chunk metadata first (uneven sharding).
-        if hasattr(local_tensor, "__create_chunk_list__"):
-            chunk_meta = local_tensor.__create_chunk_list__()[0]
+        mesh = dist_param.device_mesh
+        # Compute this rank's offset in the flattened parameter space.
+        # Assume the first Shard placement determines the shard dimension.
+        from torch.distributed.tensor.placement_types import Shard as DShard
+        shard_placements = [p for p in dist_param.placements if isinstance(p, DShard)]
+        if len(shard_placements) == 1 and shard_placements[0].dim == 0:
+            # Shard(0): rank's chunk is contiguous rows.
             row_stride = global_shape[1:].numel() if global_shape[1:].numel() > 0 else 1
-            start = chunk_meta.offsets[0] * row_stride
-            end = start + chunk_meta.sizes[0] * row_stride
-            fsdp_slice = slice(start, end)
-        else:
-            # Even sharding: derive from DTensor placements.
-            mesh = dist_param.device_mesh
-            full_numel = global_shape.numel()
-            chunk_numel = full_numel // mesh.size()
+            rank = dist.get_rank(mesh.get_group())
+            chunk_rows = global_shape[0] // mesh.size()
+            start = rank * chunk_rows * row_stride
+            fsdp_slice = slice(start, start + local_numel)
+        elif len(shard_placements) == 1 and shard_placements[0].dim != 0:
+            # Shard on a dimension other than 0 — treat as contiguous.
+            chunk_numel = global_shape.numel() // mesh.size()
             rank = dist.get_rank(mesh.get_group())
             start = rank * chunk_numel
             fsdp_slice = slice(start, start + local_numel)
+        else:
+            # Multiple or no shard placements — conservative: whole tensor.
+            fsdp_slice = slice(0, global_shape.numel())
 
-        # TP world size: try propagated attribute first, fallback to 1.
+        # TP world size: try propagated attribute, fallback to 1.
         tp_world_size = 1
         if is_mcore_tensor_model_parallel(dist_param):
             tp_dim = get_mcore_tensor_parallel_partition_dim(dist_param)
             if tp_dim is not None:
-                tp_world_size = global_shape[tp_dim] // dist_param._local_tensor.shape[tp_dim]
+                tp_world_size = global_shape[tp_dim] // local_tensor.shape[tp_dim]
         return fsdp_slice, tp_world_size
 
     def split_swiglu_linear_fc1(data, dist_param, swiglu_shard_axis, is_expert_param):
@@ -330,6 +339,12 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         )
 
         fsdp_slice, tp_world_size = _get_fsdp_slice_and_tp_world_size(dist_param)
+
+        rank = torch.distributed.get_rank()
+        import time
+        time.sleep(0.01 * rank)
+        print(f"Rank {rank} {dist_param._unique_name}: FSDP slice for {dist_param.shape} is {fsdp_slice}, TP world size is {tp_world_size}"
+              f" {dist_param.__create_chunk_list__()}")
 
         data_size = data.numel() // tp_world_size
         w_slice = slice(0, data_size // 2)
@@ -379,8 +394,9 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 update_uneven_dtensor_chunk_meta=True,
             )
         else:
-            # v2 path: use make_uneven_dtensor with post_process_uneven
-            # so chunk metadata is computed for the new (split) shapes.
+            # v2 path: create DTensors from the original DTensor's placements.
+            # post_process_uneven=False — let preprocess_state_dict_for_uneven_dtensor
+            # handle chunk metadata uniformly for all DTensors.
             assert isinstance(dist_param, DTensor)
             global_shape = list(dist_param.size())
             global_shape[swiglu_shard_axis] //= 2
@@ -584,7 +600,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                     shape=torch.Size(global_shape),
                     dp_mesh=dist_param.device_mesh,
                     placements=dist_param.placements,
-                    post_process_uneven=True,
+                    post_process_uneven=False,
                 )
             else:
                 dtensor = make_fsdp_dtensor(
