@@ -339,7 +339,15 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             if not _key_in_glu_layer(key):
                 _swiglu_skip_count += 1
                 continue
-            dist_param = model.get_parameter(f"module.{key}")
+            # State dict keys may or may not have a ``module.`` prefix
+            # depending on the DDP wrapper (Megatron FSDP v1 wraps via
+            # MegatronFSDP which adds the prefix; v2 uses the raw FSDPModule
+            # without wrapping).  Try the bare key first; if that fails,
+            # prepend ``module.`` for the v1 DDP wrapper.
+            try:
+                dist_param = model.get_parameter(key)
+            except AttributeError:
+                dist_param = model.get_parameter(f"module.{key}")
             weight_w, weight_v = split_swiglu_linear_fc1(
                 model_state_dict[key],
                 dist_param,
@@ -371,8 +379,9 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
                 new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
+                    stripped_key = key[len("module.") :] if key.startswith("module.") else key
                     dist_param = model.get_parameter(
-                        expert_param_local_key(key[len("module.") :], num_experts)
+                        expert_param_local_key(stripped_key, num_experts)
                     )
                     weight_w, weight_v = split_swiglu_linear_fc1(
                         opt_state_dict[key][subkey],
@@ -519,7 +528,12 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         if match is None:
             continue
         sizes, names, dim = match
-        dist_param = model.get_parameter(f"module.{key}")
+        # State dict keys may or may not have a ``module.`` prefix
+        # depending on the DDP wrapper (see handle_swiglu_in_state_dict).
+        try:
+            dist_param = model.get_parameter(key)
+        except AttributeError:
+            dist_param = model.get_parameter(f"module.{key}")
         sub_tensors = split_gdn_fused(model_state_dict[key], dist_param, sizes, dim)
         for sub_name, tensor in zip(names, sub_tensors):
             model_state_dict[f"{key}.{sub_name}"] = tensor
@@ -547,7 +561,8 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(key[len("module.") :])
+                    stripped_key = key[len("module.") :] if key.startswith("module.") else key
+                    dist_param = model.get_parameter(stripped_key)
                     sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
                         new_opt_state[f"{key}.{sub_name}"][subkey] = tensor

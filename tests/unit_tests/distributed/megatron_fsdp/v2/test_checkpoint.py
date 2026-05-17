@@ -128,6 +128,7 @@ class TestMegatronFsdpV2Checkpoint:
             vocab_size=VOCAB_SIZE,
             padded_vocab_size=VOCAB_SIZE,
             seq_length=MAX_SEQ_LEN,
+            max_position_embeddings=MAX_SEQ_LEN,
             sequence_parallel=TP > 1,
             tensor_model_parallel_size=TP,
             pipeline_model_parallel_size=PP,
@@ -246,7 +247,7 @@ class TestMegatronFsdpV2Checkpoint:
 
         # ---- Train and save via MCore save_checkpoint ----
         # Passing save=<ckpt_base> triggers save_checkpoint inside _training_loop.
-        save_config = dict(save=str(ckpt_base), no_save_optim=True, no_save_rng=True, **v2_config)
+        save_config = dict(save=str(ckpt_base), save_interval=1, no_save_optim=True, no_save_rng=True, **v2_config)
         _, source_sd = TestMegatronFsdpV2Checkpoint._training_loop(**save_config)
         source_full = _state_dict_to_full_tensor(source_sd)
         Utils.destroy_model_parallel()
