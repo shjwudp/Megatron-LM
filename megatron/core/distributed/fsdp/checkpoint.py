@@ -28,7 +28,6 @@ Provides:
 
 import logging
 import re
-from pathlib import Path
 from typing import List, Optional, Tuple
 
 import torch
@@ -37,7 +36,6 @@ import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import set_state_dict as _set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Shard as DShard
 
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
@@ -295,7 +293,14 @@ def _get_dist_param(model: nn.Module, key: str) -> nn.Parameter:
     except AttributeError:
         pass
     if key.startswith("module."):
-        return model.get_parameter(key[len("module."):])
+        try:
+            return model.get_parameter(key[len("module."):])
+        except AttributeError:
+            pass
+    raise AttributeError(
+        f"Parameter '{key}' not found in model "
+        f"(tried as-is, with 'module.' prefix, and without 'module.' prefix)"
+    )
 
 
 def _detect_glu_layers(model: nn.Module) -> dict:
@@ -521,9 +526,10 @@ def handle_swiglu_in_state_dict_v2(
                         if "expert" in param_key else param_key,
                     )
                     assert isinstance(dist_param, DTensor)
-                    _, weight_v_t = _split_swiglu_weight_v2(
+                    weight_w_t, weight_v_t = _split_swiglu_weight_v2(
                         opt_state[key][subkey], dist_param,
                     )
+                    new_opt_state[f"{key}_w"][subkey] = weight_w_t
                     new_opt_state[f"{key}_v"][subkey] = weight_v_t
             optimizer_state_dict["state"] = new_opt_state
 
@@ -549,16 +555,7 @@ def _match_gdn_key(key: str):
     for pat in _GDN_KEY_PATTERNS:
         m = re.match(pat, key)
         if m:
-            base = m.group(1)
-            info = getattr(
-                get_attr_wrapped_model(
-                    m, "config", allow_none=True
-                ), 'gdn_config', None
-            )
-            info = {
-                'conv1d_sizes': [1, 1, 1],
-            } if info is None else info
-            return info.get('conv1d_sizes', [1, 1, 1]), GDN_CONV1D_NAMES, 0
+            return [1, 1, 1], GDN_CONV1D_NAMES, 0
     return None
 
 
@@ -832,14 +829,7 @@ def _wrap_optim_states_as_dtensors(state_dict: dict, model: nn.Module) -> None:
         for state_key, state_val in param_states.items():
             if not isinstance(state_val, torch.Tensor) or isinstance(state_val, DTensor):
                 continue
-            if state_val.numel() == 0 and dist_param._local_tensor.numel() == 0:
-                param_states[state_key] = make_uneven_dtensor(
-                    state_val,
-                    shape=dist_param.size(),
-                    dp_mesh=dist_param.device_mesh,
-                    placements=dist_param.placements,
-                )
-            elif state_val.shape == dist_param._local_tensor.shape:
+            if state_val.shape == dist_param._local_tensor.shape:
                 param_states[state_key] = make_uneven_dtensor(
                     state_val,
                     shape=dist_param.size(),
