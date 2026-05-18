@@ -1039,6 +1039,7 @@ def _build_megatron_fsdp_v2_state_dict(
     """
     from megatron.core.distributed.fsdp.checkpoint import (
         _apply_mcore_postprocess,
+        _wrap_optim_states_as_dtensors,
         get_model_state_dict,
         get_optimizer_state_dict,
     )
@@ -1059,6 +1060,8 @@ def _build_megatron_fsdp_v2_state_dict(
     optim_sd = get_optimizer_state_dict(optimizer, is_loading=is_loading)
     if optim_sd is not None:
         state_dict["optimizer"] = optim_sd
+
+    _wrap_optim_states_as_dtensors(state_dict, model[0])
 
     _apply_mcore_postprocess(state_dict, args, model[0])
 

@@ -64,6 +64,7 @@ __all__ = [
     "strip_module_prefix",
     "get_model_state_dict",
     "get_optimizer_state_dict",
+    "_wrap_optim_states_as_dtensors",
     "handle_fp8_extra_state_case",
     "handle_experts_in_state_dict",
     "handle_swiglu_in_state_dict_v2",
@@ -775,6 +776,65 @@ def get_optimizer_state_dict(
 
 
 # ------------------------------------------------------------------
+# Optimizer state DTensor wrapping
+# ------------------------------------------------------------------
+
+
+def _wrap_optim_states_as_dtensors(state_dict: dict, model: nn.Module) -> None:
+    """Wrap plain-tensor optimizer states as DTensors for DCP compatibility.
+
+    FusedAdam (and similar optimizers) store ``exp_avg`` / ``exp_avg_sq`` as
+    plain tensors matching the parameter's local DTensor shard.  DCP requires
+    all sharded data to be DTensors so it can build a correct global save plan.
+    This function wraps those plain tensors as uneven DTensors using the
+    corresponding model parameter's device mesh and placements.
+
+    Operates in-place on ``state_dict["optimizer"]["state"]``.
+    """
+    if "optimizer" not in state_dict or "state" not in state_dict["optimizer"]:
+        return
+
+    param_map = {}
+    for name, param in model.named_parameters():
+        if isinstance(param, DTensor):
+            param_map[name] = param
+    if not param_map:
+        return
+
+    opt_state = state_dict["optimizer"]["state"]
+    for key, param_states in opt_state.items():
+        if not isinstance(param_states, dict):
+            continue
+        dist_param = param_map.get(key)
+        if dist_param is None:
+            stripped = key[len(_MODULE_PREFIX):] if key.startswith(_MODULE_PREFIX) else key
+            dist_param = param_map.get(stripped)
+        if dist_param is None:
+            prefixed = f"{_MODULE_PREFIX}{key}"
+            dist_param = param_map.get(prefixed)
+        if dist_param is None:
+            continue
+
+        for state_key, state_val in param_states.items():
+            if not isinstance(state_val, torch.Tensor) or isinstance(state_val, DTensor):
+                continue
+            if state_val.numel() == 0 and dist_param._local_tensor.numel() == 0:
+                param_states[state_key] = make_uneven_dtensor(
+                    state_val,
+                    shape=dist_param.size(),
+                    dp_mesh=dist_param.device_mesh,
+                    placements=dist_param.placements,
+                )
+            elif state_val.shape == dist_param._local_tensor.shape:
+                param_states[state_key] = make_uneven_dtensor(
+                    state_val,
+                    shape=dist_param.size(),
+                    dp_mesh=dist_param.device_mesh,
+                    placements=dist_param.placements,
+                )
+
+
+# ------------------------------------------------------------------
 # Save / Load checkpoint
 # ------------------------------------------------------------------
 
@@ -811,6 +871,8 @@ def save_checkpoint(
     state_dict = {"model": model_sd}
     if optim_sd is not None:
         state_dict["optimizer"] = optim_sd
+
+    _wrap_optim_states_as_dtensors(state_dict, model)
 
     if args is not None:
         _apply_mcore_postprocess(state_dict, args, model)
@@ -854,6 +916,8 @@ def load_checkpoint(
     state_dict = {"model": model_sd}
     if optim_sd is not None:
         state_dict["optimizer"] = optim_sd
+
+    _wrap_optim_states_as_dtensors(state_dict, model)
 
     if args is not None:
         _apply_mcore_postprocess(state_dict, args, model)
