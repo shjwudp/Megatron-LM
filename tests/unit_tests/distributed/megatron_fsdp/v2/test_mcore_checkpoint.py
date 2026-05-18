@@ -45,20 +45,24 @@ def _state_dict_to_full_tensor(sd):
     return out
 
 
-def _optim_state_to_full_tensor(optim_sd):
-    """Convert all DTensor optimizer state values to full (gathered) tensors.
+def _optim_state_to_full_tensor(optim_sd, model):
+    """Convert optimizer state values to full (gathered) tensors.
 
-    Expects the Path A format from ``get_optimizer_state_dict``:
-    ``{"state": {param_name: {"exp_avg": DTensor, ...}}, "param_to_group_meta": ...}``.
+    Wraps plain-tensor optimizer states as DTensors using the model parameter's
+    mesh/placements, then gathers to full tensors for cross-rank comparison.
     """
     from torch.distributed.tensor import DTensor
 
+    from megatron.core.distributed.fsdp.checkpoint import _wrap_optim_states_as_dtensors
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
         uneven_dtensor_to_full_tensor,
     )
 
+    wrapped = {"optimizer": optim_sd.copy()}
+    _wrap_optim_states_as_dtensors(wrapped, model)
+
     out = {}
-    for param_name, param_states in optim_sd["state"].items():
+    for param_name, param_states in wrapped["optimizer"]["state"].items():
         out[param_name] = {}
         for state_key, state_val in param_states.items():
             if isinstance(state_val, DTensor):
@@ -361,10 +365,10 @@ class TestMegatronFsdpV2Checkpoint:
 
         # ---- Train and save WITH optimizer ----
         save_config = dict(save=str(ckpt_base), save_interval=1, **v2_config)
-        _, source_sd, source_optim, _ = TestMegatronFsdpV2Checkpoint._training_loop(**save_config)
+        source_model, source_sd, source_optim, _ = TestMegatronFsdpV2Checkpoint._training_loop(**save_config)
         source_full = _state_dict_to_full_tensor(source_sd)
         source_optim_sd = get_optimizer_state_dict(source_optim, is_loading=False)
-        source_optim_full = _optim_state_to_full_tensor(source_optim_sd)
+        source_optim_full = _optim_state_to_full_tensor(source_optim_sd, source_model)
         Utils.destroy_model_parallel()
 
         # ---- Load WITH optimizer ----
@@ -380,7 +384,7 @@ class TestMegatronFsdpV2Checkpoint:
 
         # ---- Verify optimizer ----
         loaded_optim_sd = get_optimizer_state_dict(loaded_optim, is_loading=False)
-        loaded_optim_full = _optim_state_to_full_tensor(loaded_optim_sd)
+        loaded_optim_full = _optim_state_to_full_tensor(loaded_optim_sd, v2_model)
         _assert_optimizer_state_dict_match(source_optim_full, loaded_optim_full)
 
         # Cleanup

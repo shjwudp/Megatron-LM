@@ -65,13 +65,15 @@ format for both paths. It uses DCP directly, storing each parameter as a `DTenso
 | `handle_experts_in_state_dict(model_sd, num_experts)` | Rename expert parameter keys for expert-parallel sharding. |
 | `handle_swiglu_in_state_dict_v2(model, model_sd, opt_sd)` | Split SwiGLU fc1 weights/bias into ``_w``/``_v`` halves. Only processes layers with ``gated_linear_unit=True``. Uses DTensor-native operations: ``_get_fsdp_slice_from_dtensor`` + ``make_uneven_dtensor``. |
 | `handle_gdn_in_state_dict_v2(model, model_sd, opt_sd)` | Split fused GDN projections (e.g., linear_qkv) into per-component tensors. DTensor-native. |
-| `_get_fsdp_slice_from_dtensor(dist_param)` | Compute FSDP slice (flattened byte range) from DTensor placements/device mesh. |
+| `_get_fsdp_slice_from_dtensor(dist_param)` | Compute the FSDP slice (flattened range) from chunk metadata (``__create_chunk_list__``). Requires ``update_uneven_dtensor_chunk_metadata`` to have been called first. Correctly handles uneven sharding. |
 | `_get_tp_world_size(dist_param)` | Get tensor-parallel world size from propagated TP attributes. |
-| `_split_dtensor_v2(data, dist_param, sizes, dim)` | **Unified** DTensor split function. Splits a fused DTensor into per-component DTensors. Used by both SwiGLU (``[1, 1]`` → ``_w``/``_v``) and GDN (``[1, 1, 1]`` → query/key/value). |
+| `_split_dtensor_v2(data, dist_param, sizes, dim)` | **Unified** split function. Accepts both DTensor (model params) and plain tensor (FusedAdam states) inputs. Splits fused tensors into per-component pieces along ``split_dim``. Used by both SwiGLU and GDN. |
 | `_split_swiglu_weight_v2(data, dist_param)` | Convenience wrapper: ``_split_dtensor_v2(data, dist_param, [1, 1], 0)``. |
 | `_split_gdn_weight_v2(data, dist_param, sizes, dim)` | Convenience wrapper: ``_split_dtensor_v2(data, dist_param, sizes, dim)``. |
 | `_detect_glu_layers(model)` | Return ``{layer_path: gated_linear_unit}`` for all TransformerLayers. |
 | `_model_has_module_prefix(model)` | Detect whether model's ``named_parameters()`` keys already carry ``module.`` prefix. |
+| `_wrap_optim_states_as_dtensors(state_dict, model)` | Wrap plain-tensor optimizer states as DTensors using the corresponding model parameter's mesh/placements. Required because FusedAdam stores states as plain tensors; DCP needs DTensors for proper save plans. |
+| `_unwrap_optim_states_from_dtensors(state_dict)` | Convert DTensor optimizer states back to plain tensors (``.to_local()``) after DCP load. FusedAdam expects plain tensors in ``load_state_dict``. |
 
 ### 3.2 Current Save Flow
 
@@ -174,7 +176,7 @@ which calls `sharded_param_state_fsdp_dtensor()`. Returns:
 ```python
 {
     "state": {
-        "<param_name>": {"exp_avg": DTensor(...), "exp_avg_sq": DTensor(...)},
+        "<param_name>": {"exp_avg": torch.Tensor, "exp_avg_sq": torch.Tensor, ...},
         ...
     },
     "param_to_group_meta": {
@@ -183,6 +185,15 @@ which calls `sharded_param_state_fsdp_dtensor()`. Returns:
     }
 }
 ```
+
+**Important:** ``FusedAdam`` (and similar NVIDIA optimizers) store ``exp_avg`` /
+``exp_avg_sq`` as **plain tensors** matching the parameter's local DTensor shard,
+NOT as DTensors. This is because the optimizer kernel operates on the local data
+directly. Path A returns these plain tensors as-is.
+
+For DCP compatibility, these plain tensors must be wrapped as DTensors via
+``_wrap_optim_states_as_dtensors`` before DCP save (see Section 5.10), and
+unwrapped back via ``_unwrap_optim_states_from_dtensors`` after DCP load.
 
 This is the primary path for Megatron-integrated training.
 
@@ -258,6 +269,51 @@ The `fsdp_dtensor` checkpoint format signals to MCore's `checkpointing.py` to:
 This is the only format compatible with Megatron FSDP because the non-DCP formats
 (`torch`, `torch_dist`) use gather/scatter patterns that assume contiguous gradient
 buffers, which don't exist in the FSDP path.
+
+### 5.10 DTensor Wrapping / Unwrapping Layer (Path A)
+
+Path A must add a wrapping/unwrapping layer to bridge the gap between
+FusedAdam's plain-tensor optimizer states and DCP's DTensor requirement.
+
+**Why wrapping is needed on save:**
+
+DCP builds a global save plan by inspecting the state dict. Sharded data must
+be DTensors so DCP knows about the sharding (mesh, placements, per-rank chunk
+metadata). Plain tensors with the same FQN on every rank are treated as
+non-sharded (replicated) data, which causes ``"item.index.fqn not in md"``
+errors when ranks hold different local shards.
+
+**Why unwrapping is needed on load:**
+
+After DCP loads DTensors into the skeleton, the optimizer state dict contains
+DTensor values. But FusedAdam's ``load_state_dict`` → ``set_scaled_state``
+calls ``state[state_name].copy_(unscaled_state)`` where ``state[state_name]``
+is a plain tensor (FusedAdam's internal storage). Passing a DTensor causes
+``RuntimeError: aten.copy_.default got mixed torch.Tensor and DTensor``.
+
+**The two functions (in ``checkpoint.py``):**
+
+- ``_wrap_optim_states_as_dtensors(state_dict, model)`` — for each optimizer
+  state that is a plain tensor matching the parameter's local shard shape,
+  wraps it as an uneven DTensor using the model parameter's device mesh and
+  placements.
+- ``_unwrap_optim_states_from_dtensors(state_dict)`` — for each DTensor
+  optimizer state, calls ``.to_local()`` to get the plain local shard.
+
+**Placement in the flow:**
+
+::
+
+   Save:  get_optim_state_dict (plain) → _wrap_optim_states_as_dtensors → DCP save
+   Load:  DCP load (DTensors) → _unwrap_optim_states_from_dtensors → optimizer.load_state_dict
+
+**Note on the baseline (v1) path:**
+
+The baseline path does NOT need these functions because the existing conversion
+tests (``test_mcore_checkpoint.py``) never save optimizer states to DCP — they
+save only model state dicts via ``dcp_save({"model": source_sd}, ...)``. If
+optimizer state saving were added to the baseline path, the same wrapping/
+unwrapping layer would be required.
 
 ---
 
@@ -681,7 +737,9 @@ ensures model and optimizer state dict keys are consistent in the checkpoint.
 
 ### Phase 2: Torch-Native `get_state_dict` Path (Path B — `MegatronFSDPStateful`)
 
-- [x] Add `_is_megatron_fsdp_v2()` helper to detect FSDP v2 from model
+- [x] Add `_is_megatron_fsdp_v2()` helper — checks ``ddp_config.use_fully_shard_api``
+      on the ``FullyShardedDataParallel`` adapter, with fallback to ``isinstance(model[0], FSDPModule)``
+      for models that went through ``fully_shard()`` without the adapter wrapper
 - [x] Add `_build_megatron_fsdp_v2_state_dict()` to `checkpointing.py` using
       ``MegatronFSDPStateful`` (which internally uses ``get_state_dict`` from
       ``uneven_dtensor`` for both model and optimizer, then applies MCore
@@ -702,17 +760,43 @@ ensures model and optimizer state dict keys are consistent in the checkpoint.
 - [x] Add ``get_model_state_dict(model)`` — auto-detects prefix, adds if missing
 - [x] Add ``get_optimizer_state_dict(optimizer, is_loading)`` — delegates to
       ``optimizer.sharded_state_dict()`` with ``fsdp_dtensor`` sharding type (Path A)
+- [x] Add ``_wrap_optim_states_as_dtensors()`` / ``_unwrap_optim_states_from_dtensors()``
+      — bridges FusedAdam's plain-tensor states and DCP's DTensor requirement
 - [x] Implement ``save_checkpoint(model, ckpt_dir, optimizer, args)`` — full DCP save
       flow using Path A for optimizer
 - [x] Implement ``load_checkpoint(model, ckpt_dir, optimizer, args, strict)`` — full
       DCP load flow using Path A for optimizer, with prefix strip on load
+- [x] Fix ``_split_dtensor_v2`` to accept plain tensors (FusedAdam optimizer states)
+      in addition to DTensors
+- [x] Fix ``_get_fsdp_slice_from_dtensor`` to use ``__create_chunk_list__`` metadata
+      (correctly handles uneven sharding)
+- [x] Fix zero-numel branch in ``_split_dtensor_v2`` to use correct global component
+      shapes (not ``[0, 0]``)
+- [x] Ensure chunk metadata on model params BEFORE ``_apply_mcore_postprocess``
+      (``_get_fsdp_slice_from_dtensor`` requires ``__create_chunk_list__``)
 - [ ] Handle PP: iterate model chunks, build per-chunk state dicts
 - [ ] Handle multi-optimizer (ChainedOptimizer: expert + non-expert optimizers)
+
+### Path A Save/Load Flow (Final)
+
+::
+
+   _build_megatron_fsdp_v2_state_dict()
+     |
+     +-- get_model_state_dict(model[0])             # model DTensors
+     +-- preprocess_state_dict_for_uneven_dtensor(model_sd)  # chunk metadata on params
+     +-- get_optimizer_state_dict(optimizer)         # plain tensors from FusedAdam
+     +-- _wrap_optim_states_as_dtensors(...)         # wrap plain → DTensor
+     +-- _apply_mcore_postprocess(...)               # SwiGLU/GDN split, FP8, experts
+     |     uses _get_fsdp_slice_from_dtensor → requires chunk metadata from prev step
+     +-- preprocess_state_dict_for_uneven_dtensor(full_sd)  # metadata on split + optim DTensors
+     +-- DCP save / DCP load
 
 ### Testing
 
 - [x] Round-trip test: Save via MCore `save_checkpoint`, load via `setup_model_and_optimizer` → `load_checkpoint`
-- [ ] Optimizer state dict round-trip: save → load → verify values
+- [x] Optimizer state dict round-trip: save → load → verify values
+      (``test_megatron_fsdp_v2_round_trip`` now validates both model and optimizer)
 - [ ] Cross-format optimizer state conversion: ND-parallel → Megatron FSDP v2
 - [ ] Unskip and fix hanging `get_state_dict` tests in `test_fully_shard.py`
 - [ ] Uneven DTensor sharding with non-divisible parameter sizes
