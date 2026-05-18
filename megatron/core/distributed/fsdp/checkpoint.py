@@ -334,48 +334,63 @@ def _is_swiglu_key(key: str) -> bool:
 
 
 def _split_dtensor_v2(
-    data: DTensor,
+    data,
     dist_param: DTensor,
     split_sizes: List[int],
     split_dim: int,
-) -> List[DTensor]:
-    """Split a DTensor into per-component DTensors along ``split_dim``.
+) -> List:
+    """Split a DTensor (or plain tensor) into per-component pieces along ``split_dim``.
 
     Shared implementation for SwiGLU (``[1, 1]`` → ``_w``/``_v``) and GDN
     (``[1, 1, 1]`` → query/key/value).  Each component gets a proportionally
     sized global shape and a local shard derived from the FSDP slice.
 
+    Supports both DTensor inputs (model state dict) and plain tensor inputs
+    (optimizer state dict — e.g., FusedAdam stores ``exp_avg``/``exp_avg_sq``
+    as plain tensors matching the local DTensor shard).
+
     Args:
-        data: The fused DTensor to split.
-        dist_param: A reference DTensor providing placements and device mesh.
+        data: The fused tensor to split. May be a DTensor (model params) or
+            a plain tensor (optimizer states from FusedAdam).
+        dist_param: A reference DTensor providing placements, device mesh,
+            and global shape information.
         split_sizes: Relative sizes of each component (e.g. ``[1, 1]`` for
             two equal halves).
         split_dim: Dimension along which to split.
 
     Returns:
-        List of component DTensors, one per element in *split_sizes*.
+        List of component DTensors (if input was DTensor) or plain tensors
+        (if input was a plain tensor), one per element in *split_sizes*.
     """
-    assert isinstance(data, DTensor)
-    local_tensor = data.to_local()
+    is_dtensor = isinstance(data, DTensor)
+    if is_dtensor:
+        local_tensor = data.to_local()
+    else:
+        local_tensor = data
+
     if local_tensor.numel() == 0:
-        return [
-            make_uneven_dtensor(
-                local_tensor,
-                shape=torch.Size([0] * data.ndim),
-                dp_mesh=dist_param.device_mesh,
-                placements=dist_param.placements,
-            )
-            for _ in split_sizes
-        ]
+        if is_dtensor:
+            return [
+                make_uneven_dtensor(
+                    local_tensor,
+                    shape=torch.Size([0] * dist_param.ndim),
+                    dp_mesh=dist_param.device_mesh,
+                    placements=dist_param.placements,
+                )
+                for _ in split_sizes
+            ]
+        else:
+            return [local_tensor.clone() for _ in split_sizes]
 
     fsdp_slice = _get_fsdp_slice_from_dtensor(dist_param)
     tp_world_size = _get_tp_world_size(dist_param)
 
     total_split = sum(split_sizes)
-    data_size = data.numel() // tp_world_size
+    global_numel = dist_param.numel()
+    data_size = global_numel // tp_world_size
     elems_per_unit = data_size // total_split
 
-    view_shape = list(data.shape)
+    global_shape = list(dist_param.size())
 
     results = []
     flat_offset = 0
@@ -386,20 +401,23 @@ def _split_dtensor_v2(
         shard = _intersection(fsdp_slice, comp_slice)
         comp_data = local_tensor.view(-1)[_offset_slice(shard, -fsdp_slice.start)]
 
-        comp_view = list(view_shape)
-        comp_view[split_dim] = -1
-        comp_data = comp_data.reshape(comp_view)
+        comp_global_shape = list(global_shape)
+        comp_global_shape[split_dim] = s * (global_shape[split_dim] // total_split)
 
-        global_shape = list(dist_param.size())
-        global_shape[split_dim] = s * (dist_param.size()[split_dim] // total_split)
+        if is_dtensor:
+            comp_view = list(comp_global_shape)
+            comp_view[split_dim] = -1
+            comp_data = comp_data.reshape(comp_view)
 
-        dtensor = make_uneven_dtensor(
-            comp_data,
-            shape=torch.Size(global_shape),
-            dp_mesh=dist_param.device_mesh,
-            placements=dist_param.placements,
-        )
-        results.append(dtensor)
+            dtensor = make_uneven_dtensor(
+                comp_data,
+                shape=torch.Size(comp_global_shape),
+                dp_mesh=dist_param.device_mesh,
+                placements=dist_param.placements,
+            )
+            results.append(dtensor)
+        else:
+            results.append(comp_data)
         flat_offset += comp_flat
 
     return results
