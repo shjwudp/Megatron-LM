@@ -2045,6 +2045,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:
         try:
+            from megatron.core.distributed.fsdp.checkpoint import _unwrap_optim_states_from_dtensors
+
+            _unwrap_optim_states_from_dtensors(state_dict)
             # Load state dict.
             if getattr(args, "use_layer_wise_distributed_optimizer", False) and args.ckpt_format == 'torch':
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks

@@ -63,6 +63,7 @@ __all__ = [
     "get_model_state_dict",
     "get_optimizer_state_dict",
     "_wrap_optim_states_as_dtensors",
+    "_unwrap_optim_states_from_dtensors",
     "handle_fp8_extra_state_case",
     "handle_experts_in_state_dict",
     "handle_swiglu_in_state_dict_v2",
@@ -845,6 +846,28 @@ def _wrap_optim_states_as_dtensors(state_dict: dict, model: nn.Module) -> None:
 
 
 # ------------------------------------------------------------------
+# Optimizer state DTensor unwrapping (post-load)
+# ------------------------------------------------------------------
+
+
+def _unwrap_optim_states_from_dtensors(state_dict: dict) -> None:
+    """Convert DTensor optimizer states back to plain tensors.
+
+    Inverse of ``_wrap_optim_states_as_dtensors``.  Called after DCP load
+    because DCP fills the skeleton DTensors, but FusedAdam (and similar
+    optimizers) store states as plain tensors matching the local shard.
+    """
+    if "optimizer" not in state_dict or "state" not in state_dict["optimizer"]:
+        return
+    for param_states in state_dict["optimizer"]["state"].values():
+        if not isinstance(param_states, dict):
+            continue
+        for k, v in list(param_states.items()):
+            if isinstance(v, DTensor):
+                param_states[k] = v.to_local()
+
+
+# ------------------------------------------------------------------
 # Save / Load checkpoint
 # ------------------------------------------------------------------
 
@@ -939,6 +962,8 @@ def load_checkpoint(
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     dcp.load(state_dict, checkpoint_id=str(ckpt_dir))
+
+    _unwrap_optim_states_from_dtensors(state_dict)
 
     loaded_model_sd = state_dict["model"]
     if not _model_has_module_prefix(model):
