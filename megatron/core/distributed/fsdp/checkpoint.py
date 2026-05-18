@@ -270,11 +270,24 @@ def _get_tp_world_size(dist_param: DTensor) -> int:
 
 
 def _get_dist_param(model: nn.Module, key: str) -> nn.Parameter:
-    """Get a model parameter by state dict key, handling ``module.`` prefix."""
+    """Get a model parameter by state dict key, handling ``module.`` prefix.
+
+    Tries multiple key variants to handle both wrapped (``FullyShardedDataParallel``
+    with ``self.module``) and unwrapped (raw ``FSDPModule``) models:
+      1. Key as-is.
+      2. Key with ``module.`` prefix added.
+      3. Key with ``module.`` prefix stripped (if present).
+    """
     try:
         return model.get_parameter(key)
     except AttributeError:
+        pass
+    try:
         return model.get_parameter(f"module.{key}")
+    except AttributeError:
+        pass
+    if key.startswith("module."):
+        return model.get_parameter(key[len("module."):])
 
 
 def _detect_glu_layers(model: nn.Module) -> dict:

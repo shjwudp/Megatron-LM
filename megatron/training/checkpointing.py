@@ -1003,7 +1003,18 @@ def _is_megatron_fsdp_v2(model):
     try:
         return model[0].ddp_config.use_fully_shard_api
     except (AttributeError, IndexError):
-        return False
+        pass
+    try:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
+
+        m = model[0] if isinstance(model, (list, tuple)) else model
+        if isinstance(m, FSDPModule):
+            return True
+        if hasattr(m, 'module') and isinstance(m.module, FSDPModule):
+            return True
+    except (ImportError, IndexError, TypeError):
+        pass
+    return False
 
 
 def _build_megatron_fsdp_v2_state_dict(
