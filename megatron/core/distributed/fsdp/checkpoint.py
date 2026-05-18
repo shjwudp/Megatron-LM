@@ -103,7 +103,13 @@ class MegatronFSDPStateful(Stateful):
         self.args = args
 
     def state_dict(self):
-        model_sd, optim_sd = _get_state_dict(self.model, self.optimizer)
+        if self.optimizer is not None:
+            model_sd, optim_sd = _get_state_dict(self.model, self.optimizer)
+        else:
+            model_sd = self.model.state_dict()
+            preprocess_state_dict_for_uneven_dtensor(model_sd)
+            optim_sd = None
+
         state_dict = {"model": model_sd}
         if optim_sd is not None:
             state_dict["optimizer"] = optim_sd
