@@ -231,32 +231,39 @@ def _offset_slice(s: slice, offset: int) -> slice:
 
 
 def _get_fsdp_slice_from_dtensor(dist_param: DTensor) -> slice:
-    """Compute the FSDP slice (flattened byte range) from a v2 DTensor.
+    """Compute the FSDP slice (flattened range) from a v2 DTensor.
 
-    Does NOT rely on ``__create_chunk_list__`` — derives the slice directly
-    from the DTensor's placements and device mesh.
+    Uses the uneven chunk metadata (``__create_chunk_list__``) attached by
+    ``update_uneven_dtensor_chunk_metadata`` to correctly handle uneven
+    sharding where ranks may own different-sized slices.
+
+    The DTensor must have ``__create_chunk_list__`` set on its local tensor
+    (via ``preprocess_state_dict_for_uneven_dtensor`` or
+    ``update_uneven_dtensor_chunk_metadata``) before calling this function.
     """
     local_numel = dist_param._local_tensor.numel()
     if local_numel == 0:
         return slice(0, 0)
 
-    global_shape = dist_param.size()
-    mesh = dist_param.device_mesh
-    shard_placements = [p for p in dist_param.placements if isinstance(p, DShard)]
+    assert hasattr(dist_param._local_tensor, "__create_chunk_list__"), (
+        "_get_fsdp_slice_from_dtensor requires the DTensor to have "
+        "__create_chunk_list__ metadata. Call update_uneven_dtensor_chunk_metadata "
+        "or preprocess_state_dict_for_uneven_dtensor first."
+    )
 
-    if len(shard_placements) == 1 and shard_placements[0].dim == 0:
-        row_stride = global_shape[1:].numel() if global_shape[1:].numel() > 0 else 1
-        rank = dist.get_rank(mesh.get_group())
-        chunk_rows = global_shape[0] // mesh.size()
-        start = rank * chunk_rows * row_stride
-        return slice(start, start + local_numel)
-    elif len(shard_placements) == 1 and shard_placements[0].dim != 0:
-        chunk_numel = global_shape.numel() // mesh.size()
-        rank = dist.get_rank(mesh.get_group())
-        start = rank * chunk_numel
-        return slice(start, start + local_numel)
-    else:
-        return slice(0, global_shape.numel())
+    chunk_list = dist_param._local_tensor.__create_chunk_list__()
+    assert len(chunk_list) == 1, (
+        f"Expected exactly one chunk per rank, got {len(chunk_list)}"
+    )
+    chunk_meta = chunk_list[0]
+    offsets = chunk_meta.offsets
+    sizes = chunk_meta.sizes
+
+    global_shape = dist_param.size()
+    strides = torch.empty(global_shape, device="meta").stride()
+
+    start = sum(o * s for o, s in zip(offsets, strides))
+    return slice(start, start + local_numel)
 
 
 def _get_tp_world_size(dist_param: DTensor) -> int:
@@ -866,9 +873,11 @@ def save_checkpoint(
 
     model_sd = get_model_state_dict(model)
 
-    optim_sd = get_optimizer_state_dict(optimizer, is_loading=False)
-
     state_dict = {"model": model_sd}
+
+    preprocess_state_dict_for_uneven_dtensor(state_dict["model"])
+
+    optim_sd = get_optimizer_state_dict(optimizer, is_loading=False)
     if optim_sd is not None:
         state_dict["optimizer"] = optim_sd
 
@@ -911,9 +920,11 @@ def load_checkpoint(
 
     model_sd = get_model_state_dict(model)
 
-    optim_sd = get_optimizer_state_dict(optimizer, is_loading=True)
-
     state_dict = {"model": model_sd}
+
+    preprocess_state_dict_for_uneven_dtensor(state_dict["model"])
+
+    optim_sd = get_optimizer_state_dict(optimizer, is_loading=True)
     if optim_sd is not None:
         state_dict["optimizer"] = optim_sd
 

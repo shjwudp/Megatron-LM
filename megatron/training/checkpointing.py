@@ -1057,6 +1057,11 @@ def _build_megatron_fsdp_v2_state_dict(
 
     state_dict["model"] = get_model_state_dict(model[0])
 
+    # Add uneven DTensor chunk metadata to model param DTensors FIRST.
+    # _apply_mcore_postprocess uses _get_fsdp_slice_from_dtensor which
+    # requires __create_chunk_list__ on the parameter DTensors.
+    preprocess_state_dict_for_uneven_dtensor(state_dict["model"])
+
     optim_sd = get_optimizer_state_dict(optimizer, is_loading=is_loading)
     if optim_sd is not None:
         state_dict["optimizer"] = optim_sd
@@ -1065,6 +1070,7 @@ def _build_megatron_fsdp_v2_state_dict(
 
     _apply_mcore_postprocess(state_dict, args, model[0])
 
+    # Add chunk metadata to newly created split DTensors and optimizer DTensors.
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     # Scheduler.
