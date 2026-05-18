@@ -377,18 +377,25 @@ def _split_dtensor_v2(
         local_tensor = data
 
     if local_tensor.numel() == 0:
-        if is_dtensor:
-            return [
-                make_uneven_dtensor(
-                    local_tensor,
-                    shape=torch.Size([0] * dist_param.ndim),
-                    dp_mesh=dist_param.device_mesh,
-                    placements=dist_param.placements,
+        total_split = sum(split_sizes)
+        global_shape = list(dist_param.size())
+        results = []
+        for s in split_sizes:
+            comp_global_shape = list(global_shape)
+            comp_global_shape[split_dim] = s * (global_shape[split_dim] // total_split)
+            empty_local = local_tensor.new_empty([0] * len(comp_global_shape))
+            if is_dtensor:
+                results.append(
+                    make_uneven_dtensor(
+                        empty_local,
+                        shape=torch.Size(comp_global_shape),
+                        dp_mesh=dist_param.device_mesh,
+                        placements=dist_param.placements,
+                    )
                 )
-                for _ in split_sizes
-            ]
-        else:
-            return [local_tensor.clone() for _ in split_sizes]
+            else:
+                results.append(empty_local)
+        return results
 
     fsdp_slice = _get_fsdp_slice_from_dtensor(dist_param)
     tp_world_size = _get_tp_world_size(dist_param)
