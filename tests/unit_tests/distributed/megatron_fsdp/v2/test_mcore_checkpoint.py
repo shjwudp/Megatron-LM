@@ -197,9 +197,10 @@ class TestMegatronFsdpV2Checkpoint:
     @staticmethod
     def _init_model_and_optimizer(seed=42, **kwargs):
         """
-        Initialize model-parallel groups, build model and optimizer.
+        Initialize model-parallel groups, build model, optimizer and
+        param scheduler.
 
-        Returns (model_chunks, optim).
+        Returns (model_chunks, optim, opt_param_scheduler).
 
         NOTE: Process groups are intentionally NOT destroyed here because
         the caller (e.g. DCP.load) may need them.  The caller is responsible
@@ -243,18 +244,22 @@ class TestMegatronFsdpV2Checkpoint:
             **kwargs,
         )
 
-        return model_chunks, optim
+        from megatron.training.training import get_optimizer_param_scheduler
+
+        opt_param_scheduler = get_optimizer_param_scheduler(optim)
+
+        return model_chunks, optim, opt_param_scheduler
 
     @staticmethod
     def _training_loop(seed=42, **kwargs):
         """
         Run _init_model_and_optimizer followed by a deterministic training
-        loop and return (model, state_dict, optim).
+        loop and return (model, state_dict, optim, opt_param_scheduler).
 
         If ``save`` is in kwargs, calls MCore's ``save_checkpoint`` at the
-        end to persist the trained model and optimizer.
+        end to persist the trained model, optimizer and scheduler.
         """
-        model_chunks, optim = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
+        model_chunks, optim, scheduler = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
             seed=seed, **kwargs
         )
 
@@ -291,13 +296,13 @@ class TestMegatronFsdpV2Checkpoint:
                 iteration=0,
                 model=model_chunks,
                 optimizer=optim,
-                opt_param_scheduler=None,
+                opt_param_scheduler=scheduler,
                 num_floating_point_operations_so_far=0,
             )
 
         model = _get_model_from_chunks(model_chunks)
         state_dict = model.state_dict()
-        return model, state_dict, optim
+        return model, state_dict, optim, scheduler
 
     # ------------------------------------------------------------------
     # Setup / teardown
@@ -356,7 +361,7 @@ class TestMegatronFsdpV2Checkpoint:
 
         # ---- Train and save WITH optimizer ----
         save_config = dict(save=str(ckpt_base), save_interval=1, **v2_config)
-        _, source_sd, source_optim = TestMegatronFsdpV2Checkpoint._training_loop(**save_config)
+        _, source_sd, source_optim, _ = TestMegatronFsdpV2Checkpoint._training_loop(**save_config)
         source_full = _state_dict_to_full_tensor(source_sd)
         source_optim_sd = get_optimizer_state_dict(source_optim, is_loading=False)
         source_optim_full = _optim_state_to_full_tensor(source_optim_sd)
@@ -364,7 +369,7 @@ class TestMegatronFsdpV2Checkpoint:
 
         # ---- Load WITH optimizer ----
         load_config = dict(load=str(ckpt_base), **v2_config)
-        v2_model_chunks, loaded_optim = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
+        v2_model_chunks, loaded_optim, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
             **load_config,
         )
         v2_model = _get_model_from_chunks(v2_model_chunks)
@@ -406,7 +411,7 @@ class TestMegatronFsdpV2Checkpoint:
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
 
         # ---- ND-parallel: train and save ----
-        source_model, source_sd, _ = TestMegatronFsdpV2Checkpoint._training_loop(
+        source_model, source_sd, _, _ = TestMegatronFsdpV2Checkpoint._training_loop(
             use_distributed_optimizer=True,
             data_parallel_sharding_strategy="optim_grads_params",
             fp8_param_gather=False,
@@ -424,7 +429,7 @@ class TestMegatronFsdpV2Checkpoint:
         Utils.destroy_model_parallel()
 
         # ---- Megatron-FSDP v2: load via MegatronFSDPStateful ----
-        v2_model_chunks, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
+        v2_model_chunks, _, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
             use_megatron_fsdp=True,
             use_fully_shard_api=True,
             init_model_with_meta_device=True,
@@ -499,7 +504,7 @@ class TestMegatronFsdpV2Checkpoint:
                 gradient_accumulation_fusion=False,
             )
         )
-        source_model, source_sd, _ = TestMegatronFsdpV2Checkpoint._training_loop(
+        source_model, source_sd, _, _ = TestMegatronFsdpV2Checkpoint._training_loop(
             **nd_topology, **baseline_configs
         )
         source_full = _state_dict_to_full_tensor(source_sd)
@@ -529,7 +534,7 @@ class TestMegatronFsdpV2Checkpoint:
                 recompute_num_layers=1,
             )
         )
-        v2_model_chunks, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
+        v2_model_chunks, _, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
             **nd_topology, **v2_configs
         )
         v2_model = _get_model_from_chunks(v2_model_chunks)
