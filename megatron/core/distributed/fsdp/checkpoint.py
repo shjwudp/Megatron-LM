@@ -652,6 +652,9 @@ def _apply_mcore_postprocess(state_dict, args, model):
 
     Called after ``get_state_dict`` has attached uneven DTensor chunk
     metadata.  Uses v2-native implementations throughout.
+
+    Callers that do not want optimizer keys split (e.g. Path A) should
+    exclude ``"optimizer"`` from *state_dict* before calling.
     """
     handle_fp8_extra_state_case(state_dict["model"])
 
@@ -905,9 +908,11 @@ def save_checkpoint(
 
     optim_sd = get_optimizer_state_dict(optimizer, is_loading=False)
     if optim_sd is not None:
-        state_dict["optimizer"] = optim_sd
-
-    _wrap_optim_states_as_dtensors(state_dict, model)
+        state_dict["optimizer"] = {
+            "state": {k: dict(v) for k, v in optim_sd.get("state", {}).items()},
+            "param_to_group_meta": dict(optim_sd.get("param_to_group_meta", {})),
+        }
+        _wrap_optim_states_as_dtensors(state_dict, model)
 
     if args is not None:
         _apply_mcore_postprocess(state_dict, args, model)
@@ -950,11 +955,17 @@ def load_checkpoint(
 
     preprocess_state_dict_for_uneven_dtensor(state_dict["model"])
 
+    raw_optim_sd = None
     optim_sd = get_optimizer_state_dict(optimizer, is_loading=True)
     if optim_sd is not None:
         state_dict["optimizer"] = optim_sd
-
-    _wrap_optim_states_as_dtensors(state_dict, model)
+        # Capture raw plain-tensor dict; wrap a DTensor copy for DCP load.
+        raw_optim_sd = state_dict["optimizer"].copy()
+        state_dict["optimizer"] = {
+            "state": {k: dict(v) for k, v in optim_sd.get("state", {}).items()},
+            "param_to_group_meta": dict(optim_sd.get("param_to_group_meta", {})),
+        }
+        _wrap_optim_states_as_dtensors(state_dict, model)
 
     if args is not None:
         _apply_mcore_postprocess(state_dict, args, model)
@@ -963,7 +974,8 @@ def load_checkpoint(
 
     dcp.load(state_dict, checkpoint_id=str(ckpt_dir))
 
-    _unwrap_optim_states_from_dtensors(state_dict)
+    if raw_optim_sd is not None:
+        state_dict["optimizer"] = raw_optim_sd
 
     loaded_model_sd = state_dict["model"]
     if not _model_has_module_prefix(model):

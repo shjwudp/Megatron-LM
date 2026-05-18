@@ -72,8 +72,8 @@ format for both paths. It uses DCP directly, storing each parameter as a `DTenso
 | `_split_gdn_weight_v2(data, dist_param, sizes, dim)` | Convenience wrapper: ``_split_dtensor_v2(data, dist_param, sizes, dim)``. |
 | `_detect_glu_layers(model)` | Return ``{layer_path: gated_linear_unit}`` for all TransformerLayers. |
 | `_model_has_module_prefix(model)` | Detect whether model's ``named_parameters()`` keys already carry ``module.`` prefix. |
-| `_wrap_optim_states_as_dtensors(state_dict, model)` | Wrap plain-tensor optimizer states as DTensors using the corresponding model parameter's mesh/placements. Required because FusedAdam stores states as plain tensors; DCP needs DTensors for proper save plans. |
-| `_unwrap_optim_states_from_dtensors(state_dict)` | Convert DTensor optimizer states back to plain tensors (``.to_local()``) after DCP load. FusedAdam expects plain tensors in ``load_state_dict``. |
+| `_wrap_optim_states_as_dtensors(state_dict, model)` | Wrap plain-tensor optimizer states as DTensors using the corresponding model parameter's mesh/placements. Required because FusedAdam stores states as plain tensors; DCP needs DTensors for proper save/load plans. |
+| `_unwrap_optim_states_from_dtensors(state_dict)` | (Kept for standalone ``load_checkpoint``) Convert DTensor optimizer states back to plain tensors (``.to_local()``). Not needed in the main training loop path — see dual-dict pattern in Section 5.11. |
 
 ### 3.2 Current Save Flow
 
@@ -314,6 +314,46 @@ tests (``test_mcore_checkpoint.py``) never save optimizer states to DCP — they
 save only model state dicts via ``dcp_save({"model": source_sd}, ...)``. If
 optimizer state saving were added to the baseline path, the same wrapping/
 unwrapping layer would be required.
+
+### 5.11 Dual-Dict Pattern: Plain Tensors → DTensor Wrapping → Restore
+
+The main training loop (``checkpointing.py``) uses a **dual-dict pattern** to
+avoid the need for ``_unwrap_optim_states_from_dtensors``:
+
+::
+
+  _build_megatron_fsdp_v2_state_dict()
+    |
+    +-- state_dict["optimizer"] = plain tensors (from get_optimizer_state_dict)
+    |
+  save_checkpoint() / _load_base_checkpoint()
+    |
+    +-- (load only) raw_optimizer_state_dict = state_dict["optimizer"].copy()
+    |       captures plain-tensor dict before wrapping
+    |
+    +-- _wrap_optim_states_as_dtensors(state_dict, model)
+    |       wraps in-place: plain → DTensor (shared storage via make_uneven_dtensor)
+    |
+    +-- DCP save / DCP load
+    |       writes through DTensors → plain tensors auto-updated via shared storage
+    |
+    +-- (load only) state_dict["optimizer"] = raw_optimizer_state_dict
+            restores plain-tensor dict for optimizer.load_state_dict
+
+Key properties:
+
+* **Wrapping is deferred** — ``_build_megatron_fsdp_v2_state_dict`` keeps
+  optimizer states as plain tensors. Wrapping as DTensors happens later, in
+  ``save_checkpoint`` (before DCP save) or ``_load_base_checkpoint`` (after
+  raw copy, before DCP load).
+* **No unwrapping needed** — the ``raw_optimizer_state_dict.copy()`` at
+  line 1526 of ``checkpointing.py`` (existing code) captures the plain-tensor
+  state dict. After DCP load writes through the DTensors (which share storage
+  with the plain tensors), the raw dict is restored. The raw dict already has
+  the correct loaded values — no ``.to_local()`` conversion needed.
+* **split_optimizer=False** — ``_apply_mcore_postprocess`` only splits model
+  keys (SwiGLU ``_w``/``_v``). Optimizer keys stay as canonical parameter
+  names, which ``DistributedOptimizer.load_state_dict`` can match.
 
 ---
 
@@ -785,12 +825,21 @@ ensures model and optimizer state dict keys are consistent in the checkpoint.
      |
      +-- get_model_state_dict(model[0])             # model DTensors
      +-- preprocess_state_dict_for_uneven_dtensor(model_sd)  # chunk metadata on params
-     +-- get_optimizer_state_dict(optimizer)         # plain tensors from FusedAdam
-     +-- _wrap_optim_states_as_dtensors(...)         # wrap plain → DTensor
-     +-- _apply_mcore_postprocess(...)               # SwiGLU/GDN split, FP8, experts
-     |     uses _get_fsdp_slice_from_dtensor → requires chunk metadata from prev step
-     +-- preprocess_state_dict_for_uneven_dtensor(full_sd)  # metadata on split + optim DTensors
-     +-- DCP save / DCP load
+     +-- get_optimizer_state_dict(optimizer)         # plain tensors (NO wrapping here)
+     +-- _apply_mcore_postprocess(split_optimizer=False)  # model split, optimizer canonical
+     +-- preprocess_state_dict_for_uneven_dtensor(full_sd)  # metadata on split model DTensors
+     +-- Scheduler, Rerun, RNG
+     |
+   save_checkpoint()                        # SAVE path
+     +-- _wrap_optim_states_as_dtensors(...)       # wrap plain → DTensor for DCP save plan
+     +-- DCP save
+     |
+   _load_base_checkpoint()                  # LOAD path
+     +-- raw_optimizer_state_dict = state_dict["optimizer"].copy()  # capture plain dict
+     +-- _wrap_optim_states_as_dtensors(...)       # wrap plain → DTensor for DCP load
+     +-- DCP load (fills DTensors → plain tensors updated via shared storage)
+     +-- state_dict["optimizer"] = raw_optimizer_state_dict    # restore plain dict
+     +-- optimizer.load_state_dict(state_dict["optimizer"])    # receives plain tensors
 
 ### Testing
 

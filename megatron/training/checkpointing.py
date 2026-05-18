@@ -702,6 +702,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             if ckpt_format == "fsdp_dtensor":
                 if not _is_megatron_fsdp_v2(model):
                     state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+                else:
+                    from megatron.core.distributed.fsdp.checkpoint import _wrap_optim_states_as_dtensors
+                    _wrap_optim_states_as_dtensors(state_dict, model[0])
                 # For FSDP v2, post-processing and uneven DTensor preprocessing
                 # are already handled inside _build_megatron_fsdp_v2_state_dict.
 
@@ -1039,7 +1042,6 @@ def _build_megatron_fsdp_v2_state_dict(
     """
     from megatron.core.distributed.fsdp.checkpoint import (
         _apply_mcore_postprocess,
-        _wrap_optim_states_as_dtensors,
         get_model_state_dict,
         get_optimizer_state_dict,
     )
@@ -1066,11 +1068,14 @@ def _build_megatron_fsdp_v2_state_dict(
     if optim_sd is not None:
         state_dict["optimizer"] = optim_sd
 
-    _wrap_optim_states_as_dtensors(state_dict, model[0])
-
+    # Path A: optimizer keys stay canonical so DistributedOptimizer
+    # .load_state_dict can match them.  Temporarily exclude optimizer
+    # from post-processing.
+    _optim_sd = state_dict.pop("optimizer", None)
     _apply_mcore_postprocess(state_dict, args, model[0])
+    if _optim_sd is not None:
+        state_dict["optimizer"] = _optim_sd
 
-    # Add chunk metadata to newly created split DTensors and optimizer DTensors.
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     # Scheduler.
@@ -1528,6 +1533,10 @@ def _load_base_checkpoint(
             state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
         # For FSDP v2, post-processing and uneven DTensor preprocessing
         # are already handled inside _build_megatron_fsdp_v2_state_dict.
+
+        if _is_megatron_fsdp_v2(model):
+            from megatron.core.distributed.fsdp.checkpoint import _wrap_optim_states_as_dtensors
+            _wrap_optim_states_as_dtensors(state_dict, model[0])
 
         ckpt_type = CheckpointType.FSDP_DTENSOR
         fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
@@ -2045,9 +2054,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:
         try:
-            from megatron.core.distributed.fsdp.checkpoint import _unwrap_optim_states_from_dtensors
-
-            _unwrap_optim_states_from_dtensors(state_dict)
             # Load state dict.
             if getattr(args, "use_layer_wise_distributed_optimizer", False) and args.ckpt_format == 'torch':
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
