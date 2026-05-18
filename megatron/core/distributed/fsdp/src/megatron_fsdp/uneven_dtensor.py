@@ -505,8 +505,13 @@ def make_uneven_dtensor(
             on the created DTensor so that DCP can handle uneven sharding.
     """
     assert dp_mesh.ndim == 1, "Only 1D mesh is supported for now"
+    if local_tensor.numel() == 0:
+        local_shape = (0,) + tuple(shape[1:]) if len(shape) > 1 else (0,)
+        local_tensor = local_tensor.reshape(local_shape)
+    else:
+        local_tensor = local_tensor.view(-1, *shape[1:])
     dtensor = DTensor.from_local(
-        local_tensor=local_tensor.view(-1, *shape[1:]),
+        local_tensor=local_tensor,
         device_mesh=dp_mesh,
         placements=placements,
         run_check=False,
