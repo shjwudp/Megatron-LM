@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
 
+# ------------------------------------------------------------------
+# State dict helpers
+# ------------------------------------------------------------------
+
 def _state_dict_to_full_tensor(sd):
     """Convert all DTensor values in a state dict to full (gathered) tensors."""
     from torch.distributed.tensor import DTensor
@@ -38,6 +42,29 @@ def _state_dict_to_full_tensor(sd):
             out[k] = uneven_dtensor_to_full_tensor(v)
         else:
             out[k] = v
+    return out
+
+
+def _optim_state_to_full_tensor(optim_sd):
+    """Convert all DTensor optimizer state values to full (gathered) tensors.
+
+    Expects the Path A format from ``get_optimizer_state_dict``:
+    ``{"state": {param_name: {"exp_avg": DTensor, ...}}, "param_to_group_meta": ...}``.
+    """
+    from torch.distributed.tensor import DTensor
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        uneven_dtensor_to_full_tensor,
+    )
+
+    out = {}
+    for param_name, param_states in optim_sd["state"].items():
+        out[param_name] = {}
+        for state_key, state_val in param_states.items():
+            if isinstance(state_val, DTensor):
+                out[param_name][state_key] = uneven_dtensor_to_full_tensor(state_val)
+            else:
+                out[param_name][state_key] = state_val
     return out
 
 
@@ -75,18 +102,97 @@ def _get_model_from_chunks(model_chunks):
     return model_chunks
 
 
+# ------------------------------------------------------------------
+# Validation helpers
+# ------------------------------------------------------------------
+
+def _assert_model_state_dict_match(source_full, loaded_full):
+    """Assert model state dict values match between source and loaded.
+
+    Matches by canonical (``module.``-stripped) parameter name.
+    """
+    nonempty = False
+    for s_key, s_val in source_full.items():
+        canonical = _normalize_key(s_key)
+        matched_key = None
+        for l_key in loaded_full:
+            if _normalize_key(l_key) == canonical:
+                matched_key = l_key
+                break
+        assert matched_key is not None, (
+            f"Key {s_key} (canonical: {canonical}) not found in loaded state dict"
+        )
+        l_val = loaded_full[matched_key]
+
+        if s_val is None and l_val is None:
+            continue
+        assert s_val is not None and l_val is not None, (
+            f"One of source or loaded value for {s_key} is None while the other is not"
+        )
+        if s_val.numel() > 0:
+            nonempty = True
+        assert s_val.shape == l_val.shape, (
+            f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
+        )
+        assert_close(s_val, l_val, atol=0, rtol=0, msg=f"Value mismatch for {s_key}")
+
+    world_size = torch.distributed.get_world_size()
+    all_nonempty = [False] * world_size
+    torch.distributed.all_gather_object(all_nonempty, nonempty)
+    assert any(all_nonempty), "All ranks had empty model state after load."
+
+
+def _assert_optimizer_state_dict_match(source_optim_full, loaded_optim_full):
+    """Assert optimizer state dict values match between source and loaded.
+
+    Matches by canonical parameter name.
+    """
+    for param_name, source_states in source_optim_full.items():
+        canonical = _normalize_key(param_name)
+        matched_param = None
+        for l_param in loaded_optim_full:
+            if _normalize_key(l_param) == canonical:
+                matched_param = l_param
+                break
+        assert matched_param is not None, (
+            f"Optimizer param {param_name} (canonical: {canonical}) "
+            f"not found in loaded optimizer state"
+        )
+        loaded_states = loaded_optim_full[matched_param]
+        for state_key, s_val in source_states.items():
+            assert state_key in loaded_states, (
+                f"Optimizer state '{state_key}' for param {param_name} not found after load"
+            )
+            l_val = loaded_states[state_key]
+            if s_val is None and l_val is None:
+                continue
+            if isinstance(s_val, torch.Tensor) and s_val.numel() > 0:
+                assert s_val.shape == l_val.shape, (
+                    f"Optimizer state shape mismatch for {param_name}.{state_key}: "
+                    f"{s_val.shape} vs {l_val.shape}"
+                )
+                assert_close(
+                    s_val, l_val, atol=0, rtol=0,
+                    msg=f"Optimizer state value mismatch for {param_name}.{state_key}",
+                )
+
+
+# ==================================================================
+# Test class
+# ==================================================================
+
 class TestMegatronFsdpV2Checkpoint:
     """
     Megatron FSDP v2 checkpoint save/load and online format conversion tests.
 
     Covers:
-    - Megatron FSDP v2 → Megatron FSDP v2 round-trip (save + load)
+    - Megatron FSDP v2 → Megatron FSDP v2 round-trip (save + load, model + optimizer)
     - ND-parallel → Megatron FSDP v2 online conversion
     - Megatron FSDP v1 baseline → Megatron FSDP v2 online conversion
     """
 
     # ------------------------------------------------------------------
-    # Model init / training helpers (same pattern as test_mcore_nd_parallel.py)
+    # Model init / training helpers
     # ------------------------------------------------------------------
     @staticmethod
     def _init_model_and_optimizer(seed=42, **kwargs):
@@ -143,10 +249,10 @@ class TestMegatronFsdpV2Checkpoint:
     def _training_loop(seed=42, **kwargs):
         """
         Run _init_model_and_optimizer followed by a deterministic training
-        loop and return the model together with its state dict.
+        loop and return (model, state_dict, optim).
 
         If ``save`` is in kwargs, calls MCore's ``save_checkpoint`` at the
-        end to persist the trained model.
+        end to persist the trained model and optimizer.
         """
         model_chunks, optim = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
             seed=seed, **kwargs
@@ -191,7 +297,7 @@ class TestMegatronFsdpV2Checkpoint:
 
         model = _get_model_from_chunks(model_chunks)
         state_dict = model.state_dict()
-        return model, state_dict
+        return model, state_dict, optim
 
     # ------------------------------------------------------------------
     # Setup / teardown
@@ -221,9 +327,12 @@ class TestMegatronFsdpV2Checkpoint:
     def test_megatron_fsdp_v2_round_trip(self, sharding_strategy):
         """
         Train a Megatron FSDP v2 model, save via MCore native
-        ``save_checkpoint``, load via ``setup_model_and_optimizer``, and
-        verify parameters match.
+        ``save_checkpoint`` (model + optimizer), load via
+        ``setup_model_and_optimizer``, and verify both model parameters
+        and optimizer state values match.
         """
+        from megatron.core.distributed.fsdp.checkpoint import get_optimizer_state_dict
+
         v2_config = dict(
             use_megatron_fsdp=True,
             use_fully_shard_api=True,
@@ -245,48 +354,29 @@ class TestMegatronFsdpV2Checkpoint:
             / f"v2_round_trip_{sharding_strategy}"
         )
 
-        # ---- Train and save via MCore save_checkpoint ----
-        # Passing save=<ckpt_base> triggers save_checkpoint inside _training_loop.
-        save_config = dict(save=str(ckpt_base), save_interval=1, no_save_optim=True, no_save_rng=True, **v2_config)
-        _, source_sd = TestMegatronFsdpV2Checkpoint._training_loop(**save_config)
+        # ---- Train and save WITH optimizer ----
+        save_config = dict(save=str(ckpt_base), save_interval=1, **v2_config)
+        _, source_sd, source_optim = TestMegatronFsdpV2Checkpoint._training_loop(**save_config)
         source_full = _state_dict_to_full_tensor(source_sd)
+        source_optim_sd = get_optimizer_state_dict(source_optim, is_loading=False)
+        source_optim_full = _optim_state_to_full_tensor(source_optim_sd)
         Utils.destroy_model_parallel()
 
-        # ---- Load via setup_model_and_optimizer's load_checkpoint ----
-        load_config = dict(load=str(ckpt_base), no_load_optim=True, no_load_rng=True, **v2_config)
-        v2_model_chunks, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
+        # ---- Load WITH optimizer ----
+        load_config = dict(load=str(ckpt_base), **v2_config)
+        v2_model_chunks, loaded_optim = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
             **load_config,
         )
         v2_model = _get_model_from_chunks(v2_model_chunks)
 
-        # ---- Verify ----
+        # ---- Verify model ----
         loaded_full = _state_dict_to_full_tensor(v2_model.state_dict())
-        nonempty = False
-        for s_key, s_val in source_full.items():
-            canonical = _normalize_key(s_key)
-            matched_key = None
-            for l_key in loaded_full:
-                if _normalize_key(l_key) == canonical:
-                    matched_key = l_key
-                    break
-            assert (
-                matched_key is not None
-            ), f"Key {s_key} (canonical: {canonical}) not found in loaded state dict"
-            l_val = loaded_full[matched_key]
-            if s_val is not None and s_val.numel() > 0:
-                nonempty = True
-            if s_val is not None and l_val is not None:
-                assert (
-                    s_val.shape == l_val.shape
-                ), f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
-            else:
-                assert s_val is None and l_val is None, f"One of source or loaded value for {s_key} is None while the other is not"
-            assert_close(s_val, l_val, atol=0, rtol=0, msg=f"Value mismatch for {s_key}")
+        _assert_model_state_dict_match(source_full, loaded_full)
 
-        world_size = torch.distributed.get_world_size()
-        all_nonempty = [False] * world_size
-        torch.distributed.all_gather_object(all_nonempty, nonempty)
-        assert any(all_nonempty), "All ranks had empty model state after load."
+        # ---- Verify optimizer ----
+        loaded_optim_sd = get_optimizer_state_dict(loaded_optim, is_loading=False)
+        loaded_optim_full = _optim_state_to_full_tensor(loaded_optim_sd)
+        _assert_optimizer_state_dict_match(source_optim_full, loaded_optim_full)
 
         # Cleanup
         Utils.destroy_model_parallel()
@@ -308,14 +398,15 @@ class TestMegatronFsdpV2Checkpoint:
         and load it into a Megatron-FSDP v2 model using
         ``MegatronFSDPStateful``.  Verify the state dict.
         """
-        from megatron.core.distributed.fsdp.checkpoint import MegatronFSDPStateful
         from torch.distributed.checkpoint import load as dcp_load
         from torch.distributed.checkpoint import save as dcp_save
+
+        from megatron.core.distributed.fsdp.checkpoint import MegatronFSDPStateful
 
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
 
         # ---- ND-parallel: train and save ----
-        source_model, source_sd = TestMegatronFsdpV2Checkpoint._training_loop(
+        source_model, source_sd, _ = TestMegatronFsdpV2Checkpoint._training_loop(
             use_distributed_optimizer=True,
             data_parallel_sharding_strategy="optim_grads_params",
             fp8_param_gather=False,
@@ -355,33 +446,10 @@ class TestMegatronFsdpV2Checkpoint:
         mapped_sd = _build_key_mapping(source_sd, state["model"])
         dcp_load(state_dict=mapped_sd, checkpoint_id=str(ckpt_dir))
 
-        # ---- Verify ----
+        # ---- Verify model ----
         loaded_sd = v2_model.state_dict()
         loaded_full = _state_dict_to_full_tensor(loaded_sd)
-
-        nonempty = False
-        for s_key, s_val in source_full.items():
-            canonical = _normalize_key(s_key)
-            matched_key = None
-            for l_key in loaded_full:
-                if _normalize_key(l_key) == canonical:
-                    matched_key = l_key
-                    break
-            assert (
-                matched_key is not None
-            ), f"Key {s_key} (canonical: {canonical}) not found in v2 state dict"
-            l_val = loaded_full[matched_key]
-            if s_val.numel() > 0:
-                nonempty = True
-            assert (
-                s_val.shape == l_val.shape
-            ), f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
-            assert_close(s_val, l_val, atol=0, rtol=0, msg=f"Value mismatch for {s_key}")
-
-        world_size = torch.distributed.get_world_size()
-        all_nonempty = [False] * world_size
-        torch.distributed.all_gather_object(all_nonempty, nonempty)
-        assert any(all_nonempty), "All ranks had empty model state after load."
+        _assert_model_state_dict_match(source_full, loaded_full)
 
         # Cleanup
         Utils.destroy_model_parallel()
@@ -413,9 +481,10 @@ class TestMegatronFsdpV2Checkpoint:
         into a Megatron-FSDP v2 model using ``MegatronFSDPStateful``.
         Verify the state dict.
         """
-        from megatron.core.distributed.fsdp.checkpoint import MegatronFSDPStateful
         from torch.distributed.checkpoint import load as dcp_load
         from torch.distributed.checkpoint import save as dcp_save
+
+        from megatron.core.distributed.fsdp.checkpoint import MegatronFSDPStateful
 
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         shard_str = source_configs["data_parallel_sharding_strategy"]
@@ -430,7 +499,7 @@ class TestMegatronFsdpV2Checkpoint:
                 gradient_accumulation_fusion=False,
             )
         )
-        source_model, source_sd = TestMegatronFsdpV2Checkpoint._training_loop(
+        source_model, source_sd, _ = TestMegatronFsdpV2Checkpoint._training_loop(
             **nd_topology, **baseline_configs
         )
         source_full = _state_dict_to_full_tensor(source_sd)
@@ -470,37 +539,13 @@ class TestMegatronFsdpV2Checkpoint:
         mapped_sd = _build_key_mapping(source_sd, state["model"])
         dcp_load(state_dict=mapped_sd, checkpoint_id=str(ckpt_dir))
 
-        # ---- Verify ----
+        # ---- Verify model ----
         loaded_sd = v2_model.state_dict()
         loaded_full = _state_dict_to_full_tensor(loaded_sd)
-
-        nonempty = False
-        for s_key, s_val in source_full.items():
-            canonical = _normalize_key(s_key)
-            matched_key = None
-            for l_key in loaded_full:
-                if _normalize_key(l_key) == canonical:
-                    matched_key = l_key
-                    break
-            assert (
-                matched_key is not None
-            ), f"Key {s_key} (canonical: {canonical}) not found in v2 state dict"
-            l_val = loaded_full[matched_key]
-            if s_val.numel() > 0:
-                nonempty = True
-            assert (
-                s_val.shape == l_val.shape
-            ), f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
-            assert_close(s_val, l_val, atol=0, rtol=0, msg=f"Value mismatch for {s_key}")
-
-        world_size = torch.distributed.get_world_size()
-        all_nonempty = [False] * world_size
-        torch.distributed.all_gather_object(all_nonempty, nonempty)
-        assert any(all_nonempty), "All ranks had empty model state after load."
+        _assert_model_state_dict_match(source_full, loaded_full)
 
         # Cleanup
         Utils.destroy_model_parallel()
         if torch.distributed.get_rank() == 0:
             shutil.rmtree(ckpt_dir)
         torch.distributed.barrier()
-
