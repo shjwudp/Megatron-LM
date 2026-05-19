@@ -391,10 +391,7 @@ def handle_swiglu_in_state_dict_v2(
                     param_key = key
                     if param_key.startswith("module."):
                         param_key = param_key[len("module.") :]
-                    dist_param = _get_dist_param(
-                        model,
-                        param_key,
-                    )
+                    dist_param = _get_dist_param(model, param_key)
                     assert isinstance(opt_state[key][subkey], DTensor), (
                         f"Expected optimizer state for {key} to be a DTensor, got "
                         f"{type(opt_state[key][subkey]).__name__}"

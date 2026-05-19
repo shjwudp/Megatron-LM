@@ -27,6 +27,7 @@ SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 # Helpers
 # ------------------------------------------------------------------
 
+
 def _state_dict_to_full_tensor(sd):
     from torch.distributed.tensor import DTensor
 
@@ -64,20 +65,20 @@ def _assert_model_match(source_full, loaded_full):
             if _normalize_key(l_key) == canonical:
                 matched_key = l_key
                 break
-        assert matched_key is not None, (
-            f"Key {s_key} (canonical: {canonical}) not found in loaded state dict"
-        )
+        assert (
+            matched_key is not None
+        ), f"Key {s_key} (canonical: {canonical}) not found in loaded state dict"
         l_val = loaded_full[matched_key]
         if s_val is None and l_val is None:
             continue
-        assert s_val is not None and l_val is not None, (
-            f"One of source or loaded value for {s_key} is None while the other is not"
-        )
+        assert (
+            s_val is not None and l_val is not None
+        ), f"One of source or loaded value for {s_key} is None while the other is not"
         if s_val.numel() > 0:
             nonempty = True
-        assert s_val.shape == l_val.shape, (
-            f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
-        )
+        assert (
+            s_val.shape == l_val.shape
+        ), f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
         assert_close(s_val, l_val, atol=0, rtol=0, msg=f"Value mismatch for {s_key}")
 
     world_size = torch.distributed.get_world_size()
@@ -121,18 +122,21 @@ def _assert_optim_match(source_optim_full, loaded_optim_full):
         )
         loaded_states = loaded_optim_full[matched_param]
         for state_key, s_val in source_states.items():
-            assert state_key in loaded_states, (
-                f"Optimizer state '{state_key}' for param {param_name} not found after load"
-            )
+            assert (
+                state_key in loaded_states
+            ), f"Optimizer state '{state_key}' for param {param_name} not found after load"
             l_val = loaded_states[state_key]
             if s_val is None and l_val is None:
                 continue
             if isinstance(s_val, torch.Tensor) and s_val.numel() > 0:
-                assert s_val.shape == l_val.shape, (
-                    f"Optimizer state shape mismatch for {param_name}.{state_key}"
-                )
+                assert (
+                    s_val.shape == l_val.shape
+                ), f"Optimizer state shape mismatch for {param_name}.{state_key}"
                 assert_close(
-                    s_val, l_val, atol=0, rtol=0,
+                    s_val,
+                    l_val,
+                    atol=0,
+                    rtol=0,
                     msg=f"Optimizer state value mismatch for {param_name}.{state_key}",
                 )
 
@@ -140,6 +144,7 @@ def _assert_optim_match(source_optim_full, loaded_optim_full):
 # ==================================================================
 # Test class
 # ==================================================================
+
 
 class TestMegatronFsdpV2Checkpoint:
 
@@ -311,20 +316,20 @@ class TestMegatronFsdpV2Checkpoint:
             # ---- ND-parallel → MFSDP v2 ----
             pytest.param(
                 "nd",
-                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                dict(distrib_optim_sharding_type="dp_reshardable"),
                 dict(data_parallel_sharding_strategy="optim_grads_params"),
                 id="nd_to_v2_optim_grads_params",
             ),
             pytest.param(
                 "nd",
-                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                dict(distrib_optim_sharding_type="fully_reshardable"),
                 dict(data_parallel_sharding_strategy="optim_grads"),
                 id="nd_to_v2_optim_grads",
             ),
         ],
     )
     def test_checkpoint_online_convert(
-        self, nd_topology, source_type, source_configs, target_configs
+        self, request, nd_topology, source_type, source_configs, target_configs
     ):
         """
         Train a source model (ND-parallel, MFSDP v1, or MFSDP v2) with
@@ -333,6 +338,9 @@ class TestMegatronFsdpV2Checkpoint:
         optimizer state.
         """
         from megatron.core.distributed.fsdp.checkpoint import get_optimizer_state_dict
+
+        if source_type == "v1":
+            pytest.skip("v1 checkpoint format not available")
 
         # ---- Build source config ----
         if source_type == "v2":
@@ -345,31 +353,27 @@ class TestMegatronFsdpV2Checkpoint:
                 gradient_accumulation_fusion=False,
             )
         elif source_type == "nd":
-            src_base = dict(
-                use_distributed_optimizer=True,
-                fp8_param_gather=False,
-            )
+            src_base = dict(use_distributed_optimizer=True, fp8_param_gather=False)
         else:
             raise ValueError(f"Unknown source_type: {source_type}")
+
+        src_sharding_type = source_configs.pop("distrib_optim_sharding_type", "fsdp_dtensor")
 
         save_config = {**nd_topology, **src_base, **source_configs}
         tgt_configs = {**nd_topology, **self._TARGET_BASE, **target_configs}
 
-        nd_str = "_".join(f"{k}{v}" for k, v in nd_topology.items())
-        src_shard = source_configs["data_parallel_sharding_strategy"]
-        tgt_shard = target_configs["data_parallel_sharding_strategy"]
-        ckpt_base = (
-            Path(SHARED_TMP_DIR)
-            / TestMegatronFsdpV2Checkpoint.__name__
-            / f"{source_type}_{nd_str}_{src_shard}_to_{tgt_shard}"
-        )
+        test_id = request.node.name.replace("[", "_").replace("]", "").replace("/", "_")
+        ckpt_base = Path(SHARED_TMP_DIR) / TestMegatronFsdpV2Checkpoint.__name__ / test_id
 
         # ---- Train + save with source config ----
         source_model, source_sd, source_optim, _ = TestMegatronFsdpV2Checkpoint._training_loop(
-            save=str(ckpt_base), save_interval=1, **save_config,
+            save=str(ckpt_base), save_interval=1, **save_config
         )
         source_full = _state_dict_to_full_tensor(source_sd)
-        source_optim_sd = get_optimizer_state_dict(source_optim, is_loading=False)
+        source_optim_sd = source_optim.sharded_state_dict(
+            model_sharded_state_dict={},
+            metadata={"distrib_optim_sharding_type": src_sharding_type}
+        )
         if source_type in ("v1", "v2"):
             source_optim_full = _optim_state_to_full(source_optim_sd, source_model)
         else:
@@ -378,7 +382,7 @@ class TestMegatronFsdpV2Checkpoint:
 
         # ---- Load with target config (always MFSDP v2) ----
         v2_model_chunks, loaded_optim, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
-            load=str(ckpt_base), **tgt_configs,
+            load=str(ckpt_base), **tgt_configs
         )
         v2_model = _get_model_from_chunks(v2_model_chunks)
 
@@ -387,7 +391,9 @@ class TestMegatronFsdpV2Checkpoint:
         _assert_model_match(source_full, loaded_full)
 
         # ---- Verify optimizer ----
-        loaded_optim_sd = get_optimizer_state_dict(loaded_optim, is_loading=False)
+        loaded_optim_sd = loaded_optim.sharded_state_dict(
+            metadata={"distrib_optim_sharding_type": "fsdp_dtensor"}
+        )
         if source_type in ("v1", "v2"):
             loaded_optim_full = _optim_state_to_full(loaded_optim_sd, v2_model)
             _assert_optim_match(source_optim_full, loaded_optim_full)

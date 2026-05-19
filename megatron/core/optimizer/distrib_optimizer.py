@@ -1202,7 +1202,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
                 name_to_param.update(_name_to_param)
             if not self.ddp_config.use_fully_shard_api:
-                num_experts = self.model_chunks[0].config.num_moe_experts if self.model_chunks else None
+                num_experts = (
+                    self.model_chunks[0].config.num_moe_experts if self.model_chunks else None
+                )
                 name_to_param = handle_experts_in_state_dict(name_to_param, num_experts)
             self.param_to_name = {param: name for name, param in name_to_param.items()}
         assert (
