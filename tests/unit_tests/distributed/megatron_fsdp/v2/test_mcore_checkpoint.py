@@ -100,10 +100,8 @@ def _optim_state_to_full(optim_sd, model):
     for param_name, param_states in wrapped["optimizer"]["state"].items():
         out[param_name] = {}
         for state_key, state_val in param_states.items():
-            if isinstance(state_val, DTensor) and state_val.to_local().numel() > 0:
+            if isinstance(state_val, DTensor):
                 out[param_name][state_key] = uneven_dtensor_to_full_tensor(state_val)
-            elif isinstance(state_val, DTensor):
-                out[param_name][state_key] = state_val.to_local()
             else:
                 out[param_name][state_key] = state_val
     return out

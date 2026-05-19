@@ -1077,8 +1077,8 @@ def generate_state_dict(
 
 
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
-    assert _is_megatron_fsdp_v2(model)
-    return _apply_mcore_postprocess(raw_state_dict, args, model)
+    if _is_megatron_fsdp_v2(model):
+        return _apply_mcore_postprocess(raw_state_dict, args, model)
 
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict["model"])
