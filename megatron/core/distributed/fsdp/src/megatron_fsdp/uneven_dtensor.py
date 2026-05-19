@@ -102,30 +102,6 @@ def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
     This function modifies the DTensor in-place to include chunk metadata
     and write items closures for saving and loading.
     """
-
-    def _chunk_list_closure(chunk_meta):
-        return lambda: chunk_meta
-
-    def _write_items_closure(uneven_chunk_meta):
-        def _write_items(fqn: str, tensor: DTensor) -> List[WriteItem]:
-            if tensor.to_local().numel() == 0:
-                # If the tensor is empty, return an empty list
-                return []
-
-            return [
-                WriteItem(
-                    type=WriteItemType.SHARD,
-                    index=MetadataIndex(fqn, uneven_chunk_meta.offsets),
-                    tensor_data=TensorWriteData(
-                        chunk=uneven_chunk_meta,
-                        properties=TensorProperties.create_from_tensor(tensor.to_local()),
-                        size=tensor.size(),
-                    ),
-                )
-            ]
-
-        return _write_items
-
     # Get uneven chunk metadata for the DTensor
     # TODO: Optimize gather_and_compute_chunk_metadata synchronization:
     # 1. Add pre-check validation to verify tensor shape consistency
@@ -135,8 +111,7 @@ def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
     uneven_chunk_meta = gather_and_compute_chunk_metadata(dtensor)
 
     # Set the chunk list and write items closure for the DTensor
-    dtensor._local_tensor.__create_chunk_list__ = _chunk_list_closure([uneven_chunk_meta])
-    dtensor._local_tensor.__create_write_items__ = _write_items_closure(uneven_chunk_meta)
+    _set_chunk_metadata(dtensor, uneven_chunk_meta.offsets, uneven_chunk_meta.sizes)
 
 
 def validate_uneven_dtensor(dtensor: DTensor) -> None:
@@ -493,6 +468,8 @@ def make_uneven_dtensor(
     placements: List[Placement],
     *,
     post_process_uneven: bool = False,
+    copy_chunk_meta_from: Optional[DTensor] = None,
+    chunk_metadata: Optional[tuple] = None,
 ):
     """Create a DTensor from a possibly uneven local shard with known global shape.
 
@@ -501,8 +478,12 @@ def make_uneven_dtensor(
         shape: Global shape of the full DTensor.
         dp_mesh: 1D device mesh.
         placements: DTensor placements (e.g., [Shard(0)]).
-        post_process_uneven: If True, call ``update_uneven_dtensor_chunk_metadata``
-            on the created DTensor so that DCP can handle uneven sharding.
+        post_process_uneven: If True, call ``update_uneven_dtensor_chunk_metadata``.
+        copy_chunk_meta_from: If set, copy ``__create_chunk_list__`` /
+            ``__create_write_items__`` from this DTensor.
+        chunk_metadata: ``(offsets, sizes)`` tuple where *offsets* and *sizes*
+            are tuples of ints (one per dimension).  Sets chunk metadata
+            closures without collectives.
     """
     assert dp_mesh.ndim == 1, "Only 1D mesh is supported for now"
     if local_tensor.numel() == 0:
@@ -520,6 +501,13 @@ def make_uneven_dtensor(
     )
     if post_process_uneven:
         update_uneven_dtensor_chunk_metadata(dtensor)
+    elif copy_chunk_meta_from is not None:
+        # This branch is used for the case where we are creating a new DTensor that has the same
+        # sharding as an existing uneven DTensor, so we can copy the chunk metadata from the
+        # existing uneven DTensor instead of recomputing it.
+        copy_chunk_metadata(copy_chunk_meta_from, dtensor)
+    elif chunk_metadata is not None:
+        _set_chunk_metadata(dtensor, *chunk_metadata)
     return dtensor
 
 
@@ -540,3 +528,105 @@ def get_state_dict(
     preprocess_state_dict_for_uneven_dtensor(model_state_dict)
     preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
     return model_state_dict, optimizer_state_dict
+
+
+# ------------------------------------------------------------------
+# Chunk metadata helpers (zero-collective)
+# ------------------------------------------------------------------
+
+
+def copy_chunk_metadata(src: DTensor, dst: DTensor) -> None:
+    """Copy ``__create_chunk_list__`` / ``__create_write_items__`` from *src* to *dst*."""
+    dst._local_tensor.__create_chunk_list__ = src._local_tensor.__create_chunk_list__
+    dst._local_tensor.__create_write_items__ = src._local_tensor.__create_write_items__
+
+
+def compute_split_offsets_and_sizes(dist_param, split_dim, comp_idx, total_split, comp_data):
+    """Compute chunk offsets/sizes for a split component, derived from *dist_param*'s metadata.
+
+    Pure local computation — no collectives.
+    """
+    chunk_list = dist_param._local_tensor.__create_chunk_list__()
+    orig = chunk_list[0]
+    global_shape = list(dist_param.size())
+
+    comp_size = global_shape[split_dim] // total_split
+    comp_start = comp_idx * comp_size
+    comp_end = comp_start + comp_size
+
+    offsets = list(orig.offsets)
+    sizes = list(comp_data.shape)
+
+    o = offsets[split_dim]
+    s = orig.sizes[split_dim]
+
+    if o < comp_end and o + s > comp_start:
+        offsets[split_dim] = max(o, comp_start) - comp_start
+        sizes[split_dim] = min(o + s, comp_end) - max(o, comp_start)
+    else:
+        offsets[split_dim] = 0
+        sizes[split_dim] = 0
+
+    return tuple(offsets), tuple(sizes)
+
+
+def get_fsdp_slice_from_uneven_dtensor(dist_param: DTensor) -> slice:
+    """Compute the FSDP slice (flattened range) from a v2 DTensor.
+
+    Uses the uneven chunk metadata (``__create_chunk_list__``) attached by
+    ``update_uneven_dtensor_chunk_metadata`` to correctly handle uneven
+    sharding where ranks may own different-sized slices.
+
+    The DTensor must have ``__create_chunk_list__`` set on its local tensor
+    (via ``preprocess_state_dict_for_uneven_dtensor`` or
+    ``update_uneven_dtensor_chunk_metadata``) before calling this function.
+    """
+    local_numel = dist_param._local_tensor.numel()
+    if local_numel == 0:
+        return slice(0, 0)
+
+    assert hasattr(dist_param._local_tensor, "__create_chunk_list__"), (
+        "get_fsdp_slice_from_uneven_dtensor requires the DTensor to have "
+        "__create_chunk_list__ metadata. Call update_uneven_dtensor_chunk_metadata "
+        "or preprocess_state_dict_for_uneven_dtensor first."
+    )
+
+    chunk_list = dist_param._local_tensor.__create_chunk_list__()
+    assert len(chunk_list) == 1, (
+        f"Expected exactly one chunk per rank, got {len(chunk_list)}"
+    )
+    chunk_meta = chunk_list[0]
+    offsets = chunk_meta.offsets
+    sizes = chunk_meta.sizes
+
+    global_shape = dist_param.size()
+    strides = torch.empty(global_shape, device="meta").stride()
+
+    start = sum(o * s for o, s in zip(offsets, strides))
+    return slice(start, start + local_numel)
+
+
+def _set_chunk_metadata(dtensor: DTensor, offsets: tuple, sizes: tuple) -> None:
+    """Set ``__create_chunk_list__`` / ``__create_write_items__`` closures on *dtensor*.
+
+    No collective ops — *offsets* and *sizes* are computed locally.
+    """
+    chunk_meta = ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(sizes))
+
+    def _write_items(fqn: str, tensor: DTensor) -> list:
+        if tensor.to_local().numel() == 0:
+            return []
+        return [
+            WriteItem(
+                type=WriteItemType.SHARD,
+                index=MetadataIndex(fqn, chunk_meta.offsets),
+                tensor_data=TensorWriteData(
+                    chunk=chunk_meta,
+                    properties=TensorProperties.create_from_tensor(tensor.to_local()),
+                    size=tensor.size(),
+                ),
+            )
+        ]
+
+    dtensor._local_tensor.__create_chunk_list__ = lambda: [chunk_meta]
+    dtensor._local_tensor.__create_write_items__ = _write_items

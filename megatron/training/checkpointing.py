@@ -988,20 +988,13 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
 
 def _is_megatron_fsdp_v2(model):
     """Check if model uses Megatron FSDP v2 (fully_shard API)."""
-    try:
-        return model[0].ddp_config.use_fully_shard_api
-    except (AttributeError, IndexError):
-        pass
-    try:
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
+    m = model[0] if isinstance(model, (list, tuple)) else model
+    if isinstance(m, FSDPModule):
+        return True
+    if hasattr(m, 'module') and isinstance(m.module, FSDPModule):
+        return True
 
-        m = model[0] if isinstance(model, (list, tuple)) else model
-        if isinstance(m, FSDPModule):
-            return True
-        if hasattr(m, 'module') and isinstance(m.module, FSDPModule):
-            return True
-    except (ImportError, IndexError, TypeError):
-        pass
     return False
 
 
@@ -1084,9 +1077,8 @@ def generate_state_dict(
 
 
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
-    if _is_megatron_fsdp_v2(model):
-        state_dict = _apply_mcore_postprocess(raw_state_dict, args, model[0])
-        return state_dict
+    assert _is_megatron_fsdp_v2(model)
+    return _apply_mcore_postprocess(raw_state_dict, args, model)
 
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict["model"])

@@ -33,6 +33,12 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.checkpoint.metadata import (
+    ChunkStorageMetadata,
+    MetadataIndex,
+    TensorProperties,
+)
+from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
 from torch.distributed.checkpoint.state_dict import set_state_dict as _set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
@@ -44,6 +50,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     make_uneven_dtensor,
     preprocess_state_dict_for_uneven_dtensor,
+    compute_split_offsets_and_sizes,
+    copy_chunk_metadata,
+    get_fsdp_slice_from_uneven_dtensor,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     get_mcore_tensor_parallel_partition_dim,
@@ -234,42 +243,6 @@ def _offset_slice(s: slice, offset: int) -> slice:
     return slice(s.start + offset, s.stop + offset)
 
 
-def _get_fsdp_slice_from_dtensor(dist_param: DTensor) -> slice:
-    """Compute the FSDP slice (flattened range) from a v2 DTensor.
-
-    Uses the uneven chunk metadata (``__create_chunk_list__``) attached by
-    ``update_uneven_dtensor_chunk_metadata`` to correctly handle uneven
-    sharding where ranks may own different-sized slices.
-
-    The DTensor must have ``__create_chunk_list__`` set on its local tensor
-    (via ``preprocess_state_dict_for_uneven_dtensor`` or
-    ``update_uneven_dtensor_chunk_metadata``) before calling this function.
-    """
-    local_numel = dist_param._local_tensor.numel()
-    if local_numel == 0:
-        return slice(0, 0)
-
-    assert hasattr(dist_param._local_tensor, "__create_chunk_list__"), (
-        "_get_fsdp_slice_from_dtensor requires the DTensor to have "
-        "__create_chunk_list__ metadata. Call update_uneven_dtensor_chunk_metadata "
-        "or preprocess_state_dict_for_uneven_dtensor first."
-    )
-
-    chunk_list = dist_param._local_tensor.__create_chunk_list__()
-    assert len(chunk_list) == 1, (
-        f"Expected exactly one chunk per rank, got {len(chunk_list)}"
-    )
-    chunk_meta = chunk_list[0]
-    offsets = chunk_meta.offsets
-    sizes = chunk_meta.sizes
-
-    global_shape = dist_param.size()
-    strides = torch.empty(global_shape, device="meta").stride()
-
-    start = sum(o * s for o, s in zip(offsets, strides))
-    return slice(start, start + local_numel)
-
-
 def _get_tp_world_size(dist_param: DTensor) -> int:
     """Get tensor-parallel world size from propagated TP attributes."""
     if is_mcore_tensor_model_parallel(dist_param):
@@ -408,7 +381,7 @@ def _split_dtensor_v2(
                 results.append(empty_local)
         return results
 
-    fsdp_slice = _get_fsdp_slice_from_dtensor(dist_param)
+    fsdp_slice = get_fsdp_slice_from_uneven_dtensor(dist_param)
     tp_world_size = _get_tp_world_size(dist_param)
 
     total_split = sum(split_sizes)
@@ -440,6 +413,11 @@ def _split_dtensor_v2(
                 shape=torch.Size(comp_global_shape),
                 dp_mesh=dist_param.device_mesh,
                 placements=dist_param.placements,
+                chunk_metadata=tuple(
+                    compute_split_offsets_and_sizes(
+                        dist_param, split_dim, len(results), total_split, comp_data
+                    )
+                )
             )
             results.append(dtensor)
         else:
@@ -646,6 +624,41 @@ def handle_gdn_in_state_dict_v2(
 # ------------------------------------------------------------------
 
 
+def _find_param_in_map(key: str, param_map: dict) -> Optional[DTensor]:
+    """Look up *key* in *param_map*, trying ``module.`` prefix variants."""
+    param = param_map.get(key)
+    if param is not None:
+        return param
+    stripped = key[len(_MODULE_PREFIX):] if key.startswith(_MODULE_PREFIX) else key
+    param = param_map.get(stripped)
+    if param is not None:
+        return param
+    return param_map.get(f"{_MODULE_PREFIX}{key}")
+
+
+def _propagate_chunk_metadata_to_state_dict(model: nn.Module, state_dict: dict) -> None:
+    """Copy chunk metadata from model parameters to state dict DTensors.
+
+    ``model.state_dict()`` returns fresh DTensor objects that lack
+    ``__create_chunk_list__`` / ``__create_write_items__``.  The model
+    parameters (from ``named_parameters()``) already have them.  This
+    function copies the closures locally — no collectives.
+    """
+    param_map = {}
+    for name, param in model.named_parameters():
+        if isinstance(param, DTensor) and hasattr(
+            param._local_tensor, "__create_chunk_list__"
+        ):
+            param_map[name] = param
+
+    for key, value in state_dict.items():
+        if not isinstance(value, DTensor):
+            continue
+        param = _find_param_in_map(key, param_map)
+        if param is not None:
+            copy_chunk_metadata(param, value)
+
+
 def _apply_mcore_postprocess(raw_state_dict, args, model):
     """Apply MCore-specific state dict post-processing.
 
@@ -654,6 +667,7 @@ def _apply_mcore_postprocess(raw_state_dict, args, model):
     The original *raw_state_dict* is not mutated.
     """
     state_dict = raw_state_dict.copy()
+    _propagate_chunk_metadata_to_state_dict(model, state_dict["model"])
 
     if "optimizer" in state_dict:
         state_dict["optimizer"] = _wrap_optim_states_as_dtensors(state_dict["optimizer"], model)
@@ -828,13 +842,7 @@ def _wrap_optim_states_as_dtensors(raw_opt_state_dict: dict, model: nn.Module) -
             new_state[key] = param_states
             continue
         new_param_states = dict(param_states)
-        dist_param = param_map.get(key)
-        if dist_param is None:
-            stripped = key[len(_MODULE_PREFIX):] if key.startswith(_MODULE_PREFIX) else key
-            dist_param = param_map.get(stripped)
-        if dist_param is None:
-            prefixed = f"{_MODULE_PREFIX}{key}"
-            dist_param = param_map.get(prefixed)
+        dist_param = _find_param_in_map(key, param_map)
         if dist_param is not None:
             for state_key, state_val in new_param_states.items():
                 if not isinstance(state_val, torch.Tensor) or isinstance(state_val, DTensor):
@@ -846,6 +854,7 @@ def _wrap_optim_states_as_dtensors(raw_opt_state_dict: dict, model: nn.Module) -
                         dp_mesh=dist_param.device_mesh,
                         placements=dist_param.placements,
                     )
+                    copy_chunk_metadata(dist_param, new_param_states[state_key])
         new_state[key] = new_param_states
 
     opt_state_dict["state"] = new_state

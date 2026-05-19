@@ -63,9 +63,9 @@ format for both paths. It uses DCP directly, storing each parameter as a `DTenso
 | `get_optimizer_state_dict(optimizer, is_loading)` | Get optimizer state dict via Path A (``sharded_param_state_fsdp_dtensor``). Delegates to ``optimizer.sharded_state_dict()`` with ``fsdp_dtensor`` sharding type. Returns ``{"state": ..., "param_to_group_meta": ...}``. |
 | `handle_fp8_extra_state_case(model_sd)` | Remove ``._extra_state`` keys from model state dict (FP8 artifact cleanup). |
 | `handle_experts_in_state_dict(model_sd, num_experts)` | Rename expert parameter keys for expert-parallel sharding. |
-| `handle_swiglu_in_state_dict_v2(model, model_sd, opt_sd)` | Split SwiGLU fc1 weights/bias into ``_w``/``_v`` halves. Only processes layers with ``gated_linear_unit=True``. Uses DTensor-native operations: ``_get_fsdp_slice_from_dtensor`` + ``make_uneven_dtensor``. |
+| `handle_swiglu_in_state_dict_v2(model, model_sd, opt_sd)` | Split SwiGLU fc1 weights/bias into ``_w``/``_v`` halves. Only processes layers with ``gated_linear_unit=True``. Uses DTensor-native operations: ``get_fsdp_slice_from_uneven_dtensor`` + ``make_uneven_dtensor``. |
 | `handle_gdn_in_state_dict_v2(model, model_sd, opt_sd)` | Split fused GDN projections (e.g., linear_qkv) into per-component tensors. DTensor-native. |
-| `_get_fsdp_slice_from_dtensor(dist_param)` | Compute the FSDP slice (flattened range) from chunk metadata (``__create_chunk_list__``). Requires ``update_uneven_dtensor_chunk_metadata`` to have been called first. Correctly handles uneven sharding. |
+| `get_fsdp_slice_from_uneven_dtensor(dist_param)` | Compute the FSDP slice (flattened range) from chunk metadata (``__create_chunk_list__``). Requires ``update_uneven_dtensor_chunk_metadata`` to have been called first. Correctly handles uneven sharding. |
 | `_get_tp_world_size(dist_param)` | Get tensor-parallel world size from propagated TP attributes. |
 | `_split_dtensor_v2(data, dist_param, sizes, dim)` | **Unified** split function. Accepts both DTensor (model params) and plain tensor (FusedAdam states) inputs. Splits fused tensors into per-component pieces along ``split_dim``. Used by both SwiGLU and GDN. |
 | `_split_swiglu_weight_v2(data, dist_param)` | Convenience wrapper: ``_split_dtensor_v2(data, dist_param, [1, 1], 0)``. |
@@ -808,12 +808,12 @@ ensures model and optimizer state dict keys are consistent in the checkpoint.
       DCP load flow using Path A for optimizer, with prefix strip on load
 - [x] Fix ``_split_dtensor_v2`` to accept plain tensors (FusedAdam optimizer states)
       in addition to DTensors
-- [x] Fix ``_get_fsdp_slice_from_dtensor`` to use ``__create_chunk_list__`` metadata
+- [x] Fix ``get_fsdp_slice_from_uneven_dtensor`` to use ``__create_chunk_list__`` metadata
       (correctly handles uneven sharding)
 - [x] Fix zero-numel branch in ``_split_dtensor_v2`` to use correct global component
       shapes (not ``[0, 0]``)
 - [x] Ensure chunk metadata on model params BEFORE ``_apply_mcore_postprocess``
-      (``_get_fsdp_slice_from_dtensor`` requires ``__create_chunk_list__``)
+      (``get_fsdp_slice_from_uneven_dtensor`` requires ``__create_chunk_list__``)
 - [ ] Handle PP: iterate model chunks, build per-chunk state dicts
 - [ ] Handle multi-optimizer (ChainedOptimizer: expert + non-expert optimizers)
 
