@@ -86,13 +86,34 @@ def _assert_model_match(source_full, loaded_full):
     assert any(all_nonempty), "All ranks had empty model state after load."
 
 
-def _assert_optim_match(source_optim_sd, loaded_optim_sd):
-    source_state = source_optim_sd["state"]
-    loaded_state = loaded_optim_sd["state"]
-    for param_name, source_states in source_state.items():
+def _optim_state_to_full(optim_sd, model):
+    """Wrap optimizer states as DTensors and gather to full tensors."""
+    from torch.distributed.tensor import DTensor
+
+    from megatron.core.distributed.fsdp.checkpoint import _build_dtensor_optim_sd
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+        uneven_dtensor_to_full_tensor,
+    )
+
+    wrapped = {"optimizer": _build_dtensor_optim_sd(optim_sd, model)}
+    out = {}
+    for param_name, param_states in wrapped["optimizer"]["state"].items():
+        out[param_name] = {}
+        for state_key, state_val in param_states.items():
+            if isinstance(state_val, DTensor) and state_val.to_local().numel() > 0:
+                out[param_name][state_key] = uneven_dtensor_to_full_tensor(state_val)
+            elif isinstance(state_val, DTensor):
+                out[param_name][state_key] = state_val.to_local()
+            else:
+                out[param_name][state_key] = state_val
+    return out
+
+
+def _assert_optim_match(source_optim_full, loaded_optim_full):
+    for param_name, source_states in source_optim_full.items():
         canonical = _normalize_key(param_name)
         matched_param = None
-        for l_param in loaded_state:
+        for l_param in loaded_optim_full:
             if _normalize_key(l_param) == canonical:
                 matched_param = l_param
                 break
@@ -100,7 +121,7 @@ def _assert_optim_match(source_optim_sd, loaded_optim_sd):
             f"Optimizer param {param_name} (canonical: {canonical}) "
             f"not found in loaded optimizer state"
         )
-        loaded_states = loaded_state[matched_param]
+        loaded_states = loaded_optim_full[matched_param]
         for state_key, s_val in source_states.items():
             assert state_key in loaded_states, (
                 f"Optimizer state '{state_key}' for param {param_name} not found after load"
@@ -346,11 +367,15 @@ class TestMegatronFsdpV2Checkpoint:
         )
 
         # ---- Train + save with source config ----
-        _, source_sd, source_optim, _ = TestMegatronFsdpV2Checkpoint._training_loop(
+        source_model, source_sd, source_optim, _ = TestMegatronFsdpV2Checkpoint._training_loop(
             save=str(ckpt_base), save_interval=1, **save_config,
         )
         source_full = _state_dict_to_full_tensor(source_sd)
         source_optim_sd = get_optimizer_state_dict(source_optim, is_loading=False)
+        if source_type in ("v1", "v2"):
+            source_optim_full = _optim_state_to_full(source_optim_sd, source_model)
+        else:
+            source_optim_full = source_optim_sd
         Utils.destroy_model_parallel()
 
         # ---- Load with target config (always MFSDP v2) ----
@@ -365,7 +390,11 @@ class TestMegatronFsdpV2Checkpoint:
 
         # ---- Verify optimizer ----
         loaded_optim_sd = get_optimizer_state_dict(loaded_optim, is_loading=False)
-        _assert_optim_match(source_optim_sd, loaded_optim_sd)
+        if source_type in ("v1", "v2"):
+            loaded_optim_full = _optim_state_to_full(loaded_optim_sd, v2_model)
+            _assert_optim_match(source_optim_full, loaded_optim_full)
+        else:
+            _assert_optim_match(source_optim_sd, loaded_optim_sd)
 
         Utils.destroy_model_parallel()
         if torch.distributed.get_rank() == 0:

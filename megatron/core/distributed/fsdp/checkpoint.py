@@ -63,7 +63,7 @@ __all__ = [
     "strip_module_prefix",
     "get_model_state_dict",
     "get_optimizer_state_dict",
-    "_wrap_optim_states_as_dtensors",
+    "_build_dtensor_optim_sd",
     "handle_fp8_extra_state_case",
     "handle_experts_in_state_dict",
     "handle_swiglu_in_state_dict_v2",
@@ -162,7 +162,8 @@ def handle_experts_in_state_dict(model_state_dict: dict, num_experts: int) -> di
         return local_expert_start <= expert_index < local_expert_end
 
     def _replace(key, expert_index, sd):
-        new_idx = expert_index - local_expert_start
+        new_idx = expert_index + local_expert_start
+        # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
         if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
             if key.endswith('_w') or key.endswith('_v'):
                 new_key = key.replace(
@@ -170,6 +171,7 @@ def handle_experts_in_state_dict(model_state_dict: dict, num_experts: int) -> di
                 )
             else:
                 new_key = key.replace(f'weight{expert_index}', f'weight{new_idx}')
+        # SequentialMLP: index is between 'local_experts.' and next '.'
         elif 'mlp.experts.local_experts' in key:
             new_key = key.replace(f'local_experts.{expert_index}.', f'local_experts.{new_idx}.')
         else:
@@ -391,11 +393,7 @@ def handle_swiglu_in_state_dict_v2(
                         param_key = param_key[len("module.") :]
                     dist_param = _get_dist_param(
                         model,
-                        (
-                            _expert_param_local_key(param_key, num_experts)
-                            if "expert" in param_key
-                            else param_key
-                        ),
+                        param_key,
                     )
                     assert isinstance(opt_state[key][subkey], DTensor), (
                         f"Expected optimizer state for {key} to be a DTensor, got "
@@ -542,7 +540,7 @@ def _apply_mcore_postprocess(raw_state_dict, args, model):
     _propagate_chunk_metadata_to_state_dict(model, state_dict["model"])
 
     if "optimizer" in state_dict:
-        state_dict["optimizer"] = _wrap_optim_states_as_dtensors(state_dict["optimizer"], model)
+        state_dict["optimizer"] = _build_dtensor_optim_sd(state_dict["optimizer"], model)
     handle_fp8_extra_state_case(state_dict["model"])
 
     if getattr(args, "swiglu", False):
@@ -685,13 +683,13 @@ def get_optimizer_state_dict(optimizer, is_loading: bool = False) -> Optional[di
 # ------------------------------------------------------------------
 
 
-def _wrap_optim_states_as_dtensors(raw_opt_state_dict: dict, model: nn.Module) -> dict:
-    """Return a copy of *raw_opt_state_dict* with optimizer state tensors wrapped as DTensors.
+def _build_dtensor_optim_sd(raw_opt_state_dict: dict, model: nn.Module) -> dict:
+    """Return a copy of *raw_opt_state_dict* with optimizer state tensors converted to DTensors.
 
     FusedAdam stores ``exp_avg`` / ``exp_avg_sq`` as plain tensors matching
     the parameter's local DTensor shard.  DCP requires all sharded data to
     be DTensors.  This returns a new dict where those plain tensors are
-    wrapped as uneven DTensors using the model parameter's mesh/placements.
+    converted to uneven DTensors using the model parameter's mesh/placements.
     *raw_opt_state_dict* is **not** mutated.
     """
     opt_state_dict = raw_opt_state_dict.copy()
