@@ -28,6 +28,7 @@ SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 # State dict helpers
 # ------------------------------------------------------------------
 
+
 def _state_dict_to_full_tensor(sd):
     """Convert all DTensor values in a state dict to full (gathered) tensors."""
     from torch.distributed.tensor import DTensor
@@ -83,6 +84,7 @@ def _get_model_from_chunks(model_chunks):
 # Validation helpers
 # ------------------------------------------------------------------
 
+
 def _assert_model_state_dict_match(source_full, loaded_full):
     """Assert model state dict values match between source and loaded.
 
@@ -96,21 +98,21 @@ def _assert_model_state_dict_match(source_full, loaded_full):
             if _normalize_key(l_key) == canonical:
                 matched_key = l_key
                 break
-        assert matched_key is not None, (
-            f"Key {s_key} (canonical: {canonical}) not found in loaded state dict"
-        )
+        assert (
+            matched_key is not None
+        ), f"Key {s_key} (canonical: {canonical}) not found in loaded state dict"
         l_val = loaded_full[matched_key]
 
         if s_val is None and l_val is None:
             continue
-        assert s_val is not None and l_val is not None, (
-            f"One of source or loaded value for {s_key} is None while the other is not"
-        )
+        assert (
+            s_val is not None and l_val is not None
+        ), f"One of source or loaded value for {s_key} is None while the other is not"
         if s_val.numel() > 0:
             nonempty = True
-        assert s_val.shape == l_val.shape, (
-            f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
-        )
+        assert (
+            s_val.shape == l_val.shape
+        ), f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
         assert_close(s_val, l_val, atol=0, rtol=0, msg=f"Value mismatch for {s_key}")
 
     world_size = torch.distributed.get_world_size()
@@ -137,9 +139,9 @@ def _assert_optimizer_state_dict_match(source_optim_full, loaded_optim_full):
         )
         loaded_states = loaded_optim_full[matched_param]
         for state_key, s_val in source_states.items():
-            assert state_key in loaded_states, (
-                f"Optimizer state '{state_key}' for param {param_name} not found after load"
-            )
+            assert (
+                state_key in loaded_states
+            ), f"Optimizer state '{state_key}' for param {param_name} not found after load"
             l_val = loaded_states[state_key]
             if s_val is None and l_val is None:
                 continue
@@ -149,7 +151,10 @@ def _assert_optimizer_state_dict_match(source_optim_full, loaded_optim_full):
                     f"{s_val.shape} vs {l_val.shape}"
                 )
                 assert_close(
-                    s_val, l_val, atol=0, rtol=0,
+                    s_val,
+                    l_val,
+                    atol=0,
+                    rtol=0,
                     msg=f"Optimizer state value mismatch for {param_name}.{state_key}",
                 )
 
@@ -157,6 +162,7 @@ def _assert_optimizer_state_dict_match(source_optim_full, loaded_optim_full):
 # ==================================================================
 # Test class
 # ==================================================================
+
 
 class TestMegatronFsdpV2Checkpoint:
     """
@@ -346,7 +352,7 @@ class TestMegatronFsdpV2Checkpoint:
         # ---- Load WITH optimizer ----
         load_config = dict(load=str(ckpt_base), **v2_config)
         v2_model_chunks, loaded_optim, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
-            **load_config,
+            **load_config
         )
         v2_model = _get_model_from_chunks(v2_model_chunks)
 
@@ -356,9 +362,7 @@ class TestMegatronFsdpV2Checkpoint:
 
         # ---- Verify optimizer ----
         loaded_optim_sd = get_optimizer_state_dict(loaded_optim, is_loading=False)
-        _assert_optimizer_state_dict_match(
-            source_optim_sd["state"], loaded_optim_sd["state"]
-        )
+        _assert_optimizer_state_dict_match(source_optim_sd["state"], loaded_optim_sd["state"])
 
         # Cleanup
         Utils.destroy_model_parallel()

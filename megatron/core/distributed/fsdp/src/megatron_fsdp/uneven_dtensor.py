@@ -392,26 +392,92 @@ def split_dtensor(
     update_uneven_dtensor_chunk_meta: bool = False,
 ) -> Iterable[DTensor]:
     """
-    Splits a DTensor into smaller DTensors along a specified dimension.
+    Split a DTensor into smaller DTensors along a specified dimension.
 
-    This function manages uneven sharding by accurately assigning chunk metadata
-    for each split. Unlike the native PyTorch DTensor split functionality,
-    it does not redistribute `Replicate` placements, which helps avoid Out-Of-Memory (OOM) issues.
+    This function handles uneven sharding correctly by computing chunk metadata
+    for every output DTensor without extra collective operations.  A single call
+    to ``gather_and_compute_chunk_metadata`` is made upfront; all subsequent
+    per-split metadata is derived locally from that result using pure integer
+    arithmetic.
+
+    Unlike the native PyTorch ``DTensor.split``, this function does **not**
+    redistribute ``Replicate`` placements, which avoids OOM issues when the
+    full tensor is large.
+
+    Chunk metadata assignment strategy
+    ------------------------------------
+    For each split window ``[split_start, split_end)`` along *dim*:
+
+    * The rank's local chunk covers the global interval
+      ``[local_start, local_end)`` where::
+
+          local_start = chunk_meta.offsets[dim]
+          local_end   = local_start + chunk_meta.sizes[dim]
+
+    * The overlap with the split window is::
+
+          overlap_start = max(local_start, split_start)
+          overlap_end   = min(local_end,   split_end)
+
+    * If ``overlap_start < overlap_end`` the rank owns part of this split:
+
+      - ``new_offsets[dim] = overlap_start - split_start``
+        (offset is relative to the split's own global origin)
+      - ``new_sizes[dim]   = overlap_end - overlap_start``
+
+    * Otherwise the rank owns nothing in this split:
+
+      - ``new_offsets[dim] = 0``, ``new_sizes[dim] = 0``
+
+    All other dimensions are copied unchanged from the parent's chunk metadata.
 
     Args:
-        dtensor (DTensor): The DTensor to split.
-        split_size_or_sections (int or list of int): If int, defines the size of each chunk.
-            If a list, specifies the sizes of each chunk in order.
-        dim (int, optional): The axis along which to split. Default is 0.
-        update_uneven_dtensor_chunk_meta (bool, optional): Whether to update chunk
-            metadata for each resulting DTensor. Default is False.
+        dtensor (DTensor): The DTensor to split.  Must be compatible with
+            ``gather_and_compute_chunk_metadata`` (placements are ``Shard``,
+            ``_StridedShard``, or ``Replicate``).
+        split_size_or_sections (int | list[int]): If an ``int``, each chunk
+            has this size (the last chunk may be smaller).  If a ``list``,
+            each element is the exact size of the corresponding chunk; the
+            sizes must sum to ``dtensor.shape[dim]``.
+        dim (int, optional): Dimension along which to split.  Default: ``0``.
+        update_uneven_dtensor_chunk_meta (bool, optional): If ``True``, call
+            ``update_uneven_dtensor_chunk_metadata`` for every output DTensor
+            instead of using the locally-derived metadata.  This triggers one
+            collective per split chunk and is only needed when you require a
+            full round-trip validation or the parent's chunk metadata cannot
+            be trusted.  Default: ``False``.
 
     Yields:
-        DTensor: Sub-DTensor resulting from the split, maintaining correct metadata.
+        DTensor: Split sub-DTensors in order.  Each yielded DTensor:
 
-    Example:
-        >>> for chunk in split_dtensor(dt, 3, dim=1):
-        ...     print(chunk)
+        * Shares the same ``placements`` and ``device_mesh`` as *dtensor*.
+        * Has shape ``dtensor.shape`` with ``shape[dim]`` replaced by the
+          split-window size.
+        * Has ``__create_chunk_list__`` / ``__create_write_items__`` set on
+          its local tensor (via ``_set_chunk_metadata``), so checkpoint
+          writers can consume it directly without further collectives.
+
+    Raises:
+        ValueError: If the locally-computed split slice is internally
+            inconsistent (negative start after offset correction).
+
+    Note:
+        ``gather_and_compute_chunk_metadata`` is called exactly **once**,
+        regardless of the number of splits.  When
+        ``update_uneven_dtensor_chunk_meta=False`` (the default) no further
+        collective operations are performed.
+
+    Example::
+
+        # Split a [1024, 512] DTensor sharded on dim-0 across 4 ranks
+        # into four [256, 512] chunks — one collective, zero extra collectives
+        # for metadata.
+        for chunk in split_dtensor(dt, split_size_or_sections=256, dim=0):
+            process(chunk)
+
+        # Variable-size split, chunk metadata derived locally
+        for chunk in split_dtensor(dt, split_size_or_sections=[300, 300, 424], dim=0):
+            process(chunk)
     """
     tensor_size = dtensor.shape[dim]
 
@@ -424,25 +490,32 @@ def split_dtensor(
         for size in split_size_or_sections:
             split_points.append(split_points[-1] + size)
 
+    # One collective call — result reused for all splits below.
     chunk_meta = gather_and_compute_chunk_metadata(dtensor)
     chunk_slice = slice(chunk_meta.offsets[dim], chunk_meta.offsets[dim] + chunk_meta.sizes[dim])
     local_offset = chunk_meta.offsets[dim]
     local_tensor = dtensor.to_local()
 
-    # Create chunks using manual slicing
     for i in range(len(split_points) - 1):
         split_slice = slice(split_points[i], split_points[i + 1])
+
+        # Compute the intersection of this rank's local chunk with the split
+        # window.  _intersection returns slice(0, 0) when there is no overlap,
+        # which produces an empty tensor via narrow() — that is the correct
+        # behaviour for ranks that own nothing in this split window.
         s = _intersection(split_slice, chunk_slice)
         if s.start < s.stop:
+            # Translate to local-tensor coordinates.
             s = _offset_slice(s, -local_offset)
 
-        if s.start < 0 or s.stop < s.start and torch.distributed.get_rank() == 0:
+        if s.start < 0:
             raise ValueError(
                 f"Invalid split slice {s} for DTensor with shape {dtensor.shape} "
-                f"and local offset {local_offset} on dimension {dim}."
+                f"and local offset {local_offset} on dimension {dim}. "
+                "This is a bug — please report it."
             )
 
-        # Slice the local tensor
+        # Slice the local tensor along `dim`.
         sliced_tensor = local_tensor.narrow(dim, s.start, s.stop - s.start)
         out_shape = list(dtensor.shape)
         out_shape[dim] = split_slice.stop - split_slice.start
@@ -456,7 +529,38 @@ def split_dtensor(
         )
 
         if update_uneven_dtensor_chunk_meta:
+            # Triggers one collective per split — use only when a validated
+            # round-trip is required.
             update_uneven_dtensor_chunk_metadata(new_dtensor)
+        else:
+            # Derive chunk metadata locally from the already-computed
+            # chunk_meta — zero additional collectives.
+            #
+            # Compute the intersection in *global* coordinates so that the
+            # resulting offset is expressed relative to the split's own origin.
+            global_local_start = chunk_meta.offsets[dim]
+            global_local_end = global_local_start + chunk_meta.sizes[dim]
+            global_split_start = split_points[i]
+            global_split_end = split_points[i + 1]
+
+            overlap_start = max(global_local_start, global_split_start)
+            overlap_end = min(global_local_end, global_split_end)
+
+            new_offsets = list(chunk_meta.offsets)
+            new_sizes = list(chunk_meta.sizes)
+
+            if overlap_start < overlap_end:
+                # This rank owns [overlap_start, overlap_end) of the global
+                # tensor; the offset within the split chunk is the distance
+                # from the split's start.
+                new_offsets[dim] = overlap_start - global_split_start
+                new_sizes[dim] = overlap_end - overlap_start
+            else:
+                # This rank owns nothing in this split window.
+                new_offsets[dim] = 0
+                new_sizes[dim] = 0
+
+            _set_chunk_metadata(new_dtensor, tuple(new_offsets), tuple(new_sizes))
 
         yield new_dtensor
 
@@ -592,9 +696,7 @@ def get_fsdp_slice_from_uneven_dtensor(dist_param: DTensor) -> slice:
     )
 
     chunk_list = dist_param._local_tensor.__create_chunk_list__()
-    assert len(chunk_list) == 1, (
-        f"Expected exactly one chunk per rank, got {len(chunk_list)}"
-    )
+    assert len(chunk_list) == 1, f"Expected exactly one chunk per rank, got {len(chunk_list)}"
     chunk_meta = chunk_list[0]
     offsets = chunk_meta.offsets
     sizes = chunk_meta.sizes
