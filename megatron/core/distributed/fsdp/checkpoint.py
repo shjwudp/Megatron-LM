@@ -63,7 +63,6 @@ __all__ = [
     "get_model_state_dict",
     "get_optimizer_state_dict",
     "_wrap_optim_states_as_dtensors",
-    "_unwrap_optim_states_from_dtensors",
     "handle_fp8_extra_state_case",
     "handle_experts_in_state_dict",
     "handle_swiglu_in_state_dict_v2",
@@ -647,15 +646,17 @@ def handle_gdn_in_state_dict_v2(
 # ------------------------------------------------------------------
 
 
-def _apply_mcore_postprocess(state_dict, args, model):
+def _apply_mcore_postprocess(raw_state_dict, args, model):
     """Apply MCore-specific state dict post-processing.
 
-    Called after ``get_state_dict`` has attached uneven DTensor chunk
-    metadata.  Uses v2-native implementations throughout.
-
-    Callers that do not want optimizer keys split (e.g. Path A) should
-    exclude ``"optimizer"`` from *state_dict* before calling.
+    Copies *raw_state_dict*, wraps optimizer states as DTensors, then
+    applies FP8 cleanup, SwiGLU/GDN split, and expert key remapping.
+    The original *raw_state_dict* is not mutated.
     """
+    state_dict = raw_state_dict.copy()
+
+    if "optimizer" in state_dict:
+        state_dict["optimizer"] = _wrap_optim_states_as_dtensors(state_dict["optimizer"], model)
     handle_fp8_extra_state_case(state_dict["model"])
 
     if getattr(args, "swiglu", False):
@@ -800,32 +801,33 @@ def get_optimizer_state_dict(
 # Optimizer state DTensor wrapping
 # ------------------------------------------------------------------
 
+def _wrap_optim_states_as_dtensors(raw_opt_state_dict: dict, model: nn.Module) -> dict:
+    """Return a copy of *raw_opt_state_dict* with optimizer state tensors wrapped as DTensors.
 
-def _wrap_optim_states_as_dtensors(state_dict: dict, model: nn.Module) -> None:
-    """Wrap plain-tensor optimizer states as DTensors for DCP compatibility.
-
-    FusedAdam (and similar optimizers) store ``exp_avg`` / ``exp_avg_sq`` as
-    plain tensors matching the parameter's local DTensor shard.  DCP requires
-    all sharded data to be DTensors so it can build a correct global save plan.
-    This function wraps those plain tensors as uneven DTensors using the
-    corresponding model parameter's device mesh and placements.
-
-    Operates in-place on ``state_dict["optimizer"]["state"]``.
+    FusedAdam stores ``exp_avg`` / ``exp_avg_sq`` as plain tensors matching
+    the parameter's local DTensor shard.  DCP requires all sharded data to
+    be DTensors.  This returns a new dict where those plain tensors are
+    wrapped as uneven DTensors using the model parameter's mesh/placements.
+    *raw_opt_state_dict* is **not** mutated.
     """
-    if "optimizer" not in state_dict or "state" not in state_dict["optimizer"]:
-        return
+    opt_state_dict = raw_opt_state_dict.copy()
+    if "state" not in opt_state_dict:
+        return opt_state_dict
 
     param_map = {}
     for name, param in model.named_parameters():
         if isinstance(param, DTensor):
             param_map[name] = param
     if not param_map:
-        return
+        return opt_state_dict
 
-    opt_state = state_dict["optimizer"]["state"]
-    for key, param_states in opt_state.items():
+    old_state = opt_state_dict["state"]
+    new_state = {}
+    for key, param_states in old_state.items():
         if not isinstance(param_states, dict):
+            new_state[key] = param_states
             continue
+        new_param_states = dict(param_states)
         dist_param = param_map.get(key)
         if dist_param is None:
             stripped = key[len(_MODULE_PREFIX):] if key.startswith(_MODULE_PREFIX) else key
@@ -833,154 +835,18 @@ def _wrap_optim_states_as_dtensors(state_dict: dict, model: nn.Module) -> None:
         if dist_param is None:
             prefixed = f"{_MODULE_PREFIX}{key}"
             dist_param = param_map.get(prefixed)
-        if dist_param is None:
-            continue
+        if dist_param is not None:
+            for state_key, state_val in new_param_states.items():
+                if not isinstance(state_val, torch.Tensor) or isinstance(state_val, DTensor):
+                    continue
+                if state_val.shape == dist_param._local_tensor.shape:
+                    new_param_states[state_key] = make_uneven_dtensor(
+                        state_val,
+                        shape=dist_param.size(),
+                        dp_mesh=dist_param.device_mesh,
+                        placements=dist_param.placements,
+                    )
+        new_state[key] = new_param_states
 
-        for state_key, state_val in param_states.items():
-            if not isinstance(state_val, torch.Tensor) or isinstance(state_val, DTensor):
-                continue
-            if state_val.shape == dist_param._local_tensor.shape:
-                param_states[state_key] = make_uneven_dtensor(
-                    state_val,
-                    shape=dist_param.size(),
-                    dp_mesh=dist_param.device_mesh,
-                    placements=dist_param.placements,
-                )
-
-
-# ------------------------------------------------------------------
-# Optimizer state DTensor unwrapping (post-load)
-# ------------------------------------------------------------------
-
-
-def _unwrap_optim_states_from_dtensors(state_dict: dict) -> None:
-    """Convert DTensor optimizer states back to plain tensors.
-
-    Inverse of ``_wrap_optim_states_as_dtensors``.  Called after DCP load
-    because DCP fills the skeleton DTensors, but FusedAdam (and similar
-    optimizers) store states as plain tensors matching the local shard.
-    """
-    if "optimizer" not in state_dict or "state" not in state_dict["optimizer"]:
-        return
-    for param_states in state_dict["optimizer"]["state"].values():
-        if not isinstance(param_states, dict):
-            continue
-        for k, v in list(param_states.items()):
-            if isinstance(v, DTensor):
-                param_states[k] = v.to_local()
-
-
-# ------------------------------------------------------------------
-# Save / Load checkpoint
-# ------------------------------------------------------------------
-
-
-def save_checkpoint(
-    model: nn.Module,
-    ckpt_dir,
-    optimizer=None,
-    args=None,
-) -> None:
-    """Save a Megatron FSDP v2 checkpoint via DCP.
-
-    Implements the full save flow:
-      1. Get model state dict (with ``module.`` prefix).
-      2. Get optimizer state dict via Path A
-         (``sharded_param_state_fsdp_dtensor``).
-      3. Apply MCore post-processing (FP8, SwiGLU, GDN, experts).
-      4. Apply uneven DTensor preprocessing.
-      5. Save via ``torch.distributed.checkpoint.save``.
-
-    Args:
-        model: FSDP v2 wrapped model.
-        ckpt_dir: Checkpoint directory (path-like).
-        optimizer: Optional ``DistributedOptimizer``.
-        args: Optional MCore args namespace for post-processing
-            (``swiglu``, ``num_experts``, ``gdn``).
-    """
-    import torch.distributed.checkpoint as dcp
-
-    model_sd = get_model_state_dict(model)
-
-    state_dict = {"model": model_sd}
-
-    preprocess_state_dict_for_uneven_dtensor(state_dict["model"])
-
-    optim_sd = get_optimizer_state_dict(optimizer, is_loading=False)
-    if optim_sd is not None:
-        state_dict["optimizer"] = {
-            "state": {k: dict(v) for k, v in optim_sd.get("state", {}).items()},
-            "param_to_group_meta": dict(optim_sd.get("param_to_group_meta", {})),
-        }
-        _wrap_optim_states_as_dtensors(state_dict, model)
-
-    if args is not None:
-        _apply_mcore_postprocess(state_dict, args, model)
-
-    preprocess_state_dict_for_uneven_dtensor(state_dict)
-
-    dcp.save(state_dict, checkpoint_id=str(ckpt_dir))
-
-
-def load_checkpoint(
-    model: nn.Module,
-    ckpt_dir,
-    optimizer=None,
-    args=None,
-    strict: bool = True,
-) -> None:
-    """Load a Megatron FSDP v2 checkpoint via DCP.
-
-    Implements the full load flow:
-      1. Pre-allocate optimizer state tensors (required for in-place DCP load).
-      2. Build skeleton state dicts matching the saved checkpoint structure.
-      3. Apply MCore post-processing and uneven DTensor preprocessing to the
-         skeleton so DCP can match keys.
-      4. DCP load fills skeleton tensors in-place.
-      5. Strip ``module.`` prefix and load model state dict.
-      6. Load optimizer state dict.
-
-    Args:
-        model: FSDP v2 wrapped model.
-        ckpt_dir: Checkpoint directory (path-like).
-        optimizer: Optional ``DistributedOptimizer``.
-        args: Optional MCore args namespace for post-processing.
-        strict: Whether to enforce strict key matching for model state dict.
-    """
-    import torch.distributed.checkpoint as dcp
-
-    model_sd = get_model_state_dict(model)
-
-    state_dict = {"model": model_sd}
-
-    preprocess_state_dict_for_uneven_dtensor(state_dict["model"])
-
-    raw_optim_sd = None
-    optim_sd = get_optimizer_state_dict(optimizer, is_loading=True)
-    if optim_sd is not None:
-        state_dict["optimizer"] = optim_sd
-        # Capture raw plain-tensor dict; wrap a DTensor copy for DCP load.
-        raw_optim_sd = state_dict["optimizer"].copy()
-        state_dict["optimizer"] = {
-            "state": {k: dict(v) for k, v in optim_sd.get("state", {}).items()},
-            "param_to_group_meta": dict(optim_sd.get("param_to_group_meta", {})),
-        }
-        _wrap_optim_states_as_dtensors(state_dict, model)
-
-    if args is not None:
-        _apply_mcore_postprocess(state_dict, args, model)
-
-    preprocess_state_dict_for_uneven_dtensor(state_dict)
-
-    dcp.load(state_dict, checkpoint_id=str(ckpt_dir))
-
-    if raw_optim_sd is not None:
-        state_dict["optimizer"] = raw_optim_sd
-
-    loaded_model_sd = state_dict["model"]
-    if not _model_has_module_prefix(model):
-        loaded_model_sd = strip_module_prefix(loaded_model_sd)
-    model.load_state_dict(loaded_model_sd, strict=strict)
-
-    if optimizer is not None and "optimizer" in state_dict:
-        optimizer.load_state_dict(state_dict["optimizer"])
+    opt_state_dict["state"] = new_state
+    return opt_state_dict

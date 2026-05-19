@@ -57,6 +57,9 @@ try:
         handle_swiglu_in_state_dict,
         print_diff_in_state_dicts,
     )
+    from megatron.core.distributed.fsdp.checkpoint import (
+        _apply_mcore_postprocess
+    )
     HAVE_MEGATRON_FSDP = True
 except ImportError:
     HAVE_MEGATRON_FSDP = False
@@ -618,28 +621,16 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                              f' {sharded_sd_metadata["distrib_optim_sharding_type"]}')
         else:
             sharded_sd_metadata = None
-        state_dict = (
-            _build_megatron_fsdp_v2_state_dict(
-                args,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                rng_state,
-                iteration=iteration,
-                rerun_state=rerun_state,
-            )
-            if _is_megatron_fsdp_v2(model)
-            else generate_state_dict(
-                args,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                rng_state,
-                iteration=iteration,
-                optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
-                model_sd_kwargs=dict(metadata=sharded_sd_metadata),
-                rerun_state=rerun_state,
-            )
+        state_dict = generate_state_dict(
+            args,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            rng_state,
+            iteration=iteration,
+            optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
+            model_sd_kwargs=dict(metadata=sharded_sd_metadata),
+            rerun_state=rerun_state,
         )
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
@@ -700,13 +691,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 ensure_directory_exists(checkpoint_name, check_parent=False)
 
             if ckpt_format == "fsdp_dtensor":
-                if not _is_megatron_fsdp_v2(model):
-                    state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
-                else:
-                    from megatron.core.distributed.fsdp.checkpoint import _wrap_optim_states_as_dtensors
-                    _wrap_optim_states_as_dtensors(state_dict, model[0])
-                # For FSDP v2, post-processing and uneven DTensor preprocessing
-                # are already handled inside _build_megatron_fsdp_v2_state_dict.
+                state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
             if args.async_save:
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
@@ -1020,79 +1005,6 @@ def _is_megatron_fsdp_v2(model):
     return False
 
 
-def _build_megatron_fsdp_v2_state_dict(
-    args,
-    model,
-    optimizer,
-    opt_param_scheduler,
-    rng_state,
-    iteration=None,
-    rerun_state=None,
-    is_loading=False,
-):
-    """Build state dict for Megatron FSDP v2 using Path A checkpoint functions.
-
-    Uses ``get_model_state_dict`` (with ``module.`` prefix alignment) and
-    ``get_optimizer_state_dict`` (which delegates to
-    ``sharded_param_state_fsdp_dtensor``) from ``checkpoint.py``, then applies
-    MCore post-processing and uneven DTensor preprocessing.
-
-    Returns a combined state dict with the same structure as
-    ``generate_state_dict``.
-    """
-    from megatron.core.distributed.fsdp.checkpoint import (
-        _apply_mcore_postprocess,
-        get_model_state_dict,
-        get_optimizer_state_dict,
-    )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-        preprocess_state_dict_for_uneven_dtensor,
-    )
-
-    state_dict = {}
-    state_dict['args'] = args
-    state_dict['checkpoint_version'] = 3.0
-    if iteration is not None:
-        state_dict['iteration'] = iteration
-
-    assert len(model) == 1, "Megatron FSDP v2 only supports a single model instance"
-
-    state_dict["model"] = get_model_state_dict(model[0])
-
-    # Add uneven DTensor chunk metadata to model param DTensors FIRST.
-    # _apply_mcore_postprocess uses _get_fsdp_slice_from_dtensor which
-    # requires __create_chunk_list__ on the parameter DTensors.
-    preprocess_state_dict_for_uneven_dtensor(state_dict["model"])
-
-    optim_sd = get_optimizer_state_dict(optimizer, is_loading=is_loading)
-    if optim_sd is not None:
-        state_dict["optimizer"] = optim_sd
-
-    # Path A: optimizer keys stay canonical so DistributedOptimizer
-    # .load_state_dict can match them.  Temporarily exclude optimizer
-    # from post-processing.
-    _optim_sd = state_dict.pop("optimizer", None)
-    _apply_mcore_postprocess(state_dict, args, model[0])
-    if _optim_sd is not None:
-        state_dict["optimizer"] = _optim_sd
-
-    preprocess_state_dict_for_uneven_dtensor(state_dict)
-
-    # Scheduler.
-    if opt_param_scheduler is not None:
-        state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
-
-    # Rerun state.
-    if rerun_state:
-        state_dict['rerun_state_machine'] = rerun_state
-
-    # RNG states.
-    if not args.no_save_rng and rng_state:
-        state_dict["rng_state"] = rng_state
-
-    return state_dict
-
-
 def generate_state_dict(
     args,
     model,
@@ -1172,6 +1084,10 @@ def generate_state_dict(
 
 
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
+    if _is_megatron_fsdp_v2(model):
+        state_dict = _apply_mcore_postprocess(raw_state_dict, args, model[0])
+        return state_dict
+
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict["model"])
     if args.swiglu:
@@ -1529,14 +1445,7 @@ def _load_base_checkpoint(
         raw_optimizer_state_dict = state_dict["optimizer"].copy() if "optimizer" in state_dict else None
         raw_model_state_dict = state_dict["model"].copy() if "model" in state_dict else None
         model = state_dict.pop("_model")
-        if not _is_megatron_fsdp_v2(model):
-            state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
-        # For FSDP v2, post-processing and uneven DTensor preprocessing
-        # are already handled inside _build_megatron_fsdp_v2_state_dict.
-
-        if _is_megatron_fsdp_v2(model):
-            from megatron.core.distributed.fsdp.checkpoint import _wrap_optim_states_as_dtensors
-            _wrap_optim_states_as_dtensors(state_dict, model[0])
+        state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
         ckpt_type = CheckpointType.FSDP_DTENSOR
         fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
@@ -1949,33 +1858,17 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 gen_sd_optim = optimizer
                 gen_sd_opt_param_scheduler = opt_param_scheduler
 
-        if _is_megatron_fsdp_v2(model):
-            # Path A: get_optimizer_state_dict(is_loading=True) internally calls
-            # _init_optimizer_states_with_dummy_values() via
-            # sharded_param_state_fsdp_dtensor(is_loading=True).
-            state_dict = _build_megatron_fsdp_v2_state_dict(
-                args,
-                model=model,
-                optimizer=gen_sd_optim,
-                opt_param_scheduler=gen_sd_opt_param_scheduler,
-                rng_state=gen_sd_rng_state,
-                rerun_state=gen_sd_rerun_state,
-                iteration=1,
-                is_loading=True,
-            )
-        else:
-            optim_sd_kwargs = dict(metadata=_build_sharded_state_dict_metadata(args), is_loading=True)
-
-            state_dict = generate_state_dict(
-                args,
-                model=model,
-                optimizer=gen_sd_optim,
-                opt_param_scheduler=gen_sd_opt_param_scheduler,
-                rng_state=gen_sd_rng_state,
-                optim_sd_kwargs=optim_sd_kwargs,
-                rerun_state=gen_sd_rerun_state,
-                iteration=1,
-            )
+        optim_sd_kwargs = dict(metadata=_build_sharded_state_dict_metadata(args), is_loading=True)
+        state_dict = generate_state_dict(
+            args,
+            model=model,
+            optimizer=gen_sd_optim,
+            opt_param_scheduler=gen_sd_opt_param_scheduler,
+            rng_state=gen_sd_rng_state,
+            optim_sd_kwargs=optim_sd_kwargs,
+            rerun_state=gen_sd_rerun_state,
+            iteration=1,
+        )
         state_dict["_model"] = model
         load_kwargs["sharded_state_dict"] = state_dict
 
