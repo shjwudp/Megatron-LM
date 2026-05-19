@@ -397,7 +397,10 @@ def handle_swiglu_in_state_dict_v2(
                             else param_key
                         ),
                     )
-                    assert isinstance(dist_param, DTensor)
+                    assert isinstance(opt_state[key][subkey], DTensor), (
+                        f"Expected optimizer state for {key} to be a DTensor, got "
+                        f"{type(opt_state[key][subkey]).__name__}"
+                    )
                     weight_w_t, weight_v_t = _split_swiglu_weight_v2(opt_state[key][subkey])
                     new_opt_state[f"{key}_w"][subkey] = weight_w_t
                     new_opt_state[f"{key}_v"][subkey] = weight_v_t
@@ -567,6 +570,12 @@ def _apply_mcore_postprocess(raw_state_dict, args, model):
     num_experts = getattr(args, "num_experts", None)
     if num_experts:
         state_dict["model"] = handle_experts_in_state_dict(state_dict["model"], num_experts)
+        if "optimizer" in state_dict:
+            optim_sd = state_dict["optimizer"]
+            optim_sd["state"] = handle_experts_in_state_dict(optim_sd["state"], num_experts)
+            optim_sd["param_to_group_meta"] = handle_experts_in_state_dict(
+                optim_sd["param_to_group_meta"], num_experts
+            )
 
     return state_dict
 
@@ -693,6 +702,7 @@ def _wrap_optim_states_as_dtensors(raw_opt_state_dict: dict, model: nn.Module) -
     for name, param in model.named_parameters():
         if isinstance(param, DTensor):
             param_map[name] = param
+
     if not param_map:
         return opt_state_dict
 

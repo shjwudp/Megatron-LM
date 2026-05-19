@@ -1,6 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import copy
 import logging
 import shutil
 from pathlib import Path
@@ -25,12 +24,10 @@ SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
 
 # ------------------------------------------------------------------
-# State dict helpers
+# Helpers
 # ------------------------------------------------------------------
 
-
 def _state_dict_to_full_tensor(sd):
-    """Convert all DTensor values in a state dict to full (gathered) tensors."""
     from torch.distributed.tensor import DTensor
 
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
@@ -47,49 +44,18 @@ def _state_dict_to_full_tensor(sd):
 
 
 def _normalize_key(key: str) -> str:
-    """Strip all leading 'module.' prefixes to get the canonical parameter name."""
     while key.startswith("module."):
         key = key[len("module.") :]
     return key
 
 
-def _build_key_mapping(source_sd, target_sd):
-    """
-    Build a mapping from source state dict keys to target state dict keys.
-
-    Uses canonical (stripped) parameter names for matching.  Returns a
-    dict suitable for passing to DCP.load where values are the target
-    DTensor objects and keys match the checkpoint (source) format.
-    """
-    target_by_canonical = {}
-    for t_key in target_sd:
-        target_by_canonical[_normalize_key(t_key)] = target_sd[t_key]
-
-    mapped = {"model": {}}
-    for s_key in source_sd:
-        canonical = _normalize_key(s_key)
-        if canonical in target_by_canonical:
-            mapped["model"][s_key] = target_by_canonical[canonical]
-    return mapped
-
-
 def _get_model_from_chunks(model_chunks):
-    """Extract a single model from model_chunks (list or single module)."""
     if isinstance(model_chunks, list):
         return model_chunks[0]
     return model_chunks
 
 
-# ------------------------------------------------------------------
-# Validation helpers
-# ------------------------------------------------------------------
-
-
-def _assert_model_state_dict_match(source_full, loaded_full):
-    """Assert model state dict values match between source and loaded.
-
-    Matches by canonical (``module.``-stripped) parameter name.
-    """
+def _assert_model_match(source_full, loaded_full):
     nonempty = False
     for s_key, s_val in source_full.items():
         canonical = _normalize_key(s_key)
@@ -98,21 +64,20 @@ def _assert_model_state_dict_match(source_full, loaded_full):
             if _normalize_key(l_key) == canonical:
                 matched_key = l_key
                 break
-        assert (
-            matched_key is not None
-        ), f"Key {s_key} (canonical: {canonical}) not found in loaded state dict"
+        assert matched_key is not None, (
+            f"Key {s_key} (canonical: {canonical}) not found in loaded state dict"
+        )
         l_val = loaded_full[matched_key]
-
         if s_val is None and l_val is None:
             continue
-        assert (
-            s_val is not None and l_val is not None
-        ), f"One of source or loaded value for {s_key} is None while the other is not"
+        assert s_val is not None and l_val is not None, (
+            f"One of source or loaded value for {s_key} is None while the other is not"
+        )
         if s_val.numel() > 0:
             nonempty = True
-        assert (
-            s_val.shape == l_val.shape
-        ), f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
+        assert s_val.shape == l_val.shape, (
+            f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
+        )
         assert_close(s_val, l_val, atol=0, rtol=0, msg=f"Value mismatch for {s_key}")
 
     world_size = torch.distributed.get_world_size()
@@ -121,15 +86,13 @@ def _assert_model_state_dict_match(source_full, loaded_full):
     assert any(all_nonempty), "All ranks had empty model state after load."
 
 
-def _assert_optimizer_state_dict_match(source_optim_full, loaded_optim_full):
-    """Assert optimizer state dict values match between source and loaded.
-
-    Matches by canonical parameter name.
-    """
-    for param_name, source_states in source_optim_full.items():
+def _assert_optim_match(source_optim_sd, loaded_optim_sd):
+    source_state = source_optim_sd["state"]
+    loaded_state = loaded_optim_sd["state"]
+    for param_name, source_states in source_state.items():
         canonical = _normalize_key(param_name)
         matched_param = None
-        for l_param in loaded_optim_full:
+        for l_param in loaded_state:
             if _normalize_key(l_param) == canonical:
                 matched_param = l_param
                 break
@@ -137,24 +100,20 @@ def _assert_optimizer_state_dict_match(source_optim_full, loaded_optim_full):
             f"Optimizer param {param_name} (canonical: {canonical}) "
             f"not found in loaded optimizer state"
         )
-        loaded_states = loaded_optim_full[matched_param]
+        loaded_states = loaded_state[matched_param]
         for state_key, s_val in source_states.items():
-            assert (
-                state_key in loaded_states
-            ), f"Optimizer state '{state_key}' for param {param_name} not found after load"
+            assert state_key in loaded_states, (
+                f"Optimizer state '{state_key}' for param {param_name} not found after load"
+            )
             l_val = loaded_states[state_key]
             if s_val is None and l_val is None:
                 continue
             if isinstance(s_val, torch.Tensor) and s_val.numel() > 0:
                 assert s_val.shape == l_val.shape, (
-                    f"Optimizer state shape mismatch for {param_name}.{state_key}: "
-                    f"{s_val.shape} vs {l_val.shape}"
+                    f"Optimizer state shape mismatch for {param_name}.{state_key}"
                 )
                 assert_close(
-                    s_val,
-                    l_val,
-                    atol=0,
-                    rtol=0,
+                    s_val, l_val, atol=0, rtol=0,
                     msg=f"Optimizer state value mismatch for {param_name}.{state_key}",
                 )
 
@@ -163,32 +122,10 @@ def _assert_optimizer_state_dict_match(source_optim_full, loaded_optim_full):
 # Test class
 # ==================================================================
 
-
 class TestMegatronFsdpV2Checkpoint:
-    """
-    Megatron FSDP v2 checkpoint save/load and online format conversion tests.
 
-    Covers:
-    - Megatron FSDP v2 → Megatron FSDP v2 round-trip (save + load, model + optimizer)
-    - ND-parallel → Megatron FSDP v2 online conversion
-    - Megatron FSDP v1 baseline → Megatron FSDP v2 online conversion
-    """
-
-    # ------------------------------------------------------------------
-    # Model init / training helpers
-    # ------------------------------------------------------------------
     @staticmethod
     def _init_model_and_optimizer(seed=42, **kwargs):
-        """
-        Initialize model-parallel groups, build model, optimizer and
-        param scheduler.
-
-        Returns (model_chunks, optim, opt_param_scheduler).
-
-        NOTE: Process groups are intentionally NOT destroyed here because
-        the caller (e.g. DCP.load) may need them.  The caller is responsible
-        for calling Utils.destroy_model_parallel() when done.
-        """
         VOCAB_SIZE = kwargs.get("vocab_size", 100)
         MAX_SEQ_LEN = kwargs.get("seq_length", 128)
         MICRO_BATCH_SIZE = kwargs.get("micro_batch_size", 2)
@@ -208,7 +145,6 @@ class TestMegatronFsdpV2Checkpoint:
             expert_tensor_parallel_size=ETP,
             num_distributed_optimizer_instances=OUTER_DP,
         )
-
         set_manual_seed(seed)
 
         model_chunks, optim = make_moe_args_model_and_optimizer(
@@ -226,42 +162,29 @@ class TestMegatronFsdpV2Checkpoint:
             train_iters=NUM_TRAINING_STEPS,
             **kwargs,
         )
-
         from megatron.training.training import get_optimizer_param_scheduler
 
         opt_param_scheduler = get_optimizer_param_scheduler(optim)
-
         return model_chunks, optim, opt_param_scheduler
 
     @staticmethod
     def _training_loop(seed=42, **kwargs):
-        """
-        Run _init_model_and_optimizer followed by a deterministic training
-        loop and return (model, state_dict, optim, opt_param_scheduler).
-
-        If ``save`` is in kwargs, calls MCore's ``save_checkpoint`` at the
-        end to persist the trained model, optimizer and scheduler.
-        """
         model_chunks, optim, scheduler = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
             seed=seed, **kwargs
         )
-
-        VOCAB_SIZE = kwargs.get("vocab_size", 100)
-        MAX_SEQ_LEN = kwargs.get("seq_length", 128)
         MICRO_BATCH_SIZE = kwargs.get("micro_batch_size", 2)
         GLOBAL_BATCH_SIZE = kwargs.get("global_batch_size", 32)
-        NUM_TRAINING_STEPS = kwargs.get("train_iters", 2)
+        MAX_SEQ_LEN = kwargs.get("seq_length", 128)
         DP_GROUP = mpu.get_data_parallel_group()
 
         data_iterator = make_gpt_mock_data_iterator(
             dp_group=DP_GROUP,
-            vocab_size=VOCAB_SIZE,
+            vocab_size=kwargs.get("vocab_size", 100),
             sequence_length=MAX_SEQ_LEN,
             batch_size=MICRO_BATCH_SIZE,
-            num_samples=GLOBAL_BATCH_SIZE * NUM_TRAINING_STEPS,
+            num_samples=GLOBAL_BATCH_SIZE * kwargs.get("train_iters", 2),
         )
-
-        for _ in range(NUM_TRAINING_STEPS):
+        for _ in range(kwargs.get("train_iters", 2)):
             optim.zero_grad()
             pretrain_forward_backward(
                 model=model_chunks,
@@ -284,12 +207,8 @@ class TestMegatronFsdpV2Checkpoint:
             )
 
         model = _get_model_from_chunks(model_chunks)
-        state_dict = model.state_dict()
-        return model, state_dict, optim, scheduler
+        return model, model.state_dict(), optim, scheduler
 
-    # ------------------------------------------------------------------
-    # Setup / teardown
-    # ------------------------------------------------------------------
     @classmethod
     def setup_class(cls):
         Utils.initialize_model_parallel()
@@ -299,239 +218,156 @@ class TestMegatronFsdpV2Checkpoint:
         Utils.destroy_model_parallel()
 
     # ==================================================================
-    # Test: Megatron FSDP v2 → Megatron FSDP v2 (round-trip)
+    # Online checkpoint conversion
     # ==================================================================
+
+    # ---- Shared target config (always MFSDP v2) ----
+    _TARGET_BASE = dict(
+        use_megatron_fsdp=True,
+        use_fully_shard_api=True,
+        init_model_with_meta_device=True,
+        ckpt_format="fsdp_dtensor",
+        gradient_accumulation_fusion=False,
+        overlap_param_gather=True,
+        overlap_grad_reduce=True,
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
+        fp8_param_gather=False,
+    )
+
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"),
         reason="Requires DTensor and DeviceMesh support (PyTorch >= 2.4.0).",
     )
+    @pytest.mark.parametrize("nd_topology", [pytest.param({"EP": 2}, id="EP2")])
     @pytest.mark.parametrize(
-        "sharding_strategy",
+        "source_type, source_configs, target_configs",
         [
-            pytest.param("optim_grads_params", id="optim_grads_params"),
-            pytest.param("optim_grads", id="optim_grads"),
+            # ---- MFSDP v2 → MFSDP v2 (round-trip) ----
+            pytest.param(
+                "v2",
+                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                id="v2_rt_optim_grads_params",
+            ),
+            pytest.param(
+                "v2",
+                dict(data_parallel_sharding_strategy="optim_grads"),
+                dict(data_parallel_sharding_strategy="optim_grads"),
+                id="v2_rt_optim_grads",
+            ),
+            # ---- MFSDP v2 → MFSDP v2 (cross-setting) ----
+            pytest.param(
+                "v2",
+                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                dict(data_parallel_sharding_strategy="optim_grads"),
+                id="v2_x_optim_grads_params_to_optim_grads",
+            ),
+            pytest.param(
+                "v2",
+                dict(data_parallel_sharding_strategy="optim_grads"),
+                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                id="v2_x_optim_grads_to_optim_grads_params",
+            ),
+            # ---- MFSDP v1 baseline → MFSDP v2 ----
+            pytest.param(
+                "v1",
+                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                id="v1_to_v2_optim_grads_params",
+            ),
+            pytest.param(
+                "v1",
+                dict(data_parallel_sharding_strategy="optim_grads"),
+                dict(data_parallel_sharding_strategy="optim_grads"),
+                id="v1_to_v2_optim_grads",
+            ),
+            pytest.param(
+                "v1",
+                dict(data_parallel_sharding_strategy="optim"),
+                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                id="v1_optim_to_v2_optim_grads_params",
+            ),
+            # ---- ND-parallel → MFSDP v2 ----
+            pytest.param(
+                "nd",
+                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                id="nd_to_v2_optim_grads_params",
+            ),
+            pytest.param(
+                "nd",
+                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                dict(data_parallel_sharding_strategy="optim_grads"),
+                id="nd_to_v2_optim_grads",
+            ),
         ],
     )
-    def test_megatron_fsdp_v2_round_trip(self, sharding_strategy):
+    def test_checkpoint_online_convert(
+        self, nd_topology, source_type, source_configs, target_configs
+    ):
         """
-        Train a Megatron FSDP v2 model, save via MCore native
-        ``save_checkpoint`` (model + optimizer), load via
-        ``setup_model_and_optimizer``, and verify both model parameters
-        and optimizer state values match.
+        Train a source model (ND-parallel, MFSDP v1, or MFSDP v2) with
+        *source_configs*, save via ``save_checkpoint``, load into an
+        MFSDP v2 model with *target_configs*, and verify both model and
+        optimizer state.
         """
         from megatron.core.distributed.fsdp.checkpoint import get_optimizer_state_dict
 
-        v2_config = dict(
-            use_megatron_fsdp=True,
-            use_fully_shard_api=True,
-            init_model_with_meta_device=True,
-            ckpt_format="fsdp_dtensor",
-            gradient_accumulation_fusion=False,
-            overlap_param_gather=True,
-            overlap_grad_reduce=True,
-            recompute_granularity="full",
-            recompute_method="uniform",
-            recompute_num_layers=1,
-            data_parallel_sharding_strategy=sharding_strategy,
-            fp8_param_gather=False,
-        )
+        # ---- Build source config ----
+        if source_type == "v2":
+            src_base = dict(self._TARGET_BASE)
+        elif source_type == "v1":
+            src_base = dict(
+                use_megatron_fsdp=True,
+                init_model_with_meta_device=True,
+                ckpt_format="fsdp_dtensor",
+                gradient_accumulation_fusion=False,
+            )
+        elif source_type == "nd":
+            src_base = dict(
+                use_distributed_optimizer=True,
+                fp8_param_gather=False,
+            )
+        else:
+            raise ValueError(f"Unknown source_type: {source_type}")
 
+        save_config = {**nd_topology, **src_base, **source_configs}
+        tgt_configs = {**nd_topology, **self._TARGET_BASE, **target_configs}
+
+        nd_str = "_".join(f"{k}{v}" for k, v in nd_topology.items())
+        src_shard = source_configs["data_parallel_sharding_strategy"]
+        tgt_shard = target_configs["data_parallel_sharding_strategy"]
         ckpt_base = (
             Path(SHARED_TMP_DIR)
             / TestMegatronFsdpV2Checkpoint.__name__
-            / f"v2_round_trip_{sharding_strategy}"
+            / f"{source_type}_{nd_str}_{src_shard}_to_{tgt_shard}"
         )
 
-        # ---- Train and save WITH optimizer ----
-        save_config = dict(save=str(ckpt_base), save_interval=1, **v2_config)
-        _, source_sd, source_optim, _ = TestMegatronFsdpV2Checkpoint._training_loop(**save_config)
+        # ---- Train + save with source config ----
+        _, source_sd, source_optim, _ = TestMegatronFsdpV2Checkpoint._training_loop(
+            save=str(ckpt_base), save_interval=1, **save_config,
+        )
         source_full = _state_dict_to_full_tensor(source_sd)
         source_optim_sd = get_optimizer_state_dict(source_optim, is_loading=False)
         Utils.destroy_model_parallel()
 
-        # ---- Load WITH optimizer ----
-        load_config = dict(load=str(ckpt_base), **v2_config)
+        # ---- Load with target config (always MFSDP v2) ----
         v2_model_chunks, loaded_optim, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
-            **load_config
+            load=str(ckpt_base), **tgt_configs,
         )
         v2_model = _get_model_from_chunks(v2_model_chunks)
 
         # ---- Verify model ----
         loaded_full = _state_dict_to_full_tensor(v2_model.state_dict())
-        _assert_model_state_dict_match(source_full, loaded_full)
+        _assert_model_match(source_full, loaded_full)
 
         # ---- Verify optimizer ----
         loaded_optim_sd = get_optimizer_state_dict(loaded_optim, is_loading=False)
-        _assert_optimizer_state_dict_match(source_optim_sd["state"], loaded_optim_sd["state"])
+        _assert_optim_match(source_optim_sd, loaded_optim_sd)
 
-        # Cleanup
         Utils.destroy_model_parallel()
         if torch.distributed.get_rank() == 0:
-            shutil.rmtree(ckpt_base)
-        torch.distributed.barrier()
-
-    # ==================================================================
-    # Test: ND-parallel → Megatron-FSDP v2
-    # ==================================================================
-    @pytest.mark.skipif(
-        not is_torch_min_version("2.4.0"),
-        reason="Requires DTensor and DeviceMesh support (PyTorch >= 2.4.0).",
-    )
-    @pytest.mark.parametrize("nd_topology", [pytest.param({"EP": 2}, id="EP2")])
-    def test_nd_parallel_to_megatron_fsdp_v2(self, nd_topology):
-        """
-        Save a checkpoint from an ND-parallel (distributed-optimizer) model
-        and load it into a Megatron-FSDP v2 model using
-        ``MegatronFSDPStateful``.  Verify the state dict.
-        """
-        from torch.distributed.checkpoint import load as dcp_load
-        from torch.distributed.checkpoint import save as dcp_save
-
-        from megatron.core.distributed.fsdp.checkpoint import MegatronFSDPStateful
-
-        nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
-
-        # ---- ND-parallel: train and save ----
-        source_model, source_sd, _, _ = TestMegatronFsdpV2Checkpoint._training_loop(
-            use_distributed_optimizer=True,
-            data_parallel_sharding_strategy="optim_grads_params",
-            fp8_param_gather=False,
-            **nd_topology,
-        )
-        source_full = _state_dict_to_full_tensor(source_sd)
-
-        ckpt_dir = (
-            Path(SHARED_TMP_DIR)
-            / TestMegatronFsdpV2Checkpoint.__name__
-            / f"nd_parallel_{nd_topology_str}"
-        )
-        ckpt_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
-        dcp_save({"model": source_sd}, checkpoint_id=str(ckpt_dir))
-        Utils.destroy_model_parallel()
-
-        # ---- Megatron-FSDP v2: load via MegatronFSDPStateful ----
-        v2_model_chunks, _, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
-            use_megatron_fsdp=True,
-            use_fully_shard_api=True,
-            init_model_with_meta_device=True,
-            ckpt_format="fsdp_dtensor",
-            gradient_accumulation_fusion=False,
-            overlap_param_gather=True,
-            overlap_grad_reduce=True,
-            recompute_granularity="full",
-            recompute_method="uniform",
-            recompute_num_layers=1,
-            data_parallel_sharding_strategy="optim_grads_params",
-            fp8_param_gather=False,
-            **nd_topology,
-        )
-        v2_model = _get_model_from_chunks(v2_model_chunks)
-
-        st = MegatronFSDPStateful(v2_model)
-        state = {"model": st.state_dict()["model"]}
-        mapped_sd = _build_key_mapping(source_sd, state["model"])
-        dcp_load(state_dict=mapped_sd, checkpoint_id=str(ckpt_dir))
-
-        # ---- Verify model ----
-        loaded_sd = v2_model.state_dict()
-        loaded_full = _state_dict_to_full_tensor(loaded_sd)
-        _assert_model_state_dict_match(source_full, loaded_full)
-
-        # Cleanup
-        Utils.destroy_model_parallel()
-        if torch.distributed.get_rank() == 0:
-            shutil.rmtree(ckpt_dir)
-        torch.distributed.barrier()
-
-    # ==================================================================
-    # Test: Megatron-FSDP baseline → Megatron-FSDP v2
-    # ==================================================================
-    @pytest.mark.skipif(
-        not is_torch_min_version("2.4.0"),
-        reason="Requires DTensor and DeviceMesh support (PyTorch >= 2.4.0).",
-    )
-    @pytest.mark.parametrize("nd_topology", [pytest.param({"EP": 2}, id="EP2")])
-    @pytest.mark.parametrize(
-        "source_configs",
-        [
-            pytest.param(
-                dict(data_parallel_sharding_strategy="optim_grads_params"), id="optim_grads_params"
-            ),
-            pytest.param(dict(data_parallel_sharding_strategy="optim_grads"), id="optim_grads"),
-            pytest.param(dict(data_parallel_sharding_strategy="optim"), id="optim"),
-        ],
-    )
-    def test_megatron_fsdp_baseline_to_megatron_fsdp_v2(self, nd_topology, source_configs):
-        """
-        Save a checkpoint from a Megatron-FSDP baseline model and load it
-        into a Megatron-FSDP v2 model using ``MegatronFSDPStateful``.
-        Verify the state dict.
-        """
-        from torch.distributed.checkpoint import load as dcp_load
-        from torch.distributed.checkpoint import save as dcp_save
-
-        from megatron.core.distributed.fsdp.checkpoint import MegatronFSDPStateful
-
-        nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
-        shard_str = source_configs["data_parallel_sharding_strategy"]
-
-        # ---- Megatron-FSDP baseline: train and save ----
-        baseline_configs = copy.deepcopy(source_configs)
-        baseline_configs.update(
-            dict(
-                use_megatron_fsdp=True,
-                init_model_with_meta_device=True,
-                ckpt_format="fsdp_dtensor",
-                gradient_accumulation_fusion=False,
-            )
-        )
-        source_model, source_sd, _, _ = TestMegatronFsdpV2Checkpoint._training_loop(
-            **nd_topology, **baseline_configs
-        )
-        source_full = _state_dict_to_full_tensor(source_sd)
-
-        ckpt_dir = (
-            Path(SHARED_TMP_DIR)
-            / TestMegatronFsdpV2Checkpoint.__name__
-            / f"baseline_{shard_str}_{nd_topology_str}"
-        )
-        ckpt_dir.mkdir(parents=True, exist_ok=True, mode=0o777)
-        dcp_save({"model": source_sd}, checkpoint_id=str(ckpt_dir))
-        Utils.destroy_model_parallel()
-
-        # ---- Megatron-FSDP v2: load via MegatronFSDPStateful ----
-        v2_configs = copy.deepcopy(source_configs)
-        v2_configs.update(
-            dict(
-                use_megatron_fsdp=True,
-                use_fully_shard_api=True,
-                init_model_with_meta_device=True,
-                ckpt_format="fsdp_dtensor",
-                gradient_accumulation_fusion=False,
-                overlap_param_gather=True,
-                overlap_grad_reduce=True,
-                recompute_granularity="full",
-                recompute_method="uniform",
-                recompute_num_layers=1,
-            )
-        )
-        v2_model_chunks, _, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
-            **nd_topology, **v2_configs
-        )
-        v2_model = _get_model_from_chunks(v2_model_chunks)
-
-        st = MegatronFSDPStateful(v2_model)
-        state = {"model": st.state_dict()["model"]}
-        mapped_sd = _build_key_mapping(source_sd, state["model"])
-        dcp_load(state_dict=mapped_sd, checkpoint_id=str(ckpt_dir))
-
-        # ---- Verify model ----
-        loaded_sd = v2_model.state_dict()
-        loaded_full = _state_dict_to_full_tensor(loaded_sd)
-        _assert_model_state_dict_match(source_full, loaded_full)
-
-        # Cleanup
-        Utils.destroy_model_parallel()
-        if torch.distributed.get_rank() == 0:
-            shutil.rmtree(ckpt_dir)
+            shutil.rmtree(ckpt_base, ignore_errors=True)
         torch.distributed.barrier()

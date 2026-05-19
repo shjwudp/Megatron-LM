@@ -491,7 +491,10 @@ def split_dtensor(
             split_points.append(split_points[-1] + size)
 
     # One collective call — result reused for all splits below.
-    chunk_meta = gather_and_compute_chunk_metadata(dtensor)
+    if not hasattr(dtensor._local_tensor, "__create_chunk_list__"):
+        chunk_meta = gather_and_compute_chunk_metadata(dtensor)
+    else:
+        chunk_meta = dtensor.__create_chunk_list__()[0]
     chunk_slice = slice(chunk_meta.offsets[dim], chunk_meta.offsets[dim] + chunk_meta.sizes[dim])
     local_offset = chunk_meta.offsets[dim]
     local_tensor = dtensor.to_local()
