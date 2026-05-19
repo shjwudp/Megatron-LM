@@ -648,12 +648,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
         checkpoint file by calling 'save_parameter_state()'.
 
-        For Megatron-FSDP / FSDP v2, the full inner optimizer state dict is
+        For Megatron-FSDP v2, the full inner optimizer state dict is
         returned directly because FSDP manages parameter state as DTensors and
         the standard PyTorch DCP / get_state_dict() APIs expect a complete
         optimizer state dict.
         """
-        if self.ddp_config.use_megatron_fsdp or self.ddp_config.use_fully_shard_api:
+        if self.ddp_config.use_megatron_fsdp and self.ddp_config.use_fully_shard_api:
             return self.optimizer.state_dict()
 
         inner_state_dict = self.optimizer.state_dict()
