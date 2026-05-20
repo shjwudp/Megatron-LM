@@ -344,7 +344,10 @@ class TestMegatronFsdpV2Checkpoint:
 
         # ---- Build source config ----
         if source_type == "v2":
-            src_base = dict(self._TARGET_BASE)
+            src_base = dict(
+                self._TARGET_BASE,
+                auto_detect_ckpt_format=True,
+            )
         elif source_type == "v1":
             src_base = dict(
                 use_megatron_fsdp=True,
@@ -353,7 +356,11 @@ class TestMegatronFsdpV2Checkpoint:
                 gradient_accumulation_fusion=False,
             )
         elif source_type == "nd":
-            src_base = dict(use_distributed_optimizer=True, fp8_param_gather=False)
+            src_base = dict(
+                use_distributed_optimizer=True,
+                fp8_param_gather=False,
+                ckpt_format="torch_dist",
+            )
         else:
             raise ValueError(f"Unknown source_type: {source_type}")
 
