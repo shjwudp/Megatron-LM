@@ -248,7 +248,7 @@ class TestMegatronFsdpV2Checkpoint:
     # ---- Shared target config (always MFSDP v2) ----
     _TARGET_BASE = dict(
         use_megatron_fsdp=True,
-        use_fully_shard_api=True,
+        use_megatron_fsdp_v2=True,
         init_model_with_meta_device=True,
         ckpt_format="fsdp_dtensor",
         gradient_accumulation_fusion=False,

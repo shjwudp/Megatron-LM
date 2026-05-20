@@ -540,7 +540,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         self.is_stub_optimizer = False
-        if self.ddp_config.use_megatron_fsdp or self.ddp_config.use_fully_shard_api:
+        if self.ddp_config.use_megatron_fsdp or self.ddp_config.use_megatron_fsdp_v2:
             # Megatron-FSDP / FSDP v2 will manage optimizer weights and gradients.
             return
 
@@ -653,7 +653,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         the standard PyTorch DCP / get_state_dict() APIs expect a complete
         optimizer state dict.
         """
-        if self.ddp_config.use_megatron_fsdp and self.ddp_config.use_fully_shard_api:
+        if self.ddp_config.use_megatron_fsdp and self.ddp_config.use_megatron_fsdp_v2:
             return self.optimizer.state_dict()
 
         inner_state_dict = self.optimizer.state_dict()
@@ -739,7 +739,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - state_order : The index of a parameter within the shared parameter
             list.
         """
-        if self.ddp_config.use_megatron_fsdp or self.ddp_config.use_fully_shard_api:
+        if self.ddp_config.use_megatron_fsdp or self.ddp_config.use_megatron_fsdp_v2:
             # When using Megatron-FSDP / FSDP v2, directly load the optimizer
             # state into the wrapped optimizer.
             if "param_to_group_meta" in state_dict:
@@ -1201,7 +1201,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         "Ensure that each model chunk has unique parameter names."
                     )
                 name_to_param.update(_name_to_param)
-            if not self.ddp_config.use_fully_shard_api:
+            if not self.ddp_config.use_megatron_fsdp_v2:
                 num_experts = (
                     self.model_chunks[0].config.num_moe_experts if self.model_chunks else None
                 )
@@ -1267,7 +1267,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Handle FSDP DistributedOptimizer States
         if (
-            self.ddp_config.use_megatron_fsdp or self.ddp_config.use_fully_shard_api
+            self.ddp_config.use_megatron_fsdp or self.ddp_config.use_megatron_fsdp_v2
         ) and sharding_type != "fsdp_dtensor":
             raise NotImplementedError(
                 f"sharding_type {sharding_type} is not supported with Megatron FSDP."
@@ -1392,7 +1392,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Sharded state dict where each parameter is a separate PyTorch DTensor.
         """
         assert (
-            self.ddp_config.use_megatron_fsdp or self.ddp_config.use_fully_shard_api
+            self.ddp_config.use_megatron_fsdp or self.ddp_config.use_megatron_fsdp_v2
         ), "fsdp_dtensor sharding type is only supported with Megatron FSDP."
 
         # Initialize optimizer states with dummy values if loading.

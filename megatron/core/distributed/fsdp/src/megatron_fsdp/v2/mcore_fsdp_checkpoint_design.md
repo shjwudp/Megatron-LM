@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-Megatron FSDP v2 (`use_fully_shard_api=True`) wraps model parameters as PyTorch
+Megatron FSDP v2 (`use_megatron_fsdp_v2=True`) wraps model parameters as PyTorch
 `DTensor` objects sharded across the data-parallel dimension. This document describes
 the checkpoint save/load architecture and how it integrates with MCore's
 `DistributedOptimizer` and DCP (`torch.distributed.checkpoint`).
@@ -29,8 +29,8 @@ There are two code paths:
 
 | Path | Flag | Inner module | Model state dict |
 |------|------|-------------|------------------|
-| **Legacy Megatron FSDP** | `use_megatron_fsdp=True`, `use_fully_shard_api=False` | `MegatronFSDP` | `state_dict()` with DTensor hooks |
-| **Megatron FSDP v2** | `use_megatron_fsdp=True`, `use_fully_shard_api=True` | `FSDPModule` (DTensor-native) | `state_dict()` (DTensors natively) |
+| **Legacy Megatron FSDP** | `use_megatron_fsdp=True`, `use_megatron_fsdp_v2=False` | `MegatronFSDP` | `state_dict()` with DTensor hooks |
+| **Megatron FSDP v2** | `use_megatron_fsdp=True`, `use_megatron_fsdp_v2=True` | `FSDPModule` (DTensor-native) | `state_dict()` (DTensors natively) |
 
 The `fsdp_dtensor` checkpoint format (`--ckpt-format fsdp_dtensor`) is the required
 format for both paths. It uses DCP directly, storing each parameter as a `DTensor`.
@@ -157,7 +157,7 @@ self.state_dict_for_save_checkpoint = lambda *args, **kwargs: module.state_dict(
 the FSDP framework. **Status: OK.**
 
 ```python
-if self.ddp_config.use_fully_shard_api:
+if self.ddp_config.use_megatron_fsdp_v2:
     super().load_state_dict(state_dict, strict=strict)
     return
 ```
@@ -210,7 +210,7 @@ This path is used by:
 
 ### 5.3 `DistributedOptimizer.__init__` — FSDP Short-Circuit
 
-When `use_megatron_fsdp=True` or `use_fully_shard_api=True`, `__init__()` returns
+When `use_megatron_fsdp=True` or `use_megatron_fsdp_v2=True`, `__init__()` returns
 early (line 543) without setting up buffer ranges, gbuf mappings, or shard slicing.
 Megatron FSDP manages weight/gradient memory directly.
 
@@ -223,7 +223,7 @@ Returns the **full** inner optimizer state dict because:
   remapping separately.
 
 ```python
-if self.ddp_config.use_megatron_fsdp or self.ddp_config.use_fully_shard_api:
+if self.ddp_config.use_megatron_fsdp or self.ddp_config.use_megatron_fsdp_v2:
     return self.optimizer.state_dict()
 ```
 
@@ -239,7 +239,7 @@ Converts name-based `param_to_group_meta` back to tensor-based `param_groups`, t
 delegates to the inner optimizer:
 
 ```python
-if self.ddp_config.use_megatron_fsdp or self.ddp_config.use_fully_shard_api:
+if self.ddp_config.use_megatron_fsdp or self.ddp_config.use_megatron_fsdp_v2:
     if "param_to_group_meta" in state_dict:
         state_dict["param_groups"] = self._param2group_meta_to_param_groups(...)
     self.optimizer.load_state_dict(state_dict)
@@ -554,8 +554,8 @@ For this approach to work, the following must be in place:
 
 | Phase | Description |
 |-------|-------------|
-| **Phase 1** (now) | Keep current `generate_state_dict` path. Add `use_fully_shard_api` guards to `distrib_optimizer.py`. Wire `state_dict_for_save_checkpoint` in adapter. |
-| **Phase 2** | Add `get_state_dict`-based path (from `uneven_dtensor.py`) as an alternative code path in `checkpointing.py`, gated by `use_fully_shard_api`. Verify round-trip correctness. |
+| **Phase 1** (now) | Keep current `generate_state_dict` path. Add `use_megatron_fsdp_v2` guards to `distrib_optimizer.py`. Wire `state_dict_for_save_checkpoint` in adapter. |
+| **Phase 2** | Add `get_state_dict`-based path (from `uneven_dtensor.py`) as an alternative code path in `checkpointing.py`, gated by `use_megatron_fsdp_v2`. Verify round-trip correctness. |
 | **Phase 3** | Deprecate `sharded_param_state_fsdp_dtensor` and the `is_loading` skeleton pattern for v2. Remove `state_dict_for_save_checkpoint` wiring from adapter. |
 
 ---
@@ -762,10 +762,10 @@ ensures model and optimizer state dict keys are consistent in the checkpoint.
 
 ### Phase 1: `distrib_optimizer.py` — FSDP v2 Guard Propagation
 
-- [x] `__init__`: Guard early return with `use_megatron_fsdp or use_fully_shard_api`
+- [x] `__init__`: Guard early return with `use_megatron_fsdp or use_megatron_fsdp_v2`
 - [x] `state_dict()`: Return `self.optimizer.state_dict()` for FSDP paths
-- [x] `load_state_dict()`: Guard direct load path with `use_fully_shard_api`
-- [x] `sharded_state_dict()`: Guard `fsdp_dtensor` enforcement with `use_fully_shard_api`
+- [x] `load_state_dict()`: Guard direct load path with `use_megatron_fsdp_v2`
+- [x] `sharded_state_dict()`: Guard `fsdp_dtensor` enforcement with `use_megatron_fsdp_v2`
 - [x] `sharded_param_state_fsdp_dtensor()`: Update assertion to accept both flags
 
 ### Phase 1: `mcore_fsdp_adapter.py` — Model State Dict
@@ -777,7 +777,7 @@ ensures model and optimizer state dict keys are consistent in the checkpoint.
 
 ### Phase 2: Torch-Native `get_state_dict` Path (Path B — `MegatronFSDPStateful`)
 
-- [x] Add `_is_megatron_fsdp_v2()` helper — checks ``ddp_config.use_fully_shard_api``
+- [x] Add `_is_megatron_fsdp_v2()` helper — checks ``ddp_config.use_megatron_fsdp_v2``
       on the ``FullyShardedDataParallel`` adapter, with fallback to ``isinstance(model[0], FSDPModule)``
       for models that went through ``fully_shard()`` without the adapter wrapper
 - [x] Add `_build_megatron_fsdp_v2_state_dict()` to `checkpointing.py` using
