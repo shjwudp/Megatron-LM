@@ -381,7 +381,7 @@ class TestMegatronFsdpV2Checkpoint:
 
         if supports_optim:
             source_optim_sd = source_optim.sharded_state_dict(
-                model_sharded_state_dict=source_sd,
+                model_sharded_state_dict=source_model.sharded_state_dict(),
                 metadata={"distrib_optim_sharding_type": src_sharding_type},
             )
             source_optim_full = _optim_state_to_full(source_optim_sd, source_model)
