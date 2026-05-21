@@ -1237,6 +1237,8 @@ def _load_torch_dist_into_megatron_fsdp_v2(args, checkpoint_name, v2_state_dict)
     metadata = reader.read_metadata().state_dict_metadata
 
     v2_model = v2_state_dict["model"]
+    v2_optim_state = v2_state_dict.get("optimizer", {}).get("state", {})
+
     v2_by_canonical = {}
     for v2_key, v2_val in v2_model.items():
         canonical = v2_key
@@ -1244,57 +1246,88 @@ def _load_torch_dist_into_megatron_fsdp_v2(args, checkpoint_name, v2_state_dict)
             canonical = canonical[len("module."):]
         v2_by_canonical[canonical] = v2_val
 
-    # Build the DCP load mapping.  Optimizer hi-precision param
-    # copies take priority over regular model weight entries.
-    mapped_model = {}
+    # Partition torch_dist sharded keys into model weights and optimizer state
+    # tensors.  ``optimizer.state.param.*`` entries are treated as model weights
+    # (high-precision copies); ``optimizer.state.exp_avg.*`` etc. go into the
+    # v2 optimizer state dict.
+    model_keys = {}
+    optim_keys = {}
     for td_key in metadata:
-        canonical = td_key
-        if canonical in v2_by_canonical:
-            mapped_model[td_key] = v2_by_canonical[canonical]
+        if not td_key.startswith("optimizer.state."):
+            canonical = td_key
+            if canonical in v2_by_canonical:
+                model_keys[td_key] = v2_by_canonical[canonical]
+                continue
+            canonical = _normalize_torch_dist_key(td_key)
+            if canonical in v2_by_canonical:
+                model_keys[td_key] = v2_by_canonical[canonical]
             continue
-        canonical = _normalize_torch_dist_key(td_key)
-        if canonical in v2_by_canonical:
-            mapped_model[td_key] = v2_by_canonical[canonical]
-            continue
-        if canonical.startswith("optimizer.state.param."):
-            param_canonical = canonical[len("optimizer.state.param."):]
-            if param_canonical in v2_by_canonical:
-                mapped_model[td_key] = v2_by_canonical[param_canonical]
 
-    # Deduplicate: when both a regular weight key and an
-    # optimizer.state.param.* key map to the same v2 entry, keep only
-    # the hi-precision optimizer copy.
+        # optimizer.state.{state_key}.{param_name}
+        rest = td_key[len("optimizer.state."):]
+        if rest.startswith("param."):
+            param_canonical = rest[len("param."):]
+            if param_canonical in v2_by_canonical:
+                model_keys[td_key] = v2_by_canonical[param_canonical]
+        else:
+            parts = rest.split(".", 1)
+            if len(parts) == 2:
+                state_key, param_name = parts
+                if param_name in v2_optim_state and state_key in v2_optim_state[param_name]:
+                    optim_keys[td_key] = v2_optim_state[param_name][state_key]
+
+    # Deduplicate model keys: when a regular weight entry and an
+    # optimizer.state.param.* entry point to the same v2 DTensor, keep
+    # only the high-precision optimizer copy.
     v2_to_td_keys = {}
-    for td_key, v2_val in mapped_model.items():
+    for td_key, v2_val in model_keys.items():
         v2_id = id(v2_val)
         v2_to_td_keys.setdefault(v2_id, []).append(td_key)
-    hi_prec = {k for k in mapped_model if k.startswith("optimizer.state.param.")}
-    mapped_model = {
-        td_key: mapped_model[td_key]
+    hi_prec = {k for k in model_keys if k.startswith("optimizer.state.param.")}
+    model_keys = {
+        td_key: model_keys[td_key]
         for td_keys in v2_to_td_keys.values()
         for td_key in td_keys
-        if not (td_keys & hi_prec and td_key not in hi_prec)
+        if not (set(td_keys) & hi_prec and td_key not in hi_prec)
     }
 
-    mapped_sd = {"model": mapped_model}
-    dcp.load(
-        state_dict=mapped_sd,
-        checkpoint_id=checkpoint_name,
-        planner=DefaultLoadPlanner(allow_partial_load=True),
-    )
+    # Single DCP load covering both model weights and optimizer states.
+    mapped_sd = {}
+    if model_keys:
+        mapped_sd["model"] = model_keys
+    if optim_keys:
+        mapped_sd["optimizer"] = {"state": {}}
+        for td_key, v2_val in optim_keys.items():
+            rest = td_key[len("optimizer.state."):]
+            state_key, param_name = rest.split(".", 1)
+            mapped_sd["optimizer"]["state"].setdefault(
+                state_key, {}
+            )[param_name] = v2_val
 
-    # Now that the model state dict has been loaded, we can copy over the rest of
-    # the information from the torch_dist checkpoint.
+    if mapped_sd:
+        dcp.load(
+            state_dict=mapped_sd,
+            checkpoint_id=checkpoint_name,
+            planner=DefaultLoadPlanner(allow_partial_load=True),
+        )
+
+    # Merge common state dict metadata (args, iteration, rng_state, etc.).
+    # Do NOT overwrite the v2 optimizer structure — it already contains the
+    # correct state tensors and param_to_group_meta.
     common_info = dist_checkpointing.load_common_state_dict(checkpoint_name)
-
-    # Unwrap the nested optimizer structure from the common state dict.
-    # The common state dict stores optimizer as:
-    #   {"optimizer": {"param_groups": [...], ...}}
-    # but the FSDP v2 optimizer expects param_groups at the top level.
     if "optimizer" in common_info:
-        opt_common = common_info["optimizer"]
-        if isinstance(opt_common, dict) and "optimizer" in opt_common:
-            common_info["optimizer"] = opt_common["optimizer"]
+        opt_common = common_info.pop("optimizer")
+        if isinstance(opt_common, dict):
+            if "optimizer" in opt_common:
+                opt_common = opt_common["optimizer"]
+            step = None
+            for pg in opt_common.get("param_groups", []):
+                if "step" in pg:
+                    step = pg["step"]
+                    break
+            if step is not None:
+                for entry in v2_optim_state.values():
+                    entry["step"] = step
     v2_state_dict.update(common_info)
 
     return v2_state_dict
