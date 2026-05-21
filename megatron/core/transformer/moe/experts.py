@@ -234,6 +234,11 @@ class TEGroupedMLP(MegatronModule):
             and "moe_act" in self.config.offload_modules
         )
 
+        self.offload_group_mlp = (
+            self.config.fine_grained_activation_offloading
+            and "group_mlp" in self.config.offload_modules
+        )
+
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
@@ -314,7 +319,7 @@ class TEGroupedMLP(MegatronModule):
         if self.tp_group.size() > 1:
             return False  # Tensor parallelism is not supported
         if self.offload_expert_fc1 or self.offload_moe_act:
-            return False  # Fine-grained activation offloading is not supported
+            return False  # expert_fc1/moe_act offloading needs non-fused boundaries
         if self.config.moe_apply_probs_on_input:
             return False  # Pre-multiplying probs is not supported
 
@@ -324,16 +329,33 @@ class TEGroupedMLP(MegatronModule):
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
             return False
 
-        # Check activation: SwiGLU (ScaledSwiGLU) or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
-        if self.config.gated_linear_unit:
-            if self.activation_func == F.silu:
-                return True
-            if self.activation_func == quick_gelu:
-                try:
-                    from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
-                except ImportError:
-                    return False
-                return True
+        # Check activation: SwiGLU, quick GEGLU, or weighted squared ReLU.
+        # Use config.activation_func instead of self.activation_func because when
+        # use_te_activation_func is True, self.activation_func is a TE module, not the raw function.
+        use_glu_fusion = self.config.gated_linear_unit and self.config.activation_func in (
+            F.silu,
+            quick_gelu,
+        )
+        use_srelu_fusion = (
+            self.config.activation_func == squared_relu
+            and self.config.use_fused_weighted_squared_relu
+        )
+        if not (use_glu_fusion or use_srelu_fusion):
+            return False
+        if self.config.activation_func == F.silu:
+            return True
+        if self.config.activation_func == quick_gelu:
+            try:
+                from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
+            except ImportError:
+                return False
+            return True
+        if self.config.activation_func == squared_relu:
+            try:
+                from transformer_engine.pytorch.ops import ScaledSReLU  # noqa: F401
+            except ImportError:
+                return False
+            return True
 
         return False
 
@@ -395,11 +417,11 @@ class TEGroupedMLP(MegatronModule):
             setattr(op, "bias", getattr(self.linear_fc1, "bias"))
         ops.append(op)
 
-        # Activation and post-multiply probs (SwiGLU or clamped quick-GeGLU)
+        # Activation and post-multiply probs (SwiGLU, clamped quick-GeGLU, or SReLU)
         glu_interleave = self.config.moe_mlp_glu_interleave_size
-        if self.activation_func == F.silu and self.config.gated_linear_unit:
+        if self.config.activation_func == F.silu and self.config.gated_linear_unit:
             op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
-        elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
+        elif self.config.activation_func == quick_gelu and self.config.gated_linear_unit:
             clamp = self.config.activation_func_clamp_value
             if clamp is not None:
                 op = te.pytorch.ops.ScaledClampedQGeGLU(
@@ -407,9 +429,14 @@ class TEGroupedMLP(MegatronModule):
                 )
             else:
                 op = te.pytorch.ops.ScaledClampedQGeGLU(glu_interleave_size=glu_interleave)
+        elif (
+            self.config.activation_func == squared_relu
+            and self.config.use_fused_weighted_squared_relu
+        ):
+            op = te.pytorch.ops.ScaledSReLU()
         else:
             raise RuntimeError(
-                "_make_fused_ops expected SwiGLU or quick_gelu with gated_linear_unit; "
+                "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "
                 "call _is_fused_impl_supported() before constructing fused ops."
             )
         ops.append(op)
@@ -506,13 +533,24 @@ class TEGroupedMLP(MegatronModule):
                 tokens_per_expert, dtype=torch.int, device=permuted_probs.device
             )
 
-        # Call fused impl
-        output = ops(
-            permuted_local_hidden_states,
-            tokens_per_expert,  # FC1
-            permuted_probs,  # Scaled SwiGLU
-            tokens_per_expert,  # FC2
+        group_mlp_manager = off_interface(
+            self.offload_group_mlp, permuted_local_hidden_states, "group_mlp"
         )
+        with group_mlp_manager as permuted_local_hidden_states:
+            # Call fused impl. With group_mlp offload enabled, TE op-fuser saved tensors
+            # are captured by the active saved_tensors_hooks and offloaded as one group.
+            output = ops(
+                permuted_local_hidden_states,
+                tokens_per_expert,  # FC1
+                permuted_probs,  # Scaled SwiGLU/SReLU
+                tokens_per_expert,  # FC2
+            )
+        if self.offload_group_mlp:
+            output = off_interface.group_commit(
+                output,
+                name="group_mlp",
+                forced_released_tensors=[permuted_local_hidden_states],
+            )
 
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
