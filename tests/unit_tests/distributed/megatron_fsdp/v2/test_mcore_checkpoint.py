@@ -94,13 +94,16 @@ def _assert_model_match(source_full, loaded_full):
 
 
 def _optim_state_to_full(optim_sd, model):
-    """Wrap optimizer states as DTensors and gather to full tensors."""
+    """Wrap optimizer states as DTensors or unflatten flat format and gather to full tensors."""
     from torch.distributed.tensor import DTensor
 
     from megatron.core.distributed.fsdp.checkpoint import _build_dtensor_optim_sd
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
         uneven_dtensor_to_full_tensor,
     )
+
+    if "param_state_sharding_type" in optim_sd:
+        return _flat_optim_state_to_full(optim_sd, model)
 
     wrapped = {"optimizer": _build_dtensor_optim_sd(optim_sd, model)}
     out = {}
@@ -111,6 +114,36 @@ def _optim_state_to_full(optim_sd, model):
                 out[param_name][state_key] = uneven_dtensor_to_full_tensor(state_val)
             else:
                 out[param_name][state_key] = state_val
+    return out
+
+
+def _flat_optim_state_to_full(optim_sd, model):
+    """Convert flat fully_reshardable optimizer sd to {param_name: {state_key: tensor}}."""
+    import re
+
+    index_states = {}
+    pattern = re.compile(r'^param_state\.(\d+)\.(.+)$')
+    for key, value in optim_sd.items():
+        m = pattern.match(key)
+        if m:
+            idx = int(m.group(1))
+            state_key = m.group(2)
+            if idx not in index_states:
+                index_states[idx] = {}
+            index_states[idx][state_key] = value
+
+    grad_param_names = [name for name, p in model.named_parameters() if p.requires_grad]
+
+    out = {}
+    for idx in sorted(index_states.keys()):
+        states = index_states[idx]
+        rev_idx = len(grad_param_names) - 1 - idx
+        if 0 <= rev_idx < len(grad_param_names):
+            param_name = grad_param_names[rev_idx]
+        else:
+            param_name = f"param_{idx}"
+        out[param_name] = states
+
     return out
 
 
@@ -381,7 +414,9 @@ class TestMegatronFsdpV2Checkpoint:
 
         if supports_optim:
             source_optim_sd = source_optim.sharded_state_dict(
-                model_sharded_state_dict=source_model.sharded_state_dict(),
+                model_sharded_state_dict=(
+                    source_model.sharded_state_dict() if source_type not in ["v1", "v2"] else {}
+                ),
                 metadata={"distrib_optim_sharding_type": src_sharding_type},
             )
             source_optim_full = _optim_state_to_full(source_optim_sd, source_model)

@@ -1244,8 +1244,10 @@ def _load_torch_dist_into_megatron_fsdp_v2(args, checkpoint_name, v2_state_dict)
             canonical = canonical[len("module."):]
         v2_by_canonical[canonical] = v2_val
 
+    # Build the DCP load mapping.  Optimizer hi-precision param
+    # copies take priority over regular model weight entries.
     mapped_model = {}
-    for td_key, td_meta in metadata.items():
+    for td_key in metadata:
         canonical = td_key
         if canonical in v2_by_canonical:
             mapped_model[td_key] = v2_by_canonical[canonical]
@@ -1253,6 +1255,26 @@ def _load_torch_dist_into_megatron_fsdp_v2(args, checkpoint_name, v2_state_dict)
         canonical = _normalize_torch_dist_key(td_key)
         if canonical in v2_by_canonical:
             mapped_model[td_key] = v2_by_canonical[canonical]
+            continue
+        if canonical.startswith("optimizer.state.param."):
+            param_canonical = canonical[len("optimizer.state.param."):]
+            if param_canonical in v2_by_canonical:
+                mapped_model[td_key] = v2_by_canonical[param_canonical]
+
+    # Deduplicate: when both a regular weight key and an
+    # optimizer.state.param.* key map to the same v2 entry, keep only
+    # the hi-precision optimizer copy.
+    v2_to_td_keys = {}
+    for td_key, v2_val in mapped_model.items():
+        v2_id = id(v2_val)
+        v2_to_td_keys.setdefault(v2_id, []).append(td_key)
+    hi_prec = {k for k in mapped_model if k.startswith("optimizer.state.param.")}
+    mapped_model = {
+        td_key: mapped_model[td_key]
+        for td_keys in v2_to_td_keys.values()
+        for td_key in td_keys
+        if not (td_keys & hi_prec and td_key not in hi_prec)
+    }
 
     mapped_sd = {"model": mapped_model}
     dcp.load(
@@ -1264,6 +1286,15 @@ def _load_torch_dist_into_megatron_fsdp_v2(args, checkpoint_name, v2_state_dict)
     # Now that the model state dict has been loaded, we can copy over the rest of
     # the information from the torch_dist checkpoint.
     common_info = dist_checkpointing.load_common_state_dict(checkpoint_name)
+
+    # Unwrap the nested optimizer structure from the common state dict.
+    # The common state dict stores optimizer as:
+    #   {"optimizer": {"param_groups": [...], ...}}
+    # but the FSDP v2 optimizer expects param_groups at the top level.
+    if "optimizer" in common_info:
+        opt_common = common_info["optimizer"]
+        if isinstance(opt_common, dict) and "optimizer" in opt_common:
+            common_info["optimizer"] = opt_common["optimizer"]
     v2_state_dict.update(common_info)
 
     return v2_state_dict
