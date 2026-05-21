@@ -15,6 +15,8 @@
 """
 Example: FSDP1-compatible API backed by Megatron FSDP2.
 
+NOTE: This API is EXPERIMENTAL and subject to change without notice.
+
 This example demonstrates how to use the FullyShardedDataParallel drop-in
 replacement with the same API as PyTorch FSDP1, but powered by Megatron FSDP2.
 

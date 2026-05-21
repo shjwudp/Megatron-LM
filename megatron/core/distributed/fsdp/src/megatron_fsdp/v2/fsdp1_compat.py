@@ -15,6 +15,11 @@
 """
 FSDP1-Compatible API backed by Megatron FSDP2.
 
+.. warning::
+    This module is **experimental** and subject to change without notice.
+    It is provided for early evaluation and feedback. Do not use in
+    production workloads.
+
 This module provides a drop-in replacement for PyTorch's
 ``torch.distributed.fsdp.FullyShardedDataParallel`` that uses Megatron FSDP2's
 ``fully_shard()`` as the backend. It enables projects using FSDP1 (such as
@@ -164,6 +169,9 @@ class FullyShardedDataParallel(nn.Module):
     Drop-in replacement for ``torch.distributed.fsdp.FullyShardedDataParallel``
     backed by Megatron FSDP2's ``fully_shard()`` API.
 
+    .. warning::
+        This class is **experimental** and subject to breaking changes.
+
     This class accepts the same constructor arguments as PyTorch FSDP1 and
     internally uses Megatron FSDP2 for parameter sharding, communication
     overlap, and memory management.
@@ -191,6 +199,13 @@ class FullyShardedDataParallel(nn.Module):
         param_init_fn: Optional[Callable] = None,
     ):
         super().__init__()
+
+        warnings.warn(
+            "FullyShardedDataParallel FSDP1-compat API is experimental and "
+            "subject to breaking changes in future releases.",
+            FutureWarning,
+            stacklevel=2,
+        )
 
         if cpu_offload is not None and cpu_offload.offload_params:
             warnings.warn(

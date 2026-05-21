@@ -1,5 +1,10 @@
 # Design: FSDP1-Compatible API for Megatron FSDP2
 
+> **Status: Experimental**
+>
+> This API is experimental and subject to change. It is provided for early
+> evaluation and feedback purposes. Do not rely on it for production workloads.
+
 ## Motivation
 
 Many training frameworks (e.g., Bagel, HuggingFace, LLaMA-Factory) rely on PyTorch's
