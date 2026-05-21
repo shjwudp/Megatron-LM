@@ -182,9 +182,10 @@ class FullyShardMixedPrecisionPolicy:
                     QUANTIZED_MODEL_INIT_CLASS is not nullcontext
                 ), "Transformer Engine is required for FP8 parameter initialization"
                 args = {"enabled": True}
-                if "preserve_high_precision_init_val" in inspect.signature(
-                    QUANTIZED_MODEL_INIT_CLASS
-                ).parameters:
+                if (
+                    "preserve_high_precision_init_val"
+                    in inspect.signature(QUANTIZED_MODEL_INIT_CLASS).parameters
+                ):
                     args["preserve_high_precision_init_val"] = True
                 stack.enter_context(QUANTIZED_MODEL_INIT_CLASS(**args))
 
@@ -288,11 +289,7 @@ class FullyShardMixedPrecisionPolicy:
         return tensors
 
     def weight_buffers_for_unshard(
-        self,
-        model_weight_buffer,
-        transpose_weight_buffer=None,
-        *,
-        bwd_pass: bool = False,
+        self, model_weight_buffer, transpose_weight_buffer=None, *, bwd_pass: bool = False
     ) -> List:
         """Return the weight buffer needed for forward or backward compute."""
         if bwd_pass and transpose_weight_buffer is not None:
@@ -331,11 +328,7 @@ class FullyShardMixedPrecisionPolicy:
         ), "Transformer Engine >= 2.0 is required for FP8 dequantize"
         return tensor.dequantize()
 
-    def post_unshard(
-        self,
-        params: List[torch.Tensor],
-        bwd_pass: bool = False,
-    ) -> None:
+    def post_unshard(self, params: List[torch.Tensor], bwd_pass: bool = False) -> None:
         """Run post-unshard mixed precision processing for a parameter group."""
         params = [param for param in params if self.is_fp8_param(param)]
         if len(params) == 0:
@@ -368,10 +361,7 @@ class FullyShardMixedPrecisionPolicy:
                     param._create_columnwise()
         for param in params:
             if hasattr(param, "update_usage"):
-                param.update_usage(
-                    rowwise_usage=not bwd_pass,
-                    columnwise_usage=True,
-                )
+                param.update_usage(rowwise_usage=not bwd_pass, columnwise_usage=True)
 
     def post_reshard(self, params: List[torch.Tensor]) -> None:
         """Run post-reshard mixed precision processing for a parameter group."""
