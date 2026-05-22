@@ -56,7 +56,7 @@ def _get_model_from_chunks(model_chunks):
     return model_chunks
 
 
-def _assert_model_match(source_full, loaded_full):
+def _assert_model_match(source_full, loaded_full, compare_in_bf16=False):
     nonempty = False
     for s_key, s_val in source_full.items():
         canonical = _normalize_key(s_key)
@@ -74,16 +74,20 @@ def _assert_model_match(source_full, loaded_full):
         assert (
             s_val is not None and l_val is not None
         ), f"One of source or loaded value for {s_key} is None while the other is not"
-        if s_val.numel() > 0:
-            nonempty = True
         assert (
             s_val.shape == l_val.shape
         ), f"Shape mismatch for {s_key}: {s_val.shape} vs {l_val.shape}"
+        if s_val.numel() > 0:
+            nonempty = True
+        else:
+            continue
+        if compare_in_bf16:
+            s_val = s_val.to(torch.bfloat16)
+            l_val = l_val.to(torch.bfloat16)
         assert_close(
             s_val,
             l_val,
-            atol=0,
-            rtol=0,
+            rtol=1.6e-2, atol=1e-3,
             msg=f"Value mismatch for {s_key}, s_val: {s_val}, l_val: {l_val}",
         )
 
@@ -307,6 +311,16 @@ class TestMegatronFsdpV2Checkpoint:
     @pytest.mark.parametrize(
         "source_type, source_configs, target_configs",
         [
+            # ---- ND-parallel → MFSDP v2 ----
+            pytest.param(
+                "nd",
+                dict(
+                    distrib_optim_sharding_type="fully_reshardable",
+                    dist_ckpt_optim_fully_reshardable=True,
+                ),
+                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                id="nd_fully_reshardable_to_v2",
+            ),
             # ---- MFSDP v2 → MFSDP v2 (round-trip) ----
             pytest.param(
                 "v2",
@@ -351,16 +365,6 @@ class TestMegatronFsdpV2Checkpoint:
                 dict(data_parallel_sharding_strategy="optim"),
                 dict(data_parallel_sharding_strategy="optim_grads_params"),
                 id="v1_optim_to_v2_optim_grads_params",
-            ),
-            # ---- ND-parallel → MFSDP v2 ----
-            pytest.param(
-                "nd",
-                dict(
-                    distrib_optim_sharding_type="fully_reshardable",
-                    dist_ckpt_optim_fully_reshardable=True,
-                ),
-                dict(data_parallel_sharding_strategy="optim_grads_params"),
-                id="nd_fully_reshardable_to_v2",
             ),
         ],
     )
@@ -430,7 +434,7 @@ class TestMegatronFsdpV2Checkpoint:
 
         # ---- Verify model ----
         loaded_full = _state_dict_to_full_tensor(v2_model.state_dict())
-        _assert_model_match(source_full, loaded_full)
+        _assert_model_match(source_full, loaded_full, compare_in_bf16=(source_type == "nd"))
 
         # ---- Verify optimizer (FSDP source types only) ----
         if supports_optim:

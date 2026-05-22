@@ -725,3 +725,125 @@ def _build_dtensor_optim_sd(raw_opt_state_dict: dict, model: nn.Module) -> dict:
 
     opt_state_dict["state"] = new_state
     return opt_state_dict
+
+
+# ------------------------------------------------------------------
+# Torch_dist → FSDP v2 checkpoint key normalization
+# ------------------------------------------------------------------
+
+
+def normalize_torch_dist_key(key: str) -> str:
+    """Normalize a torch_dist checkpoint key to v2 canonical form.
+
+    Maps structural naming differences:
+    - ``experts.experts.`` → ``experts.``
+    - ``transformer_layer`` → ``mtp_model_layer``
+    """
+    if ".mlp.experts.experts." in key:
+        key = key.replace(".mlp.experts.experts.", ".mlp.experts.")
+    if ".transformer_layer." in key:
+        key = key.replace(".transformer_layer.", ".mtp_model_layer.")
+    return key
+
+
+def reverse_normalize_torch_dist_key(key: str) -> str:
+    """Reverse the v2 canonical key back to torch_dist naming.
+
+    Inverse of :func:`normalize_torch_dist_key`:
+    - ``mtp_model_layer`` → ``transformer_layer``
+    - ``experts.`` → ``experts.experts.`` (only within ``mlp.experts.``)
+    """
+    if ".mtp_model_layer." in key:
+        key = key.replace(".mtp_model_layer.", ".transformer_layer.")
+    if ".mlp.experts." in key and ".mlp.experts.experts." not in key:
+        key = key.replace(".mlp.experts.", ".mlp.experts.experts.")
+    return key
+
+
+# ------------------------------------------------------------------
+# Expert parameter loading (torch_dist flattened → v2 individual)
+# ------------------------------------------------------------------
+
+
+_EXPERT_KEY_RE = re.compile(
+    r'^(.+)\.mlp\.experts\.local_experts\.(\d+)\.(linear_fc[12])\.weight$'
+)
+_SHARD_SUFFIX_RE = re.compile(r'/shard_\d+_\d+$')
+
+
+def _load_expert_params_from_torch_dist(
+    reader, checkpoint_name, v2_state_dict, mapped_sd, metadata
+):
+    """Load MoE expert params from torch_dist flattened format into v2 DTensors.
+
+    In torch_dist checkpoints, expert parameters are stored as a single
+    flattened tensor (e.g. ``experts.experts.linear_fc1.weight`` with
+    shape ``(num_global_experts, H, W)``, EP-sharded).  FSDP v2 stores
+    each local expert as its own DTensor
+    (``local_experts.0.linear_fc1.weight``, shape ``(H, W)``).
+
+    Because DCP cannot split one tensor into many, this function loads
+    the flattened tensor into a temporary full-precision buffer and then
+    uses each DTensor's chunk metadata (``__create_chunk_list__``) to
+    copy the correct slice.
+    """
+    loaded = mapped_sd.get("model", {})
+    v2_model = v2_state_dict["model"]
+    expert_groups = {}
+
+    for v2_key, v2_val in v2_model.items():
+        m = _EXPERT_KEY_RE.match(v2_key)
+        if not m or v2_key in loaded:
+            continue
+        base = m.group(1)
+        idx = int(m.group(2))
+        fc_type = m.group(3)
+        expert_groups.setdefault(base, {}).setdefault(fc_type, []).append(
+            (idx, v2_key, v2_val)
+        )
+
+    if not expert_groups:
+        return
+
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+
+    for base, fc_types in expert_groups.items():
+        for fc_type, experts in fc_types.items():
+            experts.sort(key=lambda x: x[0])
+            num_local = len(experts)
+            example_dt = experts[0][2]
+
+            full_shape = example_dt.shape
+
+            td_flat_key = f"{base}.mlp.experts.experts.{fc_type}.weight"
+            td_meta = metadata.get(f"model.{td_flat_key}")
+            if td_meta is None:
+                continue
+            num_total_experts = td_meta.size[0]
+            local_flat = torch.empty(
+                (num_total_experts,) + full_shape,
+                dtype=example_dt.dtype,
+                device=example_dt.device,
+            )
+
+            dcp.load(
+                state_dict={td_flat_key: local_flat},
+                checkpoint_id=checkpoint_name,
+                planner=DefaultLoadPlanner(allow_partial_load=True),
+            )
+
+            ep_rank = mpu.get_expert_model_parallel_rank()
+            for i, (local_idx, v2_key, dtensor) in enumerate(experts):
+                global_idx = ep_rank * num_local + local_idx
+                full_expert = local_flat[global_idx]
+                local_tensor = dtensor._local_tensor
+
+                for chunk in local_tensor.__create_chunk_list__():
+                    off = chunk.offsets
+                    sz = chunk.sizes
+                    src = full_expert[
+                        off[0] : off[0] + sz[0], off[1] : off[1] + sz[1]
+                    ]
+                    local_tensor[: sz[0], : sz[1]].copy_(src)
+                loaded[v2_key] = dtensor

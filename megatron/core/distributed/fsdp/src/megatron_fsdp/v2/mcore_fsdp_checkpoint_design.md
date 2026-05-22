@@ -26,7 +26,7 @@ the checkpoint save/load architecture and how it integrates with MCore's
 |---------------|--------------|-------|-----------|-------|
 | MFSDP v2 | MFSDP v2 | ✓ | ✓ | Full round-trip and cross-setting (`optim_grads` ↔ `optim_grads_params`) |
 | MFSDP v1 baseline | MFSDP v2 | ✓ | ✓ | Both `fsdp_dtensor` format, canonical key matching |
-| ND-parallel (`torch_dist`) | MFSDP v2 | ✓ | ✗ | Optimizer uses bucket-based flat format — incompatible with V2's name-based format. Loaded with `no_load_optim=True` |
+| ND-parallel (`torch_dist`) | MFSDP v2 | ✓ | ✓ (``fully_reshardable`` only) | Online conversion via `_load_torch_dist_into_megatron_fsdp_v2` in `checkpointing.py`. Expert weights are split from flattened multi-expert tensors. Optimizer states (`exp_avg`, `exp_avg_sq`) are loaded into V2's name-based format. Hi-precision FP32 optimizer param copies are used for model weights when available. ``dp_reshardable`` format is not supported (bucket-based layout incompatible with name-based V2 format). |
 | ND-parallel (`torch`) | MFSDP v2 | ✗ | ✗ | Not supported (different serialization) |
 
 ---
@@ -83,6 +83,9 @@ format for both paths. It uses DCP directly, storing each parameter as a `DTenso
 | `_model_has_module_prefix(model)` | Detect whether model's ``named_parameters()`` keys already carry ``module.`` prefix. |
 | `_wrap_optim_states_as_dtensors(state_dict, model)` | Wrap plain-tensor optimizer states as DTensors using the corresponding model parameter's mesh/placements. Required because FusedAdam stores states as plain tensors; DCP needs DTensors for proper save/load plans. |
 | `_unwrap_optim_states_from_dtensors(state_dict)` | (Kept for standalone ``load_checkpoint``) Convert DTensor optimizer states back to plain tensors (``.to_local()``). Not needed in the main training loop path — see dual-dict pattern in Section 5.11. |
+| `normalize_torch_dist_key(key)` | Normalize a torch_dist checkpoint key to v2 canonical form. Maps ``experts.experts.`` → ``experts.`` and ``transformer_layer`` → ``mtp_model_layer``. |
+| `reverse_normalize_torch_dist_key(key)` | Reverse the v2 canonical key back to torch_dist naming (``mtp_model_layer`` → ``transformer_layer``, ``experts.`` → ``experts.experts.``). Used when constructing DCP load paths that must match torch_dist storage paths. |
+| `_load_expert_params_from_torch_dist(reader, checkpoint_name, v2_state_dict, mapped_sd, metadata)` | Load MoE expert params from torch_dist flattened format (``experts.experts.linear_fc1.weight``, shape ``(N, H, W)``) into individual v2 DTensors (``local_experts.0.linear_fc1.weight``, shape ``(H, W)``). DCP loads the full flattened tensor; ``__create_chunk_list__`` metadata is used to copy each rank's DP-shard chunk. |
 
 ### 3.2 Current Save Flow
 
@@ -583,67 +586,107 @@ Megatron FSDP v2 model. Key structures differ:
 | Megatron FSDP v1 baseline | `module.layer.weight` | Tensor-keyed |
 | Megatron FSDP v2 | `module.layer.weight` | String-keyed (by param name) |
 
-### 7.2 Solution: Key Mapping via `get_state_dict`
+### 7.2 Solution: `_load_torch_dist_into_megatron_fsdp_v2`
 
-The `test_mcore_checkpoint.py` test implements round-trip via MCore native APIs:
+The function `_load_torch_dist_into_megatron_fsdp_v2` in `checkpointing.py` is the entry
+point for online conversion from `torch_dist` to `fsdp_dtensor` format. It is called
+from `_load_global_dist_base_checkpoint` when `use_megatron_fsdp_v2` is set and the
+source checkpoint uses `torch_dist` format.
 
-```python
-# ---- Save via MCore save_checkpoint ----
-save_config = dict(save=str(ckpt_base), no_save_optim=True, **v2_config)
-_, source_sd = _training_loop(**save_config)
+The conversion proceeds in three phases:
 
-# ---- Load via setup_model_and_optimizer ----
-load_config = dict(load=str(ckpt_base), no_load_optim=True, **v2_config)
-v2_model_chunks, _ = _init_model_and_optimizer(**load_config)
-```
+#### Phase 1 — DCP Key Mapping
 
-And online conversion via DCP with key mapping:
+Metadata keys from the torch_dist checkpoint are partitioned and canonicalized:
 
-```python
-from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import get_state_dict
+- **Model weights** (`model.<param_name>`): the ``model.`` prefix is stripped, shard
+  suffixes (``/shard_X_Y`` on ``_extra_state`` entries) are removed, and
+  `normalize_torch_dist_key` is applied (``experts.experts.`` → ``experts.``,
+  ``transformer_layer`` → ``mtp_model_layer``).  Each canonical name is matched
+  against the v2 model's `state_dict` keys.
 
-# 1. Save source checkpoint
-source_model, source_sd = _training_loop(...)
-dcp_save({"model": source_sd}, checkpoint_id=ckpt_dir)
+- **Hi-precision optimizer copies** (`optimizer.state.param.<param_name>`): the
+  ``optimizer.state.param.`` prefix is stripped and the resulting param name is
+  canonicalized the same way.  When both a regular model weight and a hi-prec
+  optimizer copy map to the same v2 DTensor, the hi-prec copy takes priority.
 
-# 2. Init target Megatron FSDP v2 model
-v2_model_chunks, _ = _init_model_and_optimizer(...)
-v2_model = _get_model_from_chunks(v2_model_chunks)
+- **Optimizer state tensors** (`optimizer.state.exp_avg.<param_name>`,
+  `optimizer.state.exp_avg_sq.<param_name>`): the state key and param name are
+  extracted, canonicalized, and matched against the v2 optimizer's `state` dict
+  (``v2_optim_state[param_name][state_key]``).
 
-# 3. Build key mapping (canonical names match across formats)
-v2_sd = v2_model.state_dict()
-mapped_sd = _build_key_mapping(source_sd, v2_sd)
+#### Phase 2 — Single DCP Load
 
-# 4. DCP load with mapping
-dcp_load(state_dict=mapped_sd, checkpoint_id=ckpt_dir)
-v2_model.load_state_dict(v2_sd, strict=False)
-```
-
-The `_build_key_mapping` function strips `module.` prefixes to get canonical parameter
-names, then creates a mapping from source keys to target DTensor objects. DCP's `load`
-fills the target DTensors with data from the checkpoint.
-
-### 7.3 `get_state_dict` for Megatron FSDP v2
-
-The `get_state_dict()` function in `uneven_dtensor.py` wraps PyTorch's native
-`get_state_dict` with uneven DTensor preprocessing:
+A single `dcp.load` call loads all matched tensors:
 
 ```python
-def get_state_dict(model, optimizers, *, submodules=None, options=None):
-    # Assert all params are DTensors (FSDP-wrapped)
-    for param in model.parameters():
-        assert isinstance(param, DTensor)
-
-    model_state_dict, optimizer_state_dict = _get_state_dict(
-        model=model, optimizers=optimizers, submodules=submodules, options=options
-    )
-    preprocess_state_dict_for_uneven_dtensor(model_state_dict)
-    preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
-    return model_state_dict, optimizer_state_dict
+mapped_sd = {
+    "model": {
+        "decoder.layers.0.weight": v2_dtensor,    # regular weights
+        ...
+    },
+    "optimizer": {
+        "state": {
+            "exp_avg": {
+                "decoder.layers.0.weight": v2_opt_dtensor,
+                ...
+            },
+            "exp_avg_sq": { ... },
+            "param": {                              # hi-prec model copies
+                "decoder.layers.0.weight": v2_dtensor,
+                ...
+            },
+        }
+    }
+}
+dcp.load(state_dict=mapped_sd, checkpoint_id=..., planner=DefaultLoadPlanner(allow_partial_load=True))
 ```
 
-This requires `DistributedOptimizer.state_dict()` to return a proper state dict
-(the FSDP branch in Section 5.4).
+The DCP state dict mirrors the torch_dist checkpoint directory structure:
+regular weights under ``model.``, and all optimizer-related tensors (including
+hi-precision parameter copies) under ``optimizer.state.*``.
+
+After loading, hi-precision model copies are merged back into the `model` subtree
+so the model state dict is complete.
+
+#### Phase 3 — Expert Parameter Split
+
+Torch_dist stores MoE expert weights as a single flattened tensor per fc_type
+(e.g., ``experts.experts.linear_fc1.weight``, shape ``(num_global_experts, H, W)``,
+EP-sharded).  FSDP v2 stores each local expert as an individual DTensor
+(``local_experts.0.linear_fc1.weight``, shape ``(H, W)``).  DCP cannot split one
+tensor into many, so ``_load_expert_params_from_torch_dist`` in `checkpoint.py`
+handles this:
+
+1. Groups unmatched v2 expert DTensors by (base layer, fc_type).
+2. Constructs the torch_dist key using `reverse_normalize_torch_dist_key` to
+   convert v2 naming (``mtp_model_layer``) back to torch_dist naming
+   (``transformer_layer``).
+3. Creates a temporary buffer with shape ``(num_total_experts, H, W)`` — matching
+   the global shape from torch_dist metadata — and loads it via `dcp.load`.
+4. For each local expert, maps the local index to a global row
+   (``ep_rank * num_local + local_idx``) and uses ``__create_chunk_list__``
+   metadata to extract the DP-shard slice.
+
+### 7.3 Key Normalization Helpers
+
+Located in `megatron/core/distributed/fsdp/checkpoint.py`:
+
+| Function | Direction | Transforms |
+|----------|-----------|------------|
+| `normalize_torch_dist_key` | torch_dist → v2 | ``experts.experts.`` → ``experts.``, ``transformer_layer`` → ``mtp_model_layer`` |
+| `reverse_normalize_torch_dist_key` | v2 → torch_dist | ``mtp_model_layer`` → ``transformer_layer``, ``experts.`` → ``experts.experts.`` |
+
+These are used both in `_load_torch_dist_into_megatron_fsdp_v2` (for matching DCP
+keys) and in `_load_expert_params_from_torch_dist` (for constructing storage paths
+that match the torch_dist checkpoint).
+
+### 7.4 Strictness Check
+
+After all three phases complete, the v2 model's parameter names are compared against
+the union of all loaded entries.  ``_extra_state`` entries are excluded (they are
+FP8/FP4 metadata that reinitializes on load).  Any remaining unmatched parameter
+triggers a `RuntimeError`, ensuring no weights are silently skipped.
 
 ---
 

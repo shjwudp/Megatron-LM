@@ -1033,6 +1033,8 @@ def generate_state_dict(
             )
         else:   # torch, torch_dcp, fsdp_dtensor
             model_sd = model[i].state_dict_for_save_checkpoint()
+            from megatron.core.distributed.fsdp.checkpoint import _propagate_chunk_metadata_to_state_dict
+            _propagate_chunk_metadata_to_state_dict(model[i], model_sd)
 
         state_dict[key] = model_sd
 
@@ -1232,6 +1234,11 @@ def _load_torch_dist_into_megatron_fsdp_v2(args, checkpoint_name, v2_state_dict)
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint import FileSystemReader
     from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+    from megatron.core.distributed.fsdp.checkpoint import (
+        normalize_torch_dist_key,
+        _SHARD_SUFFIX_RE,
+        _load_expert_params_from_torch_dist,
+    )
 
     reader = FileSystemReader(checkpoint_name)
     metadata = reader.read_metadata().state_dict_metadata
@@ -1244,65 +1251,62 @@ def _load_torch_dist_into_megatron_fsdp_v2(args, checkpoint_name, v2_state_dict)
         canonical = v2_key
         while canonical.startswith("module."):
             canonical = canonical[len("module."):]
+        if hasattr(v2_val, "_local_tensor"):
+            assert hasattr(v2_val._local_tensor, "__create_chunk_list__"), \
+                f"Expected v2 model value {v2_key} to have __create_chunk_list__ method"
         v2_by_canonical[canonical] = v2_val
 
-    # Partition torch_dist sharded keys into model weights and optimizer state
-    # tensors.  ``optimizer.state.param.*`` entries are treated as model weights
-    # (high-precision copies); ``optimizer.state.exp_avg.*`` etc. go into the
-    # v2 optimizer state dict.
-    model_keys = {}
-    optim_keys = {}
-    for td_key in metadata:
-        if not td_key.startswith("optimizer.state."):
-            canonical = td_key
-            if canonical in v2_by_canonical:
-                model_keys[td_key] = v2_by_canonical[canonical]
-                continue
-            canonical = _normalize_torch_dist_key(td_key)
-            if canonical in v2_by_canonical:
-                model_keys[td_key] = v2_by_canonical[canonical]
-            continue
-
-        # optimizer.state.{state_key}.{param_name}
-        rest = td_key[len("optimizer.state."):]
-        if rest.startswith("param."):
-            param_canonical = rest[len("param."):]
-            if param_canonical in v2_by_canonical:
-                model_keys[td_key] = v2_by_canonical[param_canonical]
+    def _canonicalize(td_key, *, strip_model_prefix=True):
+        """Strip the top-level DCP prefix, shard suffix, and normalize naming."""
+        if strip_model_prefix and td_key.startswith("model."):
+            key = td_key[len("model."):]
         else:
-            parts = rest.split(".", 1)
-            if len(parts) == 2:
-                state_key, param_name = parts
-                if param_name in v2_optim_state and state_key in v2_optim_state[param_name]:
-                    optim_keys[td_key] = v2_optim_state[param_name][state_key]
+            key = td_key
+        key = _SHARD_SUFFIX_RE.sub('', key)
+        key = normalize_torch_dist_key(key)
+        return key
 
-    # Deduplicate model keys: when a regular weight entry and an
-    # optimizer.state.param.* entry point to the same v2 DTensor, keep
-    # only the high-precision optimizer copy.
-    v2_to_td_keys = {}
-    for td_key, v2_val in model_keys.items():
-        v2_id = id(v2_val)
-        v2_to_td_keys.setdefault(v2_id, []).append(td_key)
-    hi_prec = {k for k in model_keys if k.startswith("optimizer.state.param.")}
-    model_keys = {
-        td_key: model_keys[td_key]
-        for td_keys in v2_to_td_keys.values()
-        for td_key in td_keys
-        if not (set(td_keys) & hi_prec and td_key not in hi_prec)
-    }
-
-    # Single DCP load covering both model weights and optimizer states.
-    mapped_sd = {}
-    if model_keys:
-        mapped_sd["model"] = model_keys
-    if optim_keys:
-        mapped_sd["optimizer"] = {"state": {}}
-        for td_key, v2_val in optim_keys.items():
+    regular_model = {}   # canonical_param_name → v2 DTensor
+    hi_prec_model = {}   # canonical_param_name → v2 DTensor
+    optim_keys = {}      # full td_key → v2 state DTensor
+    for td_key in metadata:
+        if td_key.startswith("optimizer.state."):
             rest = td_key[len("optimizer.state."):]
-            state_key, param_name = rest.split(".", 1)
-            mapped_sd["optimizer"]["state"].setdefault(
-                state_key, {}
-            )[param_name] = v2_val
+            parts = rest.split(".", 1)
+            if rest.startswith("param."):
+                param_name = rest[len("param."):]
+                param_name = _canonicalize(param_name, strip_model_prefix=False)
+                if param_name in v2_by_canonical:
+                    hi_prec_model[param_name] = v2_by_canonical[param_name]
+            elif len(parts) == 2:
+                state_key, param_name = parts
+                param_name = _canonicalize(param_name, strip_model_prefix=False)
+                if (
+                    param_name in v2_optim_state
+                    and state_key in v2_optim_state[param_name]
+                ):
+                    optim_keys[td_key] = v2_optim_state[param_name][state_key]
+        else:
+            canonical = _canonicalize(td_key)
+            if canonical in v2_by_canonical:
+                regular_model[canonical] = v2_by_canonical[canonical]
+
+    for param_name in hi_prec_model:
+        regular_model.pop(param_name, None)
+
+    mapped_sd = {}
+    if regular_model:
+        mapped_sd["model"] = regular_model
+
+    opt_state = {}
+    for td_key, v2_val in optim_keys.items():
+        rest = td_key[len("optimizer.state."):]
+        state_key, param_name = rest.split(".", 1)
+        opt_state.setdefault(state_key, {})[param_name] = v2_val
+    if hi_prec_model:
+        opt_state["param"] = hi_prec_model
+    if opt_state:
+        mapped_sd["optimizer"] = {"state": opt_state}
 
     if mapped_sd:
         dcp.load(
@@ -1311,39 +1315,39 @@ def _load_torch_dist_into_megatron_fsdp_v2(args, checkpoint_name, v2_state_dict)
             planner=DefaultLoadPlanner(allow_partial_load=True),
         )
 
-    # Merge common state dict metadata (args, iteration, rng_state, etc.).
-    # Do NOT overwrite the v2 optimizer structure — it already contains the
-    # correct state tensors and param_to_group_meta.
+    if hi_prec_model:
+        mapped_sd.setdefault("model", {}).update(hi_prec_model)
+
+    _load_expert_params_from_torch_dist(
+        reader, checkpoint_name, v2_state_dict, mapped_sd, metadata
+    )
+
+    # Strictness: every v2 model parameter must have been loaded.
+    loaded = set(regular_model.keys()) | set(hi_prec_model.keys()) | set(
+        mapped_sd.get("model", {}).keys()
+    )
+    all_v2 = set()
+    for v2_key in v2_state_dict["model"]:
+        canonical = v2_key
+        while canonical.startswith("module."):
+            canonical = canonical[len("module."):]
+        all_v2.add(canonical)
+    unloaded = all_v2 - loaded - {k for k in all_v2 if k.endswith("._extra_state")}
+    if unloaded:
+        raise RuntimeError(
+            f"{len(unloaded)} v2 model parameters were not loaded from the "
+            f"torch_dist checkpoint.  Unloaded params: {sorted(unloaded)}"
+        )
+
     common_info = dist_checkpointing.load_common_state_dict(checkpoint_name)
     if "optimizer" in common_info:
         opt_common = common_info.pop("optimizer")
         if isinstance(opt_common, dict):
             if "optimizer" in opt_common:
                 opt_common = opt_common["optimizer"]
-            step = None
-            for pg in opt_common.get("param_groups", []):
-                if "step" in pg:
-                    step = pg["step"]
-                    break
-            if step is not None:
-                for entry in v2_optim_state.values():
-                    entry["step"] = step
     v2_state_dict.update(common_info)
 
     return v2_state_dict
-
-
-def _normalize_torch_dist_key(key):
-    """Normalize a torch_dist checkpoint key to canonical form.
-
-    Handles structural differences between torch_dist and v2 key naming,
-    e.g. ``experts.experts.`` → ``experts.``, ``transformer_layer`` → ``mtp_model_layer``.
-    """
-    if ".mlp.experts.experts." in key:
-        key = key.replace(".mlp.experts.experts.", ".mlp.experts.")
-    if ".transformer_layer." in key:
-        key = key.replace(".transformer_layer.", ".mtp_model_layer.")
-    return key
 
 
 def _load_global_dist_base_checkpoint(
