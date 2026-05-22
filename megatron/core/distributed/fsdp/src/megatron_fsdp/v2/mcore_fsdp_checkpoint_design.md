@@ -597,23 +597,32 @@ The conversion proceeds in three phases:
 
 #### Phase 1 — DCP Key Mapping
 
-Metadata keys from the torch_dist checkpoint are partitioned and canonicalized:
+Metadata keys from the torch_dist checkpoint are partitioned and canonicalized for
+**matching** against v2 entries, but the original torch_dist storage paths are kept
+as DCP state-dict keys so they match the checkpoint metadata verbatim:
 
-- **Model weights** (`model.<param_name>`): the ``model.`` prefix is stripped, shard
-  suffixes (``/shard_X_Y`` on ``_extra_state`` entries) are removed, and
-  `normalize_torch_dist_key` is applied (``experts.experts.`` → ``experts.``,
-  ``transformer_layer`` → ``mtp_model_layer``).  Each canonical name is matched
-  against the v2 model's `state_dict` keys.
+- **Model weights** (`model.<param_name>`): the ``model.`` prefix is stripped and
+  shard suffixes (``/shard_X_Y`` on ``_extra_state`` entries) are removed.  The
+  remaining name is canonicalized via `normalize_torch_dist_key` (``experts.experts.``
+  → ``experts.``, ``transformer_layer`` → ``mtp_model_layer``) **only for matching**
+  against the v2 model's `state_dict` keys.  The **original** torch_dist name
+  (without the ``model.`` prefix) is stored as the DCP load key.
 
 - **Hi-precision optimizer copies** (`optimizer.state.param.<param_name>`): the
-  ``optimizer.state.param.`` prefix is stripped and the resulting param name is
-  canonicalized the same way.  When both a regular model weight and a hi-prec
-  optimizer copy map to the same v2 DTensor, the hi-prec copy takes priority.
+  ``optimizer.state.param.`` prefix is stripped.  The param name is canonicalized
+  for matching; the original torch_dist name is used as the DCP key.  When both a
+  regular model weight and a hi-prec optimizer copy map to the same v2 DTensor,
+  the hi-prec copy takes priority.
 
 - **Optimizer state tensors** (`optimizer.state.exp_avg.<param_name>`,
   `optimizer.state.exp_avg_sq.<param_name>`): the state key and param name are
-  extracted, canonicalized, and matched against the v2 optimizer's `state` dict
-  (``v2_optim_state[param_name][state_key]``).
+  extracted; the param name is canonicalized for matching against the v2 optimizer's
+  `state` dict (``v2_optim_state[canonical_name][state_key]``).  The full original
+  torch_dist key (``optimizer.state.exp_avg.original_name``) is used as the DCP load
+  key.
+
+A strict pre-load check (`_assert_dcp_keys_in_metadata`) verifies every constructed
+DCP load key exists in the torch_dist metadata before calling `dcp.load`.
 
 #### Phase 2 — Single DCP Load
 

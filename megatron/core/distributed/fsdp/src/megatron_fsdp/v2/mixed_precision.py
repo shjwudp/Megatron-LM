@@ -307,7 +307,11 @@ class FullyShardMixedPrecisionPolicy:
         return self.main_params_dtype
 
     def main_grads_dtype_for_param(self, tensor: torch.Tensor) -> torch.dtype:
-        """Return the main-gradient dtype for a parameter group."""
+        """Return the main-gradient dtype for a parameter group.
+
+        Defaults to float32 for stable gradient accumulation (avoids
+        precision loss in reduce-scatter and optimizer steps).
+        """
         if self.main_grads_dtype is not None:
             return self.main_grads_dtype
         return torch.float32

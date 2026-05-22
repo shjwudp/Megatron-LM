@@ -56,7 +56,7 @@ def _get_model_from_chunks(model_chunks):
     return model_chunks
 
 
-def _assert_model_match(source_full, loaded_full, compare_in_bf16=False):
+def _assert_model_match(source_full, loaded_full):
     nonempty = False
     for s_key, s_val in source_full.items():
         canonical = _normalize_key(s_key)
@@ -81,13 +81,10 @@ def _assert_model_match(source_full, loaded_full, compare_in_bf16=False):
             nonempty = True
         else:
             continue
-        if compare_in_bf16:
-            s_val = s_val.to(torch.bfloat16)
-            l_val = l_val.to(torch.bfloat16)
         assert_close(
             s_val,
             l_val,
-            rtol=1.6e-2, atol=1e-3,
+            rtol=0, atol=0,
             msg=f"Value mismatch for {s_key}, s_val: {s_val}, l_val: {l_val}",
         )
 
@@ -122,31 +119,55 @@ def _optim_state_to_full(optim_sd, model):
 
 
 def _flat_optim_state_to_full(optim_sd, model):
-    """Convert flat fully_reshardable optimizer sd to {param_name: {state_key: tensor}}."""
-    import re
+    """Convert fully_reshardable optimizer sd to {param_name: {state_key: tensor}}.
 
-    index_states = {}
-    pattern = re.compile(r'^param_state\.(\d+)\.(.+)$')
-    for key, value in optim_sd.items():
-        m = pattern.match(key)
-        if m:
-            idx = int(m.group(1))
-            state_key = m.group(2)
-            if idx not in index_states:
-                index_states[idx] = {}
-            index_states[idx][state_key] = value
+    The ``fully_reshardable`` format stores optimizer state as a nested
+    dict: ``optim_sd["param_state"]`` = ``{0: {"param": ShardedTensor,
+    "exp_avg": ShardedTensor, ...}, 1: {...}, ...}``.  This function
+    extracts the full tensors from the ShardedTensor wrappers and maps
+    integer indices to parameter names by matching the ``"param"``
+    tensor shape against ``model.named_parameters()``.
+    """
+    from torch.distributed.checkpoint.stateful import ShardedTensor
 
-    grad_param_names = [name for name, p in model.named_parameters() if p.requires_grad]
+    param_state = optim_sd.get("param_state", {})
+    if not param_state:
+        return {}
+
+    # Build shape → param_name lookup
+    param_by_shape = {}
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            param_by_shape.setdefault(p.shape, []).append(name)
 
     out = {}
-    for idx in sorted(index_states.keys()):
-        states = index_states[idx]
-        rev_idx = len(grad_param_names) - 1 - idx
-        if 0 <= rev_idx < len(grad_param_names):
-            param_name = grad_param_names[rev_idx]
-        else:
+    used_names = set()
+    for idx, states in sorted(param_state.items()):
+        # Find matching param name via the "param" tensor shape
+        param_tensor = None
+        if "param" in states:
+            st = states["param"]
+            if isinstance(st, ShardedTensor):
+                shards = st.local_shards()
+                if shards:
+                    param_tensor = shards[0].tensor
+        param_name = None
+        if param_tensor is not None:
+            shape = param_tensor.shape
+            candidates = [n for n in param_by_shape.get(shape, []) if n not in used_names]
+            if candidates:
+                param_name = candidates[0]
+                used_names.add(param_name)
+        if param_name is None:
             param_name = f"param_{idx}"
-        out[param_name] = states
+
+        out[param_name] = {}
+        for state_key, st in states.items():
+            if isinstance(st, ShardedTensor):
+                shards = st.local_shards()
+                out[param_name][state_key] = shards[0].tensor if shards else st
+            else:
+                out[param_name][state_key] = st
 
     return out
 
@@ -434,7 +455,7 @@ class TestMegatronFsdpV2Checkpoint:
 
         # ---- Verify model ----
         loaded_full = _state_dict_to_full_tensor(v2_model.state_dict())
-        _assert_model_match(source_full, loaded_full, compare_in_bf16=(source_type == "nd"))
+        _assert_model_match(source_full, loaded_full)
 
         # ---- Verify optimizer (FSDP source types only) ----
         if supports_optim:
