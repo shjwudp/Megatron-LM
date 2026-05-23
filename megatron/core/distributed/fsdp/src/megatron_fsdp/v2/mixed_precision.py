@@ -528,20 +528,13 @@ class FullyShardMixedPrecisionPolicy:
 
         if self.is_nvfp4_param(params[0]):
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-            dp_size = torch.distributed.get_world_size(data_parallel_group)
-            logger.info(
-                f"[RANK={rank}] copy_mw_to_mw NVFP4 dp_size={dp_size} "
-                f"n_params={len(params)}"
-            )
+            logger.info(f"[RANK={rank}] NVFP4 quantize step dp={torch.distributed.get_world_size(data_parallel_group)}")
             quantize_main_weights_to_nvfp4(
                 params,
                 param_idx,
                 data_parallel_group,
                 model_weight_buffer,
                 main_weight_buffer,
-            )
-            logger.info(
-                f"[RANK={rank}] copy_mw_to_mw NVFP4 DONE"
             )
             return
 
@@ -721,12 +714,6 @@ def quantize_main_weights_to_nvfp4(
     if len(te_model_params) == 0:
         return
 
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-    dp_size = torch.distributed.get_world_size(data_parallel_group)
-    logger.info(
-        f"[RANK={rank}] quantize_nvfp4 CALL dp_size={dp_size} "
-        f"n_params={len(te_model_params)}"
-    )
     kwargs = {}
     if HAVE_TE_POST_ALL_GATHER_PROCESSING:
         kwargs["manual_post_all_gather_processing"] = True
@@ -738,7 +725,4 @@ def quantize_main_weights_to_nvfp4(
         data_parallel_group,
         te_fsdp_shard_model_params,
         **kwargs,
-    )
-    logger.info(
-        f"[RANK={rank}] quantize_nvfp4 DONE"
     )
