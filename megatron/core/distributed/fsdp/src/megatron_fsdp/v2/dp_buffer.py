@@ -585,8 +585,17 @@ class DataParallelBuffer:
         local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
         reduced_grad_shard = comm_input[sm.bucket_data_index : sm.bucket_data_index + sm.size]
 
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        logger.info(
+            f"[RANK={rank}] RS START role={self.buffer_role} "
+            f"local_size={local_grad_shard.numel()} total_size={comm_input.numel()} "
+            f"dtype={self.dtype} dp_size={torch.distributed.get_world_size(self.dp_group)}"
+        )
         torch.distributed.reduce_scatter_tensor(
             output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
+        )
+        logger.info(
+            f"[RANK={rank}] RS DONE role={self.buffer_role}"
         )
 
         local_grad_shard += reduced_grad_shard
