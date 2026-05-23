@@ -7,7 +7,6 @@ config objects belongs in the adapter layer.
 """
 
 import inspect
-import logging
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from importlib.metadata import version
@@ -159,9 +158,6 @@ if not HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8:
                 that_.copy_(this_)
 
 
-logger = logging.getLogger(__name__)
-
-
 @dataclass(frozen=True)
 class FullyShardFP8Policy:
     """FP8 recipe settings owned by the v2 ``fully_shard`` path."""
@@ -295,7 +291,7 @@ class FullyShardMixedPrecisionPolicy:
         """Return whether submodule forward hooks are needed for these parameter groups."""
         for param_group in param_groups:
             for param in param_group.params:
-                if self.is_fp8_param(param) or self.is_nvfp4_param(param):
+                if self.is_fp8_param(param):
                     return True
         return False
 
@@ -479,14 +475,6 @@ class FullyShardMixedPrecisionPolicy:
                     param.update_usage(rowwise_usage=not bwd_pass, columnwise_usage=True)
 
         if len(nvfp4_params) > 0:
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-            has_rowwise = [getattr(p, "_rowwise_data", None) is not None for p in nvfp4_params]
-            has_scale = [getattr(p, "_rowwise_scale_inv", None) is not None for p in nvfp4_params]
-            logger.info(
-                f"[RANK={rank}] post_unshard NVFP4 n_params={len(nvfp4_params)} "
-                f"has_rowwise={has_rowwise} has_scale_inv={has_scale} "
-                f"HAVE_POST_AG={HAVE_TE_POST_ALL_GATHER_PROCESSING}"
-            )
             # TE rebuilds recipe-specific state after FSDP all-gather for NVFP4.
             # Only call post_all_gather_processing if the params have valid
             # internal state; skip if _rowwise_data or _rowwise_scale_inv is
@@ -500,10 +488,6 @@ class FullyShardMixedPrecisionPolicy:
             ]
             if valid_nvfp4:
                 if HAVE_TE_POST_ALL_GATHER_PROCESSING:
-                    logger.info(
-                        f"[RANK={rank}] post_unshard CALL post_all_gather_processing "
-                        f"n_valid={len(valid_nvfp4)}"
-                    )
                     post_all_gather_processing(valid_nvfp4)
 
     def post_reshard(self, params: List[torch.Tensor]) -> None:

@@ -495,21 +495,11 @@ class DataParallelBuffer:
             sm = self.buffer_index.shard_meta
             shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
 
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-            logger.info(
-                f"[RANK={rank}] AG START role={self.buffer_role} "
-                f"shard_size={shard.numel()} output_size={self._unsharded_buffer.numel()} "
-                f"dtype={self.dtype} dp_size={torch.distributed.get_world_size(self.dp_group)}"
-            )
             work = torch.distributed.all_gather_into_tensor(
                 output_tensor=self._unsharded_buffer,
                 input_tensor=shard,
                 group=self.dp_group,
                 async_op=async_op,
-            )
-            logger.info(
-                f"[RANK={rank}] AG DONE role={self.buffer_role} "
-                f"async={async_op}"
             )
             if self._unsharded_buffer.is_cuda:
                 # The temporary bucket may be released from another stream before this

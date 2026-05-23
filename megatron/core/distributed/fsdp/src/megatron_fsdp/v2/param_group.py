@@ -21,7 +21,6 @@ and collective operations across parameters.
 """
 
 import math
-import logging
 from typing import Dict, List, Optional
 
 import torch
@@ -33,8 +32,6 @@ from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
 from .mixed_precision import FullyShardMixedPrecisionPolicy
 from .utils import ParamGroupIdx
-
-logger = logging.getLogger(__name__)
 
 
 class ParameterGroup:
@@ -158,16 +155,6 @@ class ParameterGroup:
         shard_main_weights = s != "no_shard"
         shard_grads = s in ("optim_grads", "optim_grads_params")
 
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-        dp_size = torch.distributed.get_world_size(self.dp_group)
-        nvfp4 = self.mp_policy.is_nvfp4_param(self.params[0]) if len(self.params) > 0 else False
-        logger.info(
-            f"[RANK={rank}] _init_buffers PG#{self.param_group_id} "
-            f"dp_size={dp_size} strategy={s} n_params={len(self.params)} "
-            f"nvfp4={nvfp4} "
-            f"first_shape={self.params[0].shape if len(self.params) > 0 else 'N/A'}"
-        )
-
         # Create model weight buffers. The policy owns dtype-sensitive storage
         # choices and exposes the tensor view that should be packed.
         if s != "no_shard":
@@ -176,14 +163,6 @@ class ParameterGroup:
             wbuf = self._create_buffer(
                 model_weight_dtype, shard_weights, "model_weight",
                 param_shapes=model_weight_shapes,
-            )
-            is_nvfp4 = self.mp_policy.is_nvfp4_param(self.params[0])
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-            logger.info(
-                f"[RANK={rank}] _init_buffers PG#{self.param_group_id} "
-                f"model_weight dtype={model_weight_dtype} data_size={wbuf.data_size} "
-                f"nvfp4={is_nvfp4} packed_shapes={model_weight_shapes is not None} "
-                f"first_param_shape={self.params[0].shape}"
             )
             wbuf.init_data(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):
@@ -236,7 +215,6 @@ class ParameterGroup:
         After unshard, parameters point to full unsharded storage. FP8
         parameters rebind their TE raw payload instead of ``param.data``.
         """
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
         work = None
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
@@ -244,27 +222,10 @@ class ParameterGroup:
             if weight_buffer is None:
                 continue
             if weight_buffer.is_distributed and weight_buffer.is_unsharded():
-                logger.info(
-                    f"[RANK={rank}] unshard SKIP PG#{self.param_group_id} "
-                    f"buffer_role={weight_buffer.buffer_role} bwd_pass={bwd_pass} "
-                    f"already_unsharded=True"
-                )
                 continue
-            logger.info(
-                f"[RANK={rank}] unshard START PG#{self.param_group_id} "
-                f"buffer_role={weight_buffer.buffer_role} bwd_pass={bwd_pass} "
-                f"is_distributed={weight_buffer.is_distributed} "
-                f"data_size={weight_buffer.data_size} dtype={weight_buffer.dtype} "
-                f"global_size={weight_buffer.buffer_index.bucket_meta.size} "
-                f"dp_size={torch.distributed.get_world_size(weight_buffer.dp_group)}"
-            )
             _, weight_work = weight_buffer.unshard(async_op=async_op)
             if work is None:
                 work = weight_work
-            logger.info(
-                f"[RANK={rank}] unshard DONE PG#{self.param_group_id} "
-                f"buffer_role={weight_buffer.buffer_role} bwd_pass={bwd_pass}"
-            )
 
         self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
         return work
