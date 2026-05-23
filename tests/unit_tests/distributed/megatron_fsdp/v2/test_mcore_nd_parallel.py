@@ -226,14 +226,7 @@ class TestMegatronFSDPE2E:
             except ImportError:
                 pytest.skip("NVFP4 support check requires Transformer Engine >= 2.7.0.dev0")
 
-        if spec_configs.get("fp4_param_gather"):
-            # NVFP4 param gather: reference is FSDP v2 with fp4_param_gather=False
-            # (bf16 weights quantized at forward time)
-            reference_kind = "fsdp_v2_bf16"
-        elif spec_configs.get("fp8_param_gather"):
-            reference_kind = "fsdp_v1"
-        else:
-            reference_kind = "distopt"
+        reference_kind = "distopt"
         ref_cache_key = (
             reference_kind,
             tuple(sorted(nd_topology.items())),
@@ -241,31 +234,11 @@ class TestMegatronFSDPE2E:
         )
         if ref_cache_key not in ref_cache:
             reference_spec_configs = copy.deepcopy(spec_configs)
-            if reference_kind == "fsdp_v2_bf16":
-                # NVFP4 reference: same FSDP v2, but fp4_param_gather=False (bf16 weights)
-                reference_spec_configs["fp4_param_gather"] = False
-                ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
-                    use_megatron_fsdp=True,
-                    init_model_with_meta_device=True,
-                    ckpt_format="fsdp_dtensor",
-                    **nd_topology,
-                    **reference_spec_configs,
-                )
-            elif reference_kind == "fsdp_v1":
-                reference_spec_configs["use_megatron_fsdp_v2"] = False
-                reference_spec_configs.setdefault("gradient_accumulation_fusion", False)
-                ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
-                    use_megatron_fsdp=True,
-                    init_model_with_meta_device=True,
-                    ckpt_format="fsdp_dtensor",
-                    **nd_topology,
-                    **reference_spec_configs,
-                )
-            else:
-                reference_spec_configs["fp8_param_gather"] = False
-                ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
-                    use_distributed_optimizer=True, **nd_topology, **reference_spec_configs
-                )
+            reference_spec_configs["use_megatron_fsdp_v2"] = False
+            reference_spec_configs["gradient_accumulation_fusion"] = False
+            ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
+                use_distributed_optimizer=True, **nd_topology, **reference_spec_configs
+            )
 
         fsdp_spec_configs = copy.deepcopy(spec_configs)
         fsdp_spec_configs.setdefault("gradient_accumulation_fusion", False)

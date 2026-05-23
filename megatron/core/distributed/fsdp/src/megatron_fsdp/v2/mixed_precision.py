@@ -7,6 +7,7 @@ config objects belongs in the adapter layer.
 """
 
 import inspect
+import logging
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from importlib.metadata import version
@@ -156,6 +157,9 @@ if not HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8:
         else:
             for this_, that_ in zip(this, that):
                 that_.copy_(this_)
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -475,9 +479,32 @@ class FullyShardMixedPrecisionPolicy:
                     param.update_usage(rowwise_usage=not bwd_pass, columnwise_usage=True)
 
         if len(nvfp4_params) > 0:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+            has_rowwise = [getattr(p, "_rowwise_data", None) is not None for p in nvfp4_params]
+            has_scale = [getattr(p, "_rowwise_scale_inv", None) is not None for p in nvfp4_params]
+            logger.info(
+                f"[RANK={rank}] post_unshard NVFP4 n_params={len(nvfp4_params)} "
+                f"has_rowwise={has_rowwise} has_scale_inv={has_scale} "
+                f"HAVE_POST_AG={HAVE_TE_POST_ALL_GATHER_PROCESSING}"
+            )
             # TE rebuilds recipe-specific state after FSDP all-gather for NVFP4.
-            if HAVE_TE_POST_ALL_GATHER_PROCESSING:
-                post_all_gather_processing(nvfp4_params)
+            # Only call post_all_gather_processing if the params have valid
+            # internal state; skip if _rowwise_data or _rowwise_scale_inv is
+            # None (e.g. buffer already unsharded from prior pass and state
+            # hasn't been rebound).
+            valid_nvfp4 = [
+                p
+                for p in nvfp4_params
+                if getattr(p, "_rowwise_data", None) is not None
+                and getattr(p, "_rowwise_scale_inv", None) is not None
+            ]
+            if valid_nvfp4:
+                if HAVE_TE_POST_ALL_GATHER_PROCESSING:
+                    logger.info(
+                        f"[RANK={rank}] post_unshard CALL post_all_gather_processing "
+                        f"n_valid={len(valid_nvfp4)}"
+                    )
+                    post_all_gather_processing(valid_nvfp4)
 
     def post_reshard(self, params: List[torch.Tensor]) -> None:
         """Run post-reshard mixed precision processing for a parameter group."""
@@ -555,8 +582,11 @@ class FullyShardMixedPrecisionPolicy:
 
 
 def is_fp8_param(tensor: torch.Tensor) -> bool:
-    """Return True if the parameter is backed by a Transformer Engine FP8 tensor."""
-    return HAVE_TE_FP8 and isinstance(tensor, FP8_TENSOR_CLASS)
+    """Return True if the parameter is backed by a Transformer Engine FP8 tensor.
+
+    Excludes NVFP4 tensors since they share the QuantizedTensor base class.
+    """
+    return HAVE_TE_FP8 and isinstance(tensor, FP8_TENSOR_CLASS) and not is_nvfp4_param(tensor)
 
 
 def get_fp8_raw_data(tensor: torch.Tensor, transpose: bool = False) -> torch.Tensor:

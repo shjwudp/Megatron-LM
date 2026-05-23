@@ -35,6 +35,13 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule, hook_module: nn.Module |
 
     def unshard_param_groups(_hook_module, *unused):
         ctx = fsdp_module._fsdp_root_context
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        module_name = getattr(fsdp_module, "__class__", type(fsdp_module)).__name__
+        logger.info(
+            f"[RANK={rank}] unshard_param_groups HOOK module={module_name} "
+            f"id={id(fsdp_module)} backward_phase={ctx.backward_phase} "
+            f"num_param_groups={len(fsdp_module._fsdp_param_groups)}"
+        )
         if ctx.backward_phase:
             fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
         fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
