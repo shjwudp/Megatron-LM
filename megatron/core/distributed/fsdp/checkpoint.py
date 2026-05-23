@@ -20,7 +20,6 @@ Provides:
 - ``MegatronFSDPStateful`` — ``Stateful`` wrapper that integrates with
   PyTorch DCP, handles uneven DTensor chunk metadata via ``get_state_dict``,
   and applies MCore post-processing.
-- ``save_checkpoint`` / ``load_checkpoint`` — one-line DCP save/load.
 - Post-processing functions for Megatron FSDP v2 state dicts:
   ``handle_swiglu_in_state_dict_v2``, ``handle_gdn_in_state_dict_v2``,
   ``handle_experts_in_state_dict``, ``handle_fp8_extra_state_case``.
@@ -47,10 +46,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     preprocess_state_dict_for_uneven_dtensor,
     split_dtensor,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
-    get_mcore_tensor_parallel_partition_dim,
-    is_mcore_tensor_model_parallel,
-)
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import get_attr_wrapped_model
 
@@ -58,8 +53,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "MegatronFSDPStateful",
-    "save_checkpoint",
-    "load_checkpoint",
     "add_module_prefix",
     "strip_module_prefix",
     "get_model_state_dict",
@@ -235,17 +228,6 @@ def _intersection(s1: slice, s2: slice) -> slice:
 
 def _offset_slice(s: slice, offset: int) -> slice:
     return slice(s.start + offset, s.stop + offset)
-
-
-def _get_tp_world_size(dist_param: DTensor) -> int:
-    """Get tensor-parallel world size from propagated TP attributes."""
-    if is_mcore_tensor_model_parallel(dist_param):
-        tp_dim = get_mcore_tensor_parallel_partition_dim(dist_param)
-        if tp_dim is not None:
-            global_shape = dist_param.size()
-            local_shape = dist_param._local_tensor.shape
-            return global_shape[tp_dim] // local_shape[tp_dim]
-    return 1
 
 
 def _get_dist_param(model: nn.Module, key: str) -> nn.Parameter:
@@ -468,7 +450,11 @@ def handle_gdn_in_state_dict_v2(
             opt_state = optimizer_state_dict["state"]
             new_opt_state = {}
             for key in list(opt_state.keys()):
-                match = _match_gdn_key(key)
+                param_key = key
+                if param_key.startswith("module."):
+                    param_key = param_key[len("module.") :]
+                dist_param = _get_dist_param(model, param_key)
+                match = _match_gdn_key(key, dist_param)
                 if match is None:
                     new_opt_state[key] = opt_state[key]
                     continue
@@ -476,11 +462,6 @@ def handle_gdn_in_state_dict_v2(
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
-                    param_key = key
-                    if param_key.startswith("module."):
-                        param_key = param_key[len("module.") :]
-                    dist_param = _get_dist_param(model, param_key)
-                    assert isinstance(dist_param, DTensor)
                     sub_tensors = split_dtensor(opt_state[key][subkey], sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
                         new_opt_state[f"{key}.{sub_name}"][subkey] = tensor
@@ -891,12 +872,16 @@ def _build_torch_dist_to_v2_map(metadata, v2_by_canonical, v2_optim_state):
             if rest.startswith("param."):
                 param_name_td = rest[len("param."):]
                 param_canonical = _canonicalize_td_key(param_name_td, strip_model_prefix=False)
+                while param_canonical.startswith("module."):
+                    param_canonical = param_canonical[len("module."):]
                 if param_canonical in v2_by_canonical:
                     hi_prec_model[param_name_td] = v2_by_canonical[param_canonical]
                     hi_prec_td_keys.add(param_canonical)
             elif len(parts) == 2:
                 state_key, param_name_td = parts
                 param_canonical = _canonicalize_td_key(param_name_td, strip_model_prefix=False)
+                while param_canonical.startswith("module."):
+                    param_canonical = param_canonical[len("module."):]
                 if (
                     param_canonical in v2_optim_state
                     and state_key in v2_optim_state[param_canonical]
@@ -905,10 +890,19 @@ def _build_torch_dist_to_v2_map(metadata, v2_by_canonical, v2_optim_state):
                     optim_matched.add(param_canonical)
         else:
             canonical = _canonicalize_td_key(td_key)
+            while canonical.startswith("module."):
+                canonical = canonical[len("module."):]
             if canonical in v2_by_canonical and canonical not in hi_prec_td_keys:
                 load_key = td_key[len("model."):] if td_key.startswith("model.") else td_key
                 regular_model[load_key] = v2_by_canonical[canonical]
 
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "torch_dist → v2 mapping: %d metadata keys → %d regular model + "
+            "%d hi-prec params + %d optimizer keys matched (%d unique params)",
+            len(metadata), len(regular_model), len(hi_prec_model),
+            len(optim_keys), len(optim_matched),
+        )
     return regular_model, hi_prec_model, optim_keys, optim_matched
 
 
