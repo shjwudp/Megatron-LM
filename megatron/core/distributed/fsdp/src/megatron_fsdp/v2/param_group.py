@@ -120,7 +120,8 @@ class ParameterGroup:
                 buffer.allocator = allocator
 
     def _create_buffer(
-        self, dtype: torch.dtype, is_distributed: bool, role: str
+        self, dtype: torch.dtype, is_distributed: bool, role: str,
+        param_shapes: Optional[List[torch.Size]] = None,
     ) -> DataParallelBuffer:
         """Create a buffer and namespace its temporary bucket by role."""
         return DataParallelBuffer(
@@ -137,6 +138,7 @@ class ParameterGroup:
             chunk_size_factor=self.chunk_size_factor,
             sharding_strategy=self.sharding_strategy,
             mp_policy=self.mp_policy,
+            param_shapes=param_shapes,
         )
 
     def _init_buffers(self) -> None:
@@ -157,7 +159,11 @@ class ParameterGroup:
         # choices and exposes the tensor view that should be packed.
         if s != "no_shard":
             model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
-            wbuf = self._create_buffer(model_weight_dtype, shard_weights, "model_weight")
+            model_weight_shapes = self.mp_policy.model_weight_buffer_shapes(self.params)
+            wbuf = self._create_buffer(
+                model_weight_dtype, shard_weights, "model_weight",
+                param_shapes=model_weight_shapes,
+            )
             wbuf.init_data(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):
                 wbuf.set_item(i, self.mp_policy.get_param_data(p))
