@@ -536,6 +536,8 @@ class FullyShardMixedPrecisionPolicy:
                 model_weight_buffer,
                 main_weight_buffer,
             )
+            logger.info(f"[RANK={rank}] NVFP4 quantize step dp={torch.distributed.get_world_size(data_parallel_group)} finished")
+            torch.distributed.barrier()
             return
 
         if not self.is_fp8_param(params[0]):
@@ -548,7 +550,7 @@ class FullyShardMixedPrecisionPolicy:
         model_param_shards = []
         for param in params:
             item_id = param_idx[param]
-            model_shard = model_weight_buffer.get_item(item_id, only_shard=True)
+            model_shard = model_weight_buffer.get_item(item_id, as_shard=True)
             if model_shard.numel() == 0:
                 fp8_params.append(param)
                 main_params.append(None)
@@ -558,9 +560,9 @@ class FullyShardMixedPrecisionPolicy:
 
             transpose_shard = None
             if transpose_weight_buffer is not None:
-                transpose_shard = transpose_weight_buffer.get_item(item_id, only_shard=True)
-            main_weight = main_weight_buffer.get_item(item_id, only_shard=True)
-            start_offset, _ = model_weight_buffer.buffer_index._get_item_slice_in_shard(item_id)
+                transpose_shard = transpose_weight_buffer.get_item(item_id, as_shard=True)
+            main_weight = main_weight_buffer.get_item(item_id, as_shard=True)
+            start_offset, _ = model_weight_buffer.buffer_index._get_item_self_range(item_id)
             fp8_params.append(param)
             main_params.append(main_weight)
             start_offsets.append(start_offset)
@@ -691,28 +693,30 @@ def quantize_main_weights_to_nvfp4(
             "quantize_master_weights requires Transformer Engine >= 2.7.0.dev0"
         )
 
+    if len(model_params) == 0:
+        return
+
     te_model_params = []
     te_main_params = []
     te_start_offsets = []
-    te_fsdp_shard_model_params = []
+
+    wbuf = model_weight_buffer
+    full_weight_buffer = wbuf.fetch_unsharded_buffer()
+    wbuf._bind_buffer_to_params(full_weight_buffer)
 
     for param in model_params:
         item_id = param_idx[param]
-        model_shard = model_weight_buffer.get_item(item_id, only_shard=True)
-        if model_shard.numel() == 0:
-            continue
-        main_weight = main_weight_buffer.get_item(item_id, only_shard=True)
+        main_weight_shard = main_weight_buffer.get_item(item_id, as_shard=True)
+        if main_weight_shard.numel() == 0:
+            main_weight_shard = None
+
         # Compute the start offset in LOGICAL element space using the main
         # weight buffer index (full shapes), not the model weight buffer
         # index (packed shapes for NVFP4).
-        start_offset, _ = main_weight_buffer.buffer_index._get_item_slice_in_shard(item_id)
+        shard_offset, _ = wbuf.buffer_index._get_item_self_range(item_id, as_shard=True)
         te_model_params.append(param)
-        te_main_params.append(main_weight)
-        te_start_offsets.append(start_offset)
-        te_fsdp_shard_model_params.append(model_shard)
-
-    if len(te_model_params) == 0:
-        return
+        te_main_params.append(main_weight_shard)
+        te_start_offsets.append(shard_offset)
 
     kwargs = {}
     if HAVE_TE_POST_ALL_GATHER_PROCESSING:
@@ -723,6 +727,12 @@ def quantize_main_weights_to_nvfp4(
         te_main_params,
         te_start_offsets,
         data_parallel_group,
-        te_fsdp_shard_model_params,
         **kwargs,
     )
+
+    if not wbuf.is_distributed:
+        raise RuntimeError("FIXME: implement non-distributed NVFP4 quantization path")
+    wbuf.data.copy_(main_weight_buffer.data)
+
+    # Don't forget to reshard the model weight buffer after directly writing into its payload
+    wbuf.reshard()

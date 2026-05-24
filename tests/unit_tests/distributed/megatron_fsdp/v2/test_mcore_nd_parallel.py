@@ -71,17 +71,17 @@ class TestMegatronFSDPE2E:
             ValueError: If batch-size arithmetic or other setup assumptions (e.g., divisibility) are violated.
         """
         # Configuration parameters with defaults
-        VOCAB_SIZE = kwargs.get("vocab_size", 100)
-        MAX_SEQ_LEN = kwargs.get("seq_length", 128)
-        MICRO_BATCH_SIZE = kwargs.get("micro_batch_size", 2)
-        GLOBAL_BATCH_SIZE = kwargs.get("global_batch_size", 32)
-        NUM_TRAINING_STEPS = kwargs.get("train_iters", 20)
-        TP = kwargs.get("TP", 1)
-        PP = kwargs.get("PP", 1)
-        VPP = kwargs.get("VPP", None)
-        EP = kwargs.get("EP", 1)
-        ETP = kwargs.get("ETP", 1)
-        OUTER_DP = kwargs.get("OUTER_DP", 1)
+        VOCAB_SIZE = kwargs.pop("vocab_size", 100)
+        MAX_SEQ_LEN = kwargs.pop("seq_length", 128)
+        MICRO_BATCH_SIZE = kwargs.pop("micro_batch_size", 2)
+        GLOBAL_BATCH_SIZE = kwargs.pop("global_batch_size", 32)
+        NUM_TRAINING_STEPS = kwargs.pop("train_iters", 20)
+        TP = kwargs.pop("TP", 1)
+        PP = kwargs.pop("PP", 1)
+        VPP = kwargs.pop("VPP", None)
+        EP = kwargs.pop("EP", 1)
+        ETP = kwargs.pop("ETP", 1)
+        OUTER_DP = kwargs.pop("OUTER_DP", 1)
 
         # Initialize model parallel groups
         Utils.initialize_model_parallel(
@@ -199,6 +199,7 @@ class TestMegatronFSDPE2E:
                     overlap_param_gather=True,
                     overlap_grad_reduce=True,
                     use_megatron_fsdp_v2=True,
+                    global_batch_size=8,
                 ),
                 id="optim_grads_params_nvfp4_param_gather",
             ),

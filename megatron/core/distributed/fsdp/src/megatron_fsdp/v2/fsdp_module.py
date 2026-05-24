@@ -245,7 +245,7 @@ class FSDPModule(nn.Module):
             assert gbuf_data.numel() > 0
 
             # Get offset and size from buffer index
-            offset, size = gbuf.buffer_index._get_item_offset(item_id)
+            offset, size = gbuf.buffer_index._get_item_global_range(item_id)
             grad_data = gbuf_data[offset : offset + size].view(p.shape)
 
             return grad_data
@@ -314,7 +314,8 @@ class FSDPModule(nn.Module):
         (mid-forward or mid-backward) will corrupt their state.  The safety
         check below enforces that constraint.
         """
-        forward_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
+        named_forward_modules = [(name, child) for name, child in self.named_modules() if isinstance(child, FSDPModule)]
+        forward_order = [child for name, child in named_forward_modules]
 
         # Safety check: no child FSDPModule must be in an active state.
         # - unshard_done_events[id(child)] non-None → unsharded, not yet resharded
@@ -360,14 +361,18 @@ class FSDPModule(nn.Module):
         setattr(self, "_fsdp_state", _FSDPState())
         setattr(self, "_fsdp_root_context", root_context)
 
-        for module in forward_order:
+        module_idx = 0
+        for name, module in named_forward_modules:
             for param_group in module._fsdp_param_groups:
                 param_group.set_allocator(root_context.bucket_allocator)
 
-        for child in self.modules():
-            if child is not self and isinstance(child, FSDPModule):
-                child._fsdp_state._is_root = False
-                setattr(child, "_fsdp_root_context", root_context)
+            if module is not self:
+                module._fsdp_state._is_root = False
+                setattr(module, "_fsdp_root_context", root_context)
+
+            setattr(module, "_fsdp_module_idx", module_idx)
+            setattr(module, "_fsdp_module_name", name)
+            module_idx += 1
 
     def unshard(self, async_op: bool = False, bwd_pass: bool = False):
         """
@@ -597,11 +602,16 @@ class FSDPModule(nn.Module):
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
-        for _, child in self.named_modules():
+        group_idx = 0
+        for module_name, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue
+            rank = torch.distributed.get_rank()
             for param_group in child._fsdp_param_groups:
+                logger.info(f"Rank {rank} copying main weights to model weights for {module_name} #{group_idx}")
                 param_group.copy_main_weights_to_model_weights()
+                logger.info(f"Rank {rank} done copying main weights to model weights for {module_name} #{group_idx}")
+                group_idx += 1
 
     def _compute_per_param_norms(self) -> Dict[str, Dict[str, float]]:
         """
@@ -768,7 +778,7 @@ class FSDPModule(nn.Module):
                 for param_group in child._fsdp_param_groups:
                     for param in param_group.params:
                         wbuf = param_group.model_weight_buffer
-                        param_data = wbuf.get_item(param_group.param_idx[param], only_shard=False)
+                        param_data = wbuf.get_item(param_group.param_idx[param], as_shard=False)
                         assert not torch.isnan(
                             param_data
                         ).any(), "NaN detected in model weight buffer"

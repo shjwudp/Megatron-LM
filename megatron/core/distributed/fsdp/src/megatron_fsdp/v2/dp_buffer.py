@@ -228,24 +228,45 @@ class BufferIndex:
         else:
             return cls.ShardMeta(
                 global_data_index=global_data_index,
+                # For non-distributed buffers, each rank has the full buffer, so
+                # the local index is the same as the global index.
                 local_data_index=global_data_index,
                 bucket_data_index=bucket_data_index,
                 size=shard_size,
             )
 
     # ------------------------------------------------------------------ #
-    #  Internal index query methods
+    #  Internal index query methods — three coordinate domains:
+    #
+    #  _get_item_self_range   → (start, end) relative to the item's own
+    #                            start.  Tells what portion of this item
+    #                            falls within the current rank's shard.
+    #  _get_item_local_range  → (start, end) within self.data (the local
+    #                            GPU buffer).  Where to read/write bytes.
+    #  _get_item_global_range → (global_data_index, size) in the full
+    #                            logical (unsharded) buffer, same on all
+    #                            ranks.
     # ------------------------------------------------------------------ #
 
-    def _get_item_offset(self, item_id: int) -> Tuple[int, int]:
+    def _get_item_global_range(self, item_id: int) -> Tuple[int, int]:
         """Return (global_data_index, size) for the given item."""
         idx = self.item_index_map[item_id]
         return (idx.global_data_index, idx.size)
 
-    def _get_item_slice_in_shard(self, item_id: int) -> Tuple[int, int]:
-        """Return the intersection of the item with the current shard,
-        as coordinates relative to the item's start."""
+    def _get_item_self_range(
+        self, item_id: int, *, as_shard: bool = True
+    ) -> Tuple[int, int]:
+        """Return coordinates relative to the item's own start.
+
+        When ``as_shard=True`` (default), returns the portion of the item
+        that falls within this rank's shard — the slice ``(start, end)``
+        within the item.  When ``as_shard=False``, returns ``(0, size)``
+        representing the full item.
+        """
         idx = self.item_index_map[item_id]
+        if not as_shard:
+            return (0, idx.size)
+
         item_start = idx.global_data_index
         item_end = item_start + idx.size
         shard_start = self.shard_meta.global_data_index
@@ -258,10 +279,23 @@ class BufferIndex:
         end = min(item_end, shard_end) - item_start
         return (start, end)
 
-    def _get_item_local_shard_index(self, item_id: int) -> Tuple[int, int]:
-        """Return coordinates within self.data for the portion of the item
-        that falls in this rank's shard."""
-        slice_start, slice_end = self._get_item_slice_in_shard(item_id)
+    def _get_item_local_range(
+        self, item_id: int, *, as_shard: bool = False
+    ) -> Tuple[int, int]:
+        """Return coordinates within self.data for the item.
+
+        Parameters
+        ----------
+        as_shard : bool
+            If True, compute the shard intersection even when the buffer
+            is not distributed.  Default (False) returns the full item
+            range for non-distributed buffers.
+        """
+        if not self.is_distributed and not as_shard:
+            idx = self.item_index_map[item_id]
+            return (idx.global_data_index, idx.global_data_index + idx.size)
+
+        slice_start, slice_end = self._get_item_self_range(item_id)
         if slice_start == slice_end:
             return (0, 0)
 
@@ -272,13 +306,6 @@ class BufferIndex:
             + self.shard_meta.local_data_index
         )
         return (offset + slice_start, offset + slice_end)
-
-    def _get_item_local_index(self, item_id: int) -> Tuple[int, int]:
-        """Unified entry: return coordinates within self.data for the item."""
-        if not self.is_distributed:
-            idx = self.item_index_map[item_id]
-            return (idx.global_data_index, idx.global_data_index + idx.size)
-        return self._get_item_local_shard_index(item_id)
 
 
 class DataParallelBuffer:
@@ -373,7 +400,7 @@ class DataParallelBuffer:
         # Collect (local_start, local_end, item_id, global_start, size) for each item
         slices = []
         for item_id in range(n_items):
-            local_start, local_end = self.buffer_index._get_item_local_index(item_id)
+            local_start, local_end = self.buffer_index._get_item_local_range(item_id)
             idx = self.buffer_index.item_index_map[item_id]
             slices.append((local_start, local_end, item_id, idx.global_data_index, idx.size))
 
@@ -453,20 +480,17 @@ class DataParallelBuffer:
     def set_item(self, item_id: int, item_data: torch.Tensor) -> None:
         """Write a parameter tensor into the corresponding region of the buffer."""
         if self.is_distributed:
-            slice_start, slice_end = self.buffer_index._get_item_slice_in_shard(item_id)
+            slice_start, slice_end = self.buffer_index._get_item_self_range(item_id)
             item_data = item_data.flatten()[slice_start:slice_end]
 
-        local_start, local_end = self.buffer_index._get_item_local_index(item_id)
+        local_start, local_end = self.buffer_index._get_item_local_range(item_id)
         shard = self.data[local_start:local_end]
         if shard.numel() > 0:
             shard.data.copy_(item_data.flatten())
 
-    def get_item(self, item_id: int, only_shard: bool = False) -> torch.Tensor:
+    def get_item(self, item_id: int, *, as_shard: bool = False) -> torch.Tensor:
         """Read a parameter tensor (or its shard) from the buffer."""
-        if only_shard:
-            start, end = self.buffer_index._get_item_local_shard_index(item_id)
-        else:
-            start, end = self.buffer_index._get_item_local_index(item_id)
+        start, end = self.buffer_index._get_item_local_range(item_id, as_shard=as_shard)
         return self.data[start:end]
 
     def is_unsharded(self) -> bool:
@@ -509,14 +533,23 @@ class DataParallelBuffer:
         else:
             full_buffer = self.data
 
-        for p in self.params:
-            item_id = self.param_idx[p]
-            offset, size = self.buffer_index._get_item_offset(item_id)
-            idx_shape = self.buffer_index.item_index_map[item_id].shape
-            param_data = full_buffer[offset : offset + size].view(idx_shape)
-            self.mp_policy.bind_unsharded_param(p, param_data, self.buffer_role)
+        # Bind the full buffer to the params according to the layout.
+        self._bind_buffer_to_params(full_buffer)
 
         return (full_buffer, work)
+
+    def _bind_buffer_to_params(self, buffer: torch.Tensor) -> None:
+        """Bind the given buffer to the params according to the layout."""
+        assert buffer.numel() == self.buffer_index.bucket_meta.size, (
+            f"Buffer size {buffer.numel()} does not match expected size "
+            f"{self.buffer_index.bucket_meta.size}"
+        )
+        for p in self.params:
+            item_id = self.param_idx[p]
+            offset, size = self.buffer_index._get_item_global_range(item_id)
+            idx_shape = self.buffer_index.item_index_map[item_id].shape
+            param_data = buffer[offset : offset + size].view(idx_shape)
+            self.mp_policy.bind_unsharded_param(p, param_data, self.buffer_role)
 
     @torch.no_grad()
     def reshard(self) -> None:

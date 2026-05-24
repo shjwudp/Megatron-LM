@@ -35,9 +35,11 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule, hook_module: nn.Module |
 
     def unshard_param_groups(_hook_module, *unused):
         ctx = fsdp_module._fsdp_root_context
+        logger.info(f"[RANK={torch.distributed.get_rank()}] FWD unshard_hook id={fsdp_module._fsdp_module_name}")
         if ctx.backward_phase:
             fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
         fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
+        logger.info(f"[RANK={torch.distributed.get_rank()}] FWD unshard_hook id={fsdp_module._fsdp_module_name} DONE")
 
     # In the normal path, the hook is installed on the FSDP module itself.
     # Fine-grained recompute can replay a child forward without entering the
@@ -65,10 +67,12 @@ def _register_forward_hook(module: FSDPModule):
     """Register post-forward hook to reshard parameters."""
 
     def reshard_param_groups(module, *unused):
+        logger.info(f"[RANK={torch.distributed.get_rank()}] FWD reshard_hook id={module._fsdp_module_name}")
         ctx = module._fsdp_root_context
         if ctx.backward_phase and id(module) == ctx.backward_module:
             return
         module.reshard()
+        logger.info(f"[RANK={torch.distributed.get_rank()}] FWD reshard_hook id={module._fsdp_module_name} DONE")
 
     module._mfsdp_forward_hook = module.register_forward_hook(reshard_param_groups)
 
@@ -108,6 +112,7 @@ def _register_backward_pre_hook(module: FSDPModule):
     def pre_backward_hook(module: FSDPModule, grads):
         """Hook called before backward pass for this module."""
         ctx = module._fsdp_root_context
+        logger.info(f"[RANK={torch.distributed.get_rank()}] BWD pre_hook id={id(module)}")
         if module._fsdp_state._is_root:
             ctx.backward_done_modules.clear()
             ctx.backward_phase = True

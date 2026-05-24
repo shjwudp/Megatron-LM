@@ -182,7 +182,7 @@ def test_init_buffers(strategy):
             for i, p in enumerate(orig):
                 item = wbuf.get_item(i)
                 if w_dist:
-                    s, e = wbuf.buffer_index._get_item_slice_in_shard(i)
+                    s, e = wbuf.buffer_index._get_item_self_range(i)
                     expected = p.flatten()[s:e]
                 else:
                     expected = p.flatten()
@@ -228,7 +228,7 @@ def test_unshard_reshard(strategy):
             # Distributed: after all-gather, every param should be fully
             # recoverable from the unsharded buffer at its global offset
             for i, p in enumerate(orig):
-                off, sz = wbuf.buffer_index._get_item_offset(i)
+                off, sz = wbuf.buffer_index._get_item_global_range(i)
                 recovered = unsharded[off : off + sz]
                 assert torch.equal(recovered, p.flatten())
 

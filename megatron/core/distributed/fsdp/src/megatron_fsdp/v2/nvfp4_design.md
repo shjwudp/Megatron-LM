@@ -317,6 +317,49 @@ Files that do **not** need changes: `fp4_utils.py`, `hooks.py`, `fully_shard.py`
    `ParameterGroup` params regardless of their storage dtype.
 
 5. **Checkpoint save/load**: The `state_dict` hooks and DTensor-based checkpoint
-   path in `mcore_fsdp_checkpoint_design.md` should work transparently since
-   the DTensor views point into the main_weight_buffer (fp32), not the packed
-   model-weight buffer.
+    path in `mcore_fsdp_checkpoint_design.md` should work transparently since
+    the DTensor views point into the main_weight_buffer (fp32), not the packed
+    model-weight buffer.
+
+## 9. BufferIndex API (Standardized)
+
+The `BufferIndex` class provides three coordinate domains for querying item
+positions.  All method names use a consistent `_range` suffix and clear domain
+prefixes:
+
+| Method | Domain | Returns | Description |
+|--------|--------|---------|-------------|
+| `_get_item_self_range(item_id)` | **Item-self** | `(start, end)` | Offset within the item itself (0 = start of item). What portion of this item falls in the current rank's shard. |
+| `_get_item_local_range(item_id, *, as_shard=False)` | **Local buffer** | `(start, end)` | Byte offsets within `self.data` (the local GPU buffer). Where to read/write. The `as_shard` flag forces shard-intersection computation even for non-distributed buffers. |
+| `_get_item_global_range(item_id)` | **Global buffer** | `(global_offset, size)` | Position and size in the full logical (unsharded) buffer. Same on all ranks. |
+
+`_get_item_local_range` absorbs the old `_get_item_local_index` and
+`_get_item_local_shard_index`.  The `as_shard` kwarg unifies what was
+previously the `only_shard` flag on `get_item()`:
+
+```python
+def get_item(self, item_id, *, as_shard=False):
+    start, end = self.buffer_index._get_item_local_range(item_id, as_shard=as_shard)
+    return self.data[start:end]
+```
+
+## 10. DataParallelBuffer.summon_full_params
+
+Context manager that temporarily unshards a buffer, then automatically
+reshards on exit:
+
+```python
+@contextmanager
+def summon_full_params(self, async_op=False):
+    need_unshard = self.is_distributed and not self.is_unsharded()
+    if need_unshard:
+        self.unshard(async_op=async_op)
+    try:
+        yield
+    finally:
+        if need_unshard:
+            self.reshard()
+```
+
+Only unshards/reshards if the buffer is actually distributed and not
+already unsharded.  Non-distributed buffers are a transparent no-op.

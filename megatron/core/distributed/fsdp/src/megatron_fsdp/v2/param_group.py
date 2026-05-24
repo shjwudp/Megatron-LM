@@ -302,10 +302,10 @@ class ParameterGroup:
         for param in self.params:
             if self.main_weight_buffer is not None:
                 mbuf = self.main_weight_buffer
-                data = mbuf.get_item(self.param_idx[param], only_shard=is_param_shard)
+                data = mbuf.get_item(self.param_idx[param], as_shard=is_param_shard)
             elif self.model_weight_buffer is not None:
                 wbuf = self.model_weight_buffer
-                data = wbuf.get_item(self.param_idx[param], only_shard=is_param_shard)
+                data = wbuf.get_item(self.param_idx[param], as_shard=is_param_shard)
             else:
                 data = param.data.detach()
 
@@ -331,7 +331,7 @@ class ParameterGroup:
         is_grad_shard = is_param_shard
         for p in self.params:
             gbuf = self.main_grad_buffer
-            grad_data = gbuf.get_item(self.param_idx[p], only_shard=is_grad_shard)
+            grad_data = gbuf.get_item(self.param_idx[p], as_shard=is_grad_shard)
             # NOTE: Do not remove the grad_data.numel() > 0 check.
             # Empty local grad shards are semantically no-ops, but materializing
             # them as DTensor grads can pass zero-numel tensors into fused
