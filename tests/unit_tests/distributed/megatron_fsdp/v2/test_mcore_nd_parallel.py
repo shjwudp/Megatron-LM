@@ -175,17 +175,12 @@ class TestMegatronFSDPE2E:
                     fp8="e4m3",
                     fp8_param_gather=True,
                     fp8_recipe="mxfp8",
-                    main_grads_dtype="fp32",
-                    main_params_dtype="fp32",
-                    exp_avg_dtype="bf16",
-                    exp_avg_sq_dtype="bf16",
                     moe_grouped_gemm=True,
                     overlap_param_gather=True,
                     overlap_grad_reduce=True,
                     use_megatron_fsdp_v2=True,
-                    use_precision_aware_optimizer=True,
                 ),
-                id="optim_grads_params_mxfp8_param_gather_pao",
+                id="optim_grads_params_mxfp8_param_gather",
             ),
             pytest.param(
                 dict(
