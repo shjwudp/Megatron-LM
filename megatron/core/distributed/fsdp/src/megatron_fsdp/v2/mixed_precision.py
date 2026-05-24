@@ -522,17 +522,9 @@ class FullyShardMixedPrecisionPolicy:
         assert model_weight_buffer is not None, "main weights require a model-weight buffer"
 
         if self.is_nvfp4_param(params[0]):
-            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-            logger.info(
-                f"[RANK={rank}] NVFP4 quantize step dp={torch.distributed.get_world_size(data_parallel_group)}"
-            )
             quantize_main_weights_to_nvfp4(
                 params, param_idx, data_parallel_group, model_weight_buffer, main_weight_buffer
             )
-            logger.info(
-                f"[RANK={rank}] NVFP4 quantize step dp={torch.distributed.get_world_size(data_parallel_group)} finished"
-            )
-            torch.distributed.barrier()
             return
 
         if not self.is_fp8_param(params[0]):

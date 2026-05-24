@@ -252,6 +252,8 @@ class TestMegatronFSDPE2E:
         reference_outputs = ref_cache[ref_cache_key]
 
         if torch.distributed.get_rank() == 0:
+            print(f"FSDP outputs: {outputs}")
+            print(f"Reference outputs: {reference_outputs}")
             for step, (output, ref_output) in enumerate(zip(outputs, reference_outputs)):
                 loss = output["lm loss"]
                 ref_loss = ref_output["lm loss"]

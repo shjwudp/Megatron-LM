@@ -108,7 +108,6 @@ def _register_backward_pre_hook(module: FSDPModule):
     def pre_backward_hook(module: FSDPModule, grads):
         """Hook called before backward pass for this module."""
         ctx = module._fsdp_root_context
-        logger.info(f"[RANK={torch.distributed.get_rank()}] BWD pre_hook id={id(module)}")
         if module._fsdp_state._is_root:
             ctx.backward_done_modules.clear()
             ctx.backward_phase = True
