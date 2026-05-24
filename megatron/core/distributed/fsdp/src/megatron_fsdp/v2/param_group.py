@@ -120,7 +120,10 @@ class ParameterGroup:
                 buffer.allocator = allocator
 
     def _create_buffer(
-        self, dtype: torch.dtype, is_distributed: bool, role: str,
+        self,
+        dtype: torch.dtype,
+        is_distributed: bool,
+        role: str,
         param_shapes: Optional[List[torch.Size]] = None,
     ) -> DataParallelBuffer:
         """Create a buffer and namespace its temporary bucket by role."""
@@ -161,8 +164,7 @@ class ParameterGroup:
             model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
             model_weight_shapes = self.mp_policy.model_weight_buffer_shapes(self.params)
             wbuf = self._create_buffer(
-                model_weight_dtype, shard_weights, "model_weight",
-                param_shapes=model_weight_shapes,
+                model_weight_dtype, shard_weights, "model_weight", param_shapes=model_weight_shapes
             )
             wbuf.init_data(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):

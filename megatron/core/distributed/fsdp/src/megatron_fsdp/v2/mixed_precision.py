@@ -209,10 +209,7 @@ class FullyShardMixedPrecisionPolicy:
             object.__setattr__(self, "keep_fp8_transpose_cache", self.fp8.keep_transpose_cache)
 
         if self.nvfp4 is None:
-            nvfp4 = FullyShardNVFP4Policy(
-                enabled=self.fp4_param_gather,
-                recipe=self.fp4_recipe,
-            )
+            nvfp4 = FullyShardNVFP4Policy(enabled=self.fp4_param_gather, recipe=self.fp4_recipe)
             object.__setattr__(self, "nvfp4", nvfp4)
         else:
             object.__setattr__(self, "fp4_param_gather", self.nvfp4.enabled)
@@ -241,9 +238,9 @@ class FullyShardMixedPrecisionPolicy:
                 assert (
                     QUANTIZED_MODEL_INIT_CLASS is not nullcontext
                 ), "Transformer Engine is required for NVFP4 parameter initialization"
-                assert HAVE_TE_NVFP4_RECIPE, (
-                    "NVFP4BlockScaling recipe requires Transformer Engine >= 2.7.0.dev0"
-                )
+                assert (
+                    HAVE_TE_NVFP4_RECIPE
+                ), "NVFP4BlockScaling recipe requires Transformer Engine >= 2.7.0.dev0"
                 args = {"enabled": True, "recipe": NVFP4BlockScaling()}
                 if (
                     "preserve_high_precision_init_val"
@@ -306,9 +303,7 @@ class FullyShardMixedPrecisionPolicy:
             return torch.uint8
         return tensor.dtype
 
-    def model_weight_buffer_shapes(
-        self, params: List[torch.Tensor]
-    ) -> Optional[List[torch.Size]]:
+    def model_weight_buffer_shapes(self, params: List[torch.Tensor]) -> Optional[List[torch.Size]]:
         """Return model-weight buffer shapes for ``params``.
 
         For NVFP4 params the storage is packed (2 values per byte), so the
@@ -528,15 +523,15 @@ class FullyShardMixedPrecisionPolicy:
 
         if self.is_nvfp4_param(params[0]):
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-            logger.info(f"[RANK={rank}] NVFP4 quantize step dp={torch.distributed.get_world_size(data_parallel_group)}")
-            quantize_main_weights_to_nvfp4(
-                params,
-                param_idx,
-                data_parallel_group,
-                model_weight_buffer,
-                main_weight_buffer,
+            logger.info(
+                f"[RANK={rank}] NVFP4 quantize step dp={torch.distributed.get_world_size(data_parallel_group)}"
             )
-            logger.info(f"[RANK={rank}] NVFP4 quantize step dp={torch.distributed.get_world_size(data_parallel_group)} finished")
+            quantize_main_weights_to_nvfp4(
+                params, param_idx, data_parallel_group, model_weight_buffer, main_weight_buffer
+            )
+            logger.info(
+                f"[RANK={rank}] NVFP4 quantize step dp={torch.distributed.get_world_size(data_parallel_group)} finished"
+            )
             torch.distributed.barrier()
             return
 
@@ -689,9 +684,7 @@ def quantize_main_weights_to_nvfp4(
 ) -> None:
     """Quantize FP32 main-weight shards into NVFP4 model-weight shards."""
     if not HAVE_TE_QUANTIZE_MASTER_WEIGHTS:
-        raise RuntimeError(
-            "quantize_master_weights requires Transformer Engine >= 2.7.0.dev0"
-        )
+        raise RuntimeError("quantize_master_weights requires Transformer Engine >= 2.7.0.dev0")
 
     if len(model_params) == 0:
         return
@@ -701,7 +694,10 @@ def quantize_main_weights_to_nvfp4(
     te_start_offsets = []
 
     wbuf = model_weight_buffer
-    full_weight_buffer = wbuf.fetch_unsharded_buffer()
+    if not wbuf.is_distributed:
+        raise RuntimeError("FIXME: implement non-distributed NVFP4 quantization path")
+
+    full_weight_buffer = wbuf.fetch_buffer()
     wbuf._bind_buffer_to_params(full_weight_buffer)
 
     for param in model_params:
@@ -723,16 +719,10 @@ def quantize_main_weights_to_nvfp4(
         kwargs["manual_post_all_gather_processing"] = True
 
     quantize_master_weights(
-        te_model_params,
-        te_main_params,
-        te_start_offsets,
-        data_parallel_group,
-        **kwargs,
+        te_model_params, te_main_params, te_start_offsets, data_parallel_group, **kwargs
     )
 
-    if not wbuf.is_distributed:
-        raise RuntimeError("FIXME: implement non-distributed NVFP4 quantization path")
-    wbuf.data.copy_(main_weight_buffer.data)
+    wbuf.data.copy_(wbuf.fetch_buffer(as_shard=True))
 
     # Don't forget to reshard the model weight buffer after directly writing into its payload
     wbuf.reshard()

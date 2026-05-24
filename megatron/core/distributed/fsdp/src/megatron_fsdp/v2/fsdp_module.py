@@ -240,7 +240,7 @@ class FSDPModule(nn.Module):
             gbuf = p._gbuf
             item_id = p._item_id
 
-            gbuf_data = gbuf.fetch_unsharded_buffer()
+            gbuf_data = gbuf.fetch_buffer()
             assert gbuf_data is not None
             assert gbuf_data.numel() > 0
 
@@ -314,7 +314,9 @@ class FSDPModule(nn.Module):
         (mid-forward or mid-backward) will corrupt their state.  The safety
         check below enforces that constraint.
         """
-        named_forward_modules = [(name, child) for name, child in self.named_modules() if isinstance(child, FSDPModule)]
+        named_forward_modules = [
+            (name, child) for name, child in self.named_modules() if isinstance(child, FSDPModule)
+        ]
         forward_order = [child for name, child in named_forward_modules]
 
         # Safety check: no child FSDPModule must be in an active state.
@@ -602,16 +604,11 @@ class FSDPModule(nn.Module):
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
-        group_idx = 0
-        for module_name, child in self.named_modules():
+        for child in self.modules():
             if not isinstance(child, FSDPModule):
                 continue
-            rank = torch.distributed.get_rank()
             for param_group in child._fsdp_param_groups:
-                logger.info(f"Rank {rank} copying main weights to model weights for {module_name} #{group_idx}")
                 param_group.copy_main_weights_to_model_weights()
-                logger.info(f"Rank {rank} done copying main weights to model weights for {module_name} #{group_idx}")
-                group_idx += 1
 
     def _compute_per_param_norms(self) -> Dict[str, Dict[str, float]]:
         """

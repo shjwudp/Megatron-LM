@@ -261,8 +261,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 keep_transpose_cache=ddp_config.keep_fp8_transpose_cache,
             ),
             nvfp4=FullyShardNVFP4Policy(
-                enabled=ddp_config.fp4_param_gather,
-                recipe=config.fp4_recipe,
+                enabled=ddp_config.fp4_param_gather, recipe=config.fp4_recipe
             ),
         )
         kwargs = {

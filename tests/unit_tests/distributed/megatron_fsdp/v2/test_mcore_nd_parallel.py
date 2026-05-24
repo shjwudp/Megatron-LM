@@ -199,7 +199,6 @@ class TestMegatronFSDPE2E:
                     overlap_param_gather=True,
                     overlap_grad_reduce=True,
                     use_megatron_fsdp_v2=True,
-                    global_batch_size=8,
                 ),
                 id="optim_grads_params_nvfp4_param_gather",
             ),

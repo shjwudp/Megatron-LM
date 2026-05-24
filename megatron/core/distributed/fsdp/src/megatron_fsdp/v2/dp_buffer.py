@@ -253,9 +253,7 @@ class BufferIndex:
         idx = self.item_index_map[item_id]
         return (idx.global_data_index, idx.size)
 
-    def _get_item_self_range(
-        self, item_id: int, *, as_shard: bool = True
-    ) -> Tuple[int, int]:
+    def _get_item_self_range(self, item_id: int, *, as_shard: bool = True) -> Tuple[int, int]:
         """Return coordinates relative to the item's own start.
 
         When ``as_shard=True`` (default), returns the portion of the item
@@ -279,9 +277,7 @@ class BufferIndex:
         end = min(item_end, shard_end) - item_start
         return (start, end)
 
-    def _get_item_local_range(
-        self, item_id: int, *, as_shard: bool = False
-    ) -> Tuple[int, int]:
+    def _get_item_local_range(self, item_id: int, *, as_shard: bool = False) -> Tuple[int, int]:
         """Return coordinates within self.data for the item.
 
         Parameters
@@ -559,19 +555,32 @@ class DataParallelBuffer:
         self.allocator.free(self.alloc_key)
         self._unsharded_buffer = None
 
-    def fetch_unsharded_buffer(self) -> torch.Tensor:
-        """Return the unsharded buffer, allocating it if needed."""
-        if not self.is_distributed:
-            return self.data
-        if self._unsharded_buffer is None:
-            bucket = self.allocator.allocate(
-                key=self.alloc_key,
-                size=self.buffer_index.bucket_meta.size,
-                dtype=self.dtype,
-                device=self.device,
-            )
-            self._unsharded_buffer = bucket.data
-        return self._unsharded_buffer
+    def fetch_buffer(self, *, as_shard: bool = False) -> torch.Tensor:
+        """Return the buffer, allocating the full unsharded view if needed.
+
+        Parameters
+        ----------
+        as_shard : bool
+            If True, return only this rank's shard slice of the full buffer.
+            Default (False) returns the full unsharded buffer.
+        """
+        if self.is_distributed:
+            if self._unsharded_buffer is None:
+                bucket = self.allocator.allocate(
+                    key=self.alloc_key,
+                    size=self.buffer_index.bucket_meta.size,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                self._unsharded_buffer = bucket.data
+            full = self._unsharded_buffer
+        else:
+            full = self.data
+
+        if as_shard:
+            sm = self.buffer_index.shard_meta
+            return full[sm.bucket_data_index : sm.bucket_data_index + sm.size]
+        return full
 
     @torch.no_grad()
     def reduce_grad(self, grad_comm_dtype: Optional[torch.dtype] = None):
@@ -606,7 +615,7 @@ class DataParallelBuffer:
                 self.data.copy_(comm_data.to(self.dtype))
             return
 
-        full_grad = self.fetch_unsharded_buffer()
+        full_grad = self.fetch_buffer()
         comm_input = full_grad if grad_comm_dtype == self.dtype else full_grad.to(grad_comm_dtype)
         if full_grad.is_cuda:
             # Keep temporary reduce-scatter buffers tied to the stream that uses them.
