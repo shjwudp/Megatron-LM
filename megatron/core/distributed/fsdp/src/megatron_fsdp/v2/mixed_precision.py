@@ -7,7 +7,6 @@ config objects belongs in the adapter layer.
 """
 
 import inspect
-import logging
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from importlib.metadata import version
@@ -157,9 +156,6 @@ if not HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8:
         else:
             for this_, that_ in zip(this, that):
                 that_.copy_(this_)
-
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
