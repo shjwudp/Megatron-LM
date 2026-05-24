@@ -236,6 +236,7 @@ class TestMegatronFSDPE2E:
             reference_spec_configs = copy.deepcopy(spec_configs)
             reference_spec_configs["use_megatron_fsdp_v2"] = False
             reference_spec_configs["gradient_accumulation_fusion"] = False
+            reference_spec_configs["fp8_param_gather"] = False
             ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
                 use_distributed_optimizer=True, **nd_topology, **reference_spec_configs
             )
@@ -252,8 +253,6 @@ class TestMegatronFSDPE2E:
         reference_outputs = ref_cache[ref_cache_key]
 
         if torch.distributed.get_rank() == 0:
-            print(f"FSDP outputs: {outputs}")
-            print(f"Reference outputs: {reference_outputs}")
             for step, (output, ref_output) in enumerate(zip(outputs, reference_outputs)):
                 loss = output["lm loss"]
                 ref_loss = ref_output["lm loss"]

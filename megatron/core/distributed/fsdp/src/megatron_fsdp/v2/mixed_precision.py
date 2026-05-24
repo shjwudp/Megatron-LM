@@ -473,7 +473,7 @@ class FullyShardMixedPrecisionPolicy:
                 if hasattr(param, "update_usage"):
                     param.update_usage(rowwise_usage=not bwd_pass, columnwise_usage=True)
 
-        if len(nvfp4_params) > 0:
+        if len(nvfp4_params) > 0 and bwd_pass:
             # TE rebuilds recipe-specific state after FSDP all-gather for NVFP4.
             # Only call post_all_gather_processing if the params have valid
             # internal state; skip if _rowwise_data or _rowwise_scale_inv is
@@ -701,7 +701,18 @@ def quantize_main_weights_to_nvfp4(
         # Compute the start offset in LOGICAL element space using the main
         # weight buffer index (full shapes), not the model weight buffer
         # index (packed shapes for NVFP4).
-        shard_offset, _ = wbuf.buffer_index._get_item_self_range(item_id, as_shard=True)
+        #
+        # WARNING: Do NOT use wbuf.buffer_index._get_item_self_range() here.
+        # The model weight buffer for NVFP4 uses packed shapes (last dim
+        # halved, 2 values per uint8 byte).  Its self_range returns offsets
+        # in *packed-byte* space, but TE's quantize_master_weights expects
+        # offsets in *logical-element* space.  Using the wrong offset on
+        # non-zero DP ranks silently corrupts the model weight buffer because
+        # TE writes to the wrong byte position.  Always derive this offset
+        # from the main_weight_buffer index, which uses full logical shapes.
+        shard_offset, _ = main_weight_buffer.buffer_index._get_item_self_range(
+            item_id, as_shard=True
+        )
         te_model_params.append(param)
         te_main_params.append(main_weight_shard)
         te_start_offsets.append(shard_offset)
