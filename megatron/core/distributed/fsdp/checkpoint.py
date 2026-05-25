@@ -703,6 +703,21 @@ def _preprocess_and_verify_v2_state_dict(v2_state_dict):
     v2_model = v2_state_dict["model"]
     v2_optim_state_raw = v2_state_dict.get("optimizer", {}).get("state", {})
 
+    # ---- Propagate chunk metadata from model to state dict DTensors ----
+    # Also determine which model parameters have chunk metadata so we
+    # only verify those (replicated params e.g. embeddings legitimately
+    # lack it).
+    model = v2_state_dict.get("_model")
+    model_params_with_meta = set()
+    if model is not None:
+        if isinstance(model, (list, tuple)):
+            model = model[0]
+        _propagate_chunk_metadata_to_state_dict(model, v2_model)
+        for name, param in model.named_parameters():
+            assert hasattr(param, "_local_tensor"), f"Expected DTensor parameter '{name}' to have _local_tensor"
+            if isinstance(param, DTensor) and hasattr(param._local_tensor, "__create_chunk_list__"):
+                model_params_with_meta.add(name)
+
     # ---- Strip ``module.`` prefix from optimizer state keys ----
     # Copy inner dicts so DTensor wrapping below does not mutate
     # the original state dict (optimizer.load_state_dict needs plain tensors).
@@ -733,7 +748,11 @@ def _preprocess_and_verify_v2_state_dict(v2_state_dict):
             v2_optim_state[param_name][sk] = _maybe_wrap_as_uneven_dtensor(sv, dist_param)
 
     # ---- Verify model DTensors have chunk metadata ----
+    # Only check parameters whose model-side counterpart has chunk metadata;
+    # replicated params (e.g. word embeddings) legitimately lack it.
     for canonical, v2_val in v2_by_canonical.items():
+        if canonical not in model_params_with_meta:
+            continue
         if hasattr(v2_val, "_local_tensor"):
             lt = v2_val._local_tensor
             assert hasattr(lt, "__create_chunk_list__"), (

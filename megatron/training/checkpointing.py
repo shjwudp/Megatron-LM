@@ -989,11 +989,10 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
 def _is_megatron_fsdp_v2(model):
     """Check if model uses Megatron FSDP v2 (use_megatron_fsdp_v2 flag)."""
     from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
-    m = model[0] if isinstance(model, (list, tuple)) else model
-    if isinstance(m, FSDPModule):
-        return True
-    if hasattr(m, 'module') and isinstance(m.module, FSDPModule):
-        return True
+    first_model = model[0] if isinstance(model, (list, tuple)) else model
+    for m in first_model.modules():
+        if isinstance(m, FSDPModule):
+            return True
 
     return False
 

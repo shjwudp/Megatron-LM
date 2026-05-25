@@ -465,9 +465,9 @@ class FullyShardMixedPrecisionPolicy:
                         param._create_transpose()
                     else:
                         param._create_columnwise()
-            for param in fp8_params:
-                if hasattr(param, "update_usage"):
-                    param.update_usage(rowwise_usage=not bwd_pass, columnwise_usage=True)
+                for param in fp8_params:
+                    if hasattr(param, "update_usage"):
+                        param.update_usage(rowwise_usage=not bwd_pass, columnwise_usage=True)
 
         if len(nvfp4_params) > 0 and bwd_pass:
             # TE rebuilds recipe-specific state after FSDP all-gather for NVFP4.
