@@ -1032,6 +1032,9 @@ def generate_state_dict(
             )
         else:   # torch, torch_dcp, fsdp_dtensor
             model_sd = model[i].state_dict_for_save_checkpoint()
+            if args.use_megatron_fsdp_v2 and args.ckpt_format == "fsdp_dtensor":
+                from megatron.core.distributed.fsdp.checkpoint import _propagate_chunk_metadata_to_state_dict
+                _propagate_chunk_metadata_to_state_dict(model[i], model_sd)
 
         state_dict[key] = model_sd
 

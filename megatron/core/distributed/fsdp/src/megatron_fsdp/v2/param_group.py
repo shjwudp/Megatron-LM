@@ -312,7 +312,10 @@ class ParameterGroup:
                 data = param.data.detach()
 
             dist_param = torch.nn.Parameter(
-                make_uneven_dtensor(data, param.shape, self.mesh, placements),
+                make_uneven_dtensor(
+                    data, param.shape, self.mesh, placements,
+                    post_process_uneven=True,
+                ),
                 requires_grad=param.requires_grad,
             )
             # Mark as FSDP parameter for special handling
