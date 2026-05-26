@@ -112,8 +112,7 @@ class MegatronFSDPStateful(Stateful):
             state_dict["optimizer"] = optim_sd
 
         if self.args is not None:
-            _apply_mcore_postprocess(state_dict, self.args, self.model)
-
+            state_dict = _apply_mcore_postprocess(state_dict, self.args, self.model)
         return state_dict
 
     def load_state_dict(self, state_dict):
@@ -632,18 +631,20 @@ def _maybe_wrap_as_uneven_dtensor(tensor, dist_param: DTensor):
     DTensors.  Returns the original tensor unchanged if it is already a DTensor
     or its shape does not match the parameter's local shard.
     """
-    if isinstance(tensor, DTensor) or not isinstance(tensor, torch.Tensor):
-        return tensor
-    if tensor.shape != dist_param._local_tensor.shape:
-        return tensor
-    dt = make_uneven_dtensor(
-        tensor,
-        shape=dist_param.size(),
-        dp_mesh=dist_param.device_mesh,
-        placements=dist_param.placements,
-    )
-    if hasattr(dist_param._local_tensor, "__create_chunk_list__"):
-        copy_chunk_metadata(dist_param, dt)
+    if isinstance(tensor, DTensor):
+        dt = tensor
+    else:
+        if isinstance(tensor, DTensor) or not isinstance(tensor, torch.Tensor):
+            return tensor
+        if tensor.shape != dist_param._local_tensor.shape:
+            return tensor
+        dt = make_uneven_dtensor(
+            tensor,
+            shape=dist_param.size(),
+            dp_mesh=dist_param.device_mesh,
+            placements=dist_param.placements,
+        )
+    copy_chunk_metadata(dist_param, dt)
     return dt
 
 
@@ -819,7 +820,7 @@ def reverse_normalize_torch_dist_key(key: str) -> str:
 # v2 has per-expert:              <prefix>.layers.{N}.{field}.mlp.experts.{fc}.weight{M}
 _LAYERED_KEY_RE = re.compile(r'^(.+\.)?layers\.(\d+)\.(.+)$')
 _EXPERT_V2_KEY_RE = re.compile(r'(.+\.)?mlp\.experts\.linear_fc([12])\.weight(\d+)$')
-_SEQ_EXPERT_FIELD_RE = re.compile(r'^mlp\.experts\.local_experts\.(\d+)\.(linear_fc[12])\.weight$')
+_SEQ_EXPERT_FIELD_RE = re.compile(r'(?:.+\.)?mlp\.experts\.local_experts\.(\d+)\.(linear_fc[12])\.weight$')
 
 
 def _strip_module_prefix(key: str) -> str:
@@ -869,13 +870,24 @@ def _build_torch_dist_to_v2_map(metadata, v2_by_canonical, v2_optim_state):
         field = m.group(3)
 
         # ---- Check SequentialMLP expert format first ----
-        # v2:   ``mlp.experts.local_experts.{N}.linear_fc{1|2}.weight``
-        # td:   ``{prefix}layers.{layer_idx}.mlp.experts.experts.linear_fc{1|2}.weight``
+        # v2:   ``{sub_layer}mlp.experts.local_experts.{N}.linear_fc{1|2}.weight``
+        #       (sub_layer may be empty or e.g. ``mtp_model_layer.`` for MTP)
+        # td:   ``{prefix}layers.{layer_idx}.{sub_layer}mlp.experts.experts.linear_fc{1|2}.weight``
         seq_exp_m = _SEQ_EXPERT_FIELD_RE.match(field)
         if seq_exp_m:
             local_expert_idx = int(seq_exp_m.group(1))
             fc_type = seq_exp_m.group(2)
-            td_base = f"{prefix}layers.{layer_idx}.mlp.experts.experts.{fc_type}.weight"
+            # Extract sub-layer prefix (if any) before ``mlp.experts.local_experts``
+            sub_layer_prefix = ""
+            if not field.startswith("mlp.experts.local_experts."):
+                idx = field.find("mlp.experts.local_experts.")
+                if idx > 0:
+                    sub_layer_prefix = field[:idx]  # e.g. "mtp_model_layer."
+            td_base = (
+                f"{prefix}layers.{layer_idx}."
+                f"{sub_layer_prefix}mlp.experts.experts.{fc_type}.weight"
+            )
+            td_base = reverse_normalize_torch_dist_key(td_base)
             candidates = [td_base]
             candidates.append(f"model.{td_base}")
             candidates.append(f"module.{td_base}")
@@ -921,6 +933,7 @@ def _build_torch_dist_to_v2_map(metadata, v2_by_canonical, v2_optim_state):
         if field not in _match_fused_key._logged:
             _match_fused_key._logged.add(field)
             if not v2_canonical.endswith("._extra_state"):
+                assert field in _match_fused_key._logged, f"Expected to log missing fused key for field '{field}'"
                 logger.warning(
                     "Fused key not found in metadata for v2_key='%s' (field='%s'). "
                     "Tried candidates: %s",
@@ -989,18 +1002,23 @@ def _build_torch_dist_to_v2_map(metadata, v2_by_canonical, v2_optim_state):
         if seq_exp_m:
             local_expert_idx = int(seq_exp_m.group(1))
             fc_type = seq_exp_m.group(2)
+            # Extract sub-layer prefix (if any) before ``mlp.experts.local_experts``
+            sub_layer_prefix = ""
+            if not field.startswith("mlp.experts.local_experts."):
+                idx = field.find("mlp.experts.local_experts.")
+                if idx > 0:
+                    sub_layer_prefix = field[:idx]  # e.g. "mtp_model_layer."
             for sk, sv in states.items():
                 if sk not in ("exp_avg", "exp_avg_sq"):
                     continue
                 fused_base = (
                     f"optimizer.state.{sk}."
-                    f"{prefix}layers.{layer_idx}.mlp.experts.experts.{fc_type}.weight"
+                    f"{prefix}layers.{layer_idx}."
+                    f"{sub_layer_prefix}mlp.experts.experts.{fc_type}.weight"
                 )
+                fused_base = reverse_normalize_torch_dist_key(fused_base)
                 td_opt_key = None
-                for candidate in [
-                    fused_base,
-                    f"optimizer.state.{sk}.model.{prefix}layers.{layer_idx}.mlp.experts.experts.{fc_type}.weight",
-                ]:
+                for candidate in [fused_base, f"model.{fused_base}"]:
                     if candidate in metadata:
                         td_opt_key = candidate
                         break
