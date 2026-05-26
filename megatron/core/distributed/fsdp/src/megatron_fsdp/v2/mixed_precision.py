@@ -307,7 +307,7 @@ class FullyShardMixedPrecisionPolicy:
         is required, in which case the caller falls back to ``param.shape``.
         """
         if not HAVE_TE_NVFP4 or not any(self.is_nvfp4_param(p) for p in params):
-            return None
+            return [p.shape for p in params]
         shapes = []
         for p in params:
             if self.is_nvfp4_param(p):

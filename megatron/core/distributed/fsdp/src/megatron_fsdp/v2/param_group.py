@@ -88,8 +88,9 @@ class ParameterGroup:
 
         # Compute chunk size factor for alignment
         # LCM ensures params align to common boundary for efficient sharding
-        if len(params) > 0 and any(p.shape[1:].numel() > 0 for p in params):
-            self.chunk_size_factor = max(1, math.lcm(*[p.shape[1:].numel() for p in params]))
+        model_weight_shapes = mp_policy.model_weight_buffer_shapes(params)
+        if len(params) > 0 and any(s[1:].numel() > 0 for s in model_weight_shapes):
+            self.chunk_size_factor = max(1, math.lcm(*[s[1:].numel() for s in model_weight_shapes]))
         else:
             self.chunk_size_factor = 1
 
