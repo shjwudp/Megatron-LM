@@ -1771,6 +1771,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                                        f" {sharded_sd_metadata['distrib_optim_sharding_type']}."
                                        f" Please use `--ckpt-fully-parallel-save` flag during checkpoint saving.")
 
+                if (
+                    args.use_megatron_fsdp_v2
+                    and sharded_sd_metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
+                ):
+                    raise RuntimeError(
+                        "Megatron FSDP v2 does not support checkpoint conversion from "
+                        "distrib_optim_sharding_type=dp_reshardable. "
+                        "Please re-save the checkpoint with --dist-ckpt-optim-fully-reshardable."
+                    )
+
                 # Check if fully parallel load is compatible with sharding type
                 if args.ckpt_fully_parallel_load and sharded_sd_metadata['distrib_optim_sharding_type'] == 'dp_zero_gather_scatter':
                     raise RuntimeError("Fully parallel load is not supported for dp_zero_gather_scatter checkpoints. "

@@ -313,8 +313,7 @@ class ParameterGroup:
 
             dist_param = torch.nn.Parameter(
                 make_uneven_dtensor(
-                    data, param.shape, self.mesh, placements,
-                    post_process_uneven=True,
+                    data, param.shape, self.mesh, placements, post_process_uneven=True
                 ),
                 requires_grad=param.requires_grad,
             )
