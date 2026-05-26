@@ -168,6 +168,11 @@ class DistributedDataParallelConfig:
       will be unsharded.
     """
 
+    use_megatron_fsdp: bool = False
+    """If true, use Megatron FSDP for FSDP sharding the model.
+    Automatically set when use_megatron_fsdp_v2 is True.
+    """
+
     use_megatron_fsdp_v2: bool = False
     """If true, use the `fully_shard` API for FSDP sharding the model.
     """

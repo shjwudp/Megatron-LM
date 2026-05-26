@@ -1104,6 +1104,9 @@ def validate_args(args, defaults={}):
                 "--inference-dynamic-batching-sampling-backend=torch."
             ) from e
 
+    if getattr(args, 'use_megatron_fsdp_v2', False):
+        args.use_megatron_fsdp = True
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
