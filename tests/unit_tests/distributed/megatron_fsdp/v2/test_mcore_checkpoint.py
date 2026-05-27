@@ -67,6 +67,8 @@ def _get_model_from_chunks(model_chunks):
 def _assert_model_match(source_full, loaded_full):
     nonempty = False
     for s_key, s_val in source_full.items():
+        if s_key.endswith("._extra_state"):
+            continue  # Skip _extra_state buffers which is runtime-dependent and not guaranteed to match
         canonical = _normalize_key(s_key)
         matched_key = None
         for l_key in loaded_full:
@@ -435,12 +437,14 @@ class TestMegatronFsdpV2Checkpoint:
                     fp4="e2m1",
                     fp4_recipe="nvfp4",
                     fp4_param_gather=True,
+                    bf16=True,
                 ),
                 dict(
                     data_parallel_sharding_strategy="optim_grads_params",
                     fp4="e2m1",
                     fp4_recipe="nvfp4",
                     fp4_param_gather=True,
+                    bf16=True,
                 ),
                 marks=pytest.mark.skipif(
                     not _NVFP4_AVAILABLE, reason=_NVFP4_SKIP_REASON

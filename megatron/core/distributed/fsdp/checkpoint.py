@@ -25,6 +25,7 @@ Provides:
   ``handle_experts_in_state_dict``, ``handle_fp8_extra_state_case``.
 """
 
+from collections.abc import Mapping
 import logging
 import re
 from typing import Optional, Tuple
@@ -452,10 +453,12 @@ def _find_param_in_map(key: str, param_map: dict) -> Optional[DTensor]:
     param = param_map.get(key)
     if param is not None:
         return param
-    stripped = key[len(_MODULE_PREFIX) :] if key.startswith(_MODULE_PREFIX) else key
-    param = param_map.get(stripped)
-    if param is not None:
-        return param
+    stripped = key
+    while stripped.startswith(_MODULE_PREFIX):
+        stripped = stripped[len(_MODULE_PREFIX) :]
+        param = param_map.get(stripped)
+        if param is not None:
+            return param
     return param_map.get(f"{_MODULE_PREFIX}{key}")
 
 
@@ -518,8 +521,33 @@ def _apply_mcore_postprocess(raw_state_dict, args, model):
                 optim_sd["param_to_group_meta"], num_experts
             )
 
+    flattened_sd = flatten_state_dict_keys(state_dict)
+    for key, value in flattened_sd.items():
+        if isinstance(value, DTensor):
+            assert hasattr(value._local_tensor, "__create_chunk_list__"), (
+                f"DTensor for key '{key}' is missing chunk metadata. This may cause issues"
+                f" with checkpointing. Ensure that the model parameters have chunk metadata"
+                f" and that it is properly propagated."
+            )
+
     return state_dict
 
+
+def flatten_state_dict_keys(state_dict, parent_key="", sep="."):
+    """
+    Recursively flatten nested mappings inside a state_dict.
+
+    Returns a dict: { "flat.key": value }
+    """
+    items = {}
+    for k, v in state_dict.items():
+        new_key = parent_key + sep + k if parent_key else k
+        if isinstance(v, Mapping):
+            # Recurse into nested dicts (e.g., when you saved extra metadata)
+            items.update(flatten_state_dict_keys(v, new_key, sep=sep))
+        else:
+            items[new_key] = v
+    return items
 
 # ------------------------------------------------------------------
 # Model state dict prefix alignment
