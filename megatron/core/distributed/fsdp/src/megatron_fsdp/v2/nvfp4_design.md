@@ -146,43 +146,53 @@ as FP8, lines 160–172).
 
 ### 5.2 `megatron_fsdp/v2/param_group.py`
 
-**`_init_buffers()`** — model-weight buffer creation delegates shape resolution downstream:
-
-```python
-if s != "no_shard":
-    model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
-    wbuf = self._create_buffer(
-        model_weight_dtype, shard_weights, "model_weight",
-    )
-    ...
-```
-
-`DataParallelBuffer.__init__()` calls `mp_policy.get_param_storage_shapes(params)` only
-for ``model_weight`` and ``transpose_weight`` buffers, since those store the
-compressed NVFP4 uint8 data.  Main-weight and main-grad buffers hold fp32 data
-and use the original parameter shapes (``[p.shape for p in params]``).
-
-For NVFP4, `get_param_storage_shapes()` returns packed shapes (e.g., `[128, 64]` → `[128, 32]`).
-For non-NVFP4, it returns the original param shapes.
+**`_init_buffers()`** — unchanged.  Buffer creation passes the shared logical
+`chunk_size_factor` through `_create_buffer()`.  Shape resolution is handled
+in `DataParallelBuffer.__init__()` and `BufferIndex.compact()`.
 
 ### 5.3 `megatron_fsdp/v2/dp_buffer.py`
 
-**`DataParallelBuffer.__init__()`** — uses packed shapes only for weight buffers:
+**`BufferIndex.compact(factor, compact_shapes)`** — **new method** that proportionally
+scales all indices for packed storage:
 
 ```python
-def __init__(
-    self,
-    params, param_idx, dtype, device, dp_group, param_group_id, *,
-    allocator=None, buffer_role="model_weight", is_distributed=False,
-    gradient_scaling_factor=None, chunk_size_factor=1,
-    sharding_strategy="no_shard", mp_policy,
-):
-    ...
-    _item_shapes = mp_policy.get_param_storage_shapes(params) if buffer_role in ("model_weight", "transpose_weight") else [p.shape for p in params]
-    self.buffer_index = BufferIndex(
-        param_shapes=_item_shapes, ...
+def compact(self, factor: float, compact_shapes: List[torch.Size]) -> None:
+    for item_id, item in self.item_index_map.items():
+        new_map[item_id] = ItemIndex(
+            global_data_index=int(item.global_data_index * factor),
+            size=int(item.size * factor),
+            item_id=item.item_id,
+            shape=compact_shapes[item_id],
+        )
+    self.item_index_map = new_map
+    self.bucket_meta = BucketMeta(
+        global_data_index=0,
+        size=int(self.bucket_meta.size * factor),
+        items=list(new_map.values()),
     )
+    self.shard_meta = self._build_shard_meta(...)
 ```
+
+For NVFP4, ``factor = 0.5`` and ``compact_shapes`` come from
+``get_param_storage_shapes()``.  This preserves the proportional item-offset
+mapping between buffers while eliminating fragment-binning waste.
+
+**`DataParallelBuffer.__init__()`** — always builds with logical shapes, then compacts
+NVFP4 weight buffers:
+
+```python
+_logical_shapes = [p.shape for p in params]
+self.buffer_index = BufferIndex(
+    param_shapes=_logical_shapes,
+    chunk_size_factor=chunk_size_factor,
+    ...,
+)
+if buffer_role in ("model_weight", "transpose_weight") and any(mp_policy.is_nvfp4_param(p) for p in params):
+    self.buffer_index.compact(0.5, mp_policy.get_param_storage_shapes(params))
+```
+
+Main-weight and main-grad buffers are never compacted — they keep the
+logical layout and the original ``chunk_size_factor``.
 
 ### 5.4 `megatron_fsdp/v2/fully_shard.py`
 
@@ -280,8 +290,8 @@ No changes needed. Existing functions (`is_nvfp4tensor`, `quantize_nvfp4_param_s
 | File | Change |
 |------|--------|
 | `megatron_fsdp/v2/mixed_precision.py` | Add `FullyShardNVFP4Policy`, NVFP4 detection, all policy methods |
-| `megatron_fsdp/v2/param_group.py` | Use logical `p.shape` for chunk_size_factor; packed LCM would misalign main buffers |
-| `megatron_fsdp/v2/dp_buffer.py` | Only use `get_param_storage_shapes()` for `model_weight`/`transpose_weight` buffers |
+| `megatron_fsdp/v2/param_group.py` | Pass logical `chunk_size_factor` (computed from ``p.shape``) to all buffers |
+| `megatron_fsdp/v2/dp_buffer.py` | Add `BufferIndex.compact()`; all buffers build with logical shapes, only NVFP4 weight buffers are compacted |
 | `megatron_fsdp/distributed_data_parallel_config.py` | Add `fp4_param_gather` field |
 | `mcore_fsdp_adapter.py` | Wire `fp4_param_gather` + `fp4_recipe` into policy |
 | `megatron_fsdp/v2/__init__.py` | Export new NVFP4 policy class |

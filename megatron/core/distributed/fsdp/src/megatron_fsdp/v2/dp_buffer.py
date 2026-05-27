@@ -51,6 +51,10 @@ class BufferIndex:
     ):
         self.param_group_id = param_group_id
         self.is_distributed = is_distributed
+        self.dp_rank = dp_rank
+        self.dp_world_size = dp_world_size
+        self.chunk_size_factor = chunk_size_factor
+        self.sharding_strategy = sharding_strategy
         self.item_index_map, self.bucket_meta = self._build_layout(
             param_shapes, dp_world_size, chunk_size_factor, sharding_strategy
         )
@@ -236,6 +240,37 @@ class BufferIndex:
             )
 
     # ------------------------------------------------------------------ #
+    #  Compaction — scale indices proportionally for packed storage
+    # ------------------------------------------------------------------ #
+
+    def compact(self, factor: float, compact_shapes: List[torch.Size]) -> None:
+        """Scale all indices proportionally for packed storage.
+
+        Args:
+            factor: Scale factor (0.5 for NVFP4 2-values-per-byte packing).
+            compact_shapes: Per-item shapes for the packed layout (same
+                length and order as the original param_shapes).
+        """
+        new_map: Dict[int, "BufferIndex.ItemIndex"] = {}
+        for item_id, item in self.item_index_map.items():
+            new_map[item_id] = self.ItemIndex(
+                global_data_index=int(item.global_data_index * factor),
+                size=int(item.size * factor),
+                item_id=item.item_id,
+                shape=compact_shapes[item_id],
+            )
+        self.item_index_map = new_map
+
+        self.bucket_meta = self.BucketMeta(
+            global_data_index=0,
+            size=int(self.bucket_meta.size * factor),
+            items=list(new_map.values()),
+        )
+        self.shard_meta = self._build_shard_meta(
+            self.bucket_meta, self.is_distributed, self.dp_world_size, self.dp_rank
+        )
+
+    # ------------------------------------------------------------------ #
     #  Internal index query methods — three coordinate domains:
     #
     #  _get_item_self_range   → (start, end) relative to the item's own
@@ -345,10 +380,11 @@ class DataParallelBuffer:
         dp_rank = torch.distributed.get_rank(dp_group)
         dp_world_size = torch.distributed.get_world_size(dp_group)
 
-        self._item_shapes = mp_policy.get_param_storage_shapes(params) if buffer_role in ("model_weight", "transpose_weight") else [p.shape for p in params]
-
+        # Always build layout with logical shapes and shared chunk_size_factor
+        # so that all buffers share the same proportional item-offset mapping.
+        _logical_shapes = [p.shape for p in params]
         self.buffer_index = BufferIndex(
-            param_shapes=self._item_shapes,
+            param_shapes=_logical_shapes,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             is_distributed=is_distributed,
@@ -356,6 +392,14 @@ class DataParallelBuffer:
             sharding_strategy=sharding_strategy,
             param_group_id=param_group_id,
         )
+
+        # Compact NVFP4 weight buffers: scale all indices proportionally so
+        # the buffer holds only the packed data without fragment-binning waste.
+        if buffer_role in ("model_weight", "transpose_weight") and any(
+            mp_policy.is_nvfp4_param(p) for p in params
+        ):
+            compact_shapes = mp_policy.get_param_storage_shapes(params)
+            self.buffer_index.compact(0.5, compact_shapes)
 
         if is_distributed:
             self.data_size = self.buffer_index.shard_meta.size
