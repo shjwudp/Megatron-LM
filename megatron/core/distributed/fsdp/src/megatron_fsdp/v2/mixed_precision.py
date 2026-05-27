@@ -300,7 +300,7 @@ class FullyShardMixedPrecisionPolicy:
         return tensor.dtype
 
     def get_param_shapes(self, params: List[torch.Tensor]) -> Optional[List[torch.Size]]:
-        """Return model-weight buffer shapes for ``params``.
+        """Return real parameter shapes for ``params``.
 
         For NVFP4 params the storage is packed (2 values per byte), so the
         last dimension is halved.  Returns ``None`` when no shape transform

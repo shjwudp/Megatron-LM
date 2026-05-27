@@ -246,7 +246,8 @@ class FSDPModule(nn.Module):
 
             # Get offset and size from buffer index
             offset, size = gbuf.buffer_index._get_item_global_range(item_id)
-            grad_data = gbuf_data[offset : offset + size].view(p.shape)
+            param_shape = gbuf.mp_policy.get_param_shapes([p])[0]
+            grad_data = gbuf_data[offset : offset + size].view(param_shape)
 
             return grad_data
 
@@ -700,7 +701,8 @@ class FSDPModule(nn.Module):
             if not isinstance(child, FSDPModule):
                 continue
             for param_names, param_group in child._named_param_groups:
-                numel = sum(param.numel() for param in param_group.params)
+                param_shapes = param_group.mp_policy.get_param_shapes(param_group.params)
+                numel = sum(s.numel() for s in param_shapes)
                 total_model_elems += numel
                 dp_size = torch.distributed.get_world_size(param_group.dp_group)
 
@@ -735,7 +737,7 @@ class FSDPModule(nn.Module):
                     f"comm={_mb(group_comm)} pad={_mb(group_pad)} "
                     f"{' '.join(buffer_entries)}"
                 )
-                for param_name, param in zip(param_names, param_group.params):
+                for param_name, param, param_shape in zip(param_names, param_group.params, param_shapes):
                     dist_idx = param_group.param_idx.get(param)
                     offset_info = ""
                     if param_group.model_weight_buffer is not None and dist_idx is not None:
@@ -746,7 +748,7 @@ class FSDPModule(nn.Module):
                         )
                         if item_index is not None:
                             offset_info = f" @{item_index.global_data_index:,}+{item_index.size:,}"
-                    lines.append(f"    {param_name:50s} {str(tuple(param.shape)):24s}{offset_info}")
+                    lines.append(f"    {param_name:50s} {str(tuple(param_shape)):24s}{offset_info}")
                 group_idx += 1
 
         lines.append(

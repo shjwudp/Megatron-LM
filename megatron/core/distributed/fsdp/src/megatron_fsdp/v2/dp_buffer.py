@@ -320,6 +320,7 @@ class DataParallelBuffer:
         device: torch.device,
         dp_group: torch.distributed.ProcessGroup,
         param_group_id: ParamGroupIdx,
+        mp_policy: FullyShardMixedPrecisionPolicy,
         *,
         allocator: Optional[BucketAllocator] = None,
         buffer_role: str = "model_weight",
@@ -327,7 +328,6 @@ class DataParallelBuffer:
         gradient_scaling_factor: Optional[float] = None,
         chunk_size_factor: int = 1,
         sharding_strategy: str = "no_shard",
-        mp_policy: FullyShardMixedPrecisionPolicy,
     ):
         assert mp_policy is not None, "DataParallelBuffer requires a mixed-precision policy"
         self.params = params

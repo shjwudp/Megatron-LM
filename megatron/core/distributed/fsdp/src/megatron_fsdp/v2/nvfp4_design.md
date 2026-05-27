@@ -146,24 +146,25 @@ as FP8, lines 160–172).
 
 ### 5.2 `megatron_fsdp/v2/param_group.py`
 
-**`_init_buffers()`** — changes to model-weight buffer creation (lines 158–164):
+**`_init_buffers()`** — model-weight buffer creation delegates shape resolution downstream:
 
 ```python
 if s != "no_shard":
     model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
-    model_weight_shapes = self.mp_policy.get_param_shapes(self.params)
-    wbuf = self._create_buffer(model_weight_dtype, shard_weights, "model_weight",
-                               param_shapes=model_weight_shapes)
+    wbuf = self._create_buffer(
+        model_weight_dtype, shard_weights, "model_weight",
+    )
     ...
 ```
 
-The `param_shapes` override flows through `_create_buffer()` → `DataParallelBuffer.__init__()` → `BufferIndex.__init__()`.
+`DataParallelBuffer.__init__()` calls `mp_policy.get_param_shapes(params)` directly
+to determine packed or full shapes before constructing the `BufferIndex`.
 
-For NVFP4, `model_weight_shapes` returns packed shapes (e.g., `[128, 64]` → `[128, 32]`). For non-NVFP4, it returns `None` and the default shape extraction is used.
+For NVFP4, `get_param_shapes()` returns packed shapes (e.g., `[128, 64]` → `[128, 32]`). For non-NVFP4, it returns the original param shapes.
 
 ### 5.3 `megatron_fsdp/v2/dp_buffer.py`
 
-**`DataParallelBuffer.__init__()`** — accept optional `param_shapes` override:
+**`DataParallelBuffer.__init__()`** — calls `mp_policy.get_param_shapes()` directly:
 
 ```python
 def __init__(
@@ -172,23 +173,11 @@ def __init__(
     allocator=None, buffer_role="model_weight", is_distributed=False,
     gradient_scaling_factor=None, chunk_size_factor=1,
     sharding_strategy="no_shard", mp_policy,
-    param_shapes: Optional[List[torch.Size]] = None,
 ):
     ...
-    _shapes = param_shapes if param_shapes is not None else [p.shape for p in params]
+    _shapes = mp_policy.get_param_shapes(params)
     self.buffer_index = BufferIndex(
         param_shapes=_shapes, ...
-    )
-```
-
-**`ParameterGroup._create_buffer()`** — forward `param_shapes` kwarg:
-
-```python
-def _create_buffer(self, dtype, is_distributed, role,
-                   param_shapes=None) -> DataParallelBuffer:
-    return DataParallelBuffer(
-        ...,
-        param_shapes=param_shapes,
     )
 ```
 
@@ -288,8 +277,8 @@ No changes needed. Existing functions (`is_nvfp4tensor`, `quantize_nvfp4_param_s
 | File | Change |
 |------|--------|
 | `megatron_fsdp/v2/mixed_precision.py` | Add `FullyShardNVFP4Policy`, NVFP4 detection, all policy methods |
-| `megatron_fsdp/v2/param_group.py` | Pass packed shapes to model_weight_buffer creation |
-| `megatron_fsdp/v2/dp_buffer.py` | Accept optional `param_shapes` kwarg |
+| `megatron_fsdp/v2/param_group.py` | Use `mp_policy.get_param_shapes()` for chunk_size_factor |
+| `megatron_fsdp/v2/dp_buffer.py` | Call `mp_policy.get_param_shapes()` internally in `__init__` |
 | `megatron_fsdp/distributed_data_parallel_config.py` | Add `fp4_param_gather` field |
 | `mcore_fsdp_adapter.py` | Wire `fp4_param_gather` + `fp4_recipe` into policy |
 | `megatron_fsdp/v2/__init__.py` | Export new NVFP4 policy class |

@@ -313,7 +313,7 @@ class ParameterGroup:
         placements = [Shard(dim=0)] if is_param_shard else [Replicate()]
 
         # Create parameter DTensor views
-        for param in self.params:
+        for param, param_shape in zip(self.params, self.mp_policy.get_param_shapes(self.params)):
             if self.main_weight_buffer is not None:
                 mbuf = self.main_weight_buffer
                 data = mbuf.get_item(self.param_idx[param], as_shard=is_param_shard)
@@ -325,7 +325,7 @@ class ParameterGroup:
 
             dist_param = torch.nn.Parameter(
                 make_uneven_dtensor(
-                    data, param.shape, self.mesh, placements, post_process_uneven=True
+                    data, param_shape, self.mesh, placements, post_process_uneven=True
                 ),
                 requires_grad=param.requires_grad,
             )
@@ -345,7 +345,7 @@ class ParameterGroup:
             return
 
         is_grad_shard = is_param_shard
-        for p in self.params:
+        for p, param_shape in zip(self.params, self.mp_policy.get_param_shapes(self.params)):
             gbuf = self.main_grad_buffer
             grad_data = gbuf.get_item(self.param_idx[p], as_shard=is_grad_shard)
             # NOTE: Do not remove the grad_data.numel() > 0 check.
@@ -355,7 +355,7 @@ class ParameterGroup:
             # updates for neighboring non-empty shards.
             if p.requires_grad and grad_data.numel() > 0:
                 self.dist_grads.append(
-                    make_uneven_dtensor(grad_data, p.shape, self.mesh, placements)
+                    make_uneven_dtensor(grad_data, param_shape, self.mesh, placements)
                 )
             else:
                 self.dist_grads.append(None)
