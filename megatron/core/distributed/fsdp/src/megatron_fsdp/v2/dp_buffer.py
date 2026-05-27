@@ -328,7 +328,6 @@ class DataParallelBuffer:
         chunk_size_factor: int = 1,
         sharding_strategy: str = "no_shard",
         mp_policy: FullyShardMixedPrecisionPolicy,
-        param_shapes: Optional[List[torch.Size]] = None,
     ):
         assert mp_policy is not None, "DataParallelBuffer requires a mixed-precision policy"
         self.params = params
@@ -346,7 +345,7 @@ class DataParallelBuffer:
         dp_rank = torch.distributed.get_rank(dp_group)
         dp_world_size = torch.distributed.get_world_size(dp_group)
 
-        _shapes = param_shapes if param_shapes is not None else [p.shape for p in params]
+        _shapes = mp_policy.get_param_shapes(params)
 
         self.buffer_index = BufferIndex(
             param_shapes=_shapes,

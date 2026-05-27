@@ -98,7 +98,7 @@ class ParameterGroup:
 
         # Compute chunk size factor for alignment
         # LCM ensures params align to common boundary for efficient sharding
-        model_weight_shapes = mp_policy.model_weight_buffer_shapes(params)
+        model_weight_shapes = mp_policy.get_param_shapes(params)
         if len(params) > 0 and any(s[1:].numel() > 0 for s in model_weight_shapes):
             self.chunk_size_factor = max(1, math.lcm(*[s[1:].numel() for s in model_weight_shapes]))
         else:
@@ -135,7 +135,6 @@ class ParameterGroup:
         dtype: torch.dtype,
         is_distributed: bool,
         role: str,
-        param_shapes: Optional[List[torch.Size]] = None,
     ) -> DataParallelBuffer:
         """Create a buffer and namespace its temporary bucket by role."""
         return DataParallelBuffer(
@@ -152,7 +151,6 @@ class ParameterGroup:
             chunk_size_factor=self.chunk_size_factor,
             sharding_strategy=self.sharding_strategy,
             mp_policy=self.mp_policy,
-            param_shapes=param_shapes,
         )
 
     # FIXME: The branching below currently only handles optim_grads_params since
@@ -176,9 +174,9 @@ class ParameterGroup:
         # choices and exposes the tensor view that should be packed.
         if s != "no_shard":
             model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
-            model_weight_shapes = self.mp_policy.model_weight_buffer_shapes(self.params)
+            model_weight_shapes = self.mp_policy.get_param_shapes(self.params)
             wbuf = self._create_buffer(
-                model_weight_dtype, shard_weights, "model_weight", param_shapes=model_weight_shapes
+                model_weight_dtype, shard_weights, "model_weight",
             )
             wbuf.init_data(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):

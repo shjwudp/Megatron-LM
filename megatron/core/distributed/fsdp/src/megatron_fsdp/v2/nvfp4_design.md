@@ -73,7 +73,7 @@ The `FullyShardMixedPrecisionPolicy` already owns dtype and raw-data decisions.
 We extend it with an `nvfp4` sub-policy (analogous to `fp8`) that:
 
 - Returns `torch.uint8` from `model_weight_buffer_dtype()`.
-- Returns packed shapes from a new `model_weight_buffer_shapes()`.
+- Returns packed shapes from a new `get_param_shapes()`.
 - Returns `_rowwise_data` from `get_param_data()`.
 - Calls `post_all_gather_processing()` in `post_unshard()`.
 - Invokes `quantize_master_weights` (via `quantize_nvfp4_param_shard`) in
@@ -131,7 +131,7 @@ as FP8, lines 160–172).
 | `group_key_dtype()` | Return `("quantized", "NVFP4Tensor", recipe)` for NVFP4 params |
 | `is_nvfp4_param()` | New: `isinstance(tensor, NVFP4_TENSOR_CLASS)` |
 | `model_weight_buffer_dtype()` | Return `torch.uint8` for NVFP4 (same as FP8) |
-| `model_weight_buffer_shapes()` | **New**: Return packed shapes for NVFP4, original shapes otherwise |
+| `get_param_shapes()` | **New**: Return packed shapes for NVFP4, original shapes otherwise |
 | `get_param_data()` | Return `tensor._rowwise_data` (packed) for NVFP4 |
 | `bind_unsharded_param()` | Set `_rowwise_data` to all-gathered buffer view (same pattern as FP8 `_data`) |
 | `get_high_precision_value()` | Use `dequantize()` or preserved init val |
@@ -151,7 +151,7 @@ as FP8, lines 160–172).
 ```python
 if s != "no_shard":
     model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
-    model_weight_shapes = self.mp_policy.model_weight_buffer_shapes(self.params)
+    model_weight_shapes = self.mp_policy.get_param_shapes(self.params)
     wbuf = self._create_buffer(model_weight_dtype, shard_weights, "model_weight",
                                param_shapes=model_weight_shapes)
     ...
