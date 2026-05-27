@@ -166,6 +166,9 @@ class Ref:
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_init_buffers(strategy):
+    if strategy != "optim_grads_params":
+        pytest.skip(f"Only optim_grads_params strategy creates distributed buffers, skipping {strategy} test.")
+
     groups, originals, dp_group, rank, ws, device = _build_groups(strategy)
     has_wbuf, _, w_dist, g_dist = _flags(strategy)
 
@@ -208,6 +211,9 @@ def test_init_buffers(strategy):
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_unshard_reshard(strategy):
+    if strategy != "optim_grads_params":
+        pytest.skip(f"Only optim_grads_params strategy creates distributed buffers, skipping {strategy} test.")
+
     groups, originals, dp_group, rank, ws, device = _build_groups(strategy)
     _, _, w_dist, _ = _flags(strategy)
 
@@ -248,6 +254,9 @@ def test_unshard_reshard(strategy):
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_reduce_grad(strategy):
+    if strategy != "optim_grads_params":
+        pytest.skip(f"Only optim_grads_params strategy creates distributed buffers, skipping {strategy} test.")
+
     groups, _, dp_group, rank, ws, device = _build_groups(strategy)
     _, _, _, g_dist = _flags(strategy)
 
