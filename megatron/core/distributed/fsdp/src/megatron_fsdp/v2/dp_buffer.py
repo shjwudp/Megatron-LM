@@ -345,10 +345,10 @@ class DataParallelBuffer:
         dp_rank = torch.distributed.get_rank(dp_group)
         dp_world_size = torch.distributed.get_world_size(dp_group)
 
-        _shapes = mp_policy.get_param_shapes(params)
+        self._item_shapes = mp_policy.get_param_storage_shapes(params) if buffer_role in ("model_weight", "transpose_weight") else [p.shape for p in params]
 
         self.buffer_index = BufferIndex(
-            param_shapes=_shapes,
+            param_shapes=self._item_shapes,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             is_distributed=is_distributed,

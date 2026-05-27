@@ -98,9 +98,8 @@ class ParameterGroup:
 
         # Compute chunk size factor for alignment
         # LCM ensures params align to common boundary for efficient sharding
-        model_weight_shapes = mp_policy.get_param_shapes(params)
-        if len(params) > 0 and any(s[1:].numel() > 0 for s in model_weight_shapes):
-            self.chunk_size_factor = max(1, math.lcm(*[s[1:].numel() for s in model_weight_shapes]))
+        if len(params) > 0 and any(p.shape[1:].numel() > 0 for p in params):
+            self.chunk_size_factor = max(1, math.lcm(*[p.shape[1:].numel() for p in params]))
         else:
             self.chunk_size_factor = 1
 
@@ -174,7 +173,6 @@ class ParameterGroup:
         # choices and exposes the tensor view that should be packed.
         if s != "no_shard":
             model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
-            model_weight_shapes = self.mp_policy.get_param_shapes(self.params)
             wbuf = self._create_buffer(
                 model_weight_dtype, shard_weights, "model_weight",
             )
@@ -313,15 +311,18 @@ class ParameterGroup:
         placements = [Shard(dim=0)] if is_param_shard else [Replicate()]
 
         # Create parameter DTensor views
-        for param, param_shape in zip(self.params, self.mp_policy.get_param_shapes(self.params)):
+        for param in self.params:
             if self.main_weight_buffer is not None:
                 mbuf = self.main_weight_buffer
                 data = mbuf.get_item(self.param_idx[param], as_shard=is_param_shard)
+                param_shape = param.shape
             elif self.model_weight_buffer is not None:
                 wbuf = self.model_weight_buffer
                 data = wbuf.get_item(self.param_idx[param], as_shard=is_param_shard)
+                param_shape = self.mp_policy.get_param_storage_shapes([param])[0]
             else:
                 data = param.data.detach()
+                param_shape = param.shape
 
             dist_param = torch.nn.Parameter(
                 make_uneven_dtensor(
@@ -345,7 +346,7 @@ class ParameterGroup:
             return
 
         is_grad_shard = is_param_shard
-        for p, param_shape in zip(self.params, self.mp_policy.get_param_shapes(self.params)):
+        for p in self.params:
             gbuf = self.main_grad_buffer
             grad_data = gbuf.get_item(self.param_idx[p], as_shard=is_grad_shard)
             # NOTE: Do not remove the grad_data.numel() > 0 check.
@@ -355,7 +356,7 @@ class ParameterGroup:
             # updates for neighboring non-empty shards.
             if p.requires_grad and grad_data.numel() > 0:
                 self.dist_grads.append(
-                    make_uneven_dtensor(grad_data, param_shape, self.mesh, placements)
+                    make_uneven_dtensor(grad_data, p.shape, self.mesh, placements)
                 )
             else:
                 self.dist_grads.append(None)

@@ -246,7 +246,7 @@ class FSDPModule(nn.Module):
 
             # Get offset and size from buffer index
             offset, size = gbuf.buffer_index._get_item_global_range(item_id)
-            param_shape = gbuf.mp_policy.get_param_shapes([p])[0]
+            param_shape = gbuf._item_shapes[item_id]
             grad_data = gbuf_data[offset : offset + size].view(param_shape)
 
             return grad_data
@@ -701,7 +701,7 @@ class FSDPModule(nn.Module):
             if not isinstance(child, FSDPModule):
                 continue
             for param_names, param_group in child._named_param_groups:
-                param_shapes = param_group.mp_policy.get_param_shapes(param_group.params)
+                param_shapes = [p.shape for p in param_group.params]
                 numel = sum(s.numel() for s in param_shapes)
                 total_model_elems += numel
                 dp_size = torch.distributed.get_world_size(param_group.dp_group)

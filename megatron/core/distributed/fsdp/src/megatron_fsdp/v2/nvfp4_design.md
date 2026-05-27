@@ -73,7 +73,7 @@ The `FullyShardMixedPrecisionPolicy` already owns dtype and raw-data decisions.
 We extend it with an `nvfp4` sub-policy (analogous to `fp8`) that:
 
 - Returns `torch.uint8` from `model_weight_buffer_dtype()`.
-- Returns packed shapes from a new `get_param_shapes()`.
+- Returns packed shapes from a new `get_param_storage_shapes()`.
 - Returns `_rowwise_data` from `get_param_data()`.
 - Calls `post_all_gather_processing()` in `post_unshard()`.
 - Invokes `quantize_master_weights` (via `quantize_nvfp4_param_shard`) in
@@ -131,7 +131,7 @@ as FP8, lines 160–172).
 | `group_key_dtype()` | Return `("quantized", "NVFP4Tensor", recipe)` for NVFP4 params |
 | `is_nvfp4_param()` | New: `isinstance(tensor, NVFP4_TENSOR_CLASS)` |
 | `model_weight_buffer_dtype()` | Return `torch.uint8` for NVFP4 (same as FP8) |
-| `get_param_shapes()` | **New**: Return packed shapes for NVFP4, original shapes otherwise |
+| `get_param_storage_shapes()` | **New**: Return packed shapes for NVFP4, original shapes otherwise |
 | `get_param_data()` | Return `tensor._rowwise_data` (packed) for NVFP4 |
 | `bind_unsharded_param()` | Set `_rowwise_data` to all-gathered buffer view (same pattern as FP8 `_data`) |
 | `get_high_precision_value()` | Use `dequantize()` or preserved init val |
@@ -157,14 +157,17 @@ if s != "no_shard":
     ...
 ```
 
-`DataParallelBuffer.__init__()` calls `mp_policy.get_param_shapes(params)` directly
-to determine packed or full shapes before constructing the `BufferIndex`.
+`DataParallelBuffer.__init__()` calls `mp_policy.get_param_storage_shapes(params)` only
+for ``model_weight`` and ``transpose_weight`` buffers, since those store the
+compressed NVFP4 uint8 data.  Main-weight and main-grad buffers hold fp32 data
+and use the original parameter shapes (``[p.shape for p in params]``).
 
-For NVFP4, `get_param_shapes()` returns packed shapes (e.g., `[128, 64]` → `[128, 32]`). For non-NVFP4, it returns the original param shapes.
+For NVFP4, `get_param_storage_shapes()` returns packed shapes (e.g., `[128, 64]` → `[128, 32]`).
+For non-NVFP4, it returns the original param shapes.
 
 ### 5.3 `megatron_fsdp/v2/dp_buffer.py`
 
-**`DataParallelBuffer.__init__()`** — calls `mp_policy.get_param_shapes()` directly:
+**`DataParallelBuffer.__init__()`** — uses packed shapes only for weight buffers:
 
 ```python
 def __init__(
@@ -175,9 +178,9 @@ def __init__(
     sharding_strategy="no_shard", mp_policy,
 ):
     ...
-    _shapes = mp_policy.get_param_shapes(params)
+    _item_shapes = mp_policy.get_param_storage_shapes(params) if buffer_role in ("model_weight", "transpose_weight") else [p.shape for p in params]
     self.buffer_index = BufferIndex(
-        param_shapes=_shapes, ...
+        param_shapes=_item_shapes, ...
     )
 ```
 
@@ -277,8 +280,8 @@ No changes needed. Existing functions (`is_nvfp4tensor`, `quantize_nvfp4_param_s
 | File | Change |
 |------|--------|
 | `megatron_fsdp/v2/mixed_precision.py` | Add `FullyShardNVFP4Policy`, NVFP4 detection, all policy methods |
-| `megatron_fsdp/v2/param_group.py` | Use `mp_policy.get_param_shapes()` for chunk_size_factor |
-| `megatron_fsdp/v2/dp_buffer.py` | Call `mp_policy.get_param_shapes()` internally in `__init__` |
+| `megatron_fsdp/v2/param_group.py` | Use logical `p.shape` for chunk_size_factor; packed LCM would misalign main buffers |
+| `megatron_fsdp/v2/dp_buffer.py` | Only use `get_param_storage_shapes()` for `model_weight`/`transpose_weight` buffers |
 | `megatron_fsdp/distributed_data_parallel_config.py` | Add `fp4_param_gather` field |
 | `mcore_fsdp_adapter.py` | Wire `fp4_param_gather` + `fp4_recipe` into policy |
 | `megatron_fsdp/v2/__init__.py` | Export new NVFP4 policy class |
@@ -289,11 +292,10 @@ Files that do **not** need changes: `fp4_utils.py`, `hooks.py`, `fully_shard.py`
 ## 8. Risks and Edge Cases
 
 1. **Packed buffer alignment**: The `BufferIndex._build_layout()` pads to
-   `dp_world_size * chunk_size_factor`. For NVFP4 packed buffers, the
-   `chunk_size_factor` should reflect the packed element count, not the logical
-   count. Since `chunk_size_factor` is computed from `p.shape[1:].numel()` in
-   `ParameterGroup.__init__`, and NVFP4 tensors report their logical shape,
-   this remains correct.
+   `dp_world_size * chunk_size_factor`.  `chunk_size_factor` is computed from
+   logical `p.shape[1:].numel()` so that it works correctly for all buffers
+   (model-weight, main-weight, main-grad).  Only the model-weight buffer uses
+   packed shapes in its `BufferIndex`; the main buffers use logical shapes.
 
 2. **Empty shards**: NVFP4 params with odd inner dimensions are rejected by
    TE (assertion in `get_nvfp4_rowwise_packed_shape`). No special handling needed.
