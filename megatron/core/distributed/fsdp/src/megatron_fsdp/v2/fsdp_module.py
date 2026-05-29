@@ -25,7 +25,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from .allocator import BucketAllocator
-from .mixed_precision import FullyShardMixedPrecisionPolicy
+from .mixed_precision import MixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
 
@@ -178,7 +178,7 @@ class FSDPModule(nn.Module):
         self,
         mesh: Optional[DeviceMesh],
         ignored_params: Optional[set],
-        mp_policy: FullyShardMixedPrecisionPolicy,
+        mp_policy: MixedPrecisionPolicy,
         bucket_allocator: BucketAllocator,
         gradient_scaling_factor: Optional[float] = None,
         sharding_strategy: str = "optim_grads_params",
@@ -263,7 +263,7 @@ class FSDPModule(nn.Module):
         self,
         ignored_modules: set,
         mesh: Optional[DeviceMesh] = None,
-        mp_policy: Optional[FullyShardMixedPrecisionPolicy] = None,
+        mp_policy: Optional[MixedPrecisionPolicy] = None,
     ):
         """
         Materialize meta parameters to actual device and initialize.
@@ -806,7 +806,7 @@ class FSDPModule(nn.Module):
 
 def _get_module_fsdp_param_groups(
     module: nn.Module,
-    mp_policy: FullyShardMixedPrecisionPolicy,
+    mp_policy: MixedPrecisionPolicy,
     allocator: BucketAllocator,
     mesh: Optional[DeviceMesh] = None,
     ignored_params: Optional[set[nn.Parameter]] = None,
