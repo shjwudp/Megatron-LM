@@ -114,7 +114,6 @@ class ParameterGroup:
         self.hsdp_wbuf: Optional[DataParallelBuffer] = None
         self.hsdp_gbuf: Optional[DataParallelBuffer] = None
         self.hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
-
         # Initialize buffers and distributed parameters
         self._init_buffers()
 
@@ -215,35 +214,32 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
-    def unshard(self, async_op: bool = False, bwd_pass: bool = False):
+    def unshard(self, bwd_pass: bool = False):
         """
         Unshard model weights by all-gathering from sharded buffer.
 
         After unshard, parameters point to full unsharded storage. FP8
         parameters rebind their TE raw payload instead of ``param.data``.
         """
-        work = None
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
-            if weight_buffer is None:
-                continue
-            if weight_buffer.is_distributed and weight_buffer.is_unsharded():
-                continue
-            _, weight_work = weight_buffer.unshard(async_op=async_op)
-            if work is None:
-                work = weight_work
+            if weight_buffer is not None:
+                weight_buffer.unshard(bind_params=True)
 
         self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
-        return work
 
     def has_unsharded_weight_buffers(self, bwd_pass: bool = False) -> bool:
-        """Return whether all weight buffers needed for this forward/backward phase are unsharded."""
+        """Return whether this phase can skip launching another distributed unshard."""
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
             if weight_buffer is None:
                 continue
+            if not weight_buffer.is_distributed:
+                # Replicated buffers still need DataParallelBuffer.unshard() to
+                # rebind original parameter storage before the module uses it.
+                return False
             if not weight_buffer.is_unsharded():
                 return False
         return True
@@ -271,8 +267,9 @@ class ParameterGroup:
         """
         Reduce gradients across DP ranks.
 
-        For distributed buffers: reduce-scatter the full gradient
-        For non-distributed buffers: all-reduce in-place
+        ZeRO-2/3 reduce-scatter sharded grad buffers during backward.
+        ZeRO-1 keeps grads replicated during backward and reduce-scatters
+        the replicated buffer once when the optimizer syncs.
         """
         self.main_grad_buffer.reduce_grad(grad_comm_dtype=self.mp_policy.grad_comm_dtype)
 
@@ -294,7 +291,7 @@ class ParameterGroup:
         Creates DTensor views of model weights and gradients based on sharding strategy:
         - "optim_grads_params": weights and grads sharded, full ZeRO-3
         - "optim_grads": grads sharded, weights replicated (ZeRO-2)
-        - "optim": optimizer state sharding only, weights and grads replicated (ZeRO-1)
+        - "optim": grads accumulate replicated, optimizer consumes reduced shards
         - "no_shard": replicated, no sharding (DDP-equivalent)
         """
         self.dist_params = []

@@ -102,9 +102,9 @@ class _FSDPRootContext:
     # ------------------------------------------------------------------
     # Reduce-scatter (gradient sync) tracking
     # ------------------------------------------------------------------
-    reduce_grad_buckets: Dict[int, List[Tuple[torch.cuda.Event, "ParameterGroup"]]] = field(
-        default_factory=dict
-    )
+    reduce_grad_buckets: Dict[
+        int, List[Tuple[torch.cuda.Event, "ParameterGroup"]]
+    ] = field(default_factory=dict)
     """
     Maps module_id -> list of (event, parameter_group) tuples.
 
@@ -171,7 +171,7 @@ class FSDPModule(nn.Module):
     methods for managing parameter sharding state:
     - unshard(): All-gather parameters before forward
     - reshard(): Release unsharded buffer after forward
-    - reduce_grad(): Reduce-scatter gradients after backward
+    - reduce_grad(): Reduce gradients after backward
     """
 
     def _init_named_param_groups(
@@ -181,6 +181,7 @@ class FSDPModule(nn.Module):
         mp_policy: FullyShardMixedPrecisionPolicy,
         bucket_allocator: BucketAllocator,
         gradient_scaling_factor: Optional[float] = None,
+        sharding_strategy: str = "optim_grads_params",
     ):
         """
         Initialize parameter groups and build param name mapping.
@@ -212,6 +213,7 @@ class FSDPModule(nn.Module):
             ignored_params=ignored_params,
             allocator=bucket_allocator,
             gradient_scaling_factor=gradient_scaling_factor,
+            sharding_strategy=sharding_strategy,
         )
         setattr(self, "_fsdp_param_groups", fsdp_param_groups)
 
@@ -483,7 +485,7 @@ class FSDPModule(nn.Module):
 
         This is called post-backward to:
         1. Copy gradients to main gradient buffer
-        2. Perform all-reduce or reduce-scatter
+        2. Perform gradient reduction
         3. Install reduced gradients to distributed parameters
         """
         torch.cuda.nvtx.range_push("MFSDP reduce_grad")
@@ -570,6 +572,29 @@ class FSDPModule(nn.Module):
                         ).any(), f"NaN in dist grad for parameter {name}"
 
         torch.cuda.nvtx.range_pop()
+
+    @torch.no_grad()
+    def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
+        """Finish optimizer-facing gradient synchronization for this iteration."""
+        ctx = self._fsdp_root_context
+        for _, child in self.named_modules():
+            if not isinstance(child, FSDPModule):
+                continue
+            if any(
+                param_group.sharding_strategy == "optim"
+                for param_group in child._fsdp_param_groups
+            ):
+                # ZeRO-1 keeps gradients replicated during backward and performs
+                # exactly one reduce-scatter at the iteration grad-sync boundary.
+                child.reduce_grad(async_op=False)
+            for param_group in child._fsdp_param_groups:
+                for param, dist_grad in zip(param_group.params, param_group.dist_grads):
+                    if param.requires_grad:
+                        # v1 replaces module params with optimizer-facing distributed
+                        # params after grad sync. v2 keeps compute params in the module,
+                        # so mirror the reduced grad for shared finalizers.
+                        param.main_grad = dist_grad
+        torch.cuda.current_stream().wait_stream(ctx.rs_stream)
 
     @torch.no_grad()
     def _scale_gradients(self, scaling_factor: float):
@@ -795,6 +820,7 @@ def _get_module_fsdp_param_groups(
     mesh: Optional[DeviceMesh] = None,
     ignored_params: Optional[set[nn.Parameter]] = None,
     gradient_scaling_factor: Optional[float] = None,
+    sharding_strategy: str = "optim_grads_params",
 ) -> List[ParameterGroup]:
     """
     Group module parameters by (device, dtype, requires_grad) and create ParameterGroups.
@@ -827,6 +853,7 @@ def _get_module_fsdp_param_groups(
                 mp_policy=mp_policy,
                 gradient_scaling_factor=gradient_scaling_factor,
                 allocator=allocator,
+                sharding_strategy=sharding_strategy,
             )
         )
 
