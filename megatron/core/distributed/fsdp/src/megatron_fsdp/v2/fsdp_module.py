@@ -25,7 +25,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from .allocator import BucketAllocator
-from .mixed_precision import FullyShardMixedPrecisionPolicy
+from .mixed_precision import MixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
 
@@ -178,7 +178,7 @@ class FSDPModule(nn.Module):
         self,
         mesh: Optional[DeviceMesh],
         ignored_params: Optional[set],
-        mp_policy: FullyShardMixedPrecisionPolicy,
+        mp_policy: MixedPrecisionPolicy,
         bucket_allocator: BucketAllocator,
         gradient_scaling_factor: Optional[float] = None,
         sharding_strategy: str = "optim_grads_params",
@@ -264,7 +264,7 @@ class FSDPModule(nn.Module):
         self,
         ignored_modules: set,
         mesh: Optional[DeviceMesh] = None,
-        mp_policy: Optional[FullyShardMixedPrecisionPolicy] = None,
+        mp_policy: Optional[MixedPrecisionPolicy] = None,
     ):
         """
         Materialize meta parameters to actual device and initialize.
@@ -519,11 +519,7 @@ class FSDPModule(nn.Module):
                         del param.grad
                 elif param.grad is None:
                     main_grad = param.get_main_grad()
-                    if hasattr(param, "main_grad") and param.main_grad is not None:
-                        if param.main_grad.data_ptr() != main_grad.data_ptr():
-                            main_grad.copy_(param.main_grad.detach())
-                    else:
-                        main_grad.zero_()
+                    main_grad.zero_()
                 else:
                     main_grad = param.get_main_grad()
                     main_grad.copy_(param.grad.detach())
@@ -630,6 +626,11 @@ class FSDPModule(nn.Module):
                         del dist_param.grad
                     if hasattr(dist_param, "decoupled_grad"):
                         dist_param.decoupled_grad = None
+                for param in param_group.params:
+                    if param.grad is not None:
+                        del param.grad
+                    if hasattr(param, "main_grad"):
+                        del param.main_grad
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
@@ -815,7 +816,7 @@ class FSDPModule(nn.Module):
 
 def _get_module_fsdp_param_groups(
     module: nn.Module,
-    mp_policy: FullyShardMixedPrecisionPolicy,
+    mp_policy: MixedPrecisionPolicy,
     allocator: BucketAllocator,
     mesh: Optional[DeviceMesh] = None,
     ignored_params: Optional[set[nn.Parameter]] = None,

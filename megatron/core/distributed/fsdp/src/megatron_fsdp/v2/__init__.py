@@ -35,7 +35,7 @@ from .dp_buffer import BufferIndex, DataParallelBuffer
 from .fully_shard import FSDPModule, fully_shard
 from .mixed_precision import (
     FullyShardFP8Policy,
-    FullyShardMixedPrecisionPolicy,
+    MixedPrecisionPolicy,
     FullyShardNVFP4Policy,
 )
 from .param_group import ParameterGroup
@@ -44,7 +44,7 @@ __all__ = [
     "FSDPModule",
     "fully_shard",
     "FullyShardFP8Policy",
-    "FullyShardMixedPrecisionPolicy",
+    "MixedPrecisionPolicy",
     "FullyShardNVFP4Policy",
     "ParameterGroup",
     "BufferIndex",

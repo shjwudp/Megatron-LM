@@ -145,7 +145,7 @@ class FullyShardFP8Policy:
 
 
 @dataclass(frozen=True)
-class FullyShardMixedPrecisionPolicy:
+class MixedPrecisionPolicy:
     """Mixed precision policy owned by the v2 ``fully_shard`` path."""
 
     main_params_dtype: Optional[torch.dtype] = None

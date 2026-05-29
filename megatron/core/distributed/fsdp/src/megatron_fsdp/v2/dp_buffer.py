@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from .allocator import BucketAllocator, TemporaryBucketAllocator
-from .mixed_precision import FullyShardMixedPrecisionPolicy
+from .mixed_precision import MixedPrecisionPolicy
 from .utils import ParamGroupIdx
 
 logger = logging.getLogger(__name__)
@@ -304,7 +304,7 @@ class DataParallelBuffer:
         gradient_scaling_factor: Optional[float] = None,
         chunk_size_factor: int = 1,
         sharding_strategy: str = "no_shard",
-        mp_policy: FullyShardMixedPrecisionPolicy,
+        mp_policy: MixedPrecisionPolicy,
     ):
         assert mp_policy is not None, "DataParallelBuffer requires a mixed-precision policy"
         self.params = params

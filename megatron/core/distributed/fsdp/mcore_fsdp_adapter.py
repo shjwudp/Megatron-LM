@@ -54,7 +54,7 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
     from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
         FullyShardFP8Policy,
-        FullyShardMixedPrecisionPolicy,
+        MixedPrecisionPolicy,
         FullyShardNVFP4Policy,
     )
 
@@ -242,7 +242,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         edp_mesh = _init_dp_mesh(pg_collection, edp=True)
         dp_mesh = _init_dp_mesh(pg_collection, edp=False)
 
-        fully_shard_mp_policy = FullyShardMixedPrecisionPolicy(
+        fully_shard_mp_policy = MixedPrecisionPolicy(
             main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
             main_grads_dtype=(
                 torch.float32

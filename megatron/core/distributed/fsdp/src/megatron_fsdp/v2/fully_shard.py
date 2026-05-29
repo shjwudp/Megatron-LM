@@ -35,7 +35,7 @@ from .hooks import (
     _register_forward_hook,
     _register_forward_pre_hook,
 )
-from .mixed_precision import FullyShardMixedPrecisionPolicy
+from .mixed_precision import MixedPrecisionPolicy
 from .utils import _init_default_fully_shard_mesh
 
 __all__ = ["FSDPModule", "fully_shard"]
@@ -49,7 +49,7 @@ def fully_shard(
     shard_placement_fn: Optional[
         Callable[[nn.Parameter], Optional[Shard]]
     ] = None,  # TODO: implement
-    mp_policy: Optional[FullyShardMixedPrecisionPolicy] = None,
+    mp_policy: Optional[MixedPrecisionPolicy] = None,
     offload_policy: Optional["OffloadPolicy"] = None,  # TODO: implement
     ignored_params: Optional[set[nn.Parameter]] = None,
     # --- Megatron-FSDP specific options ---
@@ -77,7 +77,7 @@ def fully_shard(
     mesh = mesh or _init_default_fully_shard_mesh()
 
     if mp_policy is None:
-        mp_policy = FullyShardMixedPrecisionPolicy()
+        mp_policy = MixedPrecisionPolicy()
 
     cls = module.__class__
     new_cls = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
