@@ -31,7 +31,7 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-    FullyShardMixedPrecisionPolicy,
+    MixedPrecisionPolicy,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
@@ -108,7 +108,7 @@ def _build_groups(strategy):
         pg = ParameterGroup(
             params=params,
             param_group_id=ParamGroupIdx(0, gid),
-            mp_policy=FullyShardMixedPrecisionPolicy(),
+            mp_policy=MixedPrecisionPolicy(),
             mesh=None,
             sharding_strategy=strategy,
         )
