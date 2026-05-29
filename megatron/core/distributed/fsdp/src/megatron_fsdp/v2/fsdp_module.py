@@ -25,7 +25,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from .allocator import BucketAllocator
-from .mixed_precision import MixedPrecisionPolicy
+from .mixed_precision import FullyShardMixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
 
@@ -178,7 +178,7 @@ class FSDPModule(nn.Module):
         self,
         mesh: Optional[DeviceMesh],
         ignored_params: Optional[set],
-        mp_policy: MixedPrecisionPolicy,
+        mp_policy: FullyShardMixedPrecisionPolicy,
         bucket_allocator: BucketAllocator,
         gradient_scaling_factor: Optional[float] = None,
         sharding_strategy: str = "optim_grads_params",
@@ -242,14 +242,13 @@ class FSDPModule(nn.Module):
             gbuf = p._gbuf
             item_id = p._item_id
 
-            gbuf_data = gbuf.fetch_buffer()
+            gbuf_data = gbuf.fetch_unsharded_buffer()
             assert gbuf_data is not None
             assert gbuf_data.numel() > 0
 
             # Get offset and size from buffer index
-            offset, size = gbuf.buffer_index._get_item_global_range(item_id)
-            param_shape = gbuf.buffer_index.item_index_map[item_id].shape
-            grad_data = gbuf_data[offset : offset + size].view(param_shape)
+            offset, size = gbuf.buffer_index._get_item_offset(item_id)
+            grad_data = gbuf_data[offset : offset + size].view(p.shape)
 
             return grad_data
 
@@ -264,7 +263,7 @@ class FSDPModule(nn.Module):
         self,
         ignored_modules: set,
         mesh: Optional[DeviceMesh] = None,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
+        mp_policy: Optional[FullyShardMixedPrecisionPolicy] = None,
     ):
         """
         Materialize meta parameters to actual device and initialize.
@@ -299,9 +298,6 @@ class FSDPModule(nn.Module):
                         f"Module {name} contains meta parameters but cannot reset them"
                     )
 
-            # Move materialized parameters to the same target device (e.g., GPU)
-            m.to(materialization_device)
-
         if mesh is not None and mesh.size() > 1:
             dp_group = mesh.get_group()
             src_rank = torch.distributed.get_global_rank(dp_group, 0)
@@ -320,10 +316,7 @@ class FSDPModule(nn.Module):
         (mid-forward or mid-backward) will corrupt their state.  The safety
         check below enforces that constraint.
         """
-        named_forward_modules = [
-            (name, child) for name, child in self.named_modules() if isinstance(child, FSDPModule)
-        ]
-        forward_order = [child for name, child in named_forward_modules]
+        forward_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
 
         # Safety check: no child FSDPModule must be in an active state.
         # - unshard_done_events[id(child)] non-None → unsharded, not yet resharded
@@ -369,18 +362,14 @@ class FSDPModule(nn.Module):
         setattr(self, "_fsdp_state", _FSDPState())
         setattr(self, "_fsdp_root_context", root_context)
 
-        module_idx = 0
-        for name, module in named_forward_modules:
+        for module in forward_order:
             for param_group in module._fsdp_param_groups:
                 param_group.set_allocator(root_context.bucket_allocator)
 
-            if module is not self:
-                module._fsdp_state._is_root = False
-                setattr(module, "_fsdp_root_context", root_context)
-
-            setattr(module, "_fsdp_module_idx", module_idx)
-            setattr(module, "_fsdp_module_name", name)
-            module_idx += 1
+        for child in self.modules():
+            if child is not self and isinstance(child, FSDPModule):
+                child._fsdp_state._is_root = False
+                setattr(child, "_fsdp_root_context", root_context)
 
     def unshard(self, async_op: bool = False, bwd_pass: bool = False):
         """
@@ -519,7 +508,12 @@ class FSDPModule(nn.Module):
                         del param.grad
                 elif param.grad is None:
                     main_grad = param.get_main_grad()
-                    main_grad.zero_()
+                    param_main_grad = getattr(param, "main_grad", None)
+                    if (
+                        param_main_grad is None
+                        or param_main_grad.data_ptr() != main_grad.data_ptr()
+                    ):
+                        main_grad.zero_()
                 else:
                     main_grad = param.get_main_grad()
                     main_grad.copy_(param.grad.detach())
@@ -538,22 +532,26 @@ class FSDPModule(nn.Module):
                 param_group.release_grad_buffer()
 
             # Install reduced gradients to distributed parameters
-            for name, param, dist_param, dist_grad in zip(
-                param_names, param_group.params, param_group.dist_params, param_group.dist_grads
-            ):
-                if not param.requires_grad:
-                    continue
-                if param_group.mp_policy.use_decoupled_grad:
-                    setattr(dist_param, "decoupled_grad", dist_grad)
-                    if dist_param.grad is not None:
-                        del dist_param.grad
-                else:
-                    if dist_grad is not None:
-                        with torch.cuda.stream(stream):
-                            dist_grad = dist_grad.to(dist_param.dtype)
-                    setattr(dist_param, "grad", dist_grad)
-                    if hasattr(dist_param, "decoupled_grad"):
-                        dist_param.decoupled_grad = None
+            with torch.cuda.stream(stream):
+                for name, param, dist_param, dist_grad in zip(
+                    param_names,
+                    param_group.params,
+                    param_group.dist_params,
+                    param_group.dist_grads,
+                ):
+                    if not param.requires_grad:
+                        continue
+                    if param_group.mp_policy.use_decoupled_grad:
+                        setattr(dist_param, "decoupled_grad", dist_grad)
+                        if dist_param.grad is not None:
+                            del dist_param.grad
+                    else:
+                        assert (
+                            dist_grad is None or dist_param.dtype == dist_grad.dtype
+                        ), f"{name} Dist param dtype {dist_param.dtype} does not match dist grad dtype {dist_grad.dtype}"
+                        setattr(dist_param, "grad", dist_grad)
+                        if hasattr(dist_param, "decoupled_grad"):
+                            dist_param.decoupled_grad = None
 
             if async_op:
                 event = stream.record_event()
@@ -626,15 +624,10 @@ class FSDPModule(nn.Module):
                         del dist_param.grad
                     if hasattr(dist_param, "decoupled_grad"):
                         dist_param.decoupled_grad = None
-                for param in param_group.params:
-                    if param.grad is not None:
-                        del param.grad
-                    if hasattr(param, "main_grad"):
-                        del param.main_grad
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
-        for child in self.modules():
+        for _, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue
             for param_group in child._fsdp_param_groups:
@@ -730,8 +723,7 @@ class FSDPModule(nn.Module):
             if not isinstance(child, FSDPModule):
                 continue
             for param_names, param_group in child._named_param_groups:
-                param_shapes = [p.shape for p in param_group.params]
-                numel = sum(s.numel() for s in param_shapes)
+                numel = sum(param.numel() for param in param_group.params)
                 total_model_elems += numel
                 dp_size = torch.distributed.get_world_size(param_group.dp_group)
 
@@ -766,9 +758,7 @@ class FSDPModule(nn.Module):
                     f"comm={_mb(group_comm)} pad={_mb(group_pad)} "
                     f"{' '.join(buffer_entries)}"
                 )
-                for param_name, param, param_shape in zip(
-                    param_names, param_group.params, param_shapes
-                ):
+                for param_name, param in zip(param_names, param_group.params):
                     dist_idx = param_group.param_idx.get(param)
                     offset_info = ""
                     if param_group.model_weight_buffer is not None and dist_idx is not None:
@@ -779,7 +769,7 @@ class FSDPModule(nn.Module):
                         )
                         if item_index is not None:
                             offset_info = f" @{item_index.global_data_index:,}+{item_index.size:,}"
-                    lines.append(f"    {param_name:50s} {str(tuple(param_shape)):24s}{offset_info}")
+                    lines.append(f"    {param_name:50s} {str(tuple(param.shape)):24s}{offset_info}")
                 group_idx += 1
 
         lines.append(
@@ -808,7 +798,7 @@ class FSDPModule(nn.Module):
                 for param_group in child._fsdp_param_groups:
                     for param in param_group.params:
                         wbuf = param_group.model_weight_buffer
-                        param_data = wbuf.get_item(param_group.param_idx[param], as_shard=False)
+                        param_data = wbuf.get_item(param_group.param_idx[param], only_shard=False)
                         assert not torch.isnan(
                             param_data
                         ).any(), "NaN detected in model weight buffer"
@@ -816,7 +806,7 @@ class FSDPModule(nn.Module):
 
 def _get_module_fsdp_param_groups(
     module: nn.Module,
-    mp_policy: MixedPrecisionPolicy,
+    mp_policy: FullyShardMixedPrecisionPolicy,
     allocator: BucketAllocator,
     mesh: Optional[DeviceMesh] = None,
     ignored_params: Optional[set[nn.Parameter]] = None,
