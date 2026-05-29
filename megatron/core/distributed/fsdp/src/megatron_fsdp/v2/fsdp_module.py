@@ -247,7 +247,7 @@ class FSDPModule(nn.Module):
             assert gbuf_data.numel() > 0
 
             # Get offset and size from buffer index
-            offset, size = gbuf.buffer_index._get_item_offset(item_id)
+            offset, size = gbuf.buffer_index._get_item_global_range(item_id)
             grad_data = gbuf_data[offset : offset + size].view(p.shape)
 
             return grad_data
@@ -798,7 +798,7 @@ class FSDPModule(nn.Module):
                 for param_group in child._fsdp_param_groups:
                     for param in param_group.params:
                         wbuf = param_group.model_weight_buffer
-                        param_data = wbuf.get_item(param_group.param_idx[param], only_shard=False)
+                        param_data = wbuf.get_item(param_group.param_idx[param], as_shard=False)
                         assert not torch.isnan(
                             param_data
                         ).any(), "NaN detected in model weight buffer"
