@@ -44,14 +44,37 @@ Controls parameter/gradient dtypes and communication precision. Available polici
 
 | Policy | Notes |
 |--------|-------|
-| `MixedPrecisionPolicy` | Base policy (bf16 param, fp32 main weight & main grad) |
+| `MixedPrecisionPolicy` | Base policy; dtypes auto-detect from param unless overridden |
 | `FullyShardFP8Policy` | MXFP8 rowwise/colwise quantized weights |
 | `FullyShardNVFP4Policy` | NVFP4 primary weights |
+
+**Auto-detection rules** (when fields are not explicitly set):
+
+| Field | Default for FP8/NVFP4 params | Default for plain params |
+|-------|------------------------------|--------------------------|
+| `main_params_dtype` | `float32` | `param.dtype` |
+| `main_grads_dtype` | `float32` (via ``use_decoupled_grad`` alignment) | `param.dtype` |
+
+- **FP8/NVFP4 params** get fp32 main-weight buffers automatically — no config needed.
+- **Plain bf16 params** get same-dtype main-weight buffers by default. Set
+  ``main_params_dtype=torch.float32`` for fp32 optimizer precision.
+- **``use_decoupled_grad``** (default ``False``) aligns `main_grads_dtype` with
+  `main_params_dtype` so the optimizer works in a consistent precision context.
 
 ```python
 from megatron_fsdp.v2 import fully_shard, MixedPrecisionPolicy
 
+# Minimal: auto-detects dtypes from params
+mp_policy = MixedPrecisionPolicy()
+fully_shard(model, mp_policy=mp_policy)
+
+# Explicit fp32 optimizer for bf16 model
 mp_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
+fully_shard(model, mp_policy=mp_policy)
+
+# FP8 mixed precision
+from megatron_fsdp.v2 import FullyShardFP8Policy
+mp_policy = MixedPrecisionPolicy(fp8=FullyShardFP8Policy(enabled=True))
 fully_shard(model, mp_policy=mp_policy)
 ```
 

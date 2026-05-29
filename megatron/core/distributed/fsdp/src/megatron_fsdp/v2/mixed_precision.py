@@ -403,22 +403,47 @@ class MixedPrecisionPolicy:
         return HAVE_TE_MXFP8 and isinstance(tensor, MXFP8Tensor)
 
     def main_params_dtype_for_param(self, tensor: torch.Tensor) -> Optional[torch.dtype]:
-        """Return the main-parameter dtype for a parameter group."""
-        if self.is_fp8_param(tensor) and self.main_params_dtype is None:
+        """Return the main-parameter dtype for a parameter group.
+
+        Resolution order (first match wins):
+        1. Explicit ``main_params_dtype`` in the policy — user override wins.
+        2. Quantized tensors (FP8 or NVFP4) — always use ``float32`` so the
+           optimizer operates on high-precision weights.
+        3. Plain tensors — fall back to the parameter's own dtype, creating a
+           same-dtype main-weight buffer so that optimizer updates remain
+           isolated from the model compute buffer.
+        """
+        if self.main_params_dtype is not None:
+            return self.main_params_dtype
+
+        if self.is_fp8_param(tensor) or self.is_nvfp4_param(tensor):
             return torch.float32
-        if self.is_nvfp4_param(tensor) and self.main_params_dtype is None:
-            return torch.float32
-        return self.main_params_dtype
+
+        return tensor.dtype
 
     def main_grads_dtype_for_param(self, tensor: torch.Tensor) -> torch.dtype:
         """Return the main-gradient dtype for a parameter group.
 
-        Defaults to float32 for stable gradient accumulation (avoids
-        precision loss in reduce-scatter and optimizer steps).
+        Resolution order (first match wins):
+        1. Explicit ``main_grads_dtype`` in the policy — user override wins.
+        2. When ``use_decoupled_grad`` is *disabled*, the optimizer's main-grad
+           buffer should match the main-param buffer dtype (the optimizer
+           writes gradients into the same context as the main params).
+        3. Default — fall back to the parameter's own dtype.
+
+        Only the first condition triggers an independent main-grad buffer
+        creation with a different dtype than the main params.  Conditions 2
+        and 3 re-use the dtype already chosen for the main-weight buffer.
         """
         if self.main_grads_dtype is not None:
             return self.main_grads_dtype
-        return torch.float32
+
+        if not self.use_decoupled_grad:
+            main_param_dtype = self.main_params_dtype_for_param(tensor)
+            if main_param_dtype is not None:
+                return main_param_dtype
+
+        return tensor.dtype
 
     def get_high_precision_value(self, tensor: torch.Tensor) -> torch.Tensor:
         """Return a high-precision value for initializing optimizer main weights."""

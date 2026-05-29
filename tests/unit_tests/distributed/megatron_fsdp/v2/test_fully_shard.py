@@ -486,7 +486,7 @@ class TestMixedPrecision:
         """grad_reduce_in_fp32=True should use fp32 gradient communication."""
         torch.manual_seed(42)
         mp_policy = MixedPrecisionPolicy(
-            main_grads_dtype=torch.float32, grad_comm_dtype=torch.float32
+            grad_comm_dtype=torch.float32
         )
         model = SimpleMLP(64).to(_device()).bfloat16()
         fully_shard(model, mp_policy=mp_policy)
