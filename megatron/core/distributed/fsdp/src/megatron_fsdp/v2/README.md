@@ -40,7 +40,7 @@ Mixin class added to wrapped modules. Methods:
 |--------|-------------|---------|
 | `unshard()` | Pre-forward | All-gather params from sharded buffer |
 | `reshard()` | Post-forward, post-backward | Release unsharded buffer |
-| `reduce_grad()` | Post-backward | All-reduce or reduce-scatter gradients |
+| `reduce_grad()` | Post-backward / grad sync | Reduce-scatter gradients into optimizer-facing shards |
 
 ### DataParallelBuffer
 
@@ -48,15 +48,15 @@ Flat buffer managing (a shard of) parameter/gradient data:
 
 - `unshard()` — all-gather to full tensor
 - `reshard()` — free temporary buffer
-- `reduce_grad()` — all-reduce or reduce-scatter gradients
+- `reduce_grad()` — reduce-scatter gradients into optimizer-facing shards
 - Uses `BufferIndex` to track parameter layout within the buffer
 
 ### ParameterGroup
 
 Groups parameters sharing the same (device, dtype, requires_grad):
 
-- `model_weight_buffer` — stores sharded model weights
-- `main_weight_buffer` — optional high-precision copy
+- `model_weight_buffer` — stores compute weights; replicated for ZeRO-1/2 and sharded for ZeRO-3
+- `main_weight_buffer` — optional high-precision optimizer copy; sharded when optimizer state is sharded
 - `main_grad_buffer` — accumulates gradients before reduce
 - `dist_params` — DTensor views into the buffer
 
