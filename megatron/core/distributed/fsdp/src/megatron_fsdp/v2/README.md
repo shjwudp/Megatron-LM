@@ -95,12 +95,12 @@ See the parent directory `..` for `uneven_dtensor.py` which provides:
 
 ## Sharding Strategies
 
-| Strategy | Shard Weights | Shard Gradients | Status | Notes |
-|----------|---------------|-----------------|--------|-------|
-| `optim_grads_params` | Yes | Yes | **Supported** | Like ZeRO-3: full parameter/gradient/optimizer sharding |
-| `no_shard` | No | No | **Not yet supported** | Like DDP: no sharding |
-| `optim` | No | No | **Not yet supported** | Like ZeRO-1: shard optimizer states only |
-| `optim_grads` | No | Yes | **Not yet supported** | Like ZeRO-2: shard optimizer states + gradients |
+| Strategy | Shard Weights | Shard Grads | Shard Optim | Status | Notes |
+|----------|---------------|-------------|-------------|--------|-------|
+| `optim_grads_params` | Yes | Yes | Yes | **Supported** | ZeRO-3: full parameter/gradient/optimizer sharding |
+| `optim_grads` | No | Yes | Yes | **Supported** | ZeRO-2: shard optimizer states + gradients |
+| `optim` | No | No | Yes | **Supported** | ZeRO-1: shard optimizer states only |
+| `no_shard` | No | No | No | **Not yet supported** | DDP-equivalent: no sharding |
 
 ## Known Limitations
 
@@ -117,9 +117,8 @@ See the parent directory `..` for `uneven_dtensor.py` which provides:
 
 ### Sharding Strategies
 
-Only `optim_grads_params` (ZeRO-3 equivalent) is implemented. `no_shard`
-(DDP-like), `optim` (ZeRO-1), and `optim_grads` (ZeRO-2) are planned but
-not yet available.
+`optim` (ZeRO-1), `optim_grads` (ZeRO-2), and `optim_grads_params` (ZeRO-3)
+are supported. `no_shard` (DDP-equivalent) is planned but not yet available.
 
 ### `fully_shard()` API Parameters
 

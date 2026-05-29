@@ -87,11 +87,11 @@ class ParameterGroup:
         # Currently only optim_grads_params is fully implemented and tested.
         # See README.md § "Sharding Strategies" for details.
         # We will add support for these strategies in a follow-up change.
-        if sharding_strategy not in ("optim_grads_params",):
+        if sharding_strategy not in ("optim", "optim_grads", "optim_grads_params"):
             raise NotImplementedError(
                 f"Sharding strategy '{sharding_strategy}' is not yet supported in FSDP v2. "
-                f"Currently only 'optim_grads_params' is implemented. "
-                f"We will add support for 'no_shard', 'optim', and 'optim_grads' in a follow-up change."
+                f"Supported strategies: 'optim' (ZeRO-1), 'optim_grads' (ZeRO-2), "
+                f"'optim_grads_params' (ZeRO-3)."
             )
         self.sharding_strategy = sharding_strategy
         self.param_group_id = param_group_id
