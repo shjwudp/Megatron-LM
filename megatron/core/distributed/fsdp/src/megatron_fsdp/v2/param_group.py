@@ -30,7 +30,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 from ..uneven_dtensor import make_uneven_dtensor, update_uneven_dtensor_chunk_metadata
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
-from .mixed_precision import FullyShardMixedPrecisionPolicy
+from .mixed_precision import MixedPrecisionPolicy
 from .utils import ParamGroupIdx
 
 
@@ -56,7 +56,7 @@ class ParameterGroup:
         params: List[torch.nn.Parameter],
         param_group_id: ParamGroupIdx,
         *,
-        mp_policy: FullyShardMixedPrecisionPolicy,
+        mp_policy: MixedPrecisionPolicy,
         mesh: Optional[DeviceMesh] = None,
         sharding_strategy: str = "optim_grads_params",
         gradient_scaling_factor: Optional[float] = None,
@@ -83,6 +83,12 @@ class ParameterGroup:
         self.mesh = mesh
         self.dp_group = mesh.get_group()
 
+        if sharding_strategy == "no_shard":
+            raise NotImplementedError(
+                "Sharding strategy 'no_shard' is not yet supported in FSDP v2."
+            )
+        if sharding_strategy not in ("optim", "optim_grads", "optim_grads_params"):
+            raise ValueError(f"Unsupported sharding strategy: {sharding_strategy}")
         self.sharding_strategy = sharding_strategy
         self.param_group_id = param_group_id
 
@@ -104,7 +110,6 @@ class ParameterGroup:
         self.hsdp_wbuf: Optional[DataParallelBuffer] = None
         self.hsdp_gbuf: Optional[DataParallelBuffer] = None
         self.hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
-
         # Initialize buffers and distributed parameters
         self._init_buffers()
 
@@ -120,11 +125,7 @@ class ParameterGroup:
                 buffer.allocator = allocator
 
     def _create_buffer(
-        self,
-        dtype: torch.dtype,
-        is_distributed: bool,
-        role: str,
-        param_shapes: Optional[List[torch.Size]] = None,
+        self, dtype: torch.dtype, is_distributed: bool, role: str
     ) -> DataParallelBuffer:
         """Create a buffer and namespace its temporary bucket by role."""
         return DataParallelBuffer(
@@ -141,7 +142,6 @@ class ParameterGroup:
             chunk_size_factor=self.chunk_size_factor,
             sharding_strategy=self.sharding_strategy,
             mp_policy=self.mp_policy,
-            param_shapes=param_shapes,
         )
 
     def _init_buffers(self) -> None:
@@ -162,10 +162,7 @@ class ParameterGroup:
         # choices and exposes the tensor view that should be packed.
         if s != "no_shard":
             model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
-            model_weight_shapes = self.mp_policy.model_weight_buffer_shapes(self.params)
-            wbuf = self._create_buffer(
-                model_weight_dtype, shard_weights, "model_weight", param_shapes=model_weight_shapes
-            )
+            wbuf = self._create_buffer(model_weight_dtype, shard_weights, "model_weight")
             wbuf.init_data(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):
                 wbuf.set_item(i, self.mp_policy.get_param_data(p))
@@ -210,35 +207,32 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
-    def unshard(self, async_op: bool = False, bwd_pass: bool = False):
+    def unshard(self, bwd_pass: bool = False):
         """
         Unshard model weights by all-gathering from sharded buffer.
 
         After unshard, parameters point to full unsharded storage. FP8
         parameters rebind their TE raw payload instead of ``param.data``.
         """
-        work = None
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
-            if weight_buffer is None:
-                continue
-            if weight_buffer.is_distributed and weight_buffer.is_unsharded():
-                continue
-            _, weight_work = weight_buffer.unshard(async_op=async_op)
-            if work is None:
-                work = weight_work
+            if weight_buffer is not None:
+                weight_buffer.unshard(bind_params=True)
 
         self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
-        return work
 
     def has_unsharded_weight_buffers(self, bwd_pass: bool = False) -> bool:
-        """Return whether all weight buffers needed for this forward/backward phase are unsharded."""
+        """Return whether this phase can skip launching another distributed unshard."""
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
             if weight_buffer is None:
                 continue
+            if not weight_buffer.is_distributed:
+                # Replicated buffers still need DataParallelBuffer.unshard() to
+                # rebind original parameter storage before the module uses it.
+                return False
             if not weight_buffer.is_unsharded():
                 return False
         return True
@@ -266,8 +260,9 @@ class ParameterGroup:
         """
         Reduce gradients across DP ranks.
 
-        For distributed buffers: reduce-scatter the full gradient
-        For non-distributed buffers: all-reduce in-place
+        ZeRO-2/3 reduce-scatter sharded grad buffers during backward.
+        ZeRO-1 keeps grads replicated during backward and reduce-scatters
+        the replicated buffer once when the optimizer syncs.
         """
         self.main_grad_buffer.reduce_grad(grad_comm_dtype=self.mp_policy.grad_comm_dtype)
 
@@ -289,7 +284,7 @@ class ParameterGroup:
         Creates DTensor views of model weights and gradients based on sharding strategy:
         - "optim_grads_params": weights and grads sharded, full ZeRO-3
         - "optim_grads": grads sharded, weights replicated (ZeRO-2)
-        - "optim": optimizer state sharding only, weights and grads replicated (ZeRO-1)
+        - "optim": grads accumulate replicated, optimizer consumes reduced shards
         - "no_shard": replicated, no sharding (DDP-equivalent)
         """
         self.dist_params = []
@@ -305,14 +300,19 @@ class ParameterGroup:
             if self.main_weight_buffer is not None:
                 mbuf = self.main_weight_buffer
                 data = mbuf.get_item(self.param_idx[param], as_shard=is_param_shard)
+                param_shape = param.shape
             elif self.model_weight_buffer is not None:
                 wbuf = self.model_weight_buffer
                 data = wbuf.get_item(self.param_idx[param], as_shard=is_param_shard)
+                param_shape = self.mp_policy.get_param_storage_shapes([param])[0]
             else:
                 data = param.data.detach()
+                param_shape = param.shape
 
             dist_param = torch.nn.Parameter(
-                make_uneven_dtensor(data, param.shape, self.mesh, placements),
+                make_uneven_dtensor(
+                    data, param_shape, self.mesh, placements, post_process_uneven=True
+                ),
                 requires_grad=param.requires_grad,
             )
             # Mark as FSDP parameter for special handling

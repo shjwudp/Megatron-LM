@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# FSDP v2 currently supports ZeRO-1/2/3 strategies (`optim`,
+# `optim_grads`, and `optim_grads_params`). `no_shard` is not implemented in
+# this path yet.
+
 from ..uneven_dtensor import (
     gather_and_compute_chunk_metadata,
     get_state_dict,
@@ -26,7 +30,7 @@ from .dp_buffer import BufferIndex, DataParallelBuffer
 from .fully_shard import FSDPModule, fully_shard
 from .mixed_precision import (
     FullyShardFP8Policy,
-    FullyShardMixedPrecisionPolicy,
+    MixedPrecisionPolicy,
     FullyShardNVFP4Policy,
 )
 from .param_group import ParameterGroup
@@ -35,7 +39,7 @@ __all__ = [
     "FSDPModule",
     "fully_shard",
     "FullyShardFP8Policy",
-    "FullyShardMixedPrecisionPolicy",
+    "MixedPrecisionPolicy",
     "FullyShardNVFP4Policy",
     "ParameterGroup",
     "BufferIndex",

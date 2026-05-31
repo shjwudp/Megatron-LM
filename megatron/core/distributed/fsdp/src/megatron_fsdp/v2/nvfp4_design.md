@@ -22,7 +22,7 @@ FSDP path, following the same patterns used for FP8 support.
 
 ### 2.2 What already works (FSDP v2 FP8 path)
 
-- `FullyShardMixedPrecisionPolicy` (in `v2/mixed_precision.py`) handles
+- `MixedPrecisionPolicy` (in `v2/mixed_precision.py`) handles
   FP8 / MXFP8 detection, buffer dtype, raw-data extraction, post-unshard
   processing, post-reshard cache invalidation, and main→model quantization.
 - `ParameterGroup` creates 3–4 `DataParallelBuffer` instances:
@@ -69,11 +69,11 @@ different byte offsets appropriate for that buffer's dtype/shape.
 
 ### 4.2 Policy-driven shape transform
 
-The `FullyShardMixedPrecisionPolicy` already owns dtype and raw-data decisions.
+The `MixedPrecisionPolicy` already owns dtype and raw-data decisions.
 We extend it with an `nvfp4` sub-policy (analogous to `fp8`) that:
 
 - Returns `torch.uint8` from `model_weight_buffer_dtype()`.
-- Returns packed shapes from a new `model_weight_buffer_shapes()`.
+- Returns packed shapes from a new `get_param_storage_shapes()`.
 - Returns `_rowwise_data` from `get_param_data()`.
 - Calls `post_all_gather_processing()` in `post_unshard()`.
 - Invokes `quantize_master_weights` (via `quantize_nvfp4_param_shard`) in
@@ -108,11 +108,11 @@ class FullyShardNVFP4Policy:
     recipe: Optional[str] = None
 ```
 
-**Extend `FullyShardMixedPrecisionPolicy`** with `nvfp4` field:
+**Extend `MixedPrecisionPolicy`** with `nvfp4` field:
 
 ```python
 @dataclass(frozen=True)
-class FullyShardMixedPrecisionPolicy:
+class MixedPrecisionPolicy:
     ...
     fp4_param_gather: bool = False
     fp4_recipe: Optional[str] = None
@@ -131,7 +131,7 @@ as FP8, lines 160–172).
 | `group_key_dtype()` | Return `("quantized", "NVFP4Tensor", recipe)` for NVFP4 params |
 | `is_nvfp4_param()` | New: `isinstance(tensor, NVFP4_TENSOR_CLASS)` |
 | `model_weight_buffer_dtype()` | Return `torch.uint8` for NVFP4 (same as FP8) |
-| `model_weight_buffer_shapes()` | **New**: Return packed shapes for NVFP4, original shapes otherwise |
+| `get_param_storage_shapes()` | **New**: Return packed shapes for NVFP4, original shapes otherwise |
 | `get_param_data()` | Return `tensor._rowwise_data` (packed) for NVFP4 |
 | `bind_unsharded_param()` | Set `_rowwise_data` to all-gathered buffer view (same pattern as FP8 `_data`) |
 | `get_high_precision_value()` | Use `dequantize()` or preserved init val |
@@ -146,51 +146,53 @@ as FP8, lines 160–172).
 
 ### 5.2 `megatron_fsdp/v2/param_group.py`
 
-**`_init_buffers()`** — changes to model-weight buffer creation (lines 158–164):
-
-```python
-if s != "no_shard":
-    model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
-    model_weight_shapes = self.mp_policy.model_weight_buffer_shapes(self.params)
-    wbuf = self._create_buffer(model_weight_dtype, shard_weights, "model_weight",
-                               param_shapes=model_weight_shapes)
-    ...
-```
-
-The `param_shapes` override flows through `_create_buffer()` → `DataParallelBuffer.__init__()` → `BufferIndex.__init__()`.
-
-For NVFP4, `model_weight_shapes` returns packed shapes (e.g., `[128, 64]` → `[128, 32]`). For non-NVFP4, it returns `None` and the default shape extraction is used.
+**`_init_buffers()`** — unchanged.  Buffer creation passes the shared logical
+`chunk_size_factor` through `_create_buffer()`.  Shape resolution is handled
+in `DataParallelBuffer.__init__()` and `BufferIndex.compact()`.
 
 ### 5.3 `megatron_fsdp/v2/dp_buffer.py`
 
-**`DataParallelBuffer.__init__()`** — accept optional `param_shapes` override:
+**`BufferIndex.compact(factor, compact_shapes)`** — **new method** that proportionally
+scales all indices for packed storage:
 
 ```python
-def __init__(
-    self,
-    params, param_idx, dtype, device, dp_group, param_group_id, *,
-    allocator=None, buffer_role="model_weight", is_distributed=False,
-    gradient_scaling_factor=None, chunk_size_factor=1,
-    sharding_strategy="no_shard", mp_policy,
-    param_shapes: Optional[List[torch.Size]] = None,
-):
-    ...
-    _shapes = param_shapes if param_shapes is not None else [p.shape for p in params]
-    self.buffer_index = BufferIndex(
-        param_shapes=_shapes, ...
+def compact(self, factor: float, compact_shapes: List[torch.Size]) -> None:
+    for item_id, item in self.item_index_map.items():
+        new_map[item_id] = ItemIndex(
+            global_data_index=int(item.global_data_index * factor),
+            size=int(item.size * factor),
+            item_id=item.item_id,
+            shape=compact_shapes[item_id],
+        )
+    self.item_index_map = new_map
+    self.bucket_meta = BucketMeta(
+        global_data_index=0,
+        size=int(self.bucket_meta.size * factor),
+        items=list(new_map.values()),
     )
+    self.shard_meta = self._build_shard_meta(...)
 ```
 
-**`ParameterGroup._create_buffer()`** — forward `param_shapes` kwarg:
+For NVFP4, ``factor = 0.5`` and ``compact_shapes`` come from
+``get_param_storage_shapes()``.  This preserves the proportional item-offset
+mapping between buffers while eliminating fragment-binning waste.
+
+**`DataParallelBuffer.__init__()`** — always builds with logical shapes, then compacts
+NVFP4 weight buffers:
 
 ```python
-def _create_buffer(self, dtype, is_distributed, role,
-                   param_shapes=None) -> DataParallelBuffer:
-    return DataParallelBuffer(
-        ...,
-        param_shapes=param_shapes,
-    )
+_logical_shapes = [p.shape for p in params]
+self.buffer_index = BufferIndex(
+    param_shapes=_logical_shapes,
+    chunk_size_factor=chunk_size_factor,
+    ...,
+)
+if buffer_role in ("model_weight", "transpose_weight") and any(mp_policy.is_nvfp4_param(p) for p in params):
+    self.buffer_index.compact(0.5, mp_policy.get_param_storage_shapes(params))
 ```
+
+Main-weight and main-grad buffers are never compacted — they keep the
+logical layout and the original ``chunk_size_factor``.
 
 ### 5.4 `megatron_fsdp/v2/fully_shard.py`
 
@@ -225,7 +227,7 @@ Already has `fp4_param_gather: bool = False` at line 75. No change needed.
 **`_init_with_fully_shard()`** — pass FP4 configuration into the policy:
 
 ```python
-fully_shard_mp_policy = FullyShardMixedPrecisionPolicy(
+fully_shard_mp_policy = MixedPrecisionPolicy(
     ...
     nvfp4=FullyShardNVFP4Policy(
         enabled=ddp_config.fp4_param_gather,
@@ -288,8 +290,8 @@ No changes needed. Existing functions (`is_nvfp4tensor`, `quantize_nvfp4_param_s
 | File | Change |
 |------|--------|
 | `megatron_fsdp/v2/mixed_precision.py` | Add `FullyShardNVFP4Policy`, NVFP4 detection, all policy methods |
-| `megatron_fsdp/v2/param_group.py` | Pass packed shapes to model_weight_buffer creation |
-| `megatron_fsdp/v2/dp_buffer.py` | Accept optional `param_shapes` kwarg |
+| `megatron_fsdp/v2/param_group.py` | Pass logical `chunk_size_factor` (computed from ``p.shape``) to all buffers |
+| `megatron_fsdp/v2/dp_buffer.py` | Add `BufferIndex.compact()`; all buffers build with logical shapes, only NVFP4 weight buffers are compacted |
 | `megatron_fsdp/distributed_data_parallel_config.py` | Add `fp4_param_gather` field |
 | `mcore_fsdp_adapter.py` | Wire `fp4_param_gather` + `fp4_recipe` into policy |
 | `megatron_fsdp/v2/__init__.py` | Export new NVFP4 policy class |
@@ -300,11 +302,10 @@ Files that do **not** need changes: `fp4_utils.py`, `hooks.py`, `fully_shard.py`
 ## 8. Risks and Edge Cases
 
 1. **Packed buffer alignment**: The `BufferIndex._build_layout()` pads to
-   `dp_world_size * chunk_size_factor`. For NVFP4 packed buffers, the
-   `chunk_size_factor` should reflect the packed element count, not the logical
-   count. Since `chunk_size_factor` is computed from `p.shape[1:].numel()` in
-   `ParameterGroup.__init__`, and NVFP4 tensors report their logical shape,
-   this remains correct.
+   `dp_world_size * chunk_size_factor`.  `chunk_size_factor` is computed from
+   logical `p.shape[1:].numel()` so that it works correctly for all buffers
+   (model-weight, main-weight, main-grad).  Only the model-weight buffer uses
+   packed shapes in its `BufferIndex`; the main buffers use logical shapes.
 
 2. **Empty shards**: NVFP4 params with odd inner dimensions are rejected by
    TE (assertion in `get_nvfp4_rowwise_packed_shape`). No special handling needed.
@@ -343,10 +344,10 @@ def get_item(self, item_id, *, as_shard=False):
     return self.data[start:end]
 ```
 
-## 10. DataParallelBuffer.summon_full_params
+## 10. DataParallelBuffer.summon_full_params (planned)
 
-Context manager that temporarily unshards a buffer, then automatically
-reshards on exit:
+> **Not yet implemented.** Context manager that temporarily unshards a
+> buffer, then automatically reshards on exit:
 
 ```python
 @contextmanager

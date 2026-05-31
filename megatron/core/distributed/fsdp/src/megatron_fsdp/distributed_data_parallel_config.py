@@ -5,8 +5,6 @@ from typing import Optional
 
 import torch
 
-from .utils import is_torch_min_version
-
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -157,6 +155,10 @@ class DistributedDataParallelConfig:
       main gradients to parameter dtype for `.grad`.
     """
 
+    use_megatron_fsdp_v2: bool = False
+    """If true, use the `fully_shard` API for FSDP sharding the model.
+    """
+
     megatron_fsdp_enable_fine_grained_param_gather: bool = False
     """If set to True, enables fine-grained parameter gathering for Megatron-FSDP.
       This feature increases the overlap between parameter all-gather and forward computation,
@@ -168,15 +170,11 @@ class DistributedDataParallelConfig:
       will be unsharded.
     """
 
-    use_megatron_fsdp_v2: bool = False
-    """If true, use the `fully_shard` API for FSDP sharding the model.
-    """
-
     def __post_init__(self):
         import os
 
         """Check the validity of the config."""
-        if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
+        if self.nccl_ub:
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "

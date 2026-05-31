@@ -41,8 +41,8 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
 
@@ -53,11 +53,6 @@ try:
         MixedPrecisionPolicy,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-        FullyShardFP8Policy,
-        FullyShardMixedPrecisionPolicy,
-        FullyShardNVFP4Policy,
-    )
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -214,13 +209,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dist_index=self.megatron_fsdp_dist_index,
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
-                # EP overlap schedule calls sub-modules directly instead of
-                # TransformerLayer.forward(), so fine-grained hooks are needed
-                # to manage _training_state and all-gather each sub-module's
-                # parameters individually.  This applies to all sharding
-                # strategies (not only optim_grads_params) because the hooks
-                # also maintain per-module training-state bookkeeping that the
-                # gradient-reduction pipeline relies on.
                 enable_fine_grained_param_gather_hook=(
                     (config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather)
                     or config.overlap_moe_expert_parallel_comm
@@ -261,6 +249,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
     ):
         if ddp_config.use_megatron_fsdp:
             from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import fully_shard
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
+                FullyShardFP8Policy,
+                MixedPrecisionPolicy,
+                FullyShardNVFP4Policy,
+            )
         else:
             from torch.distributed.fsdp import fully_shard
 
@@ -276,7 +269,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         edp_mesh = _init_dp_mesh(pg_collection, edp=True)
         dp_mesh = _init_dp_mesh(pg_collection, edp=False)
 
-        fully_shard_mp_policy = FullyShardMixedPrecisionPolicy(
+        fully_shard_mp_policy = MixedPrecisionPolicy(
             main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
             main_grads_dtype=(
                 torch.float32
@@ -303,6 +296,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "enable_unshard_prefetch": ddp_config.overlap_param_gather,
             "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
             "enable_trace_pool": ddp_config.fsdp_double_buffer,
+            "sharding_strategy": ddp_config.data_parallel_sharding_strategy,
         }
         if config.calculate_per_token_loss:
             gradient_scaling_factor = None
@@ -396,13 +390,13 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.start_param_sync = noop
         self.start_grad_sync = noop
 
-        def finish_grad_sync(force_all_reduce: Optional[bool] = False):
-            ctx = self.module._fsdp_root_context
-            torch.cuda.current_stream().wait_stream(ctx.rs_stream)
-
         def synchronize_param_gather():
             ctx = self.module._fsdp_root_context
             torch.cuda.current_stream().wait_stream(ctx.ag_stream)
+
+        def finish_grad_sync(force_all_reduce: Optional[bool] = False):
+            ctx = self.module._fsdp_root_context
+            torch.cuda.current_stream().wait_stream(ctx.rs_stream)
 
         self.finish_grad_sync = finish_grad_sync
         self.scale_gradients = self.module._scale_gradients

@@ -90,6 +90,10 @@ class DistributedDataParallelConfig:
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
 
+    use_megatron_fsdp_v2: bool = False
+    """If true, use the `fully_shard` API for FSDP sharding the model.
+    """
+
     use_custom_fsdp: bool = False
     """
     NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
