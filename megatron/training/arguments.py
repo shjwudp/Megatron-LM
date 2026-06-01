@@ -1094,6 +1094,9 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
+    if getattr(args, 'use_megatron_fsdp_v2', False):
+        args.use_megatron_fsdp = True
+
     if args.inference_dynamic_batching_sampling_backend == 'flashinfer':
         try:
             import flashinfer  # noqa: F401
@@ -2791,7 +2794,14 @@ def _add_distributed_args(parser):
                        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.')
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
-                       'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
+                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
+    group.add_argument(
+        '--use-megatron-fsdp-v2',
+        action='store_true',
+        dest='use_megatron_fsdp_v2',
+        help='Use PyTorch fully shard API for FSDP implementation. '
+        'This option is only effective when use-megatron-fsdp is set. ',
+    )
     group.add_argument('--create-all-gather-group', action='store_true',
                        help='Create a separate process group for all-gather operations '
                        'to overlap reduce-scatter and all-gather operations.')
