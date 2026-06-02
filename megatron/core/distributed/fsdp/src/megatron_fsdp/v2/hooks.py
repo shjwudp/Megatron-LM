@@ -27,6 +27,12 @@ from .allocator import TracePoolAllocator
 from .fsdp_module import FSDPModule, _FSDPState
 from .utils import RegisterFSDPBackwardFunction
 
+try:
+    from megatron.core.transformer.cuda_graphs import is_graph_capturing
+except ImportError:
+    def is_graph_capturing():
+        return False
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,6 +40,8 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule, hook_module: nn.Module |
     """Register a pre-forward hook to unshard parameters for this FSDP unit."""
 
     def unshard_param_groups(_hook_module, *unused):
+        if is_graph_capturing():
+            return
         ctx = fsdp_module._fsdp_root_context
         if ctx.backward_phase:
             fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
@@ -65,6 +73,8 @@ def _register_forward_hook(module: FSDPModule):
     """Register post-forward hook to reshard parameters."""
 
     def reshard_param_groups(module, *unused):
+        if is_graph_capturing():
+            return
         ctx = module._fsdp_root_context
         if ctx.backward_phase and id(module) == ctx.backward_module:
             return
@@ -107,6 +117,8 @@ def _register_backward_pre_hook(module: FSDPModule):
 
     def pre_backward_hook(module: FSDPModule, grads):
         """Hook called before backward pass for this module."""
+        if is_graph_capturing():
+            return
         ctx = module._fsdp_root_context
         if module._fsdp_state._is_root:
             ctx.backward_done_modules.clear()
@@ -144,6 +156,8 @@ def _register_backward_hook(module: FSDPModule):
 
     def post_backward(module: FSDPModule):
         """Hook called after backward pass for this module."""
+        if is_graph_capturing():
+            return
         ctx = module._fsdp_root_context
         ctx.backward_done_modules.add(id(module))
         ctx._advance_backward_module()

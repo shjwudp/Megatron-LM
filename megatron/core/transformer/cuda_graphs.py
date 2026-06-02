@@ -1499,10 +1499,14 @@ class CudaGraphManager(torch.nn.Module):
             torch.cuda.set_stream(torch.cuda.Stream())
 
     def call_ddp_preforward_hook(self, module):
-        """Call any DDP pre-forward hooks which are used to launch async data parallel
+        """Call any DDP or FSDP pre-forward hooks which are used to launch async data parallel
         param gather. Any other pre-forward hooks are not allowed."""
 
         from megatron.core.distributed import distributed_data_parallel
+
+        if self._is_fsdp_module(module):
+            module.unshard(async_op=False)
+            return
 
         if module._forward_pre_hooks:
             for _, hook in module._forward_pre_hooks.items():
@@ -1510,8 +1514,31 @@ class CudaGraphManager(torch.nn.Module):
                     inspect.getmodule(hook) == distributed_data_parallel
                 ), "Tried to cudagraph a module with user registered pre-forward hooks, \
                 which is not allowed."
-                # Only hooks from Mcore DDP, which take no args, should be called at this point.
                 hook(module)
+
+    @staticmethod
+    def _is_fsdp_module(module):
+        try:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
+        except ImportError:
+            return False
+        return isinstance(module, FSDPModule)
+
+    @staticmethod
+    def _run_fsdp_post_graph_cleanup(megatron_module):
+        """Eagerly run FSDP v2 post-graph cleanup (reshard + reduce_grad).
+
+        During graph capture FSDP hooks are no-ops, so cleanup must run
+        eagerly after graph replay in ``CudaGraphManager.__call__``.
+        """
+        if not CudaGraphManager._is_fsdp_module(megatron_module):
+            return
+        megatron_module.reshard()
+        if any(
+            pg.sharding_strategy in ("optim_grads", "optim_grads_params")
+            for pg in megatron_module._fsdp_param_groups
+        ):
+            megatron_module.reduce_grad(async_op=False)
 
     def get_cudagraph_runner(self, megatron_module, args, kwargs, reuse_cudagraphs, cache_key=None):
         '''Returns a valid cudagraph runner for the current forward call.
@@ -1616,6 +1643,11 @@ class CudaGraphManager(torch.nn.Module):
                 megatron_module, args, kwargs, self.reuse_cudagraphs, cache_key=cache_key
             )
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
+
+            # Megatron FSDP v2 hooks are no-ops during graph capture; run their
+            # cleanup (reshard + reduce_grad) eagerly after graph replay.
+            if self.training and torch.is_grad_enabled():
+                CudaGraphManager._run_fsdp_post_graph_cleanup(megatron_module)
         else:
             if is_inference_mode or self._inline_capture:
                 # Inference generation mode creates graphs immediately
