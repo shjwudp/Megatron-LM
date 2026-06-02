@@ -1505,8 +1505,7 @@ class CudaGraphManager(torch.nn.Module):
         from megatron.core.distributed import distributed_data_parallel
 
         if self._is_fsdp_module(module):
-            if torch.distributed.get_rank() == 0:
-                logger.debug("[FSDP-CG] call_ddp_preforward_hook: calling unshard() eagerly")
+            print("[FSDP-CG] call_ddp_preforward_hook: calling unshard() eagerly", flush=True)
             module.unshard(async_op=False)
             return
 
@@ -1537,12 +1536,14 @@ class CudaGraphManager(torch.nn.Module):
             return
         if torch.distributed.get_rank() == 0:
             logger.debug("[FSDP-CG] _run_fsdp_post_graph_cleanup: reshard+reduce_grad")
+        print("[FSDP-CG] _run_fsdp_post_graph_cleanup start", flush=True)
         megatron_module.reshard()
         if any(
             pg.sharding_strategy in ("optim_grads", "optim_grads_params")
             for pg in megatron_module._fsdp_param_groups
         ):
             megatron_module.reduce_grad(async_op=False)
+        print("[FSDP-CG] _run_fsdp_post_graph_cleanup done", flush=True)
 
     def get_cudagraph_runner(self, megatron_module, args, kwargs, reuse_cudagraphs, cache_key=None):
         '''Returns a valid cudagraph runner for the current forward call.

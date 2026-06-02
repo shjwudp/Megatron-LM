@@ -418,12 +418,11 @@ class TracePoolAllocator(BucketAllocator):
         if offset > 0:
             pool = torch.empty(offset, dtype=dtype, device=device)
             self._pools[(dtype, device)] = pool
-            if torch.distributed.get_rank() == 0:
-                logger.debug(
-                    "[FSDP-CG] plan() allocated pool: dtype=%s device=%s size=%d "
-                    "actual_device=%s",
-                    dtype, device, offset, pool.device,
-                )
+            print(
+                f"[FSDP-CG] plan() pool: dtype={dtype} device={device} "
+                f"size={offset} actual_device={pool.device}",
+                flush=True,
+            )
         return offset
 
     # -- Phase 3: optimized runtime ------------------------------------- #
