@@ -551,6 +551,10 @@ class DataParallelBuffer:
         For non-distributed buffers self.data is already full, so
         self.data is returned directly. If a replicated buffer only has this
         rank's updated shard, the shard is all-gathered into self.data first.
+
+        Memory allocation always occurs on the default stream for deterministic
+        caching-allocator behaviour.  Only the all-gather collective runs on the
+        caller's stream (which may be a side stream for overlap).
         """
         assert self.data is not None
 
@@ -562,12 +566,15 @@ class DataParallelBuffer:
             shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
         elif self.is_distributed:
             if self._unsharded_buffer is None:
-                bucket = self.allocator.allocate(
-                    key=self.alloc_key,
-                    size=self.buffer_index.bucket_meta.size,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
+                default_stream = torch.cuda.default_stream(self.device)
+                with torch.cuda.stream(default_stream):
+                    bucket = self.allocator.allocate(
+                        key=self.alloc_key,
+                        size=self.buffer_index.bucket_meta.size,
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                torch.cuda.current_stream().wait_stream(default_stream)
                 self._unsharded_buffer = bucket.data
                 sm = self.buffer_index.shard_meta
                 shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
@@ -581,10 +588,6 @@ class DataParallelBuffer:
                 input_tensor=shard_buffer,
                 group=self.dp_group,
             )
-            if self.is_distributed and full_buffer.is_cuda:
-                # Temporary all-gather buckets may be released from another stream before
-                # the collective finishes; record the producer stream for allocator safety.
-                full_buffer.record_stream(torch.cuda.current_stream())
             if self._dirty:
                 self._dirty = False
 
@@ -622,15 +625,21 @@ class DataParallelBuffer:
         as_shard : bool
             If True, return only this rank's shard slice of the full buffer.
             Default (False) returns the full unsharded buffer.
+
+        Memory allocation always occurs on the default stream for deterministic
+        caching-allocator behaviour.
         """
         if self.is_distributed:
             if self._unsharded_buffer is None:
-                bucket = self.allocator.allocate(
-                    key=self.alloc_key,
-                    size=self.buffer_index.bucket_meta.size,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
+                default_stream = torch.cuda.default_stream(self.device)
+                with torch.cuda.stream(default_stream):
+                    bucket = self.allocator.allocate(
+                        key=self.alloc_key,
+                        size=self.buffer_index.bucket_meta.size,
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                torch.cuda.current_stream().wait_stream(default_stream)
                 self._unsharded_buffer = bucket.data
             full = self._unsharded_buffer
         else:
@@ -687,9 +696,6 @@ class DataParallelBuffer:
             input_buffer = self.fetch_buffer()
             output_offset = sm.bucket_data_index
             accumulate_output = True
-            if input_buffer.is_cuda:
-                # Keep temporary reduce-scatter buffers tied to the stream that uses them.
-                input_buffer.record_stream(torch.cuda.current_stream())
         else:
             # ZeRO-1 (optim): ``self.data`` is the replicated full grad
             # accumulation buffer. The optimizer consumes only this rank's
