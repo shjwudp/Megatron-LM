@@ -13,9 +13,12 @@
 # limitations under the License.
 
 import dataclasses
+import logging
 from typing import Dict, Hashable, List, Optional, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 AllocatorKey = Hashable
 
@@ -413,7 +416,14 @@ class TracePoolAllocator(BucketAllocator):
             offset += slot.size
 
         if offset > 0:
-            self._pools[(dtype, device)] = torch.empty(offset, dtype=dtype, device=device)
+            pool = torch.empty(offset, dtype=dtype, device=device)
+            self._pools[(dtype, device)] = pool
+            if torch.distributed.get_rank() == 0:
+                logger.debug(
+                    "[FSDP-CG] plan() allocated pool: dtype=%s device=%s size=%d "
+                    "actual_device=%s",
+                    dtype, device, offset, pool.device,
+                )
         return offset
 
     # -- Phase 3: optimized runtime ------------------------------------- #
@@ -447,9 +457,16 @@ class TracePoolAllocator(BucketAllocator):
         )
         assert size <= slot.size, f"requested {size} > slot capacity {slot.size} (key={key})"
         pool = self._pools[(slot.dtype, slot.device)]
+        data = pool[slot.offset : slot.offset + size]
+        if data.device.type != 'cuda':
+            logger.error(
+                "[FSDP-CG] _pool_allocate returned non-CUDA tensor! "
+                "key=%s device=%s pool_device=%s slot=(dtype=%s, device=%s)",
+                key, data.device, pool.device, slot.dtype, slot.device,
+            )
         slot.in_use = True
         self._seq += 1
-        return Bucket(data=pool[slot.offset : slot.offset + size])
+        return Bucket(data=data)
 
     def _pool_free(self, key: AllocatorKey) -> None:
         """Mark the most recently allocated slot for this key as free.

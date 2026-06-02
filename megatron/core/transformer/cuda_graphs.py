@@ -1505,6 +1505,8 @@ class CudaGraphManager(torch.nn.Module):
         from megatron.core.distributed import distributed_data_parallel
 
         if self._is_fsdp_module(module):
+            if torch.distributed.get_rank() == 0:
+                logger.debug("[FSDP-CG] call_ddp_preforward_hook: calling unshard() eagerly")
             module.unshard(async_op=False)
             return
 
@@ -1533,6 +1535,8 @@ class CudaGraphManager(torch.nn.Module):
         """
         if not CudaGraphManager._is_fsdp_module(megatron_module):
             return
+        if torch.distributed.get_rank() == 0:
+            logger.debug("[FSDP-CG] _run_fsdp_post_graph_cleanup: reshard+reduce_grad")
         megatron_module.reshard()
         if any(
             pg.sharding_strategy in ("optim_grads", "optim_grads_params")

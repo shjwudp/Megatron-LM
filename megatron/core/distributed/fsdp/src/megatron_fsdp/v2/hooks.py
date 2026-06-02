@@ -41,6 +41,7 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule, hook_module: nn.Module |
 
     def unshard_param_groups(_hook_module, *unused):
         if is_graph_capturing():
+            logger.debug("[FSDP-CG] unshard_param_groups SKIPPED (graph capturing)")
             return
         ctx = fsdp_module._fsdp_root_context
         if ctx.backward_phase:
@@ -74,6 +75,7 @@ def _register_forward_hook(module: FSDPModule):
 
     def reshard_param_groups(module, *unused):
         if is_graph_capturing():
+            logger.debug("[FSDP-CG] reshard_param_groups SKIPPED (graph capturing)")
             return
         ctx = module._fsdp_root_context
         if ctx.backward_phase and id(module) == ctx.backward_module:
@@ -118,6 +120,7 @@ def _register_backward_pre_hook(module: FSDPModule):
     def pre_backward_hook(module: FSDPModule, grads):
         """Hook called before backward pass for this module."""
         if is_graph_capturing():
+            logger.debug("[FSDP-CG] pre_backward_hook SKIPPED (graph capturing)")
             return
         ctx = module._fsdp_root_context
         if module._fsdp_state._is_root:
@@ -157,6 +160,7 @@ def _register_backward_hook(module: FSDPModule):
     def post_backward(module: FSDPModule):
         """Hook called after backward pass for this module."""
         if is_graph_capturing():
+            logger.debug("[FSDP-CG] post_backward SKIPPED (graph capturing)")
             return
         ctx = module._fsdp_root_context
         ctx.backward_done_modules.add(id(module))
