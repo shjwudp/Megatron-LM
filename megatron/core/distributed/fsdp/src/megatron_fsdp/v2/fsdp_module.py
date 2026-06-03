@@ -125,7 +125,12 @@ class _FSDPRootContext:
     # Activation recompute / gradient checkpointing support
     # ------------------------------------------------------------------
     backward_phase: bool = False
-    """True from the root backward pre-hook until the final callback."""
+    """True from the root backward pre-hook until the final callback.
+    ``forward_phase`` is set to ``False`` when this becomes ``True``."""
+
+    forward_phase: bool = False
+    """True from the root forward pre-hook until the root backward pre-hook.
+    ``backward_phase`` is set to ``False`` when this becomes ``True``."""
 
     backward_module: Optional[int] = None
     """``id(module)`` of the FSDP module whose backward is pending next.

@@ -177,6 +177,40 @@ class TracePoolAllocator(BucketAllocator):
 
     The trace pattern must be **repeatable** — the same alloc/free call
     sequence is expected every micro-batch.
+
+    **Flexible mode** (``enable_flexible_mode`` / ``disable_flexible_mode``)
+
+    When enabled, ``allocate`` and ``free`` bypass the seq-driven replay
+    entirely.  Each key maps directly to its first planned slot (built once
+    from ``_seq_ops``).  An overlap check catches a key whose slot is
+    occupied by a different live key.  This is intended for auxiliary
+    allocations (e.g. weight quantisation buffers) that occur between
+    micro-batches while the allocator is idle.
+
+    **Hook-coordinated lifecycle** (see ``megatron_fsdp.v2.hooks``)::
+
+        Micro-batch 0
+        ┌──────────────────────────────────────────────────────────
+        │  root pre-forward     forward_phase = True
+        │    forward (trace)
+        │  root pre-backward    forward_phase = False , backward_phase = True
+        │    backward (trace)
+        │  root post-backward   backward_phase = False
+        │                       plan() → optimized
+        │                       enable_flexible_mode()   ← flexible ON
+        └──────────────────────────────────────────────────────────
+
+        Micro-batch 1+
+        ┌──────────────────────────────────────────────────────────
+        │  root pre-forward     forward_phase = True
+        │                       disable_flexible_mode()  ← flexible OFF
+        │                       reset_cursor()
+        │    forward (optimized, seq-driven)
+        │  root pre-backward    forward_phase = False , backward_phase = True
+        │    backward (optimized, seq-driven)
+        │  root post-backward   backward_phase = False
+        │                       enable_flexible_mode()   ← flexible ON (idle)
+        └──────────────────────────────────────────────────────────
     """
 
     # -- Inner types ---------------------------------------------------- #
@@ -232,6 +266,11 @@ class TracePoolAllocator(BucketAllocator):
         self._seq_ops: Dict[int, Tuple[str, AllocatorKey, Optional[int]]] = {}
         self._key_to_slot: Dict[AllocatorKey, int] = {}  # active key -> slot_idx
 
+        # Flexible mode — dispenses with seq-driven replay; each key maps
+        # directly to its first planned slot.
+        self._flexible: bool = False
+        self._flex_key_to_slot: Dict[AllocatorKey, int] = {}
+
     # -- Phase 1: trace -------------------------------------------------- #
 
     def allocate(
@@ -243,20 +282,24 @@ class TracePoolAllocator(BucketAllocator):
         *,
         param_group_id: Optional[AllocatorKey] = None,
     ) -> Bucket:
-        """Dispatch to trace or pool path depending on phase."""
+        """Dispatch to trace, pool, or flexible path depending on phase."""
         key = _resolve_key(key, param_group_id)
         assert dtype is not None and device is not None
         if self._phase != "optimized":
             return self._trace_allocate(key, size, dtype, device)
+        if self._flexible:
+            return self._flex_allocate(key, size, dtype, device)
         return self._pool_allocate(key, size, dtype, device)
 
     def free(
         self, key: Optional[AllocatorKey] = None, *, param_group_id: Optional[AllocatorKey] = None
     ) -> None:
-        """Dispatch to trace or pool path depending on phase."""
+        """Dispatch to trace, pool, or flexible path depending on phase."""
         key = _resolve_key(key, param_group_id)
         if self._phase != "optimized":
             self._trace_free(key)
+        elif self._flexible:
+            self._flex_free(key)
         else:
             self._pool_free(key)
 
@@ -530,6 +573,64 @@ class TracePoolAllocator(BucketAllocator):
                 f"planned={op}"
             )
 
+    # -- Flexible-mode allocate / free ---------------------------------- #
+    #
+    # When enabled, allocate and free skip the seq-driven replay entirely.
+    # Each key maps directly to its first planned slot (built once by
+    # ``enable_flexible_mode``).  An overlap check catches keys whose
+    # slots are occupied by a different live key.
+
+    def enable_flexible_mode(self) -> None:
+        """Enable flexible allocate/free that does not require replaying
+        the trace sequence.
+
+        After this call, every ``allocate(key)`` returns the first slot
+        associated with ``key`` in the plan, regardless of ``_seq``.
+        An overlap error is raised if the target slot is already in use
+        by a different key.
+        """
+        assert self._phase == "optimized", "flexible mode requires an existing plan"
+        self._flexible = True
+        self._flex_key_to_slot.clear()
+        for op in self._seq_ops.values():
+            if op[0] == "alloc" and op[1] not in self._flex_key_to_slot:
+                self._flex_key_to_slot[op[1]] = op[2]
+
+    def disable_flexible_mode(self) -> None:
+        """Disable flexible mode and return to seq-driven replay."""
+        self._flexible = False
+
+    def _flex_allocate(
+        self, key: AllocatorKey, size: int, dtype: torch.dtype, device: torch.device
+    ) -> Bucket:
+        """Flexible allocate — key → first planned slot."""
+        slot_idx = self._flex_key_to_slot[key]
+        slot = self._slots[slot_idx]
+        assert size <= slot.size, (
+            f"requested {size} > slot capacity {slot.size} (key={key})"
+        )
+
+        if slot.in_use and key not in self._key_to_slot:
+            raise RuntimeError(
+                f"flexible alloc overlap: slot[{slot_idx}] is in use "
+                f"but {key} does not own it"
+            )
+
+        if key in self._key_to_slot:
+            pool = self._pools[(slot.dtype, slot.device)]
+            return Bucket(data=pool[slot.offset : slot.offset + size])
+
+        slot.in_use = True
+        self._key_to_slot[key] = slot_idx
+        pool = self._pools[(slot.dtype, slot.device)]
+        return Bucket(data=pool[slot.offset : slot.offset + size])
+
+    def _flex_free(self, key: AllocatorKey) -> None:
+        """Flexible free — release the slot associated with the key."""
+        slot_idx = self._key_to_slot.pop(key, None)
+        if slot_idx is not None:
+            self._slots[slot_idx].in_use = False
+
     # -- Debug ---------------------------------------------------------- #
 
     def dump_trace(self) -> str:
@@ -589,6 +690,8 @@ class TracePoolAllocator(BucketAllocator):
         self._seq_ops.clear()
         self._key_to_slot.clear()
         self._slots.clear()
+        self._flexible = False
+        self._flex_key_to_slot.clear()
 
     @property
     def phase(self) -> str:

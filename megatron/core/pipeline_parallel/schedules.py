@@ -694,8 +694,6 @@ def forward_backward_no_pipelining(
     else:
         with no_sync_func():
             for i in range(num_microbatches - 1):
-                if torch.distributed.get_rank() == 0:
-                    print("forward_step")
                 output_tensor, num_tokens = forward_step(
                     forward_step_func,
                     data_iterator,
@@ -711,11 +709,7 @@ def forward_backward_no_pipelining(
                 )
                 total_num_tokens += num_tokens
                 if not forward_only:
-                    if torch.distributed.get_rank() == 0:
-                        print("backward_step")
                     backward_step(input_tensor, output_tensor, output_tensor_grad, config)
-                    if torch.distributed.get_rank() == 0:
-                        print("backward_step over")
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
         output_tensor, num_tokens = forward_step(

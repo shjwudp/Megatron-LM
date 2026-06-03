@@ -47,6 +47,30 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule, hook_module: nn.Module |
     return module_to_hook.register_forward_pre_hook(unshard_param_groups, prepend=True)
 
 
+def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
+    """Register a pre-forward hook that fires ONLY on the root FSDP module.
+
+    Marks the start of the forward phase, resets the seq cursor, and
+    (when using ``TracePoolAllocator`` in optimized mode) disables
+    flexible key→slot lookup so the seq-driven replay path is used
+    during forward and backward.
+    """
+
+    def root_forward_pre_hook(_hook_module, *unused):
+        ctx = fsdp_module._fsdp_root_context
+        if not fsdp_module._fsdp_state._is_root:
+            return
+        ctx.forward_phase = True
+        ctx.backward_phase = False
+        if isinstance(ctx.bucket_allocator, TracePoolAllocator):
+            ba = ctx.bucket_allocator
+            if ba.phase == "optimized":
+                ba.disable_flexible_mode()
+                ba.reset_cursor()
+
+    return fsdp_module.register_forward_pre_hook(root_forward_pre_hook, prepend=True)
+
+
 def _register_fine_grained_forward_pre_hooks(module: FSDPModule):
     """Register pre-forward hooks on this FSDP unit and its owned submodules."""
 
@@ -110,6 +134,7 @@ def _register_backward_pre_hook(module: FSDPModule):
         ctx = module._fsdp_root_context
         if module._fsdp_state._is_root:
             ctx.backward_done_modules.clear()
+            ctx.forward_phase = False
             ctx.backward_phase = True
             ctx._advance_backward_module()
         setattr(module, "post_backward_issued", False)
@@ -260,6 +285,11 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
                 bucket_alloc.reset_cursor()
             else:
                 raise ValueError(f"Unexpected bucket allocator phase: {bucket_alloc.phase}")
+            # Both forward_phase and backward_phase are now False —
+            # enable flexible key→slot lookup for auxiliary allocations
+            # between micro-batches (e.g. weight quantisation).
+            if bucket_alloc.phase == "optimized":
+                bucket_alloc.enable_flexible_mode()
 
     state._post_backward_callback_queued = True
     Variable._execution_engine.queue_callback(
