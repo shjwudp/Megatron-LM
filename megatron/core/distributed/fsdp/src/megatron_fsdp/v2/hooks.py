@@ -252,7 +252,10 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
             if bucket_alloc.phase == "trace":
                 if torch.distributed.get_rank() == 0:
                     logger.debug(bucket_alloc.dump_trace())
+                    for m in ctx.forward_order:
+                        logger.debug(f"module_id={id(m)}, module_name={m._fsdp_module_name}")
                 bucket_alloc.plan()
+                bucket_alloc.reset_cursor()
             elif bucket_alloc.phase == "optimized":
                 bucket_alloc.reset_cursor()
             else:

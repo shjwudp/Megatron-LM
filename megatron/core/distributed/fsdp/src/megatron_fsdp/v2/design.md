@@ -792,34 +792,25 @@ that eliminates allocation overhead and fragmentation.
 
 | Phase | Behaviour |
 |---|---|
-| **Trace** (``plan()`` not yet called) | Records every ``allocate`` / ``free`` call as a ``(seq, op, key)`` event.  Also stores ``(size, dtype, device)`` metadata per key.  Buckets are allocated via ``torch.empty`` as usual.  Duplicate allocs (without an intervening free) do not generate new trace events. |
+| **Trace** (``plan()`` not yet called) | Records alloc/free pairs via an ``_active_keys`` set: the first ``allocate`` per key records a trace event and marks the key active; duplicate allocs (key still active) are no-ops.  The first ``free`` per key records a trace event and marks it inactive; double-frees and free-before-alloc are ignored.  A key that is freed then re-allocated generates a new pair of events.  Buckets are created with ``torch.empty`` and **never deleted** — on re-alloc the same tensor object is resurrected via ``_alloc_storage``, keeping outstanding views (NVFP4 ``_rowwise_data`` references) live. |
 | **Plan** (``plan()``) | Replays the trace to build intervals ``(alloc_seq, free_seq, size)`` for each matched alloc/free pair, groups them by ``(dtype, device)``, and runs a greedy left-edge interval-coloring algorithm per group.  Each color is a **slot** in a contiguous flat pool tensor.  Because the same key may appear in multiple intervals, ``_slot_map[key]`` is a **list** of slot indices in alloc order. |
-| **Optimized** (after ``plan()``) | ``allocate`` returns a ``Bucket`` with a slice-view into the pool, advancing a per-key cursor through the slot list.  ``free`` marks the most recently allocated slot as unused (idempotent).  ``reset_cursor()`` rewinds all cursors between micro-batches so the same sequence replays. |
+| **Optimized** (after ``plan()``) | ``allocate`` returns a ``Bucket`` with a slice-view into the pool, advancing a per-key cursor through the slot list.  Duplicate allocs return the existing slot without advancing the cursor.  ``free`` marks the most recently allocated slot as unused (idempotent — double-free and free-before-alloc are silent no-ops).  ``reset_cursor()`` rewinds all cursors between micro-batches so the same sequence replays. |
 
-**Slot lists and cursors.**  A single allocation key can appear in multiple
-intervals — e.g., forward unshard → free → backward unshard → free.  The plan
-may assign these intervals to *different* slots (if they overlap) or *reuse*
-the same slot (if they don't).  ``_slot_map`` therefore maps each key to a
-**list** of slot indices in the exact alloc order.  During optimized-phase
-runtime a per-key **cursor** tracks which list entry to consume next; between
-micro-batches ``reset_cursor()`` rewinds all cursors to 0.
+**Slot lists and cursors.**  ...same...
 
-**Greedy left-edge coloring.**  For each ``(dtype, device)`` group, intervals are
-sorted by ``alloc_seq``.  For each interval the algorithm tries to reuse a slot
-whose previous occupant has already freed (``slot_free_seq < alloc_seq``).  If no
-slot is free a new one is allocated.  The slot is sized to the maximum bucket
-assigned to it.  After coloring, slots are laid out contiguously and a single
-``torch.empty`` is issued per group.
+**Greedy left-edge coloring.**  ...same...
 
 **Properties.**
 
-- **Optimal slot count:** left-edge produces the minimum number of slots for
-  interval graphs — it is impossible to use fewer without causing a conflict.
-- **Repeatable trace required:** the same allocate/free call sequence must
-  repeat across micro-batches.  Call ``reset_cursor()`` between micro-batches;
-  call ``reset()`` to re-profile if the pattern changes.
-- **Double-free safe:** ``free`` is idempotent (silently returns if the slot
-  is already free), matching ``TemporaryBucketAllocator``'s behavior.
+- **Optimal slot count:** ...same...
+- **Repeatable trace required:** ...same...
+- **Fully idempotent:** ``allocate`` and ``free`` are always safe to call
+  multiple times.  `allocate` → `allocate` is a no-op (returns existing).
+  `free` → `free` is a no-op (ignored).  `free` without a prior `allocate`
+  is a no-op.  Both trace and optimized phases share this guarantee.
+- **Stable tensor objects:** Buckets are never deleted — the same Python
+  tensor object is reused across alloc/free cycles, preventing dangling
+  views (e.g., NVFP4 parameter ``_rowwise_data``).
 
 **API.**
 

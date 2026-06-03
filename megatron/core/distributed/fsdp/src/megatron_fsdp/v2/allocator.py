@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import dataclasses
-from typing import Dict, Hashable, List, Optional, Tuple
+from typing import Dict, Hashable, List, Optional, Set, Tuple
 
 import torch
 
@@ -159,8 +159,8 @@ class TracePoolAllocator(BucketAllocator):
        freed before this interval starts (``slot_free_seq < alloc_seq``).
     3. If no slot is free, allocate a new one.
     4. Grow the slot's capacity to ``max(size, current)``.
-    5. Record the assignment: append the slot index to the per-key list
-       in ``_slot_map``.
+    5. Record the assignment: ``_seq_ops[alloc_seq] = ("alloc", key, slot)``
+       and ``_seq_ops[free_seq] = ("free", key, None)``.
 
     After coloring, slots are laid out contiguously and a single
     ``torch.empty`` per ``(dtype, device)`` group is allocated. If the
@@ -168,14 +168,12 @@ class TracePoolAllocator(BucketAllocator):
 
     **Phase 3 — Optimized** (after ``plan()``)
 
-    ``allocate`` returns a ``Bucket`` with a slice-view into the pool;
-    ``free`` marks the slot as unused but never releases storage.  Because
-    the same allocation key can appear in multiple intervals (e.g.,
-    forward unshard → free → backward unshard → free), ``_slot_map`` maps
-    each key to a **list** of slot indices in alloc order.  A per-key
-    ``_slot_cursors`` counter tracks which index to consume next.  Call
-    ``reset_cursor()`` at the start of each micro-batch to rewind all
-    cursors to 0.
+    ``allocate`` and ``free`` dispatch via ``_seq_ops``, a unified
+    seq→action map.  When a planned entry does not match the live call
+    (e.g., the planned key is cached from a previous micro-batch),
+    ``_seq`` fast-forwards past it automatically.  Call
+    ``reset_cursor()`` at the start of each micro-batch to rewind
+    ``_seq`` to 0 (``_key_to_slot`` survives for cached keys).
 
     The trace pattern must be **repeatable** — the same alloc/free call
     sequence is expected every micro-batch.
@@ -225,12 +223,14 @@ class TracePoolAllocator(BucketAllocator):
         self._trace: List["TracePoolAllocator._TraceEvent"] = []
         self._trace_meta: Dict[AllocatorKey, Tuple[int, torch.dtype, torch.device]] = {}
         self._buckets: Dict[AllocatorKey, Bucket] = {}  # only used in trace phase
+        self._active_keys: Set[AllocatorKey] = set()  # keys currently allocated
 
         # Pool state — populated by plan(), used in optimized phase
         self._pools: Dict[Tuple[torch.dtype, torch.device], torch.Tensor] = {}
-        self._slot_map: Dict[AllocatorKey, List[int]] = {}  # key -> [slot indices]
-        self._slot_cursors: Dict[AllocatorKey, int] = {}  # key -> next index to use
         self._slots: List["TracePoolAllocator._Slot"] = []
+        # seq-driven schedule: seq -> ("alloc", key, slot_idx) | ("free", key, None)
+        self._seq_ops: Dict[int, Tuple[str, AllocatorKey, Optional[int]]] = {}
+        self._key_to_slot: Dict[AllocatorKey, int] = {}  # active key -> slot_idx
 
     # -- Phase 1: trace -------------------------------------------------- #
 
@@ -263,25 +263,42 @@ class TracePoolAllocator(BucketAllocator):
     def _trace_allocate(
         self, key: AllocatorKey, size: int, dtype: torch.dtype, device: torch.device
     ) -> Bucket:
-        """Trace-phase allocate: record the event and create a bucket on first use.
+        """Trace-phase allocate — idempotent.
 
-        Duplicate allocs (without an intervening free) do NOT generate
-        new trace events — they are no-ops that return the existing bucket.
+        - First alloc for a key: records trace event, creates bucket.
+        - Duplicate alloc (key still active): no-op, returns existing bucket.
+        - Re-alloc after free: resurrects storage, records new trace event.
         """
+        if key in self._active_keys:
+            return self._buckets[key]
+
         if key not in self._buckets:
             self._trace.append(self._TraceEvent(seq=self._seq, op="alloc", key=key))
             self._seq += 1
             self._trace_meta[key] = (size, dtype, device)
             self._buckets[key] = Bucket(data=torch.empty(size, dtype=dtype, device=device))
+        else:
+            # Key was freed — resurrect the same tensor object.
+            self._trace.append(self._TraceEvent(seq=self._seq, op="alloc", key=key))
+            self._seq += 1
+            _alloc_storage(self._buckets[key].data, torch.Size([size]))
+
+        self._active_keys.add(key)
         return self._buckets[key]
 
     def _trace_free(self, key: AllocatorKey) -> None:
-        """Trace-phase free: record the event and release the bucket storage."""
+        """Trace-phase free — idempotent.
+
+        - Free of an active key: records trace event, releases storage.
+        - Free of an inactive key (double-free or never-allocated): no-op.
+        """
+        if key not in self._active_keys:
+            return
         self._trace.append(self._TraceEvent(seq=self._seq, op="free", key=key))
         self._seq += 1
         if key in self._buckets:
             _free_storage(self._buckets[key].data)
-            del self._buckets[key]
+        self._active_keys.discard(key)
 
     # -- Phase 2: plan --------------------------------------------------- #
 
@@ -289,9 +306,12 @@ class TracePoolAllocator(BucketAllocator):
         """Build the static pool from the recorded trace.
 
         1. Replay the trace to pair alloc/free events into ``_Interval`` objects.
-        2. Group intervals by ``(dtype, device)``.
-        3. Color each group with the greedy left-edge algorithm.
-        4. Allocate one flat pool tensor per group.
+        2. Pair any un-freed allocs with sentinel free sequences so
+           persistent keys get coloured and reserved slots.
+        3. Group intervals by ``(dtype, device)``.
+        4. Color each group with the greedy left-edge algorithm.
+        5. Allocate one flat pool tensor per group.
+        6. Pre-populate ``_key_to_slot`` with persistent key slots.
 
         Returns:
             Total pool size in **elements** (sum across all groups).
@@ -321,12 +341,42 @@ class TracePoolAllocator(BucketAllocator):
                             )
                         )
 
+        # Keys that were allocated but not freed by the end of the trace
+        # persist across micro-batches. Pair them with a sentinel free_seq
+        # so they get coloured and their slots are reserved for the lifetime
+        # of the pool.
+        _SENTINEL_FREE_SEQ = 1 << 60
+        sentinel_seq = _SENTINEL_FREE_SEQ
+        for key, alloc_seqs in alloc_stack.items():
+            for alloc_seq in alloc_seqs:
+                meta = self._trace_meta.get(key)
+                if meta is not None:
+                    size, dtype, device = meta
+                    intervals.append(
+                        self._Interval(
+                            key=key, size=size, alloc_seq=alloc_seq,
+                            free_seq=sentinel_seq,
+                        )
+                    )
+                    sentinel_seq += 1
+
         if len(intervals) == 0:
             self._phase = "optimized"
             return 0
 
         # ---- step 2 & 3: color and allocate ----
-        return self._assign_pool(intervals)
+        total_elems = self._assign_pool(intervals)
+
+        # Transfer persistent (unfreed) keys into _key_to_slot so the
+        # optimized phase recognises them as cached from the start.
+        for key, alloc_seqs in alloc_stack.items():
+            for alloc_seq in alloc_seqs:
+                op = self._seq_ops.get(alloc_seq)
+                if op is not None and op[0] == "alloc":
+                    self._key_to_slot[key] = op[2]
+
+        self._phase = "optimized"
+        return total_elems
 
     def _assign_pool(self, intervals: List["TracePoolAllocator._Interval"]) -> int:
         """Group intervals by (dtype, device), color each group, sum sizes."""
@@ -337,16 +387,15 @@ class TracePoolAllocator(BucketAllocator):
             groups.setdefault(dtype_device, []).append(iv)
 
         # Clear any previous plan state before rebuilding
-        self._slot_map.clear()
-        self._slot_cursors.clear()
         self._slots.clear()
         self._pools.clear()
+        self._seq_ops.clear()
+        self._key_to_slot.clear()
 
         total_elems = 0
         for (dtype, device), group in groups.items():
             total_elems += self._color_group(group, dtype, device)
 
-        self._phase = "optimized"
         return total_elems
 
     def _color_group(
@@ -357,46 +406,30 @@ class TracePoolAllocator(BucketAllocator):
     ) -> int:
         """Greedy left-edge interval coloring for one (dtype, device) group.
 
-        Algorithm:
-
-        1. Sort intervals by ``alloc_seq``.
-        2. Maintain a *free-list* of ``(slot_index, free_seq)`` — slots that
-           become free at ``free_seq``.
-        3. For each interval:
-           a. Scan the free-list for a slot whose ``free_seq < alloc_seq``.
-              If found, reuse it (grow its size if needed) and update its
-              free time to this interval's ``free_seq``.
-           b. If no slot is free, create a new one.
-           c. Append the assigned slot index to ``_slot_map[key]``.
-
-        After all intervals are colored, slots are laid out contiguously
-        and a single ``torch.empty`` is issued for the group.
-
-        Complexity: O(n²) worst-case (linear scan per interval), negligible
-        for the typical tens-to-hundreds of param groups per dtype/device.
+        Records the schedule in ``_seq_ops`` as ``("alloc", key, slot)``
+        and ``("free", key, None)`` entries so the optimized phase can
+        replay without per-key cursor tracking.
         """
-        intervals = sorted(intervals, key=lambda iv: iv.alloc_seq)
+        sorted_intervals = sorted(intervals, key=lambda iv: iv.alloc_seq)
 
-        # free_slots: list of (local_slot_index, free_seq)
-        free_slots: List[Tuple[int, int]] = []
-        group_slots: List["TracePoolAllocator._Slot"] = []  # slots for this group
-        local_to_global: Dict[int, int] = {}  # local index -> global index
+        free_slots: List[Tuple[int, int]] = []  # (local_slot_index, free_seq)
+        group_slots: List["TracePoolAllocator._Slot"] = []
+        local_to_global: Dict[int, int] = {}
 
-        for iv in intervals:
+        for iv in sorted_intervals:
             assigned = False
-            # Try to reuse an existing slot whose previous occupant has already freed
             for i, (slot_idx, slot_free_seq) in enumerate(free_slots):
                 if slot_free_seq < iv.alloc_seq:
                     slot = group_slots[slot_idx]
                     if iv.size > slot.size:
-                        slot.size = iv.size  # grow if needed
-                    free_slots[i] = (slot_idx, iv.free_seq)  # update free time
-                    self._slot_map.setdefault(iv.key, []).append(local_to_global[slot_idx])
+                        slot.size = iv.size
+                    free_slots[i] = (slot_idx, iv.free_seq)
+                    self._seq_ops[iv.alloc_seq] = ("alloc", iv.key, local_to_global[slot_idx])
+                    self._seq_ops[iv.free_seq] = ("free", iv.key, None)
                     assigned = True
                     break
 
             if not assigned:
-                # No reusable slot — allocate a new one
                 local_idx = len(group_slots)
                 global_idx = len(self._slots)
                 local_to_global[local_idx] = global_idx
@@ -404,7 +437,8 @@ class TracePoolAllocator(BucketAllocator):
                 group_slots.append(slot)
                 self._slots.append(slot)
                 free_slots.append((local_idx, iv.free_seq))
-                self._slot_map.setdefault(iv.key, []).append(global_idx)
+                self._seq_ops[iv.alloc_seq] = ("alloc", iv.key, global_idx)
+                self._seq_ops[iv.free_seq] = ("free", iv.key, None)
 
         # Lay out slots contiguously within the group pool
         offset = 0
@@ -418,59 +452,88 @@ class TracePoolAllocator(BucketAllocator):
 
     # -- Phase 3: optimized runtime ------------------------------------- #
     #
-    # Each micro-batch replays the same alloc/free sequence.  Because a
-    # single allocation key may appear multiple times (e.g., forward
-    # unshard → free → backward unshard → free), ``_slot_map[key]`` is
-    # a **list** of slot indices in alloc order.  A per-key cursor in
-    # ``_slot_cursors`` tracks which index to consume next.  Between
-    # micro-batches, ``reset_cursor()`` rewinds all cursors to 0.
+    # ``_seq_ops`` maps each ``alloc_seq``/``free_seq`` to the planned
+    # action. During replay the live alloc/free sequence must repeat the
+    # trace order. When a planned entry targets a key that is already
+    # in ``_key_to_slot`` (cached from a previous micro-batch), the seq
+    # counter fast-forwards past that entry automatically.
+    # Persistent keys are pre-seeded into ``_key_to_slot`` by ``plan()``.
 
     def _pool_allocate(
         self, key: AllocatorKey, size: int, dtype: torch.dtype, device: torch.device
     ) -> Bucket:
-        """Return a ``Bucket`` whose data is a slice of the pre-allocated pool.
+        """Allocate from the pre-built schedule.
 
-        Advances the per-key slot cursor after consuming the slot.
+        Walks ``_seq_ops`` starting at ``_seq`` looking for the planned
+        alloc entry for ``key``.  Planned entries (alloc or free) whose
+        target key is already in ``_key_to_slot`` are fast-forwarded past
+        as cached remnants from a prior micro-batch.
+        Returns the cached slot directly if the key is already active.
         """
-        slot_list = self._slot_map[key]
-        cursor = self._slot_cursors.get(key, 0)
-        assert cursor < len(slot_list), (
-            f"no slot available for key={key} " f"(cursor={cursor}, slots={slot_list})"
-        )
-        slot_idx = slot_list[cursor]
-        self._slot_cursors[key] = cursor + 1
+        while True:
+            op = self._seq_ops.get(self._seq)
+            if op is not None and op[0] == "alloc" and op[1] == key:
+                slot_idx = op[2]
+                slot = self._slots[slot_idx]
+                assert size <= slot.size, (
+                    f"requested {size} > slot capacity {slot.size} (key={key})"
+                )
+                slot.in_use = True
+                self._key_to_slot[key] = slot_idx
+                self._seq += 1
+                pool = self._pools[(slot.dtype, slot.device)]
+                return Bucket(data=pool[slot.offset : slot.offset + size])
 
-        slot = self._slots[slot_idx]
-        assert not slot.in_use, (
-            f"slot {slot_idx} already in use (key={key}, "
-            f"cursor={cursor}, slot_list={slot_list})"
-        )
-        assert size <= slot.size, f"requested {size} > slot capacity {slot.size} (key={key})"
-        pool = self._pools[(slot.dtype, slot.device)]
-        slot.in_use = True
-        self._seq += 1
-        return Bucket(data=pool[slot.offset : slot.offset + size])
+            if op is not None and op[1] in self._key_to_slot:
+                # planned key is cached — skip past its alloc entry
+                self._seq += 1
+                continue
+
+            if key in self._key_to_slot:
+                slot_idx = self._key_to_slot[key]
+                slot = self._slots[slot_idx]
+                pool = self._pools[(slot.dtype, slot.device)]
+                return Bucket(data=pool[slot.offset : slot.offset + size])
+
+            raise RuntimeError(
+                f"unexpected alloc at seq={self._seq} for key={key}; "
+                f"planned={op}"
+            )
 
     def _pool_free(self, key: AllocatorKey) -> None:
-        """Mark the most recently allocated slot for this key as free.
+        """Free the slot scheduled at the current sequence position.
 
-        Double-frees are silently ignored (idempotent).
+        Walks ``_seq_ops`` the same way ``_pool_allocate`` does, matching
+        the planned free entry for ``key`` and fast-forwarding past any
+        alloc or free entries whose key is cached.  Double-free and
+        free-before-alloc are silent no-ops.
         """
-        # The last allocated slot for this key is at cursor - 1.
-        slot_idx = self._slot_map[key][self._slot_cursors.get(key, 1) - 1]
-        slot = self._slots[slot_idx]
-        self._seq += 1
-        if not slot.in_use:
-            return
-        slot.in_use = False
+        while True:
+            op = self._seq_ops.get(self._seq)
+            if op is not None and op[0] == "free" and op[1] == key:
+                slot_idx = self._key_to_slot.pop(key, None)
+                if slot_idx is not None:
+                    self._slots[slot_idx].in_use = False
+                self._seq += 1
+                return
+
+            if op is not None and op[1] in self._key_to_slot:
+                # planned key is cached — skip past its free entry
+                self._seq += 1
+                continue
+
+            if key not in self._key_to_slot:
+                return  # double-free or never allocated → no-op
+
+            raise RuntimeError(
+                f"unexpected free at seq={self._seq} for key={key}; "
+                f"planned={op}"
+            )
 
     # -- Debug ---------------------------------------------------------- #
 
     def dump_trace(self) -> str:
-        """Return a human-readable dump of the trace and pool plan.
-
-        Useful for debugging slot-conflict errors (e.g., "slot already in use").
-        """
+        """Return a human-readable dump of the trace and pool plan."""
         lines = []
         lines.append(f"=== TracePoolAllocator (phase={self._phase}, seq={self._seq}) ===")
         lines.append(f"trace events: {len(self._trace)}")
@@ -489,24 +552,29 @@ class TracePoolAllocator(BucketAllocator):
             for i, slot in enumerate(self._slots):
                 lines.append(
                     f"  slot[{i}]: offset={slot.offset} size={slot.size} "
-                    f"dtype={slot.dtype} device={slot.device}"
+                    f"dtype={slot.dtype} device={slot.device} {'in_use' if slot.in_use else 'free'}"
                 )
-            lines.append("\nslot_map (key -> [slot indices]):")
-            for key, slot_list in self._slot_map.items():
-                cursor = self._slot_cursors.get(key, 0)
-                lines.append(f"  {key} -> {slot_list}  cursor={cursor}")
+            lines.append(f"\nseq_ops ({len(self._seq_ops)} entries):")
+            for seq in sorted(self._seq_ops.keys()):
+                op_type, key, slot_idx = self._seq_ops[seq]
+                lines.append(f"  seq={seq:>4}  {op_type:>5}  key={key}  slot={slot_idx}")
+            lines.append(f"\nkey_to_slot (active):")
+            for key, slot_idx in self._key_to_slot.items():
+                lines.append(f"  {key} -> slot[{slot_idx}]")
 
         return "\n".join(lines)
 
     # -- Lifecycle ------------------------------------------------------- #
 
     def reset_cursor(self) -> None:
-        """Reset all slot cursors to 0 for the next iteration / micro-batch.
+        """Reset sequence counter for the next micro-batch.
 
-        Must be called between micro-batches in the optimized phase so that
-        the alloc/free sequence replays from the start of the slot lists.
+        ``_key_to_slot`` is NOT cleared so that keys cached across
+        micro-batches survive and automatically fast-forward past
+        their planned entries on the next replay.
         """
-        self._slot_cursors.clear()
+        for slot in self._slots:
+            slot.in_use = False
         self._seq = 0
 
     def reset(self) -> None:
@@ -516,14 +584,15 @@ class TracePoolAllocator(BucketAllocator):
         self._trace.clear()
         self._trace_meta.clear()
         self._buckets.clear()
+        self._active_keys.clear()
         self._pools.clear()
-        self._slot_map.clear()
-        self._slot_cursors.clear()
+        self._seq_ops.clear()
+        self._key_to_slot.clear()
         self._slots.clear()
 
     @property
     def phase(self) -> str:
-        """Current allocator phase: 'trace', 'plan', or 'optimized'."""
+        """Current allocator phase: ``"trace"`` or ``"optimized"``."""
         return self._phase
 
     @property
