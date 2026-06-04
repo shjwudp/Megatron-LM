@@ -193,31 +193,18 @@ class FSDPModule:
         self._fsdp_state.enable_cuda_graph = True
         self._orig_forward = self.forward
 
-        @contextmanager
-        def raw_forward(module):
-            """Temporarily restore original forward, then re-apply patch."""
-            patched = module.forward
-            module.forward = module._orig_forward
-            try:
-                yield
-            finally:
-                module.forward = patched
-
         def _cuda_graph_forward(*args, **kwargs):
             ctx = self._fsdp_root_context
             ba = ctx.bucket_allocator
 
             if isinstance(ba, TracePoolAllocator) and ba.phase == "optimized":
-                with raw_forward(self):
-                    if not hasattr(self, "_fsdp_cg_runner"):
-                        # First call: capture forward() in a graph.
-                        # Warmup inside capture_forward settles FP8 /
-                        # RNG / cuDNN caches before recording.
-                        self._fsdp_cg_runner = FSDPCudaGraphRunner(self)
-                        return self._fsdp_cg_runner.capture_forward(*args, **kwargs)
-
-                    # Replay: just the captured compute graph.
-                    return self._fsdp_cg_runner.replay()
+                if not hasattr(self, "_fsdp_cg_runner"):
+                    # First call: capture forward() in a graph.
+                    self._fsdp_cg_runner = FSDPCudaGraphRunner(self)
+                    self._fsdp_cg_runner.capture_forward(*args, **kwargs)
+                    self._fsdp_cg_runner.install()
+                    if torch.distributed.get_rank() == 0:
+                        print("_cuda_graph_forward-2", len(args), kwargs.keys())
             return self._orig_forward(*args, **kwargs)
 
         self.forward = _cuda_graph_forward

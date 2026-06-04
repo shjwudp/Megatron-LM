@@ -170,6 +170,10 @@ def _register_backward_hook(module: FSDPModule):
 
     def post_backward(module: FSDPModule):
         """Hook called after backward pass for this module."""
+        if hasattr(module, "_fsdp_cg_runner"):
+            if module._fsdp_cg_runner._graphed is None:
+                # Skip the CUDA graph warmup phase
+                return
         ctx = module._fsdp_root_context
         ctx.backward_done_modules.add(id(module))
         ctx._advance_backward_module()
