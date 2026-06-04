@@ -197,14 +197,16 @@ class FSDPModule(nn.Module):
 
             if isinstance(ba, TracePoolAllocator) and ba.phase == "optimized":
                 if not hasattr(self, "_fsdp_cg_runner"):
+                    # First call: capture forward() in a graph.
+                    # Warmup inside capture_forward settles FP8 /
+                    # RNG / cuDNN caches before recording.
                     self._fsdp_cg_runner = FSDPCudaGraphRunner(self)
-                runner = self._fsdp_cg_runner
-                if runner.captured:
-                    return runner.replay()
-                else:
-                    return runner.capture_forward(*args, **kwargs)
+                    return self._fsdp_cg_runner.capture_forward(*args, **kwargs)
 
-        # Normal eager path (MRO continues to GraphableMegatronModule / nn.Module).
+                # Replay: just the captured compute graph.
+                return self._fsdp_cg_runner.replay()
+
+        # Normal eager path.
         return super().__call__(*args, **kwargs)
 
     def _init_named_param_groups(
