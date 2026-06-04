@@ -39,7 +39,7 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule):
             fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
         fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 
-    return fsdp_module.register_forward_pre_hook(prepend=True)
+    return fsdp_module.register_forward_pre_hook(unshard_param_groups, prepend=True)
 
 
 def _register_root_forward_pre_hook(fsdp_module: FSDPModule):

@@ -105,7 +105,8 @@ def fully_shard(
         enable_async_reduce_grad=enable_async_reduce_grad,
         bucket_allocator=bucket_allocator,
     )
-    module._fsdp_state.enable_cuda_graph = enable_cuda_graph
+    if enable_cuda_graph:
+        module._enable_cuda_graph()
     module._init_param_main_grad_func()
 
     if mp_policy.fine_grained_forward_hooks_required(module._fsdp_param_groups):

@@ -15,7 +15,7 @@
 """FSDPModule implementation for Megatron-FSDP2."""
 
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -178,7 +178,7 @@ class _FSDPRootContext:
         return self.forward_order[0] if self.forward_order else None
 
 
-class FSDPModule(nn.Module):
+class FSDPModule:
     """
     Mixin class for FSDP-wrapped modules.
 
@@ -189,25 +189,38 @@ class FSDPModule(nn.Module):
     - reduce_grad(): Reduce gradients after backward
     """
 
-    def __call__(self, *args, **kwargs):
-        # Intercept forward for silent CUDA graph capture / replay.
-        if getattr(self._fsdp_state, "enable_cuda_graph", False):
+    def _enable_cuda_graph(self):
+        self._fsdp_state.enable_cuda_graph = True
+        self._orig_forward = self.forward
+
+        @contextmanager
+        def raw_forward(module):
+            """Temporarily restore original forward, then re-apply patch."""
+            patched = module.forward
+            module.forward = module._orig_forward
+            try:
+                yield
+            finally:
+                module.forward = patched
+
+        def _cuda_graph_forward(*args, **kwargs):
             ctx = self._fsdp_root_context
             ba = ctx.bucket_allocator
 
             if isinstance(ba, TracePoolAllocator) and ba.phase == "optimized":
-                if not hasattr(self, "_fsdp_cg_runner"):
-                    # First call: capture forward() in a graph.
-                    # Warmup inside capture_forward settles FP8 /
-                    # RNG / cuDNN caches before recording.
-                    self._fsdp_cg_runner = FSDPCudaGraphRunner(self)
-                    return self._fsdp_cg_runner.capture_forward(*args, **kwargs)
+                with raw_forward(self):
+                    if not hasattr(self, "_fsdp_cg_runner"):
+                        # First call: capture forward() in a graph.
+                        # Warmup inside capture_forward settles FP8 /
+                        # RNG / cuDNN caches before recording.
+                        self._fsdp_cg_runner = FSDPCudaGraphRunner(self)
+                        return self._fsdp_cg_runner.capture_forward(*args, **kwargs)
 
-                # Replay: just the captured compute graph.
-                return self._fsdp_cg_runner.replay()
+                    # Replay: just the captured compute graph.
+                    return self._fsdp_cg_runner.replay()
+            return self._orig_forward(*args, **kwargs)
 
-        # Normal eager path.
-        return super().__call__(*args, **kwargs)
+        self.forward = _cuda_graph_forward
 
     def _init_named_param_groups(
         self,
