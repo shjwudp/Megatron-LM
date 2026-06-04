@@ -132,6 +132,10 @@ def _register_backward_pre_hook(module: FSDPModule):
 
     def pre_backward_hook(module: FSDPModule, grads):
         """Hook called before backward pass for this module."""
+        if hasattr(module, "_fsdp_cg_runner"):
+            if module._fsdp_cg_runner._graphed is None:
+                # Skip the CUDA graph warmup phase
+                return
         ctx = module._fsdp_root_context
         if module._fsdp_state._is_root:
             ctx.backward_done_modules.clear()

@@ -174,25 +174,32 @@ class FSDPCudaGraphRunner:
         # 3. Build shim
         shim = _ForwardShim(self._module, tensor_names, frozen_kwargs)
 
-        # 4. Warmup on side stream
-        warmup_stream = torch.cuda.Stream()
-        warmup_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(warmup_stream):
-            for _ in range(self._warmup_steps):
-                shim(*flat_sample)
-        torch.cuda.current_stream().wait_stream(warmup_stream)
+        # 4. Warmup on default stream.
+        # Use torch.autograd.grad() to exercise the backward graph without
+        # creating persistent AccumulateGrad nodes on param.grad.  Those nodes
+        # cache a stream association that breaks later CUDA graph capture.
+        for _ in range(self._warmup_steps):
+            out = shim(*flat_sample)
+            if isinstance(out, tuple):
+                loss = out[0].sum()
+            else:
+                loss = out.sum()
+            grads = torch.autograd.grad(
+                loss,
+                [p for p in self._module.parameters() if p.requires_grad],
+                allow_unused=True,
+            )
+            del grads
         torch.cuda.synchronize()
 
         def debug_capture_stages(shim, sample_args, module):
             """Isolate which stage breaks: forward-only or forward+backward."""
             import torch
 
-            # Ensure grads exist (stable addresses)
-            for p in module.parameters():
-                if p.requires_grad and p.grad is None:
-                    p.grad = torch.zeros_like(p)
-
-            # Stage 0: eager sanity check
+            # Stage 0: eager sanity check.
+            # Use torch.autograd.grad() to avoid creating persistent
+            # AccumulateGrad nodes that would carry a stale stream
+            # association into Stage 2's CUDA graph capture.
             print("[DEBUG] Stage 0: eager forward")
             out = shim(*sample_args)
             print(f"[DEBUG] Stage 0: eager forward OK, out type={type(out)}")
@@ -203,13 +210,13 @@ class FSDPCudaGraphRunner:
                 loss = out.sum()
 
             print("[DEBUG] Stage 0: eager backward")
-            loss.backward()
+            grads = torch.autograd.grad(
+                loss,
+                [p for p in module.parameters() if p.requires_grad],
+                allow_unused=True,
+            )
+            del grads
             print("[DEBUG] Stage 0: eager backward OK")
-
-            # Zero grads
-            for p in module.parameters():
-                if p.grad is not None:
-                    p.grad.zero_()
 
             torch.cuda.synchronize()
 
@@ -220,14 +227,18 @@ class FSDPCudaGraphRunner:
                 out = shim(*sample_args)
             print("[DEBUG] Stage 1: forward-only graph OK")
 
-            # Zero grads again
+            # Ensure .grad is None so Stage 2 creates fresh
+            # AccumulateGrad nodes on the capture stream.
             for p in module.parameters():
-                if p.grad is not None:
-                    p.grad.zero_()
+                if p.requires_grad:
+                    p.grad = None
 
             torch.cuda.synchronize()
 
-            # Stage 2: forward + backward graph
+            # Stage 2: forward + backward graph.
+            # This is the first time AccumulateGrad nodes are created.
+            # They are created on the capture stream inside the graph,
+            # avoiding any stale stream association.
             print("[DEBUG] Stage 2: forward+backward graph capture")
             g2 = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g2):
@@ -240,17 +251,34 @@ class FSDPCudaGraphRunner:
             print("[DEBUG] Stage 2: forward+backward graph OK")
             print("[DEBUG] All stages passed!")
 
-        # 5. Remove hooks, capture, restore hooks
+        # # 5. Remove hooks, capture, restore hooks
+        # saved_hooks = _pop_hooks(self._module)
+        # try:
+        #     # self._graphed = torch.cuda.make_graphed_callables(
+        #     #     shim,
+        #     #     sample_args=flat_sample,
+        #     #     num_warmup_iters=0,
+        #     # )
+        #     debug_capture_stages(shim, flat_sample, self._module)
+        # finally:
+        #     _restore_hooks(self._module, saved_hooks)
+
+        # Force sync comms during capture: disable prefetch/async-reduce
+        ctx = self._module._fsdp_root_context
+        saved_prefetch = ctx.enable_unshard_prefetch
+        saved_async_reduce = ctx.enable_async_reduce_grad
+        ctx.enable_unshard_prefetch = False       # unshard on current stream
+        ctx.enable_async_reduce_grad = False      # reduce_grad on current stream
+        ctx.cuda_graph_active = True              # suppress reshard deferral
+
         saved_hooks = _pop_hooks(self._module)
         try:
-            # self._graphed = torch.cuda.make_graphed_callables(
-            #     shim,
-            #     sample_args=flat_sample,
-            #     num_warmup_iters=0,
-            # )
             debug_capture_stages(shim, flat_sample, self._module)
         finally:
             _restore_hooks(self._module, saved_hooks)
+            ctx.enable_unshard_prefetch = saved_prefetch
+            ctx.enable_async_reduce_grad = saved_async_reduce
+            ctx.cuda_graph_active = False
 
         # 6. Save the tensor param names so install() can flatten at runtime
         self._tensor_param_names = tensor_names
