@@ -321,7 +321,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 )
         if fsdp_unit_modules is not None:
             for m in module.modules():
-                if isinstance(m, tuple(MambaLayer)):
+                if isinstance(m, MambaLayer):
                     fully_shard(
                         m,
                         enable_cuda_graph=True,

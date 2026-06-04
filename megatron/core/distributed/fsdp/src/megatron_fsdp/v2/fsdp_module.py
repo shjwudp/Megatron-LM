@@ -191,32 +191,18 @@ class FSDPModule(nn.Module):
 
     def __call__(self, *args, **kwargs):
         # Intercept forward for silent CUDA graph capture / replay.
-        if torch.distributed.get_rank() == 0:
-            module_name = None
-            for name, m in self.named_modules():
-                module_name = m
-                break
-            print(module_name, self._fsdp_state.enable_cuda_graph)
         if getattr(self._fsdp_state, "enable_cuda_graph", False):
             ctx = self._fsdp_root_context
             ba = ctx.bucket_allocator
-            assert isinstance(ba, TracePoolAllocator)
 
             if isinstance(ba, TracePoolAllocator) and ba.phase == "optimized":
-                stage = ba.graph_stage
-                if torch.distributed.get_rank() == 0:
-                    print("graph_stage:", stage)
-
-                if stage == 1:  # capture
-                    if not hasattr(self, "_fsdp_cg_runner"):
-                        self._fsdp_cg_runner = FSDPCudaGraphRunner(self)
-                    return self._fsdp_cg_runner.capture_forward(*args, **kwargs)
-
-                if stage == 2:  # replay
-                    return self._fsdp_cg_runner.replay()
-
-            import time
-            time.sleep(0.01)
+                if not hasattr(self, "_fsdp_cg_runner"):
+                    self._fsdp_cg_runner = FSDPCudaGraphRunner(self)
+                runner = self._fsdp_cg_runner
+                if runner.captured:
+                    return runner.replay()
+                else:
+                    return runner.capture_forward(*args, **kwargs)
 
         # Normal eager path (MRO continues to GraphableMegatronModule / nn.Module).
         return super().__call__(*args, **kwargs)

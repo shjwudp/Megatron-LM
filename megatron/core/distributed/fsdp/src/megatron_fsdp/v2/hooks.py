@@ -65,8 +65,13 @@ def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
             if ba.phase == "optimized":
                 ba.disable_flexible_mode()
                 ba.reset_cursor()
-                # ---- CUDA graph: restore slot state, flag as active ----
-                if ba.graph_stage >= 1:
+                # If any FSDP module has cuda graph enabled, restore
+                # slot state and flag the context as graph-active so
+                # side-streams are suppressed and reshard is deferred.
+                if any(
+                    getattr(m._fsdp_state, "enable_cuda_graph", False)
+                    for m in ctx.forward_order
+                ):
                     ba.restore_slots()
                     ctx.cuda_graph_active = True
 
@@ -285,16 +290,15 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
                         logger.debug(f"module_id={id(m)}, module_name={m._fsdp_module_name}")
                 bucket_alloc.plan()
                 bucket_alloc.reset_cursor()
-                # ---- CUDA graph: plan() is done, advance trace → capture ----
-                if bucket_alloc.graph_stage == 0:
-                    if root_state.enable_cuda_graph:
-                        bucket_alloc.advance_graph_stage()
+                # Pool is built with stable addresses — snapshot initial
+                # slot state for later CUDA graph replay restoration.
+                if any(
+                    getattr(m._fsdp_state, "enable_cuda_graph", False)
+                    for m in ctx.forward_order
+                ):
+                    bucket_alloc.snapshot_slots()
             elif bucket_alloc.phase == "optimized":
                 bucket_alloc.reset_cursor()
-                # ---- CUDA graph: capture → replay ----
-                if bucket_alloc.graph_stage == 1:
-                    bucket_alloc.snapshot_slots()
-                    bucket_alloc.advance_graph_stage()  # capture → replay
             else:
                 raise ValueError(f"Unexpected bucket allocator phase: {bucket_alloc.phase}")
             # Both forward_phase and backward_phase are now False —
