@@ -238,7 +238,6 @@ class FSDPCudaGraphRunner:
                     loss = out.sum()
                 loss.backward()
             print("[DEBUG] Stage 2: forward+backward graph OK")
-
             print("[DEBUG] All stages passed!")
 
         # 5. Remove hooks, capture, restore hooks
@@ -269,9 +268,8 @@ class FSDPCudaGraphRunner:
 
         self._orig_fwd = self._module.forward
         graphed = self._graphed
-        param_names = _get_forward_param_names(self._module)
+        param_names = _get_forward_param_names(self._module.__class__)
         tensor_names = self._tensor_param_names
-
 
         def _patched_fwd(*args, **kwargs):
             if self._use_cuda_graph:

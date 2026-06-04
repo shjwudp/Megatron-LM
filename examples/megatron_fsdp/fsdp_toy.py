@@ -103,10 +103,10 @@ def build_fsdp_model(
 
     # Example: per-layer sharding
     for layer in model.layers:
-        fully_shard(layer, mesh=mesh)
+        fully_shard(layer, mesh=mesh, enable_cuda_graph=True, enable_trace_pool=True)
 
     # Optionally shard the root as well
-    fully_shard(model, mesh=mesh)
+    fully_shard(model, mesh=mesh, enable_trace_pool=True)
 
     assert isinstance(model, ToyModel)
     assert isinstance(model, FSDPModule)
