@@ -440,8 +440,6 @@ class FSDPModule:
         """
         torch.cuda.nvtx.range_push("MFSDP unshard")
         ctx = self._fsdp_root_context
-        if ctx.cuda_graph_active:
-            async_op = False
         stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
 
         if async_op:
@@ -540,8 +538,6 @@ class FSDPModule:
         """
         torch.cuda.nvtx.range_push("MFSDP reduce_grad")
         ctx = self._fsdp_root_context
-        if ctx.cuda_graph_active:
-            async_op = False
         stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
 
         # Handle pending reduce events before this module to release buffers promptly.

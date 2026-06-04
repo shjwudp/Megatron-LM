@@ -68,7 +68,6 @@ def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
                     for m in ctx.forward_order
                 ):
                     ba.restore_slots()
-                    ctx.cuda_graph_active = True
 
     return fsdp_module.register_forward_pre_hook(root_forward_pre_hook, prepend=True)
 
@@ -94,8 +93,6 @@ def _register_forward_hook(module: FSDPModule):
         ctx = module._fsdp_root_context
         if ctx.backward_phase and id(module) == ctx.backward_module:
             return
-        if ctx.cuda_graph_active:
-            return  # Buffer must survive until backward replay uses it
         module.reshard()
 
     module._mfsdp_forward_hook = module.register_forward_hook(reshard_param_groups)
