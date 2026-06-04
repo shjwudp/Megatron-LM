@@ -65,13 +65,10 @@ def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
             if ba.phase == "optimized":
                 ba.disable_flexible_mode()
                 ba.reset_cursor()
-                # ---- CUDA graph staging ----
-                if fsdp_module._fsdp_state.enable_cuda_graph:
-                    if ba.graph_stage == 0:
-                        ba.advance_graph_stage()  # trace → capture
-                    if ba.graph_stage >= 1:
-                        ba.restore_slots()
-                        ctx.cuda_graph_active = True
+                # ---- CUDA graph: restore slot state, flag as active ----
+                if ba.graph_stage >= 1:
+                    ba.restore_slots()
+                    ctx.cuda_graph_active = True
 
     return fsdp_module.register_forward_pre_hook(root_forward_pre_hook, prepend=True)
 
@@ -288,9 +285,13 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
                         logger.debug(f"module_id={id(m)}, module_name={m._fsdp_module_name}")
                 bucket_alloc.plan()
                 bucket_alloc.reset_cursor()
+                # ---- CUDA graph: plan() is done, advance trace → capture ----
+                if bucket_alloc.graph_stage == 0:
+                    if root_state.enable_cuda_graph:
+                        bucket_alloc.advance_graph_stage()
             elif bucket_alloc.phase == "optimized":
                 bucket_alloc.reset_cursor()
-                # ---- CUDA graph staging ----
+                # ---- CUDA graph: capture → replay ----
                 if bucket_alloc.graph_stage == 1:
                     bucket_alloc.snapshot_slots()
                     bucket_alloc.advance_graph_stage()  # capture → replay

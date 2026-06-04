@@ -261,7 +261,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             fsdp_unit_modules is None
             and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
         ):
-            fsdp_unit_modules = [TransformerLayer]
+            fsdp_unit_modules = [TransformerLayer, MambaLayer]
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -321,7 +321,15 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 )
         if fsdp_unit_modules is not None:
             for m in module.modules():
-                if isinstance(m, tuple(fsdp_unit_modules)):
+                if isinstance(m, tuple(MambaLayer)):
+                    fully_shard(
+                        m,
+                        enable_cuda_graph=True,
+                        mesh=dp_mesh,
+                        gradient_scaling_factor=gradient_scaling_factor,
+                        **kwargs
+                    )
+                elif isinstance(m, tuple(fsdp_unit_modules)):
                     fully_shard(
                         m, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs
                     )
