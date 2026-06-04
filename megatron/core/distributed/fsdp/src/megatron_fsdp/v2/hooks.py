@@ -50,10 +50,8 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule, hook_module: nn.Module |
 def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
     """Register a pre-forward hook that fires ONLY on the root FSDP module.
 
-    Marks the start of the forward phase, resets the seq cursor, and
-    (when using ``TracePoolAllocator`` in optimized mode) disables
-    flexible key→slot lookup so the seq-driven replay path is used
-    during forward and backward.
+    Marks the start of the forward phase and manages CUDA graph staging
+    (trace → capture → replay) when ``enable_cuda_graph`` is True.
     """
 
     def root_forward_pre_hook(_hook_module, *unused):
@@ -67,6 +65,13 @@ def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
             if ba.phase == "optimized":
                 ba.disable_flexible_mode()
                 ba.reset_cursor()
+                # ---- CUDA graph staging ----
+                if fsdp_module._fsdp_state.enable_cuda_graph:
+                    if ba.graph_stage == 0:
+                        ba.advance_graph_stage()  # trace → capture
+                    if ba.graph_stage >= 1:
+                        ba.restore_slots()
+                        ctx.cuda_graph_active = True
 
     return fsdp_module.register_forward_pre_hook(root_forward_pre_hook, prepend=True)
 
@@ -92,6 +97,8 @@ def _register_forward_hook(module: FSDPModule):
         ctx = module._fsdp_root_context
         if ctx.backward_phase and id(module) == ctx.backward_module:
             return
+        if ctx.cuda_graph_active:
+            return  # Buffer must survive until backward replay uses it
         module.reshard()
 
     module._mfsdp_forward_hook = module.register_forward_hook(reshard_param_groups)
@@ -283,6 +290,10 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
                 bucket_alloc.reset_cursor()
             elif bucket_alloc.phase == "optimized":
                 bucket_alloc.reset_cursor()
+                # ---- CUDA graph staging ----
+                if bucket_alloc.graph_stage == 1:
+                    bucket_alloc.snapshot_slots()
+                    bucket_alloc.advance_graph_stage()  # capture → replay
             else:
                 raise ValueError(f"Unexpected bucket allocator phase: {bucket_alloc.phase}")
             # Both forward_phase and backward_phase are now False —

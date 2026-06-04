@@ -24,7 +24,8 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from .allocator import BucketAllocator
+from .allocator import BucketAllocator, TracePoolAllocator
+from .cuda_graph_runner import FSDPCudaGraphRunner
 from .mixed_precision import MixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
@@ -44,6 +45,7 @@ class _FSDPState:
     def __init__(self):
         self._is_root = True
         self._post_backward_callback_queued = False
+        self.enable_cuda_graph: bool = False
 
 
 @dataclass
@@ -132,6 +134,10 @@ class _FSDPRootContext:
     """True from the root forward pre-hook until the root backward pre-hook.
     ``backward_phase`` is set to ``False`` when this becomes ``True``."""
 
+    cuda_graph_active: bool = False
+    """True when FSDP is inside CUDA graph capture or about to replay.
+    Suppresses side-stream vs default-stream mismatches and defers reshard."""
+
     backward_module: Optional[int] = None
     """``id(module)`` of the FSDP module whose backward is pending next.
     Derived from ``_reversed_order`` and ``backward_done_modules`` — NOT
@@ -182,6 +188,26 @@ class FSDPModule(nn.Module):
     - reshard(): Release unsharded buffer after forward
     - reduce_grad(): Reduce gradients after backward
     """
+
+    def __call__(self, *args, **kwargs):
+        # Intercept forward for silent CUDA graph capture / replay.
+        if getattr(self._fsdp_state, "enable_cuda_graph", False):
+            ctx = self._fsdp_root_context
+            ba = ctx.bucket_allocator
+
+            if isinstance(ba, TracePoolAllocator) and ba.phase == "optimized":
+                stage = ba.graph_stage
+
+                if stage == 1:  # capture
+                    if not hasattr(self, "_fsdp_cg_runner"):
+                        self._fsdp_cg_runner = FSDPCudaGraphRunner(self)
+                    return self._fsdp_cg_runner.capture_forward(*args, **kwargs)
+
+                if stage == 2:  # replay
+                    return self._fsdp_cg_runner.replay()
+
+        # Normal eager path (MRO continues to GraphableMegatronModule / nn.Module).
+        return super().__call__(*args, **kwargs)
 
     def _init_named_param_groups(
         self,
@@ -401,6 +427,8 @@ class FSDPModule(nn.Module):
         """
         torch.cuda.nvtx.range_push("MFSDP unshard")
         ctx = self._fsdp_root_context
+        if ctx.cuda_graph_active:
+            async_op = False
         stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
 
         if async_op:
@@ -499,6 +527,8 @@ class FSDPModule(nn.Module):
         """
         torch.cuda.nvtx.range_push("MFSDP reduce_grad")
         ctx = self._fsdp_root_context
+        if ctx.cuda_graph_active:
+            async_op = False
         stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
 
         # Handle pending reduce events before this module to release buffers promptly.

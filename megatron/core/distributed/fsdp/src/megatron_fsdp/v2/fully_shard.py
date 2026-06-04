@@ -59,6 +59,7 @@ def fully_shard(
     gradient_scaling_factor: Optional[float] = None,
     enable_trace_pool: bool = False,
     sharding_strategy: str = "optim_grads_params",
+    enable_cuda_graph: bool = False,
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -104,6 +105,7 @@ def fully_shard(
         enable_async_reduce_grad=enable_async_reduce_grad,
         bucket_allocator=bucket_allocator,
     )
+    module._fsdp_state.enable_cuda_graph = enable_cuda_graph
     module._init_param_main_grad_func()
 
     if mp_policy.fine_grained_forward_hooks_required(module._fsdp_param_groups):
