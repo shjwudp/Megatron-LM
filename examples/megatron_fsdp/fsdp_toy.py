@@ -234,7 +234,7 @@ def train(
             loss = y.sum() / (world_size * args.batch_size)
             loss.backward()
             optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
 
             if step % args.log_interval == 0 and rank == 0:
                 print(f"[rank0] epoch={epoch} step={step} loss={loss.item():.4f}")

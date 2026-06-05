@@ -70,14 +70,6 @@ def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
             if ba.phase == "optimized":
                 ba.disable_flexible_mode()
                 ba.reset_cursor()
-                # If any FSDP module has cuda graph enabled, restore
-                # slot state so that graph replay hits the same
-                # pre‑allocated buffer slots as capture.
-                if any(
-                    getattr(m._fsdp_state, "enable_cuda_graph", False)
-                    for m in ctx.forward_order
-                ):
-                    ba.restore_slots()
 
     return fsdp_module.register_forward_pre_hook(root_forward_pre_hook, prepend=True)
 
@@ -301,13 +293,6 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
                         logger.debug(f"module_id={id(m)}, module_name={m._fsdp_module_name}")
                 bucket_alloc.plan()
                 bucket_alloc.reset_cursor()
-                # Pool is built with stable addresses — snapshot initial
-                # slot state for later CUDA graph replay restoration.
-                if any(
-                    getattr(m._fsdp_state, "enable_cuda_graph", False)
-                    for m in ctx.forward_order
-                ):
-                    bucket_alloc.snapshot_slots()
             elif bucket_alloc.phase == "optimized":
                 bucket_alloc.reset_cursor()
             else:

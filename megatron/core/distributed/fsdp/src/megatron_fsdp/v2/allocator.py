@@ -271,9 +271,6 @@ class TracePoolAllocator(BucketAllocator):
         self._flexible: bool = False
         self._flex_key_to_slot: Dict[AllocatorKey, int] = {}
 
-        # CUDA graph slot-state snapshot for replay restoration
-        self._captured_in_use: List[bool] = []
-
     # -- Phase 1: trace -------------------------------------------------- #
 
     def allocate(
@@ -681,19 +678,6 @@ class TracePoolAllocator(BucketAllocator):
             slot.in_use = False
         self._seq = 0
 
-    # -- CUDA graph slot snapshot / restore ---------------------------- #
-
-    def snapshot_slots(self) -> None:
-        """Freeze current ``slot.in_use`` state for replay restoration."""
-        self._captured_in_use = [s.in_use for s in self._slots]
-
-    def restore_slots(self) -> None:
-        """Restore ``slot.in_use`` to the capture-time snapshot."""
-        if not self._captured_in_use:
-            return
-        for i, in_use in enumerate(self._captured_in_use):
-            self._slots[i].in_use = in_use
-
     def reset(self) -> None:
         """Reset to trace phase, discarding the pool and all recorded state."""
         self._phase = "trace"
@@ -708,7 +692,6 @@ class TracePoolAllocator(BucketAllocator):
         self._slots.clear()
         self._flexible = False
         self._flex_key_to_slot.clear()
-        self._captured_in_use.clear()
 
     @property
     def phase(self) -> str:
