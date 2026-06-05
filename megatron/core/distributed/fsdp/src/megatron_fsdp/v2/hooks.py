@@ -57,7 +57,7 @@ def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
     (trace → capture → replay) when ``enable_cuda_graph`` is True.
     """
 
-    def root_forward_pre_hook(_hook_module):
+    def root_forward_pre_hook(_hook_module, args):
         ctx = fsdp_module._fsdp_root_context
         if not fsdp_module._fsdp_state._is_root:
             return
@@ -264,8 +264,9 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
     def _post_backward_final_callback(root_state: _FSDPState, root_module: nn.Module):
         """Final callback: reshard all modules and reduce gradients."""
         ctx = root_module._fsdp_root_context
-        if ctx.cuda_graph_active:
-            return
+        assert not ctx.cuda_graph_active, (
+            "Post-backward callback should not run during CUDA graph capture"
+        )
         stream = ctx.rs_stream
         for module in reversed(ctx.forward_order):
             if getattr(module, "post_backward_issued", False):

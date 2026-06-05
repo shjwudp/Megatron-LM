@@ -131,7 +131,7 @@ class FSDPCudaGraphRunner:
         *sample_args,
         **sample_kwargs,
     ) -> None:
-        assert ctx.cuda_graph_compatible, (
+        assert self._module.cuda_graph_compatible, (
             "CUDA graph capture requires side-stream collectives to be "
             "disabled (enable_unshard_prefetch=False, enable_async_reduce_grad=False)"
         )
@@ -157,9 +157,9 @@ class FSDPCudaGraphRunner:
 
         # Disable side-stream collectives during capture so every CUDA
         # operation lands on the default (capture) stream.
-        ctx = self._module._fsdp_root_context
         saved_prefetch = ctx.enable_unshard_prefetch
         saved_async_reduce = ctx.enable_async_reduce_grad
+        ctx = self._module._fsdp_root_context
         ctx.enable_unshard_prefetch = False
         ctx.enable_async_reduce_grad = False
         ctx.cuda_graph_active = True

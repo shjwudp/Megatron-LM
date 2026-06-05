@@ -134,8 +134,10 @@ class _FSDPRootContext:
     ``backward_phase`` is set to ``False`` when this becomes ``True``."""
 
     cuda_graph_active: bool = False
-    """True when FSDP is inside CUDA graph capture or about to replay.
-    Suppresses side-stream vs default-stream mismatches and defers reshard."""
+    cuda_graph_active: bool = False
+    """True when FSDP is inside CUDA graph capture (via FSDPCudaGraphRunner).
+    Suppresses side-stream vs default-stream mismatches and defers reshard.
+    Only needed during capture, not replay."""
 
     backward_module: Optional[int] = None
     """``id(module)`` of the FSDP module whose backward is pending next.

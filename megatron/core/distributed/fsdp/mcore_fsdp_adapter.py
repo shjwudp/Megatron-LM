@@ -320,18 +320,23 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     **kwargs,
                 )
         if fsdp_unit_modules is not None:
+            cuda_graph_on = set(ddp_config.mfsdp_cuda_graph_modules)
             for m in module.modules():
-                if isinstance(m, MambaLayer):
+                if MambaLayer in fsdp_unit_modules and isinstance(m, MambaLayer):
                     fully_shard(
                         m,
-                        enable_cuda_graph=True,
+                        enable_cuda_graph=('mamba' in cuda_graph_on),
                         mesh=dp_mesh,
                         gradient_scaling_factor=gradient_scaling_factor,
                         **kwargs
                     )
                 elif isinstance(m, tuple(fsdp_unit_modules)):
                     fully_shard(
-                        m, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs
+                        m,
+                        mesh=dp_mesh,
+                        gradient_scaling_factor=gradient_scaling_factor,
+                        enable_cuda_graph=('transformer' in cuda_graph_on),
+                        **kwargs
                     )
         fully_shard(module, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
 
