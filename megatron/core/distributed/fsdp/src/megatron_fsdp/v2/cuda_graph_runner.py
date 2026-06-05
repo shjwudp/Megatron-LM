@@ -240,14 +240,17 @@ class FSDPCudaGraphRunner:
             # They are created on the capture stream inside the graph,
             # avoiding any stale stream association.
             print("[DEBUG] Stage 2: forward+backward graph capture")
-            g2 = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g2):
-                out = shim(*sample_args)
-                if isinstance(out, tuple):
-                    loss = out[0].sum()
-                else:
-                    loss = out.sum()
-                loss.backward()
+            capture_stream = torch.cuda.Stream()
+            params = [p for p in module.parameters() if p.requires_grad]
+            with torch.cuda.stream(capture_stream):
+                # prime grads on the capture stream first
+                for p in params:
+                    if p.grad is None:
+                        p.grad = torch.zeros_like(p)
+                with torch.cuda.graph(g2, stream=capture_stream):
+                    out = shim(*sample_args)
+                    loss = (out[0] if isinstance(out, tuple) else out).sum()
+                    loss.backward()
             print("[DEBUG] Stage 2: forward+backward graph OK")
             print("[DEBUG] All stages passed!")
 
