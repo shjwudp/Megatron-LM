@@ -209,6 +209,23 @@ class FSDPModule:
 
         self.forward = _cuda_graph_forward
 
+    @property
+    def cuda_graph_compatible(self) -> bool:
+        """Return True when the root context is configured for CUDA graph capture.
+
+        Requires side-stream collectives to be disabled so every CUDA
+        operation lands on the default stream.  Can be used as a guard
+        before entering a graph capture or replay region::
+
+            assert module.cuda_graph_compatible
+        """
+        ctx = self._fsdp_root_context
+        if not isinstance(ctx.bucket_allocator, TracePoolAllocator):
+            return False
+        if ctx.bucket_allocator.phase != "optimized":
+            return False
+        return True
+
     def _init_named_param_groups(
         self,
         mesh: Optional[DeviceMesh],

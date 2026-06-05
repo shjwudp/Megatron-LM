@@ -196,6 +196,8 @@ class FSDPCudaGraphRunner:
             """Isolate which stage breaks: forward-only or forward+backward."""
             import torch
 
+            torch.cuda.synchronize()
+
             # Stage 0: eager sanity check.
             # Use torch.autograd.grad() to avoid creating persistent
             # AccumulateGrad nodes that would carry a stale stream

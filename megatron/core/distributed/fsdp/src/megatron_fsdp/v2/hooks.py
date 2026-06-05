@@ -61,8 +61,8 @@ def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
                 ba.disable_flexible_mode()
                 ba.reset_cursor()
                 # If any FSDP module has cuda graph enabled, restore
-                # slot state and flag the context as graph-active so
-                # side-streams are suppressed and reshard is deferred.
+                # slot state so that graph replay hits the same
+                # pre‑allocated buffer slots as capture.
                 if any(
                     getattr(m._fsdp_state, "enable_cuda_graph", False)
                     for m in ctx.forward_order
@@ -93,6 +93,8 @@ def _register_forward_hook(module: FSDPModule):
         ctx = module._fsdp_root_context
         if ctx.backward_phase and id(module) == ctx.backward_module:
             return
+        if ctx.cuda_graph_active:
+            return  # defer reshard — side streams suppressed during graph replay
         module.reshard()
 
     module._mfsdp_forward_hook = module.register_forward_hook(reshard_param_groups)
@@ -132,11 +134,9 @@ def _register_backward_pre_hook(module: FSDPModule):
 
     def pre_backward_hook(module: FSDPModule, grads):
         """Hook called before backward pass for this module."""
-        if hasattr(module, "_fsdp_cg_runner"):
-            if module._fsdp_cg_runner._graphed is None:
-                # Skip the CUDA graph warmup phase
-                return
         ctx = module._fsdp_root_context
+        if ctx.cuda_graph_active:
+            return
         if module._fsdp_state._is_root:
             ctx.backward_done_modules.clear()
             ctx.forward_phase = False
@@ -174,11 +174,9 @@ def _register_backward_hook(module: FSDPModule):
 
     def post_backward(module: FSDPModule):
         """Hook called after backward pass for this module."""
-        if hasattr(module, "_fsdp_cg_runner"):
-            if module._fsdp_cg_runner._graphed is None:
-                # Skip the CUDA graph warmup phase
-                return
         ctx = module._fsdp_root_context
+        if ctx.cuda_graph_active:
+            return
         ctx.backward_done_modules.add(id(module))
         ctx._advance_backward_module()
         module.reshard()
