@@ -132,8 +132,7 @@ class FSDPCudaGraphRunner:
         **sample_kwargs,
     ) -> None:
         assert self._module.cuda_graph_compatible, (
-            "CUDA graph capture requires side-stream collectives to be "
-            "disabled (enable_unshard_prefetch=False, enable_async_reduce_grad=False)"
+            "CUDA graph capture requires enable TracePoolAllocator"
         )
 
         # Introspect the module's forward signature

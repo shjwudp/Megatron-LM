@@ -196,7 +196,7 @@ class FSDPModule:
 
         Requires side-stream collectives to be disabled so every CUDA
         operation lands on the default stream.  Can be used as a guard
-        before entering a graph capture or replay region::
+        before entering a graph capture region::
 
             assert module.cuda_graph_compatible
         """
@@ -212,7 +212,6 @@ class FSDPModule:
         mesh: Optional[DeviceMesh],
         ignored_params: Optional[set],
         mp_policy: MixedPrecisionPolicy,
-        bucket_allocator: BucketAllocator,
         gradient_scaling_factor: Optional[float] = None,
         sharding_strategy: str = "optim_grads_params",
     ):
@@ -244,7 +243,6 @@ class FSDPModule:
             mp_policy=mp_policy,
             mesh=mesh,
             ignored_params=ignored_params,
-            allocator=bucket_allocator,
             gradient_scaling_factor=gradient_scaling_factor,
             sharding_strategy=sharding_strategy,
         )
@@ -877,7 +875,6 @@ class FSDPModule:
 def _get_module_fsdp_param_groups(
     module: nn.Module,
     mp_policy: MixedPrecisionPolicy,
-    allocator: BucketAllocator,
     mesh: Optional[DeviceMesh] = None,
     ignored_params: Optional[set[nn.Parameter]] = None,
     gradient_scaling_factor: Optional[float] = None,
@@ -913,7 +910,6 @@ def _get_module_fsdp_param_groups(
                 param_group_id=ParamGroupIdx(id(module), i),
                 mp_policy=mp_policy,
                 gradient_scaling_factor=gradient_scaling_factor,
-                allocator=allocator,
                 sharding_strategy=sharding_strategy,
             )
         )

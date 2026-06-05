@@ -104,7 +104,6 @@ def fully_shard(
         mesh,
         ignored_params,
         mp_policy=mp_policy,
-        bucket_allocator=bucket_allocator,
         gradient_scaling_factor=gradient_scaling_factor,
         sharding_strategy=sharding_strategy,
     )

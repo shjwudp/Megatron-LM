@@ -41,7 +41,7 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule):
         fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
         if fsdp_module._fsdp_state.enable_cuda_graph and (
             not hasattr(fsdp_module, "_fsdp_cg_runner")
-        ):
+        ) and fsdp_module.cuda_graph_compatible:
             cg_runner = FSDPCudaGraphRunner(fsdp_module)
             cg_runner.capture_forward(*args, **kwargs)
             cg_runner.install()
