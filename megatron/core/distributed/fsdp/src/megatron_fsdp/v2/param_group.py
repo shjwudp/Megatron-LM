@@ -207,6 +207,9 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
+        # Initially, gradients are zeroed.
+        self.is_zero_grad = True
+
     def unshard(self, bwd_pass: bool = False):
         """
         Unshard model weights by all-gathering from sharded buffer.
@@ -264,7 +267,16 @@ class ParameterGroup:
         ZeRO-1 keeps grads replicated during backward and reduce-scatters
         the replicated buffer once when the optimizer syncs.
         """
-        self.main_grad_buffer.reduce_grad(grad_comm_dtype=self.mp_policy.grad_comm_dtype)
+        # FIXME: When optimizer.zero_grad(set_to_none=True) is used, dist_param.grad
+        # becomes None, but the underlying grad buffer may still contain stale data
+        # from previous iterations. If overwrite_grad is not set to True, reduce_grad
+        # will accumulate into this stale buffer, potentially introducing NaNs and
+        # destabilizing training.
+        self.main_grad_buffer.reduce_grad(
+            grad_comm_dtype=self.mp_policy.grad_comm_dtype,
+            overwrite_grad=False,
+        )
+        self.is_zero_grad = False
 
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""
@@ -345,3 +357,17 @@ class ParameterGroup:
                 )
             else:
                 self.dist_grads.append(None)
+
+    def zero_grad(self, set_to_none: bool = True):
+        """Zero the main gradient buffer and mark grads as zeroed."""
+        self.release_grad_buffer()
+        if self.main_grad_buffer is not None:
+            self.main_grad_buffer.data.zero_()
+        if set_to_none:
+            for dist_param in self.dist_params:
+                if dist_param.grad is not None:
+                    del dist_param.grad
+                if hasattr(dist_param, "decoupled_grad"):
+                    dist_param.decoupled_grad = None
+        self.is_zero_grad = True
+

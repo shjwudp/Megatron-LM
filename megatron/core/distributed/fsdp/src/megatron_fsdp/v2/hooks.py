@@ -39,6 +39,8 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule):
         if ctx.backward_phase:
             fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
         fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
+
+        # If CUDA graph is enabled, let us try to capture the cuda graph.
         if fsdp_module._fsdp_state.enable_cuda_graph and (
             not hasattr(fsdp_module, "_fsdp_cg_runner")
         ) and fsdp_module.cuda_graph_compatible:

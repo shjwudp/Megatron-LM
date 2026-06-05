@@ -651,7 +651,11 @@ class DataParallelBuffer:
         return full
 
     @torch.no_grad()
-    def reduce_grad(self, grad_comm_dtype: Optional[torch.dtype] = None):
+    def reduce_grad(
+        self,
+        grad_comm_dtype: Optional[torch.dtype] = None,
+        overwrite_grad: bool = False,
+    ):
         """Reduce gradients into the optimizer-facing local shard.
 
         For distributed buffers, this reduce-scatters a temporary full gradient
@@ -695,7 +699,10 @@ class DataParallelBuffer:
             # accumulated into ``local_grad_shard`` for gradient accumulation.
             input_buffer = self.fetch_buffer()
             output_offset = sm.bucket_data_index
-            accumulate_output = True
+            if overwrite_grad:
+                accumulate_output = False
+            else:
+                accumulate_output = True
         else:
             # ZeRO-1 (optim): ``self.data`` is the replicated full grad
             # accumulation buffer. The optimizer consumes only this rank's
@@ -704,6 +711,7 @@ class DataParallelBuffer:
             input_buffer = self.data
             output_offset = sm.local_data_index
             accumulate_output = False
+            overwrite_grad = False
 
         comm_input = (
             input_buffer if grad_comm_dtype == self.dtype else input_buffer.to(grad_comm_dtype)
@@ -716,10 +724,12 @@ class DataParallelBuffer:
             output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
         )
 
-        if accumulate_output:
+        if overwrite_grad:
+            local_grad_shard.copy_(reduced_grad_shard)
+        elif accumulate_output:
             local_grad_shard += reduced_grad_shard
         elif grad_comm_dtype != self.dtype:
-            local_grad_shard.copy_(reduced_grad_shard.to(self.dtype))
+            local_grad_shard.copy_(reduced_grad_shard)
 
 
 def check_all_fsdp_buffers(module) -> bool:

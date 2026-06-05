@@ -674,14 +674,7 @@ class FSDPModule:
             if not isinstance(child, FSDPModule):
                 continue
             for param_group in child._fsdp_param_groups:
-                if param_group.main_grad_buffer is not None:
-                    param_group.main_grad_buffer.data.zero_()
-                    param_group.release_grad_buffer()
-                for dist_param in param_group.dist_params:
-                    if dist_param.grad is not None:
-                        del dist_param.grad
-                    if hasattr(dist_param, "decoupled_grad"):
-                        dist_param.decoupled_grad = None
+                param_group.zero_grad()
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
