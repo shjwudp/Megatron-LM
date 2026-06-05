@@ -25,7 +25,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from .allocator import BucketAllocator, TracePoolAllocator
-from .cuda_graph_runner import FSDPCudaGraphRunner
 from .mixed_precision import MixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
@@ -189,26 +188,6 @@ class FSDPModule:
     - reduce_grad(): Reduce gradients after backward
     """
 
-    def _enable_cuda_graph(self):
-        self._fsdp_state.enable_cuda_graph = True
-        self._orig_forward = self.forward
-
-        def _cuda_graph_forward(*args, **kwargs):
-            ctx = self._fsdp_root_context
-            ba = ctx.bucket_allocator
-
-            if isinstance(ba, TracePoolAllocator) and ba.phase == "optimized":
-                if not hasattr(self, "_fsdp_cg_runner"):
-                    # First call: capture forward() in a graph.
-                    self._fsdp_cg_runner = FSDPCudaGraphRunner(self)
-                    self._fsdp_cg_runner.capture_forward(*args, **kwargs)
-                    self._fsdp_cg_runner.install()
-                    if torch.distributed.get_rank() == 0:
-                        print("_cuda_graph_forward-2", len(args), kwargs.keys())
-            return self._orig_forward(*args, **kwargs)
-
-        self.forward = _cuda_graph_forward
-
     @property
     def cuda_graph_compatible(self) -> bool:
         """Return True when the root context is configured for CUDA graph capture.
@@ -363,7 +342,11 @@ class FSDPModule:
                 torch.distributed.broadcast(param.data, src=src_rank, group=dp_group)
 
     def _init_fsdp_state(
-        self, enable_unshard_prefetch, enable_async_reduce_grad, bucket_allocator: BucketAllocator
+        self,
+        enable_unshard_prefetch,
+        enable_async_reduce_grad,
+        bucket_allocator: BucketAllocator,
+        enable_cuda_graph: bool = False,
     ):
         """Initialize FSDP state and mark nested FSDP modules as non-root.
 
@@ -433,6 +416,18 @@ class FSDPModule:
             setattr(module, "_fsdp_module_idx", module_idx)
             setattr(module, "_fsdp_module_name", name)
             module_idx += 1
+
+        if enable_cuda_graph:
+            self._fsdp_state.enable_cuda_graph = enable_cuda_graph
+            if len(forward_order) > 1:
+                child_names = [name for name, m in named_forward_modules if m is not self]
+                raise RuntimeError(
+                    f"enable_cuda_graph=True is not supported for FSDP modules that contain "
+                    f"other FSDP modules as children. "
+                    f"Module '{self._fsdp_module_name}' (type={type(self).__name__}) "
+                    f"has FSDP children: {child_names}. "
+                    f"Only leaf FSDP modules (no FSDP children) can use CUDA graph capture."
+                )
 
     def unshard(self, async_op: bool = False, bwd_pass: bool = False):
         """

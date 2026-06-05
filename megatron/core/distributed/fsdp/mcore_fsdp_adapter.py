@@ -257,12 +257,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
         else:
             from torch.distributed.fsdp import fully_shard
 
-        from megatron.core.ssm.mamba_mixer import MambaMixer
         if (
             fsdp_unit_modules is None
             and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
         ):
-            fsdp_unit_modules = [TransformerLayer, MambaMixer]
+            fsdp_unit_modules = [TransformerLayer, MambaLayer]
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -322,7 +321,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 )
         if fsdp_unit_modules is not None:
             for m in module.modules():
-                if isinstance(m, MambaMixer):
+                if isinstance(m, MambaLayer):
                     fully_shard(
                         m,
                         enable_cuda_graph=True,

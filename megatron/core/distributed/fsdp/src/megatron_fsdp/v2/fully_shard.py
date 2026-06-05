@@ -85,7 +85,15 @@ def fully_shard(
     new_cls = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
     module.__class__ = new_cls
 
-    use_trace_pool = enable_trace_pool and sharding_strategy in (
+    use_trace_pool = (
+        enable_trace_pool
+        or enable_cuda_graph
+        or any(
+            getattr(m._fsdp_state, "enable_cuda_graph", False)
+            for m in module.modules()
+            if isinstance(m, FSDPModule) and m is not module
+        )
+    ) and sharding_strategy in (
         "optim",
         "optim_grads",
         "optim_grads_params",
@@ -104,9 +112,8 @@ def fully_shard(
         enable_unshard_prefetch=enable_unshard_prefetch,
         enable_async_reduce_grad=enable_async_reduce_grad,
         bucket_allocator=bucket_allocator,
+        enable_cuda_graph=enable_cuda_graph,
     )
-    if enable_cuda_graph:
-        module._enable_cuda_graph()
     module._init_param_main_grad_func()
 
     if mp_policy.fine_grained_forward_hooks_required(module._fsdp_param_groups):

@@ -16,19 +16,25 @@
 
 import inspect
 from collections import OrderedDict
-from typing import Tuple, List
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
 
 
 def _get_forward_param_names(module: torch.nn.Module) -> List[str]:
     """Return the ordered parameter names of module.forward (excluding 'self')."""
     sig = inspect.signature(module.forward)
     return [
-        name for name, p in sig.parameters.items()
+        name
+        for name, p in sig.parameters.items()
         if name != "self"
-        and p.kind in (
+        and p.kind
+        in (
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
             inspect.Parameter.KEYWORD_ONLY,
             inspect.Parameter.POSITIONAL_ONLY,
@@ -36,46 +42,18 @@ def _get_forward_param_names(module: torch.nn.Module) -> List[str]:
     ]
 
 
-def _flatten_args(param_names: List[str], args: tuple, kwargs: dict) -> Tuple[torch.Tensor, ...]:
-    """
-    Merge args and kwargs into a single positional tuple
-    following the order declared in the forward signature.
-    Non-tensor values are skipped (they should be baked in at capture time).
-    """
-    # Build a full mapping: name -> value
-    bound = {}
-    for i, val in enumerate(args):
-        if i < len(param_names):
-            bound[param_names[i]] = val
-    bound.update(kwargs)
-
-    # Return only tensor values in signature order
-    return tuple(bound[name] for name in param_names if name in bound and isinstance(bound[name], torch.Tensor))
-
-
-def _get_non_tensor_kwargs(param_names: List[str], args: tuple, kwargs: dict) -> dict:
-    """Extract non-tensor kwargs to bake into the shim at capture time."""
-    bound = {}
-    for i, val in enumerate(args):
-        if i < len(param_names):
-            bound[param_names[i]] = val
-    bound.update(kwargs)
-
-    return {name: val for name, val in bound.items() if not isinstance(val, torch.Tensor)}
-
-
 class _ForwardShim(torch.nn.Module):
-    """
-    Wraps module.forward so that:
-      - non-tensor kwargs are frozen at capture time
-      - tensor inputs are passed positionally in signature order
-    """
+    """Wraps module.forward so that non-tensor kwargs are frozen at
+    capture time and tensor inputs are passed positionally in signature
+    order."""
 
-    def __init__(self, module: torch.nn.Module, tensor_param_names: List[str], frozen_kwargs: dict):
+    def __init__(
+        self, module: torch.nn.Module, tensor_param_names: List[str], frozen_kwargs: dict
+    ):
         super().__init__()
         self.module = module
         self.tensor_param_names = tensor_param_names
-        self.frozen_kwargs = frozen_kwargs  # non-tensor values baked in
+        self.frozen_kwargs = frozen_kwargs
 
     def forward(self, *flat_tensor_args):
         kwargs = dict(zip(self.tensor_param_names, flat_tensor_args))
@@ -84,10 +62,7 @@ class _ForwardShim(torch.nn.Module):
 
 
 def _pop_hooks(module: torch.nn.Module) -> Dict[str, Any]:
-    """
-    Remove all hooks from *module* (non‑recursive) and return a snapshot
-    so they can be restored later.
-    """
+    """Remove all hooks from *module* (non-recursive) and return a snapshot."""
     saved: Dict[str, Any] = {
         "_forward_pre_hooks": module._forward_pre_hooks,
         "_forward_hooks": module._forward_hooks,
@@ -98,7 +73,6 @@ def _pop_hooks(module: torch.nn.Module) -> Dict[str, Any]:
     if hasattr(module, "_backward_pre_hooks"):
         saved["_backward_pre_hooks"] = module._backward_pre_hooks
 
-    # Replace with empty ordered dicts (preserves the attribute type)
     for name, value in saved.items():
         if value is not None:
             setattr(module, name, OrderedDict())
@@ -113,179 +87,96 @@ def _restore_hooks(module: torch.nn.Module, saved: Dict[str, Any]) -> None:
             setattr(module, name, value)
 
 
+# ------------------------------------------------------------------
+# Runner
+# ------------------------------------------------------------------
+
+
 class FSDPCudaGraphRunner:
-    """
-    Wraps an FSDPModule so that ``module(*args, **kwargs)`` can be served
-    from a CUDA graph (forward + backward) while bypassing all of the
-    module's hooks on the graphed path.
+    """Captures a forward+bacwkard CUDA graph for one FSDP module.
 
-    Usage
-    -----
-    >>> runner = FSDPCudaGraphRunner(my_fsdp_module, warmup_steps=3)
-    >>> runner.capture_forward(sample_input)   # ← provide a sample with the
-    >>>                                        #    expected shape/dtype
-    >>> runner.install()                       # patches forward
-    >>> output = my_fsdp_module(input_batch)   # now uses the graph, no hooks
-    >>> runner.uninstall()                     # restore original behaviour
+    During capture hooks are temporarily removed so the graph records
+    only the user's ``forward()``, not FSDP all-gather / reduce-scatter
+    collectives.  FSDP side streams are disabled for the capture region.
+
+    Usage::
+
+        runner = FSDPCudaGraphRunner(my_fsdp_module)
+        runner.capture_forward(sample_input)
+        runner.install()                       # patches module.forward
+        output = my_fsdp_module(input_batch)   # replays graph, no hooks
+        runner.uninstall()                     # restore original behaviour
     """
 
-    def __init__(
-        self,
-        fsdp_module: torch.nn.Module,
-        warmup_steps: int = 3,
-    ):
+    def __init__(self, fsdp_module: torch.nn.Module):
         self._module: torch.nn.Module = fsdp_module
-        self._warmup_steps: int = warmup_steps
 
         # Will hold the callable returned by make_graphed_callables
         self._graphed: Optional[torch._CudaGraphCallable] = None
 
-        # Original forward so we can restore it later
         self._orig_fwd: Optional[Any] = None
-
-        # Flag flipped by install()/uninstall()
         self._use_cuda_graph: bool = False
-
-        # Book‑keeping
         self._captured: bool = False
 
-    # ------------------------------------------------------------------
-    # 1. Capture (forward + backward) with hooks temporarily removed
-    # ------------------------------------------------------------------
-    def capture_forward(self, *sample_args, **sample_kwargs) -> None:
-        # 1. Introspect the module's forward signature
-        param_names = _get_forward_param_names(self._module.__class__)
-        if torch.distributed.get_rank() == 0:
-            print(f"capture_forward, param_names={param_names}", inspect.signature(self._module.__class__.forward))
+        # Saved during capture for install() replay flattening
+        self._tensor_param_names: List[str] = []
+        self._frozen_kwargs: Dict[str, Any] = {}
 
-        # 2. Separate tensor vs non-tensor inputs
-        #    - tensors become dynamic positional inputs to the graph
-        #    - non-tensors are frozen into the shim
+    # ------------------------------------------------------------------
+    # 1. Capture
+    # ------------------------------------------------------------------
+
+    def capture_forward(
+        self,
+        *sample_args,
+        **sample_kwargs,
+    ) -> None:
+        assert ctx.cuda_graph_compatible, (
+            "CUDA graph capture requires side-stream collectives to be "
+            "disabled (enable_unshard_prefetch=False, enable_async_reduce_grad=False)"
+        )
+
+        # Introspect the module's forward signature
+        param_names = _get_forward_param_names(self._module.__class__)
+
+        # Separate tensor vs non-tensor inputs
         bound = {}
         for i, val in enumerate(sample_args):
             if i < len(param_names):
                 bound[param_names[i]] = val
         bound.update(sample_kwargs)
 
-        tensor_names = [n for n in param_names if n in bound and isinstance(bound[n], torch.Tensor)]
+        tensor_names = [
+            n for n in param_names if n in bound and isinstance(bound[n], torch.Tensor)
+        ]
         frozen_kwargs = {n: v for n, v in bound.items() if not isinstance(v, torch.Tensor)}
-        flat_sample = tuple(bound[n] for n in tensor_names)
+        flat_sample = tuple(bound[n].clone().detach() for n in tensor_names)
 
-        # 3. Build shim
+        # Build shim
         shim = _ForwardShim(self._module, tensor_names, frozen_kwargs)
 
-        # 4. Warmup on default stream.
-        # Use torch.autograd.grad() to exercise the backward graph without
-        # creating persistent AccumulateGrad nodes on param.grad.  Those nodes
-        # cache a stream association that breaks later CUDA graph capture.
-        for _ in range(self._warmup_steps):
-            out = shim(*flat_sample)
-            if isinstance(out, tuple):
-                loss = out[0].sum()
-            else:
-                loss = out.sum()
-            grads = torch.autograd.grad(
-                loss,
-                [p for p in self._module.parameters() if p.requires_grad],
-                allow_unused=True,
-            )
-            del grads
-        torch.cuda.synchronize()
-
-        def debug_capture_stages(shim, sample_args, module):
-            """Isolate which stage breaks: forward-only or forward+backward."""
-            import torch
-
-            torch.cuda.synchronize()
-
-            # Stage 0: eager sanity check.
-            # Use torch.autograd.grad() to avoid creating persistent
-            # AccumulateGrad nodes that would carry a stale stream
-            # association into Stage 2's CUDA graph capture.
-            print("[DEBUG] Stage 0: eager forward")
-            out = shim(*sample_args)
-            print(f"[DEBUG] Stage 0: eager forward OK, out type={type(out)}")
-
-            if isinstance(out, tuple):
-                loss = out[0].sum()
-            else:
-                loss = out.sum()
-
-            print("[DEBUG] Stage 0: eager backward")
-            grads = torch.autograd.grad(
-                loss,
-                [p for p in module.parameters() if p.requires_grad],
-                allow_unused=True,
-            )
-            del grads
-            print("[DEBUG] Stage 0: eager backward OK")
-
-            torch.cuda.synchronize()
-
-            # Stage 1: forward-only graph
-            print("[DEBUG] Stage 1: forward-only graph capture")
-            g1 = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g1):
-                out = shim(*sample_args)
-            print("[DEBUG] Stage 1: forward-only graph OK")
-
-            # Ensure .grad is None so Stage 2 creates fresh
-            # AccumulateGrad nodes on the capture stream.
-            for p in module.parameters():
-                if p.requires_grad:
-                    p.grad = None
-
-            torch.cuda.synchronize()
-
-            # Stage 2: forward + backward graph.
-            # This is the first time AccumulateGrad nodes are created.
-            # They are created on the capture stream inside the graph,
-            # avoiding any stale stream association.
-            print("[DEBUG] Stage 2: forward+backward graph capture")
-            capture_stream = torch.cuda.Stream()
-            params = [p for p in module.parameters() if p.requires_grad]
-            with torch.cuda.stream(capture_stream):
-                # prime grads on the capture stream first
-                for p in params:
-                    if p.grad is None:
-                        p.grad = torch.zeros_like(p)
-                with torch.cuda.graph(g2, stream=capture_stream):
-                    out = shim(*sample_args)
-                    loss = (out[0] if isinstance(out, tuple) else out).sum()
-                    loss.backward()
-            print("[DEBUG] Stage 2: forward+backward graph OK")
-            print("[DEBUG] All stages passed!")
-
-        # # 5. Remove hooks, capture, restore hooks
-        # saved_hooks = _pop_hooks(self._module)
-        # try:
-        #     # self._graphed = torch.cuda.make_graphed_callables(
-        #     #     shim,
-        #     #     sample_args=flat_sample,
-        #     #     num_warmup_iters=0,
-        #     # )
-        #     debug_capture_stages(shim, flat_sample, self._module)
-        # finally:
-        #     _restore_hooks(self._module, saved_hooks)
-
-        # Force sync comms during capture: disable prefetch/async-reduce
+        # Disable side-stream collectives during capture so every CUDA
+        # operation lands on the default (capture) stream.
         ctx = self._module._fsdp_root_context
         saved_prefetch = ctx.enable_unshard_prefetch
         saved_async_reduce = ctx.enable_async_reduce_grad
-        ctx.enable_unshard_prefetch = False       # unshard on current stream
-        ctx.enable_async_reduce_grad = False      # reduce_grad on current stream
-        ctx.cuda_graph_active = True              # suppress reshard deferral
-
+        ctx.enable_unshard_prefetch = False
+        ctx.enable_async_reduce_grad = False
+        ctx.cuda_graph_active = True
         saved_hooks = _pop_hooks(self._module)
         try:
-            debug_capture_stages(shim, flat_sample, self._module)
+            torch.cuda.synchronize()
+            self._graphed = torch.cuda.make_graphed_callables(
+                shim,
+                sample_args=flat_sample,
+                num_warmup_iters=3,
+            )
         finally:
             _restore_hooks(self._module, saved_hooks)
             ctx.enable_unshard_prefetch = saved_prefetch
             ctx.enable_async_reduce_grad = saved_async_reduce
             ctx.cuda_graph_active = False
 
-        # 6. Save the tensor param names so install() can flatten at runtime
         self._tensor_param_names = tensor_names
         self._frozen_kwargs = frozen_kwargs
         self._captured = True
@@ -306,7 +197,6 @@ class FSDPCudaGraphRunner:
 
         def _patched_fwd(*args, **kwargs):
             if self._use_cuda_graph:
-                # Silently flatten args/kwargs → positional tensor tuple
                 bound = {}
                 for i, val in enumerate(args):
                     if i < len(param_names):
@@ -320,19 +210,17 @@ class FSDPCudaGraphRunner:
         self._use_cuda_graph = True
 
     def uninstall(self) -> None:
-        """
-        Restore the original ``forward`` so that the module behaves
-        exactly as before (eager execution with hooks).
-        """
+        """Restore the original ``forward``."""
         if self._orig_fwd is None:
-            return  # nothing to restore
+            return
         self._module.forward = self._orig_fwd
         self._orig_fwd = None
         self._use_cuda_graph = False
 
     # ------------------------------------------------------------------
-    # 3. Convenience properties / helpers
+    # 3. Properties
     # ------------------------------------------------------------------
+
     @property
     def captured(self) -> bool:
         """True if ``capture_forward`` has been called successfully."""
@@ -344,10 +232,7 @@ class FSDPCudaGraphRunner:
         return self._use_cuda_graph
 
     def reset(self) -> None:
-        """
-        Fully reset the runner: uninstall the patch, forget the graph,
-        and allow a fresh capture later.
-        """
+        """Uninstall the patch and allow a fresh capture later."""
         self.uninstall()
         self._graphed = None
         self._captured = False

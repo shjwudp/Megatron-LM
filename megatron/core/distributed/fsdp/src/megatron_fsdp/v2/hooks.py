@@ -26,6 +26,7 @@ from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 from .allocator import TracePoolAllocator
 from .fsdp_module import FSDPModule, _FSDPState
 from .utils import RegisterFSDPBackwardFunction
+from .cuda_graph_runner import FSDPCudaGraphRunner
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +34,20 @@ logger = logging.getLogger(__name__)
 def _register_forward_pre_hook(fsdp_module: FSDPModule):
     """Register a pre-forward hook to unshard parameters for this FSDP unit."""
 
-    def unshard_param_groups(fsdp_module, *unused):
+    def unshard_param_groups(fsdp_module, args, kwargs):
         ctx = fsdp_module._fsdp_root_context
         if ctx.backward_phase:
             fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
         fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
+        if fsdp_module._fsdp_state.enable_cuda_graph and (
+            not hasattr(fsdp_module, "_fsdp_cg_runner")
+        ):
+            cg_runner = FSDPCudaGraphRunner(fsdp_module)
+            cg_runner.capture_forward(*args, **kwargs)
+            cg_runner.install()
+            fsdp_module._fsdp_cg_runner = cg_runner
 
-    return fsdp_module.register_forward_pre_hook(unshard_param_groups, prepend=True)
+    return fsdp_module.register_forward_pre_hook(unshard_param_groups, prepend=True, with_kwargs=True)
 
 
 def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
@@ -49,7 +57,7 @@ def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
     (trace → capture → replay) when ``enable_cuda_graph`` is True.
     """
 
-    def root_forward_pre_hook(_hook_module, *unused):
+    def root_forward_pre_hook(_hook_module):
         ctx = fsdp_module._fsdp_root_context
         if not fsdp_module._fsdp_state._is_root:
             return
@@ -256,6 +264,8 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
     def _post_backward_final_callback(root_state: _FSDPState, root_module: nn.Module):
         """Final callback: reshard all modules and reduce gradients."""
         ctx = root_module._fsdp_root_context
+        if ctx.cuda_graph_active:
+            return
         stream = ctx.rs_stream
         for module in reversed(ctx.forward_order):
             if getattr(module, "post_backward_issued", False):
