@@ -133,11 +133,6 @@ class _FSDPRootContext:
     """True from the root forward pre-hook until the root backward pre-hook.
     ``backward_phase`` is set to ``False`` when this becomes ``True``."""
 
-    cuda_graph_active: bool = False
-    """True when FSDP is inside CUDA graph capture (via FSDPCudaGraphRunner).
-    Suppresses side-stream vs default-stream mismatches and defers reshard.
-    Only needed during capture, not replay."""
-
     enable_cuda_graph: bool = False
     """Set by enable_cuda_graph() — tells hooks to manage the side stream."""
 

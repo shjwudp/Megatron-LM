@@ -36,8 +36,6 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule):
 
     def unshard_param_groups(fsdp_module, args, kwargs):
         ctx = fsdp_module._fsdp_root_context
-        if ctx.cuda_graph_active:
-            return
         if ctx.backward_phase:
             fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
         fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
@@ -68,8 +66,6 @@ def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
         if ctx.enable_cuda_graph and ctx.cuda_graph_stream is None:
             ctx.cuda_graph_stream = torch.cuda.Stream()
             torch.cuda.set_stream(ctx.cuda_graph_stream)
-        if ctx.cuda_graph_active:
-            return
         ctx.forward_phase = True
         ctx.backward_phase = False
         if isinstance(ctx.bucket_allocator, TracePoolAllocator):
@@ -102,8 +98,6 @@ def _register_forward_hook(module: FSDPModule):
         ctx = module._fsdp_root_context
         if ctx.backward_phase and id(module) == ctx.backward_module:
             return
-        if ctx.cuda_graph_active:
-            return  # defer reshard
         module.reshard()
 
     module._mfsdp_forward_hook = module.register_forward_hook(reshard_param_groups)
@@ -122,9 +116,6 @@ def _register_backward_pre_hook(module: FSDPModule):
 
         @torch.compiler.disable
         def forward_hook(_module, inputs, output):
-            ctx = module._fsdp_root_context
-            if ctx.cuda_graph_active:
-                return output
             # View-as to avoid output being the same tensor object
             output = tree_map(lambda t: t.view_as(t) if torch.is_tensor(t) else t, output)
 
@@ -147,8 +138,6 @@ def _register_backward_pre_hook(module: FSDPModule):
     def pre_backward_hook(module: FSDPModule, grads):
         """Hook called before backward pass for this module."""
         ctx = module._fsdp_root_context
-        if ctx.cuda_graph_active:
-            return
         if module._fsdp_state._is_root:
             ctx.backward_done_modules.clear()
             ctx.forward_phase = False
@@ -187,8 +176,6 @@ def _register_backward_hook(module: FSDPModule):
     def post_backward(module: FSDPModule):
         """Hook called after backward pass for this module."""
         ctx = module._fsdp_root_context
-        if ctx.cuda_graph_active:
-            return
         ctx.backward_done_modules.add(id(module))
         ctx._advance_backward_module()
         module.reshard()
@@ -213,9 +200,6 @@ def _register_backward_hook(module: FSDPModule):
         input tensors in an autograd Function. The Function's backward
         calls the post_backward_hook after gradients are computed.
         """
-        ctx = module._fsdp_root_context
-        if ctx.cuda_graph_active:
-            return args, kwargs
         if not torch.is_grad_enabled():
             return args, kwargs
 
@@ -271,11 +255,6 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
     def _post_backward_final_callback(root_state: _FSDPState, root_module: nn.Module):
         """Final callback: reshard all modules and reduce gradients."""
         ctx = root_module._fsdp_root_context
-        if ctx.cuda_graph_active:
-            return
-        assert not ctx.cuda_graph_active, (
-            "Post-backward callback should not run during CUDA graph capture"
-        )
         stream = ctx.rs_stream
         for module in reversed(ctx.forward_order):
             if getattr(module, "post_backward_issued", False):
