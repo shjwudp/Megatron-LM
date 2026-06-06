@@ -169,7 +169,7 @@ class FSDPCudaGraphRunner:
         # Build shim
         shim = _ForwardShim(self._module, tensor_names, frozen_kwargs)
 
-        for name, param in self._module.named_parameters():
+        for param in self._module.parameters():
             param.grad = None
 
         # Disable side-stream collectives during capture so every CUDA
@@ -178,7 +178,7 @@ class FSDPCudaGraphRunner:
         try:
             torch.cuda.synchronize()
             detach_from_default_stream(self._module)
-            torch.cuda.make_graphed_callables(
+            self._graphed = torch.cuda.make_graphed_callables(
                 shim,
                 sample_args=flat_sample,
                 num_warmup_iters=3,
@@ -194,8 +194,6 @@ class FSDPCudaGraphRunner:
     # 2. Install / uninstall the patched forward
     # ------------------------------------------------------------------
     def install(self) -> None:
-        self._use_cuda_graph = True
-        return
         if not self._captured:
             raise RuntimeError("Call capture_forward() first")
         if self._orig_fwd is not None:
