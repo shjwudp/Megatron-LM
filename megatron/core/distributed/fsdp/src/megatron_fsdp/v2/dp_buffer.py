@@ -567,13 +567,12 @@ class DataParallelBuffer:
         elif self.is_distributed:
             if self._unsharded_buffer is None:
                 default_stream = torch.cuda.default_stream(self.device)
-                with torch.cuda.stream(default_stream):
-                    bucket = self.allocator.allocate(
-                        key=self.alloc_key,
-                        size=self.buffer_index.bucket_meta.size,
-                        dtype=self.dtype,
-                        device=self.device,
-                    )
+                bucket = self.allocator.allocate(
+                    key=self.alloc_key,
+                    size=self.buffer_index.bucket_meta.size,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
                 torch.cuda.current_stream().wait_stream(default_stream)
                 self._unsharded_buffer = bucket.data
                 sm = self.buffer_index.shard_meta
@@ -632,13 +631,12 @@ class DataParallelBuffer:
         if self.is_distributed:
             if self._unsharded_buffer is None:
                 default_stream = torch.cuda.default_stream(self.device)
-                with torch.cuda.stream(default_stream):
-                    bucket = self.allocator.allocate(
-                        key=self.alloc_key,
-                        size=self.buffer_index.bucket_meta.size,
-                        dtype=self.dtype,
-                        device=self.device,
-                    )
+                bucket = self.allocator.allocate(
+                    key=self.alloc_key,
+                    size=self.buffer_index.bucket_meta.size,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
                 torch.cuda.current_stream().wait_stream(default_stream)
                 self._unsharded_buffer = bucket.data
             full = self._unsharded_buffer

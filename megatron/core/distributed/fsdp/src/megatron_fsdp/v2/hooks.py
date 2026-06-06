@@ -65,6 +65,10 @@ def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
         ctx = fsdp_module._fsdp_root_context
         if not fsdp_module._fsdp_state._is_root:
             return
+        if ctx.enable_cuda_graph:
+            if ctx.cuda_graph_stream is None:
+                ctx.cuda_graph_stream = torch.cuda.Stream()
+                torch.cuda.set_stream(ctx.cuda_graph_stream)
         if ctx.cuda_graph_active:
             return
         ctx.forward_phase = True

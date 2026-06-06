@@ -138,6 +138,13 @@ class _FSDPRootContext:
     Suppresses side-stream vs default-stream mismatches and defers reshard.
     Only needed during capture, not replay."""
 
+    enable_cuda_graph: bool = False
+    """Set by enable_cuda_graph() — tells hooks to manage the side stream."""
+
+    cuda_graph_stream: Optional[torch.cuda.Stream] = None
+    """Side stream for CUDA graph capture/replay.  Created lazily on the
+    first forward pre-hook and shared across all FSDP modules."""
+
     backward_module: Optional[int] = None
     """``id(module)`` of the FSDP module whose backward is pending next.
     Derived from ``_reversed_order`` and ``backward_done_modules`` — NOT
@@ -210,15 +217,9 @@ class FSDPModule:
         """Enable CUDA graph capture for this FSDP module.
 
         Must be called while the module is resharded (before the first
-        forward pass).  This method:
-
-        1. Creates a side ``torch.cuda.Stream`` and installs it as the
-           **global default stream** via ``torch.cuda.set_stream()``.
-           This isolates all subsequent kernel launches from the original
-           default stream's history, which is required for CUDA graph
-           capture/replay to succeed.
-        2. Sets the ``enable_cuda_graph`` flag on the FSDP state so the
-           forward pre-hook will trigger graph capture on the next forward.
+        forward pass).  Sets the ``enable_cuda_graph`` flag on both the
+        per-module FSDP state and the shared root context.  The side
+        stream is created lazily on the first root forward pre-hook.
 
         Usage::
 
@@ -226,8 +227,7 @@ class FSDPModule:
             layer.enable_cuda_graph()   # call before first forward
         """
         self._fsdp_state.enable_cuda_graph = True
-        self._cuda_graph_stream = torch.cuda.Stream()
-        torch.cuda.set_stream(self._cuda_graph_stream)
+        self._fsdp_root_context.enable_cuda_graph = True
 
     def _init_named_param_groups(
         self,

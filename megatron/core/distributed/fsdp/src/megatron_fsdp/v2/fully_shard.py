@@ -22,6 +22,7 @@ The implementation is split across:
 
 from typing import Callable, Optional
 
+import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Shard
