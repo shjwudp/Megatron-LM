@@ -92,21 +92,6 @@ def _restore_hooks(module: torch.nn.Module, saved: Dict[str, Any]) -> None:
 # Runner
 # ------------------------------------------------------------------
 
-def detach_from_default_stream(module: nn.Module):
-    """Re-allocate all params/buffers on a side stream so they have no default-stream history."""
-    s = torch.cuda.Stream()
-    with torch.cuda.stream(s):
-        for name, param in module.named_parameters():
-            new_data = torch.empty_like(param)
-            new_data.copy_(param)
-            param.data = new_data  # .data swap preserves the Parameter object (optimizer still valid!)
-        for name, buf in module.named_buffers():
-            new_data = torch.empty_like(buf)
-            new_data.copy_(buf)
-            buf.data = new_data
-    s.synchronize()
-
-
 class FSDPCudaGraphRunner:
     """Captures a forward+bacwkard CUDA graph for one FSDP module.
 
@@ -177,7 +162,6 @@ class FSDPCudaGraphRunner:
         saved_hooks = _pop_hooks(self._module)
         try:
             torch.cuda.synchronize()
-            detach_from_default_stream(self._module)
             self._graphed = torch.cuda.make_graphed_callables(
                 shim,
                 sample_args=flat_sample,
