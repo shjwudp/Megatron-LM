@@ -227,7 +227,6 @@ class FSDPModule:
             layer.enable_cuda_graph()   # call before first forward
         """
         self._fsdp_state.enable_cuda_graph = True
-        self._fsdp_root_context.enable_cuda_graph = True
 
     def _init_named_param_groups(
         self,
@@ -450,6 +449,9 @@ class FSDPModule:
                     f"Only leaf FSDP modules (no FSDP children) can use CUDA graph capture."
                 )
             self.enable_cuda_graph()
+
+        if any(module._fsdp_state.enable_cuda_graph for module in forward_order):
+            root_context.enable_cuda_graph = True
 
     def unshard(self, async_op: bool = False, bwd_pass: bool = False):
         """
