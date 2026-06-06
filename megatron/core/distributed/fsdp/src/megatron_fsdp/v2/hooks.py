@@ -41,15 +41,19 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule):
         fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 
         # If CUDA graph is enabled, let us try to capture the cuda graph.
-        if fsdp_module._fsdp_state.enable_cuda_graph and (
-            not hasattr(fsdp_module, "_fsdp_cg_runner")
-        ) and fsdp_module.cuda_graph_compatible:
+        if (
+            fsdp_module._fsdp_state.enable_cuda_graph
+            and (not hasattr(fsdp_module, "_fsdp_cg_runner"))
+            and fsdp_module.cuda_graph_compatible
+        ):
             cg_runner = FSDPCudaGraphRunner(fsdp_module)
             cg_runner.capture_forward(*args, **kwargs)
             cg_runner.install()
             fsdp_module._fsdp_cg_runner = cg_runner
 
-    return fsdp_module.register_forward_pre_hook(unshard_param_groups, prepend=True, with_kwargs=True)
+    return fsdp_module.register_forward_pre_hook(
+        unshard_param_groups, prepend=True, with_kwargs=True
+    )
 
 
 def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
@@ -71,8 +75,7 @@ def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
         if isinstance(ctx.bucket_allocator, TracePoolAllocator):
             ba = ctx.bucket_allocator
             if ba.phase == "optimized":
-                ba.disable_flexible_mode()
-                ba.reset_cursor()
+                ba.reset_batch()
 
     return fsdp_module.register_forward_pre_hook(root_forward_pre_hook, prepend=True)
 
@@ -111,13 +114,17 @@ def _register_backward_pre_hook(module: FSDPModule):
     to trigger unshard at the right time during backward pass.
     """
 
-    def create_custom_backward_hook(module: FSDPModule, custom_backward_handler: Callable):
+    def create_custom_backward_hook(
+        module: FSDPModule, custom_backward_handler: Callable
+    ):
         """Create a custom backward hook attached to output tensors."""
 
         @torch.compiler.disable
         def forward_hook(_module, inputs, output):
             # View-as to avoid output being the same tensor object
-            output = tree_map(lambda t: t.view_as(t) if torch.is_tensor(t) else t, output)
+            output = tree_map(
+                lambda t: t.view_as(t) if torch.is_tensor(t) else t, output
+            )
 
             # Collect tensor outputs
             output_list = []
@@ -129,7 +136,9 @@ def _register_backward_pre_hook(module: FSDPModule):
             # Register pre-backward hook on output tensors.
             # This triggers when gradients are computed.
             torch.autograd.graph.register_multi_grad_hook(
-                output_list, lambda grads: custom_backward_handler(_module, grads), mode="any"
+                output_list,
+                lambda grads: custom_backward_handler(_module, grads),
+                mode="any",
             )
             return output
 
@@ -154,9 +163,15 @@ def _register_backward_pre_hook(module: FSDPModule):
                 # micro-batches.  Setting overwrite_main_grad tells TE to
                 # overwrite instead of accumulate, preventing NaN from corrupted
                 # gradient buffers.
-                if param_group.sharding_strategy in ["optim_grads_params", "optim_grads"]:
+                if param_group.sharding_strategy in [
+                    "optim_grads_params",
+                    "optim_grads",
+                ]:
                     setattr(param, "overwrite_main_grad", True)
-        if module._fsdp_state._is_root and not module._fsdp_state._post_backward_callback_queued:
+        if (
+            module._fsdp_state._is_root
+            and not module._fsdp_state._post_backward_callback_queued
+        ):
             _register_post_backward_final_callback(module._fsdp_state, module)
         module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
 
@@ -240,7 +255,9 @@ def _register_backward_hook(module: FSDPModule):
     )
 
 
-def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module) -> None:
+def _register_post_backward_final_callback(
+    state: _FSDPState, module: nn.Module
+) -> None:
     """
     Register the final callback that runs after all backward passes complete.
 
@@ -284,18 +301,16 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
                 if torch.distributed.get_rank() == 0:
                     logger.debug(bucket_alloc.dump_trace())
                     for m in ctx.forward_order:
-                        logger.debug(f"module_id={id(m)}, module_name={m._fsdp_module_name}")
+                        logger.debug(
+                            f"module_id={id(m)}, module_name={m._fsdp_module_name}"
+                        )
                 bucket_alloc.plan()
-                bucket_alloc.reset_cursor()
             elif bucket_alloc.phase == "optimized":
-                bucket_alloc.reset_cursor()
+                bucket_alloc.reset_batch()
             else:
-                raise ValueError(f"Unexpected bucket allocator phase: {bucket_alloc.phase}")
-            # Both forward_phase and backward_phase are now False —
-            # enable flexible key→slot lookup for auxiliary allocations
-            # between micro-batches (e.g. weight quantisation).
-            if bucket_alloc.phase == "optimized":
-                bucket_alloc.enable_flexible_mode()
+                raise ValueError(
+                    f"Unexpected bucket allocator phase: {bucket_alloc.phase}"
+                )
 
     state._post_backward_callback_queued = True
     Variable._execution_engine.queue_callback(
