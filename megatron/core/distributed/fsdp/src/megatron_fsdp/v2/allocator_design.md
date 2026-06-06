@@ -54,34 +54,42 @@ or duplicated relative to the trace.
 ## Design goal
 
 > Keep `TracePoolAllocator` as a single class. Replace the seq-driven replay
-> schedule (`_seq_ops`) with a **static key→slot plan** (`_key_to_slot`).
-> Every `alloc_key` maps to one fixed memory address — derived once from the
-> trace — that works regardless of whether, when, or in what order hooks fire.
+> schedule (`_seq_ops`) with a **per-key ordered slot plan** (`_key_to_slots`).
+> Each `alloc_key` maps to an ordered list of slot indices — one per interval
+> in the trace — served via a per-key cursor that resets each micro-batch.
+> The cursor ensures the forward-pass slot (`slots[0]`) is always reused,
+> giving stable CUDA graph addresses.  Later intervals that cannot reuse the
+> forward slot (occupied by another key's later interval) get new slots.
 
-## Approach: `plan()` builds a static key→slot mapping
+## Approach: `plan()` builds a per-key ordered slot list
 
 Instead of using the trace as a replay script, use it as **input data for
 memory planning**. The trace tells us which allocations overlap in time.
-`plan()` runs a greedy interval-coloring algorithm to build a static
-`alloc_key → slot` map. Runtime is just a dict lookup:
+`plan()` runs a greedy interval-coloring algorithm to build a per-key
+ordered slot list. Runtime serves slots via a per-key cursor:
 
 ```python
 def allocate(key, ...):
-    slot = _key_to_slot[key]                     # dict lookup, O(1)
-    return pool[slot.offset : slot.offset + size]  # always same address
+    slots = _key_to_slots[key]                    # dict lookup, O(1)
+    cursor = _key_cursor[key]                     # per-key position
+    _key_cursor[key] = cursor + 1                 # advance for next interval
+    slot_idx = slots[cursor]
+    return pool[slot_idx.offset : slot_idx.offset + size]  # stable address
 ```
 
 No `_seq` counter. No `_seq_ops` schedule. No dependency on call order.
+Per-key cursors reset to 0 between micro-batches, guaranteeing forward-pass
+address stability.
 
 ## What stays, what changes, what's removed
 
 | Stays unchanged | Changes | Removed |
 |---|---|---|
-| Trace phase (`_trace_allocate`, `_trace_free`, `_TraceEvent`) | `plan()` builds `_key_to_slot` instead of `_seq_ops` | `_seq`, `_seq_ops` |
+| Trace phase (`_trace_allocate`, `_trace_free`, `_TraceEvent`) | `plan()` builds `_key_to_slots` instead of `_seq_ops` | `_seq`, `_seq_ops` |
 | Interval construction from alloc/free pairs | `allocate()` / `free()` dispatch to key→slot lookup instead of seq walk | `_pool_allocate`, `_pool_free` |
 | Per-(dtype, device) pool tensors | `enable_flexible_mode` / `disable_flexible_mode` not needed | `_flexible`, `_flex_key_to_slot` |
 | `Bucket` dataclass, `BucketAllocator` interface | `_phase` transitions: `"trace"` → `"optimized"` (no intermediate `"plan"` phase held) | `snapshot_slots`, `restore_slots` |
-| `_key_to_slot: Dict[alloc_key, slot_idx]` | | `reset_cursor()` |
+| `_key_to_slots: Dict[alloc_key, List[slot_idx]]` | | `reset_cursor()` |
 
 ### Why flexible mode is removed
 
@@ -91,7 +99,7 @@ quantisation). In v3, **every** `allocate()` is already a key→slot lookup — 
 flexible-mode path is the **default** path. A separate toggle is unnecessary.
 
 Between micro-batches, `reset_batch()` clears `in_use` and `_active_keys` but
-preserves `_key_to_slot` and `_pools`. An auxiliary `allocate(quant_key)` will
+preserves `_key_to_slots` and `_pools`. An auxiliary `allocate(quant_key)` will
 find the slot free → works exactly as before.
 
 ## `plan()` — the core method
@@ -104,7 +112,7 @@ def plan(self) -> int:
     2. Group intervals by (dtype, device), color each group with
        greedy left-edge algorithm.
     3. Allocate one flat pool tensor per group.
-    4. Build _key_to_slot: every alloc_key → exactly one slot_idx.
+    4. Build _key_to_slots: every alloc_key → ordered list of slot indices.
     """
 ```
 
@@ -257,63 +265,63 @@ worth the complexity.
 
 ```python
 def allocate(key, size, dtype, device):
-    slot_idx = _key_to_slot[key]    # raises KeyError if key never traced
-    slot = _slots[slot_idx]
-    # Guard: slot free or already owned by this key
-    if slot.in_use and key not in _active_keys:
-        raise RuntimeError(
-            f"Slot collision at slot[{slot_idx}]: key={key} "
-            f"but slot is held by active key(s)"
-        )
-    assert size <= slot.size, (
-        f"requested {size} > slot capacity {slot.size} (key={key})"
-    )
     if key in _active_keys:
-        # Re-entrant: key already allocated this micro-batch
-        # (e.g. double-allocate within same iteration — idempotent)
+        # Re-entrant: key already allocated this micro-batch — idempotent
+        slot_idx = _key_active_slot[key]
+        slot = _slots[slot_idx]
+        assert size <= slot.size
         return Bucket(data=pool[slot.offset : slot.offset + size])
+
+    slots = _key_to_slots[key]           # raises KeyError if key never traced
+    cursor = _key_cursor[key]            # per-key position, reset to 0 each batch
+    slot_idx = slots[cursor]
+    _key_cursor[key] = cursor + 1        # advance for next interval
+
+    slot = _slots[slot_idx]
+    if slot.in_use and key not in _active_keys:
+        raise RuntimeError("Slot collision")
+    assert size <= slot.size
     slot.in_use = True
     _active_keys.add(key)
+    _key_active_slot[key] = slot_idx     # remember which slot is held
     return Bucket(data=pool[slot.offset : slot.offset + size])
 
 def free(key):
     if key not in _active_keys:
-        return  # double-free or never-allocated → silent no-op
-    _slots[_key_to_slot[key]].in_use = False
+        return  # double-free or never-allocated
+    slot_idx = _key_active_slot.pop(key, None)
+    if slot_idx is not None:
+        _slots[slot_idx].in_use = False
     _active_keys.discard(key)
 
 def reset_batch():
-    """Between micro-batches: clear in_use flags and active keys.
-
-    Does NOT discard _key_to_slot or _pools — the slot→address mapping
-    is immutable once planned.
-
-    Called at root pre-forward of each micro-batch after plan().
-    """
+    """Between micro-batches: clear in_use flags, reset cursors to 0."""
     assert _phase == "optimized"
     for slot in _slots:
         slot.in_use = False
     _active_keys.clear()
+    _key_active_slot.clear()
+    for key in _key_to_slots:
+        _key_cursor[key] = 0
 
 def reset():
-    """Full teardown: discard pool, plan, and trace; return to "trace" phase.
-
-    Used for model re-initialization or full training restart.
-    """
+    """Full teardown: discard pool, plan, and trace."""
     self._phase = "trace"
-    self._seq = 0            # (present only in trace phase)
+    self._seq = 0
     self._trace.clear()
     self._trace_meta.clear()
     self._buckets.clear()
     self._active_keys.clear()
     self._pools.clear()
-    self._key_to_slot.clear()
+    self._key_to_slots.clear()
+    self._key_cursor.clear()
+    self._key_active_slot.clear()
     self._slots.clear()
 ```
 
 ### Error handling for unknown keys
 
-If `allocate(key)` is called with a key never seen during trace, `_key_to_slot`
+If `allocate(key)` is called with a key never seen during trace, `_key_to_slots`
 raises `KeyError`. The caller must re-trace (call `reset()`, re-run micro-batch
 0, then `plan()`) to pick up new allocation patterns. This guarantees that all
 keys used during CUDA graph replay were planned, keeping addresses stable.
@@ -339,7 +347,7 @@ The full lifecycle spanning trace, plan, capture, and replay:
                     │ Backward:     alloc/free → _trace_*      │
                     │               records                    │
                     │ Post-backward: plan() builds             │
-                    │                _key_to_slot, allocates   │
+                    │                _key_to_slots, allocates  │
                     │                pool tensors              │
                     │                Phase → "optimized"       │
                     └──────────────────┬──────────────────────┘
@@ -528,7 +536,7 @@ def dump_trace(self) -> str:
 |---|---|
 | Fixed address per key | Pool tensors allocated once in `plan()`, never resized. Each key maps to one slot at a fixed, aligned offset. `pool[offset:offset+size]` returns identical view every time. |
 | Memory efficiency | Left-edge interval coloring reuses slots for non-overlapping allocations. Same-key→same-slot enforcement shares a single slot across multiple non-overlapping intervals of the same key. |
-| CUDA graph compatible | No `_seq` counter, no `_seq_ops` schedule. Key→slot lookup works regardless of call order, duplication, or omission relative to the trace. `reset_batch()` at micro-batch boundary. |
+| CUDA graph compatible | Per-key slot list with cursor: `slots[0]` is always the forward-pass slot. `reset_batch()` resets all cursors to 0, guaranteeing the forward slot is reused every micro-batch. Later intervals get subsequent slots — consistent across batches. |
 | No fragmentation within pool | Slots are laid out contiguously with alignment padding. No gaps between slots (only alignment-padding gaps). No dynamic allocation/deallocation — pool is a single `torch.empty`. |
 | Simple implementation | `allocate()` is a dict lookup + guard. `free()` is a flag clear. `reset_batch()` clears flags and active set. No seq walking, no fast-forward logic. |
 | Same trace mechanism | Phase 1 (trace) is identical. Only the plan output and runtime dispatch change. |

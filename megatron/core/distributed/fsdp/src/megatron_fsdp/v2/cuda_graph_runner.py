@@ -162,11 +162,14 @@ class FSDPCudaGraphRunner:
         saved_hooks = _pop_hooks(self._module)
         try:
             torch.cuda.synchronize()
+            # Gradient accumulation fusion
+            self.unshard_main_grad_buffer()
             self._graphed = torch.cuda.make_graphed_callables(
                 shim,
                 sample_args=flat_sample,
                 num_warmup_iters=3,
             )
+            self.reshard_main_grad_buffer()
         finally:
             _restore_hooks(self._module, saved_hooks)
 
@@ -229,3 +232,15 @@ class FSDPCudaGraphRunner:
         self.uninstall()
         self._graphed = None
         self._captured = False
+
+    def unshard_main_grad_buffer(self):
+        """Unshard the main grad buffer for all param groups."""
+        for group in self._module._param_groups:
+            if hasattr(group, "main_grad_buffer"):
+                group.main_grad_buffer.unshard()
+
+    def reshard_main_grad_buffer(self):
+        """Reshard the main grad buffer for all param groups."""
+        for group in self._module._param_groups:
+            group.release_grad_buffer()
+
