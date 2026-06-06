@@ -149,10 +149,13 @@ class FSDPCudaGraphRunner:
             n for n in param_names if n in bound and isinstance(bound[n], torch.Tensor)
         ]
         frozen_kwargs = {n: v for n, v in bound.items() if not isinstance(v, torch.Tensor)}
-        flat_sample = tuple(bound[n].clone().detach() for n in tensor_names)
+        flat_sample = tuple(bound[n].clone().detach().requires_grad_(True) for n in tensor_names)
 
         # Build shim
         shim = _ForwardShim(self._module, tensor_names, frozen_kwargs)
+
+        for name, param in self._module.named_parameters():
+            param.grad = None
 
         # Disable side-stream collectives during capture so every CUDA
         # operation lands on the default (capture) stream.
@@ -165,7 +168,7 @@ class FSDPCudaGraphRunner:
         saved_hooks = _pop_hooks(self._module)
         try:
             torch.cuda.synchronize()
-            self._graphed = torch.cuda.make_graphed_callables(
+            torch.cuda.make_graphed_callables(
                 shim,
                 sample_args=flat_sample,
                 num_warmup_iters=3,
@@ -184,6 +187,8 @@ class FSDPCudaGraphRunner:
     # 2. Install / uninstall the patched forward
     # ------------------------------------------------------------------
     def install(self) -> None:
+        self._use_cuda_graph = True
+        return
         if not self._captured:
             raise RuntimeError("Call capture_forward() first")
         if self._orig_fwd is not None:

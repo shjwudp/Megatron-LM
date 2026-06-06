@@ -134,7 +134,6 @@ class _FSDPRootContext:
     ``backward_phase`` is set to ``False`` when this becomes ``True``."""
 
     cuda_graph_active: bool = False
-    cuda_graph_active: bool = False
     """True when FSDP is inside CUDA graph capture (via FSDPCudaGraphRunner).
     Suppresses side-stream vs default-stream mismatches and defers reshard.
     Only needed during capture, not replay."""
@@ -206,6 +205,29 @@ class FSDPModule:
         if ctx.bucket_allocator.phase != "optimized":
             return False
         return True
+
+    def enable_cuda_graph(self) -> None:
+        """Enable CUDA graph capture for this FSDP module.
+
+        Must be called while the module is resharded (before the first
+        forward pass).  This method:
+
+        1. Creates a side ``torch.cuda.Stream`` and installs it as the
+           **global default stream** via ``torch.cuda.set_stream()``.
+           This isolates all subsequent kernel launches from the original
+           default stream's history, which is required for CUDA graph
+           capture/replay to succeed.
+        2. Sets the ``enable_cuda_graph`` flag on the FSDP state so the
+           forward pre-hook will trigger graph capture on the next forward.
+
+        Usage::
+
+            fully_shard(layer, mesh=mesh)
+            layer.enable_cuda_graph()   # call before first forward
+        """
+        self._fsdp_state.enable_cuda_graph = True
+        self._cuda_graph_stream = torch.cuda.Stream()
+        torch.cuda.set_stream(self._cuda_graph_stream)
 
     def _init_named_param_groups(
         self,
@@ -418,7 +440,6 @@ class FSDPModule:
             module_idx += 1
 
         if enable_cuda_graph:
-            self._fsdp_state.enable_cuda_graph = enable_cuda_graph
             if len(forward_order) > 1:
                 child_names = [name for name, m in named_forward_modules if m is not self]
                 raise RuntimeError(
@@ -428,6 +449,7 @@ class FSDPModule:
                     f"has FSDP children: {child_names}. "
                     f"Only leaf FSDP modules (no FSDP children) can use CUDA graph capture."
                 )
+            self.enable_cuda_graph()
 
     def unshard(self, async_op: bool = False, bwd_pass: bool = False):
         """
