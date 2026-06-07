@@ -49,7 +49,10 @@ class _ForwardShim(torch.nn.Module):
     order."""
 
     def __init__(
-        self, module: torch.nn.Module, tensor_param_names: List[str], frozen_kwargs: dict
+        self,
+        module: torch.nn.Module,
+        tensor_param_names: List[str],
+        frozen_kwargs: dict,
     ):
         super().__init__()
         self.module = module
@@ -64,20 +67,33 @@ class _ForwardShim(torch.nn.Module):
 
 def _pop_hooks(module: torch.nn.Module) -> Dict[str, Any]:
     """Remove all hooks from *module* (non-recursive) and return a snapshot."""
-    saved: Dict[str, Any] = {
-        "_forward_pre_hooks": module._forward_pre_hooks,
-        "_forward_hooks": module._forward_hooks,
-        "_backward_hooks": module._backward_hooks,
-        "_state_dict_hooks": module._state_dict_hooks,
-        "_load_state_dict_pre_hooks": module._load_state_dict_pre_hooks,
-    }
-    if hasattr(module, "_backward_pre_hooks"):
-        saved["_backward_pre_hooks"] = module._backward_pre_hooks
 
-    for name, value in saved.items():
-        if value is not None:
-            setattr(module, name, OrderedDict())
+    def _pop_one(m: torch.nn.Module) -> Dict[str, Any]:
+        saved: Dict[str, Any] = {
+            "_forward_pre_hooks": m._forward_pre_hooks,
+            "_forward_hooks": m._forward_hooks,
+            "_backward_hooks": m._backward_hooks,
+            "_state_dict_hooks": m._state_dict_hooks,
+            "_load_state_dict_pre_hooks": m._load_state_dict_pre_hooks,
+        }
+        if hasattr(m, "_backward_pre_hooks"):
+            saved["_backward_pre_hooks"] = m._backward_pre_hooks
+        for name, value in saved.items():
+            if value is not None:
+                setattr(m, name, OrderedDict())
+        return saved
 
+    return _pop_one(module)
+
+
+def _pop_hooks_recursive(module: torch.nn.Module) -> Dict[int, Dict[str, Any]]:
+    """Remove all hooks from *module* and all its submodules recursively.
+
+    Returns a dict mapping ``id(submodule) → saved_hooks`` for restore.
+    """
+    saved: Dict[int, Dict[str, Any]] = {}
+    for submodule in module.modules():
+        saved[id(submodule)] = _pop_hooks(submodule)
     return saved
 
 
@@ -88,9 +104,20 @@ def _restore_hooks(module: torch.nn.Module, saved: Dict[str, Any]) -> None:
             setattr(module, name, value)
 
 
+def _restore_hooks_recursive(
+    module: torch.nn.Module, saved: Dict[int, Dict[str, Any]]
+) -> None:
+    """Restore hooks for all submodules saved by ``_pop_hooks_recursive``."""
+    for submodule in module.modules():
+        sub_saved = saved.get(id(submodule))
+        if sub_saved is not None:
+            _restore_hooks(submodule, sub_saved)
+
+
 # ------------------------------------------------------------------
 # Runner
 # ------------------------------------------------------------------
+
 
 class FSDPCudaGraphRunner:
     """Captures a forward+bacwkard CUDA graph for one FSDP module.
@@ -148,8 +175,12 @@ class FSDPCudaGraphRunner:
         tensor_names = [
             n for n in param_names if n in bound and isinstance(bound[n], torch.Tensor)
         ]
-        frozen_kwargs = {n: v for n, v in bound.items() if not isinstance(v, torch.Tensor)}
-        flat_sample = tuple(bound[n].clone().detach().requires_grad_(True) for n in tensor_names)
+        frozen_kwargs = {
+            n: v for n, v in bound.items() if not isinstance(v, torch.Tensor)
+        }
+        flat_sample = tuple(
+            bound[n].clone().detach().requires_grad_(True) for n in tensor_names
+        )
 
         # Build shim
         shim = _ForwardShim(self._module, tensor_names, frozen_kwargs)
@@ -157,21 +188,25 @@ class FSDPCudaGraphRunner:
         for param in self._module.parameters():
             param.grad = None
 
+        self.unshard_main_grad_buffer()
+
         # Disable side-stream collectives during capture so every CUDA
         # operation lands on the default (capture) stream.
-        saved_hooks = _pop_hooks(self._module)
+        saved_hooks = _pop_hooks_recursive(self._module)
+        ctx = self._module._fsdp_root_context
+        ctx.cuda_graph_active = True
         try:
             torch.cuda.synchronize()
             # Gradient accumulation fusion
-            self.unshard_main_grad_buffer()
             self._graphed = torch.cuda.make_graphed_callables(
                 shim,
                 sample_args=flat_sample,
                 num_warmup_iters=3,
             )
-            self.reshard_main_grad_buffer()
         finally:
-            _restore_hooks(self._module, saved_hooks)
+            ctx.cuda_graph_active = False
+            _restore_hooks_recursive(self._module, saved_hooks)
+            self.reshard_main_grad_buffer()
 
         self._tensor_param_names = tensor_names
         self._frozen_kwargs = frozen_kwargs
@@ -237,10 +272,9 @@ class FSDPCudaGraphRunner:
         """Unshard the main grad buffer for all param groups."""
         for group in self._module._fsdp_param_groups:
             if hasattr(group, "main_grad_buffer"):
-                group.main_grad_buffer.unshard()
+                group.main_grad_buffer.unshard(bind_params=False)
 
     def reshard_main_grad_buffer(self):
         """Reshard the main grad buffer for all param groups."""
         for group in self._module._fsdp_param_groups:
             group.release_grad_buffer()
-

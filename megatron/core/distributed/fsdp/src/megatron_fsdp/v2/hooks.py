@@ -36,6 +36,9 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule):
 
     def unshard_param_groups(fsdp_module, args, kwargs):
         ctx = fsdp_module._fsdp_root_context
+        assert not ctx.cuda_graph_active, (
+            "hooks must not fire during CUDA graph capture"
+        )
         if ctx.backward_phase:
             fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
         fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
@@ -44,12 +47,22 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule):
         if (
             fsdp_module._fsdp_state.enable_cuda_graph
             and (not hasattr(fsdp_module, "_fsdp_cg_runner"))
+            and not ctx.backward_phase
             and fsdp_module.cuda_graph_compatible
         ):
+            print(
+                f"Capturing CUDA graph for module {fsdp_module._fsdp_module_name} (id={id(fsdp_module)})",
+                ctx.backward_phase,
+            )
             cg_runner = FSDPCudaGraphRunner(fsdp_module)
             cg_runner.capture_forward(*args, **kwargs)
             cg_runner.install()
             fsdp_module._fsdp_cg_runner = cg_runner
+
+            print(
+                f"Captured CUDA graph for module {fsdp_module._fsdp_module_name} (id={id(fsdp_module)})",
+                ctx.backward_phase,
+            )
 
     return fsdp_module.register_forward_pre_hook(
         unshard_param_groups, prepend=True, with_kwargs=True
@@ -65,6 +78,9 @@ def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
 
     def root_forward_pre_hook(_hook_module, args):
         ctx = fsdp_module._fsdp_root_context
+        assert not ctx.cuda_graph_active, (
+            "hooks must not fire during CUDA graph capture"
+        )
         if not fsdp_module._fsdp_state._is_root:
             return
         if ctx.enable_cuda_graph and ctx.cuda_graph_stream is None:
@@ -95,6 +111,9 @@ def _register_forward_hook(module: FSDPModule):
 
     def reshard_param_groups(module, *unused):
         ctx = module._fsdp_root_context
+        assert not ctx.cuda_graph_active, (
+            "hooks must not fire during CUDA graph capture"
+        )
         if ctx.backward_phase and id(module) == ctx.backward_module:
             return
         module.reshard()
@@ -117,6 +136,9 @@ def _register_backward_pre_hook(module: FSDPModule):
 
         @torch.compiler.disable
         def forward_hook(_module, inputs, output):
+            assert not _module._fsdp_root_context.cuda_graph_active, (
+                "hooks must not fire during CUDA graph capture"
+            )
             # View-as to avoid output being the same tensor object
             output = tree_map(
                 lambda t: t.view_as(t) if torch.is_tensor(t) else t, output
@@ -143,6 +165,9 @@ def _register_backward_pre_hook(module: FSDPModule):
     def pre_backward_hook(module: FSDPModule, grads):
         """Hook called before backward pass for this module."""
         ctx = module._fsdp_root_context
+        assert not ctx.cuda_graph_active, (
+            "hooks must not fire during CUDA graph capture"
+        )
         if module._fsdp_state._is_root:
             ctx.backward_done_modules.clear()
             ctx.forward_phase = False
@@ -187,6 +212,9 @@ def _register_backward_hook(module: FSDPModule):
     def post_backward(module: FSDPModule):
         """Hook called after backward pass for this module."""
         ctx = module._fsdp_root_context
+        assert not ctx.cuda_graph_active, (
+            "hooks must not fire during CUDA graph capture"
+        )
         ctx.backward_done_modules.add(id(module))
         ctx._advance_backward_module()
         module.reshard()
@@ -211,6 +239,9 @@ def _register_backward_hook(module: FSDPModule):
         input tensors in an autograd Function. The Function's backward
         calls the post_backward_hook after gradients are computed.
         """
+        assert not module._fsdp_root_context.cuda_graph_active, (
+            "hooks must not fire during CUDA graph capture"
+        )
         if not torch.is_grad_enabled():
             return args, kwargs
 
@@ -268,6 +299,9 @@ def _register_post_backward_final_callback(
     def _post_backward_final_callback(root_state: _FSDPState, root_module: nn.Module):
         """Final callback: reshard all modules and reduce gradients."""
         ctx = root_module._fsdp_root_context
+        assert not ctx.cuda_graph_active, (
+            "hooks must not fire during CUDA graph capture"
+        )
         stream = ctx.rs_stream
         for module in reversed(ctx.forward_order):
             if getattr(module, "post_backward_issued", False):
