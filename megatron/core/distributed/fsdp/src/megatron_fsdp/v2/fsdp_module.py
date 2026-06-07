@@ -614,6 +614,14 @@ class FSDPModule:
                 if grad_added or recorded:
                     if param.grad is not None:
                         del param.grad
+                    # Record TE wgrad-fusion flags for CUDA graph restore.
+                    # The trace backward ran eagerly, so TE set
+                    # grad_added_to_main_grad on each param it wrote to.
+                    # Under CUDA graph replay only the GPU kernel runs;
+                    # we record the flags here and restore them in
+                    # the CG replay backward.
+                    if grad_added and self._fsdp_state.enable_cuda_graph:
+                        setattr(param, "_mfsdp_recorded_te_wgrad", True)
                 elif param.grad is None:
                     main_grad = param.get_main_grad()
                     param_main_grad = getattr(param, "main_grad", None)

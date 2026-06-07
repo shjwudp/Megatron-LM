@@ -382,18 +382,6 @@ def _register_post_backward_final_callback(
                             f"module_id={id(m)}, module_name={m._fsdp_module_name}"
                         )
                 bucket_alloc.plan()
-                # Record TE wgrad-fusion flags for CUDA graph restore.
-                # The trace backward ran eagerly, so TE set
-                # grad_added_to_main_grad on each param it wrote to.
-                # Under CUDA graph replay only the GPU kernel runs;
-                # we record the flags here and restore them in
-                # pre_backward_hook before the next backward.
-                for m in ctx.forward_order:
-                    if getattr(m, "_fsdp_cg_runner", None) is not None:
-                        for _, pg in m._named_param_groups:
-                            for p in pg.params:
-                                recorded = getattr(p, "grad_added_to_main_grad", False)
-                                setattr(p, "_mfsdp_recorded_te_wgrad", recorded)
             elif bucket_alloc.phase != "optimized":
                 raise ValueError(
                     f"Unexpected bucket allocator phase: {bucket_alloc.phase}"

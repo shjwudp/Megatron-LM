@@ -370,12 +370,20 @@ gradients directly into ``param.main_grad``, it sets the Python-side
 ``main_grad``.  Under CUDA graph replay, TE's GPU kernel still runs but the
 ``setattr`` is not part of the graph.
 
-**Fix**: After MB 0's trace backward (which ran eagerly), we record each
-param's ``grad_added_to_main_grad`` value as
-``param._mfsdp_recorded_te_wgrad``.  On every subsequent
-``pre_backward_hook``, CUDA-graphed modules restore the recorded value
-instead of resetting to ``False``.  All other modules continue to use the
-eager path (TE sets the flag live).
+**Fix**: Recording and consume live together in ``reduce_grad()``.  On the
+first call (trace micro-batch, eager backward), if TE set the flag, we
+persist it as ``param._mfsdp_recorded_te_wgrad = True``.  On all subsequent
+calls, ``reduce_grad`` checks both the live flag (eager path) and the
+recorded flag (CUDA graph replay path).  ``pre_backward_hook`` restores
+the recorded value before each backward pass.
+
+```
+reduce_grad():
+  if grad_added_to_main_grad or _mfsdp_recorded_te_wgrad:
+      discard .grad                           # TE already populated main_grad
+      if grad_added and enable_cuda_graph:
+          _mfsdp_recorded_te_wgrad = True     # persist for future replays
+```
 
 ## Visual
 
@@ -444,8 +452,11 @@ Micro-batch 0 (trace)
 │    handle modules with post_backward_issued=False (activation ckpt)        │
 │    drain async reduce-grad events                                          │
 │    plan() → "optimized"                                                    │
-│    record: param._mfsdp_recorded_te_wgrad ← grad_added_to_main_grad       │
-│    (TE flags set by eager backward; needed for CUDA graph restore)         │
+│                                                                           │
+│    reduce_grad (per-module, inside post_backward):                         │
+│      if grad_added_to_main_grad (TE set it eagerly):                       │
+│        discard .grad; param._mfsdp_recorded_te_wgrad ← True               │
+│        (recorded for CUDA graph replays where setattr doesn't fire)        │
 └───────────────────────────────────────────────────────────────────────────┘
 
 Micro-batch 1+ (optimized)
