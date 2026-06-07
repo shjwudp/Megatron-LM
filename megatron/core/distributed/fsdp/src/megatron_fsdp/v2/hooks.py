@@ -204,6 +204,15 @@ def _register_backward_pre_hook(module: FSDPModule):
         setattr(module, "post_backward_issued", False)
 
         # ---- Transformer Engine gradient-accumulation fusion ---------------
+        #
+        # In the eager (trace) backward, TE sets
+        # ``grad_added_to_main_grad = True`` on each param whose weight
+        # gradient it writes directly to ``main_grad``.  Under CUDA graph
+        # replay the GPU kernel still runs, but the Python-side
+        # ``setattr`` is not part of the graph.  We recorded the per-param
+        # flag after the trace backward (see ``_post_backward_final_callback``)
+        # and restore it here so that ``reduce_grad`` knows TE already
+        # populated ``main_grad``.
         for param_group in module._fsdp_param_groups:
             for param in param_group.params:
                 setattr(param, "grad_added_to_main_grad", False)
@@ -311,23 +320,32 @@ def _register_post_backward_final_callback(
     state: _FSDPState, module: nn.Module
 ) -> None:
     """
-    Register the final callback that runs after all backward passes complete.
+    Enqueue a *single* engine callback that fires after every module's
+    backward pass has completed.
 
-    This is only registered by the root FSDP module to avoid duplicate
-    callbacks. It reshards all modules and reduces gradients at the end
-    of the backward pass.
+    Registered once by the root FSDP module (avoids duplicates).
+    The callback:
+    - Reshards and reduces gradients for any module whose per-module
+      post-backward hook was silently skipped (e.g. activation
+      recomputation).
+    - Waits for all async reduce-grad operations to finish.
+    - Resets root / context state for the next micro-batch.
+    - On the first call (trace → optimized transition): builds the
+      pool plan and records TE wgrad-fusion flags for CUDA graph restore.
     """
     assert state._is_root, "Only root FSDP should register post-backward callback"
     if state._post_backward_callback_queued:
         return
 
     def _post_backward_final_callback(root_state: _FSDPState, root_module: nn.Module):
-        """Final callback: reshard all modules and reduce gradients."""
+        """Engine callback — the last thing autograd runs after the backward
+        pass of every micro-batch."""
         ctx = root_module._fsdp_root_context
         assert not ctx.cuda_graph_active, (
             "hooks must not fire during CUDA graph capture"
         )
-        stream = ctx.rs_stream
+
+        # ---- handle modules whose per-module post-backward was skipped ----
         for module in reversed(ctx.forward_order):
             if getattr(module, "post_backward_issued", False):
                 continue
@@ -337,19 +355,23 @@ def _register_post_backward_final_callback(
                 for param_group in module._fsdp_param_groups
             ):
                 module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+
+        # ---- drain pending async reduce-grad events -----------------------
+        stream = ctx.rs_stream
         for buckets in ctx.reduce_grad_buckets.values():
             while len(buckets) > 0:
                 event, param_group = buckets.pop()
                 event.wait()
                 param_group.release_grad_buffer()
         torch.cuda.current_stream().wait_stream(stream)
+
+        # ---- reset root / context state for the next micro-batch ----------
         root_state._post_backward_callback_queued = False
         ctx.backward_phase = False
         ctx.backward_module = None
         ctx.backward_done_modules.clear()
 
-        # After the first backward pass, we have the full trace of bucket allocations
-        # and releases. We can now plan the memory pool based on this trace.
+        # ---- trace → optimized transition (first micro-batch only) --------
         if isinstance(ctx.bucket_allocator, TracePoolAllocator):
             bucket_alloc = ctx.bucket_allocator
             if bucket_alloc.phase == "trace":
@@ -360,6 +382,18 @@ def _register_post_backward_final_callback(
                             f"module_id={id(m)}, module_name={m._fsdp_module_name}"
                         )
                 bucket_alloc.plan()
+                # Record TE wgrad-fusion flags for CUDA graph restore.
+                # The trace backward ran eagerly, so TE set
+                # grad_added_to_main_grad on each param it wrote to.
+                # Under CUDA graph replay only the GPU kernel runs;
+                # we record the flags here and restore them in
+                # pre_backward_hook before the next backward.
+                for m in ctx.forward_order:
+                    if getattr(m, "_fsdp_cg_runner", None) is not None:
+                        for _, pg in m._named_param_groups:
+                            for p in pg.params:
+                                recorded = getattr(p, "grad_added_to_main_grad", False)
+                                setattr(p, "_mfsdp_recorded_te_wgrad", recorded)
             elif bucket_alloc.phase != "optimized":
                 raise ValueError(
                     f"Unexpected bucket allocator phase: {bucket_alloc.phase}"

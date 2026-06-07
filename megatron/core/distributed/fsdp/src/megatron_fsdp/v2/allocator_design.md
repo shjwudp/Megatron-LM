@@ -362,6 +362,21 @@ tensor addresses.  Because the pool tensors are allocated **once** in
 ``plan()`` and never resized, the same ``key`` will always resolve to the
 same address — regardless of call ordering variations across micro-batches.
 
+### TE wgrad fusion under CUDA graph
+
+When Transformer Engine's gradient-accumulation fusion writes weight
+gradients directly into ``param.main_grad``, it sets the Python-side
+``grad_added_to_main_grad = True`` to tell FSDP not to overwrite
+``main_grad``.  Under CUDA graph replay, TE's GPU kernel still runs but the
+``setattr`` is not part of the graph.
+
+**Fix**: After MB 0's trace backward (which ran eagerly), we record each
+param's ``grad_added_to_main_grad`` value as
+``param._mfsdp_recorded_te_wgrad``.  On every subsequent
+``pre_backward_hook``, CUDA-graphed modules restore the recorded value
+instead of resetting to ``False``.  All other modules continue to use the
+eager path (TE sets the flag live).
+
 ## Visual
 
 ```
@@ -378,10 +393,10 @@ same address — regardless of call ordering variations across micro-batches.
                             │                     │
                             │ 1. Build intervals  │
                             │    from trace       │
-                            │ 2. Interval coloring│
-                            │    → slots          │
-                            │    (enforce same-   │
-                            │     key→same-slot)  │
+                             │ 2. Merge per-key     │
+                             │    intervals         │
+                             │ 3. Interval coloring │
+                             │    → slots           │
                             │ 3. Align & allocate │
                             │    pool tensors     │
                             │ 4. Build static     │
@@ -405,23 +420,35 @@ same address — regardless of call ordering variations across micro-batches.
 
 `_register_forward_pre_hook` is a single hook that serves all FSDP modules
 (root and non-root).  Root-only logic (phase flags, CUDA graph stream init)
-is gated by ``is_root``:
+is gated by ``is_root``.
 
 ```
-Micro-batch 0
+Micro-batch 0 (trace)
 ┌───────────────────────────────────────────────────────────────────────────┐
 │  forward_pre_hook (per-module)                                             │
 │    if is_root: forward_phase = True                                        │
 │    assert not cuda_graph_active                                            │
 │    unshard params → _trace_allocate(); forward (trace)                     │
 │                                                                           │
-│  root pre-backward    forward_phase = False , backward_phase = True        │
-│    unshard (bwd) → _trace_allocate(); backward (trace)                     │
-│  root post-backward   backward_phase = False                               │
-│                       plan() → "optimized"                                 │
+│  pre_backward_hook (per-module, reverse order)                             │
+│    if is_root: switch to backward phase, enqueue final callback            │
+│    assert not cuda_graph_active                                            │
+│    unshard (bwd) → _trace_allocate()                                       │
+│    reset: post_backward_issued=False, grad_added_to_main_grad=False        │
+│    TE wgrad groups: overwrite_main_grad=True                               │
+│    backward (trace, eager) → TE sets grad_added_to_main_grad               │
+│                                                                           │
+│  post_backward (per-module): reshard, reduce_grad, post_backward_issued   │
+│                                                                           │
+│  _post_backward_final_callback                                             │
+│    handle modules with post_backward_issued=False (activation ckpt)        │
+│    drain async reduce-grad events                                          │
+│    plan() → "optimized"                                                    │
+│    record: param._mfsdp_recorded_te_wgrad ← grad_added_to_main_grad       │
+│    (TE flags set by eager backward; needed for CUDA graph restore)         │
 └───────────────────────────────────────────────────────────────────────────┘
 
-Micro-batch 1+
+Micro-batch 1+ (optimized)
 ┌───────────────────────────────────────────────────────────────────────────┐
 │  forward_pre_hook (per-module)                                             │
 │    if is_root: forward_phase = True                                        │
@@ -433,9 +460,21 @@ Micro-batch 1+
 │         runs warmup+capture, restores hooks, clears flag)                  │
 │    forward (optimized, graph replays if captured)                          │
 │                                                                           │
-│  root pre-backward    forward_phase = False , backward_phase = True        │
-│    unshard (bwd) → allocate() → key→slot; backward (optimized)            │
-│  root post-backward   backward_phase = False                               │
+│  pre_backward_hook (per-module, reverse order)                             │
+│    if is_root: switch to backward phase, enqueue final callback            │
+│    assert not cuda_graph_active                                            │
+│    unshard (bwd) → allocate() → key→slot                                   │
+│    reset: post_backward_issued=False                                       │
+│    grad_added_to_main_grad ← _mfsdp_recorded_te_wgrad  (CUDA graph)       │
+│    TE wgrad groups: overwrite_main_grad=True                               │
+│    backward (optimized, graph replays if captured)                         │
+│                                                                           │
+│  post_backward (per-module): reshard, reduce_grad, post_backward_issued   │
+│                                                                           │
+│  _post_backward_final_callback                                             │
+│    handle modules with post_backward_issued=False                          │
+│    drain async reduce-grad events                                          │
+│    reset context state for next micro-batch                                │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 

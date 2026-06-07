@@ -603,8 +603,15 @@ class FSDPModule:
             # kernel writes directly into main_grad (weight.main_grad = get_main_grad() in
             # layers.py) and sets grad_added_to_main_grad=True. In that case we must NOT
             # zero or overwrite main_grad; discard the dummy .grad tensor if present.
+            #
+            # Under CUDA graph replay, TE's pure-GPU backward kernel still runs, but
+            # the Python-side ``setattr(param, "grad_added_to_main_grad", True)`` that
+            # accompanies the eager backward is captured away.  We record the per-param
+            # flag during the trace micro-batch and restore it here.
             for name, param in zip(param_names, param_group.params):
-                if getattr(param, "grad_added_to_main_grad", False):
+                grad_added = getattr(param, "grad_added_to_main_grad", False)
+                recorded = getattr(param, "_mfsdp_recorded_te_wgrad", False)
+                if grad_added or recorded:
                     if param.grad is not None:
                         del param.grad
                 elif param.grad is None:
