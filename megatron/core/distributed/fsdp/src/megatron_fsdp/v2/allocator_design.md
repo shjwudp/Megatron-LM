@@ -54,27 +54,22 @@ or duplicated relative to the trace.
 ## Design goal
 
 > Keep `TracePoolAllocator` as a single class. Replace the seq-driven replay
-> schedule (`_seq_ops`) with a **per-key ordered slot plan** (`_key_to_slots`).
-> Each `alloc_key` maps to an ordered list of slot indices — one per interval
-> in the trace — served via a per-key cursor that resets each micro-batch.
-> The cursor ensures the forward-pass slot (`slots[0]`) is always reused,
-> giving stable CUDA graph addresses.  Later intervals that cannot reuse the
-> forward slot (occupied by another key's later interval) get new slots.
+> schedule (`_seq_ops`) with a **static key→slot plan** (`_key_to_slot`).
+> Each key maps to exactly one slot, giving one fixed memory address —
+> derived once from the trace.  Per-key intervals are merged into a
+> single time range during ``plan()`` so every key gets exactly one slot.
 
-## Approach: `plan()` builds a per-key ordered slot list
+## Approach: `plan()` builds a static key→slot mapping
 
 Instead of using the trace as a replay script, use it as **input data for
 memory planning**. The trace tells us which allocations overlap in time.
-`plan()` runs a greedy interval-coloring algorithm to build a per-key
-ordered slot list. Runtime serves slots via a per-key cursor:
+Per-key intervals are merged into a single time range, then colored with
+greedy left-edge. Runtime is just a dict lookup:
 
 ```python
 def allocate(key, ...):
-    slots = _key_to_slots[key]                    # dict lookup, O(1)
-    cursor = _key_cursor[key]                     # per-key position
-    _key_cursor[key] = cursor + 1                 # advance for next interval
-    slot_idx = slots[cursor]
-    return pool[slot_idx.offset : slot_idx.offset + size]  # stable address
+    slot = _key_to_slot[key]                     # dict lookup, O(1)
+    return pool[slot.offset : slot.offset + size]  # always same address
 ```
 
 No `_seq` counter. No `_seq_ops` schedule. No dependency on call order.
@@ -85,11 +80,11 @@ address stability.
 
 | Stays unchanged | Changes | Removed |
 |---|---|---|
-| Trace phase (`_trace_allocate`, `_trace_free`, `_TraceEvent`) | `plan()` builds `_key_to_slots` instead of `_seq_ops` | `_seq`, `_seq_ops` |
+| Trace phase (`_trace_allocate`, `_trace_free`, `_TraceEvent`) | `plan()` builds `_key_to_slot` instead of `_seq_ops` | `_seq`, `_seq_ops` |
 | Interval construction from alloc/free pairs | `allocate()` / `free()` dispatch to key→slot lookup instead of seq walk | `_pool_allocate`, `_pool_free` |
 | Per-(dtype, device) pool tensors | `enable_flexible_mode` / `disable_flexible_mode` not needed | `_flexible`, `_flex_key_to_slot` |
 | `Bucket` dataclass, `BucketAllocator` interface | `_phase` transitions: `"trace"` → `"optimized"` (no intermediate `"plan"` phase held) | `snapshot_slots`, `restore_slots` |
-| `_key_to_slots: Dict[alloc_key, List[slot_idx]]` | | `reset_cursor()` |
+| `_key_to_slot: Dict[alloc_key, slot_idx]` | | `reset_cursor()` |
 
 ### Why flexible mode is removed
 
@@ -98,8 +93,7 @@ key→slot lookup for auxiliary allocations between micro-batches (e.g. weight
 quantisation). In v3, **every** `allocate()` is already a key→slot lookup — the
 flexible-mode path is the **default** path. A separate toggle is unnecessary.
 
-Between micro-batches, `reset_batch()` clears `in_use` and `_active_keys` but
-preserves `_key_to_slots` and `_pools`. An auxiliary `allocate(quant_key)` will
+Between micro-batches, the allocator is idle. An auxiliary `allocate(quant_key)` will
 find the slot free → works exactly as before.
 
 ## `plan()` — the core method
@@ -112,58 +106,37 @@ def plan(self) -> int:
     2. Group intervals by (dtype, device), color each group with
        greedy left-edge algorithm.
     3. Allocate one flat pool tensor per group.
-    4. Build _key_to_slots: every alloc_key → ordered list of slot indices.
+    4. Build _key_to_slot: every alloc_key → exactly one slot_idx.
     """
 ```
 
-### The coloring algorithm (with same-key→same-slot enforcement)
+### The coloring algorithm
 
-The left-edge algorithm must enforce that **the same key always maps to
-exactly one slot**, even when the key produces multiple non-overlapping
-intervals. This is NOT a post-hoc validation — it is enforced **during**
-coloring.
+Per-key intervals are merged into a single time range before coloring,
+so each key appears exactly once — plain left-edge, no same-key
+enforcement needed:
 
 ```python
 def _color_group(intervals, dtype, device) -> int:
     sorted_intervals = sorted(intervals, key=lambda iv: iv.alloc_seq)
+
     free_slots = []           # (local_slot_idx, free_seq)
     group_slots = []          # Slot objects for this group
     local_to_global = {}      # local → global slot index
-    key_to_slot = {}          # key → assigned global slot_idx (algo-internal)
 
     for iv in sorted_intervals:
-        # ── same-key constraint: force reuse of the key's assigned slot ──
-        assigned_global = key_to_slot.get(iv.key)
-        if assigned_global is not None:
-            # Find the local slot corresponding to this global index
-            assigned_local = ... # lookup from local_to_global
-            # The slot must be free at this interval's start
-            assert assigned_local is free at iv.alloc_seq, (
-                f"key {iv.key} has overlapping intervals — this should be "
-                f"impossible in FSDP (same key never alloc'd twice without free)"
-            )
-            # Resize if this interval needs more capacity
-            if iv.size > group_slots[assigned_local].size:
-                group_slots[assigned_local].size = iv.size
-            # Update free time of this slot to this interval's free_seq
-            update_free_slots(free_slots, assigned_local, iv.free_seq)
-            # Skip the allocation pool scan; slot is already reserved
-            continue
-
-        # ── normal left-edge: reuse an existing free slot, or create new ──
+        # ── left-edge: reuse an existing free slot, or create new ──
         assigned_local = None
         for local_idx, slot_free_seq in free_slots:
             if slot_free_seq < iv.alloc_seq:
                 slot = group_slots[local_idx]
                 if iv.size > slot.size:
                     slot.size = iv.size
-                # Update this slot's free time to this interval's end
                 free_slots[...] = (local_idx, iv.free_seq)
                 assigned_local = local_idx
                 break
 
         if assigned_local is None:
-            # Need a new slot
             assigned_local = len(group_slots)
             global_idx = len(self._slots)
             local_to_global[assigned_local] = global_idx
@@ -171,17 +144,14 @@ def _color_group(intervals, dtype, device) -> int:
             group_slots.append(slot)
             self._slots.append(slot)
             free_slots.append((assigned_local, iv.free_seq))
+        else:
+            global_idx = local_to_global[assigned_local]
 
-        # Record key→slot assignment (first-seen wins; subsequent hits the
-        # same-key constraint branch above)
-        global_idx = local_to_global.get(assigned_local,
-                       key_to_slot.get(iv.key))
-        key_to_slot[iv.key] = global_idx
-        # No _seq_ops entry; slot assignment is stored later in self._key_to_slot
+        self._key_to_slot[iv.key] = global_idx
 
     # Lay out slots contiguously with alignment
     offset = 0
-    alignment = _get_alignment(device, dtype)  # see §Memory alignment
+    alignment = _get_alignment(device, dtype)
     for slot in group_slots:
         offset = (offset + alignment - 1) // alignment * alignment
         slot.offset = offset
@@ -189,9 +159,6 @@ def _color_group(intervals, dtype, device) -> int:
 
     if offset > 0:
         self._pools[(dtype, device)] = torch.empty(offset, dtype=dtype, device=device)
-
-    for key, global_idx in key_to_slot.items():
-        self._key_to_slot[key] = global_idx
 
     return offset
 ```
@@ -217,9 +184,8 @@ def _get_alignment(device, dtype):
 
 ### Coloring algorithm — known limitations and future improvements
 
-The current greedy left-edge algorithm with same-key→same-slot enforcement
-meets the basic requirements but has room for improvement. Items to review
-and discuss:
+The current greedy left-edge algorithm with per-key interval merging
+meets the basic requirements but has room for improvement:
 
 1. **Per-group isolation**: Coloring runs independently per `(dtype, device)`
    group. Groups on the same device could share a single pool with a unified
@@ -227,26 +193,19 @@ and discuss:
    different element sizes in the same pool (offset arithmetic must account
    for dtype-specific strides).
 
-2. **Sub-optimal slot reuse**: When a multi-interval key forces slot reuse,
-   the coloring for unrelated intervals is impacted — the forced slot may
-   spend more time "occupied" (because the key's first interval starts early
-   and its last interval ends late), preventing reuse by other keys that
-   could fit between the key's intervals. The current algorithm pins a slot
-   to a key for its entire traced lifetime, which is correct for correctness
-   but may over-reserve.
+2. **Merged range over-estimates active time**: Merging all of a key's
+   intervals into a single range (first alloc → last free) may prevent
+   other keys from reusing a slot during gaps between the key's intervals.
+   For FSDP forward/backward patterns, these gaps are typically small
+   (consecutive passes), so the overhead is minimal in practice.
 
 3. **Alternatives worth exploring**:
-   - **Minimum slot count via ILP**: The interval-graph coloring problem
-     (minimum chromatic number) has polynomial-time solutions that guarantee
-     optimality. This could reduce slot count at the cost of implementation
-     complexity.
+   - **Global (cross-group) coloring**: Run one coloring pass across all
+     ``(dtype, device)`` groups that share a device, reducing total pool
+     bytes.
    - **Slot merging pass**: After coloring, adjacent slots with compatible
      dtypes could be merged if their intervals never overlap and no alignment
      constraints are violated.
-   - **Profiling-guided sizing**: The trace gives exact `size` values, but
-     if sizes vary slightly across micro-batches (e.g. dynamic shapes), the
-     plan should either over-allocate conservatively or support a resizing
-     fallback.
    - **Size-class bucketing**: Group intervals by size class to reduce
      internal fragmentation when a small interval forces a large slot.
 
@@ -263,46 +222,30 @@ worth the complexity.
 
 ## Runtime: allocate / free / reset
 
+State is driven entirely by ``_optimized_allocate`` and ``_optimized_free``.
+No batched reset is needed — if every ``allocate`` is matched by a ``free``
+within the micro-batch, ``in_use`` flags and ``_active_keys`` are already
+correct by the end.
+
 ```python
 def allocate(key, size, dtype, device):
-    if key in _active_keys:
-        # Re-entrant: key already allocated this micro-batch — idempotent
-        slot_idx = _key_active_slot[key]
-        slot = _slots[slot_idx]
-        assert size <= slot.size
-        return Bucket(data=pool[slot.offset : slot.offset + size])
-
-    slots = _key_to_slots[key]           # raises KeyError if key never traced
-    cursor = _key_cursor[key]            # per-key position, reset to 0 each batch
-    slot_idx = slots[cursor]
-    _key_cursor[key] = cursor + 1        # advance for next interval
-
+    slot_idx = _key_to_slot[key]             # raises KeyError if key never traced
     slot = _slots[slot_idx]
     if slot.in_use and key not in _active_keys:
         raise RuntimeError("Slot collision")
     assert size <= slot.size
+    if key in _active_keys:
+        # Re-entrant: key already allocated this micro-batch — idempotent
+        return Bucket(data=pool[slot.offset : slot.offset + size])
     slot.in_use = True
     _active_keys.add(key)
-    _key_active_slot[key] = slot_idx     # remember which slot is held
     return Bucket(data=pool[slot.offset : slot.offset + size])
 
 def free(key):
     if key not in _active_keys:
         return  # double-free or never-allocated
-    slot_idx = _key_active_slot.pop(key, None)
-    if slot_idx is not None:
-        _slots[slot_idx].in_use = False
+    _slots[_key_to_slot[key]].in_use = False
     _active_keys.discard(key)
-
-def reset_batch():
-    """Between micro-batches: clear in_use flags, reset cursors to 0."""
-    assert _phase == "optimized"
-    for slot in _slots:
-        slot.in_use = False
-    _active_keys.clear()
-    _key_active_slot.clear()
-    for key in _key_to_slots:
-        _key_cursor[key] = 0
 
 def reset():
     """Full teardown: discard pool, plan, and trace."""
@@ -313,15 +256,13 @@ def reset():
     self._buckets.clear()
     self._active_keys.clear()
     self._pools.clear()
-    self._key_to_slots.clear()
-    self._key_cursor.clear()
-    self._key_active_slot.clear()
+    self._key_to_slot.clear()
     self._slots.clear()
 ```
 
 ### Error handling for unknown keys
 
-If `allocate(key)` is called with a key never seen during trace, `_key_to_slots`
+If `allocate(key)` is called with a key never seen during trace, `_key_to_slot`
 raises `KeyError`. The caller must re-trace (call `reset()`, re-run micro-batch
 0, then `plan()`) to pick up new allocation patterns. This guarantees that all
 keys used during CUDA graph replay were planned, keeping addresses stable.
@@ -338,16 +279,13 @@ The full lifecycle spanning trace, plan, capture, and replay:
                     │ Micro-batch 0 (trace)                    │
                     │ Phase: "trace"                           │
                     │                                          │
-                    │ Pre-forward:  _active_keys clear         │
-                    │ Forward:      alloc/free → _trace_*      │
-                    │               records; individual        │
-                    │               torch.empty tensors        │
-                    │               (NO CUDA graph — pool      │
-                    │                does not exist yet)       │
+                    │ forward_pre_hook (per-module):           │
+                    │   if is_root: forward_phase=True         │
+                    │   unshard → _trace_allocate              │
                     │ Backward:     alloc/free → _trace_*      │
                     │               records                    │
                     │ Post-backward: plan() builds             │
-                    │                _key_to_slots, allocates  │
+                    │                _key_to_slot, allocates   │
                     │                pool tensors              │
                     │                Phase → "optimized"       │
                     └──────────────────┬──────────────────────┘
@@ -359,23 +297,24 @@ The full lifecycle spanning trace, plan, capture, and replay:
     │ (capture)          │   │ (replay)            │   │ (replay)          │
     │ Phase: "optimized" │   │ Phase: "optimized"  │   │ Phase: "optimized"│
     │                    │   │                     │   │                   │
-    │ Pre-forward:       │   │ Pre-forward:        │   │ Pre-forward:      │
-    │   reset_batch()    │   │   reset_batch()     │   │   reset_batch()   │
+    │ forward_pre_hook   │   │ forward_pre_hook    │   │ forward_pre_hook  │
+    │ (per-module):      │   │ (per-module):       │   │ (per-module):     │
+    │   assert not       │   │   assert not        │   │   assert not      │
+    │   cuda_graph_active│   │   cuda_graph_active │   │   cuda_graph_active│
+    │   unshard→allocate │   │   unshard→allocate  │   │   unshard→allocate│
+    │     → key→slot     │   │     → key→slot      │   │     → key→slot    │
     │                    │   │                     │   │                   │
-    │ Per-module         │   │                     │   │                   │
-    │ pre-forward:       │   │   graphed() call    │   │   graphed() call  │
-    │   alloc param      │   │   (replay capture)  │   │   (replay capture)│
-    │     → key→slot     │   │                     │   │                   │
-    │   alloc main_grad  │   │   pool tensors      │   │   pool tensors    │
-    │     → key→slot     │   │   at SAME addr      │   │   at SAME addr    │
-    │                    │   │   as MB 1           │   │   as MB 1         │
-    │   make_graphed_    │   │                     │   │                   │
-    │   callables:       │   │                     │   │                   │
-    │   • 3 warmup iters │   │                     │   │                   │
-    │   • pop hooks      │   │                     │   │                   │
-    │   • capture fwd    │   │                     │   │                   │
-    │     into graph     │   │                     │   │                   │
-    │   • restore hooks  │   │                     │   │                   │
+    │   if not captured: │   │   graphed() call    │   │   graphed() call  │
+    │     capture_fwd(): │   │   (replay capture)  │   │   (replay capture)│
+    │     • pop hooks    │   │                     │   │                   │
+    │       (recursive)  │   │   pool tensors      │   │   pool tensors    │
+    │     • set cuda_    │   │   at SAME addr      │   │   at SAME addr    │
+    │       graph_active │   │   as MB 1           │   │   as MB 1         │
+    │     • warmup       │   │                     │   │                   │
+    │     • capture fwd  │   │                     │   │                   │
+    │     • clear flag   │   │                     │   │                   │
+    │     • restore hooks│   │                     │   │                   │
+    │     • install()    │   │                     │   │                   │
     │                    │   │                     │   │                   │
     │ Post-bwd hooks     │   │ Post-bwd hooks      │   │ Post-bwd hooks    │
     │   fire (eager)     │   │   fire              │   │   fire            │
@@ -388,8 +327,8 @@ The full lifecycle spanning trace, plan, capture, and replay:
 ### Per-module CUDA graph capture detail (MB 1)
 
 FSDP captures one CUDA graph per compatible leaf module (not the whole model).
-The capture is triggered in the module's forward pre-hook
-(`unshard_param_groups`):
+The capture is triggered inside the unified per-module forward pre-hook
+(``forward_pre_hook``, which also handles root-level phase init):
 
 1. **Pre-forward hook allocates param**: The hook calls
    `allocate(pg_id, "model_weight")` → key→slot lookup → pool view at fixed
@@ -400,28 +339,28 @@ The capture is triggered in the module's forward pre-hook
    is pre-allocated via `allocate(pg_id, "main_grad")` to ensure both forward
    and backward passes see fixed addresses.
 
-3. **Warmup**: `make_graphed_callables` runs 3 warmup iterations. Hooks fire
-   during warmup, so `allocate`/`free` calls happen normally. Key→slot returns
-   the same addresses every iteration — cuDNN/cuBLAS auto-tune settles,
-   TE FP8 scales converge.
+3. **Hooks popped recursively**: `_pop_hooks_recursive` removes all FSDP
+   hooks on the target module and every submodule. ``cuda_graph_active`` is
+   set to ``True`` so any stray hook that fires during this window asserts.
 
-4. **Actual capture**: `_pop_hooks` removes FSDP hooks → only the user's
-   `forward()` is captured as a CUDA graph. The graph records GPU kernels
-   reading/writing the pool tensor views at their fixed addresses (both param
-   and main_grad). Hooks are restored immediately after.
+4. **Warmup + capture**: `make_graphed_callables` runs 3 warmup iterations
+   (no hooks → raw forward only) + the actual graph capture. The graph
+   records GPU kernels reading/writing the pool views at their fixed addresses.
 
-5. **Replay**: The patched forward calls `graphed(*flat)`. Since the graph
+5. **Cleanup**: ``cuda_graph_active`` is cleared, hooks are restored
+   recursively, the patched forward is installed.
+
+6. **Replay**: The patched forward calls `graphed(*flat)`. Since the graph
    captured the fixed pool addresses, replay reads/writes the **same**
    addresses every time — no re-allocation, no address change.
 
 ### Key safety property
 
-During capture, both param and grad buffers are allocated from the pool at
-their planned slots before `make_graphed_callables` runs. The CUDA graph then
-records kernel operations against those specific memory addresses. Because the
-pool tensors are allocated **once** in `plan()` and never resized, the same
-`key` will always resolve to the same address — regardless of call ordering
-variations across micro-batches.
+During capture, ``cuda_graph_active`` is ``True`` and all hooks are popped
+(recursively).  The CUDA graph records kernel operations against the pool
+tensor addresses.  Because the pool tensors are allocated **once** in
+``plan()`` and never resized, the same ``key`` will always resolve to the
+same address — regardless of call ordering variations across micro-batches.
 
 ## Visual
 
@@ -464,33 +403,39 @@ variations across micro-batches.
 
 ## Hooks integration (updated for v3)
 
+`_register_forward_pre_hook` is a single hook that serves all FSDP modules
+(root and non-root).  Root-only logic (phase flags, CUDA graph stream init)
+is gated by ``is_root``:
+
 ```
 Micro-batch 0
 ┌───────────────────────────────────────────────────────────────────────────┐
-│  root pre-forward     forward_phase = True                                 │
-│    forward (trace)                                                         │
+│  forward_pre_hook (per-module)                                             │
+│    if is_root: forward_phase = True                                        │
+│    assert not cuda_graph_active                                            │
+│    unshard params → _trace_allocate(); forward (trace)                     │
+│                                                                           │
 │  root pre-backward    forward_phase = False , backward_phase = True        │
-│    backward (trace)                                                        │
+│    unshard (bwd) → _trace_allocate(); backward (trace)                     │
 │  root post-backward   backward_phase = False                               │
 │                       plan() → "optimized"                                 │
-│                       (no enable_flexible_mode needed)                     │
 └───────────────────────────────────────────────────────────────────────────┘
 
 Micro-batch 1+
 ┌───────────────────────────────────────────────────────────────────────────┐
-│  root pre-forward     forward_phase = True                                 │
-│                       reset_batch()          ← clears in_use               │
-│  per-module pre-forward:                                                   │
-│    allocate(param) → key→slot lookup                                       │
-│    allocate(main_grad) → key→slot lookup (manual, before capture)         │
-│    → if enable_cuda_graph and not yet captured:                            │
+│  forward_pre_hook (per-module)                                             │
+│    if is_root: forward_phase = True                                        │
+│    assert not cuda_graph_active                                            │
+│    unshard params → allocate() → key→slot                                  │
+│    → if enable_cuda_graph and not yet captured and not backward:           │
 │        FSDPCudaGraphRunner.capture_forward()                               │
-│    forward (optimized, key→slot lookup)                                    │
+│        (pops hooks recursively, sets cuda_graph_active,                    │
+│         runs warmup+capture, restores hooks, clears flag)                  │
+│    forward (optimized, graph replays if captured)                          │
+│                                                                           │
 │  root pre-backward    forward_phase = False , backward_phase = True        │
-│    backward (optimized, key→slot lookup)                                   │
+│    unshard (bwd) → allocate() → key→slot; backward (optimized)            │
 │  root post-backward   backward_phase = False                               │
-│                       (no enable_flexible_mode needed —                    │
-│                        between-batch allocs work natively)                 │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -535,9 +480,9 @@ def dump_trace(self) -> str:
 | Property | How it's achieved |
 |---|---|
 | Fixed address per key | Pool tensors allocated once in `plan()`, never resized. Each key maps to one slot at a fixed, aligned offset. `pool[offset:offset+size]` returns identical view every time. |
-| Memory efficiency | Left-edge interval coloring reuses slots for non-overlapping allocations. Same-key→same-slot enforcement shares a single slot across multiple non-overlapping intervals of the same key. |
-| CUDA graph compatible | Per-key slot list with cursor: `slots[0]` is always the forward-pass slot. `reset_batch()` resets all cursors to 0, guaranteeing the forward slot is reused every micro-batch. Later intervals get subsequent slots — consistent across batches. |
+| Memory efficiency | Left-edge interval coloring reuses slots for non-overlapping allocations. Per-key intervals are merged into a single time range before coloring, so each key gets exactly one slot — guaranteed stable address with minimal slot count. |
+| CUDA graph compatible | One key → one slot → one address. Per-key intervals merged into a single time range during ``plan()`` ensures each key gets exactly one dedicated slot at a fixed offset. |
 | No fragmentation within pool | Slots are laid out contiguously with alignment padding. No gaps between slots (only alignment-padding gaps). No dynamic allocation/deallocation — pool is a single `torch.empty`. |
-| Simple implementation | `allocate()` is a dict lookup + guard. `free()` is a flag clear. `reset_batch()` clears flags and active set. No seq walking, no fast-forward logic. |
+| Simple implementation | `allocate()` is a dict lookup + guard. `free()` is a flag clear. State is self-driving — no batch reset, no cursors, no seq walking. |
 | Same trace mechanism | Phase 1 (trace) is identical. Only the plan output and runtime dispatch change. |
 | Backward compatible for non-CUDA-graph users | The key→slot runtime also works for regular eager execution — it's strictly simpler than the seq-driven approach. |

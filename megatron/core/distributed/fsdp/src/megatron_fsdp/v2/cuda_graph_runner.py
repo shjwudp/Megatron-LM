@@ -188,6 +188,7 @@ class FSDPCudaGraphRunner:
         for param in self._module.parameters():
             param.grad = None
 
+        # For gradient accumulate fusion
         self.unshard_main_grad_buffer()
 
         # Disable side-stream collectives during capture so every CUDA
@@ -197,7 +198,6 @@ class FSDPCudaGraphRunner:
         ctx.cuda_graph_active = True
         try:
             torch.cuda.synchronize()
-            # Gradient accumulation fusion
             self._graphed = torch.cuda.make_graphed_callables(
                 shim,
                 sample_args=flat_sample,
@@ -207,6 +207,10 @@ class FSDPCudaGraphRunner:
             ctx.cuda_graph_active = False
             _restore_hooks_recursive(self._module, saved_hooks)
             self.reshard_main_grad_buffer()
+
+        test_out = self._graphed(*flat_sample)
+        ref_out = self._module.forward(*sample_args, **sample_kwargs)
+        assert torch.allclose(test_out, ref_out), "Graphed output does not match eager"
 
         self._tensor_param_names = tensor_names
         self._frozen_kwargs = frozen_kwargs

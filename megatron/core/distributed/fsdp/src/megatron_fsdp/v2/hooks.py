@@ -32,64 +32,58 @@ logger = logging.getLogger(__name__)
 
 
 def _register_forward_pre_hook(fsdp_module: FSDPModule):
-    """Register a pre-forward hook to unshard parameters for this FSDP unit."""
+    """Register a pre-forward hook on *fsdp_module*.
 
-    def unshard_param_groups(fsdp_module, args, kwargs):
+    Called before every ``forward()`` of the FSDP module — both in the
+    forward and backward (activation recomputation) passes.  Handles
+    root-level phase bookkeeping, parameter unshard, and CUDA graph
+    capture (once per compatible module).
+    """
+
+    def forward_pre_hook(fsdp_module, args, kwargs):
         ctx = fsdp_module._fsdp_root_context
         assert not ctx.cuda_graph_active, (
             "hooks must not fire during CUDA graph capture"
         )
+
+        # ---- root: forward-phase setup (once per micro-batch) --------------
+        if fsdp_module._fsdp_state._is_root:
+            if ctx.enable_cuda_graph and ctx.cuda_graph_stream is None:
+                ctx.cuda_graph_stream = torch.cuda.Stream()
+                torch.cuda.set_stream(ctx.cuda_graph_stream)
+            ctx.forward_phase = True
+            ctx.backward_phase = False
+
+        # ---- unshard parameters for this module ---------------------------
         if ctx.backward_phase:
             fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
         fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 
-        # If CUDA graph is enabled, let us try to capture the cuda graph.
+        # ---- CUDA graph capture (once per compatible module) --------------
         if (
             fsdp_module._fsdp_state.enable_cuda_graph
             and (not hasattr(fsdp_module, "_fsdp_cg_runner"))
             and not ctx.backward_phase
             and fsdp_module.cuda_graph_compatible
         ):
-            print(
-                f"Capturing CUDA graph for module {fsdp_module._fsdp_module_name} (id={id(fsdp_module)})",
-                ctx.backward_phase,
+            logger.debug(
+                "Capturing CUDA graph for module %s (id=%s)",
+                fsdp_module._fsdp_module_name,
+                id(fsdp_module),
             )
             cg_runner = FSDPCudaGraphRunner(fsdp_module)
             cg_runner.capture_forward(*args, **kwargs)
             cg_runner.install()
             fsdp_module._fsdp_cg_runner = cg_runner
-
-            print(
-                f"Captured CUDA graph for module {fsdp_module._fsdp_module_name} (id={id(fsdp_module)})",
-                ctx.backward_phase,
+            logger.debug(
+                "Captured CUDA graph for module %s (id=%s)",
+                fsdp_module._fsdp_module_name,
+                id(fsdp_module),
             )
 
     return fsdp_module.register_forward_pre_hook(
-        unshard_param_groups, prepend=True, with_kwargs=True
+        forward_pre_hook, prepend=True, with_kwargs=True
     )
-
-
-def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
-    """Register a pre-forward hook that fires ONLY on the root FSDP module.
-
-    Marks the start of the forward phase and manages CUDA graph staging
-    (trace → capture → replay) when ``enable_cuda_graph`` is True.
-    """
-
-    def root_forward_pre_hook(_hook_module, args):
-        ctx = fsdp_module._fsdp_root_context
-        assert not ctx.cuda_graph_active, (
-            "hooks must not fire during CUDA graph capture"
-        )
-        if not fsdp_module._fsdp_state._is_root:
-            return
-        if ctx.enable_cuda_graph and ctx.cuda_graph_stream is None:
-            ctx.cuda_graph_stream = torch.cuda.Stream()
-            torch.cuda.set_stream(ctx.cuda_graph_stream)
-        ctx.forward_phase = True
-        ctx.backward_phase = False
-
-    return fsdp_module.register_forward_pre_hook(root_forward_pre_hook, prepend=True)
 
 
 def _register_fine_grained_forward_pre_hooks(module: FSDPModule):
@@ -123,36 +117,37 @@ def _register_forward_hook(module: FSDPModule):
 
 def _register_backward_pre_hook(module: FSDPModule):
     """
-    Register backward pre-hook to handle gradient computation.
+    Register backward pre-hook using multi-grad hooks on output tensors.
 
-    This uses a custom backward hook that attaches to output tensors
-    to trigger unshard at the right time during backward pass.
+    Attaches a ``register_multi_grad_hook`` to every tensor output of
+    ``module.forward()``.  When autograd reaches this module during the
+    backward pass, the hook fires *before* the module's own backward,
+    giving FSDP a chance to unshard parameters for gradient computation.
     """
 
     def create_custom_backward_hook(
         module: FSDPModule, custom_backward_handler: Callable
     ):
-        """Create a custom backward hook attached to output tensors."""
+        """Wrap *module* so that ``custom_backward_handler`` fires as a
+        pre-backward hook via ``register_multi_grad_hook``."""
 
         @torch.compiler.disable
         def forward_hook(_module, inputs, output):
             assert not _module._fsdp_root_context.cuda_graph_active, (
                 "hooks must not fire during CUDA graph capture"
             )
-            # View-as to avoid output being the same tensor object
+            # ``view_as`` ensures the autograd graph sees a distinct tensor
+            # object even when the module returns a view of an input.
             output = tree_map(
                 lambda t: t.view_as(t) if torch.is_tensor(t) else t, output
             )
 
-            # Collect tensor outputs
             output_list = []
             if isinstance(output, torch.Tensor):
                 output_list = [output]
             elif isinstance(output, (tuple, list)):
                 output_list = [t for t in output if isinstance(t, torch.Tensor)]
 
-            # Register pre-backward hook on output tensors.
-            # This triggers when gradients are computed.
             torch.autograd.graph.register_multi_grad_hook(
                 output_list,
                 lambda grads: custom_backward_handler(_module, grads),
@@ -163,38 +158,68 @@ def _register_backward_pre_hook(module: FSDPModule):
         return module.register_forward_hook(forward_hook)
 
     def pre_backward_hook(module: FSDPModule, grads):
-        """Hook called before backward pass for this module."""
+        """Pre-backward callback for a single FSDP module.
+
+        Invoked by ``register_multi_grad_hook`` when autograd reaches
+        this module during the backward pass — *before* the module's
+        own ``backward()`` runs.  Executed in reverse forward order.
+
+        Execution flow
+        --------------
+        1. **Assert** not inside CUDA graph capture.
+        2. **Root setup** (first module in backward):
+           clear backward tracking, switch phase flags, advance the
+           backward module cursor, and enqueue the post-backward final
+           callback (once).
+        3. **Unshard** parameters for this module (bwd pass).
+        4. **Reset per-module state**: mark ``post_backward_issued``
+           as not yet handled, and reset Transformer Engine gradient
+           accumulation flags.
+        5. **TE wgrad fusion** (``optim_grads`` / ``optim_grads_params``):
+           set ``overwrite_main_grad`` so TE writes weight gradients
+           directly into ``param.main_grad`` (overwrite, not accumulate)
+           to avoid double-counting across micro-batches.
+        6. **Unshard main_grad_buffer** if the parameter group owns one.
+        """
         ctx = module._fsdp_root_context
         assert not ctx.cuda_graph_active, (
             "hooks must not fire during CUDA graph capture"
         )
+
+        # ---- root: backward-phase setup -----------------------------------
         if module._fsdp_state._is_root:
             ctx.backward_done_modules.clear()
             ctx.forward_phase = False
             ctx.backward_phase = True
             ctx._advance_backward_module()
+            if not module._fsdp_state._post_backward_callback_queued:
+                _register_post_backward_final_callback(module._fsdp_state, module)
+
+        # ---- unshard params for backward compute --------------------------
+        module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
+
+        # ---- reset per-module bookkeeping ---------------------------------
+        # ``post_backward_issued`` guards against the post-backward path
+        # (reshard + reduce_grad) being skipped.
         setattr(module, "post_backward_issued", False)
+
+        # ---- Transformer Engine gradient-accumulation fusion ---------------
         for param_group in module._fsdp_param_groups:
             for param in param_group.params:
                 setattr(param, "grad_added_to_main_grad", False)
-                # When gradient_accumulation_fusion is active, the TE backward
-                # kernel writes weight gradients directly into param.main_grad.
-                # By default TE accumulates (adds) into main_grad, which silently
-                # doubles gradients when the buffer isn't zeroed between
-                # micro-batches.  Setting overwrite_main_grad tells TE to
-                # overwrite instead of accumulate, preventing NaN from corrupted
-                # gradient buffers.
-                if param_group.sharding_strategy in [
+                if param_group.sharding_strategy in (
                     "optim_grads_params",
                     "optim_grads",
-                ]:
+                ):
+                    # TE's backward kernel writes weight gradients directly
+                    # into param.main_grad.  By default TE *accumulates*
+                    # (adds) into main_grad, which silently doubles
+                    # gradients when the buffer isn't zeroed between
+                    # micro-batches.  ``overwrite_main_grad`` tells TE to
+                    # overwrite instead.
                     setattr(param, "overwrite_main_grad", True)
-        if (
-            module._fsdp_state._is_root
-            and not module._fsdp_state._post_backward_callback_queued
-        ):
-            _register_post_backward_final_callback(module._fsdp_state, module)
-        module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
+            if hasattr(param_group, "main_grad_buffer"):
+                param_group.main_grad_buffer.unshard()
 
     module._mfsdp_backward_pre_hook = create_custom_backward_hook(
         module, custom_backward_handler=pre_backward_hook

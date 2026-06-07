@@ -35,7 +35,6 @@ from .hooks import (
     _register_fine_grained_forward_pre_hooks,
     _register_forward_hook,
     _register_forward_pre_hook,
-    _register_root_forward_pre_hook,
 )
 from .mixed_precision import MixedPrecisionPolicy
 from .utils import _init_default_fully_shard_mesh
@@ -120,7 +119,6 @@ def fully_shard(
         _register_fine_grained_forward_pre_hooks(module)
     else:
         _register_forward_pre_hook(module)
-    _register_root_forward_pre_hook(module)
     _register_forward_hook(module)
     _register_backward_pre_hook(module)
     _register_backward_hook(module)
