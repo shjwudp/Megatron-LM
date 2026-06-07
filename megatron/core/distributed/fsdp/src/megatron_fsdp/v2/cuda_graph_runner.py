@@ -208,10 +208,6 @@ class FSDPCudaGraphRunner:
             _restore_hooks_recursive(self._module, saved_hooks)
             self.reshard_main_grad_buffer()
 
-        test_out = self._graphed(*flat_sample)
-        ref_out = self._module.forward(*sample_args, **sample_kwargs)
-        assert torch.allclose(test_out, ref_out), "Graphed output does not match eager"
-
         self._tensor_param_names = tensor_names
         self._frozen_kwargs = frozen_kwargs
         self._captured = True

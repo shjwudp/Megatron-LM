@@ -312,17 +312,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
             gradient_scaling_factor = 1.0 / dp_world_size
             expert_gradient_scaling_factor = 1.0 / dp_world_size
 
-        for m in module.modules():
-            if isinstance(m, (TEGroupedMLP, SequentialMLP)):
-                fully_shard(
-                    m,
-                    mesh=edp_mesh,
-                    gradient_scaling_factor=expert_gradient_scaling_factor,
-                    **kwargs,
-                )
         if fsdp_unit_modules is not None:
             cuda_graph_on = set(ddp_config.mfsdp_cuda_graph_modules)
-            for m in module.modules():
+            # Iterate modules post order to ensure that child modules are fully sharded
+            # before their parents, which is required for correct param group divide.
+            for name, m in reversed(list(module.named_modules())):
                 if MambaLayer in fsdp_unit_modules and isinstance(m, MambaLayer):
                     fully_shard(
                         m,
@@ -338,6 +332,13 @@ class FullyShardedDataParallel(_BaseDataParallel):
                         mesh=dp_mesh,
                         gradient_scaling_factor=gradient_scaling_factor,
                         **kwargs
+                    )
+                elif isinstance(m, (TEGroupedMLP, SequentialMLP)):
+                    fully_shard(
+                        m,
+                        mesh=edp_mesh,
+                        gradient_scaling_factor=expert_gradient_scaling_factor,
+                        **kwargs,
                     )
                 elif isinstance(m, tuple(fsdp_unit_modules)):
                     fully_shard(
