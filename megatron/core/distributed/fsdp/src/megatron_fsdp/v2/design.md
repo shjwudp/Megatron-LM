@@ -793,17 +793,30 @@ that eliminates allocation overhead and fragmentation.
 | Phase | Behaviour |
 |---|---|
 | **Trace** (``plan()`` not yet called) | Records alloc/free pairs via an ``_active_keys`` set: the first ``allocate`` per key records a trace event and marks the key active; duplicate allocs (key still active) are no-ops.  The first ``free`` per key records a trace event and marks it inactive; double-frees and free-before-alloc are ignored.  A key that is freed then re-allocated generates a new pair of events.  Buckets are created with ``torch.empty`` and **never deleted** — on re-alloc the same tensor object is resurrected via ``_alloc_storage``, keeping outstanding views (NVFP4 ``_rowwise_data`` references) live. |
-| **Plan** (``plan()``) | Replays the trace to build intervals ``(alloc_seq, free_seq, size)`` for each matched alloc/free pair, groups them by ``(dtype, device)``, and runs a greedy left-edge interval-coloring algorithm per group.  Each color is a **slot** in a contiguous flat pool tensor.  Because the same key may appear in multiple intervals, ``_slot_map[key]`` is a **list** of slot indices in alloc order. |
-| **Optimized** (after ``plan()``) | ``allocate`` returns a ``Bucket`` with a slice-view into the pool, advancing a per-key cursor through the slot list.  Duplicate allocs return the existing slot without advancing the cursor.  ``free`` marks the most recently allocated slot as unused (idempotent — double-free and free-before-alloc are silent no-ops).  ``reset_cursor()`` rewinds all cursors between micro-batches so the same sequence replays. |
+| **Plan** (``plan()``) | Replays the trace to extract per-key live intervals ``(alloc_seq, free_seq)``, groups keys by ``(dtype, device)``, and runs a **conflict-graph coloring** algorithm per group.  Two keys are connected if any of their live intervals overlap; the graph is then colored greedily (largest-size-first, best-fit bin packing).  Each color is a **slot** backed by its own ``torch.empty()`` tensor (per-slot allocation).  Each key maps to exactly one fixed slot via ``_key_to_slot``, with views pre-computed in ``_key_to_view`` for O(1) access. |
+| **Optimized** (after ``plan()``) | ``allocate`` returns a ``Bucket`` with a pre-computed view of the per-slot tensor.  ``free`` marks the slot as unused.  Both are O(1) dict lookups — no allocations, storage resizes, slot-lists, or cursor management.  Addresses are fixed per-key across all micro-batches. |
 
-**Slot lists and cursors.**  ...same...
+**Conflict-graph coloring vs. left-edge.**  The previous design used greedy
+left-edge interval coloring on a monolithic pool tensor, requiring per-key
+slot *lists* and *cursors* because the same key could appear in multiple
+intervals (pre-merged into a "super-interval" to guarantee one address per
+key).  The current design builds an explicit interval-overlap graph and
+colors it with greedy graph coloring.  Each key maps to exactly one slot
+(``_key_to_slot``) backed by a separate tensor (per-slot allocation).  This:
 
-**Greedy left-edge coloring.**  ...same...
+* Eliminates the need for slot lists, cursors, and ``reset_cursor()``.
+* Produces the **theoretical minimum** slot count (optimal coloring of the
+  interval-overlap graph).
+* Reduces CUDA caching-allocator fragmentation by replacing one giant
+  contiguous block with many smaller, independently-placed tensors.
+* Still guarantees fixed per-key addresses (CUDA graph safe).
 
 **Properties.**
 
-- **Optimal slot count:** ...same...
-- **Repeatable trace required:** ...same...
+- **Optimal slot count:** Conflict-graph coloring yields the theoretical
+  minimum (peak simultaneous live memory).
+- **Repeatable trace required:** The FSDP framework must execute the same
+  alloc/free calls in the same order per micro-batch.
 - **Fully idempotent:** ``allocate`` and ``free`` are always safe to call
   multiple times.  `allocate` → `allocate` is a no-op (returns existing).
   `free` → `free` is a no-op (ignored).  `free` without a prior `allocate`
@@ -811,6 +824,10 @@ that eliminates allocation overhead and fragmentation.
 - **Stable tensor objects:** Buckets are never deleted — the same Python
   tensor object is reused across alloc/free cycles, preventing dangling
   views (e.g., NVFP4 parameter ``_rowwise_data``).
+- **Per-slot tensors:** Each slot is a separate ``torch.empty`` allocation,
+  not a slice of a monolithic pool.  Slots are independently placed by the
+  CUDA caching allocator, avoiding fragmentation from giant contiguous
+  blocks.
 
 **API.**
 
@@ -818,26 +835,25 @@ that eliminates allocation overhead and fragmentation.
 allocator = TracePoolAllocator()
 # … run one iteration (trace phase) …
 pool_elems = allocator.plan()          # returns total element count
-# … subsequent micro-batches use the pool …
-allocator.reset_cursor()                # between micro-batches
-print(allocator.total_pool_bytes)       # bytes across all groups
+# … subsequent micro-batches use the pre-allocated slots …
+print(allocator.total_pool_bytes)       # bytes across all slots
 allocator.reset()                       # back to trace phase
 ```
 
 **Lifecycle diagram for one allocation key across two micro-batches.**
 
 ```
-Trace phase                            Optimized phase
------------                            ---------------
-allocate(key) → torch.empty  --.         allocate(key) → pool slot 0   (cursor 0→1)
-free(key)     → _free_storage  | plan    free(key)     → slot free
-allocate(key) → torch.empty  --'         allocate(key) → pool slot 1   (cursor 1→2)
-free(key)     → _free_storage           free(key)     → slot free
-                                        -- reset_cursor() --
-                                        allocate(key) → pool slot 0   (cursor 0→1)
-                                        free(key)     → slot free
-                                        ...
+Trace phase                                Optimized phase
+-----------                                ---------------
+allocate(key) → torch.empty  --.             allocate(key) → slot_tensor view  (fixed addr)
+free(key)     → _free_storage  | plan(A)     free(key)     → slot free
+allocate(key) → torch.empty  --'             allocate(key) → slot_tensor view  (same addr)
+free(key)     → _free_storage               free(key)     → slot free
+                                             -- next micro-batch --
+                                             allocate(key) → slot_tensor view  (same addr)
+                                             free(key)     → slot free
+                                             ...
 ```
 
-No ``torch.empty`` or storage resizing occurs in the optimized phase — the pool
-owns all memory, and buckets are lightweight views.
+No ``torch.empty`` or storage resizing occurs in the optimized phase — each
+slot owns its own tensor, and buckets are lightweight views into them.

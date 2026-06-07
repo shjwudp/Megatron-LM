@@ -14,6 +14,7 @@
 
 import dataclasses
 import logging
+from collections import defaultdict
 from typing import Dict, Hashable, List, Optional, Set, Tuple
 
 import torch
@@ -102,33 +103,78 @@ class TemporaryBucketAllocator(BucketAllocator):
             del self.buckets[key]
 
 
+class StorageFreeingBucketAllocator(BucketAllocator):
+    """Manages temporary flat buffers keyed by caller-provided allocation key."""
+
+    def __init__(self):
+        super().__init__()
+        self.buckets = {}
+
+    def allocate(
+        self,
+        key: Optional[AllocatorKey] = None,
+        size: int = 0,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+        *,
+        param_group_id: Optional[AllocatorKey] = None,
+    ) -> Bucket:
+        key = _resolve_key(key, param_group_id)
+        assert dtype is not None and device is not None
+        if key not in self.buckets:
+            self.buckets[key] = Bucket(
+                data=torch.empty(size, dtype=dtype, device=device)
+            )
+            return self.buckets[key]
+        _alloc_storage(self.buckets[key].data, torch.Size([size]))
+        return self.buckets[key]
+
+    def free(
+        self,
+        key: Optional[AllocatorKey] = None,
+        *,
+        param_group_id: Optional[AllocatorKey] = None,
+    ) -> None:
+        key = _resolve_key(key, param_group_id)
+        if key in self.buckets:
+            _free_storage(self.buckets[key].data)
+
+
 class TracePoolAllocator(BucketAllocator):
-    """Two-phase bucket allocator with conflict-graph coloring and per-slot tensors.
+    """Two-phase bucket allocator for CUDA graph-compatible training.
 
-    **Design**
-
-    Uses a deterministic trace-then-plan approach for CUDA graph compatibility.
-    Each allocation key always maps to the same fixed memory address.
+    Profiles one micro-batch to record allocation patterns, then builds a
+    static key-to-address plan that is identical across all subsequent
+    micro-batches — essential for CUDA graph capture.
 
     **Phase 1 — Trace** (first micro-batch)
 
-    Records all alloc/free calls with monotonic sequence numbers.
+    Records alloc/free calls with monotonic sequence numbers.  Buckets are
+    created with ``torch.empty`` and freed via ``_free_storage`` so the same
+    tensor object can be resurrected on re-alloc (keeping outstanding views
+    alive, e.g.  NVFP4 ``_rowwise_data`` references).
 
     **Phase 2 — Plan** (``plan()``)
 
-    Uses **conflict-graph coloring** to find the optimal slot assignment:
-    - Two keys can share a slot iff their ACTUAL live intervals never overlap.
-    - This achieves the theoretical minimum (peak simultaneous live memory).
+    Replays the trace to build per-key live intervals, then uses
+    **conflict-graph coloring** to assign slots:
 
-    Uses **per-slot tensors** instead of one monolithic pool:
-    - Each slot is a separate ``torch.empty()`` allocation.
-    - The CUDA caching allocator can place them independently, reducing
-      fragmentation pressure from one giant contiguous block.
-    - Addresses are still fixed per-key (CUDA graph safe).
+    * An interval-overlap graph is built: edges connect keys whose live
+      intervals overlap.
+    * Nodes are colored greedily (largest-size-first, best-fit bin packing)
+      so two keys share a slot iff they never overlap.
+    * Yields the **theoretical minimum** number of slots.
+
+    Each slot is a **separate** ``torch.empty()`` tensor (per-slot allocation),
+    not a slice of a monolithic pool.  The CUDA caching allocator can place
+    them independently, reducing fragmentation pressure from giant contiguous
+    blocks, while each key still resolves to a fixed memory address.
 
     **Phase 3 — Optimized** (after ``plan()``)
 
-    ``allocate`` / ``free`` are O(1) dict lookups returning pre-allocated views.
+    ``allocate`` / ``free`` are O(1) dict lookups that return pre-computed
+    tensor views.  No allocations or storage resizes occur in this phase —
+    memory addresses are stable across all micro-batches.
     """
 
     # -- Inner types ---------------------------------------------------- #
