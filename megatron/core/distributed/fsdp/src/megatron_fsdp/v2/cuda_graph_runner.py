@@ -15,16 +15,29 @@
 """CUDA graph capture / replay for individual FSDP modules."""
 
 import inspect
+import gc
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-import torch.nn as nn
 
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+# All known hook attributes across PyTorch versions (including 2.x additions)
+_HOOK_ATTRS = [
+    "_forward_pre_hooks",
+    "_forward_hooks",
+    "_forward_hooks_with_kwargs",
+    "_forward_pre_hooks_with_kwargs",
+    "_backward_hooks",
+    "_backward_pre_hooks",
+    "_state_dict_hooks",
+    "_load_state_dict_pre_hooks",
+    "_load_state_dict_post_hooks",
+]
 
 
 def _get_forward_param_names(module: torch.nn.Module) -> List[str]:
@@ -46,7 +59,12 @@ def _get_forward_param_names(module: torch.nn.Module) -> List[str]:
 class _ForwardShim(torch.nn.Module):
     """Wraps module.forward so that non-tensor kwargs are frozen at
     capture time and tensor inputs are passed positionally in signature
-    order."""
+    order.
+
+    Handles None outputs by filtering them out before returning to
+    make_graphed_callables, and records their positions so they can be
+    restored during replay.
+    """
 
     def __init__(
         self,
@@ -59,41 +77,79 @@ class _ForwardShim(torch.nn.Module):
         self.tensor_param_names = tensor_param_names
         self.frozen_kwargs = frozen_kwargs
 
+        # Populated on first forward: tracks which output positions are None
+        self._none_mask: Optional[List[bool]] = None
+        # Whether the original output was a tuple (vs single tensor)
+        self._output_is_tuple: bool = True
+
     def forward(self, *flat_tensor_args):
         kwargs = dict(zip(self.tensor_param_names, flat_tensor_args))
         kwargs.update(self.frozen_kwargs)
-        return self.module.forward(**kwargs)
+        outputs = self.module.forward(**kwargs)
+
+        # Handle single tensor output
+        if not isinstance(outputs, tuple):
+            self._output_is_tuple = False
+            if outputs is None:
+                raise RuntimeError(
+                    "Module returned None as its only output — cannot capture "
+                    "with CUDA graphs. The module must return at least one tensor."
+                )
+            return outputs
+
+        # Handle tuple outputs — filter out None values
+        self._output_is_tuple = True
+        if self._none_mask is None:
+            self._none_mask = [o is None for o in outputs]
+
+        filtered = tuple(o for o in outputs if o is not None)
+        if len(filtered) == 0:
+            raise RuntimeError(
+                "Module returned a tuple of all None values — cannot capture "
+                "with CUDA graphs. At least one output must be a tensor."
+            )
+        if len(filtered) == 1:
+            return filtered[0]
+        return filtered
+
+    def restore_none_positions(self, graph_output) -> Any:
+        """Re-insert None values at their original positions after graph replay."""
+        if not self._output_is_tuple or self._none_mask is None:
+            return graph_output
+
+        # If all non-None outputs were collapsed to a single tensor
+        if not isinstance(graph_output, tuple):
+            graph_output = (graph_output,)
+
+        full: List[Any] = []
+        tensor_iter = iter(graph_output)
+        for is_none in self._none_mask:
+            if is_none:
+                full.append(None)
+            else:
+                full.append(next(tensor_iter))
+        return tuple(full)
 
 
 def _pop_hooks(module: torch.nn.Module) -> Dict[str, Any]:
     """Remove all hooks from *module* (non-recursive) and return a snapshot."""
-
-    def _pop_one(m: torch.nn.Module) -> Dict[str, Any]:
-        saved: Dict[str, Any] = {
-            "_forward_pre_hooks": m._forward_pre_hooks,
-            "_forward_hooks": m._forward_hooks,
-            "_backward_hooks": m._backward_hooks,
-            "_state_dict_hooks": m._state_dict_hooks,
-            "_load_state_dict_pre_hooks": m._load_state_dict_pre_hooks,
-        }
-        if hasattr(m, "_backward_pre_hooks"):
-            saved["_backward_pre_hooks"] = m._backward_pre_hooks
-        for name, value in saved.items():
-            if value is not None:
-                setattr(m, name, OrderedDict())
-        return saved
-
-    return _pop_one(module)
+    saved: Dict[str, Any] = {}
+    for attr in _HOOK_ATTRS:
+        if hasattr(module, attr):
+            saved[attr] = getattr(module, attr)
+            setattr(module, attr, OrderedDict())
+    return saved
 
 
-def _pop_hooks_recursive(module: torch.nn.Module) -> Dict[int, Dict[str, Any]]:
+def _pop_hooks_recursive(module: torch.nn.Module) -> List[Tuple[torch.nn.Module, Dict[str, Any]]]:
     """Remove all hooks from *module* and all its submodules recursively.
 
-    Returns a dict mapping ``id(submodule) → saved_hooks`` for restore.
+    Returns a list of (submodule, saved_hooks) tuples for restore.
+    Using direct module references instead of id() for safety.
     """
-    saved: Dict[int, Dict[str, Any]] = {}
+    saved: List[Tuple[torch.nn.Module, Dict[str, Any]]] = []
     for submodule in module.modules():
-        saved[id(submodule)] = _pop_hooks(submodule)
+        saved.append((submodule, _pop_hooks(submodule)))
     return saved
 
 
@@ -105,13 +161,11 @@ def _restore_hooks(module: torch.nn.Module, saved: Dict[str, Any]) -> None:
 
 
 def _restore_hooks_recursive(
-    module: torch.nn.Module, saved: Dict[int, Dict[str, Any]]
+    module: torch.nn.Module, saved: List[Tuple[torch.nn.Module, Dict[str, Any]]]
 ) -> None:
     """Restore hooks for all submodules saved by ``_pop_hooks_recursive``."""
-    for submodule in module.modules():
-        sub_saved = saved.get(id(submodule))
-        if sub_saved is not None:
-            _restore_hooks(submodule, sub_saved)
+    for submodule, sub_saved in saved:
+        _restore_hooks(submodule, sub_saved)
 
 
 # ------------------------------------------------------------------
@@ -120,11 +174,21 @@ def _restore_hooks_recursive(
 
 
 class FSDPCudaGraphRunner:
-    """Captures a forward+bacwkard CUDA graph for one FSDP module.
+    """Captures a forward+backward CUDA graph for one FSDP module.
 
     During capture hooks are temporarily removed so the graph records
     only the user's ``forward()``, not FSDP all-gather / reduce-scatter
     collectives.  FSDP side streams are disabled for the capture region.
+
+    Parameters:
+        fsdp_module: The FSDP module to capture.
+        gc_freeze: If True (default), call ``gc.collect()`` and ``gc.freeze()``
+            before capture to prevent Python GC from stalling replay.
+        graph_pool: Optional shared CUDA graph memory pool handle obtained
+            via ``torch.cuda.graph_pool_handle()``.  When provided, the
+            ``CUDAGraph`` is created with this handle so multiple FSDP
+            modules share the same backing memory pool, reducing total
+            GPU memory consumption.
 
     Usage::
 
@@ -135,11 +199,18 @@ class FSDPCudaGraphRunner:
         runner.uninstall()                     # restore original behaviour
     """
 
-    def __init__(self, fsdp_module: torch.nn.Module):
+    def __init__(
+        self,
+        fsdp_module: torch.nn.Module,
+        gc_freeze: bool = True,
+        graph_pool: Optional[Any] = None,
+    ):
         self._module: torch.nn.Module = fsdp_module
+        self._gc_freeze: bool = gc_freeze
+        self._graph_pool: Optional[int] = graph_pool
 
         # Will hold the callable returned by make_graphed_callables
-        self._graphed: Optional[torch._CudaGraphCallable] = None
+        self._graphed: Optional[Any] = None
 
         self._orig_fwd: Optional[Any] = None
         self._use_cuda_graph: bool = False
@@ -148,6 +219,12 @@ class FSDPCudaGraphRunner:
         # Saved during capture for install() replay flattening
         self._tensor_param_names: List[str] = []
         self._frozen_kwargs: Dict[str, Any] = {}
+
+        # The shim used during capture (needed for None restoration)
+        self._shim: Optional[_ForwardShim] = None
+
+        # The CUDAGraph allocated for this module (stored for lifecycle mgmt)
+        self._graph: Optional[torch.cuda.CUDAGraph] = None
 
     # ------------------------------------------------------------------
     # 1. Capture
@@ -182,7 +259,7 @@ class FSDPCudaGraphRunner:
             bound[n].clone().detach().requires_grad_(True) for n in tensor_names
         )
 
-        # Build shim
+        # Build shim (handles None filtering)
         shim = _ForwardShim(self._module, tensor_names, frozen_kwargs)
 
         for param in self._module.parameters():
@@ -190,6 +267,18 @@ class FSDPCudaGraphRunner:
 
         # For gradient accumulate fusion
         self.unshard_main_grad_buffer()
+
+        if self._gc_freeze:
+            gc.collect()
+            gc.freeze()
+
+        # Allocate a CUDAGraph (optionally sharing the root's memory pool)
+        pool_kwargs: Dict[str, Any] = {}
+        if self._graph_pool is not None:
+            self._graph = torch.cuda.CUDAGraph(pool=self._graph_pool)
+        else:
+            self._graph = torch.cuda.CUDAGraph()
+        pool_kwargs["pool"] = (self._graph,)
 
         # Disable side-stream collectives during capture so every CUDA
         # operation lands on the default (capture) stream.
@@ -202,12 +291,21 @@ class FSDPCudaGraphRunner:
                 shim,
                 sample_args=flat_sample,
                 num_warmup_iters=3,
+                allow_unused_input=True,
+                **pool_kwargs,
             )
+        except Exception as e:
+            raise RuntimeError(
+                f"CUDA graph capture failed for {self._module.__class__.__name__}. "
+                f"Tensor inputs: {tensor_names}, "
+                f"Frozen kwargs keys: {list(frozen_kwargs.keys())}"
+            ) from e
         finally:
             ctx.cuda_graph_active = False
             _restore_hooks_recursive(self._module, saved_hooks)
             self.reshard_main_grad_buffer()
 
+        self._shim = shim
         self._tensor_param_names = tensor_names
         self._frozen_kwargs = frozen_kwargs
         self._captured = True
@@ -223,6 +321,7 @@ class FSDPCudaGraphRunner:
 
         self._orig_fwd = self._module.forward
         graphed = self._graphed
+        shim = self._shim
         param_names = _get_forward_param_names(self._module.__class__)
         tensor_names = self._tensor_param_names
 
@@ -234,7 +333,9 @@ class FSDPCudaGraphRunner:
                         bound[param_names[i]] = val
                 bound.update(kwargs)
                 flat = tuple(bound[n] for n in tensor_names)
-                return graphed(*flat)
+                result = graphed(*flat)
+                # Restore None positions that were filtered during capture
+                return shim.restore_none_positions(result)
             return self._orig_fwd(*args, **kwargs)
 
         self._module.forward = _patched_fwd
@@ -266,7 +367,9 @@ class FSDPCudaGraphRunner:
         """Uninstall the patch and allow a fresh capture later."""
         self.uninstall()
         self._graphed = None
+        self._shim = None
         self._captured = False
+        self._graph = None
 
     def unshard_main_grad_buffer(self):
         """Unshard the main grad buffer for all param groups."""

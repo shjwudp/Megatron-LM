@@ -315,11 +315,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         if fsdp_unit_modules is not None:
             cuda_graph_on = set(ddp_config.mfsdp_cuda_graph_modules)
-            cg_modules = {
-                MambaLayer: "mamba",
-                Attention: "attn",
-                MoERouter: "moe_router",
-            }
             # Iterate modules post order to ensure that child modules are fully sharded
             # before their parents, which is required for correct param group divide.
             for name, m in reversed(list(module.named_modules())):
@@ -330,7 +325,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     grad_sf = gradient_scaling_factor
                     mesh = dp_mesh
 
-                if isinstance(m, tuple(cg_modules.keys())) and cg_modules[m] in cuda_graph_on:
+                if any([
+                    isinstance(m, MambaLayer) and "mamba" in cuda_graph_on,
+                    isinstance(m, Attention) and "attn" in cuda_graph_on,
+                    isinstance(m, MoERouter) and "moe_router" in cuda_graph_on,
+                ]):
                     fully_shard(
                         m,
                         enable_cuda_graph=True,

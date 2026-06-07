@@ -51,6 +51,7 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule):
             if ctx.enable_cuda_graph and ctx.cuda_graph_stream is None:
                 ctx.cuda_graph_stream = torch.cuda.Stream()
                 torch.cuda.set_stream(ctx.cuda_graph_stream)
+                ctx.cuda_graph_pool = torch.cuda.graph_pool_handle()
             ctx.forward_phase = True
             ctx.backward_phase = False
 
@@ -72,7 +73,9 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule):
                     fsdp_module._fsdp_module_name,
                     id(fsdp_module),
                 )
-            cg_runner = FSDPCudaGraphRunner(fsdp_module)
+            cg_runner = FSDPCudaGraphRunner(
+                fsdp_module, graph_pool=ctx.cuda_graph_pool
+            )
             cg_runner.capture_forward(*args, **kwargs)
             cg_runner.install()
             fsdp_module._fsdp_cg_runner = cg_runner

@@ -17,7 +17,7 @@
 import logging
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -147,6 +147,15 @@ class _FSDPRootContext:
     region.  All hooks must assert ``not cuda_graph_active`` — hooks
     are popped during capture, so a callback firing inside the capture
     window indicates a bug."""
+
+    cuda_graph_pool: Optional[Any] = None
+    f"""Shared CUDA graph memory pool handle for CUDA graph capture.
+
+    Obtained via ``torch.cuda.graph_pool_handle()``.  Multiple
+    ``torch.cuda.CUDAGraph`` objects created with this handle share
+    the same backing memory pool, allowing the CUDA driver to reuse
+    graph memory across FSDP modules and reduce total GPU memory
+    consumption."""
 
     backward_module: Optional[int] = None
     """``id(module)`` of the FSDP module whose backward is pending next.
