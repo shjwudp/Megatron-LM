@@ -223,9 +223,6 @@ class FSDPCudaGraphRunner:
         # The shim used during capture (needed for None restoration)
         self._shim: Optional[_ForwardShim] = None
 
-        # The CUDAGraph allocated for this module (stored for lifecycle mgmt)
-        self._graph: Optional[torch.cuda.CUDAGraph] = None
-
     # ------------------------------------------------------------------
     # 1. Capture
     # ------------------------------------------------------------------
@@ -272,14 +269,6 @@ class FSDPCudaGraphRunner:
             gc.collect()
             gc.freeze()
 
-        # Allocate a CUDAGraph (optionally sharing the root's memory pool)
-        pool_kwargs: Dict[str, Any] = {}
-        if self._graph_pool is not None:
-            self._graph = torch.cuda.CUDAGraph(pool=self._graph_pool)
-        else:
-            self._graph = torch.cuda.CUDAGraph()
-        pool_kwargs["pool"] = (self._graph,)
-
         # Disable side-stream collectives during capture so every CUDA
         # operation lands on the default (capture) stream.
         saved_hooks = _pop_hooks_recursive(self._module)
@@ -292,7 +281,7 @@ class FSDPCudaGraphRunner:
                 sample_args=flat_sample,
                 num_warmup_iters=3,
                 allow_unused_input=True,
-                **pool_kwargs,
+                pool=self._graph_pool,
             )
         except Exception as e:
             raise RuntimeError(
