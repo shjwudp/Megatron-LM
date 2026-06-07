@@ -185,7 +185,7 @@ class TracePoolAllocator(BucketAllocator):
     ``allocate`` and ``free`` use a simple dict lookup on ``_key_to_slot``
     to return a pool-tensor view.  Because the pool tensors are allocated
     once and never resized, the same key always resolves to the same memory
-    address — essential for CUDA graph compatibility.  ``reset_batch()``
+    address — essential for CUDA graph compatibility.
     clears slot ``in_use`` flags between micro-batches.
 
     **Hook-coordinated lifecycle** (see ``megatron_fsdp.v2.hooks``)::
@@ -203,7 +203,6 @@ class TracePoolAllocator(BucketAllocator):
         Micro-batch 1+
         ┌──────────────────────────────────────────────────────────
         │  root pre-forward     forward_phase = True
-        │                       reset_batch()
         │    forward (optimized, key→slot lookup)
         │  root pre-backward    forward_phase = False , backward_phase = True
         │    backward (optimized, key→slot lookup)
@@ -438,6 +437,9 @@ class TracePoolAllocator(BucketAllocator):
         # ---- step 3: color and allocate ----
         total_elems = self._assign_pool(intervals)
 
+        self._phase = "optimized"
+        return total_elems
+
     def _assign_pool(self, intervals: List["TracePoolAllocator._Interval"]) -> int:
         """Group intervals by (dtype, device), color each group, sum sizes."""
         groups: Dict[
@@ -628,20 +630,6 @@ class TracePoolAllocator(BucketAllocator):
         return "\n".join(lines)
 
     # -- Lifecycle ------------------------------------------------------- #
-
-    def reset_batch(self) -> None:
-        """Reset slot state for the next micro-batch.
-
-        Clears ``in_use`` flags on all slots and clears the active-key
-        set.  Does NOT discard ``_key_to_slot`` or ``_pools`` — the
-        slot→address mapping is immutable once planned.
-
-        Called at root pre-forward of each micro-batch after ``plan()``.
-        """
-        assert self._phase == "optimized", "reset_batch requires an existing plan"
-        for slot in self._slots:
-            slot.in_use = False
-        self._active_keys.clear()
 
     def reset(self) -> None:
         """Full teardown: discard pool, plan, and trace; return to "trace" phase.

@@ -72,10 +72,6 @@ def _register_root_forward_pre_hook(fsdp_module: FSDPModule):
             torch.cuda.set_stream(ctx.cuda_graph_stream)
         ctx.forward_phase = True
         ctx.backward_phase = False
-        if isinstance(ctx.bucket_allocator, TracePoolAllocator):
-            ba = ctx.bucket_allocator
-            if ba.phase == "optimized":
-                ba.reset_batch()
 
     return fsdp_module.register_forward_pre_hook(root_forward_pre_hook, prepend=True)
 
@@ -305,9 +301,7 @@ def _register_post_backward_final_callback(
                             f"module_id={id(m)}, module_name={m._fsdp_module_name}"
                         )
                 bucket_alloc.plan()
-            elif bucket_alloc.phase == "optimized":
-                bucket_alloc.reset_batch()
-            else:
+            elif bucket_alloc.phase != "optimized":
                 raise ValueError(
                     f"Unexpected bucket allocator phase: {bucket_alloc.phase}"
                 )
