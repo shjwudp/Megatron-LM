@@ -66,20 +66,22 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule):
             and not ctx.backward_phase
             and fsdp_module.cuda_graph_compatible
         ):
-            logger.debug(
-                "Capturing CUDA graph for module %s (id=%s)",
-                fsdp_module._fsdp_module_name,
-                id(fsdp_module),
-            )
+            if torch.distributed.get_rank() == 0:
+                logger.debug(
+                    "Capturing CUDA graph for module %s (id=%s)",
+                    fsdp_module._fsdp_module_name,
+                    id(fsdp_module),
+                )
             cg_runner = FSDPCudaGraphRunner(fsdp_module)
             cg_runner.capture_forward(*args, **kwargs)
             cg_runner.install()
             fsdp_module._fsdp_cg_runner = cg_runner
-            logger.debug(
-                "Captured CUDA graph for module %s (id=%s)",
-                fsdp_module._fsdp_module_name,
-                id(fsdp_module),
-            )
+            if torch.distributed.get_rank() == 0:
+                logger.debug(
+                    "Captured CUDA graph for module %s (id=%s)",
+                    fsdp_module._fsdp_module_name,
+                    id(fsdp_module),
+                )
 
     return fsdp_module.register_forward_pre_hook(
         forward_pre_hook, prepend=True, with_kwargs=True
