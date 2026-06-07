@@ -43,6 +43,7 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.moe.router import Router as MoERouter
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
 
@@ -326,6 +327,14 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     fully_shard(
                         m,
                         enable_cuda_graph=('mamba' in cuda_graph_on),
+                        mesh=dp_mesh,
+                        gradient_scaling_factor=gradient_scaling_factor,
+                        **kwargs
+                    )
+                elif "moe_router" in cuda_graph_on and isinstance(m, MoERouter):
+                    fully_shard(
+                        m,
+                        enable_cuda_graph=True,
                         mesh=dp_mesh,
                         gradient_scaling_factor=gradient_scaling_factor,
                         **kwargs

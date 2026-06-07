@@ -2811,7 +2811,7 @@ def _add_distributed_args(parser):
         '--mfsdp-cuda-graph',
         nargs='+',
         default=[],
-        choices=['mamba', 'transformer'],
+        choices=['mamba', 'transformer', "moe_router"],
         dest='mfsdp_cuda_graph_modules',
         help='Enable CUDA graph capture on specific FSDP module types '
         'when using Megatron FSDP v2 (--use-megatron-fsdp-v2). '
