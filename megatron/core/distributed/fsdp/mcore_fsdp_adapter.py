@@ -44,6 +44,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.moe.router import Router as MoERouter
+from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
 
@@ -314,38 +315,35 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         if fsdp_unit_modules is not None:
             cuda_graph_on = set(ddp_config.mfsdp_cuda_graph_modules)
+            cg_modules = {
+                MambaLayer: "mamba",
+                Attention: "attn",
+                MoERouter: "moe_router",
+            }
             # Iterate modules post order to ensure that child modules are fully sharded
             # before their parents, which is required for correct param group divide.
             for name, m in reversed(list(module.named_modules())):
-                if MambaLayer in fsdp_unit_modules and isinstance(m, MambaLayer):
-                    fully_shard(
-                        m,
-                        enable_cuda_graph=('mamba' in cuda_graph_on),
-                        mesh=dp_mesh,
-                        gradient_scaling_factor=gradient_scaling_factor,
-                        **kwargs
-                    )
-                elif "moe_router" in cuda_graph_on and isinstance(m, MoERouter):
+                if isinstance(m, (TEGroupedMLP, SequentialMLP)):
+                    grad_sf = expert_gradient_scaling_factor
+                    mesh = edp_mesh
+                else:
+                    grad_sf = gradient_scaling_factor
+                    mesh = dp_mesh
+
+                if isinstance(m, tuple(cg_modules.keys())) and cg_modules[m] in cuda_graph_on:
                     fully_shard(
                         m,
                         enable_cuda_graph=True,
-                        mesh=dp_mesh,
-                        gradient_scaling_factor=gradient_scaling_factor,
+                        mesh=mesh,
+                        gradient_scaling_factor=grad_sf,
                         **kwargs
-                    )
-                elif isinstance(m, (TEGroupedMLP, SequentialMLP)):
-                    fully_shard(
-                        m,
-                        mesh=edp_mesh,
-                        gradient_scaling_factor=expert_gradient_scaling_factor,
-                        **kwargs,
                     )
                 elif isinstance(m, tuple(fsdp_unit_modules)):
                     fully_shard(
                         m,
-                        mesh=dp_mesh,
-                        gradient_scaling_factor=gradient_scaling_factor,
-                        enable_cuda_graph=('transformer' in cuda_graph_on),
+                        mesh=mesh,
+                        gradient_scaling_factor=grad_sf,
+                        enable_cuda_graph=False,
                         **kwargs
                     )
         fully_shard(module, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
