@@ -84,8 +84,8 @@ def _read_full_weight(pg, idx, shape):
     """All-gather this param's full master weight and return it (reshaped, cloned)."""
     mbuf = pg.main_weight_buffer
     full = mbuf.unshard(bind_params=False)
-    off, sz = mbuf.buffer_index._get_item_global_range(idx)
-    out = full[off : off + sz].clone().view(shape)
+    start, end = mbuf.buffer_index._get_item_global_range(idx)
+    out = full[start:end].clone().view(shape)
     mbuf.reshard()
     return out
 

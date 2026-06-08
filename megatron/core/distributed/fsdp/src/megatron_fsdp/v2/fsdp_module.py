@@ -313,9 +313,9 @@ class FSDPModule:
             assert gbuf_data.numel() > 0
 
             # Get offset and size from buffer index
-            offset, size = gbuf.buffer_index._get_item_global_range(item_id)
+            start, end = gbuf.buffer_index._get_item_global_range(item_id)
             param_shape = gbuf.buffer_index.item_index_map[item_id].shape
-            grad_data = gbuf_data[offset : offset + size].view(param_shape)
+            grad_data = gbuf_data[start:end].view(param_shape)
 
             return grad_data
 

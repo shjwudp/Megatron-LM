@@ -352,15 +352,15 @@ class BufferIndex:
     #                            falls within the current rank's shard.
     #  _get_item_local_range  → (start, end) within self.data (the local
     #                            GPU buffer).  Where to read/write bytes.
-    #  _get_item_global_range → (global_data_index, size) in the full
-    #                            logical (unsharded) buffer, same on all
+    #  _get_item_global_range → (start, end) in the full logical
+    #                            (unsharded) buffer, same on all
     #                            ranks.
     # ------------------------------------------------------------------ #
 
     def _get_item_global_range(self, item_id: int) -> Tuple[int, int]:
-        """Return (global_data_index, size) for the given item."""
+        """Return (start, end) in the full unsharded buffer for the given item."""
         idx = self.item_index_map[item_id]
-        return (idx.global_data_index, idx.size)
+        return (idx.global_data_index, idx.global_data_index + idx.size)
 
     def _get_item_self_range(self, item_id: int, *, as_shard: bool = True) -> Tuple[int, int]:
         """Return coordinates relative to the item's own start.
@@ -644,14 +644,12 @@ class DataParallelBuffer:
                 )
                 torch.cuda.current_stream().wait_stream(default_stream)
                 self._unsharded_buffer = bucket.data
-                sm = self.buffer_index.shard_meta
-                shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
             full_buffer = self._unsharded_buffer
         else:
             full_buffer = self.data
-            sm = self.buffer_index.shard_meta
-            shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
 
+        sm = self.buffer_index.shard_meta
+        shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
         torch.distributed.all_gather_into_tensor(
             output_tensor=full_buffer,
             input_tensor=shard_buffer,
@@ -675,9 +673,9 @@ class DataParallelBuffer:
         )
         for p in self.params:
             item_id = self.param_idx[p]
-            offset, size = self.buffer_index._get_item_global_range(item_id)
+            start, end = self.buffer_index._get_item_global_range(item_id)
             idx_shape = self.buffer_index.item_index_map[item_id].shape
-            param_data = buffer[offset : offset + size].view(idx_shape)
+            param_data = buffer[start:end].view(idx_shape)
             self.mp_policy.bind_unsharded_param(p, param_data, self.buffer_role)
 
     @torch.no_grad()

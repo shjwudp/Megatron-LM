@@ -652,6 +652,14 @@ def _apply_mcore_postprocess(raw_state_dict, args, model):
     return state_dict
 
 
+def _numel(shape: tuple) -> int:
+    """Return the product of all dimensions in *shape*."""
+    n = 1
+    for d in shape:
+        n *= d
+    return n
+
+
 def _verify_chunk_metadata(flattened_sd: dict) -> None:
     """Verify every DTensor has correct ``__create_chunk_list__`` metadata.
 
@@ -672,7 +680,7 @@ def _verify_chunk_metadata(flattened_sd: dict) -> None:
             continue
 
         cl = lt.__create_chunk_list__()
-        cl_total = sum(c.sizes[0] for c in cl)
+        cl_total = sum(_numel(c.sizes) for c in cl)
         local_numel = lt.numel()
         if cl_total != local_numel:
             cl_detail = [(tuple(c.offsets), tuple(c.sizes)) for c in cl]

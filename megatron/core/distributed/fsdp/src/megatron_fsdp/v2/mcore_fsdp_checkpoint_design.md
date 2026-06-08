@@ -832,9 +832,11 @@ At the end of `_apply_mcore_postprocess`, `_verify_chunk_metadata` validates
 every DTensor in the flattened state dict:
 
 1. **Existence check** — every DTensor must have `__create_chunk_list__`.
-2. **Numel consistency check** — `sum(chunk.sizes[0]) == local_tensor.numel()`.
-   A mismatch (e.g., 40960 vs 2560) indicates chunk metadata was computed with
-   the wrong device mesh (DP instead of EDP) or against stale state.
+2. **Numel consistency check** — `sum(prod(chunk.sizes)) == local_tensor.numel()`.
+   Each chunk's sizes may be multi-dimensional (e.g., `(256, 512)`), so the
+   element count is the product of all dimensions. A mismatch (e.g., 40960 vs
+   2560) indicates chunk metadata was computed with the wrong device mesh
+   (DP instead of EDP) or against stale state.
 3. **On failure** — logs the key, global/local shapes, chunk list with offsets
    and sizes, source tag, and device mesh before raising `AssertionError`.
    This pinpoints which phase produced incorrect metadata and what mesh was used.
