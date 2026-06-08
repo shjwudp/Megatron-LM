@@ -40,6 +40,7 @@ from torch.distributed.tensor import DTensor, Shard
 import megatron.core.parallel_state as mpu
 from megatron.core import dist_checkpointing
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import copy_chunk_metadata
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import get_chunk_meta_source
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     get_state_dict as _get_state_dict,
 )
@@ -575,12 +576,30 @@ def _propagate_chunk_metadata_to_state_dict(model: nn.Module, state_dict: dict) 
         if isinstance(param, DTensor) and hasattr(param._local_tensor, "__create_chunk_list__"):
             param_map[name] = param
 
+    missing_src_metadata = []
     for key, value in state_dict.items():
         if not isinstance(value, DTensor):
             continue
         param = _find_param_in_map(key, param_map)
         if param is not None:
             copy_chunk_metadata(param, value)
+        else:
+            has_meta = hasattr(value._local_tensor, "__create_chunk_list__")
+            missing_src_metadata.append((key, value.shape, value._local_tensor.shape, has_meta))
+
+    if missing_src_metadata:
+        if torch.distributed.get_rank() == 0:
+            logger.warning(
+                "[chunk_metadata_diag] _propagate_chunk_metadata_to_state_dict: "
+                f"{len(missing_src_metadata)} DTensor(s) in state_dict could NOT be matched to "
+                "a model parameter with __create_chunk_list__. Their metadata (if any) comes "
+                "from preprocess_state_dict_for_uneven_dtensor only."
+            )
+            for key, global_shape, local_shape, has_meta in missing_src_metadata:
+                logger.warning(
+                    f"  key={key} global_shape={tuple(global_shape)} "
+                    f"local_shape={tuple(local_shape)} has_create_chunk_list={has_meta}"
+                )
 
 
 def _apply_mcore_postprocess(raw_state_dict, args, model):
@@ -628,15 +647,57 @@ def _apply_mcore_postprocess(raw_state_dict, args, model):
             )
 
     flattened_sd = flatten_state_dict_keys(state_dict)
-    for key, value in flattened_sd.items():
-        if isinstance(value, DTensor):
-            assert hasattr(value._local_tensor, "__create_chunk_list__"), (
-                f"DTensor for key '{key}' is missing chunk metadata. This may cause issues"
-                f" with checkpointing. Ensure that the model parameters have chunk metadata"
-                f" and that it is properly propagated."
-            )
+    _verify_chunk_metadata(flattened_sd)
 
     return state_dict
+
+
+def _verify_chunk_metadata(flattened_sd: dict) -> None:
+    """Verify every DTensor has correct ``__create_chunk_list__`` metadata.
+
+    Checks both existence AND consistency (chunks total numel must match
+    local tensor numel).  On failure, prints diagnostic information
+    including the metadata source tag and shape details.
+    """
+    failures = []
+    for key, value in flattened_sd.items():
+        if not isinstance(value, DTensor):
+            continue
+        lt = value._local_tensor
+        if not hasattr(lt, "__create_chunk_list__"):
+            failures.append(
+                f"MISSING metadata: key={key} global_shape={tuple(value.shape)} "
+                f"local_shape={tuple(lt.shape)} source={get_chunk_meta_source(value)}"
+            )
+            continue
+
+        cl = lt.__create_chunk_list__()
+        cl_total = sum(c.sizes[0] for c in cl)
+        local_numel = lt.numel()
+        if cl_total != local_numel:
+            cl_detail = [(tuple(c.offsets), tuple(c.sizes)) for c in cl]
+            failures.append(
+                f"NUMEL MISMATCH: key={key} "
+                f"global_shape={tuple(value.shape)} "
+                f"local_shape={tuple(lt.shape)} "
+                f"local_numel={local_numel} "
+                f"chunks_total={cl_total} "
+                f"chunk_list={cl_detail} "
+                f"source={get_chunk_meta_source(value)} "
+                f"device_mesh={value.device_mesh}"
+            )
+
+    if failures:
+        logger.error(
+            "[chunk_metadata_verify] %d DTensor(s) have invalid chunk metadata:",
+            len(failures),
+        )
+        for msg in failures:
+            logger.error("  %s", msg)
+        raise AssertionError(
+            f"{len(failures)} DTensor(s) have invalid chunk metadata. "
+            "See log above for details."
+        )
 
 
 def flatten_state_dict_keys(state_dict, parent_key="", sep="."):

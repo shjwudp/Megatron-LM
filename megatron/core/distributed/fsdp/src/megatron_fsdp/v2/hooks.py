@@ -232,7 +232,7 @@ def _register_backward_pre_hook(module: FSDPModule):
                     # micro-batches.  ``overwrite_main_grad`` tells TE to
                     # overwrite instead.
                     setattr(param, "overwrite_main_grad", True)
-            if hasattr(param_group, "main_grad_buffer"):
+            if param_group.main_grad_buffer is not None:
                 param_group.main_grad_buffer.unshard()
 
     module._mfsdp_backward_pre_hook = create_custom_backward_hook(
