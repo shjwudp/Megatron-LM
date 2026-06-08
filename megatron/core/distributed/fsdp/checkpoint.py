@@ -22,7 +22,8 @@ Provides:
   and applies MCore post-processing.
 - Post-processing functions for Megatron FSDP v2 state dicts:
   ``handle_swiglu_in_state_dict_v2``, ``handle_gdn_in_state_dict_v2``,
-  ``handle_experts_in_state_dict``, ``handle_fp8_extra_state_case``.
+  ``handle_mamba_in_state_dict_v2``, ``handle_experts_in_state_dict``,
+  ``handle_fp8_extra_state_case``.
 """
 
 import logging
@@ -50,6 +51,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
+try:
+    from megatron.core.ssm.mamba_mixer import MambaMixer
+except ImportError:
+    MambaMixer = None
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -63,6 +69,7 @@ __all__ = [
     "handle_experts_in_state_dict",
     "handle_swiglu_in_state_dict_v2",
     "handle_gdn_in_state_dict_v2",
+    "handle_mamba_in_state_dict_v2",
 ]
 
 _MODULE_PREFIX = "module."
@@ -79,15 +86,9 @@ class MegatronFSDPStateful(Stateful):
     Implements DCP's ``Stateful`` protocol.  ``state_dict()`` uses
     ``get_state_dict`` from ``uneven_dtensor`` (which preprocesses DTensors
     for uneven sharding and produces FQN-keyed optimizer states), then applies
-    MCore post-processing (SwiGLU, GDN, FP8, expert remapping — see individual
-    ``handle_*_v2`` functions).  ``load_state_dict()`` uses PyTorch's
+    MCore post-processing (SwiGLU, GDN, MambaMixer, FP8, expert remapping — see
+    individual ``handle_*_v2`` functions).  ``load_state_dict()`` uses PyTorch's
     ``set_state_dict``.
-
-    Parameters:
-        model: FSDP v2 wrapped model.
-        optimizer: Optional optimizer to checkpoint alongside the model.
-        args: Optional MCore args namespace for post-processing config
-            (``swiglu``, ``num_experts``, ``gdn``).
     """
 
     def __init__(
@@ -444,6 +445,105 @@ def handle_gdn_in_state_dict_v2(
 
 
 # ------------------------------------------------------------------
+# MambaMixer key patterns and helpers
+# ------------------------------------------------------------------
+
+_MAMBA_MIXER_IN_PROJ_NAMES = ["z", "x", "B", "C", "dt"]
+_MAMBA_MIXER_CONV1D_NAMES = ["x", "B", "C"]
+
+_MAMBA_MIXER_KEY_PATTERNS = [
+    r"(.*)\.mixer\.in_proj\.weight$",
+    r"(.*)\.mixer\.conv1d\.weight$",
+    r"(.*)\.mixer\.conv1d\.bias$",
+]
+
+
+def _detect_mamba_mixers(model: nn.Module) -> dict:
+    """Return ``{layer_path: MambaMixer_module}`` for MambaMixer layers."""
+    if MambaMixer is None:
+        return {}
+    _mixers = {}
+    for name, module in model.named_modules():
+        if isinstance(module, MambaMixer):
+            _mixers[_strip_wrappers(name)] = module
+    return _mixers
+
+
+def _mamba_mixer_detector(key, dtensor, model, mixer_map):
+    """Detector for MambaMixer fused parameters.
+
+    Returns ``(sizes, names, dim)`` for keys matching ``mixer.in_proj.*``
+    or ``mixer.conv1d.*``, using the TP-local dimensions from the owning
+    ``MambaMixer`` module.  Returns ``None`` for non-mamba keys.
+    """
+    if not _MAMBA_MIXER_KEY_PATTERNS or MambaMixer is None:
+        return None
+    dim = 0
+    for pat in _MAMBA_MIXER_KEY_PATTERNS:
+        m = re.match(pat, key)
+        if not m:
+            continue
+        prefix = m.group(1)
+        mixer_module = mixer_map.get(prefix)
+        if mixer_module is None:
+            # Strip module. prefix and retry
+            alt = prefix
+            while alt.startswith(_MODULE_PREFIX):
+                alt = alt[len(_MODULE_PREFIX):]
+                mixer_module = mixer_map.get(alt)
+                if mixer_module is not None:
+                    break
+        if mixer_module is None:
+            return None
+        if "in_proj.weight" in key:
+            sizes = [
+                mixer_module.d_inner_local_tp,
+                mixer_module.d_inner_local_tp,
+                mixer_module.ngroups_local_tp * mixer_module.d_state,
+                mixer_module.ngroups_local_tp * mixer_module.d_state,
+                mixer_module.nheads_local_tp,
+            ]
+            return (sizes, _MAMBA_MIXER_IN_PROJ_NAMES, dim)
+        if "conv1d.weight" in key or "conv1d.bias" in key:
+            sizes = [
+                mixer_module.d_inner_local_tp,
+                mixer_module.ngroups_local_tp * mixer_module.d_state,
+                mixer_module.ngroups_local_tp * mixer_module.d_state,
+            ]
+            return (sizes, _MAMBA_MIXER_CONV1D_NAMES, dim)
+    return None
+
+
+def handle_mamba_in_state_dict_v2(
+    model: nn.Module, model_state_dict: dict, optimizer_state_dict: Optional[dict]
+) -> Tuple[dict, Optional[dict]]:
+    """Split fused MambaMixer parameters into per-component DTensors.
+
+    Splits ``mixer.in_proj.weight`` → ``.z`` / ``.x`` / ``.B`` / ``.C`` / ``.dt``
+    and ``mixer.conv1d.{weight,bias}`` → ``.x`` / ``.B`` / ``.C``, using
+    TP-local dimensions read from each ``MambaMixer`` module.
+    Delegates to :func:`_split_fused_params_v2`.
+    """
+    if MambaMixer is None:
+        return model_state_dict, optimizer_state_dict
+    mixer_map = _detect_mamba_mixers(model)
+    if not mixer_map:
+        return model_state_dict, optimizer_state_dict
+
+    def detector(key, dtensor, _model):
+        return _mamba_mixer_detector(key, dtensor, _model, mixer_map)
+
+    return _split_fused_params_v2(
+        model,
+        model_state_dict,
+        optimizer_state_dict,
+        detector,
+        lambda k, s: f"{k}.{s}",
+        "MambaMixer",
+    )
+
+
+# ------------------------------------------------------------------
 # Unified post-processing
 # ------------------------------------------------------------------
 
@@ -487,7 +587,7 @@ def _apply_mcore_postprocess(raw_state_dict, args, model):
     """Apply MCore-specific state dict post-processing.
 
     Copies *raw_state_dict*, wraps optimizer states as DTensors, then
-    applies FP8 cleanup, SwiGLU/GDN split, and expert key remapping.
+    applies FP8 cleanup, SwiGLU/GDN/MambaMixer split, and expert key remapping.
     The original *raw_state_dict* is not mutated.
     """
     state_dict = raw_state_dict.copy()
@@ -510,6 +610,12 @@ def _apply_mcore_postprocess(raw_state_dict, args, model):
         state_dict["model"] = model_sd
         if new_opt is not None:
             state_dict["optimizer"] = new_opt
+
+    opt_sd = state_dict.get("optimizer")
+    model_sd, new_opt = handle_mamba_in_state_dict_v2(model, state_dict["model"], opt_sd)
+    state_dict["model"] = model_sd
+    if new_opt is not None:
+        state_dict["optimizer"] = new_opt
 
     num_experts = getattr(args, "num_experts", None)
     if num_experts:
@@ -1177,7 +1283,13 @@ def _canonicalize_td_key(td_key, *, strip_model_prefix=True):
     return key
 
 
-def _load_torch_dist_into_megatron_fsdp_v2(args, checkpoint_name, v2_state_dict, strict=True):
+def _load_torch_dist_into_megatron_fsdp_v2(
+    args,
+    checkpoint_name,
+    model,
+    v2_state_dict,
+    strict=True,
+):
     """Load a torch_dist checkpoint into a Megatron FSDP v2 skeleton via DCP.
 
     This is the entry point for online checkpoint conversion from
@@ -1188,6 +1300,10 @@ def _load_torch_dist_into_megatron_fsdp_v2(args, checkpoint_name, v2_state_dict,
 
     1. **Preprocess & verify** — wrap optimizer states as uneven DTensors
        and verify ``__create_chunk_list__`` / ``__create_write_items__`` metadata.
+       When ``args.mamba`` is True, split fused MambaMixer params
+       (``in_proj.weight`` → ``.z`` / ``.x`` / ``.B`` / ``.C`` / ``.dt``,
+       ``conv1d.*`` → ``.x`` / ``.B`` / ``.C``) so they match the torch_dist
+       split keys.
     2. **Build name mapping** — match torch_dist metadata keys to v2 DTensors,
        handling fused layers, GroupedMLP, and SequentialMLP expert formats.
     3. **DCP load 1:1 entries** — load regular model weights and optimizer
@@ -1204,6 +1320,20 @@ def _load_torch_dist_into_megatron_fsdp_v2(args, checkpoint_name, v2_state_dict,
     from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 
     # ---- Phase 1: Preprocess & verify v2 state dict ----
+
+    # Split fused MambaMixer params so that the sub-keys match the
+    # torch_dist checkpoint (which stores e.g. ``in_proj.weight.z``).
+    if model is not None:
+        if isinstance(model, (list, tuple)):
+            assert len(model) == 1
+            model = model[0]
+        model_sd, new_opt = handle_mamba_in_state_dict_v2(
+            model, v2_state_dict["model"], v2_state_dict.get("optimizer")
+        )
+        v2_state_dict["model"] = model_sd
+        if new_opt is not None:
+            v2_state_dict["optimizer"] = new_opt
+
     v2_by_canonical, v2_optim_state = _preprocess_and_verify_v2_state_dict(v2_state_dict)
 
     # ---- Phase 2: Read torch_dist metadata & build name mapping ----

@@ -87,6 +87,48 @@ Mixin class added to wrapped modules. Methods:
 | `reshard()` | Post-forward, post-backward | Release unsharded buffer |
 | `reduce_grad()` | Post-backward / grad sync | Reduce-scatter gradients into optimizer-facing shards |
 
+### CUDA Graph Capture
+
+FSDP v2 supports transparent CUDA graph capture for individual FSDP modules.
+Enable it per-module with ``enable_cuda_graph=True``:
+
+```python
+for layer in model.layers:
+    fully_shard(layer, enable_cuda_graph=True)
+fully_shard(model)  # root without CUDA graph
+```
+
+Capture happens automatically on the first optimized forward pass
+(after the trace pool has been planned).  Subsequent forward passes replay
+the captured graph, bypassing FSDP hooks entirely for that module.
+
+**How it works:**
+
+1. The forward pre-hook detects ``enable_cuda_graph=True`` and creates an
+   ``FSDPCudaGraphRunner`` for the module.
+2. The runner pops FSDP hooks, warms up via ``make_graphed_callables``,
+   and captures the module's ``forward()`` (without FSDP collectives) into a
+   CUDA graph.
+3. After capture, ``install()`` patches ``module.forward`` to a wrapper
+   that replays the graph on subsequent calls.
+4. During graph replay, side-stream collectives are suppressed
+   (``cuda_graph_active=True`` on the root context) and reshard is
+   deferred to the post-backward final callback.
+
+**Limitation — nesting:** A parent FSDP module that contains other FSDP
+modules as children **cannot** use ``enable_cuda_graph=True``.  Only leaf
+FSDP modules (those without FSDP children) are eligible.  Attempting to
+enable CUDA graph on a module with FSDP children raises a ``RuntimeError``.
+
+```python
+# OK — layers are leaf FSDP modules (no FSDP children inside them)
+for layer in model.layers:
+    fully_shard(layer, enable_cuda_graph=True)
+
+# NOT OK — model contains FSDP layers as children
+fully_shard(model, enable_cuda_graph=True)   # raises RuntimeError
+```
+
 ### DataParallelBuffer
 
 Flat buffer managing (a shard of) parameter/gradient data:
@@ -142,6 +184,14 @@ See the parent directory `..` for `uneven_dtensor.py` which provides:
 Only `optim_grads_params` (ZeRO-3 equivalent) is implemented. `no_shard`
 (DDP-like), `optim` (ZeRO-1), and `optim_grads` (ZeRO-2) are planned but
 not yet available.
+
+### CUDA Graph
+
+- **Nesting not supported.** A parent FSDP module that contains other FSDP
+  modules as children cannot use ``enable_cuda_graph=True``.  Only leaf FSDP
+  modules (those without FSDP children) are eligible for CUDA graph capture.
+  Attempting to enable CUDA graph on a nested FSDP module raises a
+  ``RuntimeError``.
 
 ### `fully_shard()` API Parameters
 
@@ -219,6 +269,7 @@ without any Megatron-LM dependency once the package is released.
 See `examples/megatron_fsdp/fsdp_toy.py` for a standalone example showing:
 
 - Basic model wrapping with `fully_shard()`
+- CUDA graph capture (`--cuda-graph` / `--no-cuda-graph`)
 - Training loop with gradient accumulation
 - Activation checkpointing (`--activation-checkpoint`)
 - Distributed checkpointing with `torch.distributed.checkpoint`
@@ -231,6 +282,11 @@ torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
 torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
     --model-dim 512 --n-layers 2 --batch-size 4 \
     --use-megatron-fsdp --activation-checkpoint
+
+# Disable CUDA graph capture
+torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
+    --model-dim 512 --n-layers 2 --batch-size 4 \
+    --use-megatron-fsdp --no-cuda-graph
 ```
 
 ## Gotchas / Pitfalls

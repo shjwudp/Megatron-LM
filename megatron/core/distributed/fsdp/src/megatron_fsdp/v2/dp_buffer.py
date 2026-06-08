@@ -544,36 +544,30 @@ class DataParallelBuffer:
     @torch.no_grad()
     def unshard(
         self,
-        bind_params: bool = True,
+        bind_params: bool = False,
     ) -> torch.Tensor:
         """All-gather the full buffer from all shards and bind parameter storage.
 
         For non-distributed buffers self.data is already full, so
         self.data is returned directly. If a replicated buffer only has this
         rank's updated shard, the shard is all-gathered into self.data first.
-
-        Memory allocation always occurs on the default stream for deterministic
-        caching-allocator behaviour.  Only the all-gather collective runs on the
-        caller's stream (which may be a side stream for overlap).
         """
         assert self.data is not None
+        # For non-distributed buffers, the full buffer is already available in self.data,
+        # so we can skip the all-gather and just return it.
+        if not self.is_distributed and not self._dirty:
+            return self.data
 
         shard_buffer = None
-        if self._dirty:
-            assert not self.is_distributed, "dirty unshard requires a replicated buffer"
-            full_buffer = self.data
-            sm = self.buffer_index.shard_meta
-            shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
-        elif self.is_distributed:
+        if self.is_distributed:
             if self._unsharded_buffer is None:
                 default_stream = torch.cuda.default_stream(self.device)
-                with torch.cuda.stream(default_stream):
-                    bucket = self.allocator.allocate(
-                        key=self.alloc_key,
-                        size=self.buffer_index.bucket_meta.size,
-                        dtype=self.dtype,
-                        device=self.device,
-                    )
+                bucket = self.allocator.allocate(
+                    key=self.alloc_key,
+                    size=self.buffer_index.bucket_meta.size,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
                 torch.cuda.current_stream().wait_stream(default_stream)
                 self._unsharded_buffer = bucket.data
                 sm = self.buffer_index.shard_meta
@@ -581,18 +575,21 @@ class DataParallelBuffer:
             full_buffer = self._unsharded_buffer
         else:
             full_buffer = self.data
+            sm = self.buffer_index.shard_meta
+            shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
 
-        if shard_buffer is not None:
-            torch.distributed.all_gather_into_tensor(
-                output_tensor=full_buffer,
-                input_tensor=shard_buffer,
-                group=self.dp_group,
-            )
-            if self._dirty:
-                self._dirty = False
+        torch.distributed.all_gather_into_tensor(
+            output_tensor=full_buffer,
+            input_tensor=shard_buffer,
+            group=self.dp_group,
+        )
 
         if bind_params:
             self._bind_buffer_to_params(full_buffer)
+
+        # After unsharding, the full buffer is up-to-date, so we can clear the dirty flag.
+        if self._dirty:
+            self._dirty = False
 
         return full_buffer
 
@@ -632,13 +629,12 @@ class DataParallelBuffer:
         if self.is_distributed:
             if self._unsharded_buffer is None:
                 default_stream = torch.cuda.default_stream(self.device)
-                with torch.cuda.stream(default_stream):
-                    bucket = self.allocator.allocate(
-                        key=self.alloc_key,
-                        size=self.buffer_index.bucket_meta.size,
-                        dtype=self.dtype,
-                        device=self.device,
-                    )
+                bucket = self.allocator.allocate(
+                    key=self.alloc_key,
+                    size=self.buffer_index.bucket_meta.size,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
                 torch.cuda.current_stream().wait_stream(default_stream)
                 self._unsharded_buffer = bucket.data
             full = self._unsharded_buffer
@@ -651,7 +647,11 @@ class DataParallelBuffer:
         return full
 
     @torch.no_grad()
-    def reduce_grad(self, grad_comm_dtype: Optional[torch.dtype] = None):
+    def reduce_grad(
+        self,
+        grad_comm_dtype: Optional[torch.dtype] = None,
+        overwrite_grad: bool = False,
+    ):
         """Reduce gradients into the optimizer-facing local shard.
 
         For distributed buffers, this reduce-scatters a temporary full gradient
@@ -695,7 +695,10 @@ class DataParallelBuffer:
             # accumulated into ``local_grad_shard`` for gradient accumulation.
             input_buffer = self.fetch_buffer()
             output_offset = sm.bucket_data_index
-            accumulate_output = True
+            if overwrite_grad:
+                accumulate_output = False
+            else:
+                accumulate_output = True
         else:
             # ZeRO-1 (optim): ``self.data`` is the replicated full grad
             # accumulation buffer. The optimizer consumes only this rank's
@@ -704,6 +707,7 @@ class DataParallelBuffer:
             input_buffer = self.data
             output_offset = sm.local_data_index
             accumulate_output = False
+            overwrite_grad = False
 
         comm_input = (
             input_buffer if grad_comm_dtype == self.dtype else input_buffer.to(grad_comm_dtype)
@@ -716,10 +720,12 @@ class DataParallelBuffer:
             output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
         )
 
-        if accumulate_output:
+        if overwrite_grad:
+            local_grad_shard.copy_(reduced_grad_shard)
+        elif accumulate_output:
             local_grad_shard += reduced_grad_shard
         elif grad_comm_dtype != self.dtype:
-            local_grad_shard.copy_(reduced_grad_shard.to(self.dtype))
+            local_grad_shard.copy_(reduced_grad_shard)
 
 
 def check_all_fsdp_buffers(module) -> bool:
