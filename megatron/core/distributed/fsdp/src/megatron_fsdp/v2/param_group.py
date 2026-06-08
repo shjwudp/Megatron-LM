@@ -234,10 +234,6 @@ class ParameterGroup:
         ):
             if weight_buffer is None:
                 continue
-            if not weight_buffer.is_distributed:
-                # Replicated buffers still need DataParallelBuffer.unshard() to
-                # rebind original parameter storage before the module uses it.
-                return False
             if not weight_buffer.is_unsharded():
                 return False
         return True

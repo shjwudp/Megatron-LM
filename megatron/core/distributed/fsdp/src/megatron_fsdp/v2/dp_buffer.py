@@ -652,6 +652,10 @@ class DataParallelBuffer:
             input_tensor=shard_buffer,
             group=self.dp_group,
         )
+        if full_buffer.is_cuda:
+            # Temporary all-gather buckets may be released from another stream before
+            # the collective finishes; record the producer stream for allocator safety.
+            full_buffer.record_stream(torch.cuda.current_stream())
 
         if bind_params:
             self._bind_buffer_to_params(full_buffer)
@@ -766,6 +770,9 @@ class DataParallelBuffer:
                 accumulate_output = False
             else:
                 accumulate_output = True
+            if input_buffer.is_cuda:
+                # Keep temporary reduce-scatter buffers tied to the stream that uses them.
+                input_buffer.record_stream(torch.cuda.current_stream())
         else:
             # ZeRO-1 (optim): ``self.data`` is the replicated full grad
             # accumulation buffer. The optimizer consumes only this rank's
