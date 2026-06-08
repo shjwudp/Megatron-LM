@@ -358,7 +358,7 @@ class FSDPCudaGraphRunner:
         """Unshard the main grad buffer for all param groups."""
         for group in self._module._fsdp_param_groups:
             if hasattr(group, "main_grad_buffer"):
-                group.main_grad_buffer.unshard()
+                group.main_grad_buffer.fetch_buffer()
 
     def reshard_main_grad_buffer(self):
         """Reshard the main grad buffer for all param groups."""

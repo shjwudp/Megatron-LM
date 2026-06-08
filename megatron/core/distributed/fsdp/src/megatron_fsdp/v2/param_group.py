@@ -212,7 +212,7 @@ class ParameterGroup:
         # Initially, gradients are zeroed.
         self.is_zero_grad = True
 
-    def unshard(self, bwd_pass: bool = False):
+    def unshard(self, bwd_pass: bool = False, bind_params: bool = True):
         """
         Unshard model weights by all-gathering from sharded buffer.
 
@@ -223,7 +223,7 @@ class ParameterGroup:
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
             if weight_buffer is not None:
-                weight_buffer.unshard(bind_params=True)
+                weight_buffer.unshard(bind_params=bind_params)
 
         self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
 

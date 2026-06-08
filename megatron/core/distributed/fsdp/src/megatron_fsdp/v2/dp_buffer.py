@@ -483,8 +483,6 @@ class DataParallelBuffer:
 
         self.data: Optional[torch.Tensor] = None
         self._unsharded_buffer: Optional[torch.Tensor] = None
-        # Set when a replicated buffer only has this rank's updated shard.
-        self._dirty = False
 
     # ------------------------------------------------------------------ #
     #  Public API
@@ -611,9 +609,10 @@ class DataParallelBuffer:
 
     def is_unsharded(self) -> bool:
         """Return whether this buffer currently has a full unsharded view."""
-        return not self._dirty and (
-            not self.is_distributed or self._unsharded_buffer is not None
-        )
+        full_tensor = self._unsharded_buffer if self.is_distributed else self.data
+        if full_tensor is not None and not getattr(full_tensor, "_dirty", True):
+            return True
+        return False
 
     @torch.no_grad()
     def unshard(
@@ -627,26 +626,24 @@ class DataParallelBuffer:
         rank's updated shard, the shard is all-gathered into self.data first.
         """
         assert self.data is not None
-        # For non-distributed buffers, the full buffer is already available in self.data,
-        # so we can skip the all-gather and just return it.
-        if not self.is_distributed and not self._dirty:
-            return self.data
-
-        shard_buffer = None
         if self.is_distributed:
             if self._unsharded_buffer is None:
-                default_stream = torch.cuda.default_stream(self.device)
                 bucket = self.allocator.allocate(
                     key=self.alloc_key,
                     size=self.buffer_index.bucket_meta.size,
                     dtype=self.dtype,
                     device=self.device,
                 )
-                torch.cuda.current_stream().wait_stream(default_stream)
                 self._unsharded_buffer = bucket.data
             full_buffer = self._unsharded_buffer
         else:
             full_buffer = self.data
+
+        if not getattr(full_buffer, "_dirty", True):
+            # If the full buffer is "clean", it means it already has the up-to-date
+            # full data (e.g. from a previous unshard or because it's non-distributed),
+            # so we can skip the all-gather and just return it directly.
+            return full_buffer
 
         sm = self.buffer_index.shard_meta
         shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
@@ -659,9 +656,7 @@ class DataParallelBuffer:
         if bind_params:
             self._bind_buffer_to_params(full_buffer)
 
-        # After unsharding, the full buffer is up-to-date, so we can clear the dirty flag.
-        if self._dirty:
-            self._dirty = False
+        setattr(full_buffer, "_dirty", False)
 
         return full_buffer
 

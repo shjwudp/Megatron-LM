@@ -105,21 +105,6 @@ def _register_fine_grained_forward_pre_hooks(module: FSDPModule):
         _register_forward_pre_hook(module, hook_module=submodule)
 
 
-def _register_forward_hook(module: FSDPModule):
-    """Register post-forward hook to reshard parameters."""
-
-    def reshard_param_groups(module, *unused):
-        ctx = module._fsdp_root_context
-        assert not ctx.cuda_graph_active, (
-            "hooks must not fire during CUDA graph capture"
-        )
-        if ctx.backward_phase and id(module) == ctx.backward_module:
-            return
-        module.reshard()
-
-    module._mfsdp_forward_hook = module.register_forward_hook(reshard_param_groups)
-
-
 def _register_backward_pre_hook(module: FSDPModule):
     """
     Register backward pre-hook using multi-grad hooks on output tensors.

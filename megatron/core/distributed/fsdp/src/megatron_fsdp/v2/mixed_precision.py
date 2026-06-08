@@ -553,10 +553,6 @@ class MixedPrecisionPolicy:
 
         assert model_weight_buffer is not None, "main weights require a model-weight buffer"
 
-        dirty_replicated_buffer = (
-            main_weight_buffer.is_distributed and not model_weight_buffer.is_distributed
-        )
-
         if self.is_nvfp4_param(params[0]):
             quantize_main_weights_to_nvfp4(
                 params, param_idx, data_parallel_group, model_weight_buffer, main_weight_buffer
@@ -583,8 +579,10 @@ class MixedPrecisionPolicy:
                         + main_shard_meta.size
                     ]
                 )
-            if dirty_replicated_buffer:
-                model_weight_buffer._dirty = True
+            if not model_weight_buffer.is_distributed:
+                # Mark the buffer dirty so FSDP knows to all-gather it update
+                # the full model weights before the forward pass.
+                setattr(model_weight_buffer.data, "_dirty", True)
             return
 
         fp8_params = []
@@ -614,10 +612,12 @@ class MixedPrecisionPolicy:
         quantize_main_weights_to_fp8(
             fp8_params, main_params, start_offsets, data_parallel_group, model_param_shards
         )
-        if dirty_replicated_buffer:
-            model_weight_buffer._dirty = True
-            if transpose_weight_buffer is not None:
-                transpose_weight_buffer._dirty = True
+        if not model_weight_buffer.is_distributed:
+            # Mark the buffer dirty so FSDP knows to all-gather it update
+            # the full model weights before the forward pass.
+            setattr(model_weight_buffer.data, "_dirty", True)
+        if not transpose_weight_buffer.is_distributed:
+            setattr(transpose_weight_buffer.data, "_dirty", True)
 
 
 def is_fp8_param(tensor: torch.Tensor) -> bool:
