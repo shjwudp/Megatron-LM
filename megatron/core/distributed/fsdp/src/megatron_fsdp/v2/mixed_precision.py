@@ -557,9 +557,7 @@ class MixedPrecisionPolicy:
             quantize_main_weights_to_nvfp4(
                 params, param_idx, data_parallel_group, model_weight_buffer, main_weight_buffer
             )
-            return
-
-        if not self.is_fp8_param(params[0]):
+        elif not self.is_fp8_param(params[0]):
             if model_weight_buffer.is_distributed and not main_weight_buffer.is_distributed:
                 raise RuntimeError(
                     "Unsupported FSDP main/model weight buffer layout: "
@@ -579,45 +577,41 @@ class MixedPrecisionPolicy:
                         + main_shard_meta.size
                     ]
                 )
-            if not model_weight_buffer.is_distributed:
-                # Mark the buffer dirty so FSDP knows to all-gather it update
-                # the full model weights before the forward pass.
-                setattr(model_weight_buffer.data, "_dirty", True)
-            return
+        else:
+            fp8_params = []
+            main_params = []
+            start_offsets = []
+            model_param_shards = []
+            for param in params:
+                item_id = param_idx[param]
+                model_shard = model_weight_buffer.get_item(item_id, as_shard=True)
+                if model_shard.numel() == 0:
+                    fp8_params.append(param)
+                    main_params.append(None)
+                    start_offsets.append(None)
+                    model_param_shards.append((None, None))
+                    continue
 
-        fp8_params = []
-        main_params = []
-        start_offsets = []
-        model_param_shards = []
-        for param in params:
-            item_id = param_idx[param]
-            model_shard = model_weight_buffer.get_item(item_id, as_shard=True)
-            if model_shard.numel() == 0:
+                transpose_shard = None
+                if transpose_weight_buffer is not None:
+                    transpose_shard = transpose_weight_buffer.get_item(item_id, as_shard=True)
+                main_weight = main_weight_buffer.get_item(item_id, as_shard=True)
+                start_offset, _ = model_weight_buffer.buffer_index._get_item_self_range(item_id)
                 fp8_params.append(param)
-                main_params.append(None)
-                start_offsets.append(None)
-                model_param_shards.append((None, None))
-                continue
+                main_params.append(main_weight)
+                start_offsets.append(start_offset)
+                model_param_shards.append((model_shard, transpose_shard))
 
-            transpose_shard = None
-            if transpose_weight_buffer is not None:
-                transpose_shard = transpose_weight_buffer.get_item(item_id, as_shard=True)
-            main_weight = main_weight_buffer.get_item(item_id, as_shard=True)
-            start_offset, _ = model_weight_buffer.buffer_index._get_item_self_range(item_id)
-            fp8_params.append(param)
-            main_params.append(main_weight)
-            start_offsets.append(start_offset)
-            model_param_shards.append((model_shard, transpose_shard))
+            quantize_main_weights_to_fp8(
+                fp8_params, main_params, start_offsets, data_parallel_group, model_param_shards
+            )
 
-        quantize_main_weights_to_fp8(
-            fp8_params, main_params, start_offsets, data_parallel_group, model_param_shards
-        )
+        # Mark the model weights dirty so FSDP knows to all-gather them before
+        # the forward or backward pass.
         if not model_weight_buffer.is_distributed:
-            # Mark the buffer dirty so FSDP knows to all-gather it update
-            # the full model weights before the forward pass.
-            setattr(model_weight_buffer.data, "_dirty", True)
-        if not transpose_weight_buffer.is_distributed:
-            setattr(transpose_weight_buffer.data, "_dirty", True)
+            model_weight_buffer.data._dirty = True
+        if transpose_weight_buffer is not None and not transpose_weight_buffer.is_distributed:
+            transpose_weight_buffer.data._dirty = True
 
 
 def is_fp8_param(tensor: torch.Tensor) -> bool:

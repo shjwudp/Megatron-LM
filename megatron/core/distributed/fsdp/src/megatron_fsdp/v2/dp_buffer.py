@@ -625,25 +625,7 @@ class DataParallelBuffer:
         self.data is returned directly. If a replicated buffer only has this
         rank's updated shard, the shard is all-gathered into self.data first.
         """
-        assert self.data is not None
-        if self.is_distributed:
-            if self._unsharded_buffer is None:
-                bucket = self.allocator.allocate(
-                    key=self.alloc_key,
-                    size=self.buffer_index.bucket_meta.size,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                self._unsharded_buffer = bucket.data
-            full_buffer = self._unsharded_buffer
-        else:
-            full_buffer = self.data
-
-        if not getattr(full_buffer, "_dirty", True):
-            # If the full buffer is "clean", it means it already has the up-to-date
-            # full data (e.g. from a previous unshard or because it's non-distributed),
-            # so we can skip the all-gather and just return it directly.
-            return full_buffer
+        full_buffer = self.fetch_buffer(as_shard=False)
 
         sm = self.buffer_index.shard_meta
         shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
@@ -660,7 +642,7 @@ class DataParallelBuffer:
         if bind_params:
             self._bind_buffer_to_params(full_buffer)
 
-        setattr(full_buffer, "_dirty", False)
+        setattr(full_buffer, "_dirty", False)  # mark the buffer as clean (unsharded)
 
         return full_buffer
 
@@ -699,17 +681,16 @@ class DataParallelBuffer:
         """
         if self.is_distributed:
             if self._unsharded_buffer is None:
-                default_stream = torch.cuda.default_stream(self.device)
                 bucket = self.allocator.allocate(
                     key=self.alloc_key,
                     size=self.buffer_index.bucket_meta.size,
                     dtype=self.dtype,
                     device=self.device,
                 )
-                torch.cuda.current_stream().wait_stream(default_stream)
                 self._unsharded_buffer = bucket.data
             full = self._unsharded_buffer
         else:
+            assert self.data is not None, "DataParallelBuffer data not initialized"
             full = self.data
 
         if as_shard:

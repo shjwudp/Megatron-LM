@@ -50,7 +50,8 @@ def dist_env():
     device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
     torch.cuda.set_device(device)
     yield
-    torch.distributed.destroy_process_group()
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 # ------------------------------------------------------------------ #
