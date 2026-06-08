@@ -281,14 +281,8 @@ class FSDPCudaGraphRunner:
                 sample_args=flat_sample,
                 num_warmup_iters=3,
                 allow_unused_input=True,
-                pool=self._graph_pool,
+                # pool=self._graph_pool,
             )
-        except Exception as e:
-            raise RuntimeError(
-                f"CUDA graph capture failed for {self._module.__class__.__name__}. "
-                f"Tensor inputs: {tensor_names}, "
-                f"Frozen kwargs keys: {list(frozen_kwargs.keys())}"
-            ) from e
         finally:
             ctx.cuda_graph_active = False
             _restore_hooks_recursive(self._module, saved_hooks)
