@@ -25,7 +25,7 @@ the checkpoint save/load architecture and how it integrates with MCore's
 | Source Format | Target Format | Model | Optimizer | Notes |
 |---------------|--------------|-------|-----------|-------|
 | MFSDP v2 | MFSDP v2 | ✓ | ✓ | Full round-trip and cross-setting (`optim_grads` ↔ `optim_grads_params`) |
-| MFSDP v1 baseline | MFSDP v2 | ✓ | ✓ | Both `fsdp_dtensor` format, canonical key matching |
+| MFSDP v1 baseline | MFSDP v2 | ✗ | ✗ | Currently skipped in tests (``pytest.skip("v1 checkpoint format not available")``).  Both use ``fsdp_dtensor`` format but key names may differ.  Planned for future support. |
 | ND-parallel (`torch_dist`) | MFSDP v2 | ✓ | ✓ (``fully_reshardable`` only) | Online conversion via `_load_torch_dist_into_megatron_fsdp_v2` in `checkpointing.py`. Expert weights are split from flattened multi-expert tensors. Optimizer states (`exp_avg`, `exp_avg_sq`) are loaded into V2's name-based format. Hi-precision FP32 optimizer param copies are used for model weights when available. ``dp_reshardable`` format is not supported (bucket-based layout incompatible with name-based V2 format). |
 | ND-parallel (`torch`) | MFSDP v2 | ✗ | ✗ | Not supported (different serialization) |
 
@@ -53,7 +53,7 @@ format for both paths. It uses DCP directly, storing each parameter as a `DTenso
 | Module | Location | Responsibility |
 |--------|----------|----------------|
 | `uneven_dtensor.py` | `megatron/core/distributed/fsdp/src/megatron_fsdp/` | `get_state_dict`, `preprocess_state_dict_for_uneven_dtensor`, chunk metadata for uneven DTensors |
-| `fsdp_dtensor_checkpoint.py` | `megatron/core/transformer/` | SWiGLU split, GDN split, expert key remapping, FP8 cleanup |
+| `fsdp_dtensor_checkpoint.py` | `megatron/core/transformer/` | (v1 only) SWiGLU split, GDN split, expert key remapping, FP8 cleanup.  v2 equivalents live in ``checkpoint.py``.
 | `distrib_optimizer.py` | `megatron/core/optimizer/` | `state_dict()`, `load_state_dict()`, `sharded_state_dict()`, `sharded_param_state_fsdp_dtensor()` |
 | `checkpointing.py` | `megatron/training/` | High-level save/load orchestration, `_build_megatron_fsdp_v2_state_dict`, `preprocess_fsdp_dtensor_state_dict()` |
 | `checkpoint.py` | `megatron/core/distributed/fsdp/` | `MegatronFSDPStateful`, `_apply_mcore_postprocess`, `_verify_chunk_metadata`, `_propagate_chunk_metadata_to_state_dict`, `_split_fused_params_v2` (SwiGLU+GDN+MambaMixer), `_build_dtensor_optim_sd`, `_preprocess_and_verify_v2_state_dict`, `_build_torch_dist_to_v2_map`, `load_torch_dist_into_fsdp_v2` |
@@ -519,8 +519,7 @@ def load_checkpoint_fsdp_v2(model_chunks, optimizer, ...):
 
 `uneven_dtensor.get_state_dict` adds uneven DTensor chunk metadata in the same call.
 With the raw PyTorch version, `preprocess_state_dict_for_uneven_dtensor` must be called
-separately, and the caller must ensure it is not double-called (once by the wrapper,
-once by `preprocess_fsdp_dtensor_state_dict`). Using `uneven_dtensor.get_state_dict`
+once by `preprocess_state_dict_for_uneven_dtensor`). Using `uneven_dtensor.get_state_dict`
 consolidates this into a single well-tested entry point.
 
 **Why separate the layers?**
@@ -930,8 +929,8 @@ ensures model and optimizer state dict keys are consistent in the checkpoint.
 - [x] Skip `preprocess_fsdp_dtensor_state_dict` for v2 in both save and load paths
       (post-processing already handled by ``_apply_mcore_postprocess`` inside
       ``MegatronFSDPStateful.state_dict()``)
-- [ ] Handle PP: iterate model chunks, build per-chunk state dicts
-- [ ] Handle multi-optimizer (ChainedOptimizer: expert + non-expert optimizers)
+- [ ] Handle PP: iterate model chunks, build per-chunk state dicts (not yet required — all current tests use PP=1)
+- [ ] Handle multi-optimizer (ChainedOptimizer: expert + non-expert optimizers) (not yet required — all current tests use single optimizer)
 
 ### Phase 2: Path A — Standalone Save/Load (`checkpoint.py`)
 

@@ -161,6 +161,13 @@ def handle_experts_in_state_dict(model_state_dict: dict, num_experts: int) -> di
 
     def _replace(key, expert_index, sd):
         new_idx = expert_index + local_expert_start
+        if new_idx == expert_index and not _should_keep(expert_index):
+            logger.warning(
+                "Identity transform for non-local expert key '%s' (expert_index=%d, "
+                "local_expert_start=%d). This expert does not belong to EP rank %d "
+                "but survived in the state dict. Consider removing it instead.",
+                key, expert_index, local_expert_start, ep_rank,
+            )
         # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
         if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
             if key.endswith('_w') or key.endswith('_v'):
@@ -838,7 +845,7 @@ def _maybe_wrap_as_uneven_dtensor(tensor, dist_param: DTensor):
     if isinstance(tensor, DTensor):
         dt = tensor
     else:
-        if isinstance(tensor, DTensor) or not isinstance(tensor, torch.Tensor):
+        if not isinstance(tensor, torch.Tensor):
             return tensor
         if tensor.shape != dist_param._local_tensor.shape:
             return tensor
@@ -890,7 +897,7 @@ def _build_dtensor_optim_sd(raw_opt_state_dict: dict, model: nn.Module) -> dict:
     return opt_state_dict
 
 
-def _preprocess_and_verify_v2_state_dict(v2_state_dict):
+def _preprocess_and_verify_v2_state_dict(v2_state_dict, model=None):
     """Preprocess and verify the Megatron FSDP v2 state dict before DCP loading.
 
     DCP requires DTensors for distributed load, but ``optimizer.load_state_dict``
@@ -903,6 +910,11 @@ def _preprocess_and_verify_v2_state_dict(v2_state_dict):
     Also verifies that every model and shadow optimizer DTensor has
     ``__create_chunk_list__`` and ``__create_write_items__`` metadata.
 
+    Args:
+        v2_state_dict: The v2 state dict (from ``_build_megatron_fsdp_v2_state_dict``).
+        model: The FSDP model (for chunk metadata propagation).  If ``None``,
+            metadata propagation is skipped.
+
     Returns:
         v2_by_canonical: ``{canonical_name: model_DTensor}`` mapping.
         v2_optim_state: ``{canonical_name: {state_key: DTensor}}`` shadow dict.
@@ -911,10 +923,7 @@ def _preprocess_and_verify_v2_state_dict(v2_state_dict):
     v2_optim_state_raw = v2_state_dict.get("optimizer", {}).get("state", {})
 
     # ---- Propagate chunk metadata from model to state dict DTensors ----
-    model = v2_state_dict.get("_model")
     if model is not None:
-        if isinstance(model, (list, tuple)):
-            model = model[0]
         _propagate_chunk_metadata_to_state_dict(model, v2_model)
 
     # ---- Strip ``module.`` prefix from optimizer state keys ----
@@ -1403,7 +1412,7 @@ def _load_torch_dist_into_megatron_fsdp_v2(
         if new_opt is not None:
             v2_state_dict["optimizer"] = new_opt
 
-    v2_by_canonical, v2_optim_state = _preprocess_and_verify_v2_state_dict(v2_state_dict)
+    v2_by_canonical, v2_optim_state = _preprocess_and_verify_v2_state_dict(v2_state_dict, model)
 
     # ---- Phase 2: Read torch_dist metadata & build name mapping ----
     reader = FileSystemReader(checkpoint_name)
@@ -1508,7 +1517,7 @@ def _load_torch_dist_into_megatron_fsdp_v2(
                 chunk = flat[layer_idx]
             if isinstance(v2_val, DTensor):
                 lt = v2_val._local_tensor
-                if lt.numel() != 0:
+                if lt.numel() != 0 and hasattr(lt, "__create_chunk_list__"):
                     local_off = 0
                     for c in lt.__create_chunk_list__():
                         off = c.offsets
