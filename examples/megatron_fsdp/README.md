@@ -10,6 +10,7 @@ Standalone toy example (not Megatron-LM) demonstrating Megatron-FSDP v2 usage:
 
 - Basic model wrapping with `fully_shard()`
 - CUDA graph capture (`--cuda-graph` / `--no-cuda-graph`)
+  > **Experimental** — CUDA graph support is experimental and may change.
 - Activation checkpointing (`--activation-checkpoint`)
 - Distributed checkpointing
 

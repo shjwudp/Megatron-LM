@@ -16,6 +16,7 @@
 
 import inspect
 import gc
+import warnings
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -205,6 +206,12 @@ class FSDPCudaGraphRunner:
         gc_freeze: bool = True,
         graph_pool: Optional[Any] = None,
     ):
+        warnings.warn(
+            "FSDPCudaGraphRunner is an experimental feature. The API and "
+            "behaviour may change in future releases without notice.",
+            FutureWarning,
+            stacklevel=2,
+        )
         self._module: torch.nn.Module = fsdp_module
         self._gc_freeze: bool = gc_freeze
         self._graph_pool: Optional[int] = graph_pool
@@ -233,7 +240,7 @@ class FSDPCudaGraphRunner:
         **sample_kwargs,
     ) -> None:
         assert self._module.cuda_graph_compatible, (
-            "CUDA graph capture requires enable TracePoolAllocator"
+            "CUDA graph capture requires TracePoolAllocator in optimized phase"
         )
 
         # Introspect the module's forward signature

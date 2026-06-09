@@ -99,6 +99,9 @@ Mixin class added to wrapped modules. Methods:
 
 ### CUDA Graph Capture
 
+> **Experimental** — CUDA graph support in Megatron FSDP v2 is an experimental
+> feature.  The API and behaviour may change in future releases without notice.
+
 FSDP v2 supports transparent CUDA graph capture for individual FSDP modules.
 Enable it per-module with ``enable_cuda_graph=True``:
 
@@ -121,9 +124,10 @@ the captured graph, bypassing FSDP hooks entirely for that module.
    CUDA graph.
 3. After capture, ``install()`` patches ``module.forward`` to a wrapper
    that replays the graph on subsequent calls.
-4. During graph replay, side-stream collectives are suppressed
-   (``cuda_graph_active=True`` on the root context) and reshard is
-   deferred to the post-backward final callback.
+4. After capture, ``install()`` patches ``module.forward`` to a wrapper that
+   replays the graph on subsequent calls. During replay, the patched forward
+   calls the graphed callable directly, bypassing FSDP forward hooks entirely.
+   Backward hooks (unshard/reshard/reduce_grad) still fire normally.
 
 **Limitation — nesting:** A parent FSDP module that contains other FSDP
 modules as children **cannot** use ``enable_cuda_graph=True``.  Only leaf
@@ -199,6 +203,9 @@ pipelining) — weights are replicated so no all-gather is needed.
 
 ### CUDA Graph
 
+- **Experimental.** CUDA graph support is experimental. The API and behavior
+  may change in future releases without notice. Enable via
+  ``enable_cuda_graph=True`` on leaf FSDP modules only.
 - **Nesting not supported.** A parent FSDP module that contains other FSDP
   modules as children cannot use ``enable_cuda_graph=True``.  Only leaf FSDP
   modules (those without FSDP children) are eligible for CUDA graph capture.
