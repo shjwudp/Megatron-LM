@@ -32,6 +32,7 @@ from .fsdp_module import FSDPModule
 from .hooks import (
     _register_backward_hook,
     _register_backward_pre_hook,
+    _register_ep_overlap_hooks,
     _register_forward_hook,
     _register_forward_pre_hook,
 )
@@ -59,6 +60,7 @@ def fully_shard(
     enable_trace_pool: bool = False,
     sharding_strategy: str = "optim_grads_params",
     enable_cuda_graph: bool = False,
+    enable_ep_overlap: bool = False,
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -112,13 +114,19 @@ def fully_shard(
         bucket_allocator=bucket_allocator,
         enable_cuda_graph=enable_cuda_graph,
     )
-    module._init_param_main_grad_func()
+    module._init_ptr_main_grad_func()
 
-    _register_forward_pre_hook(
-        fsdp_module=module,
-        fine_grained=mp_policy.fine_grained_forward_hooks_required(module._fsdp_param_groups),
-    )
-    _register_forward_hook(module)
+    if enable_ep_overlap:
+        module.enable_ep_overlap()
+        _register_ep_overlap_hooks(module)
+    else:
+        _register_forward_pre_hook(
+            fsdp_module=module,
+            fine_grained=mp_policy.fine_grained_forward_hooks_required(
+                module._fsdp_param_groups
+            ),
+        )
+        _register_forward_hook(module)
     _register_backward_pre_hook(module)
     _register_backward_hook(module)
 

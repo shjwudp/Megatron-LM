@@ -312,11 +312,17 @@ class FullyShardedDataParallel(_BaseDataParallel):
                         **kwargs
                     )
                 elif isinstance(m, tuple(fsdp_unit_modules)):
+                    is_moe_layer = (
+                        isinstance(m, TransformerLayer)
+                        and m.is_moe_layer
+                        and getattr(config, 'overlap_moe_expert_parallel_comm', False)
+                    )
                     fully_shard(
                         m,
                         mesh=mesh,
                         gradient_scaling_factor=grad_sf,
                         enable_cuda_graph=False,
+                        enable_ep_overlap=is_moe_layer,
                         **kwargs
                     )
         fully_shard(module, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)

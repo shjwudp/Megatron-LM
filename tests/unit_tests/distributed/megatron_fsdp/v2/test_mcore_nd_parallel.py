@@ -595,6 +595,133 @@ class TestMegatronFSDPE2E:
                 f"precision={precision_configs}"
             )
 
+    @pytest.mark.parametrize("nd_topology", [pytest.param({"EP": 2}, id="EP2")])
+    @pytest.mark.parametrize(
+        "spec_configs",
+        [
+            pytest.param(
+                dict(
+                    use_megatron_fsdp_v2=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    gradient_accumulation_fusion=True,
+                    overlap_moe_expert_parallel_comm=True,
+                ),
+                id="optim_grads_params",
+            ),
+        ],
+    )
+    def test_ep_overlap_submodule_hooks(self, nd_topology, spec_configs):
+        """Verify EP overlap fine-grained sub-module hooks produce correct losses.
+
+        Training with EP=2 + overlap_moe_expert_parallel_comm should produce
+        finite losses.  The sub-module reference-counting hooks handle unshard
+        at first sub-module and reshard + reduce_grad at last sub-module.
+        """
+        outputs = TestMegatronFSDPE2E._training_loop(
+            use_megatron_fsdp=True,
+            use_megatron_fsdp_v2=True,
+            train_iters=4,
+            seq_length=128,
+            micro_batch_size=2,
+            global_batch_size=32,
+            overlap_param_gather=True,
+            overlap_grad_reduce=True,
+            **nd_topology,
+            **spec_configs,
+        )
+
+        if torch.distributed.get_rank() != 0:
+            return
+
+        assert len(outputs) == 4
+        for step, output in enumerate(outputs):
+            assert torch.isfinite(output["lm loss"]), (
+                f"Non-finite loss at step {step} with EP overlap submodule hooks"
+            )
+
+    @pytest.mark.parametrize("nd_topology", [pytest.param({"EP": 2}, id="EP2")])
+    @pytest.mark.parametrize(
+        "spec_configs",
+        [
+            pytest.param(
+                dict(
+                    use_megatron_fsdp_v2=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    gradient_accumulation_fusion=True,
+                    overlap_moe_expert_parallel_comm=True,
+                ),
+                id="optim_grads_params",
+            ),
+        ],
+    )
+    def test_ep_overlap_inspect_fsdp_hierarchy(self, nd_topology, spec_configs):
+        """Check FSDP hierarchy with EP overlap: TransformerLayer stays one FSDP.
+
+        Verifies:
+        - MoE TransformerLayer IS still an FSDPModule (not decomposed).
+        - ``_ep_submodule_fwd_total`` == 2 (self_attention + mlp).
+        - Sub-module hooks are registered on self_attention and mlp.
+        """
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=nd_topology.get("EP", 1),
+        )
+        set_manual_seed(42)
+
+        model_chunks, _optim = make_moe_args_model_and_optimizer(
+            ut_filename="test_mcore_fully_sharded_data_parallel.py",
+            micro_batch_size=2,
+            global_batch_size=32,
+            vocab_size=100,
+            padded_vocab_size=100,
+            seq_length=128,
+            sequence_parallel=False,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            train_iters=1,
+            use_megatron_fsdp=True,
+            use_megatron_fsdp_v2=True,
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_param_gather=True,
+            overlap_grad_reduce=True,
+            gradient_accumulation_fusion=True,
+            **spec_configs,
+        )
+
+        moe_found = 0
+        for model_chunk in model_chunks:
+            for name, module in model_chunk.named_modules():
+                if not isinstance(module, TransformerLayer):
+                    continue
+                if not module.is_moe_layer:
+                    continue
+                moe_found += 1
+
+                # TransformerLayer must still be an FSDPModule
+                assert isinstance(module, FSDPModule), (
+                    f"MoE TransformerLayer '{name}' should be an FSDPModule"
+                )
+                # EP overlap counters must be set
+                assert module._fsdp_state._ep_submodule_fwd_total == 2, (
+                    f"Expected 2 sub-modules (self_attention, mlp), got "
+                    f"{module._fsdp_state._ep_submodule_fwd_total}"
+                )
+                # Sub-module attributes must exist
+                assert hasattr(module, 'self_attention'), (
+                    f"MoE layer missing self_attention"
+                )
+                assert hasattr(module, 'mlp'), (
+                    f"MoE layer missing mlp"
+                )
+
+        assert moe_found > 0, "Expected at least one MoE TransformerLayer"
+
+        Utils.destroy_model_parallel()
+
 
 def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
     """

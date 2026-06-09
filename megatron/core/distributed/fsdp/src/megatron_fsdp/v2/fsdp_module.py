@@ -46,6 +46,16 @@ class _FSDPState:
         self._post_backward_callback_queued = False
         self.enable_cuda_graph: bool = False
 
+        # EP overlap reference-counting for sub-module hooks.
+        # When a MoE TransformerLayer is wrapped as one FSDPModule,
+        # fine-grained hooks on self_attention and mlp children use
+        # these counters to defer reshard until all sub-modules
+        # have completed their forward/backward passes.
+        self._ep_submodule_fwd_total: int = 0
+        self._ep_submodule_fwd_done: int = 0
+        self._ep_submodule_bwd_total: int = 0
+        self._ep_submodule_bwd_done: int = 0
+
 
 @dataclass
 class _FSDPRootContext:
@@ -241,6 +251,46 @@ class FSDPModule:
             layer.enable_cuda_graph()   # call before first forward
         """
         self._fsdp_state.enable_cuda_graph = True
+
+    def enable_ep_overlap(self) -> None:
+        """Enable fine-grained sub-module hooks for EP communication overlap.
+
+        Must be called while the module is resharded (before the first
+        forward pass).  Counts the MoE sub-modules (self_attention, mlp)
+        and sets up reference counters so unshard is triggered by the
+        first sub-module and reshard/reduce_grad by the last.
+
+        Only effective when the wrapped module is a ``TransformerLayer``
+        with ``is_moe_layer=True``.  For non-MoE layers this is a no-op.
+        """
+        state = self._fsdp_state
+        submodules = self._count_moe_submodules()
+        if submodules == 0:
+            return
+        state._ep_submodule_fwd_total = submodules
+        state._ep_submodule_bwd_total = submodules
+        state._ep_submodule_fwd_done = 0
+        state._ep_submodule_bwd_done = 0
+
+    def _count_moe_submodules(self) -> int:
+        """Return the number of FSDP-tracked sub-modules in this MoE layer.
+
+        An MoE TransformerLayer has two parameter-bearing sub-modules:
+        ``self_attention`` and ``mlp``.  dispatch/combine are pure
+        communication ops with no parameters, so they are not counted.
+        Returns 0 if the wrapped module is not a MoE TransformerLayer.
+        """
+        try:
+            wrapped = self  # FSDPModule.__class__ is the wrapped type
+        except Exception:
+            return 0
+
+        # Use hasattr because the wrapped type's __init__ sets these
+        if not hasattr(self, 'self_attention') or not hasattr(self, 'mlp'):
+            return 0
+        if not getattr(self, 'is_moe_layer', False):
+            return 0
+        return 2  # self_attention, mlp
 
     def _init_named_param_groups(
         self,

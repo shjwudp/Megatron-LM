@@ -194,7 +194,8 @@ def _register_backward_pre_hook(module: FSDPModule):
                 _register_post_backward_final_callback(module._fsdp_state, module)
 
         # ---- unshard params for backward compute --------------------------
-        module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
+        if module._fsdp_state._ep_submodule_bwd_total == 0:
+            module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
 
         # ---- reset per-module bookkeeping ---------------------------------
         # ``post_backward_issued`` guards against the post-backward path
@@ -249,12 +250,14 @@ def _register_backward_hook(module: FSDPModule):
         )
         ctx.backward_done_modules.add(id(module))
         ctx._advance_backward_module()
-        module.reshard()
-        if any(
-            param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
-            for param_group in module._fsdp_param_groups
-        ):
-            module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+
+        if module._fsdp_state._ep_submodule_bwd_total == 0:
+            module.reshard()
+            if any(
+                param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
+                for param_group in module._fsdp_param_groups
+            ):
+                module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
         module.post_backward_issued = True
 
     @torch.compiler.disable
@@ -389,3 +392,99 @@ def _register_post_backward_final_callback(
     Variable._execution_engine.queue_callback(
         functools.partial(_post_backward_final_callback, state, module)
     )
+
+
+# ------------------------------------------------------------------
+# Fine-grained EP overlap hooks
+# ------------------------------------------------------------------
+
+
+def _register_ep_overlap_hooks(module: FSDPModule) -> None:
+    """Register reference-counted hooks on MoE sub-modules for EP overlap.
+
+    When enabled, the FSDP module's own forward_pre_hook/forward_hook are
+    suppressed and replaced with fine-grained hooks on the MoE sub-modules
+    (self_attention, mlp).  Unshard is triggered by the first sub-module
+    that needs params; reshard/reduce_grad is deferred until the last
+    sub-module completes.
+
+    This is a no-op if ``_ep_submodule_fwd_total`` is 0.
+    """
+    state = module._fsdp_state
+    if state._ep_submodule_fwd_total == 0:
+        return
+
+    _register_submodule_forward_hooks(module)
+    _register_submodule_backward_hooks(module)
+
+
+def _register_submodule_forward_hooks(module: FSDPModule) -> None:
+    """Register forward hooks on self_attention and mlp sub-modules.
+
+    Pre-forward (first sub-module): unshard the entire FSDP buffer.
+    Post-forward (each sub-module): increment counter; if all done → reshard.
+    """
+    state = module._fsdp_state
+    total = state._ep_submodule_fwd_total
+
+    def _make_pre_forward():
+        def _pre_forward(sub, args):
+            if state._ep_submodule_fwd_done == 0:
+                module.unshard(async_op=False, bwd_pass=False)
+        return _pre_forward
+
+    def _make_post_forward():
+        def _post_forward(sub, *unused):
+            state._ep_submodule_fwd_done += 1
+            if state._ep_submodule_fwd_done == total:
+                state._ep_submodule_fwd_done = 0
+                module.reshard()
+        return _post_forward
+
+    for attr_name in ("self_attention", "mlp"):
+        sub = getattr(module, attr_name, None)
+        if sub is None:
+            continue
+        sub.register_forward_pre_hook(
+            _make_pre_forward(), prepend=True, with_kwargs=True
+        )
+        sub.register_forward_hook(_make_post_forward())
+
+
+def _register_submodule_backward_hooks(module: FSDPModule) -> None:
+    """Register backward hooks on mlp and self_attention sub-modules.
+
+    Pre-backward (first sub-module): unshard the entire FSDP buffer.
+    Post-backward (each sub-module): increment counter; if all done →
+    reduce_grad + reshard.
+    """
+    state = module._fsdp_state
+    total = state._ep_submodule_bwd_total
+
+    def _make_pre_backward():
+        def _pre_backward(sub, grad_output):
+            if state._ep_submodule_bwd_done == 0:
+                module.unshard(async_op=False, bwd_pass=True)
+                module.unshard(async_op=False, bwd_pass=False)
+        return _pre_backward
+
+    def _make_post_backward():
+        def _post_backward(sub, *unused):
+            state._ep_submodule_bwd_done += 1
+            if state._ep_submodule_bwd_done == total:
+                state._ep_submodule_bwd_done = 0
+                module.reshard()
+                if any(
+                    param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
+                    for param_group in module._fsdp_param_groups
+                ):
+                    module.reduce_grad(async_op=False)
+        return _post_backward
+
+    # Backward order: mlp first, then self_attention (reverse of forward)
+    for attr_name in ("mlp", "self_attention"):
+        sub = getattr(module, attr_name, None)
+        if sub is None:
+            continue
+        sub.register_full_backward_pre_hook(_make_pre_backward())
+        sub.register_full_backward_hook(_make_post_backward())
