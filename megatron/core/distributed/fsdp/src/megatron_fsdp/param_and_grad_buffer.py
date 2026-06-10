@@ -2134,7 +2134,6 @@ class ParamAndGradBuffer:
                 name="fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
-                fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.main_grad_alloc = FixedPoolAllocator(
                 name="fsdp_grads",
@@ -2500,7 +2499,14 @@ class ParamAndGradBuffer:
                                 gc.collect()
                                 torch.cuda.empty_cache()
 
-                            m.to_empty(device=self.device, recurse=False)
+                            # Materialize only meta tensors in a module, preserving
+                            # non-meta tensors that are already initialized on device.
+                            m._apply(
+                                lambda t: (
+                                    torch.empty_like(t, device=self.device) if t.is_meta else t
+                                ),
+                                recurse=False,
+                            )
                             if (
                                 HAVE_TE
                                 and is_te_min_version("0.9.0")
@@ -3101,7 +3107,6 @@ class ParamAndGradBuffer:
                 if is_blockwise_float8tensor(param):
                     fp8_params.append(param)
                     if model_param.numel() == 0:
-                        # Empty parameter.
                         shard_fp32_from_fp8.append(None)
                         shard_offsets_in_fp8.append(None)
                         shard_model_params.append([None, None])
