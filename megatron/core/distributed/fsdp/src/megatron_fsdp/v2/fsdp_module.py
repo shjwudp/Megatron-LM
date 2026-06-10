@@ -269,6 +269,8 @@ class FSDPModule:
                 for child_submodule in child.modules():
                     ignored_modules.add(child_submodule)
 
+        self._mp_policy = mp_policy
+
         # Materialize meta parameters to actual device
         self._materialize_meta_module(ignored_modules, mesh=mesh, mp_policy=mp_policy)
 

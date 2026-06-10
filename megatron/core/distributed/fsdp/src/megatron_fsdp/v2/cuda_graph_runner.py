@@ -22,6 +22,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+try:
+    from transformer_engine.pytorch.graph import (
+        make_graphed_callables as te_make_graphed_callables,
+        restore_fp8_tensors,
+        save_fp8_tensors,
+    )
+    HAVE_TE_GRAPHS = True
+except ImportError:
+    HAVE_TE_GRAPHS = False
+
 
 # ------------------------------------------------------------------
 # Helpers
@@ -283,13 +293,7 @@ class FSDPCudaGraphRunner:
         ctx.cuda_graph_active = True
         try:
             torch.cuda.synchronize()
-            self._graphed = torch.cuda.make_graphed_callables(
-                shim,
-                sample_args=flat_sample,
-                num_warmup_iters=3,
-                allow_unused_input=True,
-                # pool=self._graph_pool,
-            )
+            self._graphed = self._make_graphed_callables(shim, flat_sample)
         finally:
             ctx.cuda_graph_active = False
             _restore_hooks_recursive(self._module, saved_hooks)
@@ -338,6 +342,26 @@ class FSDPCudaGraphRunner:
         self._module.forward = self._orig_fwd
         self._orig_fwd = None
         self._use_cuda_graph = False
+
+    def _make_graphed_callables(self, shim, sample_args):
+        mp_policy = self._module._mp_policy
+        if mp_policy.fp8.enabled or mp_policy.nvfp4.enabled:
+            assert HAVE_TE_GRAPHS, "Transformer Engine is required for FP8/NVFP4 graph capture"
+            return te_make_graphed_callables(
+                shim,
+                sample_args=sample_args,
+                num_warmup_iters=3,
+                allow_unused_input=True,
+                # pool=self._graph_pool,
+            )
+        else:
+            return torch.cuda.make_graphed_callables(
+                shim,
+                sample_args=sample_args,
+                num_warmup_iters=3,
+                allow_unused_input=True,
+                # pool=self._graph_pool,
+            )
 
     # ------------------------------------------------------------------
     # 3. Properties
