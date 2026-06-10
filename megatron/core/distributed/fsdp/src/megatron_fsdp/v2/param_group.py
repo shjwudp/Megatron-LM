@@ -82,12 +82,10 @@ class ParameterGroup:
         assert mesh.ndim == 1, "Only 1D mesh is supported"
         self.mesh = mesh
         self.dp_group = mesh.get_group()
+        self._dp_rank = torch.distributed.get_rank(self.dp_group)
+        self._dp_world_size = torch.distributed.get_world_size(self.dp_group)
 
-        if sharding_strategy == "no_shard":
-            raise NotImplementedError(
-                "Sharding strategy 'no_shard' is not yet supported in FSDP v2."
-            )
-        if sharding_strategy not in ("optim", "optim_grads", "optim_grads_params"):
+        if sharding_strategy not in ("no_shard", "optim", "optim_grads", "optim_grads_params"):
             raise ValueError(f"Unsupported sharding strategy: {sharding_strategy}")
         self.sharding_strategy = sharding_strategy
         self.param_group_id = param_group_id
@@ -149,7 +147,7 @@ class ParameterGroup:
         Initialize all buffers based on sharding strategy.
 
         Buffer creation logic:
-        - model_weight_buffer: always created unless "no_shard"
+        - model_weight_buffer: always created; replicated unless "optim_grads_params"
         - main_weight_buffer: created if mp_policy.main_params_dtype is specified
         - main_grad_buffer: created if requires_grad
         """
@@ -160,20 +158,19 @@ class ParameterGroup:
 
         # Create model weight buffers. The policy owns dtype-sensitive storage
         # choices and exposes the tensor view that should be packed.
-        if s != "no_shard":
-            model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
-            wbuf = self._create_buffer(model_weight_dtype, shard_weights, "model_weight")
-            wbuf.init_data(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
-            for i, p in enumerate(self.params):
-                wbuf.set_item(i, self.mp_policy.get_param_data(p))
-            self.model_weight_buffer = wbuf
+        model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
+        wbuf = self._create_buffer(model_weight_dtype, shard_weights, "model_weight")
+        wbuf.init_data(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
+        for i, p in enumerate(self.params):
+            wbuf.set_item(i, self.mp_policy.get_param_data(p))
+        self.model_weight_buffer = wbuf
 
-            if self.mp_policy.needs_transpose_weight_buffer(self.params[0]):
-                tbuf = self._create_buffer(torch.uint8, shard_weights, "transpose_weight")
-                tbuf.init_data(torch.empty(tbuf.data_size, dtype=tbuf.dtype, device=self.device))
-                for i, p in enumerate(self.params):
-                    tbuf.set_item(i, self.mp_policy.get_param_data(p, transpose=True))
-                self.transpose_weight_buffer = tbuf
+        if self.mp_policy.needs_transpose_weight_buffer(self.params[0]):
+            tbuf = self._create_buffer(torch.uint8, shard_weights, "transpose_weight")
+            tbuf.init_data(torch.empty(tbuf.data_size, dtype=tbuf.dtype, device=self.device))
+            for i, p in enumerate(self.params):
+                tbuf.set_item(i, self.mp_policy.get_param_data(p, transpose=True))
+            self.transpose_weight_buffer = tbuf
 
         # Create main weight buffer for mixed precision
         main_params_dtype = self.mp_policy.main_params_dtype_for_param(self.params[0])
@@ -210,7 +207,7 @@ class ParameterGroup:
         # Initially, gradients are zeroed.
         self.is_zero_grad = True
 
-    def unshard(self, bwd_pass: bool = False):
+    def unshard(self, bwd_pass: bool = False, bind_params: bool = True):
         """
         Unshard model weights by all-gathering from sharded buffer.
 
@@ -221,7 +218,7 @@ class ParameterGroup:
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
             if weight_buffer is not None:
-                weight_buffer.unshard(bind_params=True)
+                weight_buffer.unshard(bind_params=bind_params)
 
         self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
 
@@ -232,10 +229,6 @@ class ParameterGroup:
         ):
             if weight_buffer is None:
                 continue
-            if not weight_buffer.is_distributed:
-                # Replicated buffers still need DataParallelBuffer.unshard() to
-                # rebind original parameter storage before the module uses it.
-                return False
             if not weight_buffer.is_unsharded():
                 return False
         return True
@@ -370,4 +363,3 @@ class ParameterGroup:
                 if hasattr(dist_param, "decoupled_grad"):
                     dist_param.decoupled_grad = None
         self.is_zero_grad = True
-
