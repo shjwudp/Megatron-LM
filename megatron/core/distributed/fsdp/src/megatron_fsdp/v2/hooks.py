@@ -24,9 +24,9 @@ from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from .allocator import TracePoolAllocator
+from .cuda_graph_runner import FSDPCudaGraphRunner
 from .fsdp_module import FSDPModule, _FSDPState
 from .utils import RegisterFSDPBackwardFunction
-from .cuda_graph_runner import FSDPCudaGraphRunner
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,10 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule, fine_grained: bool = Fal
                     id(fsdp_module),
                 )
             cg_runner = FSDPCudaGraphRunner(
-                fsdp_module, graph_pool=ctx.cuda_graph_pool
+                fsdp_module,
+                graph_pool=ctx.cuda_graph_pool,
+                config=ctx.transformer_config,
+                pg_collection=ctx.pg_collection,
             )
             cg_runner.capture_forward(*args, **kwargs)
             cg_runner.install()

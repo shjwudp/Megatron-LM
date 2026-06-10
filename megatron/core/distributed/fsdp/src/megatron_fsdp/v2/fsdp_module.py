@@ -157,6 +157,14 @@ class _FSDPRootContext:
     graph memory across FSDP modules and reduce total GPU memory
     consumption."""
 
+    transformer_config: Optional[Any] = None
+    """TransformerConfig for building TE FP8/FP4/MXFP8 recipe objects
+    needed by TE's ``make_graphed_callables`` during CUDA graph capture."""
+
+    pg_collection: Optional[Any] = None
+    """ProcessGroupCollection for computing FP8 amax reduction group
+    needed by TE's ``make_graphed_callables`` when TP > 1."""
+
     backward_module: Optional[int] = None
     """``id(module)`` of the FSDP module whose backward is pending next.
     Derived from ``_reversed_order`` and ``backward_done_modules`` — NOT
@@ -388,6 +396,8 @@ class FSDPModule:
         enable_async_reduce_grad,
         bucket_allocator: BucketAllocator,
         enable_cuda_graph: bool = False,
+        transformer_config: Optional[Any] = None,
+        pg_collection: Optional[Any] = None,
     ):
         """Initialize FSDP state and mark nested FSDP modules as non-root.
 
@@ -447,6 +457,8 @@ class FSDPModule:
             enable_async_reduce_grad=enable_async_reduce_grad,
             _reversed_order=list(reversed(forward_order)),
             bucket_allocator=bucket_allocator,
+            transformer_config=transformer_config,
+            pg_collection=pg_collection,
         )
         setattr(self, "_fsdp_state", _FSDPState())
         setattr(self, "_fsdp_root_context", root_context)

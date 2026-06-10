@@ -14,8 +14,8 @@
 
 """CUDA graph capture / replay for individual FSDP modules."""
 
-import inspect
 import gc
+import inspect
 import warnings
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,11 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 try:
-    from transformer_engine.pytorch.graph import (
-        make_graphed_callables as te_make_graphed_callables,
-        restore_fp8_tensors,
-        save_fp8_tensors,
-    )
+    from transformer_engine.pytorch.graph import make_graphed_callables as te_make_graphed_callables
+    from transformer_engine.pytorch.graph import restore_fp8_tensors, save_fp8_tensors
     HAVE_TE_GRAPHS = True
 except ImportError:
     HAVE_TE_GRAPHS = False
@@ -215,6 +212,8 @@ class FSDPCudaGraphRunner:
         fsdp_module: torch.nn.Module,
         gc_freeze: bool = True,
         graph_pool: Optional[Any] = None,
+        config: Optional[Any] = None,
+        pg_collection: Optional[Any] = None,
     ):
         warnings.warn(
             "FSDPCudaGraphRunner is an experimental feature. The API and "
@@ -225,6 +224,8 @@ class FSDPCudaGraphRunner:
         self._module: torch.nn.Module = fsdp_module
         self._gc_freeze: bool = gc_freeze
         self._graph_pool: Optional[int] = graph_pool
+        self._config = config
+        self._pg_collection = pg_collection
 
         # Will hold the callable returned by make_graphed_callables
         self._graphed: Optional[Any] = None
@@ -347,12 +348,13 @@ class FSDPCudaGraphRunner:
         mp_policy = self._module._mp_policy
         if mp_policy.fp8.enabled or mp_policy.nvfp4.enabled:
             assert HAVE_TE_GRAPHS, "Transformer Engine is required for FP8/NVFP4 graph capture"
+            kwargs = self._build_te_graph_kwargs()
             return te_make_graphed_callables(
                 shim,
                 sample_args=sample_args,
                 num_warmup_iters=3,
                 allow_unused_input=True,
-                # pool=self._graph_pool,
+                **kwargs,
             )
         else:
             return torch.cuda.make_graphed_callables(
@@ -360,8 +362,84 @@ class FSDPCudaGraphRunner:
                 sample_args=sample_args,
                 num_warmup_iters=3,
                 allow_unused_input=True,
-                # pool=self._graph_pool,
+                pool=self._graph_pool,
             )
+
+    def _build_te_graph_kwargs(self):
+        """Build Transformer Engine ``make_graphed_callables`` kwargs
+        for FP8 / MXFP8 / NVFP4 quantization support.
+
+        Priority: use ``self._config`` if available (full accuracy), else
+        build a best-effort recipe from the module's ``_mp_policy``.
+        """
+        mp_policy = self._module._mp_policy
+        kwargs = {"fp8_enabled": True, "fp8_weight_caching": True}
+
+        if self._config is not None:
+            from megatron.core.fp4_utils import get_fp4_recipe
+            from megatron.core.fp8_utils import get_fp8_recipe
+
+            if mp_policy.fp8.enabled:
+                kwargs["fp8_recipe"] = get_fp8_recipe(self._config)
+            else:
+                kwargs["fp8_recipe"] = get_fp4_recipe(self._config)
+
+            # Compute fp8_group from pg_collection when available
+            if self._pg_collection is not None:
+                kwargs["fp8_group"] = self._get_amax_reduction_group()
+        else:
+            kwargs["fp8_recipe"] = self._build_te_recipe_from_policy(mp_policy)
+
+        return kwargs
+
+    @staticmethod
+    def _build_te_recipe_from_policy(mp_policy):
+        """Build a best-effort TE recipe object from ``MixedPrecisionPolicy``.
+
+        This is a fallback when ``TransformerConfig`` is unavailable.
+        It uses ``Format.E4M3`` as default fp8 format.  For the ``HYBRID``
+        format, use the batch ``FSDPCudaGraphHelper`` path which has access
+        to the full config.
+        """
+        from transformer_engine.common.recipe import (
+            DelayedScaling,
+            Float8BlockScaling,
+            Float8CurrentScaling,
+            Format,
+            MXFP8BlockScaling,
+            NVFP4BlockScaling,
+        )
+
+        if mp_policy.fp8.enabled:
+            fp8_format = Format.E4M3
+            recipe_name = mp_policy.fp8.recipe
+        else:
+            return NVFP4BlockScaling()
+
+        if recipe_name == "mxfp8":
+            return MXFP8BlockScaling(fp8_format=fp8_format)
+        elif recipe_name == "delayed":
+            return DelayedScaling(fp8_format=fp8_format)
+        elif recipe_name == "tensorwise":
+            return Float8CurrentScaling(fp8_format=fp8_format)
+        elif recipe_name == "blockwise":
+            return Float8BlockScaling(fp8_format=fp8_format)
+        else:
+            return DelayedScaling(fp8_format=fp8_format)
+
+    def _get_amax_reduction_group(self):
+        """Get the FP8 amax reduction group from ``ProcessGroupCollection``."""
+        if self._pg_collection is None:
+            return None
+        # Follow the same pattern as TECudaGraphHelper._get_amax_reduction_group
+        pgc = self._pg_collection
+        if hasattr(pgc, "tp_dp_cp") and pgc.tp_dp_cp is not None:
+            return pgc.tp_dp_cp
+        if hasattr(pgc, "tp_cp") and pgc.tp_cp is not None:
+            return pgc.tp_cp
+        if hasattr(pgc, "tp") and pgc.tp is not None:
+            return pgc.tp
+        return None
 
     # ------------------------------------------------------------------
     # 3. Properties

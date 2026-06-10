@@ -59,6 +59,9 @@ def fully_shard(
     enable_trace_pool: bool = False,
     sharding_strategy: str = "optim_grads_params",
     enable_cuda_graph: bool = False,
+    # --- TE CUDA graph support ---
+    transformer_config: Optional[Any] = None,
+    pg_collection: Optional[Any] = None,
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -111,6 +114,8 @@ def fully_shard(
         enable_async_reduce_grad=enable_async_reduce_grad,
         bucket_allocator=bucket_allocator,
         enable_cuda_graph=enable_cuda_graph,
+        transformer_config=transformer_config,
+        pg_collection=pg_collection,
     )
     module._init_param_main_grad_func()
 
