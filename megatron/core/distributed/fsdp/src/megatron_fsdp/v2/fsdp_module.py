@@ -258,6 +258,9 @@ class FSDPModule:
         """
         ctx = self._fsdp_root_context
         allocator = ctx.bucket_allocator
+        for module in self._get_fsdp_modules(recursive=True):
+            for pg in module._fsdp_param_groups:
+                pg.release_grad_buffer()
 
         if not isinstance(allocator, TracePoolAllocator):
             return
@@ -385,7 +388,9 @@ class FSDPModule:
                 for buf in (pg.model_weight_buffer, pg.transpose_weight_buffer,
                             pg.main_weight_buffer, pg.main_grad_buffer):
                     if buf is not None:
-                        buf._move_data_to(module.device)
+                        buf._move_data_to(
+                            torch.device(f"cuda:{torch.cuda.current_device()}")
+                        )
                 pg._rebuild_dist_views()
 
     def _init_named_param_groups(

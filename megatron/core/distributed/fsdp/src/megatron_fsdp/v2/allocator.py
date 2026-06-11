@@ -505,6 +505,9 @@ class TracePoolAllocator(BucketAllocator):
         **automatically re-allocates** all slots and returns to ``"optimized"``
         — no explicit ``resume()`` call is needed.
         """
+        if self._phase == "released":
+            return
+
         if self._phase == "trace":
             self.reset()
             return
@@ -513,6 +516,7 @@ class TracePoolAllocator(BucketAllocator):
             f"release() requires 'optimized' or 'trace' phase, got '{self._phase}'"
         )
         for slot in self._slots:
+            _free_storage(slot.tensor)
             slot.tensor = torch.empty(0, dtype=slot.dtype, device=slot.device)
             slot.in_use = False
         self._active_keys.clear()

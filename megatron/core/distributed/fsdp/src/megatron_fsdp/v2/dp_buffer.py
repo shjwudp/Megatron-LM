@@ -439,7 +439,12 @@ class DataParallelBuffer:
         self.data = self.data.to(self.device, non_blocking=True)
         return True
 
-    def _move_data_to(self, target_device: torch.device, pin_memory: bool = False) -> None:
+    def _move_data_to(
+        self,
+        target_device: torch.device,
+        pin_memory: bool = False,
+        non_blocking: bool = True,
+    ) -> None:
         """Move ``self.data`` to *target_device*, optionally using pinned memory.
 
         Caller must call ``ParameterGroup._rebuild_dist_views()`` afterwards
@@ -449,10 +454,10 @@ class DataParallelBuffer:
             return
         if target_device.type == "cpu" and pin_memory:
             cpu_data = torch.empty(self.data.shape, dtype=self.data.dtype, pin_memory=True)
-            cpu_data.copy_(self.data, non_blocking=True)
+            cpu_data.copy_(self.data, non_blocking=non_blocking)
             self.data = cpu_data
         else:
-            self.data = self.data.to(target_device, non_blocking=True)
+            self.data = self.data.to(target_device, non_blocking=non_blocking)
 
     def check_no_local_overlap(self, label: str = "") -> bool:
         """
