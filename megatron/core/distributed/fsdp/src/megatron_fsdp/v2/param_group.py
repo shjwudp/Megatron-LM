@@ -328,7 +328,7 @@ class ParameterGroup:
             for param in self.params:
                 if hasattr(param, 'main_grad'):
                     del param.main_grad
-            self.main_grad_buffer.reshard()
+            self.main_grad_buffer.data = None
 
     def _maybe_free_grad_data(self) -> None:
         """Drop ``main_grad_buffer.data`` if all params are zero-graded.
@@ -340,7 +340,10 @@ class ParameterGroup:
         """
         if self.main_grad_buffer is None or self.main_grad_buffer.data is None:
             return
-        if not all(getattr(p, "grad", None) is None for p in self.dist_params):
+        if any(
+            [getattr(p, "grad", None) is not None for p in self.dist_params] +
+            [getattr(p, "decoupled_grad", None) is not None for p in self.dist_params]
+        ):
             return
         self.main_grad_buffer.data = None
         self.dist_grads = [None for _ in self.params]
@@ -463,12 +466,10 @@ class ParameterGroup:
     def zero_grad(self, set_to_none: bool = True):
         """Zero the main gradient buffer and mark grads as zeroed."""
         self.release_grad_buffer()
-        if self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
-            self.main_grad_buffer.data.zero_()
         if set_to_none:
             for dist_param in self.dist_params:
                 if dist_param.grad is not None:
                     del dist_param.grad
                 if hasattr(dist_param, "decoupled_grad"):
-                    dist_param.decoupled_grad = None
+                    del dist_param.decoupled_grad
         self._grad_buffer_is_fresh = True
