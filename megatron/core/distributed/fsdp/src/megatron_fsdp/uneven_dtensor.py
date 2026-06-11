@@ -582,8 +582,8 @@ def make_uneven_dtensor(
     Args:
         local_tensor: Local shard tensor.
         shape: Global shape of the full DTensor.
-        dp_mesh: 1D device mesh.
-        placements: DTensor placements (e.g., [Shard(0)]).
+        dp_mesh: Device mesh.
+        placements: DTensor placements (e.g., [Shard(0)] or [Replicate(), Shard(0)]).
         post_process_uneven: If True, call ``update_uneven_dtensor_chunk_metadata``.
         copy_chunk_meta_from: If set, copy ``__create_chunk_list__`` /
             ``__create_write_items__`` from this DTensor.
@@ -591,7 +591,10 @@ def make_uneven_dtensor(
             are tuples of ints (one per dimension).  Sets chunk metadata
             closures without collectives.
     """
-    assert dp_mesh.ndim == 1, "Only 1D mesh is supported for now"
+    if len(placements) != dp_mesh.ndim:
+        raise ValueError(
+            f"Expected {dp_mesh.ndim} placements for DeviceMesh, got {len(placements)}."
+        )
     if local_tensor.numel() == 0:
         local_shape = (0,) + tuple(shape[1:]) if len(shape) > 1 else (0,)
         local_tensor = local_tensor.reshape(local_shape)

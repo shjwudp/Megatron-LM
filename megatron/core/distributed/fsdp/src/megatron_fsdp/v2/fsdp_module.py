@@ -373,12 +373,15 @@ class FSDPModule:
             m.to(materialization_device)
 
         if mesh is not None and mesh.size() > 1:
-            dp_group = mesh.get_group()
-            src_rank = torch.distributed.get_global_rank(dp_group, 0)
             for param in self.parameters():
                 if param.is_meta or isinstance(param, DTensor):
                     continue
-                torch.distributed.broadcast(param.data, src=src_rank, group=dp_group)
+                for mesh_dim in range(mesh.ndim):
+                    group = mesh.get_group(mesh_dim=mesh_dim)
+                    if torch.distributed.get_world_size(group) == 1:
+                        continue
+                    src_rank = torch.distributed.get_global_rank(group, 0)
+                    torch.distributed.broadcast(param.data, src=src_rank, group=group)
 
     def _init_fsdp_state(
         self,

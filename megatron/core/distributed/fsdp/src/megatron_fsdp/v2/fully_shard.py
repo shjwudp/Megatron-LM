@@ -76,6 +76,8 @@ def fully_shard(
             "Please do not call fully_shard on the same module more than once."
         )
     mesh = mesh or _init_default_fully_shard_mesh()
+    if mesh.ndim != 2:
+        raise ValueError(f"FSDP v2 expects a 2D (outer, inner) DeviceMesh, got {mesh.ndim}D.")
 
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy()

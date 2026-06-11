@@ -152,11 +152,10 @@ def _make_mesh(mesh_case, device):
     assert selected_group is not None
     # Ranks 2/3 use group ranks 0/1 in a group whose global ranks are 2/3. This
     # catches P2P code that accidentally passes group ranks as global peers.
-    _RANK_PAIR_MESH = DeviceMesh.from_group(
-        [selected_group],
-        device_type=device.type,
-        mesh=selected_ranks,
-        mesh_dim_names=("dp",),
+    _RANK_PAIR_MESH = DeviceMesh(
+        device.type,
+        torch.tensor(selected_ranks, dtype=torch.int).reshape(1, -1),
+        mesh_dim_names=("dp_outer", "dp"),
     )
     return _RANK_PAIR_MESH
 

@@ -75,13 +75,21 @@ class ParameterGroup:
 
         # Setup device mesh and derived process group
         if mesh is None:
+            world_ranks = torch.arange(
+                torch.distributed.get_world_size(torch.distributed.group.WORLD)
+            ).reshape(1, -1)
             mesh = DeviceMesh(
                 self.device.type,
-                list(range(torch.distributed.get_world_size(torch.distributed.group.WORLD))),
+                world_ranks,
+                mesh_dim_names=("dp_outer", "dp"),
             )
-        assert mesh.ndim == 1, "Only 1D mesh is supported"
+        if mesh.ndim != 2:
+            raise ValueError(
+                f"FSDP v2 expects a 2D (outer, inner) DeviceMesh, got {mesh.ndim}D."
+            )
         self.mesh = mesh
-        self.dp_group = mesh.get_group()
+        self.outer_dp_group = self.mesh.get_group(mesh_dim=0)
+        self.dp_group = self.mesh.get_group(mesh_dim=1)
         self._dp_rank = torch.distributed.get_rank(self.dp_group)
         self._dp_world_size = torch.distributed.get_world_size(self.dp_group)
 
@@ -296,15 +304,16 @@ class ParameterGroup:
         self.dist_grads = []
         s = self.sharding_strategy
 
-        # Determine placement based on sharding strategy
-        is_param_shard = s in ("optim", "optim_grads", "optim_grads_params")
-        placements = [Shard(dim=0)] if is_param_shard else [Replicate()]
+        is_param_shard = s == "optim_grads_params"
+        is_optim_shard = s != "no_shard"
+        # Mesh layout is (outer, inner); FSDP shards optimizer views on inner.
+        optim_placements = [Replicate(), Shard(dim=0) if is_optim_shard else Replicate()]
 
         # Create parameter DTensor views
         for param in self.params:
             if self.main_weight_buffer is not None:
                 mbuf = self.main_weight_buffer
-                data = mbuf.get_item(self.param_idx[param], as_shard=is_param_shard)
+                data = mbuf.get_item(self.param_idx[param], as_shard=is_optim_shard)
                 param_shape = param.shape
             elif self.model_weight_buffer is not None:
                 wbuf = self.model_weight_buffer
@@ -316,7 +325,7 @@ class ParameterGroup:
 
             dist_param = torch.nn.Parameter(
                 make_uneven_dtensor(
-                    data, param_shape, self.mesh, placements, post_process_uneven=True
+                    data, param_shape, self.mesh, optim_placements, post_process_uneven=True
                 ),
                 requires_grad=param.requires_grad,
             )
@@ -335,10 +344,9 @@ class ParameterGroup:
             self.dist_grads = [None for _ in self.params]
             return
 
-        is_grad_shard = is_param_shard
         for p in self.params:
             gbuf = self.main_grad_buffer
-            grad_data = gbuf.get_item(self.param_idx[p], as_shard=is_grad_shard)
+            grad_data = gbuf.get_item(self.param_idx[p], as_shard=is_optim_shard)
             # NOTE: Do not remove the grad_data.numel() > 0 check.
             # Empty local grad shards are semantically no-ops, but materializing
             # them as DTensor grads can pass zero-numel tensors into fused
@@ -346,7 +354,7 @@ class ParameterGroup:
             # updates for neighboring non-empty shards.
             if p.requires_grad and grad_data.numel() > 0:
                 self.dist_grads.append(
-                    make_uneven_dtensor(grad_data, p.shape, self.mesh, placements)
+                    make_uneven_dtensor(grad_data, p.shape, self.mesh, optim_placements)
                 )
             else:
                 self.dist_grads.append(None)

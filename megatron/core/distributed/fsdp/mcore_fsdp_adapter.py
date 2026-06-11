@@ -242,8 +242,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
-        edp_mesh = _init_dp_mesh(pg_collection, edp=True)
-        dp_mesh = _init_dp_mesh(pg_collection, edp=False)
+        edp_mesh = _init_dp_mesh(pg_collection, ddp_config, edp=True)
+        dp_mesh = _init_dp_mesh(pg_collection, ddp_config, edp=False)
 
         fully_shard_mp_policy = MixedPrecisionPolicy(
             main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
@@ -703,7 +703,7 @@ def _reset_parameters(module):
             parent_fsdp_module_map[m].reshard()
 
 
-def _init_dp_mesh(pg_collection, edp=False):
+def _init_dp_mesh(pg_collection, ddp_config, edp=False):
     assert HAVE_DTENSOR, (
         "DTensor support is required to initialize the device mesh. "
         "Please install a compatible version of PyTorch."
@@ -711,20 +711,33 @@ def _init_dp_mesh(pg_collection, edp=False):
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    if edp:
-        mesh = DeviceMesh.from_group(
-            device_type="cuda",
-            group=pg_collection.expt_dp,
-            mesh=dist.get_process_group_ranks(pg_collection.expt_dp),
-            mesh_dim_names=("edp",),
-        )
-    else:
-        mesh = DeviceMesh.from_group(
-            device_type="cuda",
-            group=pg_collection.dp_cp,
-            mesh=dist.get_process_group_ranks(pg_collection.dp_cp),
-            mesh_dim_names=("dp",),
-        )
+
+    outer_dp_size = max(1, getattr(ddp_config, "num_distributed_optimizer_instances", 1) or 1)
+    inner_group = (
+        (pg_collection.intra_expt_dp if edp else pg_collection.intra_dp_cp)
+        if outer_dp_size > 1
+        else (pg_collection.expt_dp if edp else pg_collection.dp_cp)
+    )
+    inner_dim_name = "edp" if edp else "dp"
+    tp_group = getattr(pg_collection, 'expt_tp' if edp else 'tp', None)
+    if tp_group is None:
+        tp_group = dist.new_group(ranks=[dist.get_rank()])
+    ep_group = getattr(pg_collection, 'ep', None)
+    ep_size = ep_group.size() if edp and ep_group is not None else 1
+    ep_rank = ep_group.rank() if edp and ep_group is not None else 0
+
+    mesh = torch.arange(dist.get_world_size(), dtype=torch.int).reshape(
+        outer_dp_size,
+        inner_group.size(),
+        ep_size,
+        tp_group.size(),
+    )
+    mesh = mesh[:, :, ep_rank, tp_group.rank()]
+    mesh = DeviceMesh(
+        "cuda",
+        mesh,
+        mesh_dim_names=("dp_outer", inner_dim_name),
+    )
 
     return mesh
 

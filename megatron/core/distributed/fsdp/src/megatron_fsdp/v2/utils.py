@@ -18,7 +18,7 @@ from typing import Callable
 import torch
 import torch.nn as nn
 from torch.distributed import distributed_c10d
-from torch.distributed.tensor import DeviceMesh, init_device_mesh
+from torch.distributed.tensor import DeviceMesh
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,15 +69,15 @@ def _init_default_fully_shard_mesh() -> DeviceMesh:
     if not distributed_c10d.is_initialized():
         distributed_c10d.init_process_group()
 
-    default_pg = distributed_c10d._get_default_group()  # still private
     if torch.cuda.is_available():
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
-    mesh = DeviceMesh.from_group(
-        [default_pg],
-        device_type=device.type,
-        mesh=torch.distributed.get_process_group_ranks(default_pg),
-        mesh_dim_names=("dp",),
+    world_ranks = torch.arange(
+        torch.distributed.get_world_size(torch.distributed.group.WORLD)
+    ).reshape(1, -1)
+    return DeviceMesh(
+        device.type,
+        world_ranks,
+        mesh_dim_names=("dp_outer", "dp"),
     )
-    return mesh
