@@ -14,21 +14,31 @@
 
 """Unit tests for allocators. Pure CPU, no torch.distributed."""
 
+import importlib.util
 import sys
 from pathlib import Path
 
 import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).parents[2]))
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.allocator import (
-    Bucket,
-    TemporaryBucketAllocator,
-    TracePoolAllocator,
+# Import from source file directly — avoids megatron.core import chain which
+# requires a GPU environment.
+_SRC_DIR = Path(__file__).resolve().parents[5] / "megatron" / "core" / "distributed" / "fsdp" / "src"
+_ALLOCATOR_PATH = _SRC_DIR / "megatron_fsdp" / "v2" / "allocator.py"
+assert _ALLOCATOR_PATH.exists(), f"allocator.py not found at {_ALLOCATOR_PATH}"
+
+spec = importlib.util.spec_from_file_location(
+    "mfsdp_v2_allocator", str(_ALLOCATOR_PATH)
 )
+_allocator_mod = importlib.util.module_from_spec(spec)
+sys.modules["mfsdp_v2_allocator"] = _allocator_mod
+spec.loader.exec_module(_allocator_mod)
+
+TemporaryBucketAllocator = _allocator_mod.TemporaryBucketAllocator
+TracePoolAllocator = _allocator_mod.TracePoolAllocator
 
 
-def _run_allocator_tests(allocator: TemporaryBucketAllocator) -> None:
+def _run_allocator_tests(allocator) -> None:
     """Three-phase test covering allocate, free, and re-allocate for any allocator.
 
     Phase 1 -- allocate:
@@ -230,7 +240,6 @@ class TestTracePoolAllocator:
         b_post = allocator.allocate(key="A", size=100, dtype=dtype, device=device)
         assert allocator.phase == "optimized"
         assert b_post.data.numel() >= 100
-        # Address may differ because tensors were re-allocated
         assert b_post.data.data_ptr() != 0
 
         allocator.free(key="A")
@@ -262,15 +271,13 @@ class TestTracePoolAllocator:
         device = torch.device("cpu")
 
         for _ in range(3):
-            # Allocate and capture address
             b = allocator.allocate(key="A", size=100, dtype=dtype, device=device)
-            addr = b.data.data_ptr()
             allocator.free(key="A")
 
             allocator.release()
             assert allocator.phase == "released"
 
-            # Auto-resume
+            # Auto-resume via free
             allocator.free(key="B")
             assert allocator.phase == "optimized"
 

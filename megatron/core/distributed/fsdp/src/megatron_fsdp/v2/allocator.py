@@ -356,12 +356,13 @@ class TracePoolAllocator(BucketAllocator):
 
         self._phase = "optimized"
 
-        if torch.distributed.get_rank() == 0:
-            logger.debug(
-                f"TracePoolAllocator plan complete: {len(self._slots)} slots, "
-                f"{total_elems} total elements, "
-                f"{self.total_pool_bytes / 1024 / 1024:.1f} MB"
-            )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == 0:
+                logger.debug(
+                    f"TracePoolAllocator plan complete: {len(self._slots)} slots, "
+                    f"{total_elems} total elements, "
+                    f"{self.total_pool_bytes / 1024 / 1024:.1f} MB"
+                )
         return total_elems
 
     def _color_and_allocate_slots(
@@ -657,10 +658,18 @@ def _intervals_overlap(
     return False
 
 
+def _is_torchdynamo_compiling() -> bool:
+    """Check whether torchdynamo is compiling — safe across PyTorch versions."""
+    try:
+        return torch.distributed._functional_collectives.is_torchdynamo_compiling()
+    except (AttributeError, RuntimeError):
+        return False
+
+
 def _free_storage(tensor: torch.Tensor) -> None:
     """Free the underlying storage of ``tensor`` by resizing it to 0."""
     with torch.no_grad():
-        if not torch.distributed._functional_collectives.is_torchdynamo_compiling():
+        if not _is_torchdynamo_compiling():
             already_freed = tensor._typed_storage()._size() == 0
             if not already_freed:
                 assert tensor.storage_offset() == 0, (
@@ -680,7 +689,7 @@ def _alloc_storage(tensor: torch.Tensor, size: torch.Size) -> None:
     existing shape.
     """
     with torch.no_grad():
-        if not torch.distributed._functional_collectives.is_torchdynamo_compiling():
+        if not _is_torchdynamo_compiling():
             already_allocated = tensor._typed_storage()._size() == size.numel()
             if not already_allocated:
                 tensor_storage_size = tensor._typed_storage()._size()
