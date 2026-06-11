@@ -22,6 +22,7 @@ import torch
 from .allocator import BucketAllocator, TemporaryBucketAllocator
 from .mixed_precision import MixedPrecisionPolicy
 from .utils import ParamGroupIdx
+from .allocator import _free_storage
 
 logger = logging.getLogger(__name__)
 
@@ -455,6 +456,7 @@ class DataParallelBuffer:
         if target_device.type == "cpu" and pin_memory:
             cpu_data = torch.empty(self.data.shape, dtype=self.data.dtype, pin_memory=True)
             cpu_data.copy_(self.data, non_blocking=non_blocking)
+            _free_storage(self.data)
             self.data = cpu_data
         else:
             self.data = self.data.to(target_device, non_blocking=non_blocking)

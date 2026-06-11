@@ -55,7 +55,7 @@ def fully_shard(
     # --- Megatron-FSDP specific options ---
     enable_unshard_prefetch: bool = True,
     enable_async_reduce_grad: bool = True,
-    gradient_scaling_factor: Optional[float] = None,
+    gradient_scaling_factor: Optional[float] = "auto",
     enable_trace_pool: bool = False,
     sharding_strategy: str = "optim_grads_params",
     enable_cuda_graph: bool = False,

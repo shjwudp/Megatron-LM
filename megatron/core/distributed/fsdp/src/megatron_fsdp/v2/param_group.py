@@ -98,6 +98,8 @@ class ParameterGroup:
             self.chunk_size_factor = 1
 
         self.gradient_scaling_factor = gradient_scaling_factor
+        if self.gradient_scaling_factor == "auto":
+            self.gradient_scaling_factor = 1.0 / max(self._dp_world_size, 1)
         self.allocator = allocator if allocator is not None else TemporaryBucketAllocator()
 
         # Buffer references (initialized in _init_buffers)

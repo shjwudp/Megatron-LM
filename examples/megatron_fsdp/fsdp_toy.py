@@ -231,7 +231,7 @@ def train(
             # Dummy data
             x = torch.randn(args.batch_size, args.model_dim, device="cuda")
             y = model(x)
-            loss = y.sum() / (world_size * args.batch_size)
+            loss = y.sum() / args.batch_size
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
@@ -266,8 +266,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=5)
     parser.add_argument("--use-megatron-fsdp", action="store_true", help="Use Megatron-FSDP instead of PyTorch FSDP2")
     parser.add_argument("--activation-checkpoint", action="store_true", help="Enable activation checkpointing on transformer layers")
-    parser.add_argument("--cuda-graph", action="store_true", default=True, help="Enable CUDA graph capture (default: on)")
-    parser.add_argument("--no-cuda-graph", action="store_false", dest="cuda_graph", help="Disable CUDA graph capture")
+    parser.add_argument("--no-cuda-graph", action="store_false", dest="cuda_graph",
+                        default=True, help="Disable CUDA graph capture")
     return parser.parse_args()
 
 
