@@ -289,7 +289,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--steps-per-epoch", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--ckpt-dir", type=str, default="checkpoints")
+    parser.add_argument("--ckpt-dir", type=str, default=None,
+                        help="Directory for DCP checkpoints (omit to skip)")
     parser.add_argument("--ckpt-interval", type=int, default=20)
     parser.add_argument("--log-interval", type=int, default=5)
     parser.add_argument("--use-megatron-fsdp", action="store_true", help="Use Megatron-FSDP instead of PyTorch FSDP2")
