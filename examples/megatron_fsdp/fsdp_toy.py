@@ -15,6 +15,7 @@
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Tuple
 import warnings
@@ -216,6 +217,14 @@ def load_checkpoint_if_available(
 # Training loop
 # -----------------------
 
+def _fmt_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
 def train(
     args: argparse.Namespace,
     model: nn.Module,
@@ -223,10 +232,10 @@ def train(
     start_step: int = 0,
 ) -> None:
     rank = dist.get_rank()
-    world_size = dist.get_world_size()
 
     model.train()
     step = start_step
+    t_start = time.time()
 
     for epoch in range(args.epochs):
         for _ in range(args.steps_per_epoch):
@@ -239,7 +248,16 @@ def train(
             optimizer.zero_grad()
 
             if step % args.log_interval == 0 and rank == 0:
-                print(f"[rank0] epoch={epoch} step={step} loss={loss.item():.4f}")
+                t_now = time.time()
+                elapsed = t_now - t_start
+                it_s = elapsed / max(step - start_step + 1, 1)
+                alloc = _fmt_bytes(torch.cuda.memory_allocated())
+                max_reserved = _fmt_bytes(torch.cuda.max_memory_reserved())
+                print(
+                    f"[rank0] epoch={epoch} step={step} loss={loss.item():.4f} "
+                    f"alloc={alloc} max_reserved={max_reserved} "
+                    f"it={elapsed:.1f}s ({it_s * 1000:.0f}ms/it)"
+                )
 
             if args.ckpt_dir and step % args.ckpt_interval == 0 and step > 0:
                 save_checkpoint(model, optimizer, step, args.ckpt_dir)
