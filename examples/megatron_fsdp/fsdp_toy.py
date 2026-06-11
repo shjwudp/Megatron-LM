@@ -175,6 +175,10 @@ def save_checkpoint(
     ckpt_dir: str,
 ) -> None:
     rank = dist.get_rank()
+    if rank == 0:
+        print(f"[rank0] Saving checkpoint step={step} ...")
+    t0 = time.time()
+
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
 
     ckpt_step_dir = os.path.join(ckpt_dir, f"step_{step:06d}")
@@ -183,7 +187,7 @@ def save_checkpoint(
     dcp.save(state_dict=state, checkpoint_id=ckpt_step_dir)
 
     if rank == 0:
-        print(f"[rank0] Saved checkpoint to {ckpt_dir}")
+        print(f"[rank0] Saved checkpoint to {ckpt_dir} ({time.time() - t0:.1f}s)")
 
 
 def load_checkpoint_if_available(
@@ -206,9 +210,17 @@ def load_checkpoint_if_available(
     if last_ckpt is None:
         return 0
 
+    rank = dist.get_rank()
+    if rank == 0:
+        print(f"[rank0] Loading checkpoint from {last_ckpt} ...")
+    t0 = time.time()
+
     step = torch.zeros([1])
     state = {"app": AppState(model, optimizer), "step": step}
     dcp.load(state_dict=state, checkpoint_id=last_ckpt)
+
+    if rank == 0:
+        print(f"[rank0] Loaded checkpoint ({time.time() - t0:.1f}s)")
 
     return int(step.item()) + 1
 
