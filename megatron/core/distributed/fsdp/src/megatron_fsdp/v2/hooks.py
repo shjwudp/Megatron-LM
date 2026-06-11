@@ -55,6 +55,13 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule, fine_grained: bool = Fal
             ctx.forward_phase = True
             ctx.backward_phase = False
 
+            # Release grad buffer data for param groups whose grads are
+            # already zeroed (no backward in prev micro-batch).  Saves GPU
+            # memory; _init_dist_grads re-allocates on next reduce_grad.
+            for module in ctx.forward_order:
+                for pg in module._fsdp_param_groups:
+                    pg._maybe_free_grad_data()
+
         # ---- unshard parameters for this module ---------------------------
         if ctx.backward_phase:
             fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)

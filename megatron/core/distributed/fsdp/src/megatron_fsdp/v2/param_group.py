@@ -196,18 +196,24 @@ class ParameterGroup:
             ):
                 _free_storage(tensor)
 
-        # Create gradient buffer
+        # Create main_grad_buffer layout eagerly; defer the backing tensor
+        # for distributed (sharded) buffers to reduce_grad().  Replicated
+        # buffers allocate immediately because main_grad_getter accesses
+        # self.data directly (no allocator path).
         if self.requires_grad:
             main_grads_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])
             gbuf = self._create_buffer(main_grads_dtype, shard_grads, "main_grad")
-            gbuf.init_data(torch.zeros(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
-            self.main_grad_buffer = gbuf
+            if shard_grads:
+                self.main_grad_buffer = gbuf  # layout only, data is None
+            else:
+                gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
+                self.main_grad_buffer = gbuf
 
         # Create distributed parameter views
         self._init_dist_params()
 
         # Initially, gradients are zeroed.
-        self.is_zero_grad = True
+        self._grad_buffer_is_fresh = True
 
     def unshard(self, bwd_pass: bool = False, bind_params: bool = True):
         """
@@ -257,6 +263,43 @@ class ParameterGroup:
             self.transpose_weight_buffer,
         )
 
+    def _init_dist_grads(self) -> None:
+        """Lazily allocate ``main_grad_buffer.data`` and rebuild ``dist_grads``.
+
+        The buffer layout (``BufferIndex``, offsets, shard) was created in
+        ``_init_buffers``; only the backing tensor is deferred.  Called from
+        ``reduce_grad()`` on first use.  Uses ``torch.empty`` (uninitialised)
+        because ``_grad_buffer_is_fresh`` is True, so the next ``reduce_grad``
+        will overwrite rather than accumulate.  Subsequent calls are no-ops.
+        """
+        gbuf = self.main_grad_buffer
+        if gbuf is None or not self.requires_grad:
+            return
+        if gbuf.data is not None:
+            return  # already initialised
+
+        gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
+
+        # Rebuild dist_grads views — dist_params are unchanged
+        s = self.sharding_strategy
+        is_grad_shard = s in ("optim", "optim_grads", "optim_grads_params")
+        placements = [Shard(dim=0)] if is_grad_shard else [Replicate()]
+
+        self.dist_grads = []
+        for p, dist_param in zip(self.params, self.dist_params):
+            grad_data = gbuf.get_item(self.param_idx[p], as_shard=is_grad_shard)
+            if p.requires_grad and grad_data.numel() > 0:
+                self.dist_grads.append(
+                    make_uneven_dtensor(
+                        grad_data, p.shape, self.mesh, placements,
+                        copy_chunk_meta_from=dist_param,
+                    )
+                )
+            else:
+                self.dist_grads.append(None)
+
+        self._grad_buffer_is_fresh = True
+
     def reduce_grad(self):
         """
         Reduce gradients across DP ranks.
@@ -266,16 +309,15 @@ class ParameterGroup:
         the replicated buffer once when the optimizer syncs.
         """
         self._ensure_buffers_on_gpu()
-        # FIXME: When optimizer.zero_grad(set_to_none=True) is used, dist_param.grad
-        # becomes None, but the underlying grad buffer may still contain stale data
-        # from previous iterations. If overwrite_grad is not set to True, reduce_grad
-        # will accumulate into this stale buffer, potentially introducing NaNs and
-        # destabilizing training.
+        self._init_dist_grads()
+        # _grad_buffer_is_fresh is True after zero_grad() or lazy buffer init,
+        # so the first reduce_grad after either event overwrites instead of
+        # accumulating — no stale data from uninitialised or zeroed buffers.
         self.main_grad_buffer.reduce_grad(
             grad_comm_dtype=self.mp_policy.grad_comm_dtype,
-            overwrite_grad=False,
+            overwrite_grad=self._grad_buffer_is_fresh,
         )
-        self.is_zero_grad = False
+        self._grad_buffer_is_fresh = False
 
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""
@@ -287,6 +329,21 @@ class ParameterGroup:
                 if hasattr(param, 'main_grad'):
                     del param.main_grad
             self.main_grad_buffer.reshard()
+
+    def _maybe_free_grad_data(self) -> None:
+        """Drop ``main_grad_buffer.data`` if all params are zero-graded.
+
+        After ``zero_grad()`` (or before the first backward), all
+        ``dist_param.grad`` are ``None``, so the gradient buffer holds no
+        meaningful data.  Free the backing tensor — ``_init_dist_grads``
+        will re-allocate on the next ``reduce_grad``.
+        """
+        if self.main_grad_buffer is None or self.main_grad_buffer.data is None:
+            return
+        if not all(getattr(p, "grad", None) is None for p in self.dist_params):
+            return
+        self.main_grad_buffer.data = None
+        self.dist_grads = [None for _ in self.params]
 
     def _init_dist_params(self):
         """
@@ -335,9 +392,8 @@ class ParameterGroup:
         for dist_param in self.dist_params:
             update_uneven_dtensor_chunk_metadata(dist_param)
 
-        # Create gradient DTensor views. Some groups, e.g. uint8 FP8 model
-        # payloads, do not require grads and therefore have no grad buffer.
-        if self.main_grad_buffer is None:
+        # Create gradient DTensor views.
+        if self.main_grad_buffer is None or self.main_grad_buffer.data is None:
             self.dist_grads = [None for _ in self.params]
             return
 
@@ -380,7 +436,7 @@ class ParameterGroup:
                     continue
                 object.__setattr__(dist_param._local_tensor, 'data', data)
 
-        if self.main_grad_buffer is not None:
+        if self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
             is_grad_shard = is_param_shard
             for i, param in enumerate(self.params):
                 dist_grad = self.dist_grads[i]
@@ -407,7 +463,7 @@ class ParameterGroup:
     def zero_grad(self, set_to_none: bool = True):
         """Zero the main gradient buffer and mark grads as zeroed."""
         self.release_grad_buffer()
-        if self.main_grad_buffer is not None:
+        if self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
             self.main_grad_buffer.data.zero_()
         if set_to_none:
             for dist_param in self.dist_params:
@@ -415,4 +471,4 @@ class ParameterGroup:
                     del dist_param.grad
                 if hasattr(dist_param, "decoupled_grad"):
                     dist_param.decoupled_grad = None
-        self.is_zero_grad = True
+        self._grad_buffer_is_fresh = True
