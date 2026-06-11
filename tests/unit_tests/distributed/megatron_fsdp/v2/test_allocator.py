@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for TemporaryBucketAllocator. Pure CPU, no torch.distributed."""
+"""Unit tests for allocators. Pure CPU, no torch.distributed."""
 
 import sys
 from pathlib import Path
@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.allocator import (
     Bucket,
     TemporaryBucketAllocator,
+    TracePoolAllocator,
 )
 
 
@@ -93,6 +94,252 @@ class TestTemporaryBucketAllocator:
 
     def test_full_lifecycle(self):
         _run_allocator_tests(TemporaryBucketAllocator())
+
+
+# ------------------------------------------------------------------
+# Helper: run a simple trace → plan → optimized cycle
+# ------------------------------------------------------------------
+
+def _trace_plan_cycle(allocator: TracePoolAllocator) -> int:
+    """Run a minimal trace→plan cycle and return pool element count.
+
+    Simulates a realistic FSDP forward/backward pattern with
+    overlapping allocations (A and B active simultaneously, then A freed,
+    then C allocated while B is still active).
+    """
+    dtype = torch.float32
+    device = torch.device("cpu")
+
+    # Forward: allocate two buffers
+    allocator.allocate(key="A", size=100, dtype=dtype, device=device)
+    allocator.allocate(key="B", size=200, dtype=dtype, device=device)
+
+    # Free A after its forward pass
+    allocator.free(key="A")
+
+    # Backward: allocate C while B is still active
+    allocator.allocate(key="C", size=150, dtype=dtype, device=device)
+
+    # Free remaining
+    allocator.free(key="B")
+    allocator.free(key="C")
+
+    return allocator.plan()
+
+
+# ------------------------------------------------------------------
+# TracePoolAllocator tests
+# ------------------------------------------------------------------
+
+class TestTracePoolAllocator:
+
+    def test_full_lifecycle(self):
+        """Trace → plan → optimized: allocate/free returns fixed-address views."""
+        allocator = TracePoolAllocator()
+        _trace_plan_cycle(allocator)
+        assert allocator.phase == "optimized"
+
+        dtype = torch.float32
+        device = torch.device("cpu")
+
+        # First micro-batch: allocate A
+        b0 = allocator.allocate(key="A", size=100, dtype=dtype, device=device)
+        assert b0.data.numel() >= 100
+        addr0 = b0.data.data_ptr()
+
+        # Second micro-batch: allocate A again — same address
+        allocator.free(key="A")
+        allocator.free(key="B")  # B wasn't allocated yet; no-op
+        b0b = allocator.allocate(key="A", size=100, dtype=dtype, device=device)
+        assert b0b.data.data_ptr() == addr0
+
+        allocator.free(key="A")
+
+        # Allocate B+C overlapping
+        b1 = allocator.allocate(key="B", size=200, dtype=dtype, device=device)
+        b2 = allocator.allocate(key="C", size=150, dtype=dtype, device=device)
+        assert b1.data.data_ptr() != b2.data.data_ptr()
+        allocator.free(key="B")
+        allocator.free(key="C")
+
+    def test_release_in_trace_phase(self):
+        """release() in trace phase resets to clean trace state."""
+        allocator = TracePoolAllocator()
+        assert allocator.phase == "trace"
+
+        allocator.allocate(key="A", size=100, dtype=torch.float32,
+                           device=torch.device("cpu"))
+        allocator.allocate(key="B", size=200, dtype=torch.float32,
+                           device=torch.device("cpu"))
+
+        assert len(allocator._trace) > 0
+        assert len(allocator._trace_meta) > 0
+        assert "A" in allocator._buckets
+
+        allocator.release()
+
+        assert allocator.phase == "trace"
+        assert len(allocator._trace) == 0
+        assert len(allocator._trace_meta) == 0
+        assert len(allocator._buckets) == 0
+
+    def test_release_in_optimized_phase(self):
+        """release() in optimized phase frees tensors but preserves plan."""
+        allocator = TracePoolAllocator()
+        _trace_plan_cycle(allocator)
+        assert allocator.phase == "optimized"
+
+        n_slots_before = len(allocator._slots)
+        n_keys = len(allocator._key_to_slot)
+        assert n_slots_before > 0
+        assert n_keys > 0
+
+        # Verify slots have real memory
+        for slot in allocator._slots:
+            assert slot.tensor.numel() > 0
+
+        allocator.release()
+        assert allocator.phase == "released"
+
+        # Plan metadata preserved
+        assert len(allocator._slots) == n_slots_before
+        assert len(allocator._key_to_slot) == n_keys
+        assert len(allocator._key_to_view) == n_keys
+
+        # Slots have zero-sized tensors (memory freed)
+        for slot in allocator._slots:
+            assert slot.tensor.numel() == 0
+            assert slot.in_use is False
+
+    def test_auto_resume_on_allocate(self):
+        """First allocate after release auto-resumes slots."""
+        allocator = TracePoolAllocator()
+        _trace_plan_cycle(allocator)
+
+        # Capture addresses before release
+        dtype = torch.float32
+        device = torch.device("cpu")
+        b_pre = allocator.allocate(key="A", size=100, dtype=dtype, device=device)
+        addr_pre = b_pre.data.data_ptr()
+        allocator.free(key="A")
+
+        allocator.release()
+        assert allocator.phase == "released"
+
+        # allocate() triggers auto-resume
+        b_post = allocator.allocate(key="A", size=100, dtype=dtype, device=device)
+        assert allocator.phase == "optimized"
+        assert b_post.data.numel() >= 100
+        # Address may differ because tensors were re-allocated
+        assert b_post.data.data_ptr() != 0
+
+        allocator.free(key="A")
+
+    def test_auto_resume_on_free(self):
+        """First free after release auto-resumes slots."""
+        allocator = TracePoolAllocator()
+        _trace_plan_cycle(allocator)
+
+        dtype = torch.float32
+        device = torch.device("cpu")
+        allocator.allocate(key="A", size=100, dtype=dtype, device=device)
+        allocator.free(key="A")
+
+        allocator.release()
+        assert allocator.phase == "released"
+
+        # free() triggers auto-resume (no-op since A is already freed)
+        allocator.free(key="A")
+        assert allocator.phase == "optimized"
+
+    def test_multiple_release_resume_cycles(self):
+        """Multiple release → allocate (auto-resume) cycles work."""
+        allocator = TracePoolAllocator()
+        _trace_plan_cycle(allocator)
+        assert allocator.phase == "optimized"
+
+        dtype = torch.float32
+        device = torch.device("cpu")
+
+        for _ in range(3):
+            # Allocate and capture address
+            b = allocator.allocate(key="A", size=100, dtype=dtype, device=device)
+            addr = b.data.data_ptr()
+            allocator.free(key="A")
+
+            allocator.release()
+            assert allocator.phase == "released"
+
+            # Auto-resume
+            allocator.free(key="B")
+            assert allocator.phase == "optimized"
+
+            # Verify slots are re-allocated (non-zero)
+            for slot in allocator._slots:
+                assert slot.tensor.numel() > 0
+
+    def test_idempotent_allocate_after_release(self):
+        """Double allocate after release is idempotent."""
+        allocator = TracePoolAllocator()
+        _trace_plan_cycle(allocator)
+        allocator.release()
+
+        dtype = torch.float32
+        device = torch.device("cpu")
+
+        b1 = allocator.allocate(key="A", size=100, dtype=dtype, device=device)
+        b2 = allocator.allocate(key="A", size=100, dtype=dtype, device=device)
+        assert b1.data.data_ptr() == b2.data.data_ptr()
+        allocator.free(key="A")
+
+    def test_unknown_key_raises_keyerror(self):
+        """Allocating an key not seen during trace raises KeyError."""
+        allocator = TracePoolAllocator()
+        _trace_plan_cycle(allocator)
+
+        with pytest.raises(KeyError):
+            allocator.allocate(key="UNKNOWN", size=100, dtype=torch.float32,
+                               device=torch.device("cpu"))
+
+    def test_reset_clears_all(self):
+        """reset() discards everything and returns to trace."""
+        allocator = TracePoolAllocator()
+        _trace_plan_cycle(allocator)
+        assert allocator.phase == "optimized"
+
+        allocator.reset()
+        assert allocator.phase == "trace"
+        assert len(allocator._trace) == 0
+        assert len(allocator._trace_meta) == 0
+        assert len(allocator._buckets) == 0
+        assert len(allocator._slots) == 0
+        assert len(allocator._key_to_slot) == 0
+        assert len(allocator._key_to_view) == 0
+
+    def test_dump_trace_covers_phases(self):
+        """dump_trace() works in trace, optimized, and released phases."""
+        allocator = TracePoolAllocator()
+        s = allocator.dump_trace()
+        assert "phase=trace" in s
+
+        allocator.allocate(key="A", size=100, dtype=torch.float32,
+                           device=torch.device("cpu"))
+        allocator.free(key="A")
+        allocator.plan()
+        s = allocator.dump_trace()
+        assert "phase=optimized" in s
+        assert "slots:" in s
+
+        allocator.release()
+        s = allocator.dump_trace()
+        assert "phase=released" in s
+        assert "<released>" in s
+
+    def test_total_pool_bytes(self):
+        """total_pool_bytes returns positive value after plan()."""
+        allocator = TracePoolAllocator()
+        _trace_plan_cycle(allocator)
+        assert allocator.total_pool_bytes > 0
 
 
 if __name__ == "__main__":

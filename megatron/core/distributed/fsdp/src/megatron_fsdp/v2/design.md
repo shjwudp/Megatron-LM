@@ -866,3 +866,56 @@ free(key)     → _free_storage               free(key)     → slot free
 
 No ``torch.empty`` or storage resizing occurs in the optimized phase — each
 slot owns its own tensor, and buckets are lightweight views into them.
+
+### Memory-Pool Release and Resume
+
+`FSDPModule.release_memory_pool()` and `FSDPModule.resume_memory_pool()`
+coordinate the release and restore of all persistent memory held by the
+``TracePoolAllocator``, together with any captured CUDA graphs that
+reference those memory addresses.
+
+**When to use.**  Temporarily free GPU memory for an out-of-band operation
+(save/load checkpoints, export tensors, etc.) and then restore the training
+state without re-tracing or re-planning the allocator.
+
+**Release flow** (call on any FSDP module — all share the root context):
+
+1. **Tear down all CUDA graphs.**  Iterates ``ctx.forward_order`` and:
+   - Per-module runner path: calls ``FSDPCudaGraphRunner.reset()`` which
+     uninstalls the patched forward, restores the original ``forward``, and
+     deletes the ``CUDAGraph`` object.
+   - Batch helper path: restores ``module.forward`` from
+     ``_fsdp_cuda_graph_orig_forward``, deletes ``_fsdp_cuda_graphs`` and all
+     associated metadata.
+   - Resets ``cuda_graph_stream``, ``cuda_graph_pool``, and
+     ``cuda_graph_active`` on the root context.
+   - ``gc.collect()`` + ``torch.cuda.empty_cache()`` to return freed memory
+     to the CUDA allocator.
+2. **Clear CUDA graph sentinels.**  Removes ``_fsdp_cg_runner`` from all
+   modules so hooks will trigger fresh graph capture on the next forward pass.
+3. **Release allocator memory.**  ``TracePoolAllocator.release()`` replaces
+   every slot tensor with a zero-sized ``torch.empty``, marks all slots as
+   free, and transitions to ``"released"`` phase.
+
+**Automatic resume.**  On the next ``allocate()`` or ``free()`` call the
+``TracePoolAllocator`` **automatically re-allocates** all slot tensors and
+returns to ``"optimized"`` phase — no explicit ``resume()`` call is needed.
+Fresh tensors are allocated with the same ``(size, dtype, device)`` from the
+original plan.  CUDA graphs are re-captured by hooks on the next forward pass
+(sentinels have already been cleared).
+
+```
+TracePoolAllocator:  trace → plan() → optimized → release() → released → allocate() auto-resume → optimized
+CUDA Graphs:          ---     ---      capture      reset       ---               ---               auto-recapture
+FSDPModule:           ---     ---        ---     release_memory      ---               ---                    ---
+                                                                     _pool()
+```
+
+**Example** (temporarily free memory for checkpoint I/O):
+
+```python
+root_module.release_memory_pool()
+# --- All slot tensors and CUDA graphs freed (~ N GB) ---
+torch.save(model.state_dict(), "checkpoint.pt")
+# Next forward's first allocate() auto-resumes slots; hooks auto-recapture graphs
+```

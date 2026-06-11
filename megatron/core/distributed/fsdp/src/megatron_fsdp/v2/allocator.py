@@ -229,6 +229,8 @@ class TracePoolAllocator(BucketAllocator):
     ) -> Bucket:
         key = _resolve_key(key, param_group_id)
         assert dtype is not None and device is not None
+        if self._phase == "released":
+            self._auto_resume()
         if self._phase != "optimized":
             return self._trace_allocate(key, size, dtype, device)
         else:
@@ -241,6 +243,8 @@ class TracePoolAllocator(BucketAllocator):
         param_group_id: Optional[AllocatorKey] = None,
     ) -> None:
         key = _resolve_key(key, param_group_id)
+        if self._phase == "released":
+            self._auto_resume()
         if self._phase != "optimized":
             self._trace_free(key)
         else:
@@ -485,6 +489,68 @@ class TracePoolAllocator(BucketAllocator):
         self._key_to_slot.clear()
         self._key_to_view.clear()
 
+    def release(self) -> None:
+        """Release all slot tensor memory while preserving the slot plan.
+
+        In ``"trace"`` phase this is equivalent to ``reset()`` — discards all
+        trace data and returns to a clean trace state.
+
+        In ``"optimized"`` phase this drops every ``_SlotInfo.tensor`` reference
+        (freeing GPU memory) but retains the plan metadata: ``_slots``
+        (size/dtype/device), ``_key_to_slot``, ``_key_to_view``, and the trace
+        history.  The allocator transitions to ``"released"``.
+
+        On the next ``allocate()`` or ``free()`` call the allocator
+        **automatically re-allocates** all slots and returns to ``"optimized"``
+        — no explicit ``resume()`` call is needed.
+        """
+        if self._phase == "trace":
+            self.reset()
+            return
+
+        assert self._phase == "optimized", (
+            f"release() requires 'optimized' or 'trace' phase, got '{self._phase}'"
+        )
+        for slot in self._slots:
+            slot.tensor = torch.empty(0, dtype=slot.dtype, device=slot.device)
+            slot.in_use = False
+        self._active_keys.clear()
+        self._phase = "released"
+
+    def _auto_resume(self) -> None:
+        """Lazily re-allocate all slot tensors when the first ``allocate``/``free``
+        arrives in the ``"released"`` phase.
+
+        Internal — called automatically from ``allocate`` and ``free``.
+        """
+        if self._phase != "released":
+            return
+
+        for slot_idx, slot in enumerate(self._slots):
+            new_tensor = torch.empty(slot.size, dtype=slot.dtype, device=slot.device)
+            slot.tensor = new_tensor
+
+        for key, slot_idx in self._key_to_slot.items():
+            slot = self._slots[slot_idx]
+            meta = self._trace_meta.get(key)
+            if meta is not None:
+                size_k, _, _ = meta
+            else:
+                size_k = slot.size
+            self._key_to_view[key] = slot.tensor[: min(size_k, slot.size)]
+
+        self._active_keys.clear()
+        self._phase = "optimized"
+
+    def resume(self) -> None:
+        """Explicitly re-allocate slots and return to ``"optimized"`` phase.
+
+        Normally you do not need to call this — the first ``allocate`` or
+        ``free`` after ``release()`` will auto-resume.  Use this only when
+        you need to restore the pool before any alloc/free call.
+        """
+        self._auto_resume()
+
     @property
     def phase(self) -> str:
         return self._phase
@@ -513,24 +579,34 @@ class TracePoolAllocator(BucketAllocator):
                 f"{size_str}  {dtype_str}  {device_str}"
             )
 
-        if self._phase == "optimized":
-            lines.append(f"\nslots: {len(self._slots)}")
+        if self._phase in ("optimized", "released"):
+            lines.append(f"\nslots: {len(self._slots)} ({self._phase})")
             for i, slot in enumerate(self._slots):
                 keys_in_slot = [
                     k for k, idx in self._key_to_slot.items() if idx == i
                 ]
+                if self._phase == "optimized":
+                    addr_str = f"addr=0x{slot.tensor.data_ptr():x}"
+                else:
+                    addr_str = "addr=<released>"
                 lines.append(
                     f"  slot[{i}]: size={slot.size} "
                     f"dtype={slot.dtype} device={slot.device} "
-                    f"addr=0x{slot.tensor.data_ptr():x} "
+                    f"{addr_str} "
                     f"{'IN_USE' if slot.in_use else 'free'} "
                     f"keys={keys_in_slot}"
                 )
-            lines.append(
-                f"\ntotal pool: {len(self._slots)} slots, "
-                f"{self.total_pool_bytes} bytes "
-                f"({self.total_pool_bytes / 1024 / 1024:.1f} MB)"
-            )
+            if self._phase == "optimized":
+                lines.append(
+                    f"\ntotal pool: {len(self._slots)} slots, "
+                    f"{self.total_pool_bytes} bytes "
+                    f"({self.total_pool_bytes / 1024 / 1024:.1f} MB)"
+                )
+            else:
+                lines.append(
+                    f"\ntotal pool: {len(self._slots)} slots, "
+                    f"memory released (call resume() to restore)"
+                )
 
         return "\n".join(lines)
 

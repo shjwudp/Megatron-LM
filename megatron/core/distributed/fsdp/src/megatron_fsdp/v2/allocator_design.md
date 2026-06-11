@@ -270,6 +270,78 @@ keys used during CUDA graph replay were planned, keeping addresses stable.
 No on-the-fly slot allocation is supported — it would change pool tensor sizes
 and invalidate all captured CUDA graphs.
 
+## Memory release and auto-resume — ``release()`` / ``_auto_resume()``
+
+### Motivation
+
+During training there are points where freeing all communication-buffer memory
+is useful — checkpoint I/O, model export, or memory defragmentation.  Running a
+full ``reset()`` → re-trace → re-plan would be expensive and unnecessary
+because the allocation pattern (which keys are live together) is unchanged.
+
+### Design
+
+Instead of discarding the plan, **release** slot tensors (free GPU memory)
+while **preserving** the metadata.  The allocator transitions to ``"released"``
+phase, then **automatically re-allocates** and returns to ``"optimized"`` on
+the very next ``allocate()`` or ``free()`` call.  No re-trace, no re-plan.
+
+```
+plan() → optimized → release() → released → next allocate/free → optimized (auto!)
+           |                        |                                    |
+           v                        v                                    v
+     slots allocated          tensors freed                    fresh tensors,
+     views computed           metadata kept                    views rebuilt,
+                                                               same layout
+```
+
+### ``release()``
+
+```python
+def release(self) -> None:
+    for slot in self._slots:
+        slot.tensor = torch.empty(0, dtype=slot.dtype, device=slot.device)
+        slot.in_use = False
+    self._active_keys.clear()
+    self._phase = "released"
+```
+
+- Replaces every slot's backing tensor with a zero-sized empty — frees GPU
+  memory via the CUDA caching allocator.
+- Preserves: ``_slots`` (size, dtype, device per slot), ``_key_to_slot``,
+  ``_key_to_view`` (stale — rebuilt on auto-resume), ``_trace``,
+  ``_trace_meta``.
+
+### ``_auto_resume()`` — internal, called from ``allocate`` / ``free``
+
+```python
+def _auto_resume(self) -> None:
+    for slot in self._slots:
+        slot.tensor = torch.empty(slot.size, dtype=slot.dtype, device=slot.device)
+    for key, slot_idx in self._key_to_slot.items():
+        self._key_to_view[key] = self._slots[slot_idx].tensor[: meta_size]
+    self._active_keys.clear()
+    self._phase = "optimized"
+```
+
+- Re-allocates fresh ``torch.empty`` tensors per slot — same capacity as the
+  original plan.  Addresses **will differ** from the previous cycle, so any
+  CUDA graphs referencing old addresses must be invalidated **before** calling
+  ``release()``.
+- Rebuilds ``_key_to_view`` from the new tensors so ``allocate()`` returns
+  fresh stable views.
+- Transitions back to ``"optimized"`` — the allocator is immediately usable.
+- ``resume()`` is a thin public wrapper around ``_auto_resume()`` for callers
+  that want to explicitly restore before the first alloc/free.
+
+### Coordination with CUDA graphs
+
+``release()`` alone does **not** invalidate CUDA graphs — the caller must tear
+down existing graphs before calling release.  ``FSDPModule.release_memory_pool()``
+handles this coordination automatically (tears down graphs, clears sentinels,
+then calls ``release()``; see ``design.md``).  CUDA graphs re-capture on the
+next forward pass because the sentinels were cleared at release time.
+
 ## CUDA graph integration lifecycle
 
 The full lifecycle spanning trace, plan, capture, and replay:

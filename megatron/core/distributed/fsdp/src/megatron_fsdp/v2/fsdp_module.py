@@ -15,6 +15,7 @@
 """FSDPModule implementation for Megatron-FSDP2."""
 
 import logging
+import gc
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -241,6 +242,55 @@ class FSDPModule:
             layer.enable_cuda_graph()   # call before first forward
         """
         self._fsdp_state.enable_cuda_graph = True
+
+    def release_memory_pool(self) -> None:
+        """Release all persistent communication-buffer memory and any CUDA graphs.
+
+        Tears down captured CUDA graphs across all FSDP modules, clears graph
+        sentinels so they auto-recapture on the next forward pass, and releases
+        the ``TracePoolAllocator`` slot tensors.
+
+        On the next ``allocate`` / ``free`` call the allocator **automatically**
+        re-allocates slots, so no explicit "resume" call is needed.  CUDA graphs
+        are re-captured by the hooks on the next forward pass.
+
+        Typical use: temporarily free GPU memory (e.g. for checkpoint I/O).
+        """
+        ctx = self._fsdp_root_context
+        allocator = ctx.bucket_allocator
+
+        if not isinstance(allocator, TracePoolAllocator):
+            return
+
+        self._release_cuda_graphs(ctx)
+        self._clear_cuda_graph_sentinels(ctx)
+        allocator.release()
+
+    # ----------------------------------------------------------------
+    # Internal: CUDA graph teardown / sentinel helpers
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    def _release_cuda_graphs(ctx: "_FSDPRootContext") -> None:
+        """Tear down all captured CUDA graphs on every FSDP module.
+
+        Supports both the per-module runner path (``_fsdp_cg_runner``) and
+        the batch helper path (``_fsdp_cuda_graphs``, ``_fsdp_cg_runner`` sentinel).
+        Restores original ``forward`` methods before deleting graph objects.
+        """
+        if not ctx.enable_cuda_graph:
+            return
+
+        for module in ctx.forward_order:
+            if hasattr(module, "_fsdp_cg_runner"):
+                runner = module._fsdp_cg_runner
+                if hasattr(runner, "reset"):
+                    runner.reset()
+                delattr(module, "_fsdp_cg_runner")
+
+        ctx.cuda_graph_active = False
+        ctx.cuda_graph_stream = None
+        ctx.cuda_graph_pool = None
 
     def _init_named_param_groups(
         self,
