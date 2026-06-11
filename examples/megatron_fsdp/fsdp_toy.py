@@ -85,13 +85,12 @@ def build_fsdp_model(
     use_megatron_fsdp: bool,
     use_activation_checkpointing: bool = False,
     enable_cuda_graph: bool = True,
+    enable_trace_pool: bool = False,
 ) -> Tuple["FSDPModule", torch.distributed.device_mesh.DeviceMesh]:
     if use_megatron_fsdp:
         try:
-            from megatron_fsdp.uneven_dtensor import get_state_dict
             from megatron_fsdp.v2 import FSDPModule, fully_shard
         except ImportError:
-            from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import get_state_dict
             from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule, fully_shard
     else:
         from torch.distributed.fsdp import FSDPModule, fully_shard
@@ -105,8 +104,11 @@ def build_fsdp_model(
     if use_megatron_fsdp:
         sublayer_kwargs = dict(
             enable_cuda_graph=enable_cuda_graph,
+            enable_trace_pool=enable_trace_pool,
         )
-        kwargs = {}
+        kwargs = dict(
+            enable_trace_pool=enable_trace_pool,
+        )
     else:
         sublayer_kwargs = {}
         kwargs = {}
@@ -268,6 +270,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--activation-checkpoint", action="store_true", help="Enable activation checkpointing on transformer layers")
     parser.add_argument("--no-cuda-graph", action="store_false", dest="cuda_graph",
                         default=True, help="Disable CUDA graph capture")
+    parser.add_argument("--use-trace-pool", action="store_true", default=False,
+                        help="Use TracePoolAllocator for stable buffer addresses")
     return parser.parse_args()
 
 
@@ -280,6 +284,7 @@ def main() -> None:
         use_megatron_fsdp=args.use_megatron_fsdp,
         use_activation_checkpointing=args.activation_checkpoint,
         enable_cuda_graph=args.cuda_graph,
+        enable_trace_pool=args.use_trace_pool,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
