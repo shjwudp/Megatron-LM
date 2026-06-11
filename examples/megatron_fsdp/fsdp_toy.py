@@ -253,9 +253,10 @@ def train(
     for epoch in range(args.epochs):
         for _ in range(args.steps_per_epoch):
             # Dummy data
-            x = torch.randn(args.batch_size, args.model_dim, device="cuda", dtype=torch.bfloat16)
+            x = torch.randn(args.batch_size, args.seq_len, args.model_dim,
+                            device="cuda", dtype=torch.bfloat16)
             y = model(x)
-            loss = y.sum() / args.batch_size
+            loss = y.sum() / (args.batch_size * args.seq_len)
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
@@ -291,6 +292,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dim", type=int, default=1024)
     parser.add_argument("--n-layers", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--seq-len", type=int, default=128,
+                        help="Sequence length (larger = more compute vs communication)")
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--steps-per-epoch", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
