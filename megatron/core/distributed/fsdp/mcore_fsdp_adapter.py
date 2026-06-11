@@ -41,10 +41,10 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.ssm.mamba_layer import MambaLayer
-from megatron.core.transformer.moe.router import Router as MoERouter
 from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.moe.router import Router as MoERouter
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
 
@@ -227,8 +227,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
             from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import fully_shard
             from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
                 FullyShardFP8Policy,
-                MixedPrecisionPolicy,
                 FullyShardNVFP4Policy,
+                MixedPrecisionPolicy,
             )
         else:
             from torch.distributed.fsdp import fully_shard
@@ -271,7 +271,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "mp_policy": fully_shard_mp_policy,
             "enable_unshard_prefetch": ddp_config.overlap_param_gather,
             "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
-            "enable_trace_pool": ddp_config.fsdp_double_buffer,
+            "enable_trace_pool": ddp_config.fsdp_trace_pool
+            or ddp_config.fsdp_double_buffer
+            or ddp_config.nccl_ub,
             "sharding_strategy": ddp_config.data_parallel_sharding_strategy,
         }
         if config.calculate_per_token_loss:
