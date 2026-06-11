@@ -33,10 +33,15 @@ from torch.distributed.tensor import DTensor
 # -----------------------
 
 class ToyBlock(nn.Module):
-    def __init__(self, dim: int):
+    """MLP-style block with expand→project, similar to transformer FFN."""
+
+    def __init__(self, dim: int, expansion: int = 4, dropout: float = 0.0):
         super().__init__()
-        self.linear1 = nn.Linear(dim, dim)
-        self.linear2 = nn.Linear(dim, dim)
+        hidden_dim = dim * expansion
+        self.gate = nn.Linear(dim, hidden_dim, bias=False)
+        self.up = nn.Linear(dim, hidden_dim, bias=False)
+        self.down = nn.Linear(hidden_dim, dim, bias=False)
+        self.dropout = nn.Dropout(dropout) if dropout else nn.Identity()
         self._use_activation_checkpointing = False
 
     def forward(self, x):
@@ -45,7 +50,7 @@ class ToyBlock(nn.Module):
         return self._forward_impl(x)
 
     def _forward_impl(self, x):
-        return self.linear2(torch.relu(self.linear1(x)))
+        return self.dropout(self.down(torch.nn.functional.gelu(self.gate(x)) * self.up(x)))
 
 
 class ToyModel(nn.Module):
@@ -96,7 +101,7 @@ def build_fsdp_model(
         from torch.distributed.fsdp import FSDPModule, fully_shard
 
     mesh = init_distributed()
-    model = ToyModel(dim=dim, n_layers=n_layers).to("cuda")
+    model = ToyModel(dim=dim, n_layers=n_layers).to(device="cuda", dtype=torch.bfloat16)
 
     if use_activation_checkpointing:
         model.enable_activation_checkpointing()

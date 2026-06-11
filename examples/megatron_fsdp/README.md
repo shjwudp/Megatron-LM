@@ -57,7 +57,9 @@ torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
 | `--log-interval` | `5` | Logging interval (steps) |
 | `--record-memory-history` | `None` | Dump per-rank CUDA memory snapshots to this directory |
 
-**Memory formula**: `n_layers × 2 × dim² × 4` params + equal grads + 2× AdamW states ≈ `24 × dim² × n_layers` bytes.  E.g. `--model-dim 8192 --n-layers 12` ≈ 19 GB total.
+**Memory formula**: Each `ToyBlock` is a SwiGLU MLP (`gate`, `up`, `down`) with `dim → 4×dim → dim`.
+`n_layers × (3 × dim × 4×dim + 4×dim × dim)` params × 2 bytes (bf16) + fp32 optimizer states.
+E.g. `--model-dim 8192 --n-layers 12` ≈ 19 GB total.
 
 ### `qwen3-30b-a3b.gbs128_mbs4_seq4096_n2_mfsdp2_mxfp8_wandb.sh`
 
