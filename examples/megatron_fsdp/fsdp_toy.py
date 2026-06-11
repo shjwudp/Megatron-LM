@@ -253,7 +253,7 @@ def train(
     for epoch in range(args.epochs):
         for _ in range(args.steps_per_epoch):
             # Dummy data
-            x = torch.randn(args.batch_size, args.model_dim, device="cuda")
+            x = torch.randn(args.batch_size, args.model_dim, device="cuda", dtype=torch.bfloat16)
             y = model(x)
             loss = y.sum() / args.batch_size
             loss.backward()
