@@ -745,6 +745,9 @@ class FSDPModule:
         # Handle pending reduce events before this module to release buffers promptly.
         self._wait_for_previous_async_reduce_grad()
 
+        # Ensure all backward compute is done before starting reduction.
+        stream.wait_stream(torch.cuda.current_stream())
+
         # Perform reduction for this module
         for param_names, param_group in self._named_param_groups:
             if not param_group.requires_grad:
@@ -789,16 +792,17 @@ class FSDPModule:
                         param_main_grad is None
                         or param_main_grad.data_ptr() != main_grad.data_ptr()
                     ):
-                        main_grad.zero_()
+                        with torch.cuda.stream(stream):
+                            main_grad.zero_()
                 else:
                     main_grad = param.get_main_grad()
-                    main_grad.copy_(param.grad.detach())
+                    with torch.cuda.stream(stream):
+                        main_grad.copy_(param.grad.detach())
                     del param.grad
 
             if async_op:
                 # ---- Overlapped path ----
                 # Switch to rs_stream for the reduce-scatter kernel
-                stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
                     param_group.reduce_grad()
             else:
