@@ -298,11 +298,19 @@ def parse_args() -> argparse.Namespace:
                         default=True, help="Disable CUDA graph capture")
     parser.add_argument("--use-trace-pool", action="store_true", default=False,
                         help="Use TracePoolAllocator for stable buffer addresses")
+    parser.add_argument("--record-memory-history", type=str, default=None, metavar="DIR",
+                        help="Enable CUDA memory recording, dump snapshot to this directory")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.record_memory_history:
+        torch.cuda.memory._record_memory_history(
+            max_entries=100000,
+            stacks="all",
+        )
 
     model, _ = build_fsdp_model(
         dim=args.model_dim,
@@ -319,6 +327,16 @@ def main() -> None:
         start_step = load_checkpoint_if_available(model, optimizer, args.ckpt_dir)
 
     train(args, model, optimizer, start_step=start_step)
+
+    if args.record_memory_history:
+        rank = dist.get_rank()
+        out_dir = args.record_memory_history
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        snapshot_path = os.path.join(out_dir, f"memory_snapshot_rank{rank}.pickle")
+        torch.cuda.memory._dump_snapshot(snapshot_path)
+        if rank == 0:
+            print(f"[rank0] Memory snapshot dumped to {snapshot_path}")
+        torch.cuda.memory._record_memory_history(enabled=None)
 
     dist.barrier()
     dist.destroy_process_group()
