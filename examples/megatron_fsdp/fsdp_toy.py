@@ -13,9 +13,7 @@
 # limitations under the License.
 
 import argparse
-import logging
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Tuple
@@ -125,6 +123,9 @@ def build_fsdp_model(
 
     assert isinstance(model, ToyModel)
     assert isinstance(model, FSDPModule)
+
+    if use_megatron_fsdp:
+        model._log_parameter_groups()
 
     p = next(model.parameters())
     assert isinstance(p, DTensor)
@@ -308,9 +309,6 @@ def parse_args() -> argparse.Namespace:
                         default=True, help="Disable CUDA graph capture")
     parser.add_argument("--use-trace-pool", action="store_true", default=False,
                         help="Use TracePoolAllocator for stable buffer addresses")
-    parser.add_argument("--log-level", type=str, default="WARNING",
-                        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
-                        help="Python logging level for FSDP internals")
     parser.add_argument("--record-memory-history", type=str, default=None, metavar="DIR",
                         help="Enable CUDA memory recording, dump snapshot to this directory")
     return parser.parse_args()
@@ -318,16 +316,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    if local_rank == 0:
-        logging.basicConfig(
-            level=getattr(logging, args.log_level),
-            format="[%(levelname)s] %(name)s: %(message)s",
-            force=True,
-        )
-    else:
-        logging.getLogger("megatron.core.distributed.fsdp").setLevel(logging.ERROR)
 
     if args.record_memory_history:
         torch.cuda.memory._record_memory_history(

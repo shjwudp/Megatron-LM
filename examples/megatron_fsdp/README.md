@@ -55,6 +55,7 @@ torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
 | `--ckpt-dir` | `None` | Directory for DCP checkpoints (omit to skip) |
 | `--ckpt-interval` | `20` | Checkpoint save interval (steps) |
 | `--log-interval` | `5` | Logging interval (steps) |
+| `--seq-len` | `128` | Sequence length (more = better compute/comm ratio) |
 | `--record-memory-history` | `None` | Dump per-rank CUDA memory snapshots to this directory |
 
 **Memory formula**: Each `ToyBlock` is a SwiGLU MLP (`gate`, `up`, `down`) with `dim → 4×dim → dim`.

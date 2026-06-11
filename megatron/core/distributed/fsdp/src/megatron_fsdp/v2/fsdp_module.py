@@ -970,8 +970,8 @@ class FSDPModule:
                 f"param_norm={param_norm:.6f} grad_norm={grad_norm:.6f}"
             )
 
-    def _log_parameter_groups(self):
-        """Print a compact summary of rewrite-path FSDP parameter groups."""
+    def dump_parameter_groups(self) -> str:
+        """Return a human-readable summary of all FSDP parameter groups."""
 
         def _fmt_dtype(dtype: torch.dtype) -> str:
             short = {
@@ -997,7 +997,7 @@ class FSDPModule:
         def _mb(num_bytes: int | float) -> str:
             return f"{num_bytes / 1_000_000:.2f} MB"
 
-        rank = torch.distributed.get_rank()
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         lines = [f"FSDP parameter groups (rank {rank})"]
         group_idx = 0
         total_model_elems = 0
@@ -1067,7 +1067,13 @@ class FSDPModule:
             f"Summary: {group_idx} groups, {total_model_elems:,} model elems, "
             f"comm={_mb(total_comm)}, pad={_mb(total_pad)}"
         )
-        logger.info("\n".join(lines))
+        return "\n".join(lines)
+
+    def _log_parameter_groups(self):
+        """Print parameter group summary on rank 0."""
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        print(self.dump_parameter_groups())
 
     def _set_nan_check(self, enable_nan_checks: bool):
         """Enable or disable NaN checking."""

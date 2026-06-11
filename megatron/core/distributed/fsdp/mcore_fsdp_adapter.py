@@ -323,6 +323,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     )
         fully_shard(module, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
 
+        module._log_parameter_groups()
+
         # Propagate relevant attributes from original parameters to the new
         # distributed parameters created by FSDP.  This is REQUIRED for
         # correctness: the optimizer's param group builder
