@@ -18,13 +18,12 @@ import sys
 import time
 from pathlib import Path
 from typing import Tuple
-import warnings
 
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+from torch.distributed.checkpoint.state_dict import set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
@@ -148,14 +147,11 @@ class AppState(Stateful):
             from megatron_fsdp.uneven_dtensor import get_state_dict
         except ImportError:
             from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import get_state_dict
-        except ImportError:
-            warnings.warn("Could not import get_state_dict from megatron_fsdp.uneven_dtensor.")
 
-        # this line automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
         model_state_dict, optimizer_state_dict = get_state_dict(self.model, self.optimizer)
         return {
             "model": model_state_dict,
-            "optim": optimizer_state_dict
+            "optim": optimizer_state_dict,
         }
 
     def load_state_dict(self, state_dict):
@@ -164,7 +160,7 @@ class AppState(Stateful):
             self.model,
             self.optimizer,
             model_state_dict=state_dict["model"],
-            optim_state_dict=state_dict["optim"]
+            optim_state_dict=state_dict["optim"],
         )
 
 
