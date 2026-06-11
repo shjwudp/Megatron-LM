@@ -9,35 +9,55 @@ Example scripts for training and checkpoint conversion using [Megatron-FSDP](../
 Standalone toy example (not Megatron-LM) demonstrating Megatron-FSDP v2 usage:
 
 - Basic model wrapping with `fully_shard()`
-- CUDA graph capture (`--cuda-graph` / `--no-cuda-graph`)
+- CUDA graph capture (on by default, `--no-cuda-graph` to disable)
   > **Experimental** — CUDA graph support is experimental and may change.
 - Activation checkpointing (`--activation-checkpoint`)
-- Distributed checkpointing
+- Trace pool allocator (`--use-trace-pool`) for stable buffer addresses
+- Distributed checkpointing (`--ckpt-dir`) via `torch.distributed.checkpoint`
+- CUDA memory recording (`--record-memory-history`) with per-rank snapshot dumps
+- Per-step memory and timing logging
 
 ```bash
+# Basic run (2 GPUs, checkpointing disabled by default)
 torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
     --model-dim 512 --n-layers 2 --batch-size 4 \
     --use-megatron-fsdp
 
-# With CUDA graph
+# Larger model with checkpointing and memory profiling
 torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
-    --model-dim 512 --n-layers 2 --batch-size 4 \
-    --use-megatron-fsdp --cuda-graph
+    --model-dim 8192 --n-layers 12 --batch-size 4 \
+    --use-megatron-fsdp --epochs 4 --log-interval 1 \
+    --ckpt-dir ./checkpoints --ckpt-interval 20 \
+    --record-memory-history ./mem_snapshots
 
-# Without CUDA graph
+# With trace pool allocator + no CUDA graph
 torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
     --model-dim 512 --n-layers 2 --batch-size 4 \
-    --use-megatron-fsdp --no-cuda-graph
+    --use-megatron-fsdp --use-trace-pool --no-cuda-graph
+
+# Compare against PyTorch FSDP2
+torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
+    --model-dim 512 --n-layers 2 --batch-size 4
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--model-dim` | `1024` | Hidden dimension size |
 | `--n-layers` | `3` | Number of transformer layers |
+| `--batch-size` | `8` | Micro-batch size |
+| `--epochs` | `2` | Number of epochs |
+| `--steps-per-epoch` | `10` | Steps per epoch |
+| `--lr` | `1e-3` | Learning rate |
 | `--use-megatron-fsdp` | off | Use Megatron-FSDP v2 instead of PyTorch FSDP2 |
-| `--cuda-graph` | on | Enable CUDA graph capture on transformer layers |
-| `--no-cuda-graph` | — | Disable CUDA graph capture |
+| `--no-cuda-graph` | — | Disable CUDA graph capture (enabled by default) |
 | `--activation-checkpoint` | off | Enable activation checkpointing |
+| `--use-trace-pool` | off | Use TracePoolAllocator for stable buffer addresses |
+| `--ckpt-dir` | `None` | Directory for DCP checkpoints (omit to skip) |
+| `--ckpt-interval` | `20` | Checkpoint save interval (steps) |
+| `--log-interval` | `5` | Logging interval (steps) |
+| `--record-memory-history` | `None` | Dump per-rank CUDA memory snapshots to this directory |
+
+**Memory formula**: `n_layers × 2 × dim² × 4` params + equal grads + 2× AdamW states ≈ `24 × dim² × n_layers` bytes.  E.g. `--model-dim 8192 --n-layers 12` ≈ 19 GB total.
 
 ### `qwen3-30b-a3b.gbs128_mbs4_seq4096_n2_mfsdp2_mxfp8_wandb.sh`
 
