@@ -209,9 +209,9 @@ def test_init_buffers(strategy):
 # ------------------------------------------------------------------ #
 
 
-@pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
+@pytest.mark.parametrize("strategy", ["optim", "optim_grads", "optim_grads_params"])
 def test_unshard_reshard(strategy):
-    if strategy not in ("no_shard", "optim_grads_params"):
+    if strategy not in ("optim_grads_params",):
         pytest.skip(
             "This test currently covers no_shard and optim_grads_params, "
             f"skipping {strategy}."

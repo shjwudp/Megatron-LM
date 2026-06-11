@@ -421,6 +421,39 @@ class DataParallelBuffer:
         assert data.numel() == self.data_size, f"size mismatch: {data.numel()} vs {self.data_size}"
         self.data = data
 
+    # ------------------------------------------------------------------ #
+    #  CPU offload
+    # ------------------------------------------------------------------ #
+
+    def _is_on_cpu(self) -> bool:
+        """True if ``self.data`` is resident on CPU."""
+        return self.data is not None and self.data.device.type == "cpu"
+
+    def _ensure_data_on_gpu(self) -> bool:
+        """Move ``self.data`` to GPU if currently on CPU.
+
+        Returns True if a move happened (caller must rebuild dist views).
+        """
+        if not self._is_on_cpu():
+            return False
+        self.data = self.data.to(self.device, non_blocking=True)
+        return True
+
+    def _move_data_to(self, target_device: torch.device, pin_memory: bool = False) -> None:
+        """Move ``self.data`` to *target_device*, optionally using pinned memory.
+
+        Caller must call ``ParameterGroup._rebuild_dist_views()`` afterwards
+        because ``dist_params._local_tensor`` views share ``self.data`` Storage.
+        """
+        if self.data is None or self.data.device == target_device:
+            return
+        if target_device.type == "cpu" and pin_memory:
+            cpu_data = torch.empty(self.data.shape, dtype=self.data.dtype, pin_memory=True)
+            cpu_data.copy_(self.data, non_blocking=True)
+            self.data = cpu_data
+        else:
+            self.data = self.data.to(target_device, non_blocking=True)
+
     def check_no_local_overlap(self, label: str = "") -> bool:
         """
         Runtime check: verify no two items' local slices overlap within ``self.data``.

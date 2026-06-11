@@ -214,6 +214,8 @@ class ParameterGroup:
         After unshard, parameters point to full unsharded storage. FP8
         parameters rebind their TE raw payload instead of ``param.data``.
         """
+        self._ensure_buffers_on_gpu()
+
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
@@ -243,6 +245,7 @@ class ParameterGroup:
     @torch.no_grad()
     def copy_main_weights_to_model_weights(self):
         """Install optimized main weights into model compute weights."""
+        self._ensure_buffers_on_gpu()
         self.mp_policy.copy_main_weights_to_model_weights(
             self.params,
             self.param_idx,
@@ -260,6 +263,7 @@ class ParameterGroup:
         ZeRO-1 keeps grads replicated during backward and reduce-scatters
         the replicated buffer once when the optimizer syncs.
         """
+        self._ensure_buffers_on_gpu()
         # FIXME: When optimizer.zero_grad(set_to_none=True) is used, dist_param.grad
         # becomes None, but the underlying grad buffer may still contain stale data
         # from previous iterations. If overwrite_grad is not set to True, reduce_grad
@@ -350,6 +354,53 @@ class ParameterGroup:
                 )
             else:
                 self.dist_grads.append(None)
+
+    def _rebuild_dist_views(self) -> None:
+        """In-place update ``dist_params._local_tensor`` / ``dist_grad._local_tensor``.
+
+        Called after any buffer's ``self.data`` changes device (offload_to_cpu /
+        auto-reload).  Updates the ``_local_tensor`` attribute inside existing
+        DTensor objects so optimizer references remain valid.
+        """
+        s = self.sharding_strategy
+        is_param_shard = s in ("optim", "optim_grads", "optim_grads_params")
+
+        for i, param in enumerate(self.params):
+            dist_param = self.dist_params[i]
+            if dist_param is not None:
+                if self.main_weight_buffer is not None:
+                    data = self.main_weight_buffer.get_item(self.param_idx[param],
+                                                            as_shard=is_param_shard)
+                elif self.model_weight_buffer is not None:
+                    data = self.model_weight_buffer.get_item(self.param_idx[param],
+                                                             as_shard=is_param_shard)
+                else:
+                    continue
+                object.__setattr__(dist_param._local_tensor, 'data', data)
+
+        if self.main_grad_buffer is not None:
+            is_grad_shard = is_param_shard
+            for i, param in enumerate(self.params):
+                dist_grad = self.dist_grads[i]
+                if dist_grad is not None:
+                    grad_data = self.main_grad_buffer.get_item(
+                        self.param_idx[param], as_shard=is_grad_shard
+                    )
+                    object.__setattr__(dist_grad._local_tensor, 'data', grad_data)
+
+    def _ensure_buffers_on_gpu(self) -> bool:
+        """Auto-reload any buffer on CPU back to GPU.
+
+        Returns True if any buffer was moved (views were rebuilt).
+        """
+        moved = False
+        for buf in (self.model_weight_buffer, self.main_weight_buffer,
+                    self.main_grad_buffer, self.transpose_weight_buffer):
+            if buf is not None and buf._ensure_data_on_gpu():
+                moved = True
+        if moved:
+            self._rebuild_dist_views()
+        return moved
 
     def zero_grad(self, set_to_none: bool = True):
         """Zero the main gradient buffer and mark grads as zeroed."""

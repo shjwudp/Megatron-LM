@@ -14,8 +14,8 @@
 
 """FSDPModule implementation for Megatron-FSDP2."""
 
-import logging
 import gc
+import logging
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -291,6 +291,102 @@ class FSDPModule:
         ctx.cuda_graph_active = False
         ctx.cuda_graph_stream = None
         ctx.cuda_graph_pool = None
+
+    @staticmethod
+    def _clear_cuda_graph_sentinels(ctx: "_FSDPRootContext") -> None:
+        """Clear CUDA graph sentinels so hooks will re-capture on next forward."""
+        for module in ctx.forward_order:
+            if hasattr(module, "_fsdp_cg_runner"):
+                delattr(module, "_fsdp_cg_runner")
+
+    # ----------------------------------------------------------------
+    # CPU offload
+    # ----------------------------------------------------------------
+
+    def _get_fsdp_modules(self, recursive: bool = True) -> List["FSDPModule"]:
+        """Return ``[self]`` plus optionally all child ``FSDPModules``."""
+        if not recursive:
+            return [self]
+        result = [self]
+        for _, child in self.named_modules():
+            if child is not self and isinstance(child, FSDPModule):
+                result.append(child)
+        return result
+
+    def offload_to_cpu(
+        self,
+        recursive: bool = True,
+        pin_memory: bool = False,
+        max_cpu_bytes: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Offload FSDP-held GPU memory to CPU within an optional budget.
+
+        Moves every DataParallelBuffer.data to CPU and releases
+        TracePoolAllocator slot tensors.  All buffers auto-reload on
+        next access — no explicit reload call needed.
+
+        Buffers are offloaded in descending size order so the largest
+        buffers (most GPU savings) are prioritized when the budget is
+        tight.
+
+        Args:
+            recursive: If True (default), also offloads child FSDPModules.
+            pin_memory: If True, allocate pinned CPU memory for faster
+                CPU↔GPU transfers (~12 GB/s via DMA vs ~3-6 GB/s pageable).
+            max_cpu_bytes: Maximum CPU memory (in bytes) to consume.
+                Buffers beyond this limit are left on GPU.  ``None``
+                means no limit (offload everything).  The allocator
+                slots are always released and do not count against
+                this budget.
+
+        Returns:
+            Dict with ``"offloaded_bytes"`` and ``"skipped_bytes"``.
+        """
+        ctx = self._fsdp_root_context
+
+        # Collect (buffer, nbytes) pairs, largest first
+        entries: List[Tuple[Any, int]] = []
+        for module in self._get_fsdp_modules(recursive):
+            for pg in module._fsdp_param_groups:
+                for buf in (pg.model_weight_buffer, pg.transpose_weight_buffer,
+                            pg.main_weight_buffer, pg.main_grad_buffer):
+                    if buf is not None and buf.data is not None and not buf._is_on_cpu():
+                        entries.append((buf, buf.data.nbytes))
+        entries.sort(key=lambda x: x[1], reverse=True)
+
+        offloaded_bytes = 0
+        skipped_bytes = 0
+        for buf, nbytes in entries:
+            if max_cpu_bytes is not None and offloaded_bytes + nbytes > max_cpu_bytes:
+                skipped_bytes += nbytes
+                continue
+            buf._move_data_to(torch.device("cpu"), pin_memory=pin_memory)
+            offloaded_bytes += nbytes
+
+        # Rebuild views after all moves
+        for module in self._get_fsdp_modules(recursive):
+            for pg in module._fsdp_param_groups:
+                pg._rebuild_dist_views()
+
+        # Release allocator slots (always — no CPU cost)
+        if isinstance(ctx.bucket_allocator, TracePoolAllocator):
+            ctx.bucket_allocator.release()
+
+        return {"offloaded_bytes": offloaded_bytes, "skipped_bytes": skipped_bytes}
+
+    def reload_to_gpu(self, recursive: bool = True) -> None:
+        """Explicitly move all buffers back to GPU and rebuild views.
+
+        Normally not needed — every access path auto-reloads.
+        Useful to hide first-touch CPU→GPU copy latency.
+        """
+        for module in self._get_fsdp_modules(recursive):
+            for pg in module._fsdp_param_groups:
+                for buf in (pg.model_weight_buffer, pg.transpose_weight_buffer,
+                            pg.main_weight_buffer, pg.main_grad_buffer):
+                    if buf is not None:
+                        buf._move_data_to(module.device)
+                pg._rebuild_dist_views()
 
     def _init_named_param_groups(
         self,
