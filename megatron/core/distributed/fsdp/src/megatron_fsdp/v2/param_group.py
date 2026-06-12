@@ -270,9 +270,9 @@ class ParameterGroup:
         # destabilizing training.
         self.main_grad_buffer.reduce_grad(
             grad_comm_dtype=self.mp_policy.grad_comm_dtype,
-            overwrite_grad=False,
+            overwrite_grad=self._grad_buffer_is_fresh,
         )
-        self.is_zero_grad = False
+        self._grad_buffer_is_fresh = False
 
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""
@@ -367,7 +367,7 @@ class ParameterGroup:
         if gbuf.data is not None:
             return  # already initialised
 
-        gbuf.init_data(torch.zeros(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
+        gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
 
         # Rebuild dist_grads views — dist_params are unchanged
         s = self.sharding_strategy
