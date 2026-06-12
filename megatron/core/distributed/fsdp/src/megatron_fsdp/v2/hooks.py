@@ -226,7 +226,8 @@ def _register_backward_pre_hook(module: FSDPModule):
                     # overwrite instead.
                     setattr(param, "overwrite_main_grad", True)
             if param_group.main_grad_buffer is not None:
-                param_group.main_grad_buffer.unshard()
+                param_group._init_dist_grads()
+                param_group.main_grad_buffer.fetch_buffer()
 
     module._mfsdp_backward_pre_hook = create_custom_backward_hook(
         module, custom_backward_handler=pre_backward_hook
