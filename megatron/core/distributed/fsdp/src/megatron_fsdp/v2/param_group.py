@@ -198,8 +198,11 @@ class ParameterGroup:
         if self.requires_grad:
             main_grads_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])
             gbuf = self._create_buffer(main_grads_dtype, shard_grads, "main_grad")
-            gbuf.init_data(torch.zeros(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
-            self.main_grad_buffer = gbuf
+            if shard_grads:
+                self.main_grad_buffer = gbuf  # layout only, data is None
+            else:
+                gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
+                self.main_grad_buffer = gbuf
 
         # Create distributed parameter views
         self._init_dist_params()
@@ -282,6 +285,24 @@ class ParameterGroup:
                     del param.main_grad
             self.main_grad_buffer.reshard()
 
+    def _maybe_free_grad_data(self) -> None:
+        """Drop ``main_grad_buffer.data`` if all params are zero-graded.
+
+        After ``zero_grad()`` (or before the first backward), all
+        ``dist_param.grad`` are ``None``, so the gradient buffer holds no
+        meaningful data.  Free the backing tensor — ``_init_dist_grads``
+        will re-allocate on the next ``reduce_grad``.
+        """
+        if self.main_grad_buffer is None or self.main_grad_buffer.data is None:
+            return
+        if any(
+            [getattr(p, "grad", None) is not None for p in self.dist_params] +
+            [getattr(p, "decoupled_grad", None) is not None for p in self.dist_params]
+        ):
+            return
+        self.main_grad_buffer.data = None
+        self.dist_grads = [None for _ in self.params]
+
     def _init_dist_params(self):
         """
         Initialize distributed parameter views (DTensors) into the buffers.
@@ -331,7 +352,7 @@ class ParameterGroup:
 
         # Create gradient DTensor views. Some groups, e.g. uint8 FP8 model
         # payloads, do not require grads and therefore have no grad buffer.
-        if self.main_grad_buffer is None:
+        if self.main_grad_buffer is None or self.main_grad_buffer.data is None:
             self.dist_grads = [None for _ in self.params]
             return
 
@@ -350,6 +371,41 @@ class ParameterGroup:
                 )
             else:
                 self.dist_grads.append(None)
+
+    def _init_dist_grads(self) -> None:
+        """Lazily allocate ``main_grad_buffer.data`` and rebuild ``dist_grads``.
+
+        The buffer layout (``BufferIndex``, offsets, shard) was created in
+        ``_init_buffers``; only the backing tensor is deferred.  Called from
+        ``reduce_grad()`` on first use.  Uses ``torch.empty`` (uninitialised)
+        because ``_grad_buffer_is_fresh`` is True, so the next ``reduce_grad``
+        will overwrite rather than accumulate.  Subsequent calls are no-ops.
+        """
+        gbuf = self.main_grad_buffer
+        if gbuf is None or not self.requires_grad:
+            return
+        if gbuf.data is not None:
+            return  # already initialised
+
+        with torch.cuda.stream(torch.cuda.default_stream(self.device)):
+            gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
+
+        # Rebuild dist_grads views — dist_params are unchanged
+        s = self.sharding_strategy
+        is_grad_shard = s in ("optim", "optim_grads", "optim_grads_params")
+        placements = [Shard(dim=0)] if is_grad_shard else [Replicate()]
+
+        self.dist_grads = []
+        for p, dist_param in zip(self.params, self.dist_params):
+            grad_data = gbuf.get_item(self.param_idx[p], as_shard=is_grad_shard)
+            if p.requires_grad and grad_data.numel() > 0:
+                self.dist_grads.append(
+                    make_uneven_dtensor(grad_data, p.shape, self.mesh, placements)
+                )
+            else:
+                self.dist_grads.append(None)
+
+        self._grad_buffer_is_fresh = True
 
     def zero_grad(self, set_to_none: bool = True):
         """Zero the main gradient buffer and mark grads as zeroed."""
