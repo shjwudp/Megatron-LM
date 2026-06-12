@@ -255,8 +255,6 @@ def _register_backward_hook(module: FSDPModule):
             param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
             for param_group in module._fsdp_param_groups
         ):
-            for param_group in module._fsdp_param_groups:
-                param_group._init_dist_grads()
             module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
         module.post_backward_issued = True
 
@@ -355,8 +353,6 @@ def _register_post_backward_final_callback(
                 param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
                 for param_group in module._fsdp_param_groups
             ):
-                for param_group in module._fsdp_param_groups:
-                    param_group._init_dist_grads()
                 module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
 
         # ---- drain pending async reduce-grad events -----------------------
