@@ -861,7 +861,7 @@ class FSDPModule:
                 # no_shard and ZeRO-1 keep gradients replicated during backward.
                 # Sync them once at the iteration grad-sync boundary: no_shard
                 # all-reduces full grads, ZeRO-1 reduce-scatters virtual shards.
-                child.reduce_grad(async_op=False, overwrite_grad=True)
+                child.reduce_grad(async_op=False)
             for param_group in child._fsdp_param_groups:
                 for param, dist_grad in zip(param_group.params, param_group.dist_grads):
                     if param.requires_grad:

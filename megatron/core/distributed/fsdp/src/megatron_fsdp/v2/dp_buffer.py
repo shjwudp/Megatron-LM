@@ -688,7 +688,7 @@ class DataParallelBuffer:
         casted tensor and cast the reduced result back before accumulation.
         """
         if self.sharding_strategy in ("no_shard", "optim"):
-            assert overwrite_grad, "overwrite_grad must be True for no_shard or optim buffers"
+            overwrite_grad = True
 
         grad_comm_dtype = grad_comm_dtype or self.dtype
 
@@ -745,8 +745,8 @@ class DataParallelBuffer:
             output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
         )
 
-        # If local_grad_shard and reduced_grad_shard are same tensor
-        if grad_comm_dtype == self.dtype and not self.is_distributed:
+        # If the reduced shard is already in the local grad buffer, skip copy/accumulation.
+        if local_grad_shard.data_ptr() == reduced_grad_shard.data_ptr():
             return
 
         if overwrite_grad:
