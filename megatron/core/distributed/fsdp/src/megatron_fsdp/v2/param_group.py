@@ -202,11 +202,7 @@ class ParameterGroup:
         if self.requires_grad:
             main_grads_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])
             gbuf = self._create_buffer(main_grads_dtype, shard_grads, "main_grad")
-            if shard_grads:
-                self.main_grad_buffer = gbuf  # layout only, data is None
-            else:
-                gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
-                self.main_grad_buffer = gbuf
+            self.main_grad_buffer = gbuf
 
         # Create distributed parameter views
         self._init_dist_params()
@@ -317,7 +313,7 @@ class ParameterGroup:
         - "no_shard": replicated, no sharding (DDP-equivalent)
         """
         self.dist_params = []
-        self.dist_grads = []
+        self.dist_grads = []  # placeholder, populated in _init_dist_grads
         s = self.sharding_strategy
 
         # Determine placement based on sharding strategy
@@ -348,12 +344,11 @@ class ParameterGroup:
             setattr(param, "__fsdp_param__", True)
             setattr(dist_param, "__fsdp_param__", True)
             self.dist_params.append(dist_param)
+            self.dist_grads.append(None)  # placeholder, will be set in _init_dist_grads
 
         # Update dist_param chunk metadata for checkpointing and debugging.
         for dist_param in self.dist_params:
             update_uneven_dtensor_chunk_metadata(dist_param)
-
-        self.dist_grads = [None for _ in self.params]
 
     def _init_dist_grads(self) -> None:
         """Lazily allocate ``main_grad_buffer.data`` and rebuild ``dist_grads``.
