@@ -334,9 +334,12 @@ class TestMegatronFsdpV2Checkpoint:
             batch_size=MICRO_BATCH_SIZE,
             num_samples=GLOBAL_BATCH_SIZE * kwargs.get("train_iters", 2),
         )
-        for _ in range(kwargs.get("train_iters", 2)):
+        rank = torch.distributed.get_rank()
+        num_iters = kwargs.get("train_iters", 2)
+        t_start = time.time()
+        for step in range(num_iters):
             optim.zero_grad()
-            pretrain_forward_backward(
+            output = pretrain_forward_backward(
                 model=model_chunks,
                 data_iterator=data_iterator,
                 sequence_length=MAX_SEQ_LEN,
@@ -344,6 +347,16 @@ class TestMegatronFsdpV2Checkpoint:
                 num_micro_batches=GLOBAL_BATCH_SIZE // MICRO_BATCH_SIZE // DP_GROUP.size(),
             )
             optim.step()
+
+            if rank == 0:
+                loss_val = output[-1] if isinstance(output, (list, tuple)) else output
+                elapsed = time.time() - t_start
+                it_s = elapsed / (step + 1)
+                print(
+                    f"[_training_loop] step={step + 1}/{num_iters} "
+                    f"loss={loss_val:.6f} "
+                    f"elapsed={elapsed:.1f}s ({it_s * 1000:.0f}ms/it)"
+                )
 
         if "save" in kwargs:
             from megatron.training.checkpointing import save_checkpoint as mcore_save_checkpoint
