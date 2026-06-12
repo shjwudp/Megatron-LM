@@ -263,6 +263,7 @@ def test_reduce_grad(strategy):
     _, _, _, g_dist = _flags(strategy)
 
     for pg in groups:
+        pg._init_dist_grads()  # lazily allocate grad buffer and dist_grads list
         gbuf = pg.main_grad_buffer
         if gbuf is None:
             # uint8 group has requires_grad=False, so no grad buffer
