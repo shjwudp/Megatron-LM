@@ -263,6 +263,7 @@ def train(
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+            model.zero_grad()
 
             if step % args.log_interval == 0 and rank == 0:
                 t_now = time.time()
