@@ -882,7 +882,6 @@ class TestSafety:
 
 
 class TestCheckpoint:
-    @pytest.mark.skip(reason="Hangs. Debug in progress.")
     def test_get_state_dict_returns_dicts(self):
         """get_state_dict should return model and optimizer state dicts."""
         torch.manual_seed(42)
@@ -902,7 +901,6 @@ class TestCheckpoint:
         assert isinstance(opt_sd, dict)
         assert len(model_sd) > 0, "Model state dict should not be empty"
 
-    @pytest.mark.skip(reason="Hangs. Debug in progress.")
     def test_get_state_dict_nested_fsdp(self):
         """get_state_dict should work with nested FSDP modules."""
         torch.manual_seed(42)
@@ -921,7 +919,6 @@ class TestCheckpoint:
         model_sd, opt_sd = get_state_dict(model, optimizer)
         assert len(model_sd) > 0
 
-    @pytest.mark.skip(reason="Hangs. Debug in progress.")
     def test_preprocess_state_dict_adds_metadata(self):
         """preprocess_state_dict_for_uneven_dtensor should add chunk metadata."""
         torch.manual_seed(42)
@@ -948,7 +945,6 @@ class TestCheckpoint:
         with pytest.raises(AssertionError, match="Expected all parameters to be DTensors"):
             get_state_dict(model, optimizer)
 
-    @pytest.mark.skip(reason="Hangs. Debug in progress.")
     def test_get_state_dict_llm_scenario(self):
         """Full LLM forward-backward-checkpoint cycle should work."""
         torch.manual_seed(42)
@@ -969,7 +965,6 @@ class TestCheckpoint:
         assert len(model_sd) > 0
         assert len(opt_sd) > 0
 
-    @pytest.mark.skip(reason="Hangs. Debug in progress.")
     def test_get_state_dict_with_frozen_params(self):
         """get_state_dict should work with mixed frozen/trainable params."""
         torch.manual_seed(42)

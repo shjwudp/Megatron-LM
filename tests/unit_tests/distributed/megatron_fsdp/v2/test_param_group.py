@@ -198,8 +198,7 @@ def test_init_buffers(strategy):
         if pg.requires_grad:
             assert pg.main_grad_buffer is not None
             assert pg.main_grad_buffer.is_distributed == g_dist
-            # Grad buffer must be zero-initialized
-            assert torch.all(pg.main_grad_buffer.data == 0)
+            assert pg.main_grad_buffer.data is None  # lazy init
 
     torch.distributed.barrier()
 
