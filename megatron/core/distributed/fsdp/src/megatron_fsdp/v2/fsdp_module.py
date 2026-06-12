@@ -753,7 +753,7 @@ class FSDPModule:
             if not param_group.requires_grad:
                 continue
 
-            self._init_dist_grads()
+            param_group._init_dist_grads()
 
             # NaN check before reduction
             if getattr(self, "_enable_nan_checks", False):
