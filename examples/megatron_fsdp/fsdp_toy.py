@@ -261,6 +261,8 @@ def train(
             y = model(x)
             loss = y.sum() / (args.batch_size * args.seq_len)
             loss.backward()
+            if args.use_megatron_fsdp and args.release_memory_pool:
+                model.release_memory_pool()
             optimizer.step()
             optimizer.zero_grad()
             model.zero_grad()
@@ -311,6 +313,10 @@ def parse_args() -> argparse.Namespace:
                         default=True, help="Disable CUDA graph capture")
     parser.add_argument("--use-trace-pool", action="store_true", default=False,
                         help="Use TracePoolAllocator for stable buffer addresses")
+    parser.add_argument("--release-memory-pool", action="store_true", default=False,
+                        help="Call FSDPModule.release_memory_pool() after each backward "
+                        "to release allocator slot tensors and CUDA graphs. "
+                        "Only takes effect with --use-megatron-fsdp.")
     parser.add_argument("--record-memory-history", type=str, default=None, metavar="DIR",
                         help="Enable CUDA memory recording, dump snapshot to this directory")
     return parser.parse_args()
