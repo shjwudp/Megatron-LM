@@ -303,7 +303,6 @@ class ParameterGroup:
         the replicated buffer once when the optimizer syncs.
         """
         self._ensure_buffers_on_gpu()
-        self._init_dist_grads()
         # _grad_buffer_is_fresh is True after zero_grad() or lazy buffer init,
         # so the first reduce_grad after either event overwrites instead of
         # accumulating — no stale data from uninitialised or zeroed buffers.
@@ -389,26 +388,7 @@ class ParameterGroup:
         for dist_param in self.dist_params:
             update_uneven_dtensor_chunk_metadata(dist_param)
 
-        # Create gradient DTensor views.
-        if self.main_grad_buffer is None:
-            self.dist_grads = [None for _ in self.params]
-            return
-
-        is_grad_shard = is_param_shard
-        for p in self.params:
-            gbuf = self.main_grad_buffer
-            grad_data = gbuf.get_item(self.param_idx[p], as_shard=is_grad_shard)
-            # NOTE: Do not remove the grad_data.numel() > 0 check.
-            # Empty local grad shards are semantically no-ops, but materializing
-            # them as DTensor grads can pass zero-numel tensors into fused
-            # multi-tensor optimizers such as TE FusedAdam. That can break
-            # updates for neighboring non-empty shards.
-            if p.requires_grad and grad_data.numel() > 0:
-                self.dist_grads.append(
-                    make_uneven_dtensor(grad_data, p.shape, self.mesh, placements)
-                )
-            else:
-                self.dist_grads.append(None)
+        self.dist_grads = [None for _ in self.params]
 
     def _rebuild_dist_views(self) -> None:
         """In-place update ``dist_params._local_tensor`` / ``dist_grad._local_tensor``.
