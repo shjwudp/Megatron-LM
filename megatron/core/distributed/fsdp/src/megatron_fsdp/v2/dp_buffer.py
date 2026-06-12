@@ -687,6 +687,9 @@ class DataParallelBuffer:
         If grad_comm_dtype differs from self.dtype, communicate with a temporary
         casted tensor and cast the reduced result back before accumulation.
         """
+        if self.sharding_strategy in ("no_shard", "optim"):
+            assert overwrite_grad, "overwrite_grad must be True for no_shard or optim buffers"
+
         grad_comm_dtype = grad_comm_dtype or self.dtype
 
         if self.gradient_scaling_factor in (None, 1.0):
@@ -720,10 +723,6 @@ class DataParallelBuffer:
             # accumulated into ``local_grad_shard`` for gradient accumulation.
             input_buffer = self.fetch_buffer()
             output_offset = sm.bucket_data_index
-            if overwrite_grad:
-                accumulate_output = False
-            else:
-                accumulate_output = True
             if input_buffer.is_cuda:
                 # Keep temporary reduce-scatter buffers tied to the stream that uses them.
                 input_buffer.record_stream(torch.cuda.current_stream())
@@ -734,8 +733,6 @@ class DataParallelBuffer:
             # slice instead of accumulating into a separate shard buffer.
             input_buffer = self.data
             output_offset = sm.local_data_index
-            accumulate_output = False
-            overwrite_grad = False
 
         comm_input = (
             input_buffer if grad_comm_dtype == self.dtype else input_buffer.to(grad_comm_dtype)
@@ -748,12 +745,14 @@ class DataParallelBuffer:
             output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
         )
 
+        # If local_grad_shard and reduced_grad_shard are same tensor
+        if grad_comm_dtype == self.dtype and not self.is_distributed:
+            return
+
         if overwrite_grad:
             local_grad_shard.copy_(reduced_grad_shard)
-        elif accumulate_output:
+        else:
             local_grad_shard += reduced_grad_shard
-        elif grad_comm_dtype != self.dtype:
-            local_grad_shard.copy_(reduced_grad_shard)
 
 
 def check_all_fsdp_buffers(module) -> bool:
