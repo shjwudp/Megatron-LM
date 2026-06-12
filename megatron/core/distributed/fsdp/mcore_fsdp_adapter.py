@@ -273,6 +273,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
             "enable_trace_pool": ddp_config.fsdp_double_buffer,
             "sharding_strategy": ddp_config.data_parallel_sharding_strategy,
+            "outer_dp_sharding_strategy": ddp_config.outer_dp_sharding_strategy,
         }
         if config.calculate_per_token_loss:
             gradient_scaling_factor = None

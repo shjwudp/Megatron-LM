@@ -58,6 +58,7 @@ def fully_shard(
     gradient_scaling_factor: Optional[float] = None,
     enable_trace_pool: bool = False,
     sharding_strategy: str = "optim_grads_params",
+    outer_dp_sharding_strategy: str = "no_shard",
     enable_cuda_graph: bool = False,
 ) -> nn.Module:
     """
@@ -107,6 +108,7 @@ def fully_shard(
         mp_policy=mp_policy,
         gradient_scaling_factor=gradient_scaling_factor,
         sharding_strategy=sharding_strategy,
+        outer_dp_sharding_strategy=outer_dp_sharding_strategy,
     )
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,

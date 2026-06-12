@@ -59,6 +59,7 @@ class ParameterGroup:
         mp_policy: MixedPrecisionPolicy,
         mesh: Optional[DeviceMesh] = None,
         sharding_strategy: str = "optim_grads_params",
+        outer_dp_sharding_strategy: str = "no_shard",
         gradient_scaling_factor: Optional[float] = None,
         allocator: Optional[BucketAllocator] = None,
     ):
@@ -95,7 +96,12 @@ class ParameterGroup:
 
         if sharding_strategy not in ("no_shard", "optim", "optim_grads", "optim_grads_params"):
             raise ValueError(f"Unsupported sharding strategy: {sharding_strategy}")
+        if outer_dp_sharding_strategy not in ("no_shard", "optim"):
+            raise ValueError(
+                f"Unsupported outer DP sharding strategy: {outer_dp_sharding_strategy}"
+            )
         self.sharding_strategy = sharding_strategy
+        self.outer_dp_sharding_strategy = outer_dp_sharding_strategy
         self.param_group_id = param_group_id
 
         # Compute chunk size factor for alignment
@@ -139,7 +145,7 @@ class ParameterGroup:
             param_idx=self.param_idx,
             dtype=dtype,
             device=self.device,
-            dp_group=self.dp_group,
+            mesh=self.mesh,
             allocator=self.allocator,
             buffer_role=role,
             is_distributed=is_distributed,
@@ -147,6 +153,7 @@ class ParameterGroup:
             gradient_scaling_factor=self.gradient_scaling_factor,
             chunk_size_factor=self.chunk_size_factor,
             sharding_strategy=self.sharding_strategy,
+            outer_dp_sharding_strategy=self.outer_dp_sharding_strategy,
             mp_policy=self.mp_policy,
         )
 

@@ -249,6 +249,7 @@ class FSDPModule:
         mp_policy: MixedPrecisionPolicy,
         gradient_scaling_factor: Optional[float] = None,
         sharding_strategy: str = "optim_grads_params",
+        outer_dp_sharding_strategy: str = "no_shard",
     ):
         """
         Initialize parameter groups and build param name mapping.
@@ -280,6 +281,7 @@ class FSDPModule:
             ignored_params=ignored_params,
             gradient_scaling_factor=gradient_scaling_factor,
             sharding_strategy=sharding_strategy,
+            outer_dp_sharding_strategy=outer_dp_sharding_strategy,
         )
         setattr(self, "_fsdp_param_groups", fsdp_param_groups)
 
@@ -961,6 +963,7 @@ def _get_module_fsdp_param_groups(
     ignored_params: Optional[set[nn.Parameter]] = None,
     gradient_scaling_factor: Optional[float] = None,
     sharding_strategy: str = "optim_grads_params",
+    outer_dp_sharding_strategy: str = "no_shard",
 ) -> List[ParameterGroup]:
     """
     Group module parameters by (device, dtype, requires_grad) and create ParameterGroups.
@@ -993,6 +996,7 @@ def _get_module_fsdp_param_groups(
                 mp_policy=mp_policy,
                 gradient_scaling_factor=gradient_scaling_factor,
                 sharding_strategy=sharding_strategy,
+                outer_dp_sharding_strategy=outer_dp_sharding_strategy,
             )
         )
 

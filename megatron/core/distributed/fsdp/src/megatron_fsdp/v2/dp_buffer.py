@@ -18,6 +18,7 @@ from collections import namedtuple
 from typing import Dict, List, Optional, Tuple
 
 import torch
+from torch.distributed.tensor import DeviceMesh
 
 from .allocator import BucketAllocator, TemporaryBucketAllocator
 from .mixed_precision import MixedPrecisionPolicy
@@ -354,7 +355,7 @@ class DataParallelBuffer:
         param_idx: Dict[torch.nn.Parameter, int],
         dtype: torch.dtype,
         device: torch.device,
-        dp_group: torch.distributed.ProcessGroup,
+        mesh: DeviceMesh,
         param_group_id: ParamGroupIdx,
         mp_policy: MixedPrecisionPolicy,
         *,
@@ -364,23 +365,27 @@ class DataParallelBuffer:
         gradient_scaling_factor: Optional[float] = None,
         chunk_size_factor: int = 1,
         sharding_strategy: str = "no_shard",
+        outer_dp_sharding_strategy: str = "no_shard",
     ):
         assert mp_policy is not None, "DataParallelBuffer requires a mixed-precision policy"
         self.params = params
         self.param_idx = param_idx
         self.dtype = dtype
         self.device = device
-        self.dp_group = dp_group
+        self.mesh = mesh
+        self.outer_dp_group = mesh.get_group(mesh_dim=0)
+        self.dp_group = mesh.get_group(mesh_dim=1)
         self.allocator = allocator if allocator is not None else TemporaryBucketAllocator()
         self.buffer_role = buffer_role
         self.alloc_key = (param_group_id, buffer_role)
         self.mp_policy = mp_policy
         self.is_distributed = is_distributed
         self.sharding_strategy = sharding_strategy
+        self.outer_dp_sharding_strategy = outer_dp_sharding_strategy
         self.gradient_scaling_factor = gradient_scaling_factor
 
-        dp_rank = torch.distributed.get_rank(dp_group)
-        dp_world_size = torch.distributed.get_world_size(dp_group)
+        dp_rank = torch.distributed.get_rank(self.dp_group)
+        dp_world_size = torch.distributed.get_world_size(self.dp_group)
 
         # Always build layout with logical shapes and shared chunk_size_factor
         # so that all buffers share the same proportional item-offset mapping.
@@ -672,6 +677,7 @@ class DataParallelBuffer:
             torch.distributed.all_reduce(comm_input, group=self.dp_group, op=op)
             if grad_comm_dtype != self.dtype:
                 self.data.copy_(comm_input.to(self.dtype))
+            self._outter_reduce_grad(self.data, grad_comm_dtype)
             return
 
         if self.is_distributed:
@@ -715,6 +721,43 @@ class DataParallelBuffer:
             local_grad_shard += reduced_grad_shard
         elif grad_comm_dtype != self.dtype:
             local_grad_shard.copy_(reduced_grad_shard)
+
+        self._outter_reduce_grad(local_grad_shard, grad_comm_dtype)
+
+    def _outter_reduce_grad(self, grad: torch.Tensor, grad_comm_dtype: torch.dtype) -> None:
+        """All-reduce the optimizer-facing grad over replicated HSDP outer ranks."""
+        if self.outer_dp_sharding_strategy != "no_shard":
+            raise NotImplementedError(
+                "FSDP v2 does not support outer-DP grad sharding yet: "
+                f"{self.outer_dp_sharding_strategy}"
+            )
+        if self.outer_dp_group is None:
+            return
+        if torch.distributed.get_world_size(self.outer_dp_group) == 1:
+            return
+        if grad.numel() == 0:
+            return
+
+        if grad_comm_dtype == self.dtype:
+            torch.distributed.all_reduce(
+                grad, group=self.outer_dp_group, op=torch.distributed.ReduceOp.SUM
+            )
+            return
+
+        bucket = self.allocator.allocate(
+            key=(self.alloc_key, "hsdp_grad_comm"),
+            size=grad.numel(),
+            dtype=grad_comm_dtype,
+            device=self.device,
+        )
+        comm_input = bucket.data
+        comm_input.copy_(grad)
+
+        torch.distributed.all_reduce(
+            comm_input, group=self.outer_dp_group, op=torch.distributed.ReduceOp.SUM
+        )
+        grad.copy_(comm_input.to(self.dtype))
+        self.allocator.free((self.alloc_key, "hsdp_grad_comm"))
 
 
 def check_all_fsdp_buffers(module) -> bool:

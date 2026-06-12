@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DeviceMesh
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
@@ -76,7 +77,7 @@ class MixedDtypeLayer(nn.Module):
 # ------------------------------------------------------------------ #
 
 
-def _build_groups(strategy):
+def _build_groups(strategy, mesh=None, mp_policy=None):
     """Create two ParameterGroups (bf16 + uint8) and call init_buffers.
 
     Returns (groups, originals, dp_group, rank, world_size, device) where
@@ -84,7 +85,7 @@ def _build_groups(strategy):
     """
     rank = torch.distributed.get_rank()
     device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
-    dp_group = torch.distributed.group.WORLD
+    dp_group = torch.distributed.group.WORLD if mesh is None else mesh.get_group(mesh_dim=1)
 
     # Fixed seed so all ranks start with identical weights
     torch.manual_seed(42)
@@ -109,12 +110,20 @@ def _build_groups(strategy):
         pg = ParameterGroup(
             params=params,
             param_group_id=ParamGroupIdx(0, gid),
-            mp_policy=MixedPrecisionPolicy(),
-            mesh=None,
+            mp_policy=mp_policy or MixedPrecisionPolicy(),
+            mesh=mesh,
             sharding_strategy=strategy,
         )
         groups.append(pg)
     return groups, originals, dp_group, rank, torch.distributed.get_world_size(), device
+
+
+def _build_hsdp_mesh(device):
+    world_size = torch.distributed.get_world_size()
+    if world_size < 4 or world_size % 2 != 0:
+        pytest.skip("HSDP mesh coverage requires an even world size >= 4")
+    mesh = torch.arange(world_size, dtype=torch.int).reshape(2, world_size // 2)
+    return DeviceMesh(device.type, mesh, mesh_dim_names=("dp_outer", "dp"))
 
 
 def _flags(s):
@@ -297,6 +306,50 @@ def test_reduce_grad(strategy):
             gbuf.reduce_grad()
 
             # Only compare the shard region of self.data
+            sm = gbuf.buffer_index.shard_meta
+            actual = gbuf.data[sm.local_data_index : sm.local_data_index + sm.size]
+            assert torch.equal(actual, ref_shard)
+
+    torch.distributed.barrier()
+
+
+@pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
+def test_hsdp_reduce_grad(strategy):
+    rank = torch.distributed.get_rank()
+    device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
+    mesh = _build_hsdp_mesh(device)
+    groups, _, _, rank, _, device = _build_groups(strategy, mesh=mesh)
+    _, _, _, g_dist = _flags(strategy)
+
+    for pg in groups:
+        gbuf = pg.main_grad_buffer
+        if gbuf is None:
+            continue
+
+        if strategy == "no_shard":
+            gbuf.data.fill_(float(rank + 1))
+            ref = torch.full_like(gbuf.data, float(rank + 1))
+            Ref.all_reduce(ref, pg.dp_group)
+            Ref.all_reduce(ref, pg.outer_dp_group)
+            gbuf.reduce_grad()
+            assert torch.equal(gbuf.data, ref)
+        else:
+            full_size = gbuf.buffer_index.bucket_meta.size
+            full = torch.full((full_size,), float(rank + 1), dtype=gbuf.dtype, device=device)
+
+            ref_shard = Ref.reduce_scatter(full.clone(), pg.dp_group)
+            Ref.all_reduce(ref_shard, pg.outer_dp_group)
+
+            if g_dist:
+                bucket = gbuf.allocator.allocate(
+                    key=gbuf.alloc_key, size=full_size, dtype=gbuf.dtype, device=device
+                )
+                bucket.data.copy_(full)
+                gbuf.data.zero_()
+            else:
+                gbuf.data.copy_(full)
+            gbuf.reduce_grad()
+
             sm = gbuf.buffer_index.shard_meta
             actual = gbuf.data[sm.local_data_index : sm.local_data_index + sm.size]
             assert torch.equal(actual, ref_shard)
