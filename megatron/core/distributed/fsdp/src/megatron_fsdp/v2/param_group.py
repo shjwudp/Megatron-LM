@@ -100,6 +100,11 @@ class ParameterGroup:
             raise ValueError(
                 f"Unsupported outer DP sharding strategy: {outer_dp_sharding_strategy}"
             )
+        if outer_dp_sharding_strategy == "optim" and sharding_strategy != "optim_grads_params":
+            raise NotImplementedError(
+                "FSDP v2 outer-DP optimizer sharding currently requires inner "
+                f"optim_grads_params, got {sharding_strategy}."
+            )
         self.sharding_strategy = sharding_strategy
         self.outer_dp_sharding_strategy = outer_dp_sharding_strategy
         self.param_group_id = param_group_id
@@ -119,9 +124,6 @@ class ParameterGroup:
         self.transpose_weight_buffer: Optional[DataParallelBuffer] = None
         self.main_weight_buffer: Optional[DataParallelBuffer] = None
         self.main_grad_buffer: Optional[DataParallelBuffer] = None
-        self.hsdp_wbuf: Optional[DataParallelBuffer] = None
-        self.hsdp_gbuf: Optional[DataParallelBuffer] = None
-        self.hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
         # Initialize buffers and distributed parameters
         self._init_buffers()
 
@@ -237,6 +239,8 @@ class ParameterGroup:
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
             if weight_buffer is not None:
+                if self.outer_dp_sharding_strategy == "optim":
+                    weight_buffer.unshard_outer()
                 weight_buffer.unshard(bind_params=bind_params)
 
         self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
@@ -288,6 +292,7 @@ class ParameterGroup:
             grad_comm_dtype=self.mp_policy.grad_comm_dtype,
             overwrite_grad=False,
         )
+        self.main_grad_buffer.reduce_grad_outer(self.mp_policy.grad_comm_dtype)
         self.is_zero_grad = False
 
     def release_grad_buffer(self):
@@ -317,12 +322,31 @@ class ParameterGroup:
 
         is_param_shard = s == "optim_grads_params"
         is_optim_shard = s != "no_shard"
-        # Mesh layout is (outer, inner); FSDP shards optimizer views on inner.
-        optim_placements = [Replicate(), Shard(dim=0) if is_optim_shard else Replicate()]
+        is_outer_optim_shard = self.outer_dp_sharding_strategy == "optim" and is_optim_shard
+        if is_outer_optim_shard:
+            setattr(self.mesh, "_shard_order", [1, 0])
+        # Mesh layout is (outer, inner). Outer optim shards optimizer views on
+        # both dimensions, with inner sharding applied before outer sharding.
+        optim_placements = [
+            Shard(dim=0) if is_outer_optim_shard else Replicate(),
+            Shard(dim=0) if is_optim_shard else Replicate(),
+        ]
 
         # Create parameter DTensor views
         for param in self.params:
-            if self.main_weight_buffer is not None:
+            if is_outer_optim_shard:
+                buffer = self.main_weight_buffer or self.model_weight_buffer
+                assert buffer is not None
+                data = buffer.get_item(
+                    self.param_idx[param],
+                    as_shard=is_optim_shard,
+                    as_outer_shard=is_outer_optim_shard,
+                )
+                if self.main_weight_buffer is not None:
+                    param_shape = param.shape
+                else:
+                    param_shape = self.mp_policy.get_param_storage_shapes([param])[0]
+            elif self.main_weight_buffer is not None:
                 mbuf = self.main_weight_buffer
                 data = mbuf.get_item(self.param_idx[param], as_shard=is_optim_shard)
                 param_shape = param.shape
@@ -357,7 +381,11 @@ class ParameterGroup:
 
         for p in self.params:
             gbuf = self.main_grad_buffer
-            grad_data = gbuf.get_item(self.param_idx[p], as_shard=is_optim_shard)
+            grad_data = gbuf.get_item(
+                self.param_idx[p],
+                as_shard=is_optim_shard,
+                as_outer_shard=is_outer_optim_shard,
+            )
             # NOTE: Do not remove the grad_data.numel() > 0 check.
             # Empty local grad shards are semantically no-ops, but materializing
             # them as DTensor grads can pass zero-numel tensors into fused

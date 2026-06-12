@@ -31,6 +31,9 @@ class BufferIndex:
     """Describes how params are laid out in a flat buffer, including global layout
     and per-rank shard information.
 
+    HSDP outer optimizer sharding is modeled as a second shard meta inside this
+    rank's inner-DP shard, not as a new global ``inner * outer`` layout.
+
     Each DataParallelBuffer owns its own independent BufferIndex instance.
     """
 
@@ -49,19 +52,34 @@ class BufferIndex:
         param_group_id: ParamGroupIdx,
         chunk_size_factor: int = 1,
         sharding_strategy: str = "no_shard",
+        outer_dp_rank: Optional[int] = None,
+        outer_dp_world_size: Optional[int] = None,
     ):
         self.param_group_id = param_group_id
         self.is_distributed = is_distributed
         self.dp_rank = dp_rank
         self.dp_world_size = dp_world_size
+        self.outer_dp_rank = outer_dp_rank
+        self.outer_dp_world_size = outer_dp_world_size
         self.chunk_size_factor = chunk_size_factor
         self.sharding_strategy = sharding_strategy
+        layout_world_size = dp_world_size
+        if outer_dp_world_size is not None:
+            # HSDP outer optimizer sharding splits each inner-DP shard again.
+            # Pad the global layout so both inner and outer shard boundaries
+            # preserve dim-0 row boundaries.
+            layout_world_size *= outer_dp_world_size
         self.item_index_map, self.bucket_meta = self._build_layout(
-            param_shapes, dp_world_size, chunk_size_factor, sharding_strategy
+            param_shapes, layout_world_size, chunk_size_factor, sharding_strategy
         )
         self.shard_meta = self._build_shard_meta(
             self.bucket_meta, is_distributed, dp_world_size, dp_rank
         )
+        self.outer_shard_meta: Optional[BufferIndex.ShardMeta] = None
+        if outer_dp_world_size is not None:
+            self.outer_shard_meta = self._build_outer_shard_meta(
+                self.shard_meta, outer_dp_world_size, outer_dp_rank
+            )
 
     # ------------------------------------------------------------------ #
     #  Layout construction (global, rank-independent)
@@ -241,6 +259,27 @@ class BufferIndex:
                 size=shard_size,
             )
 
+    @classmethod
+    def _build_outer_shard_meta(
+        cls,
+        shard_meta: "BufferIndex.ShardMeta",
+        outer_dp_world_size: int,
+        outer_dp_rank: int,
+    ) -> "BufferIndex.ShardMeta":
+        if shard_meta.size % outer_dp_world_size != 0:
+            raise ValueError(
+                f"Inner shard size {shard_meta.size} is not divisible by "
+                f"outer DP size {outer_dp_world_size}."
+            )
+        outer_shard_size = shard_meta.size // outer_dp_world_size
+        outer_offset = outer_dp_rank * outer_shard_size
+        return cls.ShardMeta(
+            global_data_index=shard_meta.global_data_index + outer_offset,
+            local_data_index=shard_meta.local_data_index + outer_offset,
+            bucket_data_index=shard_meta.bucket_data_index + outer_offset,
+            size=outer_shard_size,
+        )
+
     # ------------------------------------------------------------------ #
     #  Compaction — scale indices proportionally for packed storage
     # ------------------------------------------------------------------ #
@@ -271,6 +310,10 @@ class BufferIndex:
         self.shard_meta = self._build_shard_meta(
             self.bucket_meta, self.is_distributed, self.dp_world_size, self.dp_rank
         )
+        if self.outer_dp_world_size is not None:
+            self.outer_shard_meta = self._build_outer_shard_meta(
+                self.shard_meta, self.outer_dp_world_size, self.outer_dp_rank
+            )
 
     # ------------------------------------------------------------------ #
     #  Internal index query methods — three coordinate domains:
@@ -290,7 +333,9 @@ class BufferIndex:
         idx = self.item_index_map[item_id]
         return (idx.global_data_index, idx.global_data_index + idx.size)
 
-    def _get_item_self_range(self, item_id: int, *, as_shard: bool = True) -> Tuple[int, int]:
+    def _get_item_self_range(
+        self, item_id: int, *, as_shard: bool = True, as_outer_shard: bool = False
+    ) -> Tuple[int, int]:
         """Return coordinates relative to the item's own start.
 
         When ``as_shard=True`` (default), returns the portion of the item
@@ -299,22 +344,32 @@ class BufferIndex:
         representing the full item.
         """
         idx = self.item_index_map[item_id]
-        if not as_shard:
-            return (0, idx.size)
-
         item_start = idx.global_data_index
         item_end = item_start + idx.size
-        shard_start = self.shard_meta.global_data_index
-        shard_end = shard_start + self.shard_meta.size
+        range_start = item_start
+        range_end = item_end
 
-        if item_start > shard_end or item_end < shard_start:
+        if as_shard:
+            shard_start = self.shard_meta.global_data_index
+            shard_end = shard_start + self.shard_meta.size
+            range_start = max(range_start, shard_start)
+            range_end = min(range_end, shard_end)
+
+        if as_outer_shard:
+            assert self.outer_shard_meta is not None
+            outer_start = self.outer_shard_meta.global_data_index
+            outer_end = outer_start + self.outer_shard_meta.size
+            range_start = max(range_start, outer_start)
+            range_end = min(range_end, outer_end)
+
+        if range_start >= range_end:
             return (0, 0)
 
-        start = max(item_start, shard_start) - item_start
-        end = min(item_end, shard_end) - item_start
-        return (start, end)
+        return (range_start - idx.global_data_index, range_end - idx.global_data_index)
 
-    def _get_item_local_range(self, item_id: int, *, as_shard: bool = False) -> Tuple[int, int]:
+    def _get_item_local_range(
+        self, item_id: int, *, as_shard: bool = False, as_outer_shard: bool = False
+    ) -> Tuple[int, int]:
         """Return coordinates within self.data for the item.
 
         Parameters
@@ -324,21 +379,41 @@ class BufferIndex:
             is not distributed.  Default (False) returns the full item
             range for non-distributed buffers.
         """
-        if not self.is_distributed and not as_shard:
-            idx = self.item_index_map[item_id]
-            return (idx.global_data_index, idx.global_data_index + idx.size)
+        idx = self.item_index_map[item_id]
+        range_start = idx.global_data_index
+        range_end = range_start + idx.size
 
-        slice_start, slice_end = self._get_item_self_range(item_id)
-        if slice_start == slice_end:
+        if as_shard:
+            shard_start = self.shard_meta.global_data_index
+            shard_end = shard_start + self.shard_meta.size
+            range_start = max(range_start, shard_start)
+            range_end = min(range_end, shard_end)
+
+        if as_outer_shard:
+            assert self.outer_shard_meta is not None
+            outer_start = self.outer_shard_meta.global_data_index
+            outer_end = outer_start + self.outer_shard_meta.size
+            range_start = max(range_start, outer_start)
+            range_end = min(range_end, outer_end)
+
+        if self.is_distributed:
+            shard_start = self.shard_meta.global_data_index
+            shard_end = shard_start + self.shard_meta.size
+            range_start = max(range_start, shard_start)
+            range_end = min(range_end, shard_end)
+
+        if range_start >= range_end:
             return (0, 0)
 
-        idx = self.item_index_map[item_id]
-        offset = (
-            idx.global_data_index
-            - self.shard_meta.global_data_index
-            + self.shard_meta.local_data_index
-        )
-        return (offset + slice_start, offset + slice_end)
+        if self.is_distributed:
+            local_start = (
+                self.shard_meta.local_data_index
+                + range_start
+                - self.shard_meta.global_data_index
+            )
+        else:
+            local_start = range_start
+        return (local_start, local_start + (range_end - range_start))
 
 
 class DataParallelBuffer:
@@ -386,6 +461,11 @@ class DataParallelBuffer:
 
         dp_rank = torch.distributed.get_rank(self.dp_group)
         dp_world_size = torch.distributed.get_world_size(self.dp_group)
+        outer_dp_rank = None
+        outer_dp_world_size = None
+        if outer_dp_sharding_strategy == "optim":
+            outer_dp_rank = torch.distributed.get_rank(self.outer_dp_group)
+            outer_dp_world_size = torch.distributed.get_world_size(self.outer_dp_group)
 
         # Always build layout with logical shapes and shared chunk_size_factor
         # so that all buffers share the same proportional item-offset mapping.
@@ -398,6 +478,8 @@ class DataParallelBuffer:
             chunk_size_factor=chunk_size_factor,
             sharding_strategy=sharding_strategy,
             param_group_id=param_group_id,
+            outer_dp_rank=outer_dp_rank,
+            outer_dp_world_size=outer_dp_world_size,
         )
 
         # Compact NVFP4 weight buffers: scale all indices proportionally so
@@ -525,20 +607,41 @@ class DataParallelBuffer:
             pass  # silent on success
         return valid
 
-    def set_item(self, item_id: int, item_data: torch.Tensor) -> None:
+    def set_item(
+        self,
+        item_id: int,
+        item_data: torch.Tensor,
+        *,
+        as_shard: bool = False,
+        as_outer_shard: bool = False,
+    ) -> None:
         """Write a parameter tensor into the corresponding region of the buffer."""
-        if self.is_distributed:
-            slice_start, slice_end = self.buffer_index._get_item_self_range(item_id)
-            item_data = item_data.flatten()[slice_start:slice_end]
-
-        local_start, local_end = self.buffer_index._get_item_local_range(item_id)
+        local_start, local_end = self.buffer_index._get_item_local_range(
+            item_id, as_shard=as_shard, as_outer_shard=as_outer_shard
+        )
         shard = self.data[local_start:local_end]
         if shard.numel() > 0:
+            idx = self.buffer_index.item_index_map[item_id]
+            if self.is_distributed:
+                global_start = (
+                    self.buffer_index.shard_meta.global_data_index
+                    + local_start
+                    - self.buffer_index.shard_meta.local_data_index
+                )
+            else:
+                global_start = local_start
+            slice_start = global_start - idx.global_data_index
+            slice_end = slice_start + shard.numel()
+            item_data = item_data.flatten()[slice_start:slice_end]
             shard.data.copy_(item_data.flatten())
 
-    def get_item(self, item_id: int, *, as_shard: bool = False) -> torch.Tensor:
+    def get_item(
+        self, item_id: int, *, as_shard: bool = False, as_outer_shard: bool = False
+    ) -> torch.Tensor:
         """Read a parameter tensor (or its shard) from the buffer."""
-        start, end = self.buffer_index._get_item_local_range(item_id, as_shard=as_shard)
+        start, end = self.buffer_index._get_item_local_range(
+            item_id, as_shard=as_shard, as_outer_shard=as_outer_shard
+        )
         return self.data[start:end]
 
     def is_unsharded(self) -> bool:
@@ -559,15 +662,14 @@ class DataParallelBuffer:
         self.data is returned directly. If a replicated buffer only has this
         rank's updated shard, the shard is all-gathered into self.data first.
         """
-        full_buffer = self.fetch_buffer(as_shard=False)
+        full_buffer = self.fetch_buffer()
 
         if not self.is_distributed and not getattr(full_buffer, "_dirty", False):
             if bind_params:
                 self._bind_buffer_to_params(full_buffer)
             return full_buffer
 
-        sm = self.buffer_index.shard_meta
-        shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
+        shard_buffer = self.fetch_buffer(shard_mode="inner_shard")
         torch.distributed.all_gather_into_tensor(
             output_tensor=full_buffer,
             input_tensor=shard_buffer,
@@ -583,6 +685,25 @@ class DataParallelBuffer:
 
         setattr(full_buffer, "_dirty", False)  # mark the buffer as clean (unsharded)
 
+        return full_buffer
+
+    @torch.no_grad()
+    def unshard_outer(self) -> torch.Tensor:
+        """All-gather outer optimizer shards into this rank's local inner-DP shard."""
+        full_buffer = self.fetch_buffer(shard_mode="inner_shard")
+        if self.outer_dp_sharding_strategy != "optim":
+            return full_buffer
+        if torch.distributed.get_world_size(self.outer_dp_group) == 1:
+            return full_buffer
+
+        shard_buffer = self.fetch_buffer(shard_mode="outer_shard")
+        torch.distributed.all_gather_into_tensor(
+            output_tensor=full_buffer,
+            input_tensor=shard_buffer,
+            group=self.outer_dp_group,
+        )
+        if full_buffer.is_cuda:
+            full_buffer.record_stream(torch.cuda.current_stream())
         return full_buffer
 
     def _bind_buffer_to_params(self, buffer: torch.Tensor) -> None:
@@ -606,18 +727,31 @@ class DataParallelBuffer:
         self.allocator.free(self.alloc_key)
         self._unsharded_buffer = None
 
-    def fetch_buffer(self, *, as_shard: bool = False) -> torch.Tensor:
+    def fetch_buffer(self, *, shard_mode: str = "no_shard") -> torch.Tensor:
         """Return the buffer, allocating the full unsharded view if needed.
 
         Parameters
         ----------
-        as_shard : bool
-            If True, return only this rank's shard slice of the full buffer.
-            Default (False) returns the full unsharded buffer.
+        shard_mode : str
+            "no_shard" returns the full buffer, "inner_shard" returns this
+            inner-DP rank's shard, and "outer_shard" returns this outer-DP
+            rank's shard inside the local inner-DP buffer.
 
         Memory allocation always occurs on the default stream for deterministic
         caching-allocator behaviour.
         """
+        if shard_mode == "inner_shard":
+            assert self.data is not None, "DataParallelBuffer data not initialized"
+            sm = self.buffer_index.shard_meta
+            return self.data[sm.local_data_index : sm.local_data_index + sm.size]
+        if shard_mode == "outer_shard":
+            assert self.data is not None, "DataParallelBuffer data not initialized"
+            assert self.buffer_index.outer_shard_meta is not None
+            sm = self.buffer_index.outer_shard_meta
+            return self.data[sm.local_data_index : sm.local_data_index + sm.size]
+        if shard_mode != "no_shard":
+            raise ValueError(f"Unsupported shard_mode: {shard_mode}")
+
         if self.is_distributed:
             if self._unsharded_buffer is None:
                 bucket = self.allocator.allocate(
@@ -632,9 +766,6 @@ class DataParallelBuffer:
             assert self.data is not None, "DataParallelBuffer data not initialized"
             full = self.data
 
-        if as_shard:
-            sm = self.buffer_index.shard_meta
-            return full[sm.bucket_data_index : sm.bucket_data_index + sm.size]
         return full
 
     @torch.no_grad()
@@ -677,7 +808,6 @@ class DataParallelBuffer:
             torch.distributed.all_reduce(comm_input, group=self.dp_group, op=op)
             if grad_comm_dtype != self.dtype:
                 self.data.copy_(comm_input.to(self.dtype))
-            self._outter_reduce_grad(self.data, grad_comm_dtype)
             return
 
         if self.is_distributed:
@@ -686,11 +816,7 @@ class DataParallelBuffer:
             # assembled only for this reduce-scatter, and the RS result is
             # accumulated into ``local_grad_shard`` for gradient accumulation.
             input_buffer = self.fetch_buffer()
-            output_offset = sm.bucket_data_index
-            if overwrite_grad:
-                accumulate_output = False
-            else:
-                accumulate_output = True
+            accumulate_output = not overwrite_grad
             if input_buffer.is_cuda:
                 # Keep temporary reduce-scatter buffers tied to the stream that uses them.
                 input_buffer.record_stream(torch.cuda.current_stream())
@@ -700,16 +826,18 @@ class DataParallelBuffer:
             # virtual shard, so the one delayed RS writes directly into that
             # slice instead of accumulating into a separate shard buffer.
             input_buffer = self.data
-            output_offset = sm.local_data_index
             accumulate_output = False
             overwrite_grad = False
+
+        output_offset = sm.bucket_data_index if self.is_distributed else sm.local_data_index
 
         comm_input = (
             input_buffer if grad_comm_dtype == self.dtype else input_buffer.to(grad_comm_dtype)
         )
         if prescale:
             comm_input.mul_(self.gradient_scaling_factor)
-        reduced_grad_shard = comm_input[output_offset : output_offset + sm.size]
+
+        reduced_grad_shard = comm_input[output_offset : output_offset + local_grad_shard.numel()]
 
         torch.distributed.reduce_scatter_tensor(
             output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
@@ -722,13 +850,71 @@ class DataParallelBuffer:
         elif grad_comm_dtype != self.dtype:
             local_grad_shard.copy_(reduced_grad_shard)
 
-        self._outter_reduce_grad(local_grad_shard, grad_comm_dtype)
+    @torch.no_grad()
+    def reduce_grad_outer(self, grad_comm_dtype: Optional[torch.dtype] = None) -> None:
+        """Reduce-scatter this inner-DP grad shard into its outer optimizer shard."""
+        if self.outer_dp_sharding_strategy == "no_shard":
+            grad_comm_dtype = grad_comm_dtype or self.dtype
+            grad = (
+                self.data
+                if self.sharding_strategy == "no_shard"
+                else self.fetch_buffer(shard_mode="inner_shard")
+            )
+            self._outter_reduce_grad(grad, grad_comm_dtype)
+            return
+        if self.outer_dp_sharding_strategy != "optim":
+            raise NotImplementedError(
+                f"Unsupported outer-DP sharding strategy: {self.outer_dp_sharding_strategy}"
+            )
+        if torch.distributed.get_world_size(self.outer_dp_group) == 1:
+            return
+
+        grad_comm_dtype = grad_comm_dtype or self.dtype
+        input_buffer = self.fetch_buffer(shard_mode="inner_shard")
+        output_shard = self.fetch_buffer(shard_mode="outer_shard")
+        if grad_comm_dtype == self.dtype:
+            torch.distributed.reduce_scatter_tensor(
+                output=output_shard,
+                input=input_buffer,
+                group=self.outer_dp_group,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+            return
+
+        input_key = (self.alloc_key, "hsdp_outer_grad_input")
+        input_bucket = self.allocator.allocate(
+            key=input_key,
+            size=input_buffer.numel(),
+            dtype=grad_comm_dtype,
+            device=self.device,
+        )
+        comm_input = input_bucket.data
+        comm_input.copy_(input_buffer)
+
+        output_key = (self.alloc_key, "hsdp_outer_grad_output")
+        output_bucket = self.allocator.allocate(
+            key=output_key,
+            size=output_shard.numel(),
+            dtype=grad_comm_dtype,
+            device=self.device,
+        )
+        comm_output = output_bucket.data
+
+        torch.distributed.reduce_scatter_tensor(
+            output=comm_output,
+            input=comm_input,
+            group=self.outer_dp_group,
+            op=torch.distributed.ReduceOp.SUM,
+        )
+        output_shard.copy_(comm_output.to(self.dtype))
+        self.allocator.free(output_key)
+        self.allocator.free(input_key)
 
     def _outter_reduce_grad(self, grad: torch.Tensor, grad_comm_dtype: torch.dtype) -> None:
         """All-reduce the optimizer-facing grad over replicated HSDP outer ranks."""
         if self.outer_dp_sharding_strategy != "no_shard":
             raise NotImplementedError(
-                "FSDP v2 does not support outer-DP grad sharding yet: "
+                "FSDP v2 does not support outer-DP grad sharding in DataParallelBuffer: "
                 f"{self.outer_dp_sharding_strategy}"
             )
         if self.outer_dp_group is None:

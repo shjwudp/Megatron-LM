@@ -77,7 +77,7 @@ class MixedDtypeLayer(nn.Module):
 # ------------------------------------------------------------------ #
 
 
-def _build_groups(strategy, mesh=None, mp_policy=None):
+def _build_groups(strategy, mesh=None, mp_policy=None, outer_dp_sharding_strategy="no_shard"):
     """Create two ParameterGroups (bf16 + uint8) and call init_buffers.
 
     Returns (groups, originals, dp_group, rank, world_size, device) where
@@ -113,6 +113,7 @@ def _build_groups(strategy, mesh=None, mp_policy=None):
             mp_policy=mp_policy or MixedPrecisionPolicy(),
             mesh=mesh,
             sharding_strategy=strategy,
+            outer_dp_sharding_strategy=outer_dp_sharding_strategy,
         )
         groups.append(pg)
     return groups, originals, dp_group, rank, torch.distributed.get_world_size(), device
@@ -314,11 +315,17 @@ def test_reduce_grad(strategy):
 
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
-def test_hsdp_reduce_grad(strategy):
+@pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
+def test_hsdp_reduce_grad(strategy, outer_strategy):
+    if outer_strategy == "optim" and strategy != "optim_grads_params":
+        pytest.skip("Outer-DP optimizer sharding currently requires inner optim_grads_params.")
+
     rank = torch.distributed.get_rank()
     device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
     mesh = _build_hsdp_mesh(device)
-    groups, _, _, rank, _, device = _build_groups(strategy, mesh=mesh)
+    groups, _, _, rank, _, device = _build_groups(
+        strategy, mesh=mesh, outer_dp_sharding_strategy=outer_strategy
+    )
     _, _, _, g_dist = _flags(strategy)
 
     for pg in groups:
@@ -331,14 +338,17 @@ def test_hsdp_reduce_grad(strategy):
             ref = torch.full_like(gbuf.data, float(rank + 1))
             Ref.all_reduce(ref, pg.dp_group)
             Ref.all_reduce(ref, pg.outer_dp_group)
-            gbuf.reduce_grad()
+            pg.reduce_grad()
             assert torch.equal(gbuf.data, ref)
         else:
             full_size = gbuf.buffer_index.bucket_meta.size
             full = torch.full((full_size,), float(rank + 1), dtype=gbuf.dtype, device=device)
 
             ref_shard = Ref.reduce_scatter(full.clone(), pg.dp_group)
-            Ref.all_reduce(ref_shard, pg.outer_dp_group)
+            if outer_strategy == "optim":
+                ref_shard = Ref.reduce_scatter(ref_shard, pg.outer_dp_group)
+            else:
+                Ref.all_reduce(ref_shard, pg.outer_dp_group)
 
             if g_dist:
                 bucket = gbuf.allocator.allocate(
@@ -348,10 +358,16 @@ def test_hsdp_reduce_grad(strategy):
                 gbuf.data.zero_()
             else:
                 gbuf.data.copy_(full)
-            gbuf.reduce_grad()
+            pg.reduce_grad()
 
-            sm = gbuf.buffer_index.shard_meta
-            actual = gbuf.data[sm.local_data_index : sm.local_data_index + sm.size]
+            if outer_strategy == "optim":
+                assert gbuf.buffer_index.outer_shard_meta is not None
+                start = gbuf.buffer_index.outer_shard_meta.local_data_index
+                end = start + gbuf.buffer_index.outer_shard_meta.size
+                actual = gbuf.data[start:end]
+            else:
+                sm = gbuf.buffer_index.shard_meta
+                actual = gbuf.data[sm.local_data_index : sm.local_data_index + sm.size]
             assert torch.equal(actual, ref_shard)
 
     torch.distributed.barrier()
