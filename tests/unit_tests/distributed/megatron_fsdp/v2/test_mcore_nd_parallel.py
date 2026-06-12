@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import copy
+import time
 
 import pytest
 import torch
@@ -211,7 +212,9 @@ class TestMegatronFSDPE2E:
         param_snapshots = []
 
         # Training loop
-        for _ in range(NUM_TRAINING_STEPS):
+        rank = torch.distributed.get_rank()
+        t_start = time.time()
+        for step in range(NUM_TRAINING_STEPS):
             optim.zero_grad()
             output = pretrain_forward_backward(
                 model=model_chunks,
@@ -229,6 +232,16 @@ class TestMegatronFSDPE2E:
             if capture_param_snapshots:
                 param_snapshots.append(
                     TestMegatronFSDPE2E._capture_named_params(model_chunks)
+                )
+
+            if rank == 0:
+                loss_val = output[-1]
+                elapsed = time.time() - t_start
+                it_s = elapsed / (step + 1)
+                print(
+                    f"[_training_loop] step={step + 1}/{NUM_TRAINING_STEPS} "
+                    f"loss={loss_val:.6f} "
+                    f"elapsed={elapsed:.1f}s ({it_s * 1000:.0f}ms/it)"
                 )
 
         Utils.destroy_model_parallel()

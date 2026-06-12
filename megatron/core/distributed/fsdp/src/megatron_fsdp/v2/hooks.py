@@ -235,6 +235,7 @@ def _register_backward_pre_hook(module: FSDPModule):
 
             # The buffer is fetched in advance for compatibility with CUDA graph.
             if param_group.main_grad_buffer is not None:
+                param_group._init_dist_grads()
                 param_group.main_grad_buffer.fetch_buffer()
 
     module._mfsdp_backward_pre_hook = create_custom_backward_hook(

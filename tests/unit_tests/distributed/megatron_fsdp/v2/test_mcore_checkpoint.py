@@ -2,6 +2,7 @@
 
 import logging
 import shutil
+import time
 from pathlib import Path
 
 import pytest
@@ -347,6 +348,10 @@ class TestMegatronFsdpV2Checkpoint:
         if "save" in kwargs:
             from megatron.training.checkpointing import save_checkpoint as mcore_save_checkpoint
 
+            rank = torch.distributed.get_rank()
+            if rank == 0:
+                print(f"[_training_loop] Saving checkpoint to {kwargs['save']} ...")
+            t0 = time.time()
             mcore_save_checkpoint(
                 iteration=0,
                 model=model_chunks,
@@ -354,6 +359,8 @@ class TestMegatronFsdpV2Checkpoint:
                 opt_param_scheduler=scheduler,
                 num_floating_point_operations_so_far=0,
             )
+            if rank == 0:
+                print(f"[_training_loop] Checkpoint saved ({time.time() - t0:.1f}s)")
 
         model = _get_model_from_chunks(model_chunks)
         return model, model.state_dict(), optim, scheduler
@@ -525,9 +532,14 @@ class TestMegatronFsdpV2Checkpoint:
         ckpt_base = Path(SHARED_TMP_DIR) / TestMegatronFsdpV2Checkpoint.__name__ / test_id
 
         # ---- Train + save with source config ----
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            print(f"[checkpoint] Training source model ({source_type}) ...")
         source_model, source_sd, source_optim, _ = TestMegatronFsdpV2Checkpoint._training_loop(
             save=str(ckpt_base), save_interval=1, **save_config
         )
+        if rank == 0:
+            print(f"[checkpoint] Gathering source state dict ...")
         source_full = _state_dict_to_full_tensor(source_sd)
 
         if supports_optim:
@@ -544,17 +556,26 @@ class TestMegatronFsdpV2Checkpoint:
         Utils.destroy_model_parallel()
 
         # ---- Load with target config (always MFSDP v2) ----
+        if rank == 0:
+            print(f"[checkpoint] Loading checkpoint into target model (v2) ...")
+        t0 = time.time()
         v2_model_chunks, loaded_optim, _ = TestMegatronFsdpV2Checkpoint._init_model_and_optimizer(
             load=str(ckpt_base), **tgt_configs
         )
+        if rank == 0:
+            print(f"[checkpoint] Loaded ({time.time() - t0:.1f}s)")
         v2_model = _get_model_from_chunks(v2_model_chunks)
 
         # ---- Verify model ----
+        if rank == 0:
+            print(f"[checkpoint] Verifying model ...")
         loaded_full = _state_dict_to_full_tensor(v2_model.state_dict())
         _assert_model_match(source_full, loaded_full)
 
         # ---- Verify optimizer (FSDP source types only) ----
         if supports_optim:
+            if rank == 0:
+                print(f"[checkpoint] Verifying optimizer ...")
             loaded_optim_sd = loaded_optim.sharded_state_dict(
                 metadata={"distrib_optim_sharding_type": "fsdp_dtensor"}
             )
