@@ -599,6 +599,9 @@ class FSDPModule:
             if not param_group.requires_grad:
                 continue
 
+            # Initialize main gradient buffer and param -> main_grad mapping if not already done.
+            param_group._init_dist_grads()
+
             # NaN check before reduction
             if getattr(self, "_enable_nan_checks", False):
                 for name, param in zip(param_names, param_group.params):

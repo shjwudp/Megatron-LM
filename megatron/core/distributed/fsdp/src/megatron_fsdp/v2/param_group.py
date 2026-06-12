@@ -410,7 +410,7 @@ class ParameterGroup:
     def zero_grad(self, set_to_none: bool = True):
         """Zero the main gradient buffer and mark grads as zeroed."""
         self.release_grad_buffer()
-        if self.main_grad_buffer is not None:
+        if self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
             self.main_grad_buffer.data.zero_()
         if set_to_none:
             for dist_param in self.dist_params:
