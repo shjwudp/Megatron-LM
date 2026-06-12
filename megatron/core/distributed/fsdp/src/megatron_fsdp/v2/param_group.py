@@ -275,8 +275,7 @@ class ParameterGroup:
         if gbuf.data is not None:
             return  # already initialised
 
-        with torch.cuda.stream(torch.cuda.default_stream(self.device)):
-            gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
+        gbuf.init_data(torch.zeros(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
 
         # Rebuild dist_grads views — dist_params are unchanged
         s = self.sharding_strategy
