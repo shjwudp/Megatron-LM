@@ -207,9 +207,6 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
-        # Initially, gradients are zeroed.
-        self.is_zero_grad = True
-
     def unshard(self, bwd_pass: bool = False, bind_params: bool = True):
         """
         Unshard model weights by all-gathering from sharded buffer.
@@ -217,6 +214,8 @@ class ParameterGroup:
         After unshard, parameters point to full unsharded storage. FP8
         parameters rebind their TE raw payload instead of ``param.data``.
         """
+        self._ensure_buffers_on_gpu()
+
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
@@ -246,6 +245,7 @@ class ParameterGroup:
     @torch.no_grad()
     def copy_main_weights_to_model_weights(self):
         """Install optimized main weights into model compute weights."""
+        self._ensure_buffers_on_gpu()
         self.mp_policy.copy_main_weights_to_model_weights(
             self.params,
             self.param_idx,
@@ -263,11 +263,10 @@ class ParameterGroup:
         ZeRO-1 keeps grads replicated during backward and reduce-scatters
         the replicated buffer once when the optimizer syncs.
         """
-        # FIXME: When optimizer.zero_grad(set_to_none=True) is used, dist_param.grad
-        # becomes None, but the underlying grad buffer may still contain stale data
-        # from previous iterations. If overwrite_grad is not set to True, reduce_grad
-        # will accumulate into this stale buffer, potentially introducing NaNs and
-        # destabilizing training.
+        self._ensure_buffers_on_gpu()
+        # _grad_buffer_is_fresh is True after zero_grad() or lazy buffer init,
+        # so the first reduce_grad after either event overwrites instead of
+        # accumulating — no stale data from uninitialised or zeroed buffers.
         self.main_grad_buffer.reduce_grad(
             grad_comm_dtype=self.mp_policy.grad_comm_dtype,
             overwrite_grad=self._grad_buffer_is_fresh,
@@ -357,9 +356,10 @@ class ParameterGroup:
 
         The buffer layout (``BufferIndex``, offsets, shard) was created in
         ``_init_buffers``; only the backing tensor is deferred.  Called from
-        ``reduce_grad()`` on first use.  Uses ``torch.empty`` (uninitialised)
-        because ``_grad_buffer_is_fresh`` is True, so the next ``reduce_grad``
-        will overwrite rather than accumulate.  Subsequent calls are no-ops.
+        ``reduce_grad()`` on first use.  Uses ``torch.zeros`` so that the
+        first reduce-scatter (which accumulates, ``overwrite_grad=False``
+        on the first micro-batch after lazy init) starts from a clean slate.
+        Subsequent calls are no-ops.
         """
         gbuf = self.main_grad_buffer
         if gbuf is None or not self.requires_grad:
@@ -367,7 +367,7 @@ class ParameterGroup:
         if gbuf.data is not None:
             return  # already initialised
 
-        gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
+        gbuf.init_data(torch.zeros(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
 
         # Rebuild dist_grads views — dist_params are unchanged
         s = self.sharding_strategy
@@ -386,16 +386,62 @@ class ParameterGroup:
 
         self._grad_buffer_is_fresh = True
 
+    def _rebuild_dist_views(self) -> None:
+        """In-place update ``dist_params._local_tensor`` / ``dist_grad._local_tensor``.
+
+        Called after any buffer's ``self.data`` changes device (offload_to_cpu /
+        auto-reload).  Updates the ``_local_tensor`` attribute inside existing
+        DTensor objects so optimizer references remain valid.
+        """
+        s = self.sharding_strategy
+        is_param_shard = s in ("optim", "optim_grads", "optim_grads_params")
+
+        for i, param in enumerate(self.params):
+            dist_param = self.dist_params[i]
+            if dist_param is not None:
+                if self.main_weight_buffer is not None:
+                    data = self.main_weight_buffer.get_item(self.param_idx[param],
+                                                            as_shard=is_param_shard)
+                elif self.model_weight_buffer is not None:
+                    data = self.model_weight_buffer.get_item(self.param_idx[param],
+                                                             as_shard=is_param_shard)
+                else:
+                    continue
+                object.__setattr__(dist_param._local_tensor, 'data', data)
+
+        if self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
+            is_grad_shard = is_param_shard
+            for i, param in enumerate(self.params):
+                dist_grad = self.dist_grads[i]
+                if dist_grad is not None:
+                    grad_data = self.main_grad_buffer.get_item(
+                        self.param_idx[param], as_shard=is_grad_shard
+                    )
+                    object.__setattr__(dist_grad._local_tensor, 'data', grad_data)
+
+    def _ensure_buffers_on_gpu(self) -> bool:
+        """Auto-reload any buffer on CPU back to GPU.
+
+        Returns True if any buffer was moved (views were rebuilt).
+        """
+        moved = False
+        for buf in (self.model_weight_buffer, self.main_weight_buffer,
+                    self.main_grad_buffer, self.transpose_weight_buffer):
+            if buf is not None and buf._ensure_data_on_gpu():
+                moved = True
+        if moved:
+            self._rebuild_dist_views()
+        return moved
+
     def zero_grad(self, set_to_none: bool = True):
         """Zero the main gradient buffer and mark grads as zeroed."""
-        self.release_grad_buffer()
         if set_to_none:
             for dist_param in self.dist_params:
                 if dist_param.grad is not None:
-                    del dist_param.grad
+                    dist_param.grad = None
                 if hasattr(dist_param, "decoupled_grad"):
                     dist_param.decoupled_grad = None
             self._maybe_free_grad_data()
-        elif self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
-            self.main_grad_buffer.data.zero_()
-        self.is_zero_grad = True
+        else:
+            if self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
+                self.main_grad_buffer.data.zero_()

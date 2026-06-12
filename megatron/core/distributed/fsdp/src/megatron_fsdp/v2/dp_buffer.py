@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from .allocator import BucketAllocator, TemporaryBucketAllocator
+from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .mixed_precision import MixedPrecisionPolicy
 from .utils import ParamGroupIdx
 
@@ -420,6 +420,45 @@ class DataParallelBuffer:
         assert data.dtype == self.dtype, f"dtype mismatch: {data.dtype} vs {self.dtype}"
         assert data.numel() == self.data_size, f"size mismatch: {data.numel()} vs {self.data_size}"
         self.data = data
+
+    # ------------------------------------------------------------------ #
+    #  CPU offload
+    # ------------------------------------------------------------------ #
+
+    def _is_on_cpu(self) -> bool:
+        """True if ``self.data`` is resident on CPU."""
+        return self.data is not None and self.data.device.type == "cpu"
+
+    def _ensure_data_on_gpu(self) -> bool:
+        """Move ``self.data`` to GPU if currently on CPU.
+
+        Returns True if a move happened (caller must rebuild dist views).
+        """
+        if not self._is_on_cpu():
+            return False
+        self.data = self.data.to(self.device, non_blocking=True)
+        return True
+
+    def _move_data_to(
+        self,
+        target_device: torch.device,
+        pin_memory: bool = False,
+        non_blocking: bool = True,
+    ) -> None:
+        """Move ``self.data`` to *target_device*, optionally using pinned memory.
+
+        Caller must call ``ParameterGroup._rebuild_dist_views()`` afterwards
+        because ``dist_params._local_tensor`` views share ``self.data`` Storage.
+        """
+        if self.data is None or self.data.device == target_device:
+            return
+        if target_device.type == "cpu" and pin_memory:
+            cpu_data = torch.empty(self.data.shape, dtype=self.data.dtype, pin_memory=True)
+            cpu_data.copy_(self.data, non_blocking=non_blocking)
+            _free_storage(self.data)
+            self.data = cpu_data
+        else:
+            self.data = self.data.to(target_device, non_blocking=non_blocking)
 
     def check_no_local_overlap(self, label: str = "") -> bool:
         """
