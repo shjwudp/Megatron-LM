@@ -350,27 +350,7 @@ class ParameterGroup:
         for dist_param in self.dist_params:
             update_uneven_dtensor_chunk_metadata(dist_param)
 
-        # Create gradient DTensor views. Some groups, e.g. uint8 FP8 model
-        # payloads, do not require grads and therefore have no grad buffer.
-        if self.main_grad_buffer is None or self.main_grad_buffer.data is None:
-            self.dist_grads = [None for _ in self.params]
-            return
-
-        is_grad_shard = is_param_shard
-        for p in self.params:
-            gbuf = self.main_grad_buffer
-            grad_data = gbuf.get_item(self.param_idx[p], as_shard=is_grad_shard)
-            # NOTE: Do not remove the grad_data.numel() > 0 check.
-            # Empty local grad shards are semantically no-ops, but materializing
-            # them as DTensor grads can pass zero-numel tensors into fused
-            # multi-tensor optimizers such as TE FusedAdam. That can break
-            # updates for neighboring non-empty shards.
-            if p.requires_grad and grad_data.numel() > 0:
-                self.dist_grads.append(
-                    make_uneven_dtensor(grad_data, p.shape, self.mesh, placements)
-                )
-            else:
-                self.dist_grads.append(None)
+        self.dist_grads = [None for _ in self.params]
 
     def _init_dist_grads(self) -> None:
         """Lazily allocate ``main_grad_buffer.data`` and rebuild ``dist_grads``.
@@ -409,12 +389,13 @@ class ParameterGroup:
     def zero_grad(self, set_to_none: bool = True):
         """Zero the main gradient buffer and mark grads as zeroed."""
         self.release_grad_buffer()
-        if self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
-            self.main_grad_buffer.data.zero_()
         if set_to_none:
             for dist_param in self.dist_params:
                 if dist_param.grad is not None:
                     del dist_param.grad
                 if hasattr(dist_param, "decoupled_grad"):
                     dist_param.decoupled_grad = None
+            self._maybe_free_grad_data()
+        elif self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
+            self.main_grad_buffer.data.zero_()
         self.is_zero_grad = True

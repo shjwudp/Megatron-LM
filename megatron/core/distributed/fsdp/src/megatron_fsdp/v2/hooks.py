@@ -60,6 +60,9 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule, fine_grained: bool = Fal
             fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
         fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 
+        for param_group in fsdp_module._fsdp_param_groups:
+            param_group._maybe_free_grad_data()
+
         # ---- CUDA graph capture (once per compatible module) --------------
         if (
             hook_module is fsdp_module
