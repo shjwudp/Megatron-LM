@@ -466,14 +466,13 @@ class ParameterGroup:
     def zero_grad(self, set_to_none: bool = True):
         """Zero the main gradient buffer and mark grads as zeroed."""
         if set_to_none:
-            if self.main_grad_buffer is not None:
-                self.main_grad_buffer.data = None
             for dist_param in self.dist_params:
                 if dist_param.grad is not None:
-                    del dist_param.grad
+                    dist_param.grad = None
                 if hasattr(dist_param, "decoupled_grad"):
-                    del dist_param.decoupled_grad
+                    dist_param.decoupled_grad = None
+            self._maybe_free_grad_data()
         else:
             if self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
-                self.main_grad_buffer.zero_()  # zero the buffer, but keep the views valid
+                self.main_grad_buffer.data.zero_()  # zero the buffer, but keep the views valid
         self._grad_buffer_is_fresh = True

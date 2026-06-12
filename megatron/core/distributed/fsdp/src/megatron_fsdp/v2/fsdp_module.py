@@ -895,11 +895,7 @@ class FSDPModule:
 
     def _zero_grad_buffer(self):
         """Zero the gradient buffer for all parameter groups."""
-        for _, child in self.named_modules():
-            if not isinstance(child, FSDPModule):
-                continue
-            for param_group in child._fsdp_param_groups:
-                param_group.zero_grad()
+        self.zero_grad()  # Zero .grad for any params that still have it
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
@@ -1110,6 +1106,12 @@ class FSDPModule:
 
     def _sync_module_states_after_load(self):
         self._copy_main_weights_to_model_weights()
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        """Override zero_grad to zero the gradient buffer."""
+        for child in self._get_fsdp_modules(recursive=True):
+            for param_group in child._fsdp_param_groups:
+                param_group.zero_grad(set_to_none=set_to_none)
 
 
 def _get_module_fsdp_param_groups(
