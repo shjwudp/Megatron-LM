@@ -196,10 +196,7 @@ class ParameterGroup:
             ):
                 _free_storage(tensor)
 
-        # Create main_grad_buffer layout eagerly; defer the backing tensor
-        # for distributed (sharded) buffers to reduce_grad().  Replicated
-        # buffers allocate immediately because main_grad_getter accesses
-        # self.data directly (no allocator path).
+        # Create gradient buffer
         if self.requires_grad:
             main_grads_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])
             gbuf = self._create_buffer(main_grads_dtype, shard_grads, "main_grad")
@@ -278,7 +275,8 @@ class ParameterGroup:
         if gbuf.data is not None:
             return  # already initialised
 
-        gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
+        with torch.cuda.stream(torch.cuda.default_stream(self.device)):
+            gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
 
         # Rebuild dist_grads views — dist_params are unchanged
         s = self.sharding_strategy
@@ -290,10 +288,7 @@ class ParameterGroup:
             grad_data = gbuf.get_item(self.param_idx[p], as_shard=is_grad_shard)
             if p.requires_grad and grad_data.numel() > 0:
                 self.dist_grads.append(
-                    make_uneven_dtensor(
-                        grad_data, p.shape, self.mesh, placements,
-                        copy_chunk_meta_from=dist_param,
-                    )
+                    make_uneven_dtensor(grad_data, p.shape, self.mesh, placements)
                 )
             else:
                 self.dist_grads.append(None)
@@ -396,7 +391,7 @@ class ParameterGroup:
             update_uneven_dtensor_chunk_metadata(dist_param)
 
         # Create gradient DTensor views.
-        if self.main_grad_buffer is None or self.main_grad_buffer.data is None:
+        if self.main_grad_buffer is None:
             self.dist_grads = [None for _ in self.params]
             return
 
