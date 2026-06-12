@@ -320,6 +320,7 @@ class FullyShardV2Muon(torch.optim.Optimizer):
             for param_idx in rooted:
                 shape = self._main_weights[param_idx].shape
                 full_grad = self._full_grads.get(param_idx, self._managed[param_idx][3])
+                assert full_grad is not None, f"param {param_idx} has no grad shard and no full grad buffer"
                 full_grad = full_grad.view(shape)
                 if param_idx in self._full_grads:
                     wait_comm_rooted.append((param_idx, full_grad))
