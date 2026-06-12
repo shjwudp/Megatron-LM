@@ -420,6 +420,8 @@ class DataParallelBuffer:
         assert data.dtype == self.dtype, f"dtype mismatch: {data.dtype} vs {self.dtype}"
         assert data.numel() == self.data_size, f"size mismatch: {data.numel()} vs {self.data_size}"
         self.data = data
+        if self.buffer_role in ("model_weight", "transpose_weight") and not self.is_distributed:
+            self.data._dirty = False
 
     def check_no_local_overlap(self, label: str = "") -> bool:
         """
@@ -553,6 +555,11 @@ class DataParallelBuffer:
         rank's updated shard, the shard is all-gathered into self.data first.
         """
         full_buffer = self.fetch_buffer(as_shard=False)
+
+        if not self.is_distributed and not getattr(full_buffer, "_dirty", False):
+            if bind_params:
+                self._bind_buffer_to_params(full_buffer)
+            return full_buffer
 
         sm = self.buffer_index.shard_meta
         shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
