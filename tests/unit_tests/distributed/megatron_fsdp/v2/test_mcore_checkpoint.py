@@ -540,20 +540,43 @@ class TestMegatronFsdpV2Checkpoint:
         )
         if rank == 0:
             print(f"[checkpoint] Gathering source state dict ...")
+        t0 = time.time()
         source_full = _state_dict_to_full_tensor(source_sd)
+        if rank == 0:
+            print(f"[checkpoint]   source state dict gathered ({time.time() - t0:.1f}s)")
 
         if supports_optim:
             if source_type == "nd":
+                if rank == 0:
+                    print(f"[checkpoint] Gathering source optimizer (nd) ...")
+                t0 = time.time()
                 source_optim_full = _optim_state_to_full(source_optim, source_model)
+                if rank == 0:
+                    print(f"[checkpoint]   source optim gathered ({time.time() - t0:.1f}s)")
             else:
+                if rank == 0:
+                    print(f"[checkpoint] Getting source sharded_state_dict ...")
+                t0 = time.time()
                 source_optim_sd = source_optim.sharded_state_dict(
                     model_sharded_state_dict=(
                         source_model.sharded_state_dict() if source_type not in ["v1", "v2"] else {}
                     ),
                     metadata={"distrib_optim_sharding_type": src_sharding_type},
                 )
+                if rank == 0:
+                    print(f"[checkpoint]   sharded_state_dict ({time.time() - t0:.1f}s)")
+                if rank == 0:
+                    print(f"[checkpoint] Gathering source optimizer to full ...")
+                t0 = time.time()
                 source_optim_full = _optim_state_to_full(source_optim_sd, source_model)
+                if rank == 0:
+                    print(f"[checkpoint]   source optim gathered ({time.time() - t0:.1f}s)")
+        if rank == 0:
+            print(f"[checkpoint] Destroying source model parallel ...")
+        t0 = time.time()
         Utils.destroy_model_parallel()
+        if rank == 0:
+            print(f"[checkpoint]   destroyed ({time.time() - t0:.1f}s)")
 
         # ---- Load with target config (always MFSDP v2) ----
         if rank == 0:
@@ -563,26 +586,43 @@ class TestMegatronFsdpV2Checkpoint:
             load=str(ckpt_base), **tgt_configs
         )
         if rank == 0:
-            print(f"[checkpoint] Loaded ({time.time() - t0:.1f}s)")
+            print(f"[checkpoint]   loaded ({time.time() - t0:.1f}s)")
         v2_model = _get_model_from_chunks(v2_model_chunks)
 
         # ---- Verify model ----
         if rank == 0:
             print(f"[checkpoint] Verifying model ...")
+        t0 = time.time()
         loaded_full = _state_dict_to_full_tensor(v2_model.state_dict())
+        if rank == 0:
+            print(f"[checkpoint]   state dict gathered ({time.time() - t0:.1f}s)")
         _assert_model_match(source_full, loaded_full)
+        if rank == 0:
+            print(f"[checkpoint]   model matches")
 
         # ---- Verify optimizer (FSDP source types only) ----
         if supports_optim:
             if rank == 0:
                 print(f"[checkpoint] Verifying optimizer ...")
+            t0 = time.time()
             loaded_optim_sd = loaded_optim.sharded_state_dict(
                 metadata={"distrib_optim_sharding_type": "fsdp_dtensor"}
             )
+            if rank == 0:
+                print(f"[checkpoint]   sharded_state_dict ({time.time() - t0:.1f}s)")
+            t0 = time.time()
             loaded_optim_full = _optim_state_to_full(loaded_optim_sd, v2_model)
+            if rank == 0:
+                print(f"[checkpoint]   optim gathered ({time.time() - t0:.1f}s)")
             _assert_optim_match(source_optim_full, loaded_optim_full)
+            if rank == 0:
+                print(f"[checkpoint]   optimizer matches")
 
+        if rank == 0:
+            print(f"[checkpoint] Cleaning up ...")
         Utils.destroy_model_parallel()
         if torch.distributed.get_rank() == 0:
             shutil.rmtree(ckpt_base, ignore_errors=True)
         torch.distributed.barrier()
+        if rank == 0:
+            print(f"[checkpoint] Done")
