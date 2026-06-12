@@ -94,7 +94,7 @@ def build_fsdp_model(
     if use_megatron_fsdp:
         try:
             from megatron_fsdp.v2 import FSDPModule, fully_shard
-        except ImportError:
+        except (ImportError, ModuleNotFoundError) as err:
             from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule, fully_shard
     else:
         from torch.distributed.fsdp import FSDPModule, fully_shard
