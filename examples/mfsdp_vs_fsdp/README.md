@@ -7,10 +7,16 @@ only stock packages are required below.
 ## Environment Setup (run once)
 
 ```bash
-pip install flash_attn_interface          # FA3 with autograd support
 pip install "diffusers>=0.37.0"           # QwenImage model
 pip install megatron-fsdp                 # if not installed in repo
 pip install huggingface_hub               # model download
+
+# Flash attention (pick one tier):
+#   Tier 1: FA3 — best perf, install from PyPI
+pip install flash_attn_interface
+#   Tier 2: FA2 — if FA3 unavailable
+pip install flash-attn --no-build-isolation
+#   Tier 3: no flash-attn at all → use --attention native below
 ```
 
 ## Download Model (run once)
@@ -26,29 +32,45 @@ huggingface-cli download Qwen/Qwen-Image \
 ### Single node, 4 GPU (full shard)
 
 ```bash
-# Megatron-FSDP
+# Tier 1: FA3 (_flash_3)
 torchrun --nproc_per_node=4 repro_for_nvidia.py \
   --backend mfsdp --sharding full \
   --pretrained_model_name_or_path /tmp/qwen-image \
   --num_gpus_per_node 4 --batch_size 4 --height 512 --width 512 \
-  --compile --bench_steps 20 --warmup_steps 3
+  --attention _flash_3 --compile --bench_steps 20 --warmup_steps 3
 
-# PyTorch FSDP1 (identical args, swap --backend)
+# Tier 2: FA2 (flash) — if FA3 unavailable
+nsys profile \
+torchrun --nproc_per_node=4 repro_for_nvidia.py \
+  --backend mfsdp --sharding full \
+  --pretrained_model_name_or_path /tmp/qwen-image \
+  --num_gpus_per_node 4 --batch_size 4 --height 512 --width 512 \
+  --attention flash --compile --bench_steps 3 --warmup_steps 1
+
+# Tier 3: native attention — no flash-attn needed
+torchrun --nproc_per_node=4 repro_for_nvidia.py \
+  --backend mfsdp --sharding full \
+  --pretrained_model_name_or_path /tmp/qwen-image \
+  --num_gpus_per_node 4 --batch_size 4 --height 512 --width 512 \
+  --attention native --compile --bench_steps 20 --warmup_steps 3
+
+# PyTorch FSDP1 for comparison (swap --backend)
+nsys profile \
 torchrun --nproc_per_node=4 repro_for_nvidia.py \
   --backend fsdp1 --sharding full \
   --pretrained_model_name_or_path /tmp/qwen-image \
   --num_gpus_per_node 4 --batch_size 4 --height 512 --width 512 \
-  --compile --bench_steps 20 --warmup_steps 3
+  --attention flash --compile --bench_steps 20 --warmup_steps 3
 ```
 
-### Single node, 8 GPU (hybrid shard for multi-node simulation)
+### Single node, 8 GPU (hybrid shard)
 
 ```bash
 torchrun --nproc_per_node=8 repro_for_nvidia.py \
   --backend mfsdp --sharding hybrid \
   --pretrained_model_name_or_path /tmp/qwen-image \
   --batch_size 4 --height 512 --width 512 \
-  --compile --bench_steps 20 --warmup_steps 3
+  --attention _flash_3 --compile --bench_steps 20 --warmup_steps 3
 ```
 
 ### With numerical verification (adds sync overhead)
@@ -58,7 +80,7 @@ torchrun --nproc_per_node=4 repro_for_nvidia.py \
   --backend mfsdp --sharding full \
   --pretrained_model_name_or_path /tmp/qwen-image \
   --num_gpus_per_node 4 --batch_size 4 --height 512 --width 512 \
-  --compile --verify
+  --attention flash --compile --verify
 ```
 
 ### Multi-node (2+ nodes)
@@ -70,7 +92,7 @@ torchrun --nnodes=$NNODES --node_rank=$NODE_RANK \
   --backend mfsdp --sharding hybrid \
   --pretrained_model_name_or_path /tmp/qwen-image \
   --batch_size 4 --height 512 --width 512 \
-  --compile --bench_steps 20 --warmup_steps 3
+  --attention _flash_3 --compile --bench_steps 20 --warmup_steps 3
 ```
 
 ## torch FSDP1 (reference API)
