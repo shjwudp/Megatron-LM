@@ -16,6 +16,7 @@
 
 import functools
 import logging
+import weakref
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -41,14 +42,18 @@ def _find_fsdp_target(hook_module: nn.Module) -> Optional[FSDPModule]:
 
     Used by fine-grained hooks registered on sub-modules to resolve the
     FSDPModule that owns the sub-module.  The reference is stored as
-    ``_fsdp_parent_module`` during hook registration (fine-grained path).
+    ``_fsdp_parent_module`` during FSDP init (a ``weakref.ref`` to avoid
+    reference cycles).
 
     Returns:
         The owning FSDPModule, or ``None`` if the module has no FSDP parent.
     """
     if isinstance(hook_module, FSDPModule):
         return hook_module
-    return getattr(hook_module, '_fsdp_parent_module', None)
+    parent_ref = getattr(hook_module, '_fsdp_parent_module', None)
+    if parent_ref is not None:
+        return parent_ref()
+    return None
 
 
 def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):

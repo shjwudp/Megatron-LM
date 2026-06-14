@@ -15,6 +15,7 @@
 """FSDPModule implementation for Megatron-FSDP2."""
 
 import logging
+import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -625,7 +626,7 @@ class FSDPModule:
                     continue
                 if hasattr(submodule, '_fsdp_parent_module'):
                     continue
-                submodule._fsdp_parent_module = module
+                submodule._fsdp_parent_module = weakref.ref(module)
 
         if enable_cuda_graph:
             if len(forward_order) > 1:
