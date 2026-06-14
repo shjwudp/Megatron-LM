@@ -187,7 +187,9 @@ def _register_forward_hook(module: FSDPModule):
 # ---------------------------------------------------------------------------
 
 
-def mfsdp_pre_backward_setup(hook_module: nn.Module, grads: Any = None):
+def mfsdp_pre_backward_setup(
+    hook_module: nn.Module, grads: Any = None, skip_final_callback: bool = False
+):
     """Pre-backward hook for FSDP modules and fine-grained sub-modules.
 
     Resolves the target FSDPModule via :func:`_find_fsdp_target`, performs
@@ -197,6 +199,14 @@ def mfsdp_pre_backward_setup(hook_module: nn.Module, grads: Any = None):
 
     Compatible with ``register_multi_grad_hook`` callback signature
     (module, grads).
+
+    Args:
+        hook_module: Module whose backward pass is about to start.
+        grads: Gradients from ``register_multi_grad_hook`` (unused).
+        skip_final_callback: If ``True``, do **not** auto-enqueue
+            ``mfsdp_post_backward_final_callback``.  The caller is
+            responsible for calling it manually (used by the 1F1B EP
+            overlap schedule).
     """
     target = _find_fsdp_target(hook_module)
     if target is None:
@@ -204,7 +214,7 @@ def mfsdp_pre_backward_setup(hook_module: nn.Module, grads: Any = None):
     if target._fsdp_pre_backward_done:
         return
 
-    _pre_backward_setup(target)
+    _pre_backward_setup(target, skip_final_callback=skip_final_callback)
     target._fsdp_pre_backward_done = True
 
 
@@ -353,10 +363,18 @@ def _create_custom_backward_hook(
     return module.register_forward_hook(forward_hook)
 
 
-def _pre_backward_setup(module: FSDPModule):
+def _pre_backward_setup(
+    module: FSDPModule, skip_final_callback: bool = False
+):
     """Shared pre-backward logic: root setup, unshard, TE flags.
 
     Used by both the normal and fine-grained backward pre-hook paths.
+
+    Args:
+        module: The FSDPModule whose backward is starting.
+        skip_final_callback: If ``True``, do not enqueue the post-backward
+            final callback.  The caller must call
+            ``mfsdp_post_backward_final_callback`` manually later.
     """
     ctx = module._fsdp_root_context
     assert not ctx.cuda_graph_active, (
@@ -369,7 +387,7 @@ def _pre_backward_setup(module: FSDPModule):
         ctx.forward_phase = False
         ctx.backward_phase = True
         ctx._advance_backward_module()
-        if not module._fsdp_state._post_backward_callback_queued:
+        if not skip_final_callback and not module._fsdp_state._post_backward_callback_queued:
             _register_post_backward_final_callback(module._fsdp_state, module)
 
     # ---- unshard params for backward compute --------------------------

@@ -290,6 +290,24 @@ class TestMegatronFSDPE2E:
                 ),
                 id="optim_grads_params_nvfp4_param_gather",
             ),
+            pytest.param(
+                dict(
+                    bf16=True,
+                    data_parallel_sharding_strategy="optim_grads",
+                    overlap_moe_expert_parallel_comm=True,
+                    use_megatron_fsdp_v2=True,
+                ),
+                id="ep_overlap-optim_grads",
+            ),
+            pytest.param(
+                dict(
+                    bf16=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    overlap_moe_expert_parallel_comm=True,
+                    use_megatron_fsdp_v2=True,
+                ),
+                id="ep_overlap-optim_grads_params",
+            ),
         ],
     )
     def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, spec_configs):
@@ -314,6 +332,12 @@ class TestMegatronFSDPE2E:
             except ImportError:
                 pytest.skip("NVFP4 support check requires Transformer Engine >= 2.7.0.dev0")
 
+        if spec_configs.get("overlap_moe_expert_parallel_comm"):
+            from megatron.core.utils import is_te_min_version
+
+            if not is_te_min_version("2.3.0"):
+                pytest.skip("EP overlap requires Transformer Engine >= 2.3.0")
+
         reference_kind = "distopt"
         ref_cache_key = (
             reference_kind,
@@ -325,6 +349,7 @@ class TestMegatronFSDPE2E:
             reference_spec_configs["use_megatron_fsdp_v2"] = False
             reference_spec_configs["gradient_accumulation_fusion"] = False
             reference_spec_configs["fp8_param_gather"] = False
+            reference_spec_configs["overlap_moe_expert_parallel_comm"] = False
             ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
                 use_distributed_optimizer=True, **nd_topology, **reference_spec_configs
             )
