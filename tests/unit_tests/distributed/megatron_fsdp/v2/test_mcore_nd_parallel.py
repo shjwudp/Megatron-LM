@@ -185,6 +185,7 @@ class TestMegatronFSDPE2E:
             padded_vocab_size=VOCAB_SIZE,
             seq_length=MAX_SEQ_LEN,
             sequence_parallel=TP > 1,
+            expert_model_parallel_size=EP,
             tensor_model_parallel_size=TP,
             pipeline_model_parallel_size=PP,
             num_layers_per_virtual_pipeline_stage=VPP,
