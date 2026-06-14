@@ -295,6 +295,7 @@ class TestMegatronFSDPE2E:
                 dict(
                     bf16=True,
                     data_parallel_sharding_strategy="optim_grads",
+                    moe_token_dispatcher_type="alltoall",
                     overlap_moe_expert_parallel_comm=True,
                     use_megatron_fsdp_v2=True,
                 ),
@@ -304,6 +305,7 @@ class TestMegatronFSDPE2E:
                 dict(
                     bf16=True,
                     data_parallel_sharding_strategy="optim_grads_params",
+                    moe_token_dispatcher_type="alltoall",
                     overlap_moe_expert_parallel_comm=True,
                     use_megatron_fsdp_v2=True,
                 ),
