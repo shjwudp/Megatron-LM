@@ -228,6 +228,13 @@ def mfsdp_post_backward_hook(module: nn.Module):
     Only supports direct FSDPModule calls.  Raises ``TypeError`` when
     called with a non-FSDPModule (fine-grained path is not yet handled).
     """
+    import traceback
+    if torch.distributed.get_rank() == 0:
+        stack = traceback.extract_stack()
+        caller = stack[-3] if len(stack) >= 3 else stack[-1]
+        print(f"[DEBUG] mfsdp_post_backward_hook called for module {module._fsdp_module_name} (id={id(module)}), "
+              f"caller: {caller.name}:{caller.lineno}")
+
     if not isinstance(module, FSDPModule):
         raise TypeError(
             "mfsdp_post_backward_hook only supports FSDPModule, "

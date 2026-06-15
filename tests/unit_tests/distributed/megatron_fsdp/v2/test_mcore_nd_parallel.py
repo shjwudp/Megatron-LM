@@ -300,8 +300,9 @@ class TestMegatronFSDPE2E:
                     fp8_recipe="mxfp8",
                     moe_grouped_gemm=True,
                     use_megatron_fsdp_v2=True,
-                    overlap_moe_expert_parallel_comm=True,
                     moe_token_dispatcher_type="alltoall",
+                    overlap_moe_expert_parallel_comm=True,
+                    delay_wgrad_compute=True,
                 ),
                 id="ep_overlap-optim_grads_params",
             ),
@@ -346,7 +347,6 @@ class TestMegatronFSDPE2E:
             reference_spec_configs["use_megatron_fsdp_v2"] = False
             reference_spec_configs["gradient_accumulation_fusion"] = False
             reference_spec_configs["fp8_param_gather"] = False
-            reference_spec_configs["overlap_moe_expert_parallel_comm"] = False
             ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
                 use_distributed_optimizer=True, **nd_topology, **reference_spec_configs
             )

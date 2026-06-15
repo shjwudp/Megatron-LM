@@ -201,8 +201,14 @@ class TransformerLayerSchedulePlan:
         else:
             hook_module = self.layer.mtp_model_layer
 
+        def attn_post_backward_hook():
+            if torch.distributed.get_rank() == 0:
+                print(f"attn_post_backward_hook called for layer {hook_module.layer_number} {hook_module}")
+            post_backward_hook(hook_module)
+
         # After the last backward op (attn), release backward-pass params.
-        self.attn.set_post_backward_hook(lambda: post_backward_hook(hook_module))
+        # self.attn.set_post_backward_hook(lambda: post_backward_hook(hook_module))
+        self.attn.set_post_backward_hook(attn_post_backward_hook)
 
         # Determine the last node in forward order.
         if isinstance(self.moe_combine, NoopScheduleNode):

@@ -342,6 +342,9 @@ class TransformerLayerNode(ScheduleNode):
         """Computes the weight gradients for the transformer layer node."""
         if not self.delay_wgrad_compute:
             return
+        if torch.distributed.get_rank() == 0:
+            print(f"[DEBUG] TransformerLayerNode.backward_dw() name={self.name} "
+                  f"is_layer_first_node={self.is_layer_first_node}")
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
         with torch.cuda.stream(self.stream):
