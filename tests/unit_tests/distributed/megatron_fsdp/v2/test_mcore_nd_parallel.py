@@ -294,20 +294,14 @@ class TestMegatronFSDPE2E:
             pytest.param(
                 dict(
                     bf16=True,
-                    data_parallel_sharding_strategy="optim_grads",
-                    moe_token_dispatcher_type="alltoall",
-                    overlap_moe_expert_parallel_comm=True,
-                    use_megatron_fsdp_v2=True,
-                ),
-                id="ep_overlap-optim_grads",
-            ),
-            pytest.param(
-                dict(
-                    bf16=True,
                     data_parallel_sharding_strategy="optim_grads_params",
-                    moe_token_dispatcher_type="alltoall",
-                    overlap_moe_expert_parallel_comm=True,
+                    fp8="e4m3",
+                    fp8_param_gather=True,
+                    fp8_recipe="mxfp8",
+                    moe_grouped_gemm=True,
                     use_megatron_fsdp_v2=True,
+                    overlap_moe_expert_parallel_comm=True,
+                    moe_token_dispatcher_type="alltoall",
                 ),
                 id="ep_overlap-optim_grads_params",
             ),
