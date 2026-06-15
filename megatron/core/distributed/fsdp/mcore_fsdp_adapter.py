@@ -271,7 +271,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "mp_policy": fully_shard_mp_policy,
             "enable_unshard_prefetch": ddp_config.overlap_param_gather,
             "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
-            "enable_trace_pool": ddp_config.fsdp_double_buffer,
+            "enable_trace_pool": ddp_config.fsdp_double_buffer or ddp_config.fsdp_trace_pool,
             "sharding_strategy": ddp_config.data_parallel_sharding_strategy,
             "outer_dp_sharding_strategy": ddp_config.outer_dp_sharding_strategy,
         }
