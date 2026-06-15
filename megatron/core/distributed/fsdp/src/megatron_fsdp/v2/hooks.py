@@ -16,7 +16,6 @@
 
 import functools
 import logging
-import weakref
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -63,9 +62,16 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
     parameter unshard, root-phase bookkeeping, and (for direct FSDPModule
     calls only) CUDA graph capture.
 
-    Fine-grained deduplication: the ``_fsdp_pre_forward_done`` flag on the
-    target prevents redundant unshard when multiple sub-modules of the same
-    parent fire.
+    **Repeatability**: This function MUST be safe to call multiple times per
+    module without observable overhead.  Fine-grained hook registration
+    (``_register_forward_pre_hook(fine_grained=True)``) installs the hook on
+    every sub-module of an FSDPModule.  When a sub-module's ``forward()`` is
+    called, PyTorch triggers the pre-forward hook, which calls this function.
+    If the enclosing FSDPModule is also directly invoked (and its own pre-forward
+    hook fires), this function will be invoked again for the same target.
+    The implementation must handle this gracefully — duplicating a no-op
+    ``unshard()`` call or re-applying idempotent bookkeeping must not introduce
+    measurable latency.
     """
     target = _find_fsdp_target(hook_module)
     if target is None:
@@ -75,12 +81,6 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
     assert not ctx.cuda_graph_active, (
         "hooks must not fire during CUDA graph capture"
     )
-
-    is_fine_grained = not isinstance(hook_module, FSDPModule)
-
-    # ---- deduplication (fine-grained only) --------------------------------
-    if is_fine_grained and target._fsdp_pre_forward_done:
-        return
 
     # ---- root: forward-phase setup (once per micro-batch) ------------------
     if target._fsdp_state._is_root:
@@ -96,11 +96,9 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
         target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
     target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 
+    # ---- free stale grad data (safe to repeat, idempotent) ----------------
     for param_group in target._fsdp_param_groups:
         param_group._maybe_free_grad_data()
-
-    # Mark pre-forward as done for this target module
-    target._fsdp_pre_forward_done = True
 
     # ---- CUDA graph capture (FSDPModule targets only) ---------------------
     # Fine-grained hooks fire on sub-modules whose forward args differ from
@@ -133,7 +131,7 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
 
 
 def mfsdp_post_forward_hook(module: nn.Module, *unused):
-    """Post-forward hook: reshard parameters and clear the pre-forward flag.
+    """Post-forward hook: reshard parameters.
 
     Only supports direct FSDPModule calls.  Raises ``TypeError`` when
     called with a non-FSDPModule (fine-grained path is not yet handled).
@@ -150,7 +148,6 @@ def mfsdp_post_forward_hook(module: nn.Module, *unused):
     if ctx.backward_phase and id(module) == ctx.backward_module:
         return
     module.reshard()
-    module._fsdp_pre_forward_done = False
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +182,7 @@ def _register_forward_pre_hook(
 
 
 def _register_forward_hook(module: FSDPModule):
-    """Register post-forward hook to reshard parameters and clear the
-    fine-grained ``_fsdp_pre_forward_done`` flag."""
+    """Register post-forward hook to reshard parameters."""
     module._mfsdp_forward_hook = module.register_forward_hook(mfsdp_post_forward_hook)
 
 

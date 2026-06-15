@@ -121,7 +121,7 @@ def fully_shard(
     module._init_param_main_grad_func()
 
     _register_forward_pre_hook(
-        fsdp_module=module,
+        module,
         fine_grained=(
             fine_grained_hooks
             or mp_policy.fine_grained_forward_hooks_required(module._fsdp_param_groups)

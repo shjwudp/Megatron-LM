@@ -31,24 +31,28 @@ Resolve the nearest parent FSDPModule for any module.
 Pre-forward: unshard parameters for the target FSDPModule.
 
 - Resolves target via `_find_fsdp_target`.  No-op if `None`.
-- **Deduplication** (fine-grained only): skips if `target._fsdp_pre_forward_done` is `True`.
 - Root phase: sets `ctx.forward_phase = True`, creates CG stream lazily.
 - Unshards parameters (forward + optional backward pass).
 - Frees stale grad data.
-- Sets `target._fsdp_pre_forward_done = True`.
 - **CUDA graph capture**: only when `isinstance(hook_module, FSDPModule)` (skipped for sub-modules).
 
 Accepts any module.  Sub-modules delegate to parent via `_fsdp_parent_module`.
 
+**Repeatability**: This function may be called multiple times for the same target
+when fine-grained hooks are active (e.g. sub-module forward triggers the hook,
+followed by the enclosing FSDPModule's forward also triggering it).  The
+implementation MUST be safe to invoke repeatedly without observable overhead —
+duplicate ``unshard()`` calls and idempotent bookkeeping must be effectively
+free.
+
 ### `mfsdp_post_forward_hook(module, *unused)`
 
-Post-forward: reshard parameters and clear the pre-forward flag.
+Post-forward: reshard parameters.
 
 - **Validates**: `TypeError` if `not isinstance(module, FSDPModule)`.
 - Skips if `ctx.backward_phase` and this module is the current backward module
   (activation recomputation: don't reshard before backward needs params).
 - `module.reshard()`.
-- `module._fsdp_pre_forward_done = False`.
 
 ---
 
@@ -104,9 +108,6 @@ Finalise the backward pass for one micro-batch.
 ## Flag lifecycle
 
 ```
-_fsdp_pre_forward_done:
-    False (init) ─► True (mfsdp_forward_pre_hook) ─► False (mfsdp_post_forward_hook)
-
 _fsdp_pre_backward_done:
     False (init) ─► True (mfsdp_pre_backward_setup) ─► False (mfsdp_post_backward_final_callback)
 

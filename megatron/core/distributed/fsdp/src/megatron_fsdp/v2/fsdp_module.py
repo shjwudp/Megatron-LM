@@ -611,7 +611,6 @@ class FSDPModule:
 
             setattr(module, "_fsdp_module_idx", module_idx)
             setattr(module, "_fsdp_module_name", name)
-            module._fsdp_pre_forward_done = False
             module._fsdp_pre_backward_done = False
             module.post_backward_issued = False
             module_idx += 1
