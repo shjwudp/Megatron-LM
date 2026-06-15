@@ -425,7 +425,11 @@ def _pre_backward_setup(
 # ---------------------------------------------------------------------------
 
 
-def _register_backward_pre_hook(module: FSDPModule, fine_grained: bool = False):
+def _register_backward_pre_hook(
+    module: FSDPModule,
+    fine_grained: bool = False,
+    skip_final_callback: bool = False,
+):
     """Register backward pre-hook using multi-grad hooks on output tensors.
 
     Attaches a ``register_multi_grad_hook`` to every tensor output of
@@ -440,13 +444,17 @@ def _register_backward_pre_hook(module: FSDPModule, fine_grained: bool = False):
                 continue
             submodule._mfsdp_backward_pre_hook = _create_custom_backward_hook(
                 submodule,
-                custom_backward_handler=mfsdp_pre_backward_setup,
+                custom_backward_handler=lambda m, g: mfsdp_pre_backward_setup(
+                    m, g, skip_final_callback=skip_final_callback
+                ),
                 ctx_module=module,
             )
         return
 
     module._mfsdp_backward_pre_hook = _create_custom_backward_hook(
-        module, custom_backward_handler=mfsdp_pre_backward_setup
+        module, custom_backward_handler=lambda m, g: mfsdp_pre_backward_setup(
+            m, g, skip_final_callback=skip_final_callback
+        ),
     )
 
 

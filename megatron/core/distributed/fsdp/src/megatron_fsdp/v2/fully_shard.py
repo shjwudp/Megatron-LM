@@ -32,7 +32,6 @@ from .fsdp_module import FSDPModule
 from .hooks import (
     _register_backward_hook,
     _register_backward_pre_hook,
-    _register_backward_pre_hook_fine_grained,
     _register_forward_hook,
     _register_forward_pre_hook,
 )
@@ -61,6 +60,7 @@ def fully_shard(
     sharding_strategy: str = "optim_grads_params",
     enable_cuda_graph: bool = False,
     fine_grained_hooks: bool = False,
+    skip_final_backward_callback: bool = False,
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -128,7 +128,11 @@ def fully_shard(
         ),
     )
     _register_forward_hook(module)
-    _register_backward_pre_hook(module, fine_grained=fine_grained_hooks)
+    _register_backward_pre_hook(
+        module,
+        fine_grained=fine_grained_hooks,
+        skip_final_callback=skip_final_backward_callback,
+    )
     _register_backward_hook(module)
 
     module.reshard()
