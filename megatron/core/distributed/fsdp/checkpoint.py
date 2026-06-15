@@ -39,7 +39,10 @@ from torch.distributed.tensor import DTensor, Shard
 
 import megatron.core.parallel_state as mpu
 from megatron.core import dist_checkpointing
-from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import copy_chunk_metadata
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    copy_chunk_metadata,
+    get_chunk_meta_source,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     get_state_dict as _get_state_dict,
 )
@@ -160,6 +163,13 @@ def handle_experts_in_state_dict(model_state_dict: dict, num_experts: int) -> di
 
     def _replace(key, expert_index, sd):
         new_idx = expert_index + local_expert_start
+        if new_idx == expert_index and not _should_keep(expert_index):
+            logger.warning(
+                "Identity transform for non-local expert key '%s' (expert_index=%d, "
+                "local_expert_start=%d). This expert does not belong to EP rank %d "
+                "but survived in the state dict. Consider removing it instead.",
+                key, expert_index, local_expert_start, ep_rank,
+            )
         # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
         if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
             if key.endswith('_w') or key.endswith('_v'):
@@ -575,12 +585,30 @@ def _propagate_chunk_metadata_to_state_dict(model: nn.Module, state_dict: dict) 
         if isinstance(param, DTensor) and hasattr(param._local_tensor, "__create_chunk_list__"):
             param_map[name] = param
 
+    missing_src_metadata = []
     for key, value in state_dict.items():
         if not isinstance(value, DTensor):
             continue
         param = _find_param_in_map(key, param_map)
         if param is not None:
             copy_chunk_metadata(param, value)
+        else:
+            has_meta = hasattr(value._local_tensor, "__create_chunk_list__")
+            missing_src_metadata.append((key, value.shape, value._local_tensor.shape, has_meta))
+
+    if missing_src_metadata:
+        if torch.distributed.get_rank() == 0:
+            logger.warning(
+                "[chunk_metadata_diag] _propagate_chunk_metadata_to_state_dict: "
+                f"{len(missing_src_metadata)} DTensor(s) in state_dict could NOT be matched to "
+                "a model parameter with __create_chunk_list__. Their metadata (if any) comes "
+                "from preprocess_state_dict_for_uneven_dtensor only."
+            )
+            for key, global_shape, local_shape, has_meta in missing_src_metadata:
+                logger.warning(
+                    f"  key={key} global_shape={tuple(global_shape)} "
+                    f"local_shape={tuple(local_shape)} has_create_chunk_list={has_meta}"
+                )
 
 
 def _apply_mcore_postprocess(raw_state_dict, args, model):
@@ -628,15 +656,65 @@ def _apply_mcore_postprocess(raw_state_dict, args, model):
             )
 
     flattened_sd = flatten_state_dict_keys(state_dict)
-    for key, value in flattened_sd.items():
-        if isinstance(value, DTensor):
-            assert hasattr(value._local_tensor, "__create_chunk_list__"), (
-                f"DTensor for key '{key}' is missing chunk metadata. This may cause issues"
-                f" with checkpointing. Ensure that the model parameters have chunk metadata"
-                f" and that it is properly propagated."
-            )
+    _verify_chunk_metadata(flattened_sd)
 
     return state_dict
+
+
+def _numel(shape: tuple) -> int:
+    """Return the product of all dimensions in *shape*."""
+    n = 1
+    for d in shape:
+        n *= d
+    return n
+
+
+def _verify_chunk_metadata(flattened_sd: dict) -> None:
+    """Verify every DTensor has correct ``__create_chunk_list__`` metadata.
+
+    Checks both existence AND consistency (chunks total numel must match
+    local tensor numel).  On failure, prints diagnostic information
+    including the metadata source tag and shape details.
+    """
+    failures = []
+    for key, value in flattened_sd.items():
+        if not isinstance(value, DTensor):
+            continue
+        lt = value._local_tensor
+        if not hasattr(lt, "__create_chunk_list__"):
+            failures.append(
+                f"MISSING metadata: key={key} global_shape={tuple(value.shape)} "
+                f"local_shape={tuple(lt.shape)} source={get_chunk_meta_source(value)}"
+            )
+            continue
+
+        cl = lt.__create_chunk_list__()
+        cl_total = sum(_numel(c.sizes) for c in cl)
+        local_numel = lt.numel()
+        if cl_total != local_numel:
+            cl_detail = [(tuple(c.offsets), tuple(c.sizes)) for c in cl]
+            failures.append(
+                f"NUMEL MISMATCH: key={key} "
+                f"global_shape={tuple(value.shape)} "
+                f"local_shape={tuple(lt.shape)} "
+                f"local_numel={local_numel} "
+                f"chunks_total={cl_total} "
+                f"chunk_list={cl_detail} "
+                f"source={get_chunk_meta_source(value)} "
+                f"device_mesh={value.device_mesh}"
+            )
+
+    if failures:
+        logger.error(
+            "[chunk_metadata_verify] %d DTensor(s) have invalid chunk metadata:",
+            len(failures),
+        )
+        for msg in failures:
+            logger.error("  %s", msg)
+        raise AssertionError(
+            f"{len(failures)} DTensor(s) have invalid chunk metadata. "
+            "See log above for details."
+        )
 
 
 def flatten_state_dict_keys(state_dict, parent_key="", sep="."):
@@ -769,7 +847,7 @@ def _maybe_wrap_as_uneven_dtensor(tensor, dist_param: DTensor):
     if isinstance(tensor, DTensor):
         dt = tensor
     else:
-        if isinstance(tensor, DTensor) or not isinstance(tensor, torch.Tensor):
+        if not isinstance(tensor, torch.Tensor):
             return tensor
         if tensor.shape != dist_param._local_tensor.shape:
             return tensor
@@ -821,7 +899,7 @@ def _build_dtensor_optim_sd(raw_opt_state_dict: dict, model: nn.Module) -> dict:
     return opt_state_dict
 
 
-def _preprocess_and_verify_v2_state_dict(v2_state_dict):
+def _preprocess_and_verify_v2_state_dict(v2_state_dict, model=None):
     """Preprocess and verify the Megatron FSDP v2 state dict before DCP loading.
 
     DCP requires DTensors for distributed load, but ``optimizer.load_state_dict``
@@ -834,6 +912,11 @@ def _preprocess_and_verify_v2_state_dict(v2_state_dict):
     Also verifies that every model and shadow optimizer DTensor has
     ``__create_chunk_list__`` and ``__create_write_items__`` metadata.
 
+    Args:
+        v2_state_dict: The v2 state dict (from ``_build_megatron_fsdp_v2_state_dict``).
+        model: The FSDP model (for chunk metadata propagation).  If ``None``,
+            metadata propagation is skipped.
+
     Returns:
         v2_by_canonical: ``{canonical_name: model_DTensor}`` mapping.
         v2_optim_state: ``{canonical_name: {state_key: DTensor}}`` shadow dict.
@@ -842,10 +925,7 @@ def _preprocess_and_verify_v2_state_dict(v2_state_dict):
     v2_optim_state_raw = v2_state_dict.get("optimizer", {}).get("state", {})
 
     # ---- Propagate chunk metadata from model to state dict DTensors ----
-    model = v2_state_dict.get("_model")
     if model is not None:
-        if isinstance(model, (list, tuple)):
-            model = model[0]
         _propagate_chunk_metadata_to_state_dict(model, v2_model)
 
     # ---- Strip ``module.`` prefix from optimizer state keys ----
@@ -1320,7 +1400,6 @@ def _load_torch_dist_into_megatron_fsdp_v2(
     from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 
     # ---- Phase 1: Preprocess & verify v2 state dict ----
-
     # Split fused MambaMixer params so that the sub-keys match the
     # torch_dist checkpoint (which stores e.g. ``in_proj.weight.z``).
     if model is not None:
@@ -1334,7 +1413,7 @@ def _load_torch_dist_into_megatron_fsdp_v2(
         if new_opt is not None:
             v2_state_dict["optimizer"] = new_opt
 
-    v2_by_canonical, v2_optim_state = _preprocess_and_verify_v2_state_dict(v2_state_dict)
+    v2_by_canonical, v2_optim_state = _preprocess_and_verify_v2_state_dict(v2_state_dict, model)
 
     # ---- Phase 2: Read torch_dist metadata & build name mapping ----
     reader = FileSystemReader(checkpoint_name)
@@ -1439,7 +1518,7 @@ def _load_torch_dist_into_megatron_fsdp_v2(
                 chunk = flat[layer_idx]
             if isinstance(v2_val, DTensor):
                 lt = v2_val._local_tensor
-                if lt.numel() != 0:
+                if lt.numel() != 0 and hasattr(lt, "__create_chunk_list__"):
                     local_off = 0
                     for c in lt.__create_chunk_list__():
                         off = c.offsets

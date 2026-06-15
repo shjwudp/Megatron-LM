@@ -14,13 +14,13 @@
 
 """CUDA graph capture / replay for individual FSDP modules."""
 
-import inspect
 import gc
+import inspect
+import warnings
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-
 
 # ------------------------------------------------------------------
 # Helpers
@@ -205,6 +205,12 @@ class FSDPCudaGraphRunner:
         gc_freeze: bool = True,
         graph_pool: Optional[Any] = None,
     ):
+        warnings.warn(
+            "FSDPCudaGraphRunner is an experimental feature. The API and "
+            "behaviour may change in future releases without notice.",
+            FutureWarning,
+            stacklevel=2,
+        )
         self._module: torch.nn.Module = fsdp_module
         self._gc_freeze: bool = gc_freeze
         self._graph_pool: Optional[int] = graph_pool
@@ -233,7 +239,7 @@ class FSDPCudaGraphRunner:
         **sample_kwargs,
     ) -> None:
         assert self._module.cuda_graph_compatible, (
-            "CUDA graph capture requires enable TracePoolAllocator"
+            "CUDA graph capture requires TracePoolAllocator in optimized phase"
         )
 
         # Introspect the module's forward signature
@@ -358,7 +364,7 @@ class FSDPCudaGraphRunner:
         """Unshard the main grad buffer for all param groups."""
         for group in self._module._fsdp_param_groups:
             if hasattr(group, "main_grad_buffer"):
-                group.main_grad_buffer.unshard()
+                group.main_grad_buffer.fetch_buffer()
 
     def reshard_main_grad_buffer(self):
         """Reshard the main grad buffer for all param groups."""

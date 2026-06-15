@@ -242,6 +242,156 @@ class FSDPModule:
         """
         self._fsdp_state.enable_cuda_graph = True
 
+    def release_memory_pool(self) -> None:
+        """Release all persistent communication-buffer memory and any CUDA graphs.
+
+        Tears down captured CUDA graphs across all FSDP modules, clears graph
+        sentinels so they auto-recapture on the next forward pass, and releases
+        the ``TracePoolAllocator`` slot tensors.
+
+        On the next ``allocate`` / ``free`` call the allocator **automatically**
+        re-allocates slots, so no explicit "resume" call is needed.  CUDA graphs
+        are re-captured by the hooks on the next forward pass.
+
+        Typical use: temporarily free GPU memory (e.g. for checkpoint I/O).
+        """
+        ctx = self._fsdp_root_context
+        allocator = ctx.bucket_allocator
+        for module in self._get_fsdp_modules(recursive=True):
+            for pg in module._fsdp_param_groups:
+                pg.release_grad_buffer()
+
+        if not isinstance(allocator, TracePoolAllocator):
+            return
+
+        self._release_cuda_graphs(ctx)
+        self._clear_cuda_graph_sentinels(ctx)
+        allocator.release()
+
+    # ----------------------------------------------------------------
+    # Internal: CUDA graph teardown / sentinel helpers
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    def _release_cuda_graphs(ctx: "_FSDPRootContext") -> None:
+        """Tear down all captured CUDA graphs on every FSDP module.
+
+        Supports both the per-module runner path (``_fsdp_cg_runner``) and
+        the batch helper path (``_fsdp_cuda_graphs``, ``_fsdp_cg_runner`` sentinel).
+        Restores original ``forward`` methods before deleting graph objects.
+        """
+        if not ctx.enable_cuda_graph:
+            return
+
+        for module in ctx.forward_order:
+            if hasattr(module, "_fsdp_cg_runner"):
+                runner = module._fsdp_cg_runner
+                if hasattr(runner, "reset"):
+                    runner.reset()
+                delattr(module, "_fsdp_cg_runner")
+
+        ctx.cuda_graph_active = False
+        ctx.cuda_graph_stream = None
+        ctx.cuda_graph_pool = None
+
+    @staticmethod
+    def _clear_cuda_graph_sentinels(ctx: "_FSDPRootContext") -> None:
+        """Clear CUDA graph sentinels so hooks will re-capture on next forward."""
+        for module in ctx.forward_order:
+            if hasattr(module, "_fsdp_cg_runner"):
+                delattr(module, "_fsdp_cg_runner")
+
+    # ----------------------------------------------------------------
+    # CPU offload
+    # ----------------------------------------------------------------
+
+    def _get_fsdp_modules(self, recursive: bool = True) -> List["FSDPModule"]:
+        """Return ``[self]`` plus optionally all child ``FSDPModules``."""
+        if not recursive:
+            return [self]
+        result = [self]
+        for _, child in self.named_modules():
+            if child is not self and isinstance(child, FSDPModule):
+                result.append(child)
+        return result
+
+    def offload_to_cpu(
+        self,
+        recursive: bool = True,
+        pin_memory: bool = False,
+        max_cpu_bytes: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Offload FSDP-held GPU memory to CPU within an optional budget.
+
+        Moves every DataParallelBuffer.data to CPU and releases
+        TracePoolAllocator slot tensors.  All buffers auto-reload on
+        next access — no explicit reload call needed.
+
+        Buffers are offloaded in descending size order so the largest
+        buffers (most GPU savings) are prioritized when the budget is
+        tight.
+
+        Args:
+            recursive: If True (default), also offloads child FSDPModules.
+            pin_memory: If True, allocate pinned CPU memory for faster
+                CPU↔GPU transfers (~12 GB/s via DMA vs ~3-6 GB/s pageable).
+            max_cpu_bytes: Maximum CPU memory (in bytes) to consume.
+                Buffers beyond this limit are left on GPU.  ``None``
+                means no limit (offload everything).  The allocator
+                slots are always released and do not count against
+                this budget.
+
+        Returns:
+            Dict with ``"offloaded_bytes"`` and ``"skipped_bytes"``.
+        """
+        ctx = self._fsdp_root_context
+
+        # Collect (buffer, nbytes) pairs, largest first
+        entries: List[Tuple[Any, int]] = []
+        for module in self._get_fsdp_modules(recursive):
+            for pg in module._fsdp_param_groups:
+                for buf in (pg.model_weight_buffer, pg.transpose_weight_buffer,
+                            pg.main_weight_buffer, pg.main_grad_buffer):
+                    if buf is not None and buf.data is not None and not buf._is_on_cpu():
+                        entries.append((buf, buf.data.nbytes))
+        entries.sort(key=lambda x: x[1], reverse=True)
+
+        offloaded_bytes = 0
+        skipped_bytes = 0
+        for buf, nbytes in entries:
+            if max_cpu_bytes is not None and offloaded_bytes + nbytes > max_cpu_bytes:
+                skipped_bytes += nbytes
+                continue
+            buf._move_data_to(torch.device("cpu"), pin_memory=pin_memory)
+            offloaded_bytes += nbytes
+
+        # Rebuild views after all moves
+        for module in self._get_fsdp_modules(recursive):
+            for pg in module._fsdp_param_groups:
+                pg._rebuild_dist_views()
+
+        # Release allocator slots (always — no CPU cost)
+        if isinstance(ctx.bucket_allocator, TracePoolAllocator):
+            ctx.bucket_allocator.release()
+
+        return {"offloaded_bytes": offloaded_bytes, "skipped_bytes": skipped_bytes}
+
+    def reload_to_gpu(self, recursive: bool = True) -> None:
+        """Explicitly move all buffers back to GPU and rebuild views.
+
+        Normally not needed — every access path auto-reloads.
+        Useful to hide first-touch CPU→GPU copy latency.
+        """
+        for module in self._get_fsdp_modules(recursive):
+            for pg in module._fsdp_param_groups:
+                for buf in (pg.model_weight_buffer, pg.transpose_weight_buffer,
+                            pg.main_weight_buffer, pg.main_grad_buffer):
+                    if buf is not None:
+                        buf._move_data_to(
+                            torch.device(f"cuda:{torch.cuda.current_device()}")
+                        )
+                pg._rebuild_dist_views()
+
     def _init_named_param_groups(
         self,
         mesh: Optional[DeviceMesh],
@@ -313,9 +463,9 @@ class FSDPModule:
             assert gbuf_data.numel() > 0
 
             # Get offset and size from buffer index
-            offset, size = gbuf.buffer_index._get_item_global_range(item_id)
+            start, end = gbuf.buffer_index._get_item_global_range(item_id)
             param_shape = gbuf.buffer_index.item_index_map[item_id].shape
-            grad_data = gbuf_data[offset : offset + size].view(param_shape)
+            grad_data = gbuf_data[start:end].view(param_shape)
 
             return grad_data
 
@@ -599,6 +749,9 @@ class FSDPModule:
             if not param_group.requires_grad:
                 continue
 
+            # Initialize main gradient buffer and param -> main_grad mapping if not already done.
+            param_group._init_dist_grads()
+
             # NaN check before reduction
             if getattr(self, "_enable_nan_checks", False):
                 for name, param in zip(param_names, param_group.params):
@@ -702,11 +855,12 @@ class FSDPModule:
             if not isinstance(child, FSDPModule):
                 continue
             if any(
-                param_group.sharding_strategy == "optim"
+                param_group.sharding_strategy in ("no_shard", "optim")
                 for param_group in child._fsdp_param_groups
             ):
-                # ZeRO-1 keeps gradients replicated during backward and performs
-                # exactly one reduce-scatter at the iteration grad-sync boundary.
+                # no_shard and ZeRO-1 keep gradients replicated during backward.
+                # Sync them once at the iteration grad-sync boundary: no_shard
+                # all-reduces full grads, ZeRO-1 reduce-scatters virtual shards.
                 child.reduce_grad(async_op=False)
             for param_group in child._fsdp_param_groups:
                 for param, dist_grad in zip(param_group.params, param_group.dist_grads):
@@ -737,13 +891,15 @@ class FSDPModule:
                     else:
                         grad.mul_(scaling_factor)
 
+    def zero_grad(self, set_to_none: bool = True):
+        """Zero gradients for all parameter groups."""
+        for child in self._get_fsdp_modules(recursive=True):
+            for param_group in child._fsdp_param_groups:
+                param_group.zero_grad(set_to_none=set_to_none)
+
     def _zero_grad_buffer(self):
         """Zero the gradient buffer for all parameter groups."""
-        for _, child in self.named_modules():
-            if not isinstance(child, FSDPModule):
-                continue
-            for param_group in child._fsdp_param_groups:
-                param_group.zero_grad()
+        self.zero_grad()
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
@@ -758,9 +914,11 @@ class FSDPModule:
         Compute per-parameter L2 norms for params and grads.
 
         Returns {param_name: {"param_norm": float, "grad_norm": float}}.
-        Local squared norms are all-reduced across the DP group.
+        Sharded DTensor squared norms are all-reduced across the DP group;
+        replicated no-shard norms are computed from the local full tensor.
         """
         results = {}
+        reduce_norms = {}
         dp_group = None
 
         for module_name, child in self.named_modules():
@@ -776,6 +934,7 @@ class FSDPModule:
                         f"{module_name}.{param_name}" if module_name else param_name
                     )
                     results[full_name] = {"param_norm": 0.0, "grad_norm": 0.0}
+                    reduce_norms[full_name] = param_group.sharding_strategy != "no_shard"
                     if dist_param._local_tensor.numel() > 0:
                         results[full_name]["param_norm"] = (
                             dist_param._local_tensor.float().norm(p=2).item() ** 2
@@ -787,6 +946,10 @@ class FSDPModule:
 
         if dp_group is not None:
             for param_name in results:
+                if not reduce_norms[param_name]:
+                    for key in ("param_norm", "grad_norm"):
+                        results[param_name][key] = results[param_name][key] ** 0.5
+                    continue
                 for key in ("param_norm", "grad_norm"):
                     value = torch.tensor([results[param_name][key]], device="cuda")
                     torch.distributed.all_reduce(value, group=dp_group)

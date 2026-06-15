@@ -1,5 +1,8 @@
 # Silent CUDA Graph inside Megatron FSDP v2 — Design
 
+> **Experimental** — CUDA graph support in Megatron FSDP v2 is an experimental
+> feature.  The API and behaviour may change in future releases without notice.
+
 ## 1. Motivation
 
 mcore's CUDA graph system (`cuda_graph_impl="local"`, `cuda_graphs.py`) was

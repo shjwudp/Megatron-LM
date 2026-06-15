@@ -41,10 +41,10 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.ssm.mamba_layer import MambaLayer
-from megatron.core.transformer.moe.router import Router as MoERouter
 from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.moe.router import Router as MoERouter
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
 
@@ -173,32 +173,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
             if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                self.fsdp_unit_modules = [TransformerLayer, MambaLayer]
+                self.fsdp_unit_modules = [TransformerLayer]
             else:
                 self.fsdp_unit_modules = []
 
         self._annotate_tensor_parallelism(module)
 
-        if config.overlap_moe_expert_parallel_comm:
-            assert not ddp_config.fsdp_double_buffer, (
-                "1F1B overlap with FSDP does not support double buffer. "
-                "Please set fsdp_double_buffer=False in the ddp config."
-            )
-            assert config.cuda_graph_impl in ("none", "full_iteration"), (
-                "1F1B overlap with FSDP does not support per-layer CUDA graphs "
-                f"(cuda_graph_impl={config.cuda_graph_impl!r}). "
-                "Use cuda_graph_impl='full_iteration' or disable CUDA graphs "
-                "(cuda_graph_impl='none')."
-            )
-
-        if (
-            config.overlap_moe_expert_parallel_comm
-            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
-        ):
-            assert self.fsdp_unit_modules == [TransformerLayer], (
-                "EP overlap with FSDP currently requires fsdp_unit_modules "
-                f"to be [TransformerLayer], got {self.fsdp_unit_modules}."
-            )
         super().__init__(
             config=config,
             module=MegatronFSDP(
@@ -212,13 +192,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
                 enable_fine_grained_param_gather_hook=(
-                    (config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather)
-                    or config.overlap_moe_expert_parallel_comm
-                    or self.ddp_config.megatron_fsdp_enable_fine_grained_param_gather
-                ),
-                enable_fine_grained_param_gather_backward_hook=(
-                    config.overlap_moe_expert_parallel_comm
-                    and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                    config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather
                 ),
             ),
         )
@@ -253,8 +227,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
             from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import fully_shard
             from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
                 FullyShardFP8Policy,
-                MixedPrecisionPolicy,
                 FullyShardNVFP4Policy,
+                MixedPrecisionPolicy,
             )
         else:
             from torch.distributed.fsdp import fully_shard
@@ -263,7 +237,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             fsdp_unit_modules is None
             and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
         ):
-            fsdp_unit_modules = [TransformerLayer, MambaLayer]
+            fsdp_unit_modules = [TransformerLayer, MambaLayer, TEGroupedMLP, SequentialMLP]
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -297,7 +271,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "mp_policy": fully_shard_mp_policy,
             "enable_unshard_prefetch": ddp_config.overlap_param_gather,
             "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
-            "enable_trace_pool": ddp_config.fsdp_double_buffer,
+            "enable_trace_pool": ddp_config.fsdp_double_buffer or ddp_config.fsdp_trace_pool,
             "sharding_strategy": ddp_config.data_parallel_sharding_strategy,
         }
         if config.calculate_per_token_loss:
@@ -414,11 +388,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             ctx = self.module._fsdp_root_context
             torch.cuda.current_stream().wait_stream(ctx.ag_stream)
 
-        def finish_grad_sync(force_all_reduce: Optional[bool] = False):
-            ctx = self.module._fsdp_root_context
-            torch.cuda.current_stream().wait_stream(ctx.rs_stream)
-
-        self.finish_grad_sync = finish_grad_sync
+        self.finish_grad_sync = self.module.finish_grad_sync
         self.scale_gradients = self.module._scale_gradients
         self.zero_grad_buffer = self.module._zero_grad_buffer
         self.log_per_param_norms = self.module._log_per_param_norms
@@ -479,9 +449,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self.module.load_state_dict(custom_state_dict, strict=strict)
 
-    def _detect_parallelism_type(
-        self, param_name: str, module: nn.Module, param: nn.Parameter = None
-    ) -> Optional[str]:
+    def _detect_parallelism_type(self, param_name: str, module: nn.Module) -> Optional[str]:
         """
         Infer tensor-parallelism type for a parameter under a given module
         (forked from Megatron-Bridge).
@@ -522,18 +490,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     return "replicated"
                 return "row"
 
-        # Fallback to inspecting parameter-level TP attributes.
-        # Some modules (e.g. MambaMixer) set tensor_model_parallel and partition_dim
-        # directly on parameters rather than on the owning module.
-        if param is not None and getattr(param, "tensor_model_parallel", False):
-            partition_dim = getattr(param, "partition_dim", None)
-            if partition_dim == 0:
-                return "column"
-            elif partition_dim == 1:
-                if "bias" in param_name:
-                    return "replicated"
-                return "row"
-
         # Fallback for normalization layers
         if any(norm in module_type for norm in ["Norm", "Normalization"]):
             return "replicated"
@@ -559,7 +515,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         """
         for submodule in root_module.modules():
             for name, param in submodule.named_parameters(recurse=False):
-                detected_type = self._detect_parallelism_type(name, submodule, param)
+                detected_type = self._detect_parallelism_type(name, submodule)
                 if detected_type is not None:
                     setattr(param, "_tensor_parallel_mode", detected_type)
 

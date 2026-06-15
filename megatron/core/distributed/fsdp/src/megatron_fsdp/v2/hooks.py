@@ -24,15 +24,15 @@ from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from .allocator import TracePoolAllocator
+from .cuda_graph_runner import FSDPCudaGraphRunner
 from .fsdp_module import FSDPModule, _FSDPState
 from .utils import RegisterFSDPBackwardFunction
-from .cuda_graph_runner import FSDPCudaGraphRunner
 
 logger = logging.getLogger(__name__)
 
 
-def _register_forward_pre_hook(fsdp_module: FSDPModule):
-    """Register a pre-forward hook on *fsdp_module*.
+def _register_forward_pre_hook(fsdp_module: FSDPModule, fine_grained: bool = False):
+    """Register a pre-forward hook on *hook_module*.
 
     Called before every ``forward()`` of the FSDP module — both in the
     forward and backward (activation recomputation) passes.  Handles
@@ -40,14 +40,14 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule):
     capture (once per compatible module).
     """
 
-    def forward_pre_hook(fsdp_module, args, kwargs):
+    def forward_pre_hook(hook_module, args, kwargs):
         ctx = fsdp_module._fsdp_root_context
         assert not ctx.cuda_graph_active, (
             "hooks must not fire during CUDA graph capture"
         )
 
         # ---- root: forward-phase setup (once per micro-batch) --------------
-        if fsdp_module._fsdp_state._is_root:
+        if hook_module is fsdp_module and fsdp_module._fsdp_state._is_root:
             if ctx.enable_cuda_graph and ctx.cuda_graph_stream is None:
                 ctx.cuda_graph_stream = torch.cuda.Stream()
                 torch.cuda.set_stream(ctx.cuda_graph_stream)
@@ -60,9 +60,13 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule):
             fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
         fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 
+        for param_group in fsdp_module._fsdp_param_groups:
+            param_group._maybe_free_grad_data()
+
         # ---- CUDA graph capture (once per compatible module) --------------
         if (
-            fsdp_module._fsdp_state.enable_cuda_graph
+            hook_module is fsdp_module
+            and fsdp_module._fsdp_state.enable_cuda_graph
             and (not hasattr(fsdp_module, "_fsdp_cg_runner"))
             and not ctx.backward_phase
             and fsdp_module.cuda_graph_compatible
@@ -86,23 +90,15 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule):
                     id(fsdp_module),
                 )
 
-    return fsdp_module.register_forward_pre_hook(
-        forward_pre_hook, prepend=True, with_kwargs=True
-    )
-
-
-def _register_fine_grained_forward_pre_hooks(module: FSDPModule):
-    """Register pre-forward hooks on this FSDP unit and its owned submodules."""
-
-    nested_fsdp_modules = set()
-    for submodule in module.modules():
-        if submodule is not module and isinstance(submodule, FSDPModule):
-            nested_fsdp_modules.update(submodule.modules())
-
-    for submodule in module.modules():
-        if submodule in nested_fsdp_modules:
-            continue
-        _register_forward_pre_hook(module, hook_module=submodule)
+    if fine_grained:
+        for submodule in fsdp_module.modules():
+            submodule.register_forward_pre_hook(
+                forward_pre_hook, prepend=True, with_kwargs=True,
+            )
+    else:
+        fsdp_module.register_forward_pre_hook(
+            forward_pre_hook, prepend=True, with_kwargs=True
+        )
 
 
 def _register_forward_hook(module: FSDPModule):
@@ -232,8 +228,9 @@ def _register_backward_pre_hook(module: FSDPModule):
                     # micro-batches.  ``overwrite_main_grad`` tells TE to
                     # overwrite instead.
                     setattr(param, "overwrite_main_grad", True)
-            if hasattr(param_group, "main_grad_buffer"):
-                param_group.main_grad_buffer.unshard()
+            if param_group.main_grad_buffer is not None:
+                param_group._init_dist_grads()
+                param_group.main_grad_buffer.fetch_buffer()
 
     module._mfsdp_backward_pre_hook = create_custom_backward_hook(
         module, custom_backward_handler=pre_backward_hook
