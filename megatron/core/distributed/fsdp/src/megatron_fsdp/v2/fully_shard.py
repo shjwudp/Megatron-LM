@@ -32,6 +32,7 @@ from .fsdp_module import FSDPModule
 from .hooks import (
     _register_backward_hook,
     _register_backward_pre_hook,
+    _register_backward_pre_hook_fine_grained,
     _register_forward_hook,
     _register_forward_pre_hook,
 )
@@ -59,6 +60,7 @@ def fully_shard(
     enable_trace_pool: bool = False,
     sharding_strategy: str = "optim_grads_params",
     enable_cuda_graph: bool = False,
+    fine_grained_hooks: bool = False,
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -69,6 +71,10 @@ def fully_shard(
     3. Creates ParameterGroup for each group with dedicated buffers
     4. Registers forward/backward hooks for unshard/reshard/reduce
     5. Replaces module parameters with DTensor representations
+
+    Args:
+        fine_grained_hooks: If ``True``, register pre-forward/backward hooks
+            on every sub-module (for EP-overlap / 1F1B schedules).
     """
     if isinstance(module, FSDPModule):
         raise ValueError(
@@ -116,10 +122,13 @@ def fully_shard(
 
     _register_forward_pre_hook(
         fsdp_module=module,
-        fine_grained=mp_policy.fine_grained_forward_hooks_required(module._fsdp_param_groups),
+        fine_grained=(
+            fine_grained_hooks
+            or mp_policy.fine_grained_forward_hooks_required(module._fsdp_param_groups)
+        ),
     )
     _register_forward_hook(module)
-    _register_backward_pre_hook(module)
+    _register_backward_pre_hook(module, fine_grained=fine_grained_hooks)
     _register_backward_hook(module)
 
     module.reshard()

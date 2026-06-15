@@ -159,7 +159,7 @@ def mfsdp_post_forward_hook(module: nn.Module, *unused):
 
 
 def _register_forward_pre_hook(
-    fsdp_module: FSDPModule, fine_grained: bool = False
+    module: FSDPModule, fine_grained: bool = False
 ) -> None:
     """Register a pre-forward hook on the FSDP module or its sub-modules.
 
@@ -171,12 +171,15 @@ def _register_forward_pre_hook(
             (done by :meth:`FSDPModule._init_fsdp_state`).
     """
     if fine_grained:
-        for submodule in fsdp_module.modules():
+        for submodule in module.modules():
+            fsdp_module = _find_fsdp_target(submodule)
+            if fsdp_module is None or fsdp_module is not module:
+                continue
             submodule.register_forward_pre_hook(
                 mfsdp_forward_pre_hook, prepend=True, with_kwargs=True,
             )
     else:
-        fsdp_module.register_forward_pre_hook(
+        module.register_forward_pre_hook(
             mfsdp_forward_pre_hook, prepend=True, with_kwargs=True
         )
 
@@ -422,7 +425,7 @@ def _pre_backward_setup(
 # ---------------------------------------------------------------------------
 
 
-def _register_backward_pre_hook(module: FSDPModule):
+def _register_backward_pre_hook(module: FSDPModule, fine_grained: bool = False):
     """Register backward pre-hook using multi-grad hooks on output tensors.
 
     Attaches a ``register_multi_grad_hook`` to every tensor output of
@@ -430,19 +433,21 @@ def _register_backward_pre_hook(module: FSDPModule):
     backward pass, the hook fires *before* the module's own backward,
     giving FSDP a chance to unshard parameters for gradient computation.
     """
+    if fine_grained:
+        for submodule in module.modules():
+            fsdp_module = _find_fsdp_target(submodule)
+            if fsdp_module is None or fsdp_module is not module:
+                continue
+            submodule._mfsdp_backward_pre_hook = _create_custom_backward_hook(
+                submodule,
+                custom_backward_handler=mfsdp_pre_backward_setup,
+                ctx_module=module,
+            )
+        return
+
     module._mfsdp_backward_pre_hook = _create_custom_backward_hook(
         module, custom_backward_handler=mfsdp_pre_backward_setup
     )
-
-
-def _register_backward_pre_hook_fine_grained(fsdp_module: FSDPModule):
-    """Register per-sub-module backward pre-hooks for fine-grained scheduling."""
-    for submodule in fsdp_module.modules():
-        submodule._mfsdp_backward_pre_hook = _create_custom_backward_hook(
-            submodule,
-            custom_backward_handler=mfsdp_pre_backward_setup,
-            ctx_module=fsdp_module,
-        )
 
 
 def _register_backward_hook(module: FSDPModule):
