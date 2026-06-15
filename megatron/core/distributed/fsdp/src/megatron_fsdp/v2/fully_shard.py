@@ -133,7 +133,12 @@ def fully_shard(
         fine_grained=fine_grained_hooks,
         skip_final_callback=skip_final_backward_callback,
     )
-    _register_backward_hook(module)
+    # Skip the autograd post-backward hook when EP overlap is active. The
+    # RegisterFSDPBackwardFunction fires during autograd backward (before
+    # backward_dw() completes delayed wgrad computation), which is too early.
+    # mfsdp_post_backward_final_callback handles all modules at the correct time.
+    if not skip_final_backward_callback:
+        _register_backward_hook(module)
 
     module.reshard()
 
