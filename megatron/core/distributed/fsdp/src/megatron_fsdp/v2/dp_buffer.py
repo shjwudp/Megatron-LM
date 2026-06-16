@@ -640,7 +640,12 @@ class DataParallelBuffer:
         self.allocator.free(self.alloc_key)
         self._unsharded_buffer = None
 
-    def fetch_buffer(self, *, as_shard: bool = False) -> torch.Tensor:
+    def fetch_buffer(
+        self,
+        *,
+        dtype: Optional[torch.dtype] = None,
+        as_shard: bool = False
+    ) -> torch.Tensor:
         """Return the buffer, allocating the full unsharded view if needed.
 
         Parameters
@@ -654,10 +659,11 @@ class DataParallelBuffer:
         """
         if self.is_distributed:
             if self._unsharded_buffer is None:
+                dtype = dtype if dtype is not None else self.dtype
                 bucket = self.allocator.allocate(
                     key=self.alloc_key,
                     size=self.buffer_index.bucket_meta.size,
-                    dtype=self.dtype,
+                    dtype=dtype,
                     device=self.device,
                 )
                 self._unsharded_buffer = bucket.data
@@ -665,6 +671,8 @@ class DataParallelBuffer:
         else:
             assert self.data is not None, "DataParallelBuffer data not initialized"
             full = self.data
+            if dtype is not None and dtype != self.dtype:
+                full = full.to(dtype)
 
         if as_shard:
             sm = self.buffer_index.shard_meta
@@ -721,22 +729,19 @@ class DataParallelBuffer:
             # persistent local grad shard. The full grad buffer is temporary,
             # assembled only for this reduce-scatter, and the RS result is
             # accumulated into ``local_grad_shard`` for gradient accumulation.
-            input_buffer = self.fetch_buffer()
+            comm_input = self.fetch_buffer(dtype=grad_comm_dtype)
             output_offset = sm.bucket_data_index
-            if input_buffer.is_cuda:
+            if comm_input.is_cuda:
                 # Keep temporary reduce-scatter buffers tied to the stream that uses them.
-                input_buffer.record_stream(torch.cuda.current_stream())
+                comm_input.record_stream(torch.cuda.current_stream())
         else:
             # ZeRO-1 (optim): ``self.data`` is the replicated full grad
             # accumulation buffer. The optimizer consumes only this rank's
             # virtual shard, so the one delayed RS writes directly into that
             # slice instead of accumulating into a separate shard buffer.
-            input_buffer = self.data
+            comm_input = self.fetch_buffer(dtype=grad_comm_dtype)
             output_offset = sm.local_data_index
 
-        comm_input = (
-            input_buffer if grad_comm_dtype == self.dtype else input_buffer.to(grad_comm_dtype)
-        )
         if prescale:
             comm_input.mul_(self.gradient_scaling_factor)
         reduced_grad_shard = comm_input[output_offset : output_offset + sm.size]

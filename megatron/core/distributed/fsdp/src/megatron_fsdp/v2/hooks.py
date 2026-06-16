@@ -255,7 +255,6 @@ def mfsdp_post_backward_hook(module: nn.Module):
     Only supports direct FSDPModule calls.  Raises ``TypeError`` when
     called with a non-FSDPModule (fine-grained path is not yet handled).
     """
-
     if not isinstance(module, FSDPModule):
         raise TypeError(
             "mfsdp_post_backward_hook only supports FSDPModule, "
@@ -265,15 +264,19 @@ def mfsdp_post_backward_hook(module: nn.Module):
     assert not ctx.cuda_graph_active, (
         "hooks must not fire during CUDA graph capture"
     )
-    ctx.backward_done_modules.add(id(module))
+
+    for submodule in module._get_fsdp_modules(recursive=True):
+        if submodule.post_backward_issued:
+            continue
+        ctx.backward_done_modules.add(id(submodule))
+        submodule.reshard()
+        if any(
+            param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
+            for param_group in submodule._fsdp_param_groups
+        ):
+            submodule.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+        submodule.post_backward_issued = True
     ctx._advance_backward_module()
-    module.reshard()
-    if any(
-        param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
-        for param_group in module._fsdp_param_groups
-    ):
-        module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
-    module.post_backward_issued = True
 
 
 def mfsdp_post_backward_final_callback(root_module: nn.Module):
