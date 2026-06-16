@@ -86,6 +86,17 @@ def _device():
     return torch.device(f"cuda:{_rank() % torch.cuda.device_count()}")
 
 
+def _build_hsdp_mesh():
+    world_size = _world_size()
+    if world_size < 4 or world_size % 2 != 0:
+        pytest.skip("HSDP checkpoint coverage requires an even world size >= 4")
+
+    from torch.distributed.tensor import DeviceMesh
+
+    mesh = torch.arange(world_size, dtype=torch.int).reshape(2, world_size // 2)
+    return DeviceMesh(_device().type, mesh, mesh_dim_names=("dp_outer", "dp"))
+
+
 # ------------------------------------------------------------------ #
 #  Mock models for different application scenarios
 # ------------------------------------------------------------------ #
@@ -180,6 +191,12 @@ class MOETransformerLayer(nn.Module):
 # ------------------------------------------------------------------ #
 
 
+def _set_last_microbatch(model, is_last_microbatch: bool = True):
+    """Mark the current FSDP v2 micro-batch boundary when the model supports it."""
+    if hasattr(model, "set_is_last_microbatch"):
+        model.set_is_last_microbatch(is_last_microbatch)
+
+
 def _forward_backward(model, x):
     """Run forward + backward and return loss."""
     out = model(x)
@@ -263,6 +280,7 @@ class TestFullyShardBasic:
         fully_shard(model, sharding_strategy="no_shard", enable_async_reduce_grad=False)
 
         x = torch.randn(2, 64, device=_device())
+        _set_last_microbatch(model)
         loss = _forward_backward(model, x)
         assert not torch.isnan(torch.tensor(loss)), "Loss is NaN"
         model.finish_grad_sync()
@@ -985,3 +1003,69 @@ class TestCheckpoint:
 
         model_sd, opt_sd = get_state_dict(model, optimizer)
         assert len(model_sd) > 0
+
+    def test_get_state_dict_hsdp_outer_optim(self):
+        """HSDP outer-optim checkpoint state should carry 2D DTensor metadata."""
+        from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor.placement_types import Shard
+
+        torch.manual_seed(42)
+        device = _device()
+        mesh = _build_hsdp_mesh()
+        model = SimpleMLP(64).to(device)
+        fully_shard(
+            model,
+            mesh=mesh,
+            sharding_strategy="optim_grads_params",
+            outer_dp_sharding_strategy="optim",
+            mp_policy=MixedPrecisionPolicy(
+                main_params_dtype=torch.float32,
+                main_grads_dtype=torch.float32,
+            ),
+            enable_async_reduce_grad=False,
+        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+        x = torch.randn(2, 64, device=device)
+        _set_last_microbatch(model)
+        loss = model(x).sum()
+        loss.backward()
+        model.finish_grad_sync()
+        optimizer.step()
+
+        model_sd, opt_sd = get_state_dict(model, optimizer)
+        param_by_name = dict(model.named_parameters())
+        model_dtensors = [
+            (name, value) for name, value in model_sd.items() if isinstance(value, DTensor)
+        ]
+        assert model_dtensors, "HSDP model checkpoint should contain DTensor params"
+
+        for name, dtensor in model_dtensors:
+            assert name in param_by_name
+            assert torch.allclose(dtensor.to_local(), param_by_name[name].to_local())
+            assert len(dtensor.placements) == 2
+            assert isinstance(dtensor.placements[0], Shard)
+            assert isinstance(dtensor.placements[1], Shard)
+            assert hasattr(dtensor._local_tensor, "__create_chunk_list__")
+            assert hasattr(dtensor._local_tensor, "__create_write_items__")
+
+        optim_dtensors = []
+        for name, state_tensors in opt_sd.get("state", {}).items():
+            assert name in param_by_name
+            raw_state = optimizer.state[param_by_name[name]]
+            optim_dtensors.extend(
+                (name, key, value, raw_state[key])
+                for key, value in state_tensors.items()
+                if isinstance(value, DTensor) and value.to_local().dim() > 0
+            )
+        assert optim_dtensors, "HSDP optimizer checkpoint should contain DTensor state"
+
+        for _name, _key, dtensor, reference in optim_dtensors:
+            if isinstance(reference, DTensor):
+                reference = reference.to_local()
+            assert torch.allclose(dtensor.to_local(), reference)
+            assert len(dtensor.placements) == 2
+            assert isinstance(dtensor.placements[0], Shard)
+            assert isinstance(dtensor.placements[1], Shard)
+            assert hasattr(dtensor._local_tensor, "__create_chunk_list__")
+            assert hasattr(dtensor._local_tensor, "__create_write_items__")

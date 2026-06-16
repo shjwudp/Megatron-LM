@@ -507,6 +507,7 @@ class DataParallelBuffer:
         assert data.dtype == self.dtype, f"dtype mismatch: {data.dtype} vs {self.dtype}"
         assert data.numel() == self.data_size, f"size mismatch: {data.numel()} vs {self.data_size}"
         self.data = data
+        self._outer_dirty = False
         if self.buffer_role in ("model_weight", "transpose_weight") and not self.is_distributed:
             self.data._dirty = False
 
@@ -733,6 +734,9 @@ class DataParallelBuffer:
         if self.outer_dp_sharding_strategy != "optim":
             return full_buffer
         if torch.distributed.get_world_size(self.outer_dp_group) == 1:
+            self._outer_dirty = False
+            return full_buffer
+        if not self._outer_dirty:
             return full_buffer
 
         shard_buffer = self.fetch_buffer(shard_mode="outer_shard")
@@ -743,6 +747,7 @@ class DataParallelBuffer:
         )
         if full_buffer.is_cuda:
             full_buffer.record_stream(torch.cuda.current_stream())
+        self._outer_dirty = False
         return full_buffer
 
     def _bind_buffer_to_params(self, buffer: torch.Tensor) -> None:
@@ -882,7 +887,6 @@ class DataParallelBuffer:
             output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
         )
 
-        # If the reduced shard is already in the local grad buffer, skip copy/accumulation.
         if local_grad_shard.data_ptr() == reduced_grad_shard.data_ptr():
             return
 
@@ -893,53 +897,75 @@ class DataParallelBuffer:
 
     @torch.no_grad()
     def reduce_grad_outer(self, grad_comm_dtype: Optional[torch.dtype] = None) -> None:
-        """Reduce-scatter this inner-DP grad shard into its outer optimizer shard."""
+        """Reduce optimizer-facing gradients across the outer-DP dimension."""
+        grad_comm_dtype = grad_comm_dtype or self.dtype
+        if self.outer_dp_group is None:
+            return
+        if torch.distributed.get_world_size(self.outer_dp_group) == 1:
+            return
+
         if self.outer_dp_sharding_strategy == "no_shard":
-            grad_comm_dtype = grad_comm_dtype or self.dtype
             grad = (
                 self.data
                 if self.sharding_strategy == "no_shard"
                 else self.fetch_buffer(shard_mode="inner_shard")
             )
-            self._outter_reduce_grad(grad, grad_comm_dtype)
+            if grad.numel() == 0:
+                return
+
+            comm_grad = grad
+            comm_key = None
+            if grad_comm_dtype != self.dtype:
+                comm_key = (self.alloc_key, "hsdp_grad_comm")
+                bucket = self.allocator.allocate(
+                    key=comm_key,
+                    size=grad.numel(),
+                    dtype=grad_comm_dtype,
+                    device=self.device,
+                )
+                comm_grad = bucket.data
+                comm_grad.copy_(grad)
+
+            torch.distributed.all_reduce(
+                comm_grad,
+                group=self.outer_dp_group,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+            if comm_key is not None:
+                grad.copy_(comm_grad.to(self.dtype))
+                self.allocator.free(comm_key)
             return
+
         if self.outer_dp_sharding_strategy != "optim":
             raise NotImplementedError(
                 f"Unsupported outer-DP sharding strategy: {self.outer_dp_sharding_strategy}"
             )
-        if torch.distributed.get_world_size(self.outer_dp_group) == 1:
-            return
 
-        grad_comm_dtype = grad_comm_dtype or self.dtype
         input_buffer = self.fetch_buffer(shard_mode="inner_shard")
         output_shard = self.fetch_buffer(shard_mode="outer_shard")
-        if grad_comm_dtype == self.dtype:
-            torch.distributed.reduce_scatter_tensor(
-                output=output_shard,
-                input=input_buffer,
-                group=self.outer_dp_group,
-                op=torch.distributed.ReduceOp.SUM,
+        comm_input = input_buffer
+        comm_output = output_shard
+        input_key = None
+        output_key = None
+        if grad_comm_dtype != self.dtype:
+            input_key = (self.alloc_key, "hsdp_outer_grad_input")
+            input_bucket = self.allocator.allocate(
+                key=input_key,
+                size=input_buffer.numel(),
+                dtype=grad_comm_dtype,
+                device=self.device,
             )
-            return
+            comm_input = input_bucket.data
+            comm_input.copy_(input_buffer)
 
-        input_key = (self.alloc_key, "hsdp_outer_grad_input")
-        input_bucket = self.allocator.allocate(
-            key=input_key,
-            size=input_buffer.numel(),
-            dtype=grad_comm_dtype,
-            device=self.device,
-        )
-        comm_input = input_bucket.data
-        comm_input.copy_(input_buffer)
-
-        output_key = (self.alloc_key, "hsdp_outer_grad_output")
-        output_bucket = self.allocator.allocate(
-            key=output_key,
-            size=output_shard.numel(),
-            dtype=grad_comm_dtype,
-            device=self.device,
-        )
-        comm_output = output_bucket.data
+            output_key = (self.alloc_key, "hsdp_outer_grad_output")
+            output_bucket = self.allocator.allocate(
+                key=output_key,
+                size=output_shard.numel(),
+                dtype=grad_comm_dtype,
+                device=self.device,
+            )
+            comm_output = output_bucket.data
 
         torch.distributed.reduce_scatter_tensor(
             output=comm_output,
@@ -947,44 +973,10 @@ class DataParallelBuffer:
             group=self.outer_dp_group,
             op=torch.distributed.ReduceOp.SUM,
         )
-        output_shard.copy_(comm_output.to(self.dtype))
-        self.allocator.free(output_key)
-        self.allocator.free(input_key)
-
-    def _outter_reduce_grad(self, grad: torch.Tensor, grad_comm_dtype: torch.dtype) -> None:
-        """All-reduce the optimizer-facing grad over replicated HSDP outer ranks."""
-        if self.outer_dp_sharding_strategy != "no_shard":
-            raise NotImplementedError(
-                "FSDP v2 does not support outer-DP grad sharding in DataParallelBuffer: "
-                f"{self.outer_dp_sharding_strategy}"
-            )
-        if self.outer_dp_group is None:
-            return
-        if torch.distributed.get_world_size(self.outer_dp_group) == 1:
-            return
-        if grad.numel() == 0:
-            return
-
-        if grad_comm_dtype == self.dtype:
-            torch.distributed.all_reduce(
-                grad, group=self.outer_dp_group, op=torch.distributed.ReduceOp.SUM
-            )
-            return
-
-        bucket = self.allocator.allocate(
-            key=(self.alloc_key, "hsdp_grad_comm"),
-            size=grad.numel(),
-            dtype=grad_comm_dtype,
-            device=self.device,
-        )
-        comm_input = bucket.data
-        comm_input.copy_(grad)
-
-        torch.distributed.all_reduce(
-            comm_input, group=self.outer_dp_group, op=torch.distributed.ReduceOp.SUM
-        )
-        grad.copy_(comm_input.to(self.dtype))
-        self.allocator.free((self.alloc_key, "hsdp_grad_comm"))
+        if output_key is not None:
+            output_shard.copy_(comm_output.to(self.dtype))
+            self.allocator.free(output_key)
+            self.allocator.free(input_key)
 
 
 def check_all_fsdp_buffers(module) -> bool:

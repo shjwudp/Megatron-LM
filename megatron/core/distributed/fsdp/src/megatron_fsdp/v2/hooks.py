@@ -254,7 +254,7 @@ def _register_backward_hook(module: FSDPModule):
         ctx.backward_done_modules.add(id(module))
         ctx._advance_backward_module()
         module.reshard()
-        if any(
+        if ctx.is_last_microbatch or any(
             param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
             for param_group in module._fsdp_param_groups
         ):
@@ -352,7 +352,7 @@ def _register_post_backward_final_callback(
             if getattr(module, "post_backward_issued", False):
                 continue
             module.reshard()
-            if any(
+            if ctx.is_last_microbatch or any(
                 param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
                 for param_group in module._fsdp_param_groups
             ):

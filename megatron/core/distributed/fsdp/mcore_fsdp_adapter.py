@@ -725,18 +725,18 @@ def _init_dp_mesh(pg_collection, ddp_config, edp=False):
         tp_group = dist.new_group(ranks=[dist.get_rank()])
     ep_group = getattr(pg_collection, 'ep', None)
     ep_size = ep_group.size() if edp and ep_group is not None else 1
-    ep_rank = ep_group.rank() if edp and ep_group is not None else 0
 
-    mesh = torch.arange(dist.get_world_size(), dtype=torch.int).reshape(
-        outer_dp_size,
-        inner_group.size(),
-        ep_size,
-        tp_group.size(),
+    outer_group = (
+        pg_collection.inter_dist_opt
+        if outer_dp_size > 1
+        else dist.new_group(ranks=[dist.get_rank()])
     )
-    mesh = mesh[:, :, ep_rank, tp_group.rank()]
-    mesh = DeviceMesh(
-        "cuda",
-        mesh,
+    mesh = _get_hsdp_tp_mesh(outer_group, inner_group, tp_group, ep_size=ep_size)
+    mesh = mesh[:, :, tp_group.rank()]
+    mesh = DeviceMesh.from_group(
+        [outer_group, inner_group],
+        device_type="cuda",
+        mesh=mesh.tolist(),
         mesh_dim_names=("dp_outer", inner_dim_name),
     )
 

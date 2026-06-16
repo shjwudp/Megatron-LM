@@ -338,7 +338,7 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
             ref = torch.full_like(gbuf.data, float(rank + 1))
             Ref.all_reduce(ref, pg.dp_group)
             Ref.all_reduce(ref, pg.outer_dp_group)
-            pg.reduce_grad()
+            pg.reduce_grad(is_last_microbatch=True)
             assert torch.equal(gbuf.data, ref)
         else:
             full_size = gbuf.buffer_index.bucket_meta.size
@@ -358,7 +358,7 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
                 gbuf.data.zero_()
             else:
                 gbuf.data.copy_(full)
-            pg.reduce_grad()
+            pg.reduce_grad(is_last_microbatch=True)
 
             if outer_strategy == "optim":
                 assert gbuf.buffer_index.outer_shard_meta is not None

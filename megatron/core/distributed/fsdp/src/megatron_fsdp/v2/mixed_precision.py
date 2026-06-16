@@ -625,14 +625,14 @@ class MixedPrecisionPolicy:
                 fp8_params, main_params, start_offsets, data_parallel_group, model_param_shards
             )
 
-        # ZeRO-1/2 refresh only this rank's slice; gather before next compute.
-        def mark_dirty(buffer):
-            if buffer is not None and not buffer.is_distributed:
+        # Refresh updated local shards before the next compute unshard.
+        for buffer in (model_weight_buffer, transpose_weight_buffer):
+            if buffer is None:
+                continue
+            if buffer.sharding_strategy != "no_shard" and not buffer.is_distributed:
                 buffer.data._dirty = True
-
-        if model_weight_buffer.sharding_strategy != "no_shard":
-            mark_dirty(model_weight_buffer)
-            mark_dirty(transpose_weight_buffer)
+            if outer_optim:
+                buffer._outer_dirty = True
 
 
 def is_fp8_param(tensor: torch.Tensor) -> bool:

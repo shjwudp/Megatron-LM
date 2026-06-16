@@ -124,6 +124,9 @@ class _FSDPRootContext:
     enable_async_reduce_grad: bool = True
     """Whether to overlap gradient reduction with backward computation."""
 
+    is_last_microbatch: bool = False
+    """Whether the current backward pass is the last micro-batch in an optimizer step."""
+
     # ------------------------------------------------------------------
     # Activation recompute / gradient checkpointing support
     # ------------------------------------------------------------------
@@ -524,16 +527,16 @@ class FSDPModule:
             # Move materialized parameters to the same target device (e.g., GPU)
             m.to(materialization_device)
 
-        if mesh is not None and mesh.size() > 1:
-            for param in self.parameters():
-                if param.is_meta or isinstance(param, DTensor):
-                    continue
-                for mesh_dim in range(mesh.ndim):
-                    group = mesh.get_group(mesh_dim=mesh_dim)
-                    if torch.distributed.get_world_size(group) == 1:
+            if mesh is not None and mesh.size() > 1:
+                for param in m.parameters(recurse=False):
+                    if param.is_meta or isinstance(param, DTensor):
                         continue
-                    src_rank = torch.distributed.get_global_rank(group, 0)
-                    torch.distributed.broadcast(param.data, src=src_rank, group=group)
+                    for mesh_dim in range(mesh.ndim):
+                        group = mesh.get_group(mesh_dim=mesh_dim)
+                        if torch.distributed.get_world_size(group) == 1:
+                            continue
+                        src_rank = torch.distributed.get_global_rank(group, 0)
+                        torch.distributed.broadcast(param.data, src=src_rank, group=group)
 
     def _init_fsdp_state(
         self,
@@ -807,11 +810,11 @@ class FSDPModule:
                 # Switch to rs_stream for the reduce-scatter kernel
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
-                    param_group.reduce_grad()
+                    param_group.reduce_grad(is_last_microbatch=ctx.is_last_microbatch)
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
-                param_group.reduce_grad()
+                param_group.reduce_grad(is_last_microbatch=ctx.is_last_microbatch)
                 param_group.release_grad_buffer()
 
             # Install reduced gradients to distributed parameters
@@ -855,26 +858,8 @@ class FSDPModule:
     @torch.no_grad()
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """Finish optimizer-facing gradient synchronization for this iteration."""
-        ctx = self._fsdp_root_context
-        for _, child in self.named_modules():
-            if not isinstance(child, FSDPModule):
-                continue
-            if any(
-                param_group.sharding_strategy in ("no_shard", "optim")
-                for param_group in child._fsdp_param_groups
-            ):
-                # no_shard and ZeRO-1 keep gradients replicated during backward.
-                # Sync them once at the iteration grad-sync boundary: no_shard
-                # all-reduces full grads, ZeRO-1 reduce-scatters virtual shards.
-                child.reduce_grad(async_op=False)
-            for param_group in child._fsdp_param_groups:
-                for param, dist_grad in zip(param_group.params, param_group.dist_grads):
-                    if param.requires_grad:
-                        # v1 replaces module params with optimizer-facing distributed
-                        # params after grad sync. v2 keeps compute params in the module,
-                        # so mirror the reduced grad for shared finalizers.
-                        param.main_grad = dist_grad
-        torch.cuda.current_stream().wait_stream(ctx.rs_stream)
+        assert not force_all_reduce, "FSDP v2 does not support force_all_reduce."
+        torch.cuda.current_stream().wait_stream(self._fsdp_root_context.rs_stream)
 
     @torch.no_grad()
     def _scale_gradients(self, scaling_factor: float):
@@ -1106,6 +1091,10 @@ class FSDPModule:
     def get_root_module(self):
         """Return the root FSDP module associated with this module."""
         return self._fsdp_root_context.get_root_module()
+
+    def set_is_last_microbatch(self, is_last_microbatch: bool = True):
+        """Set whether the current micro-batch is the optimizer-step boundary."""
+        self._fsdp_root_context.is_last_microbatch = is_last_microbatch
 
     def _sync_module_states_after_load(self):
         self._copy_main_weights_to_model_weights()
