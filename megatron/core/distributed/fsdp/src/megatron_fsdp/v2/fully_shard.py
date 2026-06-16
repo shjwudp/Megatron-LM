@@ -60,6 +60,7 @@ def fully_shard(
     sharding_strategy: str = "optim_grads_params",
     enable_cuda_graph: bool = False,
     fine_grained_hooks: bool = False,
+    skip_backward_callback: bool = False,  # For advanced users only. Use with caution.
     skip_final_backward_callback: bool = False,
 ) -> nn.Module:
     """
@@ -137,7 +138,7 @@ def fully_shard(
     # RegisterFSDPBackwardFunction fires during autograd backward (before
     # backward_dw() completes delayed wgrad computation), which is too early.
     # mfsdp_post_backward_final_callback handles all modules at the correct time.
-    if not skip_final_backward_callback:
+    if not skip_backward_callback:
         _register_backward_hook(module)
 
     module.reshard()
