@@ -442,21 +442,21 @@ class ParameterGroup:
                 as_shard=is_grad_shard,
                 as_outer_shard=is_outer_optim_shard,
             )
-            # NOTE: Do not remove the grad_data.numel() > 0 check.
-            # Empty local grad shards are semantically no-ops, but materializing
-            # them as DTensor grads can pass zero-numel tensors into fused
-            # multi-tensor optimizers such as TE FusedAdam. That can break
-            # updates for neighboring non-empty shards.
-            if p.requires_grad and grad_data.numel() > 0:
-                self.dist_grads.append(
-                    make_uneven_dtensor(
-                        grad_data,
-                        p.shape,
-                        self.mesh,
-                        placements,
-                        post_process_uneven=True,
-                    )
+            if p.requires_grad:
+                grad_dtensor = make_uneven_dtensor(
+                    grad_data,
+                    p.shape,
+                    self.mesh,
+                    placements,
+                    post_process_uneven=True,
                 )
+                # NOTE: Do not materialize empty local grad shards in self.dist_grads.
+                # Empty shards are semantically no-ops, but passing zero-numel DTensor
+                # grads into fused multi-tensor optimizers such as TE FusedAdam can
+                # break updates for neighboring non-empty shards.  We still construct
+                # grad_dtensor above so every rank enters the metadata collective in
+                # the same parameter order.
+                self.dist_grads.append(grad_dtensor if grad_data.numel() > 0 else None)
             else:
                 self.dist_grads.append(None)
 
