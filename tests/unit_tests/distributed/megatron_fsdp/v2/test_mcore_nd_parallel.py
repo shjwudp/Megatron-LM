@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import copy
+import time
 
 import pytest
 import torch
@@ -212,7 +213,10 @@ class TestMegatronFSDPE2E:
         param_snapshots = []
 
         # Training loop
-        for _ in range(NUM_TRAINING_STEPS):
+        for step in range(NUM_TRAINING_STEPS):
+            t0 = time.time()
+            if torch.distributed.get_rank() == 0:
+                print(f"[Step {step + 1}/{NUM_TRAINING_STEPS}] starting...")
             optim.zero_grad()
             output = pretrain_forward_backward(
                 model=model_chunks,
@@ -227,6 +231,18 @@ class TestMegatronFSDPE2E:
 
             # Collect loss
             outputs.append(output[-1])
+            if torch.distributed.get_rank() == 0:
+                elapsed = time.time() - t0
+                mem_alloc = torch.cuda.memory_allocated() / 1024**3
+                mem_reserved = torch.cuda.max_memory_reserved() / 1024**3
+                print(
+                    f"[Step {step + 1}/{NUM_TRAINING_STEPS}] "
+                    f"loss={output[-1]['lm loss'].item():.6f} "
+                    f"time={elapsed:.2f}s "
+                    f"mem_alloc={mem_alloc:.2f}GiB "
+                    f"mem_reserved_max={mem_reserved:.2f}GiB"
+                )
+                torch.cuda.reset_peak_memory_stats()
             if capture_param_snapshots:
                 param_snapshots.append(
                     TestMegatronFSDPE2E._capture_named_params(model_chunks)
