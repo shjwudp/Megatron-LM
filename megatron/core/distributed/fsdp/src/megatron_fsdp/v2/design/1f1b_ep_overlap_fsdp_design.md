@@ -261,7 +261,7 @@ reduce only activation gradients, but not weight gradients.  The subsequent
 `backward_dw()` then writes to the already-resharded DTensor params,
 corrupting `.grad`.
 
-**Fix**: When `skip_backward_callback=True` (wired to `config.delay_wgrad_compute`
+**Fix**: When `skip_backward_reduce_grad_callback=True` (wired to `config.delay_wgrad_compute`
 in `mcore_fsdp_adapter.py:277`), this autograd hook is **skipped**.  The
 `mfsdp_post_backward_final_callback` (called after all `backward_dw()` calls
 complete at `combined_1f1b.py:629`) handles all FSDP modules — both the
