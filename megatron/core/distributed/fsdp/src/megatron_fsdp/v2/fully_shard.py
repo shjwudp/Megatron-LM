@@ -60,7 +60,7 @@ def fully_shard(
     sharding_strategy: str = "optim_grads_params",
     enable_cuda_graph: bool = False,
     fine_grained_hooks: bool = False,
-    skip_backward_callback: bool = False,  # For advanced users only. Use with caution.
+    skip_backward_callback: bool = False,  # Skip autograd post-bwd hook when wgrad is delayed.
     skip_final_backward_callback: bool = False,
 ) -> nn.Module:
     """
@@ -76,6 +76,15 @@ def fully_shard(
     Args:
         fine_grained_hooks: If ``True``, register pre-forward/backward hooks
             on every sub-module (for EP-overlap / 1F1B schedules).
+        skip_backward_callback: If ``True``, skip ``_register_backward_hook``.
+            The autograd post-backward hook (RegisterFSDPBackwardFunction) fires
+            during autograd backward, which is too early when wgrad computation
+            is delayed (``delay_wgrad_compute=True``).  Post-backward
+            finalization is handled by ``mfsdp_post_backward_final_callback``.
+        skip_final_backward_callback: If ``True``, do not auto-enqueue
+            ``_register_post_backward_final_callback`` during the backward
+            pre-hook.  The caller must invoke the final callback manually
+            (used by the 1F1B EP overlap schedule).
     """
     if isinstance(module, FSDPModule):
         raise ValueError(
@@ -134,10 +143,12 @@ def fully_shard(
         fine_grained=fine_grained_hooks,
         skip_final_callback=skip_final_backward_callback,
     )
-    # Skip the autograd post-backward hook when EP overlap is active. The
-    # RegisterFSDPBackwardFunction fires during autograd backward (before
-    # backward_dw() completes delayed wgrad computation), which is too early.
-    # mfsdp_post_backward_final_callback handles all modules at the correct time.
+    # Skip the autograd post-backward hook when delay_wgrad_compute is enabled.
+    # The RegisterFSDPBackwardFunction fires during autograd backward (before
+    # backward_dw() completes delayed weight gradient computation), which is too
+    # early for reduce_grad(). mfsdp_post_backward_final_callback handles all
+    # modules at the correct time.  Note: delay_wgrad_compute already requires
+    # overlap_moe_expert_parallel_comm (asserted in transformer_config.py).
     if not skip_backward_callback:
         _register_backward_hook(module)
 

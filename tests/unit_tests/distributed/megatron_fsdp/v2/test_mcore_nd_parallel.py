@@ -215,8 +215,6 @@ class TestMegatronFSDPE2E:
         # Training loop
         for step in range(NUM_TRAINING_STEPS):
             t0 = time.time()
-            if torch.distributed.get_rank() == 0:
-                print(f"[Step {step + 1}/{NUM_TRAINING_STEPS}] starting...")
             optim.zero_grad()
             output = pretrain_forward_backward(
                 model=model_chunks,
