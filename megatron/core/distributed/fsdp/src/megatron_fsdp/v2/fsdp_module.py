@@ -527,16 +527,16 @@ class FSDPModule:
             # Move materialized parameters to the same target device (e.g., GPU)
             m.to(materialization_device)
 
-            if mesh is not None and mesh.size() > 1:
-                for param in m.parameters(recurse=False):
-                    if param.is_meta or isinstance(param, DTensor):
+        if mesh is not None and mesh.size() > 1:
+            for param in self.parameters():
+                if param.is_meta or isinstance(param, DTensor):
+                    continue
+                for mesh_dim in range(mesh.ndim):
+                    group = mesh.get_group(mesh_dim=mesh_dim)
+                    if torch.distributed.get_world_size(group) == 1:
                         continue
-                    for mesh_dim in range(mesh.ndim):
-                        group = mesh.get_group(mesh_dim=mesh_dim)
-                        if torch.distributed.get_world_size(group) == 1:
-                            continue
-                        src_rank = torch.distributed.get_global_rank(group, 0)
-                        torch.distributed.broadcast(param.data, src=src_rank, group=group)
+                    src_rank = torch.distributed.get_global_rank(group, 0)
+                    torch.distributed.broadcast(param.data, src=src_rank, group=group)
 
     def _init_fsdp_state(
         self,

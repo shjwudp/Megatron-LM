@@ -27,7 +27,7 @@ import torch
 from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from ..uneven_dtensor import copy_chunk_metadata, make_uneven_dtensor
+from ..uneven_dtensor import make_uneven_dtensor, update_uneven_dtensor_chunk_metadata
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
 from .mixed_precision import MixedPrecisionPolicy
@@ -374,44 +374,37 @@ class ParameterGroup:
                     param_shape = param.shape
                 else:
                     param_shape = self.mp_policy.get_param_storage_shapes([param])[0]
-                shard_start, shard_end = buffer.buffer_index._get_item_self_range(
-                    item_id,
-                    as_shard=is_optim_shard,
-                    as_outer_shard=is_outer_optim_shard,
-                )
             elif self.main_weight_buffer is not None:
                 mbuf = self.main_weight_buffer
                 data = mbuf.get_item(item_id, as_shard=is_optim_shard)
                 param_shape = param.shape
-                shard_start, shard_end = mbuf.buffer_index._get_item_self_range(
-                    item_id, as_shard=is_optim_shard
-                )
             elif self.model_weight_buffer is not None:
                 wbuf = self.model_weight_buffer
                 data = wbuf.get_item(item_id, as_shard=is_param_shard)
                 param_shape = self.mp_policy.get_param_storage_shapes([param])[0]
-                shard_start, shard_end = wbuf.buffer_index._get_item_self_range(
-                    item_id, as_shard=is_param_shard
-                )
             else:
                 data = param.data.detach()
                 param_shape = param.shape
-                shard_start, shard_end = 0, param_shape.numel()
 
-            dist_param_dtensor = make_uneven_dtensor(
-                data,
-                param_shape,
-                self.mesh,
-                optim_placements,
-                shard_range=(shard_start, shard_end),
+            dist_param = torch.nn.Parameter(
+                make_uneven_dtensor(
+                    data,
+                    param_shape,
+                    self.mesh,
+                    optim_placements,
+                    post_process_uneven=True,
+                ),
+                requires_grad=param.requires_grad,
             )
-            dist_param = torch.nn.Parameter(dist_param_dtensor, requires_grad=param.requires_grad)
-            copy_chunk_metadata(dist_param_dtensor, dist_param)
             # Mark as FSDP parameter for special handling
             setattr(param, "__fsdp_param__", True)
             setattr(dist_param, "__fsdp_param__", True)
             self.dist_params.append(dist_param)
             self.dist_grads.append(None)  # placeholder, will be set in _init_dist_grads
+
+        # Update dist_param chunk metadata for checkpointing and debugging.
+        for dist_param in self.dist_params:
+            update_uneven_dtensor_chunk_metadata(dist_param)
 
     def _init_dist_grads(self) -> None:
         """Lazily allocate ``main_grad_buffer.data`` and rebuild ``dist_grads``.
@@ -449,11 +442,6 @@ class ParameterGroup:
                 as_shard=is_grad_shard,
                 as_outer_shard=is_outer_optim_shard,
             )
-            shard_start, shard_end = gbuf.buffer_index._get_item_self_range(
-                item_id,
-                as_shard=is_grad_shard,
-                as_outer_shard=is_outer_optim_shard,
-            )
             # NOTE: Do not remove the grad_data.numel() > 0 check.
             # Empty local grad shards are semantically no-ops, but materializing
             # them as DTensor grads can pass zero-numel tensors into fused
@@ -466,7 +454,7 @@ class ParameterGroup:
                         p.shape,
                         self.mesh,
                         placements,
-                        shard_range=(shard_start, shard_end),
+                        post_process_uneven=True,
                     )
                 )
             else:

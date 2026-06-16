@@ -573,16 +573,8 @@ class MixedPrecisionPolicy:
             elif model_weight_buffer.is_distributed == main_weight_buffer.is_distributed:
                 model_weight_buffer.data.copy_(main_weight_buffer.data)
             else:
-                model_shard_meta = model_weight_buffer.buffer_index.shard_meta
-                main_shard_meta = main_weight_buffer.buffer_index.shard_meta
-                model_weight_buffer.data[
-                    model_shard_meta.local_data_index : model_shard_meta.local_data_index
-                    + model_shard_meta.size
-                ].copy_(
-                    main_weight_buffer.data[
-                        main_shard_meta.local_data_index : main_shard_meta.local_data_index
-                        + main_shard_meta.size
-                    ]
+                model_weight_buffer.get_shard_view("inner_shard").copy_(
+                    main_weight_buffer.get_shard_view("inner_shard")
                 )
         else:
             fp8_params = []
