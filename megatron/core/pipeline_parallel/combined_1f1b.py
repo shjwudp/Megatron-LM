@@ -195,6 +195,9 @@ def combined_1f1b_schedule_for_no_pipelining(
         checkpoint_activations_microbatch=None,
         is_first_microbatch=check_first_val_step(True),
         current_microbatch=0,
+        root_module=root_module,
+        is_mfsdp=is_mfsdp,
+        is_v1=is_v1,
     )
     # The forward step is executed in parallel with the backward step of another microbatch
     # EP A2A in forward step is hidden by the attention/mlp computation in the backward step
