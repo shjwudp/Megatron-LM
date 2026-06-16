@@ -778,6 +778,11 @@ class FSDPModule:
             # the Python-side ``setattr(param, "grad_added_to_main_grad", True)`` that
             # accompanies the eager backward is captured away.  We record the per-param
             # flag during the trace micro-batch and restore it here.
+            # no_shard/ZeRO-1 keep full grads replicated until the last
+            # micro-batch, but still accumulate each micro-batch into the FP32
+            # main-grad buffer.
+            replicated_grad = param_group.sharding_strategy in ("no_shard", "optim")
+            add_to_main_grad = replicated_grad and not param_group._grad_buffer_is_fresh
             for name, param in zip(param_names, param_group.params):
                 grad_added = getattr(param, "grad_added_to_main_grad", False)
                 recorded = getattr(param, "_mfsdp_recorded_te_wgrad", False)
@@ -793,17 +798,23 @@ class FSDPModule:
                     if grad_added and self._fsdp_state.enable_cuda_graph:
                         setattr(param, "_mfsdp_recorded_te_wgrad", True)
                 elif param.grad is None:
-                    main_grad = param.get_main_grad()
-                    param_main_grad = getattr(param, "main_grad", None)
-                    if (
-                        param_main_grad is None
-                        or param_main_grad.data_ptr() != main_grad.data_ptr()
-                    ):
-                        main_grad.zero_()
+                    if not add_to_main_grad:
+                        main_grad = param.get_main_grad()
+                        param_main_grad = getattr(param, "main_grad", None)
+                        if (
+                            param_main_grad is None
+                            or param_main_grad.data_ptr() != main_grad.data_ptr()
+                        ):
+                            main_grad.zero_()
                 else:
                     main_grad = param.get_main_grad()
-                    main_grad.copy_(param.grad.detach())
+                    if add_to_main_grad:
+                        main_grad.add_(param.grad.detach())
+                    else:
+                        main_grad.copy_(param.grad.detach())
                     del param.grad
+            if replicated_grad:
+                param_group._grad_buffer_is_fresh = False
 
             if async_op:
                 # ---- Overlapped path ----

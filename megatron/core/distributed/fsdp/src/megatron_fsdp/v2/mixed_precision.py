@@ -567,8 +567,8 @@ class MixedPrecisionPolicy:
                     "model weights are sharded but main weights are replicated."
                 )
             if outer_optim:
-                model_weight_buffer.fetch_buffer(shard_mode="outer_shard").copy_(
-                    main_weight_buffer.fetch_buffer(shard_mode="outer_shard")
+                model_weight_buffer.get_shard_view("outer_shard").copy_(
+                    main_weight_buffer.get_shard_view("outer_shard")
                 )
             elif model_weight_buffer.is_distributed == main_weight_buffer.is_distributed:
                 model_weight_buffer.data.copy_(main_weight_buffer.data)
@@ -800,7 +800,12 @@ def quantize_main_weights_to_nvfp4(
         te_model_params, te_main_params, te_start_offsets, data_parallel_group, **kwargs
     )
 
-    wbuf.data.copy_(wbuf.fetch_buffer(shard_mode="inner_shard"))
+    shard_meta = wbuf.buffer_index.shard_meta
+    wbuf.data.copy_(
+        full_weight_buffer[
+            shard_meta.bucket_data_index : shard_meta.bucket_data_index + shard_meta.size
+        ]
+    )
 
     # Don't forget to reshard the model weight buffer after directly writing into its payload
     wbuf.reshard()

@@ -709,7 +709,7 @@ class DataParallelBuffer:
                 self._bind_buffer_to_params(full_buffer)
             return full_buffer
 
-        shard_buffer = self.fetch_buffer(shard_mode="inner_shard")
+        shard_buffer = self.get_shard_view("inner_shard")
         torch.distributed.all_gather_into_tensor(
             output_tensor=full_buffer,
             input_tensor=shard_buffer,
@@ -730,7 +730,7 @@ class DataParallelBuffer:
     @torch.no_grad()
     def unshard_outer(self) -> torch.Tensor:
         """All-gather outer optimizer shards into this rank's local inner-DP shard."""
-        full_buffer = self.fetch_buffer(shard_mode="inner_shard")
+        full_buffer = self.get_shard_view("inner_shard")
         if self.outer_dp_sharding_strategy != "optim":
             return full_buffer
         if torch.distributed.get_world_size(self.outer_dp_group) == 1:
@@ -739,7 +739,7 @@ class DataParallelBuffer:
         if not self._outer_dirty:
             return full_buffer
 
-        shard_buffer = self.fetch_buffer(shard_mode="outer_shard")
+        shard_buffer = self.get_shard_view("outer_shard")
         torch.distributed.all_gather_into_tensor(
             output_tensor=full_buffer,
             input_tensor=shard_buffer,
@@ -771,19 +771,8 @@ class DataParallelBuffer:
         self.allocator.free(self.alloc_key)
         self._unsharded_buffer = None
 
-    def fetch_buffer(self, *, shard_mode: str = "no_shard") -> torch.Tensor:
-        """Return the buffer, allocating the full unsharded view if needed.
-
-        Parameters
-        ----------
-        shard_mode : str
-            "no_shard" returns the full buffer, "inner_shard" returns this
-            inner-DP rank's shard, and "outer_shard" returns this outer-DP
-            rank's shard inside the local inner-DP buffer.
-
-        Memory allocation always occurs on the default stream for deterministic
-        caching-allocator behaviour.
-        """
+    def get_shard_view(self, shard_mode: str) -> torch.Tensor:
+        """Return an inner/outer persistent shard view inside ``self.data``."""
         if shard_mode == "inner_shard":
             assert self.data is not None, "DataParallelBuffer data not initialized"
             sm = self.buffer_index.shard_meta
@@ -793,9 +782,14 @@ class DataParallelBuffer:
             assert self.buffer_index.outer_shard_meta is not None
             sm = self.buffer_index.outer_shard_meta
             return self.data[sm.local_data_index : sm.local_data_index + sm.size]
-        if shard_mode != "no_shard":
-            raise ValueError(f"Unsupported shard_mode: {shard_mode}")
+        raise ValueError(f"Unsupported shard_mode: {shard_mode}")
 
+    def fetch_buffer(self) -> torch.Tensor:
+        """Return the full unsharded buffer, allocating it if needed.
+
+        Memory allocation always occurs on the default stream for deterministic
+        caching-allocator behaviour.
+        """
         if self.is_distributed:
             if self._unsharded_buffer is None:
                 bucket = self.allocator.allocate(
@@ -908,7 +902,7 @@ class DataParallelBuffer:
             grad = (
                 self.data
                 if self.sharding_strategy == "no_shard"
-                else self.fetch_buffer(shard_mode="inner_shard")
+                else self.get_shard_view("inner_shard")
             )
             if grad.numel() == 0:
                 return
@@ -941,8 +935,8 @@ class DataParallelBuffer:
                 f"Unsupported outer-DP sharding strategy: {self.outer_dp_sharding_strategy}"
             )
 
-        input_buffer = self.fetch_buffer(shard_mode="inner_shard")
-        output_shard = self.fetch_buffer(shard_mode="outer_shard")
+        input_buffer = self.get_shard_view("inner_shard")
+        output_shard = self.get_shard_view("outer_shard")
         comm_input = input_buffer
         comm_output = output_shard
         input_key = None
