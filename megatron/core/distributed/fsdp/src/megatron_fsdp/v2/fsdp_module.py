@@ -847,11 +847,6 @@ class FSDPModule:
                         setattr(dist_param, "grad", dist_grad)
                         if hasattr(dist_param, "decoupled_grad"):
                             dist_param.decoupled_grad = None
-                        if torch.distributed.get_rank() == 0:
-                            dist_grad_type = type(dist_grad).__name__ if dist_grad is not None else "None"
-                            existing_grad_type = type(dist_param.grad).__name__ if dist_param.grad is not None else "None"
-                            print(f"[DEBUG] reduce_grad module={self._fsdp_module_name} param={name} "
-                                  f"dist_grad_type={dist_grad_type} installed_grad_type={existing_grad_type}")
 
             if async_op:
                 event = stream.record_event()

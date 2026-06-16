@@ -792,9 +792,6 @@ class TEGroupedMLP(MegatronModule):
         If an error occurs during execution, it is caught and re-raised with a
         descriptive message.
         """
-        if torch.distributed.get_rank() == 0:
-            print(f"[DEBUG] TEGroupedMLP.backward_dw() called, _with_fused_impl={self._with_fused_impl}, "
-                  f"delay_wgrad_compute={self.config.delay_wgrad_compute}")
         if self._with_fused_impl and self.config.delay_wgrad_compute:
             if self._fused_ops is not None:
                 (seq,) = self._fused_ops
