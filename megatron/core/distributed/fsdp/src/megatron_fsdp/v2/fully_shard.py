@@ -60,7 +60,7 @@ def fully_shard(
     sharding_strategy: str = "optim_grads_params",
     enable_cuda_graph: bool = False,
     fine_grained_hooks: bool = False,
-    skip_backward_reduce_grad_callback: bool = False,  # Reshard only in autograd bwd hook; defer reduce_grad.
+    skip_backward_callback: bool = False,  # Skip autograd RegisterFSDPBackwardFunction.
     skip_final_backward_callback: bool = False,
 ) -> nn.Module:
     """
@@ -76,11 +76,13 @@ def fully_shard(
     Args:
         fine_grained_hooks: If ``True``, register pre-forward/backward hooks
             on every sub-module (for EP-overlap / 1F1B schedules).
-        skip_backward_reduce_grad_callback: If ``True``, the autograd post-backward
-            hook only reshards (releases all-gathered buffers) — gradient reduction
-            is deferred to ``mfsdp_post_backward_final_callback``.  Set when
-            ``delay_wgrad_compute=True`` because weight gradients are not ready
-            during autograd backward.
+        skip_backward_callback: If ``True``, skip the autograd post-backward
+            hook (``_register_backward_hook``).  Per-layer reshard + reduce_grad
+            still fires via ``set_fsdp_reshard_hooks`` / ``mfsdp_post_backward_hook``
+            for the TransformerLayer; remaining modules (e.g., TEGroupedMLP) are
+            handled by ``mfsdp_post_backward_final_callback`` after all
+            ``backward_dw()`` calls complete.  Set when ``delay_wgrad_compute=True``
+            because weight gradients are not ready during autograd backward.
         skip_final_backward_callback: If ``True``, do not auto-enqueue
             ``_register_post_backward_final_callback`` during the backward
             pre-hook.  The caller must invoke the final callback manually
@@ -143,16 +145,14 @@ def fully_shard(
         fine_grained=fine_grained_hooks,
         skip_final_callback=skip_final_backward_callback,
     )
-    # When delay_wgrad_compute is enabled, register a reshard-only autograd
-    # post-backward hook.  This releases the all-gathered parameter buffer
-    # immediately after autograd backward, keeping peak memory low.
-    # Gradient reduction is deferred to mfsdp_post_backward_final_callback,
-    # which runs after all backward_dw() calls complete.
+    # When delay_wgrad_compute is enabled, skip the autograd post-backward
+    # hook.  Per-layer reshard+reduce_grad still fires via set_fsdp_reshard_hooks
+    # for TransformerLayer; remaining modules (TEGroupedMLP, root) are handled
+    # by mfsdp_post_backward_final_callback after all backward_dw() calls.
     #
-    # When delay_wgrad_compute is disabled, register the full hook that does
-    # both reshard and reduce_grad inline (all grads are ready during autograd
-    # backward).
-    _register_backward_hook(module, reduce_grad=not skip_backward_reduce_grad_callback)
+    # When disabled, the autograd hook does both inline.
+    if not skip_backward_callback:
+        _register_backward_hook(module)
 
     module.reshard()
 

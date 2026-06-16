@@ -261,11 +261,13 @@ reduce only activation gradients, but not weight gradients.  The subsequent
 `backward_dw()` then writes to the already-resharded DTensor params,
 corrupting `.grad`.
 
-**Fix**: When `skip_backward_reduce_grad_callback=True` (wired to `config.delay_wgrad_compute`
-in `mcore_fsdp_adapter.py:277`), this autograd hook is **skipped**.  The
-`mfsdp_post_backward_final_callback` (called after all `backward_dw()` calls
-complete at `combined_1f1b.py:629`) handles all FSDP modules — both the
-TransformerLayer and nested modules like TEGroupedMLP — at the correct time.
+**Fix**: When `skip_backward_callback=True` (wired to `config.delay_wgrad_compute`
+in `mcore_fsdp_adapter.py:303`), the autograd `RegisterFSDPBackwardFunction` is
+**skipped** for this module.  Per-layer `reshard()` + `reduce_grad()` still fires
+manually for the TransformerLayer via `set_fsdp_reshard_hooks` →
+`mfsdp_post_backward_hook`.  Remaining nested modules (e.g., TEGroupedMLP, root)
+are handled by `mfsdp_post_backward_final_callback` (called at
+`combined_1f1b.py:629`), which runs after all `backward_dw()` calls complete.
 
 For EP overlap **without** `delay_wgrad_compute`, the autograd hook fires at
 the right time (all grads are ready inline during backward), so it is

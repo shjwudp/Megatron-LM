@@ -222,33 +222,6 @@ def mfsdp_pre_backward_setup(
     target._fsdp_pre_backward_done = True
 
 
-def mfsdp_post_backward_reshard_only(module: nn.Module):
-    """Post-backward hook: reshard only (no gradient reduction).
-
-    Used when ``delay_wgrad_compute=True`` — the autograd backward fires this
-    hook to release the all-gathered parameter buffer immediately.  Gradient
-    reduction is deferred to ``mfsdp_post_backward_final_callback``, which
-    runs after all ``backward_dw()`` calls complete.
-
-    Only supports direct FSDPModule calls.  Raises ``TypeError`` when
-    called with a non-FSDPModule.
-    """
-    if not isinstance(module, FSDPModule):
-        raise TypeError(
-            "mfsdp_post_backward_reshard_only only supports FSDPModule, "
-            f"got {type(module).__name__}"
-        )
-    ctx = module._fsdp_root_context
-    assert not ctx.cuda_graph_active, (
-        "hooks must not fire during CUDA graph capture"
-    )
-    ctx.backward_done_modules.add(id(module))
-    ctx._advance_backward_module()
-    module.reshard()
-    # Do NOT set post_backward_issued = True — reduce_grad still pending,
-    # handled by mfsdp_post_backward_final_callback.
-
-
 def mfsdp_post_backward_hook(module: nn.Module):
     """Post-backward hook: reshard parameters and reduce gradients.
 
@@ -485,27 +458,14 @@ def _register_backward_pre_hook(
     )
 
 
-def _register_backward_hook(module: FSDPModule, reduce_grad: bool = True):
+def _register_backward_hook(module: FSDPModule):
     """
     Register backward hook using autograd Function.
 
     This inserts a RegisterFSDPBackwardFunction in the backward pass
-    that triggers reshard (and optionally reduce_grad) after gradients
-    are computed.
-
-    Args:
-        reduce_grad: If ``True`` (default), the hook calls
-            ``mfsdp_post_backward_hook`` which reshards AND reduces
-            gradients.  If ``False``, the hook calls
-            ``mfsdp_post_backward_reshard_only`` which only reshards
-            — gradient reduction is deferred to
-            ``mfsdp_post_backward_final_callback``.
+    that triggers ``mfsdp_post_backward_hook`` after gradients are
+    computed — resharding parameters and reducing gradients.
     """
-    post_backward_hook = (
-        mfsdp_post_backward_hook if reduce_grad
-        else mfsdp_post_backward_reshard_only
-    )
-
     @torch.compiler.disable
     def _register_post_backward_hook(
         post_backward_hook: Callable,
@@ -559,7 +519,7 @@ def _register_backward_hook(module: FSDPModule, reduce_grad: bool = True):
         return args, kwargs
 
     module._mfsdp_backward_hook = module.register_forward_pre_hook(
-        functools.partial(_register_post_backward_hook, post_backward_hook),
+        functools.partial(_register_post_backward_hook, mfsdp_post_backward_hook),
         with_kwargs=True,
     )
 
