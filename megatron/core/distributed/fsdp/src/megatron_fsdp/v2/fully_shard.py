@@ -36,7 +36,7 @@ from .hooks import (
     _register_forward_pre_hook,
 )
 from .mixed_precision import MixedPrecisionPolicy
-from .utils import _init_default_fully_shard_mesh
+from .utils import _init_default_fully_shard_mesh, _prepare_fsdp_mesh
 
 __all__ = ["FSDPModule", "fully_shard"]
 
@@ -76,9 +76,7 @@ def fully_shard(
             "The input module has already been fully sharded. "
             "Please do not call fully_shard on the same module more than once."
         )
-    mesh = mesh or _init_default_fully_shard_mesh()
-    if mesh.ndim != 2:
-        raise ValueError(f"FSDP v2 expects a 2D (outer, inner) DeviceMesh, got {mesh.ndim}D.")
+    mesh = _prepare_fsdp_mesh(mesh or _init_default_fully_shard_mesh())
 
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy()

@@ -31,7 +31,7 @@ from ..uneven_dtensor import make_uneven_dtensor, update_uneven_dtensor_chunk_me
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
 from .mixed_precision import MixedPrecisionPolicy
-from .utils import ParamGroupIdx
+from .utils import ParamGroupIdx, _prepare_fsdp_mesh
 
 
 class ParameterGroup:
@@ -84,10 +84,7 @@ class ParameterGroup:
                 world_ranks,
                 mesh_dim_names=("dp_outer", "dp"),
             )
-        if mesh.ndim != 2:
-            raise ValueError(
-                f"FSDP v2 expects a 2D (outer, inner) DeviceMesh, got {mesh.ndim}D."
-            )
+        mesh = _prepare_fsdp_mesh(mesh)
         self.mesh = mesh
         self.outer_dp_group = self.mesh.get_group(mesh_dim=0)
         self.dp_group = self.mesh.get_group(mesh_dim=1)

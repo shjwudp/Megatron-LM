@@ -358,3 +358,44 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
             assert torch.equal(actual, ref_shard)
 
     torch.distributed.barrier()
+
+
+@pytest.mark.parametrize("strategy", ["no_shard", "optim"])
+def test_hsdp_reduce_grad_multi_microbatch(strategy):
+    rank = torch.distributed.get_rank()
+    device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
+    mesh = _build_hsdp_mesh(device)
+    groups, _, _, rank, _, _ = _build_groups(
+        strategy, mesh=mesh, outer_dp_sharding_strategy="no_shard"
+    )
+
+    num_micro_batches = 3
+    for pg in groups:
+        pg._init_dist_grads()
+        gbuf = pg.main_grad_buffer
+        if gbuf is None:
+            continue
+
+        gbuf.data.zero_()
+        full_batch_grad = torch.zeros_like(gbuf.data)
+        for microbatch in range(num_micro_batches):
+            micro_grad = torch.full_like(
+                gbuf.data, float((microbatch + 1) * (rank + 1))
+            )
+            gbuf.data.add_(micro_grad)
+            full_batch_grad.add_(micro_grad)
+            pg.reduce_grad(is_last_microbatch=microbatch == num_micro_batches - 1)
+
+        if strategy == "no_shard":
+            ref = full_batch_grad
+            Ref.all_reduce(ref, pg.dp_group)
+            Ref.all_reduce(ref, pg.outer_dp_group)
+            assert torch.equal(gbuf.data, ref)
+        else:
+            ref_shard = Ref.reduce_scatter(full_batch_grad, pg.dp_group)
+            Ref.all_reduce(ref_shard, pg.outer_dp_group)
+            sm = gbuf.buffer_index.shard_meta
+            actual = gbuf.data[sm.local_data_index : sm.local_data_index + sm.size]
+            assert torch.equal(actual, ref_shard)
+
+    torch.distributed.barrier()
