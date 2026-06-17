@@ -497,7 +497,6 @@ class DataParallelBuffer:
 
         self.data: Optional[torch.Tensor] = None
         self._unsharded_buffer: Optional[torch.Tensor] = None
-        self._dirty = False
 
     # ------------------------------------------------------------------ #
     #  Public API
@@ -509,7 +508,8 @@ class DataParallelBuffer:
         assert data.numel() == self.data_size, f"size mismatch: {data.numel()} vs {self.data_size}"
         self.data = data
         self._outer_dirty = False
-        self._dirty = self.is_distributed
+        if self.buffer_role in ("model_weight", "transpose_weight") and not self.is_distributed:
+            self.data._dirty = False
 
     # ------------------------------------------------------------------ #
     #  CPU offload
@@ -686,9 +686,10 @@ class DataParallelBuffer:
 
     def is_unsharded(self) -> bool:
         """Return whether this buffer currently has a full unsharded view."""
-        if self.is_distributed:
-            return self._unsharded_buffer is not None and not self._dirty
-        return self.data is not None and not self._dirty
+        full_tensor = self._unsharded_buffer if self.is_distributed else self.data
+        if full_tensor is not None and not getattr(full_tensor, "_dirty", True):
+            return True
+        return False
 
     @torch.no_grad()
     def unshard(
@@ -703,7 +704,7 @@ class DataParallelBuffer:
         """
         full_buffer = self.fetch_buffer()
 
-        if not self.is_distributed and not self._dirty:
+        if not self.is_distributed and not getattr(full_buffer, "_dirty", False):
             if bind_params:
                 self._bind_buffer_to_params(full_buffer)
             return full_buffer
@@ -722,7 +723,7 @@ class DataParallelBuffer:
         if bind_params:
             self._bind_buffer_to_params(full_buffer)
 
-        self._dirty = False
+        setattr(full_buffer, "_dirty", False)  # mark the buffer as clean (unsharded)
 
         return full_buffer
 
@@ -769,7 +770,6 @@ class DataParallelBuffer:
             return
         self.allocator.free(self.alloc_key)
         self._unsharded_buffer = None
-        self._dirty = True
 
     def get_shard_view(self, shard_mode: str) -> torch.Tensor:
         """Return an inner/outer persistent shard view inside ``self.data``."""
@@ -799,7 +799,6 @@ class DataParallelBuffer:
                     device=self.device,
                 )
                 self._unsharded_buffer = bucket.data
-                self._dirty = True
             full = self._unsharded_buffer
         else:
             assert self.data is not None, "DataParallelBuffer data not initialized"
