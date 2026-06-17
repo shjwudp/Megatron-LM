@@ -1103,9 +1103,13 @@ class FSDPModule:
         """Return the root FSDP module associated with this module."""
         return self._fsdp_root_context.get_root_module()
 
-    def set_is_last_microbatch(self, is_last_microbatch: bool = True):
-        """Set whether the current micro-batch is the optimizer-step boundary."""
-        self._fsdp_root_context.is_last_microbatch = is_last_microbatch
+    def set_is_last_backward(self, is_last_backward: bool = True):
+        """Set whether the next backward is the optimizer-step boundary.
+
+        This mirrors PyTorch FSDP2's microbatching API.  On the last backward,
+        delayed inner grad reductions and outer-DP grad sync are issued.
+        """
+        self._fsdp_root_context.is_last_microbatch = is_last_backward
 
     def _sync_module_states_after_load(self):
         self._copy_main_weights_to_model_weights()

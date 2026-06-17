@@ -29,10 +29,9 @@ def pretrain_forward_backward(
 
     def forward_step_func(data_iterator, model):
         nonlocal microbatch_idx
-        if hasattr(model, "set_is_last_microbatch"):
-            model.set_is_last_microbatch(
-                microbatch_idx % num_micro_batches == num_micro_batches - 1
-            )
+        is_last_backward = microbatch_idx % num_micro_batches == num_micro_batches - 1
+        if hasattr(model, "set_is_last_backward"):
+            model.set_is_last_backward(is_last_backward)
         microbatch_idx += 1
         return _forward_step_func(data_iterator, model)
 

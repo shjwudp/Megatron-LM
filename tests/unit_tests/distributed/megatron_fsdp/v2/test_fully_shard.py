@@ -53,9 +53,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-    MixedPrecisionPolicy,
-)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
 
 # ------------------------------------------------------------------ #
 #  Distributed environment (NCCL session-scoped)
@@ -191,10 +189,10 @@ class MOETransformerLayer(nn.Module):
 # ------------------------------------------------------------------ #
 
 
-def _set_last_microbatch(model, is_last_microbatch: bool = True):
-    """Mark the current FSDP v2 micro-batch boundary when the model supports it."""
-    if hasattr(model, "set_is_last_microbatch"):
-        model.set_is_last_microbatch(is_last_microbatch)
+def _set_last_backward(model, is_last_backward: bool = True):
+    """Mark the next FSDP v2 backward as the optimizer-step boundary."""
+    if hasattr(model, "set_is_last_backward"):
+        model.set_is_last_backward(is_last_backward)
 
 
 def _forward_backward(model, x):
@@ -280,7 +278,7 @@ class TestFullyShardBasic:
         fully_shard(model, sharding_strategy="no_shard", enable_async_reduce_grad=False)
 
         x = torch.randn(2, 64, device=_device())
-        _set_last_microbatch(model)
+        _set_last_backward(model)
         loss = _forward_backward(model, x)
         assert not torch.isnan(torch.tensor(loss)), "Loss is NaN"
         model.finish_grad_sync()
@@ -1027,7 +1025,7 @@ class TestCheckpoint:
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
         x = torch.randn(2, 64, device=device)
-        _set_last_microbatch(model)
+        _set_last_backward(model)
         loss = model(x).sum()
         loss.backward()
         model.finish_grad_sync()
