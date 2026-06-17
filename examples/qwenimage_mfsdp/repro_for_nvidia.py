@@ -1,17 +1,17 @@
 """
-Minimal single-file repro: FSDP1 vs Megatron-FSDP on QwenImageTransformer2DModel.
+Minimal single-file repro: FSDP1 vs Megatron-FSDP v1/v2 on QwenImageTransformer2DModel.
 
 Self-contained except for stock packages (`torch`, `diffusers`, `megatron-fsdp`).
 The diffusion-transformer body is the upstream diffusers model — no private fork.
 
 Usage (per node):
-  torchrun --nnodes=$NNODES --node_rank=$NODE_RANK \\
-           --nproc_per_node=8 --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \\
-           repro_for_nvidia.py \\
-           --backend {fsdp1|mfsdp} \\
-           --sharding {full|hybrid} \\
-           --batch_size 4 --height 512 --width 512 \\
-           --bench_steps 20 --warmup_steps 3 \\
+  torchrun --nnodes=$NNODES --node_rank=$NODE_RANK \
+           --nproc_per_node=8 --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+           repro_for_nvidia.py \
+           --backend {fsdp1|mfsdp|mfsdpv2} \
+           --sharding {full|hybrid} \
+           --batch_size 4 --height 512 --width 512 \
+           --bench_steps 20 --warmup_steps 3 \
            --compile --verify
 
 Reports per-step latency (averaged over `bench_steps`) and peak GPU memory.
@@ -19,6 +19,9 @@ Reports per-step latency (averaged over `bench_steps`) and peak GPU memory.
 two backends can be checked for numerical agreement; it forces a sync each step
 so absolute ms include extra overhead — only the *relative* delta between
 backends within the same probe mode is meaningful.
+
+Note: mfsdpv2 uses a 1D-only device mesh (no HSDP). When --sharding hybrid is
+requested with mfsdpv2 it falls back to full sharding on the 1D mesh.
 """
 import argparse
 from contextlib import contextmanager
@@ -168,7 +171,7 @@ def install_vit_nvtx_tag(model):
 # ----------------------------- args -----------------------------
 def parse():
     p = argparse.ArgumentParser()
-    p.add_argument("--backend", required=True, choices=["fsdp1", "mfsdp"])
+    p.add_argument("--backend", required=True, choices=["fsdp1", "mfsdp", "mfsdpv2"])
     p.add_argument("--sharding", default="hybrid", choices=["full", "hybrid"])
     p.add_argument("--pretrained_model_name_or_path", required=True,
                    help="HF repo or local dir containing the QwenImage transformer.")
@@ -253,6 +256,38 @@ def wrap_mfsdp(model, world_size, num_gpus_per_node, dtype, sharding,
         overlap_grad_reduce=True, overlap_param_gather=True,
         mixed_precision_policy=mp, **hsdp_kwargs,
     )
+
+
+def wrap_mfsdpv2(model, world_size, num_gpus_per_node, dtype, sharding):
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import (
+        fully_shard, MixedPrecisionPolicy,
+    )
+
+    use_hsdp = sharding == "hybrid" and (world_size // num_gpus_per_node) > 1
+    if use_hsdp:
+        mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp_shard",))
+        shard_strategy = "optim_grads_params"
+        if dist.get_rank() == 0:
+            print("[mfsdpv2] HSDP not supported; falling back to full sharding on 1D mesh")
+    else:
+        mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp_shard",))
+        shard_strategy = "optim_grads_params"
+
+    mp = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype,
+                              grad_comm_dtype=dtype)
+
+    for blk in model.transformer_blocks:
+        fully_shard(blk, mesh=mesh, mp_policy=mp,
+                    sharding_strategy=shard_strategy,
+                    enable_unshard_prefetch=True,
+                    enable_async_reduce_grad=True)
+
+    fully_shard(model, mesh=mesh, mp_policy=mp,
+                sharding_strategy=shard_strategy,
+                enable_unshard_prefetch=True,
+                enable_async_reduce_grad=True)
+
+    return model
 
 
 # ------------------------ verify probe ------------------------
@@ -343,6 +378,9 @@ def main():
     if args.backend == "fsdp1":
         model = wrap_fsdp1(model, world, args.num_gpus_per_node, dtype,
                            args.sharding, local_rank)
+    elif args.backend == "mfsdpv2":
+        model = wrap_mfsdpv2(model, world, args.num_gpus_per_node, dtype,
+                             args.sharding)
     else:
         # verify needs grads finished before optimizer.step(); benchmark path keeps overlap
         model = wrap_mfsdp(model, world, args.num_gpus_per_node, dtype,
@@ -404,6 +442,9 @@ def main():
                     optim.step(sync_grad_before_optimizer_step=True,
                                install_optimized_model_weights=True)
                     optim.zero_grad(set_to_none=True, zero_grad_buffer=True)
+                elif args.backend == "mfsdpv2":
+                    optim.step()
+                    optim.zero_grad(set_to_none=True)
                 else:
                     optim.step(); optim.zero_grad(set_to_none=True)
 
