@@ -192,6 +192,8 @@ def parse():
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--compile", action="store_true",
                    help="Per-block torch.compile on transformer_blocks.")
+    p.add_argument("--trace-pool", action="store_true",
+                   help="Use TracePoolAllocator for stable buffer addresses (mfsdpv2 only).")
     p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--verify", action="store_true",
                    help="Cross-rank gloss + global grad-norm probe; timing INVALID for this run.")
@@ -258,7 +260,8 @@ def wrap_mfsdp(model, world_size, num_gpus_per_node, dtype, sharding,
     )
 
 
-def wrap_mfsdpv2(model, world_size, num_gpus_per_node, dtype, sharding):
+def wrap_mfsdpv2(model, world_size, num_gpus_per_node, dtype, sharding,
+                 enable_trace_pool=False):
     from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import (
         fully_shard, MixedPrecisionPolicy,
     )
@@ -278,10 +281,16 @@ def wrap_mfsdpv2(model, world_size, num_gpus_per_node, dtype, sharding):
 
     for blk in model.transformer_blocks:
         fully_shard(blk, mesh=mesh, mp_policy=mp,
-                    sharding_strategy=shard_strategy)
+                    sharding_strategy=shard_strategy,
+                    enable_unshard_prefetch=True,
+                    enable_async_reduce_grad=True,
+                    enable_trace_pool=enable_trace_pool)
 
     fully_shard(model, mesh=mesh, mp_policy=mp,
-                sharding_strategy=shard_strategy)
+                sharding_strategy=shard_strategy,
+                enable_unshard_prefetch=True,
+                enable_async_reduce_grad=True,
+                enable_trace_pool=enable_trace_pool)
 
     return model
 
@@ -376,7 +385,7 @@ def main():
                            args.sharding, local_rank)
     elif args.backend == "mfsdpv2":
         model = wrap_mfsdpv2(model, world, args.num_gpus_per_node, dtype,
-                             args.sharding)
+                             args.sharding, enable_trace_pool=args.trace_pool)
     else:
         # verify needs grads finished before optimizer.step(); benchmark path keeps overlap
         model = wrap_mfsdp(model, world, args.num_gpus_per_node, dtype,
