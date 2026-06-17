@@ -622,7 +622,7 @@ class MixedPrecisionPolicy:
             if buffer is None:
                 continue
             if buffer.sharding_strategy != "no_shard" and not buffer.is_distributed:
-                buffer.data._dirty = True
+                buffer._dirty = True
             if outer_optim:
                 buffer._outer_dirty = True
 
