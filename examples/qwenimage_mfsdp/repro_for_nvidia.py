@@ -278,14 +278,10 @@ def wrap_mfsdpv2(model, world_size, num_gpus_per_node, dtype, sharding):
 
     for blk in model.transformer_blocks:
         fully_shard(blk, mesh=mesh, mp_policy=mp,
-                    sharding_strategy=shard_strategy,
-                    enable_unshard_prefetch=True,
-                    enable_async_reduce_grad=True)
+                    sharding_strategy=shard_strategy)
 
     fully_shard(model, mesh=mesh, mp_policy=mp,
-                sharding_strategy=shard_strategy,
-                enable_unshard_prefetch=True,
-                enable_async_reduce_grad=True)
+                sharding_strategy=shard_strategy)
 
     return model
 

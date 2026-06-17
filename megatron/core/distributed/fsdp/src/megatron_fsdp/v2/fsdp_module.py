@@ -519,8 +519,8 @@ class FSDPModule:
                         f"Module {name} contains meta parameters but cannot reset them"
                     )
 
-            # Move materialized parameters to the same target device (e.g., GPU)
-            m.to(materialization_device)
+        # Move materialized parameters to the same target device (e.g., GPU)
+        m.to(f"cuda:{materialization_device}")
 
         if mesh is not None and mesh.size() > 1:
             dp_group = mesh.get_group()
@@ -641,13 +641,6 @@ class FSDPModule:
         ctx = self._fsdp_root_context
         stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
 
-        if async_op:
-            # Synchronize ag_stream with current_stream to guarantee that main-stream
-            # writes to parameter data are visible before the all-gather kernel reads them
-            # on ag_stream. Without this barrier, stale or partially-written parameter
-            # shards may be gathered, causing convergence divergence.
-            stream.wait_stream(torch.cuda.current_stream())
-
         # Unshard this module and optionally prefetch next modules in the forward/backward pass
         if async_op:
             prefetch_modules = ctx.get_prefetch_next_modules(self, bwd_pass=bwd_pass)
@@ -671,8 +664,7 @@ class FSDPModule:
                             f"NaN detected in dist param for parameter {name}"
                         )
 
-                with torch.cuda.stream(stream):
-                    param_group.unshard(bwd_pass=bwd_pass)
+                param_group.unshard(bwd_pass=bwd_pass, stream=stream)
 
             # Record event to track when unshard is done for this module
             if async_op:
@@ -800,9 +792,7 @@ class FSDPModule:
             if async_op:
                 # ---- Overlapped path ----
                 # Switch to rs_stream for the reduce-scatter kernel
-                stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(stream):
-                    param_group.reduce_grad()
+                param_group.reduce_grad(stream=stream)
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
@@ -810,28 +800,27 @@ class FSDPModule:
                 param_group.release_grad_buffer()
 
             # Install reduced gradients to distributed parameters
-            with torch.cuda.stream(stream):
-                for name, param, dist_param, dist_grad in zip(
-                    param_names,
-                    param_group.params,
-                    param_group.dist_params,
-                    param_group.dist_grads,
-                ):
-                    if not param.requires_grad:
-                        continue
-                    if param_group.mp_policy.use_decoupled_grad:
-                        setattr(dist_param, "decoupled_grad", dist_grad)
-                        if dist_param.grad is not None:
-                            del dist_param.grad
-                    else:
-                        assert (
-                            dist_grad is None or dist_param.dtype == dist_grad.dtype
-                        ), (
-                            f"{name} Dist param dtype {dist_param.dtype} does not match dist grad dtype {dist_grad.dtype}"
-                        )
-                        setattr(dist_param, "grad", dist_grad)
-                        if hasattr(dist_param, "decoupled_grad"):
-                            dist_param.decoupled_grad = None
+            for name, param, dist_param, dist_grad in zip(
+                param_names,
+                param_group.params,
+                param_group.dist_params,
+                param_group.dist_grads,
+            ):
+                if not param.requires_grad:
+                    continue
+                if param_group.mp_policy.use_decoupled_grad:
+                    setattr(dist_param, "decoupled_grad", dist_grad)
+                    if dist_param.grad is not None:
+                        del dist_param.grad
+                else:
+                    assert (
+                        dist_grad is None or dist_param.dtype == dist_grad.dtype
+                    ), (
+                        f"{name} Dist param dtype {dist_param.dtype} does not match dist grad dtype {dist_grad.dtype}"
+                    )
+                    setattr(dist_param, "grad", dist_grad)
+                    if hasattr(dist_param, "decoupled_grad"):
+                        dist_param.decoupled_grad = None
 
             if async_op:
                 event = stream.record_event()

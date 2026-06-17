@@ -207,7 +207,12 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
-    def unshard(self, bwd_pass: bool = False, bind_params: bool = True):
+    def unshard(
+        self,
+        bwd_pass: bool = False,
+        bind_params: bool = True,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
         """
         Unshard model weights by all-gathering from sharded buffer.
 
@@ -220,7 +225,7 @@ class ParameterGroup:
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
             if weight_buffer is not None:
-                weight_buffer.unshard(bind_params=bind_params)
+                weight_buffer.unshard(bind_params=bind_params, stream=stream)
 
         self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
 
@@ -255,7 +260,7 @@ class ParameterGroup:
             self.transpose_weight_buffer,
         )
 
-    def reduce_grad(self):
+    def reduce_grad(self, stream: Optional[torch.cuda.Stream] = None):
         """
         Reduce gradients across DP ranks.
 
@@ -270,6 +275,7 @@ class ParameterGroup:
         self.main_grad_buffer.reduce_grad(
             grad_comm_dtype=self.mp_policy.grad_comm_dtype,
             overwrite_grad=self._grad_buffer_is_fresh,
+            stream=stream,
         )
         self._grad_buffer_is_fresh = False
 
