@@ -40,6 +40,7 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule, fine_grained: bool = Fal
     capture (once per compatible module).
     """
 
+    @torch.compiler.disable
     def forward_pre_hook(hook_module, args, kwargs):
         ctx = fsdp_module._fsdp_root_context
         assert not ctx.cuda_graph_active, (
@@ -104,6 +105,7 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule, fine_grained: bool = Fal
 def _register_forward_hook(module: FSDPModule):
     """Register post-forward hook to reshard parameters."""
 
+    @torch.compiler.disable
     def reshard_param_groups(module, *unused):
         ctx = module._fsdp_root_context
         assert not ctx.cuda_graph_active, (

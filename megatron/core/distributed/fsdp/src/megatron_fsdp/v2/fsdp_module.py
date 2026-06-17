@@ -520,7 +520,7 @@ class FSDPModule:
                     )
 
         # Move materialized parameters to the same target device (e.g., GPU)
-        m.to(f"cuda:{materialization_device}")
+        self.to(f"cuda:{materialization_device}")
 
         if mesh is not None and mesh.size() > 1:
             dp_group = mesh.get_group()
