@@ -518,17 +518,19 @@ class FSDPModule:
                     raise ValueError(
                         f"Module {name} contains meta parameters but cannot reset them"
                     )
-
-        # Move materialized parameters to the same target device (e.g., GPU)
-        self.to(f"cuda:{materialization_device}")
+            # Move materialized parameters to the same target device (e.g., GPU)
+            m.to(f"cuda:{materialization_device}")
 
         if mesh is not None and mesh.size() > 1:
             dp_group = mesh.get_group()
             src_rank = torch.distributed.get_global_rank(dp_group, 0)
-            for param in self.parameters():
-                if param.is_meta or isinstance(param, DTensor):
+            for name, m in self.named_modules():
+                if m in ignored_modules:
                     continue
-                torch.distributed.broadcast(param.data, src=src_rank, group=dp_group)
+                for param in m.parameters():
+                    if param.is_meta or isinstance(param, DTensor):
+                        continue
+                    torch.distributed.broadcast(param.data, src=src_rank, group=dp_group)
 
     def _init_fsdp_state(
         self,
