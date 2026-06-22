@@ -75,17 +75,39 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 # Debug toggles (env-var gated, no-op when disabled)
 # ------------------------------------------------------------------
-# Set MFSDP_CG_MEM_DEBUG=1 to, for every captured layer, run an extra
-# eager (no-CG) forward+backward on a side stream and log CG vs no-CG
-# peak memory side by side. For the FIRST captured layer, also dump
-# torch.cuda memory snapshots for both CG and no-CG paths so they can
-# be inspected with the PyTorch memory viz tool
-# (https://pytorch.org/memory_viz).
-_CG_MEM_DEBUG: bool = os.environ.get("MFSDP_CG_MEM_DEBUG", "").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+# MFSDP_CG_MEM_DEBUG selects a memory-debug mode. To avoid mutual
+# interference between the CUDA graph pool and the caching allocator
+# (they are separate arenas that bias each other's peak measurements),
+# CG and no-CG are measured in SEPARATE runs:
+#
+#   MFSDP_CG_MEM_DEBUG=cg    — capture CG normally; for the first
+#                              captured layer, dump a torch.cuda memory
+#                              snapshot (cg_first_layer_rankN.pickle).
+#   MFSDP_CG_MEM_DEBUG=nocg  — do NOT capture any CG. capture_forward
+#                              instead runs one eager forward+backward
+#                              per layer (same hooks-popped, params-
+#                              unsharded context as CG capture) and
+#                              logs peak memory. For the first layer,
+#                              dumps nocg_first_layer_rankN.pickle.
+#                              install() is a no-op, so the module runs
+#                              eagerly for the whole run.
+#   MFSDP_CG_MEM_DEBUG=both  — capture CG AND run the eager comparison
+#                              inline (the original behaviour; useful
+#                              for a quick sanity check but the two
+#                              arenas interfere — prefer cg/nocg).
+#   MFSDP_CG_MEM_DEBUG=1     — alias for "both".
+#
+# Snapshots are loadable at https://pytorch.org/memory_viz — drag in
+# the cg and nocg pickles from two separate runs to compare.
+_CG_MEM_MODE_RAW: str = os.environ.get("MFSDP_CG_MEM_DEBUG", "").lower()
+if _CG_MEM_MODE_RAW in ("1", "true", "yes", "both"):
+    _CG_MEM_MODE: str = "both"
+elif _CG_MEM_MODE_RAW in ("cg",):
+    _CG_MEM_MODE = "cg"
+elif _CG_MEM_MODE_RAW in ("nocg", "no-cg", "eager"):
+    _CG_MEM_MODE = "nocg"
+else:
+    _CG_MEM_MODE = ""
 # Optional override for the snapshot dump directory. Defaults to
 # ./cg_mem_snapshots.
 _CG_MEM_SNAPSHOT_DIR: Optional[str] = os.environ.get("MFSDP_CG_MEM_SNAPSHOT_DIR")
@@ -385,7 +407,7 @@ class FSDPCudaGraphRunner:
         # forward execution order, so the first module to reach here is
         # the first layer.
         is_first_layer = False
-        if _CG_MEM_DEBUG and ctx is not None:
+        if _CG_MEM_MODE and ctx is not None:
             seq = getattr(ctx, "_cg_capture_seq", 0)
             is_first_layer = seq == 0
             ctx._cg_capture_seq = seq + 1
@@ -429,7 +451,7 @@ class FSDPCudaGraphRunner:
             for param in self._module.parameters():
                 param.grad = None
 
-            # -- memory tracking: before capture --
+            # ---- Common debug helpers ----
             _rank = (
                 torch.distributed.get_rank()
                 if torch.distributed.is_available()
@@ -437,14 +459,36 @@ class FSDPCudaGraphRunner:
                 else 0
             )
             _snap_dir = _CG_MEM_SNAPSHOT_DIR or "cg_mem_snapshots"
+
+            # ============================================================
+            # nocg mode: run eager fwd+bwd, dump snapshot, skip capture
+            # ============================================================
+            if _CG_MEM_MODE == "nocg":
+                self._debug_run_eager(
+                    static_inputs=static_inputs,
+                    tensor_names=tensor_names,
+                    frozen_kwargs=frozen_kwargs,
+                    is_first_layer=is_first_layer,
+                    snap_dir=_snap_dir,
+                    rank=_rank,
+                    label="nocg",
+                )
+                # No graph captured — _captured stays False so install()
+                # is a no-op and the module continues to run eagerly.
+                return
+
+            # ============================================================
+            # cg / both / disabled: capture the forward graph
+            # ============================================================
             # Start stack-aware recording before capture so the CG
             # snapshot (first layer only) carries allocation call stacks.
-            _cg_record = _CG_MEM_DEBUG and is_first_layer
+            _cg_record = _CG_MEM_MODE in ("cg", "both") and is_first_layer
             if _cg_record:
                 os.makedirs(_snap_dir, exist_ok=True)
                 torch.cuda.memory._record_memory_history(
                     max_entries=200000, stacks="all"
                 )
+            # -- memory tracking: before capture --
             torch.cuda.reset_peak_memory_stats()
             _alloc_before = torch.cuda.memory_allocated()
             _reserved_before = torch.cuda.memory_reserved()
@@ -498,8 +542,8 @@ class FSDPCudaGraphRunner:
                 finally:
                     torch.cuda.memory._record_memory_history(enabled=None)
 
-            # -- debug: no-CG comparison (+ no-CG snapshot for first layer) --
-            if _CG_MEM_DEBUG:
+            # -- debug (both mode only): inline no-CG comparison --
+            if _CG_MEM_MODE == "both":
                 self._debug_compare_eager(
                     static_inputs=static_inputs,
                     tensor_names=tensor_names,
@@ -529,52 +573,63 @@ class FSDPCudaGraphRunner:
                     pass
 
         # ---- 7. Save metadata ----
-        self.static_inputs = static_inputs
-        self._tensor_param_names = tensor_names
-        self._param_names = param_names
-        self._frozen_kwargs = frozen_kwargs
-        self._captured = True
+        # (skipped in nocg mode — no graph was captured, _captured stays
+        # False so install() no-ops and the module runs eagerly)
+        if _CG_MEM_MODE != "nocg":
+            self.static_inputs = static_inputs
+            self._tensor_param_names = tensor_names
+            self._param_names = param_names
+            self._frozen_kwargs = frozen_kwargs
+            self._captured = True
 
     # ------------------------------------------------------------------
-    # 1b. Debug: no-CG comparison + first-layer memory snapshot
+    # 1b. Debug: eager (no-CG) execution + first-layer memory snapshot
     # ------------------------------------------------------------------
 
-    def _debug_compare_eager(
+    def _debug_run_eager(
         self,
         *,
         static_inputs: Tuple[torch.Tensor, ...],
         tensor_names: List[str],
         frozen_kwargs: Dict[str, Any],
-        cg_peak_alloc: int,
-        cg_peak_reserved: int,
-        cg_alloc_before: int,
-        cg_alloc_after: int,
         is_first_layer: bool,
         snap_dir: str,
         rank: int,
-    ) -> None:
-        """Run an eager (no-CG) forward+backward on a side stream and log
-        CG vs no-CG peak memory side by side. For the first captured
-        layer, also dump a torch.cuda memory snapshot of the no-CG path.
+        label: str,
+    ) -> Dict[str, int]:
+        """Run ONE eager (no-CG) forward+backward on a side stream and
+        return peak memory stats. For the first captured layer, also
+        records stack-aware allocation history and dumps a
+        ``{label}_first_layer_rank{N}.pickle`` snapshot.
 
         Runs inside ``capture_forward``'s try block, so FSDP hooks are
         already popped and ``cuda_graph_active`` is True — the eager
         forward sees the same raw ``module.forward()`` body the graph
-        captured, with parameters already unsharded. This makes the
-        comparison apples-to-apples: same compute, same params, only
+        would capture, with parameters already unsharded. This makes
+        the comparison apples-to-apples: same compute, same params, only
         the graph pool differs.
+
+        Parameters
+        ----------
+        label : "cg" | "nocg"
+            Used in the snapshot filename so separate cg and nocg runs
+            produce distinct pickles.
+
+        Returns
+        -------
+        dict with keys: alloc_before, alloc_after, reserved_before,
+        reserved_after, peak_alloc, peak_reserved.
         """
         torch.cuda.synchronize()
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
 
         recording = is_first_layer
-        eager_peak_alloc = 0
-        eager_peak_reserved = 0
-        eager_alloc_before = 0
-        eager_alloc_after = 0
-        eager_reserved_before = 0
-        eager_reserved_after = 0
+        stats = dict(
+            alloc_before=0, alloc_after=0,
+            reserved_before=0, reserved_after=0,
+            peak_alloc=0, peak_reserved=0,
+        )
 
         with torch.cuda.stream(side):
             # Fresh inputs so we do not build on the captured
@@ -587,13 +642,14 @@ class FSDPCudaGraphRunner:
                 p.grad = None
 
             if recording:
+                os.makedirs(snap_dir, exist_ok=True)
                 torch.cuda.memory._record_memory_history(
                     max_entries=200000, stacks="all"
                 )
             try:
                 torch.cuda.reset_peak_memory_stats()
-                eager_alloc_before = torch.cuda.memory_allocated()
-                eager_reserved_before = torch.cuda.memory_reserved()
+                stats["alloc_before"] = torch.cuda.memory_allocated()
+                stats["reserved_before"] = torch.cuda.memory_reserved()
 
                 out = self._call_module(eager_inputs, tensor_names, frozen_kwargs)
                 flat_out = self._flatten_output_for_autograd(out)
@@ -619,26 +675,28 @@ class FSDPCudaGraphRunner:
                     )
                 del out, flat_out, grads
 
-                eager_peak_alloc = torch.cuda.max_memory_allocated()
-                eager_peak_reserved = torch.cuda.max_memory_reserved()
-                eager_alloc_after = torch.cuda.memory_allocated()
-                eager_reserved_after = torch.cuda.memory_reserved()
+                stats["peak_alloc"] = torch.cuda.max_memory_allocated()
+                stats["peak_reserved"] = torch.cuda.max_memory_reserved()
+                stats["alloc_after"] = torch.cuda.memory_allocated()
+                stats["reserved_after"] = torch.cuda.memory_reserved()
 
                 if recording:
                     try:
-                        _nocg_path = os.path.join(
-                            snap_dir, f"nocg_first_layer_rank{rank}.pickle"
+                        _path = os.path.join(
+                            snap_dir, f"{label}_first_layer_rank{rank}.pickle"
                         )
-                        torch.cuda.memory._dump_snapshot(_nocg_path)
+                        torch.cuda.memory._dump_snapshot(_path)
                         logger.info(
-                            "%s [mem-debug] dumped no-CG snapshot: %s",
+                            "%s [mem-debug] dumped %s snapshot: %s",
                             self._log_prefix,
-                            _nocg_path,
+                            label,
+                            _path,
                         )
                     except Exception as e:
                         logger.warning(
-                            "%s [mem-debug] no-CG snapshot dump failed: %s",
+                            "%s [mem-debug] %s snapshot dump failed: %s",
                             self._log_prefix,
+                            label,
                             e,
                         )
             finally:
@@ -656,28 +714,66 @@ class FSDPCudaGraphRunner:
         # graph pool memory is separate and is not freed by this.
         torch.cuda.empty_cache()
 
-        cg_peak_delta = cg_peak_alloc - cg_alloc_before
-        eager_peak_delta = eager_peak_alloc - eager_alloc_before
+        logger.info(
+            "%s [mem-debug] %s peak memory (MB): "
+            "peak_alloc %.1f (delta %+.1f)  "
+            "peak_reserved %.1f (delta %+.1f)  post %d MB",
+            self._log_prefix,
+            label,
+            stats["peak_alloc"] / 1e6,
+            (stats["peak_alloc"] - stats["alloc_before"]) / 1e6,
+            stats["peak_reserved"] / 1e6,
+            (stats["reserved_after"] - stats["reserved_before"]) / 1e6,
+            stats["alloc_after"] // 1_000_000,
+        )
+        return stats
+
+    def _debug_compare_eager(
+        self,
+        *,
+        static_inputs: Tuple[torch.Tensor, ...],
+        tensor_names: List[str],
+        frozen_kwargs: Dict[str, Any],
+        cg_peak_alloc: int,
+        cg_peak_reserved: int,
+        cg_alloc_before: int,
+        cg_alloc_after: int,
+        is_first_layer: bool,
+        snap_dir: str,
+        rank: int,
+    ) -> None:
+        """``both`` mode: run eager right after CG capture and log a
+        side-by-side comparison. The two arenas interfere, so prefer
+        separate ``cg`` and ``nocg`` runs for accurate measurements.
+        """
+        e = self._debug_run_eager(
+            static_inputs=static_inputs,
+            tensor_names=tensor_names,
+            frozen_kwargs=frozen_kwargs,
+            is_first_layer=is_first_layer,
+            snap_dir=snap_dir,
+            rank=rank,
+            label="nocg",
+        )
         logger.info(
             "%s [mem-debug] CG vs no-CG peak memory (MB):\n"
             "        CG   : peak_alloc %7.1f (delta %+.1f)  "
             "peak_reserved %7.1f  post %d MB\n"
             "        no-CG: peak_alloc %7.1f (delta %+.1f)  "
-            "peak_reserved %7.1f (delta %+.1f)  post %d MB\n"
+            "peak_reserved %7.1f  post %d MB\n"
             "        diff (CG - no-CG): peak_alloc %+.1f  "
             "peak_reserved %+.1f",
             self._log_prefix,
             cg_peak_alloc / 1e6,
-            cg_peak_delta / 1e6,
+            (cg_peak_alloc - cg_alloc_before) / 1e6,
             cg_peak_reserved / 1e6,
             cg_alloc_after // 1_000_000,
-            eager_peak_alloc / 1e6,
-            eager_peak_delta / 1e6,
-            eager_peak_reserved / 1e6,
-            (eager_reserved_after - eager_reserved_before) / 1e6,
-            eager_alloc_after // 1_000_000,
-            (cg_peak_alloc - eager_peak_alloc) / 1e6,
-            (cg_peak_reserved - eager_peak_reserved) / 1e6,
+            e["peak_alloc"] / 1e6,
+            (e["peak_alloc"] - e["alloc_before"]) / 1e6,
+            e["peak_reserved"] / 1e6,
+            e["alloc_after"] // 1_000_000,
+            (cg_peak_alloc - e["peak_alloc"]) / 1e6,
+            (cg_peak_reserved - e["peak_reserved"]) / 1e6,
         )
 
     # ------------------------------------------------------------------
@@ -822,6 +918,11 @@ class FSDPCudaGraphRunner:
     def install(self) -> None:
         """Patch ``module.forward`` to invoke the custom autograd Function."""
         if not self._captured:
+            # nocg debug mode: no graph was captured, leave the module
+            # running eagerly. This is NOT an error — it is the intended
+            # no-CG path when MFSDP_CG_MEM_DEBUG=nocg.
+            if _CG_MEM_MODE == "nocg":
+                return
             raise RuntimeError("Call capture_forward() first")
         if self._installed:
             return
