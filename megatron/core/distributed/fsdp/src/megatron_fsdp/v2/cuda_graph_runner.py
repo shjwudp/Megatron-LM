@@ -111,6 +111,12 @@ else:
 # Optional override for the snapshot dump directory. Defaults to
 # ./cg_mem_snapshots.
 _CG_MEM_SNAPSHOT_DIR: Optional[str] = os.environ.get("MFSDP_CG_MEM_SNAPSHOT_DIR")
+# Number of leading captured layers to dump per-layer torch.cuda memory
+# snapshots for. Useful for checking whether the no-CG caching allocator
+# reuses memory across layers while the CG graph pool does not. Set to a
+# larger value to trace more layers (filenames are zero-indexed:
+# cg_layer0_rankN.pickle, cg_layer1_rankN.pickle, ...). Default 2.
+_CG_MEM_SNAP_LAYERS: int = int(os.environ.get("MFSDP_CG_MEM_SNAP_LAYERS", "2"))
 
 
 # ------------------------------------------------------------------
@@ -402,14 +408,19 @@ class FSDPCudaGraphRunner:
             gc.collect()
             gc.freeze()
 
-        # Debug: detect the first CG-captured layer so we can dump a
-        # torch memory snapshot for it. The capture pre-hook fires in
-        # forward execution order, so the first module to reach here is
-        # the first layer.
-        is_first_layer = False
+        # Debug: detect the first N captured layers so we can dump a
+        # torch memory snapshot for each. The capture pre-hook fires in
+        # forward execution order, so the counter matches the layer
+        # index (0-based). Snapshots are controlled by
+        # MFSDP_CG_MEM_SNAP_LAYERS (default 2: traces layer0 + layer1
+        # so we can see whether the no-CG caching allocator reuses
+        # memory between layers while the CG graph pool does not).
+        layer_index = -1
+        do_snapshot = False
         if _CG_MEM_MODE and ctx is not None:
             seq = getattr(ctx, "_cg_capture_seq", 0)
-            is_first_layer = seq == 0
+            layer_index = seq
+            do_snapshot = seq < _CG_MEM_SNAP_LAYERS
             ctx._cg_capture_seq = seq + 1
 
         try:
@@ -468,7 +479,8 @@ class FSDPCudaGraphRunner:
                     static_inputs=static_inputs,
                     tensor_names=tensor_names,
                     frozen_kwargs=frozen_kwargs,
-                    is_first_layer=is_first_layer,
+                    layer_index=layer_index,
+                    do_snapshot=do_snapshot,
                     snap_dir=_snap_dir,
                     rank=_rank,
                     label="nocg",
@@ -481,8 +493,8 @@ class FSDPCudaGraphRunner:
             # cg / both / disabled: capture the forward graph
             # ============================================================
             # Start stack-aware recording before capture so the CG
-            # snapshot (first layer only) carries allocation call stacks.
-            _cg_record = _CG_MEM_MODE in ("cg", "both") and is_first_layer
+            # snapshot (first N layers) carries allocation call stacks.
+            _cg_record = _CG_MEM_MODE in ("cg", "both") and do_snapshot
             if _cg_record:
                 os.makedirs(_snap_dir, exist_ok=True)
                 torch.cuda.memory._record_memory_history(
@@ -521,22 +533,38 @@ class FSDPCudaGraphRunner:
                 _peak_alloc // 1_000_000, _peak_reserved // 1_000_000,
             )
 
-            # -- debug: dump CG snapshot for the first layer --
+            # -- debug: aligned per-layer CG peak log --
+            if _CG_MEM_MODE in ("cg", "both"):
+                logger.info(
+                    "%s [mem-debug] cg peak memory (MB): "
+                    "peak_alloc %.1f (delta %+.1f)  "
+                    "peak_reserved %.1f (delta %+.1f)  post %d MB",
+                    self._log_prefix,
+                    _peak_alloc / 1e6,
+                    (_peak_alloc - _alloc_before) / 1e6,
+                    _peak_reserved / 1e6,
+                    (_reserved_after - _reserved_before) / 1e6,
+                    _alloc_after // 1_000_000,
+                )
+
+            # -- debug: dump CG snapshot for the first N layers --
             if _cg_record:
                 try:
                     _cg_path = os.path.join(
-                        _snap_dir, f"cg_first_layer_rank{_rank}.pickle"
+                        _snap_dir, f"cg_layer{layer_index}_rank{_rank}.pickle"
                     )
                     torch.cuda.memory._dump_snapshot(_cg_path)
                     logger.info(
-                        "%s [mem-debug] dumped CG snapshot: %s",
+                        "%s [mem-debug] dumped cg snapshot (layer %d): %s",
                         self._log_prefix,
+                        layer_index,
                         _cg_path,
                     )
                 except Exception as e:
                     logger.warning(
-                        "%s [mem-debug] CG snapshot dump failed: %s",
+                        "%s [mem-debug] CG snapshot dump failed (layer %d): %s",
                         self._log_prefix,
+                        layer_index,
                         e,
                     )
                 finally:
@@ -552,7 +580,8 @@ class FSDPCudaGraphRunner:
                     cg_peak_reserved=_peak_reserved,
                     cg_alloc_before=_alloc_before,
                     cg_alloc_after=_alloc_after,
-                    is_first_layer=is_first_layer,
+                    layer_index=layer_index,
+                    do_snapshot=do_snapshot,
                     snap_dir=_snap_dir,
                     rank=_rank,
                 )
@@ -592,15 +621,16 @@ class FSDPCudaGraphRunner:
         static_inputs: Tuple[torch.Tensor, ...],
         tensor_names: List[str],
         frozen_kwargs: Dict[str, Any],
-        is_first_layer: bool,
+        layer_index: int,
+        do_snapshot: bool,
         snap_dir: str,
         rank: int,
         label: str,
     ) -> Dict[str, int]:
         """Run ONE eager (no-CG) forward+backward on a side stream and
-        return peak memory stats. For the first captured layer, also
-        records stack-aware allocation history and dumps a
-        ``{label}_first_layer_rank{N}.pickle`` snapshot.
+        return peak memory stats. For the first ``MFSDP_CG_MEM_SNAP_LAYERS``
+        layers, also records stack-aware allocation history and dumps a
+        ``{label}_layer{N}_rank{R}.pickle`` snapshot.
 
         Runs inside ``capture_forward``'s try block, so FSDP hooks are
         already popped and ``cuda_graph_active`` is True — the eager
@@ -614,6 +644,9 @@ class FSDPCudaGraphRunner:
         label : "cg" | "nocg"
             Used in the snapshot filename so separate cg and nocg runs
             produce distinct pickles.
+        layer_index : 0-based layer index (for filename + log).
+        do_snapshot : whether to record stacks and dump a pickle for
+            this layer (True for the first ``_CG_MEM_SNAP_LAYERS``).
 
         Returns
         -------
@@ -624,7 +657,7 @@ class FSDPCudaGraphRunner:
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
 
-        recording = is_first_layer
+        recording = do_snapshot
         stats = dict(
             alloc_before=0, alloc_after=0,
             reserved_before=0, reserved_after=0,
@@ -683,20 +716,22 @@ class FSDPCudaGraphRunner:
                 if recording:
                     try:
                         _path = os.path.join(
-                            snap_dir, f"{label}_first_layer_rank{rank}.pickle"
+                            snap_dir, f"{label}_layer{layer_index}_rank{rank}.pickle"
                         )
                         torch.cuda.memory._dump_snapshot(_path)
                         logger.info(
-                            "%s [mem-debug] dumped %s snapshot: %s",
+                            "%s [mem-debug] dumped %s snapshot (layer %d): %s",
                             self._log_prefix,
                             label,
+                            layer_index,
                             _path,
                         )
                     except Exception as e:
                         logger.warning(
-                            "%s [mem-debug] %s snapshot dump failed: %s",
+                            "%s [mem-debug] %s snapshot dump failed (layer %d): %s",
                             self._log_prefix,
                             label,
+                            layer_index,
                             e,
                         )
             finally:
@@ -715,11 +750,12 @@ class FSDPCudaGraphRunner:
         torch.cuda.empty_cache()
 
         logger.info(
-            "%s [mem-debug] %s peak memory (MB): "
+            "%s [mem-debug] %s peak memory (MB) [layer %d]: "
             "peak_alloc %.1f (delta %+.1f)  "
             "peak_reserved %.1f (delta %+.1f)  post %d MB",
             self._log_prefix,
             label,
+            layer_index,
             stats["peak_alloc"] / 1e6,
             (stats["peak_alloc"] - stats["alloc_before"]) / 1e6,
             stats["peak_reserved"] / 1e6,
@@ -738,7 +774,8 @@ class FSDPCudaGraphRunner:
         cg_peak_reserved: int,
         cg_alloc_before: int,
         cg_alloc_after: int,
-        is_first_layer: bool,
+        layer_index: int,
+        do_snapshot: bool,
         snap_dir: str,
         rank: int,
     ) -> None:
@@ -750,13 +787,14 @@ class FSDPCudaGraphRunner:
             static_inputs=static_inputs,
             tensor_names=tensor_names,
             frozen_kwargs=frozen_kwargs,
-            is_first_layer=is_first_layer,
+            layer_index=layer_index,
+            do_snapshot=do_snapshot,
             snap_dir=snap_dir,
             rank=rank,
             label="nocg",
         )
         logger.info(
-            "%s [mem-debug] CG vs no-CG peak memory (MB):\n"
+            "%s [mem-debug] CG vs no-CG peak memory (MB) [layer %d]:\n"
             "        CG   : peak_alloc %7.1f (delta %+.1f)  "
             "peak_reserved %7.1f  post %d MB\n"
             "        no-CG: peak_alloc %7.1f (delta %+.1f)  "
@@ -764,6 +802,7 @@ class FSDPCudaGraphRunner:
             "        diff (CG - no-CG): peak_alloc %+.1f  "
             "peak_reserved %+.1f",
             self._log_prefix,
+            layer_index,
             cg_peak_alloc / 1e6,
             (cg_peak_alloc - cg_alloc_before) / 1e6,
             cg_peak_reserved / 1e6,
