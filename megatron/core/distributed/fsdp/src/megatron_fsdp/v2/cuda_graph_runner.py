@@ -117,6 +117,18 @@ _CG_MEM_SNAPSHOT_DIR: Optional[str] = os.environ.get("MFSDP_CG_MEM_SNAPSHOT_DIR"
 # larger value to trace more layers (filenames are zero-indexed:
 # cg_layer0_rankN.pickle, cg_layer1_rankN.pickle, ...). Default 2.
 _CG_MEM_SNAP_LAYERS: int = int(os.environ.get("MFSDP_CG_MEM_SNAP_LAYERS", "2"))
+# Whether the no-CG comparison path runs backward before taking its
+# snapshot. The CG snapshot is taken right after forward graph capture
+# (the backward graph is captured lazily on first real backward), so to
+# compare apples-to-apples we DEFAULT TO FORWARD-ONLY for no-CG too —
+# at that point both paths hold the autograd-saved forward activations.
+#
+# Set MFSDP_CG_MEM_RUN_BWD=1 to additionally run backward in the no-CG
+# path; that snapshot then represents "end of fwd+bwd" and lets you see
+# what eager frees but CG's graph pool retains.
+_CG_MEM_RUN_BWD: bool = os.environ.get("MFSDP_CG_MEM_RUN_BWD", "").lower() in (
+    "1", "true", "yes",
+)
 
 
 # ------------------------------------------------------------------
@@ -484,6 +496,7 @@ class FSDPCudaGraphRunner:
                     snap_dir=_snap_dir,
                     rank=_rank,
                     label="nocg",
+                    run_backward=_CG_MEM_RUN_BWD,
                 )
                 # No graph captured — _captured stays False so install()
                 # is a no-op and the module continues to run eagerly.
@@ -626,27 +639,47 @@ class FSDPCudaGraphRunner:
         snap_dir: str,
         rank: int,
         label: str,
+        run_backward: bool = False,
     ) -> Dict[str, int]:
-        """Run ONE eager (no-CG) forward+backward on a side stream and
-        return peak memory stats. For the first ``MFSDP_CG_MEM_SNAP_LAYERS``
-        layers, also records stack-aware allocation history and dumps a
+        """Run ONE eager (no-CG) forward (+ optional backward) on a side
+        stream and return peak memory stats. For the first
+        ``MFSDP_CG_MEM_SNAP_LAYERS`` layers, also records stack-aware
+        allocation history and dumps a
         ``{label}_layer{N}_rank{R}.pickle`` snapshot.
 
         Runs inside ``capture_forward``'s try block, so FSDP hooks are
         already popped and ``cuda_graph_active`` is True — the eager
         forward sees the same raw ``module.forward()`` body the graph
-        would capture, with parameters already unsharded. This makes
-        the comparison apples-to-apples: same compute, same params, only
-        the graph pool differs.
+        would capture, with parameters already unsharded.
+
+        Snapshot point parity
+        ---------------------
+        The CG snapshot is taken RIGHT AFTER the forward graph is
+        captured — the backward graph is NOT yet captured (it's lazy,
+        triggered on first real backward at runtime). At that moment
+        the autograd tape still holds every SavedVariable the backward
+        will eventually need.
+
+        To compare apples-to-apples we DEFAULT to ``run_backward=False``
+        — the snapshot is taken right after the eager forward returns,
+        with the autograd tape intact. Both CG and no-CG snapshots then
+        show the same set of forward-saved activations, in different
+        pools (graph-pool vs caching-pool).
+
+        Set ``run_backward=True`` (env ``MFSDP_CG_MEM_RUN_BWD=1``) to
+        additionally run an eager backward before snapshotting. That
+        snapshot represents "end of fwd+bwd": the free list now
+        contains every activation backward consumed; the gap between
+        that and the CG snapshot shows what CG pins past end-of-step.
 
         Parameters
         ----------
         label : "cg" | "nocg"
-            Used in the snapshot filename so separate cg and nocg runs
-            produce distinct pickles.
-        layer_index : 0-based layer index (for filename + log).
-        do_snapshot : whether to record stacks and dump a pickle for
-            this layer (True for the first ``_CG_MEM_SNAP_LAYERS``).
+            Used in the snapshot filename.
+        layer_index : 0-based layer index (filename + log).
+        do_snapshot : whether to record stacks and dump a pickle.
+        run_backward : whether to run ``torch.autograd.grad`` after the
+            forward before taking the snapshot.
 
         Returns
         -------
@@ -686,8 +719,8 @@ class FSDPCudaGraphRunner:
 
                 out = self._call_module(eager_inputs, tensor_names, frozen_kwargs)
                 flat_out = self._flatten_output_for_autograd(out)
-                grads = None
-                if any(o.requires_grad for o in flat_out):
+
+                if run_backward and any(o.requires_grad for o in flat_out):
                     grads = tuple(
                         torch.empty_like(o) for o in flat_out if o.requires_grad
                     )
@@ -706,7 +739,15 @@ class FSDPCudaGraphRunner:
                         allow_unused=True,
                         retain_graph=False,
                     )
-                del out, flat_out, grads
+                    del grads
+
+                # NOTE: we deliberately keep `out` / `flat_out` alive
+                # until AFTER the snapshot when run_backward=False, so
+                # the snapshot reflects the full autograd-saved-set.
+                # When run_backward=True, backward already freed them
+                # via retain_graph=False; dropping here just clears the
+                # Python references too.
+                del out, flat_out
 
                 stats["peak_alloc"] = torch.cuda.max_memory_allocated()
                 stats["peak_reserved"] = torch.cuda.max_memory_reserved()
@@ -714,23 +755,26 @@ class FSDPCudaGraphRunner:
                 stats["reserved_after"] = torch.cuda.memory_reserved()
 
                 if recording:
+                    _bwd_tag = "fwd+bwd" if run_backward else "fwd-only"
                     try:
                         _path = os.path.join(
                             snap_dir, f"{label}_layer{layer_index}_rank{rank}.pickle"
                         )
                         torch.cuda.memory._dump_snapshot(_path)
                         logger.info(
-                            "%s [mem-debug] dumped %s snapshot (layer %d): %s",
+                            "%s [mem-debug] dumped %s snapshot (%s, layer %d): %s",
                             self._log_prefix,
                             label,
+                            _bwd_tag,
                             layer_index,
                             _path,
                         )
                     except Exception as e:
                         logger.warning(
-                            "%s [mem-debug] %s snapshot dump failed (layer %d): %s",
+                            "%s [mem-debug] %s snapshot dump failed (%s, layer %d): %s",
                             self._log_prefix,
                             label,
+                            _bwd_tag,
                             layer_index,
                             e,
                         )
@@ -747,15 +791,22 @@ class FSDPCudaGraphRunner:
         # Release the eager activations back to the caching allocator so
         # they do not inflate subsequent layers' measurements. The CG
         # graph pool memory is separate and is not freed by this.
+        # NOTE: with run_backward=False, this also drops the autograd
+        # tape and frees the ~1.26 GB of forward-saved activations we
+        # just snapshotted, so it does NOT pollute subsequent layers'
+        # measurements — that's the whole point of running each layer's
+        # measurement on a side stream with a fresh tape.
         torch.cuda.empty_cache()
 
+        _bwd_tag = "fwd+bwd" if run_backward else "fwd-only"
         logger.info(
-            "%s [mem-debug] %s peak memory (MB) [layer %d]: "
+            "%s [mem-debug] %s peak memory (MB) [layer %d, %s]: "
             "peak_alloc %.1f (delta %+.1f)  "
             "peak_reserved %.1f (delta %+.1f)  post %d MB",
             self._log_prefix,
             label,
             layer_index,
+            _bwd_tag,
             stats["peak_alloc"] / 1e6,
             (stats["peak_alloc"] - stats["alloc_before"]) / 1e6,
             stats["peak_reserved"] / 1e6,
@@ -792,6 +843,7 @@ class FSDPCudaGraphRunner:
             snap_dir=snap_dir,
             rank=rank,
             label="nocg",
+            run_backward=_CG_MEM_RUN_BWD,
         )
         logger.info(
             "%s [mem-debug] CG vs no-CG peak memory (MB) [layer %d]:\n"
