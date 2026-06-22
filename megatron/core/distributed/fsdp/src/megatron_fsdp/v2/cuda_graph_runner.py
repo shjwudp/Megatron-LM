@@ -274,6 +274,10 @@ class FSDPCudaGraphRunner:
         self._capture_stream: Optional[torch.cuda.Stream] = capture_stream
         self._num_warmup_iters: int = num_warmup_iters
 
+        # Module identifier for debug logging
+        self._module_name = getattr(fsdp_module, "_fsdp_module_name", fsdp_module.__class__.__name__)
+        self._log_prefix = f"[{self._module_name}]"
+
         # Forward graph state
         self.fwd_graph: Optional[torch.cuda.CUDAGraph] = None
         self.static_inputs: Tuple[torch.Tensor, ...] = ()
@@ -395,6 +399,11 @@ class FSDPCudaGraphRunner:
             for param in self._module.parameters():
                 param.grad = None
 
+            # -- memory tracking: before capture --
+            torch.cuda.reset_peak_memory_stats()
+            _alloc_before = torch.cuda.memory_allocated()
+            _reserved_before = torch.cuda.memory_reserved()
+
             # ---- 6. Capture forward graph on the shared pool ----
             self.fwd_graph = torch.cuda.CUDAGraph()
             with torch.cuda.stream(capture_stream):
@@ -405,6 +414,23 @@ class FSDPCudaGraphRunner:
                 ):
                     out = self._call_module(static_inputs, tensor_names, frozen_kwargs)
 
+            # -- memory tracking: after capture --
+            _alloc_after = torch.cuda.memory_allocated()
+            _reserved_after = torch.cuda.memory_reserved()
+            _peak_alloc = torch.cuda.max_memory_allocated()
+            _peak_reserved = torch.cuda.max_memory_reserved()
+
+            logger.info(
+                "%s fwd-capture mem: alloc %+.1f MB (%d→%d)  "
+                "reserved %+.1f MB (%d→%d)  "
+                "peak_alloc %d MB  peak_reserved %d MB  ",
+                self._log_prefix,
+                (_alloc_after - _alloc_before) / 1e6,
+                _alloc_before // 1_000_000, _alloc_after // 1_000_000,
+                (_reserved_after - _reserved_before) / 1e6,
+                _reserved_before // 1_000_000, _reserved_after // 1_000_000,
+                _peak_alloc // 1_000_000, _peak_reserved // 1_000_000,
+            )
             # Snapshot output structure (for None restoration on replay).
             self._record_output_structure(out)
             static_outputs_list = list(self._flatten_output_for_autograd(out))
