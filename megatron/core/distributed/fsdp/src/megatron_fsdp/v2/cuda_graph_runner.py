@@ -111,6 +111,24 @@ _CG_MEM_SNAPSHOT_DIR: Optional[str] = os.environ.get("MFSDP_CG_MEM_SNAPSHOT_DIR"
 # cg_layer0_rankN.pickle, cg_layer1_rankN.pickle, ...). Default 2.
 _CG_MEM_SNAP_LAYERS: int = int(os.environ.get("MFSDP_CG_MEM_SNAP_LAYERS", "2"))
 
+# MFSDP_CG_COMPILE_FWD controls whether capture_forward compiles
+# module.forward with torch.compile before warmup + capture. Without
+# this, the captured graph runs the un-fused Python-level forward body
+# (each matmul / activation allocates its own workspace and saves its
+# own activation for backward), which uses significantly more memory
+# than the no-CG path where the user's blk.compile() drives inductor
+# fusion. With this enabled, the captured graph contains inductor
+# triton kernels — same memory profile as the no-CG path.
+#
+#   MFSDP_CG_COMPILE_FWD=1   — compile forward body, capture fused kernels
+#   MFSDP_CG_COMPILE_FWD=0   — (default) legacy: capture eager forward body
+_CG_COMPILE_FWD: bool = os.environ.get("MFSDP_CG_COMPILE_FWD", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
 
 # ------------------------------------------------------------------
 # Hook helpers
@@ -341,6 +359,16 @@ class FSDPCudaGraphRunner:
         self._captured: bool = False
         self._installed: bool = False
 
+        # Inductor-fusion state for capture_forward. When
+        # _CG_COMPILE_FWD is enabled we temporarily replace
+        # self._module.forward with torch.compile(<original forward>)
+        # so warmup populates dynamo's cache and capture runs the
+        # cached triton kernels (which are CUDA-graph capturable).
+        # After capture we restore the original forward so install()
+        # sees the user-written body.
+        self._captured_fwd_was_compiled: bool = False
+        self._orig_fwd_body: Optional[Any] = None
+
         # Debug state (nocg mode — patches module.forward to record the
         # REAL forward call instead of running a separate debug forward)
         self._debug_layer_index: int = -1
@@ -448,6 +476,36 @@ class FSDPCudaGraphRunner:
             gc.freeze()
 
         try:
+            # ---- 3b. Optionally compile forward body so capture contains
+            #          inductor-fused triton kernels (not eager ops) ----
+            # See _CG_COMPILE_FWD docstring. We replace self._module.forward
+            # with torch.compile(orig) so the warmup below populates
+            # dynamo's cache; the subsequent capture (inside
+            # torch.cuda.graph) runs the cached compiled code, whose
+            # triton kernels are capturable. Without this, capture runs
+            # the un-fused python body, which uses significantly more
+            # memory than the no-CG path.
+            if _CG_COMPILE_FWD:
+                _orig_fwd_body = self._module.forward
+                # Skip if the user already compiled the forward directly.
+                if not hasattr(_orig_fwd_body, "get_compiler_config"):
+                    try:
+                        self._module.forward = torch.compile(_orig_fwd_body)
+                        self._captured_fwd_was_compiled = True
+                        self._orig_fwd_body = _orig_fwd_body
+                        logger.info(
+                            "%s [cg-compile-fwd] compiled forward body for "
+                            "inductor fusion during capture",
+                            self._log_prefix,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "%s [cg-compile-fwd] torch.compile failed (%s); "
+                            "capturing eager forward (legacy behavior)",
+                            self._log_prefix,
+                            e,
+                        )
+
             # ---- 4. Pick / create capture stream ----
             capture_stream = self._capture_stream
             if capture_stream is None:
@@ -584,6 +642,14 @@ class FSDPCudaGraphRunner:
         finally:
             if ctx is not None:
                 ctx.cuda_graph_active = prev_active
+            # Restore the original forward body if we replaced it with a
+            # torch.compile call for capture. install() reads
+            # self._module.forward immediately after this and expects the
+            # user-written body (not a compiled wrapper).
+            if self._captured_fwd_was_compiled:
+                self._module.forward = self._orig_fwd_body
+                self._orig_fwd_body = None
+                self._captured_fwd_was_compiled = False
             _restore_hooks_recursive(self._module, saved_hooks)
             self._reshard_main_grad_buffer()
             if self._gc_freeze:
