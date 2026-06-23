@@ -278,16 +278,24 @@ class DataParallelBuffer:
         if shard_dims is None:
             # shard_dims=(outer, inner): use this buffer's storage shard state.
             shard_dims = self.storage_shard_dims
-        local_start, local_end = self.buffer_index._get_item_local_range(
+        slice_start, slice_end = self.buffer_index._get_item_self_range(
             item_id, shard_dims=shard_dims
         )
+        storage_slice_start, storage_slice_end = self.buffer_index._get_item_self_range(
+            item_id, shard_dims=self.storage_shard_dims
+        )
+        slice_start = max(slice_start, storage_slice_start)
+        slice_end = min(slice_end, storage_slice_end)
+        if slice_start >= slice_end:
+            return
+        storage_local_start, _ = self.buffer_index._get_item_local_range(
+            item_id, shard_dims=self.storage_shard_dims
+        )
+        local_start = storage_local_start + slice_start - storage_slice_start
+        local_end = local_start + (slice_end - slice_start)
         shard = self.data[local_start:local_end]
-        if shard.numel() > 0:
-            slice_start, slice_end = self.buffer_index._get_item_self_range(
-                item_id, shard_dims=shard_dims
-            )
-            item_data = item_data.flatten()[slice_start:slice_end]
-            shard.data.copy_(item_data.flatten())
+        item_data = item_data.flatten()[slice_start:slice_end]
+        shard.data.copy_(item_data.flatten())
 
     def get_item(
         self, item_id: int, *, shard_dims: Optional[Iterable[int]] = None
@@ -296,7 +304,21 @@ class DataParallelBuffer:
         if shard_dims is None:
             # shard_dims=(outer, inner): use this buffer's storage shard state.
             shard_dims = self.storage_shard_dims
-        start, end = self.buffer_index._get_item_local_range(item_id, shard_dims=shard_dims)
+        slice_start, slice_end = self.buffer_index._get_item_self_range(
+            item_id, shard_dims=shard_dims
+        )
+        storage_slice_start, storage_slice_end = self.buffer_index._get_item_self_range(
+            item_id, shard_dims=self.storage_shard_dims
+        )
+        slice_start = max(slice_start, storage_slice_start)
+        slice_end = min(slice_end, storage_slice_end)
+        if slice_start >= slice_end:
+            return self.data[:0]
+        storage_local_start, _ = self.buffer_index._get_item_local_range(
+            item_id, shard_dims=self.storage_shard_dims
+        )
+        start = storage_local_start + slice_start - storage_slice_start
+        end = start + (slice_end - slice_start)
         return self.data[start:end]
 
     def is_unsharded(self) -> bool:
