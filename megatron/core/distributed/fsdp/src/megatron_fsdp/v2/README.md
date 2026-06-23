@@ -46,7 +46,7 @@ Controls parameter/gradient dtypes and communication precision.
 
 | Field | Default | Purpose |
 |-------|---------|---------|
-| `main_params_dtype` | ``None`` | Dtype for optimizer main-weight buffer. ``None`` = no separate buffer, optimizer mutates model weights directly. Set to ``torch.float32`` for quantized models (FP8/NVFP4) so the optimizer works on high-precision copies. |
+| `main_params_dtype` | ``None`` | Dtype for optimizer main-weight buffer. ``None`` = no separate buffer, optimizer mutates model weights directly. Set to ``torch.float32`` for quantized models (FP8/NVFP4) so the optimizer works on high-precision copies. When this equals the model-weight dtype and the sharding layout matches, the separate buffer is skipped automatically to avoid a redundant copy. |
 | `main_grads_dtype` | ``None`` | Dtype for optimizer main-grad buffer. When ``None`` and ``use_decoupled_grad=False``, aligns with ``main_params_dtype``. Otherwise falls back to ``param.dtype``. |
 | `grad_comm_dtype` | ``None`` | Dtype for gradient reduce-scatter communication. ``None`` = use ``main_grads_dtype``. |
 | `use_decoupled_grad` | ``False`` | When ``False``, ``main_grads_dtype`` is inferred from ``main_params_dtype`` so the optimizer operates in a consistent precision context. |

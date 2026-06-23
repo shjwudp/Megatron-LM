@@ -26,6 +26,7 @@ requested with mfsdpv2 it falls back to full sharding on the 1D mesh.
 import argparse
 from contextlib import contextmanager
 import os
+from pathlib import Path
 import time
 
 import torch
@@ -37,6 +38,13 @@ from diffusers.models.transformers.transformer_qwenimage import (
     QwenImageTransformerBlock,
 )
 from diffusers.models.attention_dispatch import attention_backend
+
+import logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
+
 
 
 # ---------- FA3 training shim ------------------------------------------------
@@ -192,11 +200,17 @@ def parse():
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--compile", action="store_true",
                    help="Per-block torch.compile on transformer_blocks.")
+    p.add_argument("--trace-pool", action="store_true",
+                   help="Use TracePoolAllocator for stable buffer addresses (mfsdpv2 only).")
+    p.add_argument("--cuda-graph", action="store_true",
+                   help="Enable CUDA graph capture on leaf FSDP modules (mfsdpv2 only).")
     p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--verify", action="store_true",
                    help="Cross-rank gloss + global grad-norm probe; timing INVALID for this run.")
     p.add_argument("--cuda_profiler_capture", action="store_true",
                    help="Bracket bench steps with cudaProfilerStart/Stop for Nsight capture ranges.")
+    p.add_argument("--record-memory-history", type=str, default=None, metavar="DIR",
+                   help="Enable CUDA memory recording, dump snapshot to this directory.")
     return p.parse_args()
 
 
@@ -258,7 +272,8 @@ def wrap_mfsdp(model, world_size, num_gpus_per_node, dtype, sharding,
     )
 
 
-def wrap_mfsdpv2(model, world_size, num_gpus_per_node, dtype, sharding):
+def wrap_mfsdpv2(model, world_size, num_gpus_per_node, dtype, sharding,
+                 enable_trace_pool=False, enable_cuda_graph=False):
     from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import (
         fully_shard, MixedPrecisionPolicy,
     )
@@ -278,10 +293,17 @@ def wrap_mfsdpv2(model, world_size, num_gpus_per_node, dtype, sharding):
 
     for blk in model.transformer_blocks:
         fully_shard(blk, mesh=mesh, mp_policy=mp,
-                    sharding_strategy=shard_strategy)
+                    sharding_strategy=shard_strategy,
+                    enable_unshard_prefetch=True,
+                    enable_async_reduce_grad=True,
+                    enable_trace_pool=enable_trace_pool,
+                    enable_cuda_graph=enable_cuda_graph)
 
     fully_shard(model, mesh=mesh, mp_policy=mp,
-                sharding_strategy=shard_strategy)
+                sharding_strategy=shard_strategy,
+                enable_unshard_prefetch=True,
+                enable_async_reduce_grad=True,
+                enable_trace_pool=enable_trace_pool)
 
     return model
 
@@ -376,7 +398,8 @@ def main():
                            args.sharding, local_rank)
     elif args.backend == "mfsdpv2":
         model = wrap_mfsdpv2(model, world, args.num_gpus_per_node, dtype,
-                             args.sharding)
+                             args.sharding, enable_trace_pool=args.trace_pool,
+                             enable_cuda_graph=args.cuda_graph)
     else:
         # verify needs grads finished before optimizer.step(); benchmark path keeps overlap
         model = wrap_mfsdp(model, world, args.num_gpus_per_node, dtype,
@@ -403,6 +426,15 @@ def main():
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
+    if args.record_memory_history:
+        torch.cuda.memory._record_memory_history(
+            max_entries=200000, stacks="all",
+        )
+        if rank == 0:
+            print(f"[rank0] Memory history recording enabled, dump to {args.record_memory_history}")
+
+    _mem_log("after_model_init", rank=rank)
+
     gen = torch.Generator(device=device).manual_seed(args.seed + rank)
     step_times = []
     cuda_profiler_active = False
@@ -421,6 +453,7 @@ def main():
             t0 = time.perf_counter()
 
             hs = _NvtxFwdStartBwdEnd.apply(hs)
+            t_fwd = time.perf_counter()
             with torch.amp.autocast("cuda", dtype=dtype):
                 out = model(hidden_states=hs, timestep=ts / 1000,
                             encoder_hidden_states=pe,
@@ -429,6 +462,11 @@ def main():
                 pred = _NvtxFwdEndBwdStart.apply(pred)
             loss = pred.float().pow(2).mean()
             loss.backward()
+            t_bwd = time.perf_counter()
+
+            if step < args.warmup_steps:
+                _mem_log(f"step={step} fwd_bwd fwd_ms={((t_bwd - t_fwd) * 1000):.1f} "
+                         f"bwd_ms={((time.perf_counter() - t_bwd) * 1000):.1f}", rank=rank)
 
             if args.verify:
                 gloss, gnorm, n = verify_stats(model, loss, device)
@@ -470,7 +508,40 @@ def main():
         avg = sum(step_times) / max(1, len(step_times)) * 1000
         print(f"\n[{args.backend}] avg step (n={len(step_times)}): {avg:.2f} ms | "
               f"peak mem: {peak.item():.2f} GB")
+
+    _mem_log("final", rank=rank)
+
+    if args.record_memory_history:
+        out_dir = args.record_memory_history
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        snapshot_path = os.path.join(out_dir, f"memory_snapshot_rank{rank}.pickle")
+        torch.cuda.memory._dump_snapshot(snapshot_path)
+        if rank == 0:
+            print(f"[rank0] Memory snapshot dumped to {out_dir}")
+        torch.cuda.memory._record_memory_history(enabled=None)
+
     dist.destroy_process_group()
+
+
+def _fmt_bytes(n: int) -> str:
+    for power, suffix in [(4, "TB"), (3, "GB"), (2, "MB"), (1, "KB"), (0, "B")]:
+        unit = 1024 ** power
+        if n >= unit:
+            return f"{n / unit:.2f} {suffix}"
+    return f"{n} B"
+
+
+def _mem_log(tag="", rank=None):
+    """Log CUDA memory stats for the current rank."""
+    if rank is None:
+        rank = torch.distributed.get_rank()
+    alloc = torch.cuda.memory_allocated()
+    max_alloc = torch.cuda.max_memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    max_reserved = torch.cuda.max_memory_reserved()
+    prefix = f"[rank{rank}] {tag}" if tag else f"[rank{rank}]"
+    print(f"{prefix} alloc={_fmt_bytes(alloc)} max_alloc={_fmt_bytes(max_alloc)} "
+          f"reserved={_fmt_bytes(reserved)} max_reserved={_fmt_bytes(max_reserved)}")
 
 
 if __name__ == "__main__":
