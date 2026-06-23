@@ -639,6 +639,19 @@ class FSDPCudaGraphRunner:
             for param in self._module.parameters():
                 param.grad = None
 
+            # When compile + no_grad_fwd are both on, the capture forward
+            # runs under torch.no_grad() which traces a DIFFERENT inductor
+            # graph than the grad-enabled warmup above. Run an extra no_grad
+            # warmup pass so triton autotuning fires here (outside capture)
+            # rather than during capture where cuda.synchronize() is illegal
+            # (cudaErrorStreamCaptureUnsupported).
+            if _CG_COMPILE_FWD and _CG_NO_GRAD_FWD:
+                with torch.cuda.stream(warmup_stream):
+                    with torch.no_grad():
+                        _ = self._call_module(static_inputs, tensor_names, frozen_kwargs)
+                torch.cuda.current_stream().wait_stream(warmup_stream)
+                torch.cuda.synchronize()
+
             # ---- Common debug helpers ----
             _rank = (
                 torch.distributed.get_rank()
