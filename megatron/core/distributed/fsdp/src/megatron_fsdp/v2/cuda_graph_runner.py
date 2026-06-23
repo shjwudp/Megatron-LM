@@ -931,55 +931,84 @@ class FSDPCudaGraphRunner:
             for param in self._module.parameters():
                 param.grad = None
 
-            # Re-run forward AND capture backward inside a single CUDA
-            # graph so that with activation checkpointing, the recompute
-            # forward writes to the same memory addresses the backward
-            # graph captured.  Without this, the recompute forward would
-            # write to transient tensors at different addresses, making
-            # the backward graph read stale data.
+            # When _CG_NO_GRAD_FWD is on, the fwd_graph was captured
+            # under torch.no_grad(), so it contains no autograd tape.
+            # The backward must recompute the forward (with grad) to
+            # build a tape.  We capture that recompute inside bwd_graph
+            # so all memory addresses match at replay time — critical
+            # for activation checkpointing where the checkpoint hook
+            # supplies different saved-tensor addresses each step.
+            #
+            # When _CG_NO_GRAD_FWD is off, the fwd_graph already ran
+            # with grad enabled, so the autograd tape exists and the
+            # backward just needs to run torch.autograd.grad from the
+            # replay outputs.  No forward recompute needed.
             with torch.cuda.stream(capture_stream):
                 # Make inputs require grad like at capture time
                 replay_inputs = tuple(
                     t.detach().clone().requires_grad_(t.requires_grad)
                     for t in self.static_inputs
                 )
-                # Save for updating with ctx.saved_tensors before
-                # each subsequent bwd_graph replay
-                self._bwd_inputs = replay_inputs
-                # Call the ORIGINAL forward (saved by install()) rather
-                # than _call_module() which would route through the
-                # _CudaGraphFunction wrapper and trigger re-entrant
-                # backward capture.  We need a fresh eager autograd tape
-                # from the original forward body to capture the backward
-                # graph here.
                 kwargs = dict(zip(self._tensor_param_names, replay_inputs))
                 kwargs.update(self._frozen_kwargs)
 
-                # 3. Capture recompute forward + backward in bwd_graph
-                self.bwd_graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(
-                    self.bwd_graph,
-                    pool=self._graph_pool,
-                    stream=capture_stream,
-                ):
+                if _CG_NO_GRAD_FWD:
+                    # Save for updating with ctx.saved_tensors before
+                    # each subsequent bwd_graph replay
+                    self._bwd_inputs = replay_inputs
+
+                    # Capture recompute forward + backward in bwd_graph
+                    self.bwd_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(
+                        self.bwd_graph,
+                        pool=self._graph_pool,
+                        stream=capture_stream,
+                    ):
+                        replay_out = self._orig_fwd(**kwargs)
+                        flat_replay_out = self._flatten_output_for_autograd(replay_out)
+                        grad_ins = torch.autograd.grad(
+                            outputs=tuple(
+                                o for o in flat_replay_out if o.requires_grad
+                            ),
+                            inputs=tuple(
+                                t for t in replay_inputs if t.requires_grad
+                            ),
+                            grad_outputs=tuple(
+                                sg for sg, o in zip(static_grad_outputs, flat_replay_out)
+                                if o.requires_grad
+                            ),
+                            retain_graph=False,
+                            create_graph=False,
+                            only_inputs=True,
+                            allow_unused=True,
+                        )
+                else:
+                    # Forward outside bwd_graph; backward inside
                     replay_out = self._orig_fwd(**kwargs)
                     flat_replay_out = self._flatten_output_for_autograd(replay_out)
-                    grad_ins = torch.autograd.grad(
-                        outputs=tuple(
-                            o for o in flat_replay_out if o.requires_grad
-                        ),
-                        inputs=tuple(
-                            t for t in replay_inputs if t.requires_grad
-                        ),
-                        grad_outputs=tuple(
-                            sg for sg, o in zip(static_grad_outputs, flat_replay_out)
-                            if o.requires_grad
-                        ),
-                        retain_graph=False,
-                        create_graph=False,
-                        only_inputs=True,
-                        allow_unused=True,
-                    )
+
+                    self.bwd_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(
+                        self.bwd_graph,
+                        pool=self._graph_pool,
+                        stream=capture_stream,
+                    ):
+                        grad_ins = torch.autograd.grad(
+                            outputs=tuple(
+                                o for o in flat_replay_out if o.requires_grad
+                            ),
+                            inputs=tuple(
+                                t for t in replay_inputs if t.requires_grad
+                            ),
+                            grad_outputs=tuple(
+                                sg for sg, o in zip(static_grad_outputs, flat_replay_out)
+                                if o.requires_grad
+                            ),
+                            retain_graph=False,
+                            create_graph=False,
+                            only_inputs=True,
+                            allow_unused=True,
+                        )
 
                 # Build static_grad_inputs aligned with self.static_inputs
                 # (with None where requires_grad=False).
