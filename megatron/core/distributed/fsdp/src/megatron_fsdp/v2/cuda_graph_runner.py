@@ -932,9 +932,15 @@ class FSDPCudaGraphRunner:
                     t.detach().clone().requires_grad_(t.requires_grad)
                     for t in self.static_inputs
                 )
-                replay_out = self._call_module(
-                    replay_inputs, self._tensor_param_names, self._frozen_kwargs
-                )
+                # Call the ORIGINAL forward (saved by install()) rather
+                # than _call_module() which would route through the
+                # _CudaGraphFunction wrapper and trigger re-entrant
+                # backward capture.  We need a fresh eager autograd tape
+                # from the original forward body to capture the backward
+                # graph here.
+                kwargs = dict(zip(self._tensor_param_names, replay_inputs))
+                kwargs.update(self._frozen_kwargs)
+                replay_out = self._orig_fwd(**kwargs)
                 flat_replay_out = self._flatten_output_for_autograd(replay_out)
 
                 # 3. Capture the backward
