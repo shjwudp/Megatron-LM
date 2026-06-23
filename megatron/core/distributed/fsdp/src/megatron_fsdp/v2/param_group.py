@@ -354,18 +354,21 @@ class ParameterGroup:
             if is_outer_optim_shard:
                 buffer = self.main_weight_buffer or self.model_weight_buffer
                 assert buffer is not None
-                data = buffer.get_item(item_id, shard_level="outer")
+                # shard_dims=(outer, inner): (1, 1) means both dimensions are sharded.
+                data = buffer.get_item(item_id, shard_dims=(1, 1))
                 if self.main_weight_buffer is not None:
                     param_shape = param.shape
                 else:
                     param_shape = self.mp_policy.get_param_storage_shapes([param])[0]
             elif self.main_weight_buffer is not None:
                 mbuf = self.main_weight_buffer
-                data = mbuf.get_item(item_id, shard_level="inner" if is_optim_shard else "full")
+                # shard_dims=(outer, inner): (0, 1) is inner sharded; (0, 0) is full.
+                data = mbuf.get_item(item_id, shard_dims=(0, 1) if is_optim_shard else (0, 0))
                 param_shape = param.shape
             elif self.model_weight_buffer is not None:
                 wbuf = self.model_weight_buffer
-                data = wbuf.get_item(item_id, shard_level="inner" if is_param_shard else "full")
+                # shard_dims=(outer, inner): (0, 1) is inner sharded; (0, 0) is full.
+                data = wbuf.get_item(item_id, shard_dims=(0, 1) if is_param_shard else (0, 0))
                 param_shape = self.mp_policy.get_param_storage_shapes([param])[0]
             else:
                 data = param.data.detach()
@@ -422,8 +425,9 @@ class ParameterGroup:
         self.dist_grads = []
         for p in self.params:
             item_id = self.param_idx[p]
-            shard_level = "outer" if is_outer_optim_shard else "inner" if is_grad_shard else "full"
-            grad_data = gbuf.get_item(item_id, shard_level=shard_level)
+            # shard_dims=(outer, inner): (1, 1) outer+inner, (0, 1) inner, (0, 0) full.
+            shard_dims = (1, 1) if is_outer_optim_shard else (0, 1) if is_grad_shard else (0, 0)
+            grad_data = gbuf.get_item(item_id, shard_dims=shard_dims)
             if p.requires_grad:
                 grad_dtensor = make_uneven_dtensor(
                     grad_data,
@@ -463,16 +467,19 @@ class ParameterGroup:
                     buffer = self.main_weight_buffer or self.model_weight_buffer
                     if buffer is None:
                         continue
-                    data = buffer.get_item(self.param_idx[param], shard_level="outer")
+                    # shard_dims=(outer, inner): (1, 1) means both dimensions are sharded.
+                    data = buffer.get_item(self.param_idx[param], shard_dims=(1, 1))
                 elif self.main_weight_buffer is not None:
                     data = self.main_weight_buffer.get_item(
                         self.param_idx[param],
-                        shard_level="inner" if is_optim_shard else "full",
+                        # shard_dims=(outer, inner): (0, 1) is inner sharded; (0, 0) is full.
+                        shard_dims=(0, 1) if is_optim_shard else (0, 0),
                     )
                 elif self.model_weight_buffer is not None:
                     data = self.model_weight_buffer.get_item(
                         self.param_idx[param],
-                        shard_level="inner" if is_param_shard else "full",
+                        # shard_dims=(outer, inner): (0, 1) is inner sharded; (0, 0) is full.
+                        shard_dims=(0, 1) if is_param_shard else (0, 0),
                     )
                 else:
                     continue
@@ -483,12 +490,11 @@ class ParameterGroup:
             for i, param in enumerate(self.params):
                 dist_grad = self.dist_grads[i]
                 if dist_grad is not None:
-                    shard_level = (
-                        "outer" if is_outer_optim_shard else "inner" if is_grad_shard else "full"
-                    )
+                    # shard_dims=(outer, inner): (1, 1) outer+inner, (0, 1) inner, (0, 0) full.
+                    shard_dims = (1, 1) if is_outer_optim_shard else (0, 1) if is_grad_shard else (0, 0)
                     grad_data = self.main_grad_buffer.get_item(
                         self.param_idx[param],
-                        shard_level=shard_level,
+                        shard_dims=shard_dims,
                     )
                     object.__setattr__(dist_grad._local_tensor, 'data', grad_data)
 

@@ -567,14 +567,16 @@ class MixedPrecisionPolicy:
                     "model weights are sharded but main weights are replicated."
                 )
             if outer_optim:
-                model_weight_buffer.get_shard_view("outer_shard").copy_(
-                    main_weight_buffer.get_shard_view("outer_shard")
+                # shard_dims=(outer, inner): (1, 1) means both dimensions are sharded.
+                model_weight_buffer.get_shard_view((1, 1)).copy_(
+                    main_weight_buffer.get_shard_view((1, 1))
                 )
             elif model_weight_buffer.inner_sharded == main_weight_buffer.inner_sharded:
                 model_weight_buffer.data.copy_(main_weight_buffer.data)
             else:
-                model_weight_buffer.get_shard_view("inner_shard").copy_(
-                    main_weight_buffer.get_shard_view("inner_shard")
+                # shard_dims=(outer, inner): (0, 1) means inner sharded only.
+                model_weight_buffer.get_shard_view((0, 1)).copy_(
+                    main_weight_buffer.get_shard_view((0, 1))
                 )
         else:
             fp8_params = []
@@ -582,10 +584,11 @@ class MixedPrecisionPolicy:
             start_offsets = []
             model_param_shards = []
             no_shard = model_weight_buffer.sharding_strategy == "no_shard"
-            shard_level = "outer" if outer_optim else "inner" if not no_shard else "full"
+            # shard_dims=(outer, inner): (1, 1) outer+inner, (0, 1) inner, (0, 0) full.
+            shard_dims = (1, 1) if outer_optim else (0, 1) if not no_shard else (0, 0)
             for param in params:
                 item_id = param_idx[param]
-                model_shard = model_weight_buffer.get_item(item_id, shard_level=shard_level)
+                model_shard = model_weight_buffer.get_item(item_id, shard_dims=shard_dims)
                 if model_shard.numel() == 0:
                     fp8_params.append(param)
                     main_params.append(None)
@@ -596,14 +599,15 @@ class MixedPrecisionPolicy:
                 transpose_shard = None
                 if transpose_weight_buffer is not None:
                     transpose_shard = transpose_weight_buffer.get_item(
-                        item_id, shard_level=shard_level
+                        item_id, shard_dims=shard_dims
                     )
-                main_weight = main_weight_buffer.get_item(item_id, shard_level=shard_level)
+                main_weight = main_weight_buffer.get_item(item_id, shard_dims=shard_dims)
                 if no_shard:
                     start_offset = 0
                 else:
                     start_offset, _ = model_weight_buffer.buffer_index._get_item_self_range(
-                        item_id, shard_level="outer" if outer_optim else "inner"
+                        # shard_dims=(outer, inner): (1, 1) outer+inner, (0, 1) inner.
+                        item_id, shard_dims=(1, 1) if outer_optim else (0, 1)
                     )
                 fp8_params.append(param)
                 main_params.append(main_weight)
@@ -758,7 +762,8 @@ def quantize_main_weights_to_nvfp4(
 
     for param in model_params:
         item_id = param_idx[param]
-        main_weight_shard = main_weight_buffer.get_item(item_id, shard_level="inner")
+        # shard_dims=(outer, inner): (0, 1) means inner sharded only.
+        main_weight_shard = main_weight_buffer.get_item(item_id, shard_dims=(0, 1))
         if main_weight_shard.numel() == 0:
             main_weight_shard = None
 
@@ -774,8 +779,9 @@ def quantize_main_weights_to_nvfp4(
         # non-zero DP ranks silently corrupts the model weight buffer because
         # TE writes to the wrong byte position.  Always derive this offset
         # from the main_weight_buffer index, which uses full logical shapes.
+        # shard_dims=(outer, inner): (0, 1) means inner sharded only.
         shard_offset, _ = main_weight_buffer.buffer_index._get_item_self_range(
-            item_id, shard_level="inner"
+            item_id, shard_dims=(0, 1)
         )
         te_model_params.append(param)
         te_main_params.append(main_weight_shard)

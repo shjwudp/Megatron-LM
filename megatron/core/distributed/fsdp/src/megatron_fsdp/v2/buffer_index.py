@@ -28,8 +28,8 @@ class BufferIndex:
 
     The index always builds coordinate metadata for a 2D ``(outer, inner)``
     mesh. Callers choose which mesh dimensions shard a query via
-    ``shard_dims``: ``()`` full, ``(0,)`` outer, ``(1,)`` inner, and
-    ``(0, 1)`` inner then outer.
+    ``shard_dims``: ``(0, 0)`` full, ``(1, 0)`` outer, ``(0, 1)`` inner, and
+    ``(1, 1)`` inner then outer.
 
     Each DataParallelBuffer owns its own independent BufferIndex instance.
     """
@@ -311,17 +311,30 @@ class BufferIndex:
     #                            ranks.
     # ------------------------------------------------------------------ #
 
-    def _get_shard_meta(self, shard_dims: Iterable[int] | None):
+    def _get_shard_meta(self, shard_dims: Iterable[int] | int | None):
+        # shard_dims=(outer, inner): 1 means that dimension is sharded, 0 means replicated.
         if shard_dims is None:
-            shard_dims = ()
+            outer_sharded = 0
+            inner_sharded = 0
+        elif isinstance(shard_dims, int):
+            if shard_dims not in (0, 1):
+                raise ValueError(f"Unsupported shard_dims: {shard_dims}")
+            outer_sharded = 0
+            inner_sharded = shard_dims
         else:
-            shard_dims = tuple(sorted(int(dim) for dim in shard_dims))
-        if any(dim not in (0, 1) for dim in shard_dims):
-            raise ValueError(f"Unsupported shard_dims: {shard_dims}")
-        if len(set(shard_dims)) != len(shard_dims):
-            raise ValueError(f"Duplicate shard_dims are not allowed: {shard_dims}")
-        inner_sharded = int(1 in shard_dims)
-        outer_sharded = int(0 in shard_dims)
+            shard_dims = tuple(int(dim) for dim in shard_dims)
+            if any(dim not in (0, 1) for dim in shard_dims):
+                raise ValueError(f"Unsupported shard_dims: {shard_dims}")
+            if len(shard_dims) == 0:
+                outer_sharded = 0
+                inner_sharded = 0
+            elif len(shard_dims) == 1:
+                outer_sharded = 0
+                inner_sharded = shard_dims[0]
+            elif len(shard_dims) == 2:
+                outer_sharded, inner_sharded = shard_dims
+            else:
+                raise ValueError(f"Unsupported shard_dims: {shard_dims}")
         return self.outer_shard_metas[(outer_sharded, inner_sharded)]
 
     def _get_item_global_range(self, item_id: int) -> Tuple[int, int]:
@@ -333,7 +346,7 @@ class BufferIndex:
         self,
         item_id: int,
         *,
-        shard_dims: Iterable[int] | None = (1,),
+        shard_dims: Iterable[int] | None = (0, 1),
     ) -> Tuple[int, int]:
         """Return coordinates relative to the item's own start.
 
@@ -360,7 +373,7 @@ class BufferIndex:
         self,
         item_id: int,
         *,
-        shard_dims: Iterable[int] | None = (),
+        shard_dims: Iterable[int] | None = (0, 0),
     ) -> Tuple[int, int]:
         """Return item coordinates relative to the selected shard dimensions.
 
