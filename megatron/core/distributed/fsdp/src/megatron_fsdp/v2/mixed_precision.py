@@ -561,7 +561,7 @@ class MixedPrecisionPolicy:
                 params, param_idx, data_parallel_group, model_weight_buffer, main_weight_buffer
             )
         elif not self.is_fp8_param(params[0]):
-            if model_weight_buffer.is_distributed and not main_weight_buffer.is_distributed:
+            if model_weight_buffer.inner_sharded and not main_weight_buffer.inner_sharded:
                 raise RuntimeError(
                     "Unsupported FSDP main/model weight buffer layout: "
                     "model weights are sharded but main weights are replicated."
@@ -570,7 +570,7 @@ class MixedPrecisionPolicy:
                 model_weight_buffer.get_shard_view("outer_shard").copy_(
                     main_weight_buffer.get_shard_view("outer_shard")
                 )
-            elif model_weight_buffer.is_distributed == main_weight_buffer.is_distributed:
+            elif model_weight_buffer.inner_sharded == main_weight_buffer.inner_sharded:
                 model_weight_buffer.data.copy_(main_weight_buffer.data)
             else:
                 model_weight_buffer.get_shard_view("inner_shard").copy_(
@@ -582,11 +582,10 @@ class MixedPrecisionPolicy:
             start_offsets = []
             model_param_shards = []
             no_shard = model_weight_buffer.sharding_strategy == "no_shard"
+            shard_level = "outer" if outer_optim else "inner" if not no_shard else "full"
             for param in params:
                 item_id = param_idx[param]
-                model_shard = model_weight_buffer.get_item(
-                    item_id, as_shard=not no_shard, as_outer_shard=outer_optim
-                )
+                model_shard = model_weight_buffer.get_item(item_id, shard_level=shard_level)
                 if model_shard.numel() == 0:
                     fp8_params.append(param)
                     main_params.append(None)
@@ -597,16 +596,14 @@ class MixedPrecisionPolicy:
                 transpose_shard = None
                 if transpose_weight_buffer is not None:
                     transpose_shard = transpose_weight_buffer.get_item(
-                        item_id, as_shard=not no_shard, as_outer_shard=outer_optim
+                        item_id, shard_level=shard_level
                     )
-                main_weight = main_weight_buffer.get_item(
-                    item_id, as_shard=not no_shard, as_outer_shard=outer_optim
-                )
+                main_weight = main_weight_buffer.get_item(item_id, shard_level=shard_level)
                 if no_shard:
                     start_offset = 0
                 else:
                     start_offset, _ = model_weight_buffer.buffer_index._get_item_self_range(
-                        item_id, as_outer_shard=outer_optim
+                        item_id, shard_level="outer" if outer_optim else "inner"
                     )
                 fp8_params.append(param)
                 main_params.append(main_weight)
@@ -621,8 +618,8 @@ class MixedPrecisionPolicy:
         for buffer in (model_weight_buffer, transpose_weight_buffer):
             if buffer is None:
                 continue
-            if buffer.sharding_strategy != "no_shard" and not buffer.is_distributed:
-                buffer.data._dirty = True
+            if buffer.sharding_strategy != "no_shard" and not buffer.inner_sharded:
+                buffer._inner_dirty = True
             if outer_optim:
                 buffer._outer_dirty = True
 
@@ -753,7 +750,7 @@ def quantize_main_weights_to_nvfp4(
     te_start_offsets = []
 
     wbuf = model_weight_buffer
-    if not wbuf.is_distributed:
+    if not wbuf.inner_sharded:
         raise RuntimeError("FIXME: implement non-distributed NVFP4 quantization path")
 
     full_weight_buffer = wbuf.fetch_buffer()
@@ -761,7 +758,7 @@ def quantize_main_weights_to_nvfp4(
 
     for param in model_params:
         item_id = param_idx[param]
-        main_weight_shard = main_weight_buffer.get_item(item_id, as_shard=True)
+        main_weight_shard = main_weight_buffer.get_item(item_id, shard_level="inner")
         if main_weight_shard.numel() == 0:
             main_weight_shard = None
 
@@ -778,7 +775,7 @@ def quantize_main_weights_to_nvfp4(
         # TE writes to the wrong byte position.  Always derive this offset
         # from the main_weight_buffer index, which uses full logical shapes.
         shard_offset, _ = main_weight_buffer.buffer_index._get_item_self_range(
-            item_id, as_shard=True
+            item_id, shard_level="inner"
         )
         te_model_params.append(param)
         te_main_params.append(main_weight_shard)

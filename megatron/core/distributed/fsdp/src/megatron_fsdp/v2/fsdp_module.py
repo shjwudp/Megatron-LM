@@ -1028,7 +1028,9 @@ class FSDPModule:
                     elem_size = _elem_size(buffer.dtype)
                     group_pad += max(0, global_size - numel) * elem_size
                     group_comm += global_size * elem_size
-                    dist_flag = "D" if buffer.is_distributed else "R"
+                    dist_flag = (
+                        "O" if buffer.outer_sharded else "I" if buffer.inner_sharded else "R"
+                    )
                     buffer_entries.append(
                         f"{buffer_label}[{_fmt_dtype(buffer.dtype)}:{buffer.data_size}:{dist_flag}]"
                     )
@@ -1093,7 +1095,7 @@ class FSDPModule:
                     for param in param_group.params:
                         wbuf = param_group.model_weight_buffer
                         param_data = wbuf.get_item(
-                            param_group.param_idx[param], as_shard=False
+                            param_group.param_idx[param], shard_level="full"
                         )
                         assert not torch.isnan(param_data).any(), (
                             "NaN detected in model weight buffer"

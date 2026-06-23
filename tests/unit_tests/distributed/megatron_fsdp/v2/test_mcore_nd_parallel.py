@@ -82,7 +82,7 @@ class TestMegatronFSDPE2E:
                 for param_group in module._fsdp_param_groups:
                     if (
                         param_group.model_weight_buffer is None
-                        or param_group.model_weight_buffer.is_distributed
+                        or param_group.model_weight_buffer.inner_sharded
                     ):
                         continue
                     param_group.unshard(bwd_pass=False)
@@ -93,7 +93,7 @@ class TestMegatronFSDPE2E:
                         ("model_weight_buffer", param_group.model_weight_buffer),
                         ("transpose_weight_buffer", param_group.transpose_weight_buffer),
                     ):
-                        if buffer is None or buffer.is_distributed:
+                        if buffer is None or buffer.inner_sharded:
                             continue
                         gathered = [
                             torch.empty_like(buffer.data)

@@ -183,7 +183,7 @@ def test_init_buffers(strategy):
         if has_wbuf:
             assert pg.model_weight_buffer is not None
             wbuf = pg.model_weight_buffer
-            assert wbuf.is_distributed == w_dist
+            assert wbuf.inner_sharded == w_dist
 
             # Per-param check: get_item should return this rank's portion of
             # the original param. A param may span shard boundaries, so the
@@ -199,7 +199,7 @@ def test_init_buffers(strategy):
         # -- main_grad_buffer --
         if pg.requires_grad:
             assert pg.main_grad_buffer is not None
-            assert pg.main_grad_buffer.is_distributed == g_dist
+            assert pg.main_grad_buffer.inner_sharded == g_dist
             assert pg.main_grad_buffer.data is None  # lazy init
 
     torch.distributed.barrier()

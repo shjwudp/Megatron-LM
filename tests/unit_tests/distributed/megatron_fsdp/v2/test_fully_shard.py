@@ -289,9 +289,9 @@ class TestFullyShardBasic:
 
         for param_group in model._fsdp_param_groups:
             assert param_group.model_weight_buffer is not None
-            assert not param_group.model_weight_buffer.is_distributed
+            assert not param_group.model_weight_buffer.inner_sharded
             assert param_group.main_grad_buffer is not None
-            assert not param_group.main_grad_buffer.is_distributed
+            assert not param_group.main_grad_buffer.inner_sharded
             for dist_grad in param_group.dist_grads:
                 if dist_grad is None:
                     continue

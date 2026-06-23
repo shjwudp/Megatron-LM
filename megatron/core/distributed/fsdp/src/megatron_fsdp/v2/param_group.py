@@ -135,9 +135,7 @@ class ParameterGroup:
             if buffer is not None:
                 buffer.allocator = allocator
 
-    def _create_buffer(
-        self, dtype: torch.dtype, is_distributed: bool, role: str
-    ) -> DataParallelBuffer:
+    def _create_buffer(self, dtype: torch.dtype, role: str) -> DataParallelBuffer:
         """Create a buffer and namespace its temporary bucket by role."""
         return DataParallelBuffer(
             params=self.params,
@@ -147,7 +145,6 @@ class ParameterGroup:
             mesh=self.mesh,
             allocator=self.allocator,
             buffer_role=role,
-            is_distributed=is_distributed,
             param_group_id=self.param_group_id,
             gradient_scaling_factor=self.gradient_scaling_factor,
             chunk_size_factor=self.chunk_size_factor,
@@ -165,22 +162,17 @@ class ParameterGroup:
         - main_weight_buffer: created if mp_policy.main_params_dtype is specified
         - main_grad_buffer: created if requires_grad
         """
-        s = self.sharding_strategy
-        shard_weights = s == "optim_grads_params"
-        shard_main_weights = s != "no_shard"
-        shard_grads = s in ("optim_grads", "optim_grads_params")
-
         # Create model weight buffers. The policy owns dtype-sensitive storage
         # choices and exposes the tensor view that should be packed.
         model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
-        wbuf = self._create_buffer(model_weight_dtype, shard_weights, "model_weight")
+        wbuf = self._create_buffer(model_weight_dtype, "model_weight")
         wbuf.init_data(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
         for i, p in enumerate(self.params):
             wbuf.set_item(i, self.mp_policy.get_param_data(p))
         self.model_weight_buffer = wbuf
 
         if self.mp_policy.needs_transpose_weight_buffer(self.params[0]):
-            tbuf = self._create_buffer(torch.uint8, shard_weights, "transpose_weight")
+            tbuf = self._create_buffer(torch.uint8, "transpose_weight")
             tbuf.init_data(torch.empty(tbuf.data_size, dtype=tbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):
                 tbuf.set_item(i, self.mp_policy.get_param_data(p, transpose=True))
@@ -189,7 +181,7 @@ class ParameterGroup:
         # Create main weight buffer for mixed precision
         main_params_dtype = self.mp_policy.main_params_dtype_for_param(self.params[0])
         if main_params_dtype is not None:
-            mbuf = self._create_buffer(main_params_dtype, shard_main_weights, "main_weight")
+            mbuf = self._create_buffer(main_params_dtype, "main_weight")
             mbuf.init_data(torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):
                 item = self.mp_policy.get_high_precision_value(p)
@@ -209,13 +201,13 @@ class ParameterGroup:
                 _free_storage(tensor)
 
         for weight_buffer in (self.model_weight_buffer, self.transpose_weight_buffer):
-            if weight_buffer is not None and not weight_buffer.is_distributed:
+            if weight_buffer is not None and not weight_buffer.inner_sharded:
                 weight_buffer._bind_buffer_to_params(weight_buffer.data)
 
         # Create gradient buffer
         if self.requires_grad:
             main_grads_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])
-            gbuf = self._create_buffer(main_grads_dtype, shard_grads, "main_grad")
+            gbuf = self._create_buffer(main_grads_dtype, "main_grad")
             self.main_grad_buffer = gbuf
 
         # Create distributed parameter views
@@ -362,22 +354,18 @@ class ParameterGroup:
             if is_outer_optim_shard:
                 buffer = self.main_weight_buffer or self.model_weight_buffer
                 assert buffer is not None
-                data = buffer.get_item(
-                    item_id,
-                    as_shard=is_optim_shard,
-                    as_outer_shard=is_outer_optim_shard,
-                )
+                data = buffer.get_item(item_id, shard_level="outer")
                 if self.main_weight_buffer is not None:
                     param_shape = param.shape
                 else:
                     param_shape = self.mp_policy.get_param_storage_shapes([param])[0]
             elif self.main_weight_buffer is not None:
                 mbuf = self.main_weight_buffer
-                data = mbuf.get_item(item_id, as_shard=is_optim_shard)
+                data = mbuf.get_item(item_id, shard_level="inner" if is_optim_shard else "full")
                 param_shape = param.shape
             elif self.model_weight_buffer is not None:
                 wbuf = self.model_weight_buffer
-                data = wbuf.get_item(item_id, as_shard=is_param_shard)
+                data = wbuf.get_item(item_id, shard_level="inner" if is_param_shard else "full")
                 param_shape = self.mp_policy.get_param_storage_shapes([param])[0]
             else:
                 data = param.data.detach()
@@ -434,11 +422,8 @@ class ParameterGroup:
         self.dist_grads = []
         for p in self.params:
             item_id = self.param_idx[p]
-            grad_data = gbuf.get_item(
-                item_id,
-                as_shard=is_grad_shard,
-                as_outer_shard=is_outer_optim_shard,
-            )
+            shard_level = "outer" if is_outer_optim_shard else "inner" if is_grad_shard else "full"
+            grad_data = gbuf.get_item(item_id, shard_level=shard_level)
             if p.requires_grad:
                 grad_dtensor = make_uneven_dtensor(
                     grad_data,
@@ -478,18 +463,16 @@ class ParameterGroup:
                     buffer = self.main_weight_buffer or self.model_weight_buffer
                     if buffer is None:
                         continue
-                    data = buffer.get_item(
-                        self.param_idx[param],
-                        as_shard=is_optim_shard,
-                        as_outer_shard=is_outer_optim_shard,
-                    )
+                    data = buffer.get_item(self.param_idx[param], shard_level="outer")
                 elif self.main_weight_buffer is not None:
                     data = self.main_weight_buffer.get_item(
-                        self.param_idx[param], as_shard=is_optim_shard
+                        self.param_idx[param],
+                        shard_level="inner" if is_optim_shard else "full",
                     )
                 elif self.model_weight_buffer is not None:
                     data = self.model_weight_buffer.get_item(
-                        self.param_idx[param], as_shard=is_param_shard
+                        self.param_idx[param],
+                        shard_level="inner" if is_param_shard else "full",
                     )
                 else:
                     continue
@@ -500,10 +483,12 @@ class ParameterGroup:
             for i, param in enumerate(self.params):
                 dist_grad = self.dist_grads[i]
                 if dist_grad is not None:
+                    shard_level = (
+                        "outer" if is_outer_optim_shard else "inner" if is_grad_shard else "full"
+                    )
                     grad_data = self.main_grad_buffer.get_item(
                         self.param_idx[param],
-                        as_shard=is_grad_shard,
-                        as_outer_shard=is_outer_optim_shard,
+                        shard_level=shard_level,
                     )
                     object.__setattr__(dist_grad._local_tensor, 'data', grad_data)
 
