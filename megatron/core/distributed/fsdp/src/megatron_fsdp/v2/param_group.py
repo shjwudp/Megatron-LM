@@ -149,6 +149,8 @@ class ParameterGroup:
         Buffer creation logic:
         - model_weight_buffer: always created; replicated unless "optim_grads_params"
         - main_weight_buffer: created if mp_policy.main_params_dtype is specified
+          AND it differs from the model-weight dtype or requires a different
+          sharding layout; otherwise the optimizer mutates model_weight_buffer
         - main_grad_buffer: created if requires_grad
         """
         s = self.sharding_strategy
@@ -172,9 +174,19 @@ class ParameterGroup:
                 tbuf.set_item(i, self.mp_policy.get_param_data(p, transpose=True))
             self.transpose_weight_buffer = tbuf
 
-        # Create main weight buffer for mixed precision
+        # Create main weight buffer for mixed precision. Skip the redundant
+        # copy when the optimizer dtype matches the model-weight dtype AND the
+        # sharding layout is identical — in that case the optimizer mutates
+        # ``model_weight_buffer`` directly via the dist_param views (which the
+        # code below already binds to ``model_weight_buffer`` when
+        # ``main_weight_buffer`` is None). Quantized params (FP8/NVFP4) always
+        # need a separate main buffer because their model-weight dtype (uint8)
+        # differs from the optimizer dtype (fp32), so the dtype guard below
+        # already prevents skipping them.
         main_params_dtype = self.mp_policy.main_params_dtype_for_param(self.params[0])
-        if main_params_dtype is not None:
+        if main_params_dtype is not None and (
+            main_params_dtype != model_weight_dtype or shard_main_weights != shard_weights
+        ):
             mbuf = self._create_buffer(main_params_dtype, shard_main_weights, "main_weight")
             mbuf.init_data(torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):
