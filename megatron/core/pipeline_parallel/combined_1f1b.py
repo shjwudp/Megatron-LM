@@ -40,9 +40,20 @@ def _find_mfsdp_root_module(model: nn.Module) -> Optional[nn.Module]:
         return v1
 
     # v2: walk sub-modules to find the root FSDPModule
+    v2_modules: List[nn.Module] = []
     for child in model.modules():
-        if hasattr(child, '_fsdp_state') and getattr(child._fsdp_state, '_is_root', False):
-            return child
+        if hasattr(child, '_fsdp_state'):
+            v2_modules.append(child)
+            if getattr(child._fsdp_state, '_is_root', False):
+                return child
+
+    if v2_modules:
+        raise RuntimeError(
+            "Found M-FSDP v2 modules but none marked as root. "
+            "Ensure the root FSDP module has _fsdp_state._is_root = True. "
+            "This is normally set by fully_shard() on the outermost module. "
+            f"v2 modules found: {[m.__class__.__name__ for m in v2_modules[:5]]}"
+        )
 
     return None
 
