@@ -14,7 +14,7 @@
 
 import math
 from collections import namedtuple
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import torch
 from torch.distributed.tensor import DeviceMesh
@@ -26,8 +26,10 @@ class BufferIndex:
     """Describes how params are laid out in a flat buffer, including global layout
     and per-rank shard information.
 
-    HSDP outer optimizer sharding is modeled as a second shard meta inside this
-    rank's inner-DP shard, not as a new global ``inner * outer`` layout.
+    The index always builds coordinate metadata for a 2D ``(outer, inner)``
+    mesh. Callers choose which mesh dimensions shard a query via
+    ``shard_dims``: ``()`` full, ``(0,)`` outer, ``(1,)`` inner, and
+    ``(0, 1)`` inner then outer.
 
     Each DataParallelBuffer owns its own independent BufferIndex instance.
     """
@@ -42,14 +44,11 @@ class BufferIndex:
         self,
         param_shapes: List[torch.Size],
         mesh: DeviceMesh,
-        inner_sharded: bool,
         param_group_id: ParamGroupIdx,
-        outer_sharded: bool = False,
         chunk_size_factor: int = 1,
     ):
+        assert mesh.ndim == 2, f"BufferIndex expects a 2D mesh, got {mesh.ndim}D."
         self.param_group_id = param_group_id
-        self.inner_sharded = inner_sharded
-        self.outer_sharded = outer_sharded
         dp_rank = int(mesh.get_local_rank(mesh_dim=1))
         dp_world_size = int(mesh.size(1))
         outer_dp_rank = int(mesh.get_local_rank(mesh_dim=0))
@@ -59,25 +58,13 @@ class BufferIndex:
         self.outer_dp_rank = outer_dp_rank
         self.outer_dp_world_size = outer_dp_world_size
         self.chunk_size_factor = chunk_size_factor
-        layout_world_size = dp_world_size if inner_sharded else 1
-        if outer_sharded:
-            # HSDP outer optimizer sharding splits each inner-DP shard again.
-            # Pad the global layout so both inner and outer shard boundaries
-            # preserve dim-0 row boundaries.
-            layout_world_size *= outer_dp_world_size
+        # Pad for the finest shard grid so full, inner, and outer coordinate
+        # queries all preserve dim-0 row boundaries.
+        layout_world_size = dp_world_size * outer_dp_world_size
         self.item_index_map, self.bucket_meta = self._build_layout(
             param_shapes, layout_world_size, chunk_size_factor
         )
-        self.shard_meta = self._build_shard_meta(
-            self.bucket_meta, inner_sharded, dp_world_size, dp_rank
-        )
-        self.outer_shard_meta: BufferIndex.ShardMeta
-        if outer_sharded:
-            self.outer_shard_meta = self._build_outer_shard_meta(
-                self.shard_meta, outer_dp_world_size, outer_dp_rank
-            )
-        else:
-            self.outer_shard_meta = self.shard_meta
+        self._refresh_shard_metas()
 
     # ------------------------------------------------------------------ #
     #  Layout construction (global, rank-independent)
@@ -230,52 +217,57 @@ class BufferIndex:
     @classmethod
     def _build_shard_meta(
         cls,
-        bucket_meta: "BufferIndex.BucketMeta",
-        inner_sharded: bool,
-        dp_world_size: int,
-        dp_rank: int,
+        parent_meta,
+        num_shards: int,
+        shard_id: int,
     ) -> "BufferIndex.ShardMeta":
-        shard_size = bucket_meta.size // dp_world_size
-        bucket_data_index = shard_size * dp_rank
-        global_data_index = bucket_meta.global_data_index + bucket_data_index
-
-        if inner_sharded:
-            return cls.ShardMeta(
-                global_data_index=global_data_index,
-                local_data_index=0,
-                bucket_data_index=bucket_data_index,
-                size=shard_size,
-            )
-        else:
-            return cls.ShardMeta(
-                global_data_index=global_data_index,
-                # For non-distributed buffers, each rank has the full buffer, so
-                # the local index is the same as the global index.
-                local_data_index=global_data_index,
-                bucket_data_index=bucket_data_index,
-                size=shard_size,
-            )
-
-    @classmethod
-    def _build_outer_shard_meta(
-        cls,
-        shard_meta: "BufferIndex.ShardMeta",
-        outer_dp_world_size: int,
-        outer_dp_rank: int,
-    ) -> "BufferIndex.ShardMeta":
-        if shard_meta.size % outer_dp_world_size != 0:
+        if parent_meta.size % num_shards != 0:
             raise ValueError(
-                f"Inner shard size {shard_meta.size} is not divisible by "
-                f"outer DP size {outer_dp_world_size}."
+                f"Shard parent size {parent_meta.size} is not divisible by "
+                f"shard count {num_shards}."
             )
-        outer_shard_size = shard_meta.size // outer_dp_world_size
-        outer_offset = outer_dp_rank * outer_shard_size
+        shard_size = parent_meta.size // num_shards
+        shard_offset = shard_id * shard_size
+        parent_bucket_data_index = getattr(parent_meta, "bucket_data_index", 0)
         return cls.ShardMeta(
-            global_data_index=shard_meta.global_data_index + outer_offset,
+            global_data_index=parent_meta.global_data_index + shard_offset,
             local_data_index=0,
-            bucket_data_index=shard_meta.bucket_data_index + outer_offset,
-            size=outer_shard_size,
+            bucket_data_index=parent_bucket_data_index + shard_offset,
+            size=shard_size,
         )
+
+    def _refresh_shard_metas(self) -> None:
+        full_meta = self.ShardMeta(
+            global_data_index=0,
+            local_data_index=0,
+            bucket_data_index=0,
+            size=self.bucket_meta.size,
+        )
+        inner_meta = self._build_shard_meta(self.bucket_meta, self.dp_world_size, self.dp_rank)
+        outer_full_meta = self._build_shard_meta(
+            self.bucket_meta, self.outer_dp_world_size, self.outer_dp_rank
+        )
+        outer_inner_meta = self._build_shard_meta(
+            inner_meta, self.outer_dp_world_size, self.outer_dp_rank
+        )
+
+        # ``shard_dims`` follows PyTorch DeviceMesh dim order:
+        # mesh_dim 0 is outer-DP, mesh_dim 1 is inner-DP.
+        # The cache keys below use 0/1 flags to mean unsharded/sharded.
+        self.inner_shard_metas = {
+            0: full_meta,
+            1: inner_meta,
+        }
+        # Outer has four views: outer flag x inner flag, matching mesh dim order.
+        self.outer_shard_metas = {
+            (0, 0): full_meta,
+            (0, 1): inner_meta,
+            (1, 0): outer_full_meta,
+            (1, 1): outer_inner_meta,
+        }
+
+        self.shard_meta = inner_meta
+        self.outer_shard_meta = outer_inner_meta
 
     # ------------------------------------------------------------------ #
     #  Compaction — scale indices proportionally for packed storage
@@ -304,15 +296,7 @@ class BufferIndex:
             size=int(self.bucket_meta.size * factor),
             items=list(new_map.values()),
         )
-        self.shard_meta = self._build_shard_meta(
-            self.bucket_meta, self.inner_sharded, self.dp_world_size, self.dp_rank
-        )
-        if self.outer_sharded:
-            self.outer_shard_meta = self._build_outer_shard_meta(
-                self.shard_meta, self.outer_dp_world_size, self.outer_dp_rank
-            )
-        else:
-            self.outer_shard_meta = self.shard_meta
+        self._refresh_shard_metas()
 
     # ------------------------------------------------------------------ #
     #  Internal index query methods — three coordinate domains:
@@ -320,22 +304,40 @@ class BufferIndex:
     #  _get_item_self_range   → (start, end) relative to the item's own
     #                            start.  Tells what portion of this item
     #                            falls within the current rank's shard.
-    #  _get_item_local_range  → (start, end) within self.data (the local
-    #                            GPU buffer).  Where to read/write bytes.
+    #  _get_item_local_range  → (start, end) relative to the selected
+    #                            shard_dims coordinate domain.
     #  _get_item_global_range → (start, end) in the full logical
     #                            (unsharded) buffer, same on all
     #                            ranks.
     # ------------------------------------------------------------------ #
+
+    def _get_shard_meta(self, shard_dims: Iterable[int] | None):
+        if shard_dims is None:
+            shard_dims = ()
+        else:
+            shard_dims = tuple(sorted(int(dim) for dim in shard_dims))
+        if any(dim not in (0, 1) for dim in shard_dims):
+            raise ValueError(f"Unsupported shard_dims: {shard_dims}")
+        if len(set(shard_dims)) != len(shard_dims):
+            raise ValueError(f"Duplicate shard_dims are not allowed: {shard_dims}")
+        inner_sharded = int(1 in shard_dims)
+        outer_sharded = int(0 in shard_dims)
+        return self.outer_shard_metas[(outer_sharded, inner_sharded)]
 
     def _get_item_global_range(self, item_id: int) -> Tuple[int, int]:
         """Return (start, end) in the full unsharded buffer for the given item."""
         idx = self.item_index_map[item_id]
         return (idx.global_data_index, idx.global_data_index + idx.size)
 
-    def _get_item_self_range(self, item_id: int, *, shard_level: str = "inner") -> Tuple[int, int]:
+    def _get_item_self_range(
+        self,
+        item_id: int,
+        *,
+        shard_dims: Iterable[int] | None = (1,),
+    ) -> Tuple[int, int]:
         """Return coordinates relative to the item's own start.
 
-        ``shard_level`` selects the coordinate level: "full", "inner", or "outer".
+        ``shard_dims`` selects the mesh dimensions to shard on.
         """
         idx = self.item_index_map[item_id]
         item_start = idx.global_data_index
@@ -343,69 +345,39 @@ class BufferIndex:
         range_start = item_start
         range_end = item_end
 
-        if shard_level == "full":
-            pass
-        elif shard_level == "inner":
-            shard_start = self.shard_meta.global_data_index
-            shard_end = shard_start + self.shard_meta.size
-            range_start = max(range_start, shard_start)
-            range_end = min(range_end, shard_end)
-        elif shard_level == "outer":
-            outer_start = self.outer_shard_meta.global_data_index
-            outer_end = outer_start + self.outer_shard_meta.size
-            range_start = max(range_start, outer_start)
-            range_end = min(range_end, outer_end)
-        else:
-            raise ValueError(f"Unsupported shard_level: {shard_level}")
+        shard_meta = self._get_shard_meta(shard_dims)
+        shard_start = shard_meta.global_data_index
+        shard_end = shard_start + shard_meta.size
+        range_start = max(range_start, shard_start)
+        range_end = min(range_end, shard_end)
 
         if range_start >= range_end:
             return (0, 0)
 
         return (range_start - idx.global_data_index, range_end - idx.global_data_index)
 
-    def _get_item_local_range(self, item_id: int, *, shard_level: str = "full") -> Tuple[int, int]:
-        """Return coordinates within self.data for the item.
+    def _get_item_local_range(
+        self,
+        item_id: int,
+        *,
+        shard_dims: Iterable[int] | None = (),
+    ) -> Tuple[int, int]:
+        """Return item coordinates relative to the selected shard dimensions.
 
-        ``shard_level`` selects the requested coordinate level: "full", "inner",
-        or "outer".  The result is always clipped to this rank's local storage.
+        The result is not aware of DataParallelBuffer storage.
         """
         idx = self.item_index_map[item_id]
         range_start = idx.global_data_index
         range_end = range_start + idx.size
 
-        if shard_level == "full":
-            pass
-        elif shard_level == "inner":
-            shard_start = self.shard_meta.global_data_index
-            shard_end = shard_start + self.shard_meta.size
-            range_start = max(range_start, shard_start)
-            range_end = min(range_end, shard_end)
-        elif shard_level == "outer":
-            outer_start = self.outer_shard_meta.global_data_index
-            outer_end = outer_start + self.outer_shard_meta.size
-            range_start = max(range_start, outer_start)
-            range_end = min(range_end, outer_end)
-        else:
-            raise ValueError(f"Unsupported shard_level: {shard_level}")
-
-        if self.outer_sharded:
-            storage_meta = self.outer_shard_meta
-        elif self.inner_sharded:
-            storage_meta = self.shard_meta
-        else:
-            storage_meta = None
-        if storage_meta is not None:
-            storage_start = storage_meta.global_data_index
-            storage_end = storage_start + storage_meta.size
-            range_start = max(range_start, storage_start)
-            range_end = min(range_end, storage_end)
+        shard_meta = self._get_shard_meta(shard_dims)
+        shard_start = shard_meta.global_data_index
+        shard_end = shard_start + shard_meta.size
+        range_start = max(range_start, shard_start)
+        range_end = min(range_end, shard_end)
 
         if range_start >= range_end:
             return (0, 0)
 
-        local_start = (
-            range_start
-            if storage_meta is None
-            else storage_meta.local_data_index + range_start - storage_meta.global_data_index
-        )
+        local_start = shard_meta.local_data_index + range_start - shard_meta.global_data_index
         return (local_start, local_start + (range_end - range_start))

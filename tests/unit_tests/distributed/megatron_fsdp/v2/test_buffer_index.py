@@ -43,70 +43,118 @@ def _build_hsdp_mesh():
     return DeviceMesh("cuda", mesh, mesh_dim_names=("dp_outer", "dp"))
 
 
-def _intersect(left, right):
-    start = max(left[0], right[0])
-    end = min(left[1], right[1])
-    return None if start >= end else (start, end)
+class TestBufferIndex:
+    def setup_method(self):
+        self.mesh = _build_hsdp_mesh()
+        self.param_shapes = [torch.Size([16]), torch.Size([8]), torch.Size([40])]
+        self.chunk_size_factor = 4
 
+        self.ref_item_ranges = {
+            0: (0, 16),
+            1: (16, 24),
+            2: (24, 64),
+        }
+        layout_size = 64
+        shard_grid = int(self.mesh.size(0) * self.mesh.size(1) * self.chunk_size_factor)
+        self.ref_bucket_size = ((layout_size + shard_grid - 1) // shard_grid) * shard_grid
 
-def _meta_range(meta):
-    return (meta.global_data_index, meta.global_data_index + meta.size)
+        outer_size = int(self.mesh.size(0))
+        inner_size = int(self.mesh.size(1))
+        outer_rank = int(self.mesh.get_local_rank(mesh_dim=0))
+        inner_rank = int(self.mesh.get_local_rank(mesh_dim=1))
 
+        inner_shard_size = self.ref_bucket_size // inner_size
+        inner_global_start = inner_rank * inner_shard_size
+        outer_full_shard_size = self.ref_bucket_size // outer_size
+        outer_full_global_start = outer_rank * outer_full_shard_size
+        outer_inner_shard_size = inner_shard_size // outer_size
+        outer_inner_offset = outer_rank * outer_inner_shard_size
 
-@pytest.mark.parametrize(
-    ("inner_sharded", "outer_sharded"),
-    [(False, False), (True, False), (False, True), (True, True)],
-)
-@pytest.mark.parametrize("shard_level", ["full", "inner", "outer"])
-def test_buffer_index_item_ranges(inner_sharded, outer_sharded, shard_level):
-    mesh = _build_hsdp_mesh()
-    index = BufferIndex(
-        param_shapes=[torch.Size([64])],
-        mesh=mesh,
-        inner_sharded=inner_sharded,
-        outer_sharded=outer_sharded,
-        param_group_id=ParamGroupIdx(0, 0),
-        chunk_size_factor=1,
+        self.ref_shard_metas = {
+            (): (0, 0, 0, self.ref_bucket_size),
+            (0,): (
+                outer_full_global_start,
+                0,
+                outer_full_global_start,
+                outer_full_shard_size,
+            ),
+            (1,): (
+                inner_global_start,
+                0,
+                inner_global_start,
+                inner_shard_size,
+            ),
+            (0, 1): (
+                inner_global_start + outer_inner_offset,
+                0,
+                inner_global_start + outer_inner_offset,
+                outer_inner_shard_size,
+            ),
+        }
+
+    @pytest.mark.parametrize(
+        "shard_dims",
+        [
+            (),
+            (0,),
+            (1,),
+            (0, 1),
+        ],
     )
-
-    item_range = index._get_item_global_range(0)
-    if shard_level == "full":
-        requested_range = item_range
-    elif shard_level == "inner":
-        requested_range = _intersect(item_range, _meta_range(index.shard_meta))
-    else:
-        requested_range = _intersect(item_range, _meta_range(index.outer_shard_meta))
-
-    if requested_range is None:
-        expected_self = (0, 0)
-    else:
-        expected_self = (
-            requested_range[0] - item_range[0],
-            requested_range[1] - item_range[0],
+    def test_shard_meta_matches_ref(self, shard_dims):
+        index = BufferIndex(
+            param_shapes=self.param_shapes,
+            mesh=self.mesh,
+            param_group_id=ParamGroupIdx(0, 0),
+            chunk_size_factor=self.chunk_size_factor,
         )
-    assert index._get_item_self_range(0, shard_level=shard_level) == expected_self
+        meta = index._get_shard_meta(shard_dims)
+        assert (
+            meta.global_data_index,
+            meta.local_data_index,
+            meta.bucket_data_index,
+            meta.size,
+        ) == self.ref_shard_metas[shard_dims]
 
-    if outer_sharded:
-        storage_meta = index.outer_shard_meta
-    elif inner_sharded:
-        storage_meta = index.shard_meta
-    else:
-        storage_meta = None
+        assert index.shard_meta == index._get_shard_meta((1,))
+        assert index.outer_shard_meta == index._get_shard_meta((0, 1))
 
-    local_range = requested_range
-    if storage_meta is not None and local_range is not None:
-        local_range = _intersect(local_range, _meta_range(storage_meta))
-
-    if local_range is None:
-        expected_local = (0, 0)
-    elif storage_meta is None:
-        expected_local = local_range
-    else:
-        expected_local = (
-            storage_meta.local_data_index + local_range[0] - storage_meta.global_data_index,
-            storage_meta.local_data_index + local_range[1] - storage_meta.global_data_index,
+    @pytest.mark.parametrize("item_id", [0, 1, 2])
+    @pytest.mark.parametrize("shard_dims", [(), (0,), (1,), (0, 1), (1, 0)])
+    def test_item_ranges_match_ref(self, shard_dims, item_id):
+        index = BufferIndex(
+            param_shapes=self.param_shapes,
+            mesh=self.mesh,
+            param_group_id=ParamGroupIdx(0, 0),
+            chunk_size_factor=self.chunk_size_factor,
         )
-    assert index._get_item_local_range(0, shard_level=shard_level) == expected_local
+        normalized_shard_dims = tuple(sorted(shard_dims))
+        item_start, item_end = self.ref_item_ranges[item_id]
+        shard_global_start, shard_local_start, _, shard_size = self.ref_shard_metas[
+            normalized_shard_dims
+        ]
+        range_start = max(item_start, shard_global_start)
+        range_end = min(item_end, shard_global_start + shard_size)
 
-    if outer_sharded and shard_level == "outer":
-        assert expected_local == (0, index.outer_shard_meta.size)
+        assert index._get_item_global_range(item_id) == (item_start, item_end)
+
+        meta = index._get_shard_meta(shard_dims)
+        assert (
+            meta.global_data_index,
+            meta.local_data_index,
+            meta.bucket_data_index,
+            meta.size,
+        ) == self.ref_shard_metas[normalized_shard_dims]
+
+        if range_start >= range_end:
+            expected_self = (0, 0)
+            expected_local = (0, 0)
+        else:
+            expected_self = (range_start - item_start, range_end - item_start)
+            expected_local = (
+                shard_local_start + range_start - shard_global_start,
+                shard_local_start + range_end - shard_global_start,
+            )
+
+        assert index._get_item_self_range(item_id, shard_dims=shard_dims) == expected_self
+        assert index._get_item_local_range(item_id, shard_dims=shard_dims) == expected_local
