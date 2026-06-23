@@ -129,6 +129,35 @@ _CG_COMPILE_FWD: bool = os.environ.get("MFSDP_CG_COMPILE_FWD", "0").lower() in (
     "on",
 )
 
+# MFSDP_CG_USE_CHECKPOINT controls whether capture_forward wraps
+# module.forward with torch.utils.checkpoint.checkpoint (use_reentrant=False)
+# before warmup + capture. With this enabled, forward intermediates are
+# freed at the checkpoint boundary during capture, so the captured fwd
+# graph pins only the boundary tensors (input + output) instead of every
+# inductor triton intermediate.  Based on the full-snapshot analysis this
+# targets the 18.7 GB "/60-layer" activation row (the largest single
+# CG-overhead bucket).
+#
+# Composition with MFSDP_CG_COMPILE_FWD: when both are enabled we wrap as
+# torch.compile(checkpoint(orig_fwd)) — compile sees the whole checkpoint
+# region and can fuse the recompute path in backward.
+#
+#   MFSDP_CG_USE_CHECKPOINT=1  — checkpoint forward body during capture
+#   MFSDP_CG_USE_CHECKPOINT=0  — (default) no checkpoint wrapping
+#
+# Caveat: the backward graph capture (_capture_backward_and_run) re-runs
+# forward via _call_module to build a fresh autograd tape.  With
+# checkpoint installed, that re-run will also be checkpointed; the
+# recompute then happens INSIDE the captured bwd_graph, growing the
+# backward graph pool.  Net memory effect depends on whether the fwd
+# graph shrink outweighs the bwd graph growth — measure to confirm.
+_CG_USE_CHECKPOINT: bool = os.environ.get("MFSDP_CG_USE_CHECKPOINT", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
 
 # ------------------------------------------------------------------
 # Hook helpers
@@ -476,35 +505,61 @@ class FSDPCudaGraphRunner:
             gc.freeze()
 
         try:
-            # ---- 3b. Optionally compile forward body so capture contains
-            #          inductor-fused triton kernels (not eager ops) ----
-            # See _CG_COMPILE_FWD docstring. We replace self._module.forward
-            # with torch.compile(orig) so the warmup below populates
-            # dynamo's cache; the subsequent capture (inside
-            # torch.cuda.graph) runs the cached compiled code, whose
-            # triton kernels are capturable. Without this, capture runs
-            # the un-fused python body, which uses significantly more
-            # memory than the no-CG path.
-            if _CG_COMPILE_FWD:
+            # ---- 3b. Optionally wrap forward body with torch.utils.checkpoint
+            #          and/or torch.compile so capture sees fused/recomputed
+            #          kernels rather than the raw eager Python body. ----
+            #
+            # Composition order:
+            #   - if _CG_USE_CHECKPOINT: wrap orig with checkpoint(...)
+            #   - if _CG_COMPILE_FWD:    wrap the result with torch.compile(...)
+            # i.e. torch.compile(checkpoint(orig)) when both are on, which
+            # is the PyTorch 2.x recommended ordering (compile sees the
+            # whole checkpoint region and can fuse the recompute path).
+            #
+            # Both wrappers are temporary: we restore the original forward
+            # in the finally block so install() sees the user-written body.
+            if _CG_COMPILE_FWD or _CG_USE_CHECKPOINT:
                 _orig_fwd_body = self._module.forward
-                # Skip if the user already compiled the forward directly.
-                if not hasattr(_orig_fwd_body, "get_compiler_config"):
-                    try:
-                        self._module.forward = torch.compile(_orig_fwd_body)
-                        self._captured_fwd_was_compiled = True
-                        self._orig_fwd_body = _orig_fwd_body
+                target_fwd = _orig_fwd_body
+                try:
+                    if _CG_USE_CHECKPOINT:
+                        _ckpt_orig = target_fwd
+
+                        def _ckpt_fwd(*a, **kw):
+                            return torch.utils.checkpoint.checkpoint(
+                                _ckpt_orig, *a, use_reentrant=False, **kw
+                            )
+
+                        target_fwd = _ckpt_fwd
+                        logger.info(
+                            "%s [cg-compile-fwd] wrapped forward body with "
+                            "torch.utils.checkpoint (use_reentrant=False)",
+                            self._log_prefix,
+                        )
+                    if _CG_COMPILE_FWD and not hasattr(
+                        target_fwd, "get_compiler_config"
+                    ):
+                        target_fwd = torch.compile(target_fwd)
                         logger.info(
                             "%s [cg-compile-fwd] compiled forward body for "
                             "inductor fusion during capture",
                             self._log_prefix,
                         )
-                    except Exception as e:
-                        logger.warning(
-                            "%s [cg-compile-fwd] torch.compile failed (%s); "
-                            "capturing eager forward (legacy behavior)",
-                            self._log_prefix,
-                            e,
-                        )
+                    if target_fwd is not _orig_fwd_body:
+                        self._module.forward = target_fwd
+                        self._captured_fwd_was_compiled = True
+                        self._orig_fwd_body = _orig_fwd_body
+                except Exception as e:
+                    logger.warning(
+                        "%s [cg-compile-fwd] forward wrapping failed (%s); "
+                        "capturing eager forward (legacy behavior)",
+                        self._log_prefix,
+                        e,
+                    )
+                    if self._captured_fwd_was_compiled:
+                        self._module.forward = self._orig_fwd_body
+                        self._orig_fwd_body = None
+                        self._captured_fwd_was_compiled = False
 
             # ---- 4. Pick / create capture stream ----
             capture_stream = self._capture_stream
