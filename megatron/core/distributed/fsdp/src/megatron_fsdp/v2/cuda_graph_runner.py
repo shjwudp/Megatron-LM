@@ -59,6 +59,7 @@ custom ``Function.backward``, we run an eager backward to capture the
 backward graph, then replay it. Subsequent microbatches replay both.
 """
 
+import contextlib
 import gc
 import inspect
 import logging
@@ -151,7 +152,46 @@ _CG_COMPILE_FWD: bool = os.environ.get("MFSDP_CG_COMPILE_FWD", "0").lower() in (
 # recompute then happens INSIDE the captured bwd_graph, growing the
 # backward graph pool.  Net memory effect depends on whether the fwd
 # graph shrink outweighs the bwd graph growth — measure to confirm.
+#
+# SUPERSEDED by MFSDP_CG_NO_GRAD_FWD (see below), which achieves the
+# same fwd-graph saving without the bwd-graph growth.  Kept for A/B
+# testing only.
 _CG_USE_CHECKPOINT: bool = os.environ.get("MFSDP_CG_USE_CHECKPOINT", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# MFSDP_CG_NO_GRAD_FWD controls whether the forward CUDA graph is
+# captured under torch.no_grad().  This is a strictly better approach
+# than torch.utils.checkpoint for our separate-fwd/bwd-graph
+# architecture:
+#
+#   - The captured fwd_graph is replayed at runtime inside
+#     _CudaGraphFunction.forward, which is a torch.autograd.Function.
+#     PyTorch runs autograd Function forward methods with grad DISABLED,
+#     so fwd_graph.replay() already executes under no_grad at runtime.
+#     Capturing under no_grad makes capture-time behavior match
+#     replay-time behavior exactly (CUDA graph requirement).
+#   - SavedVariables accumulated during the capture (the 312 MB/layer
+#     inductor activation row in the analysis) are never used by the
+#     bwd graph because _capture_backward_and_run already re-runs the
+#     forward with grad enabled to build a fresh autograd tape.
+#     Capturing forward with no_grad drops those dead SavedVariables
+#     entirely — no recompute cost, no bwd-graph growth.
+#   - Contrast with torch.utils.checkpoint (MFSDP_CG_USE_CHECKPOINT=1):
+#     checkpoint's unpack hook re-runs the forward during the
+#     bwd-capture re-run, which DOUBLES the recompute and grows the
+#     bwd_graph.  no_grad_fwd avoids this entirely.
+#
+# Default is ON because it is more correct than the legacy behavior
+# (legacy captured with grad enabled, which is inconsistent with the
+# runtime no_grad dispatch).  Set to 0 only for debugging.
+#
+#   MFSDP_CG_NO_GRAD_FWD=1  — (default) capture fwd_graph under no_grad
+#   MFSDP_CG_NO_GRAD_FWD=0  — legacy: capture with grad enabled
+_CG_NO_GRAD_FWD: bool = os.environ.get("MFSDP_CG_NO_GRAD_FWD", "1").lower() in (
     "1",
     "true",
     "yes",
@@ -625,14 +665,24 @@ class FSDPCudaGraphRunner:
             _reserved_before = torch.cuda.memory_reserved()
 
             # ---- 6. Capture forward graph on the shared pool ----
+            # When _CG_NO_GRAD_FWD is enabled (default), the forward body
+            # runs under torch.no_grad() during capture. This matches the
+            # runtime behavior of _CudaGraphFunction.forward (autograd
+            # Function forward methods run with grad disabled) and drops
+            # the SavedVariables that would otherwise be pinned in the
+            # graph pool for backward — they are dead weight here because
+            # _capture_backward_and_run re-runs the forward with grad
+            # enabled to build its own fresh autograd tape.
             self.fwd_graph = torch.cuda.CUDAGraph()
+            no_grad_ctx = torch.no_grad() if _CG_NO_GRAD_FWD else contextlib.nullcontext()
             with torch.cuda.stream(capture_stream):
                 with torch.cuda.graph(
                     self.fwd_graph,
                     pool=self._graph_pool,
                     stream=capture_stream,
                 ):
-                    out = self._call_module(static_inputs, tensor_names, frozen_kwargs)
+                    with no_grad_ctx:
+                        out = self._call_module(static_inputs, tensor_names, frozen_kwargs)
 
             # -- memory tracking: after capture --
             _alloc_after = torch.cuda.memory_allocated()
