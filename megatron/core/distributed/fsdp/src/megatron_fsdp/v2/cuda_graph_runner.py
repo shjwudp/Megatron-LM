@@ -130,39 +130,6 @@ _CG_COMPILE_FWD: bool = os.environ.get("MFSDP_CG_COMPILE_FWD", "0").lower() in (
     "on",
 )
 
-# MFSDP_CG_USE_CHECKPOINT controls whether capture_forward wraps
-# module.forward with torch.utils.checkpoint.checkpoint (use_reentrant=False)
-# before warmup + capture. With this enabled, forward intermediates are
-# freed at the checkpoint boundary during capture, so the captured fwd
-# graph pins only the boundary tensors (input + output) instead of every
-# inductor triton intermediate.  Based on the full-snapshot analysis this
-# targets the 18.7 GB "/60-layer" activation row (the largest single
-# CG-overhead bucket).
-#
-# Composition with MFSDP_CG_COMPILE_FWD: when both are enabled we wrap as
-# torch.compile(checkpoint(orig_fwd)) — compile sees the whole checkpoint
-# region and can fuse the recompute path in backward.
-#
-#   MFSDP_CG_USE_CHECKPOINT=1  — checkpoint forward body during capture
-#   MFSDP_CG_USE_CHECKPOINT=0  — (default) no checkpoint wrapping
-#
-# Caveat: the backward graph capture (_capture_backward_and_run) re-runs
-# forward via _call_module to build a fresh autograd tape.  With
-# checkpoint installed, that re-run will also be checkpointed; the
-# recompute then happens INSIDE the captured bwd_graph, growing the
-# backward graph pool.  Net memory effect depends on whether the fwd
-# graph shrink outweighs the bwd graph growth — measure to confirm.
-#
-# SUPERSEDED by MFSDP_CG_NO_GRAD_FWD (see below), which achieves the
-# same fwd-graph saving without the bwd-graph growth.  Kept for A/B
-# testing only.
-_CG_USE_CHECKPOINT: bool = os.environ.get("MFSDP_CG_USE_CHECKPOINT", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-
 # MFSDP_CG_NO_GRAD_FWD controls whether the forward CUDA graph is
 # captured under torch.no_grad().  This is a strictly better approach
 # than torch.utils.checkpoint for our separate-fwd/bwd-graph
@@ -180,10 +147,6 @@ _CG_USE_CHECKPOINT: bool = os.environ.get("MFSDP_CG_USE_CHECKPOINT", "0").lower(
 #     forward with grad enabled to build a fresh autograd tape.
 #     Capturing forward with no_grad drops those dead SavedVariables
 #     entirely — no recompute cost, no bwd-graph growth.
-#   - Contrast with torch.utils.checkpoint (MFSDP_CG_USE_CHECKPOINT=1):
-#     checkpoint's unpack hook re-runs the forward during the
-#     bwd-capture re-run, which DOUBLES the recompute and grows the
-#     bwd_graph.  no_grad_fwd avoids this entirely.
 #
 # Default is ON because it is more correct than the legacy behavior
 # (legacy captured with grad enabled, which is inconsistent with the
@@ -323,6 +286,13 @@ class _CudaGraphFunction(torch.autograd.Function):
             return runner._capture_backward_and_run(ctx.saved_tensors, grad_outputs)
 
         # ---- Subsequent backwards: replay ----
+        # Copy saved forward inputs into the bwd_graph's replay buffers
+        # so the recompute forward runs with the correct values.
+        if runner._bwd_inputs:
+            for static, live in zip(runner._bwd_inputs, ctx.saved_tensors):
+                if static.data_ptr() != live.data_ptr():
+                    static.copy_(live)
+
         for static, live in zip(runner.static_grad_outputs, grad_outputs):
             if live is None:
                 continue
@@ -415,6 +385,7 @@ class FSDPCudaGraphRunner:
         self.bwd_graph: Optional[torch.cuda.CUDAGraph] = None
         self.static_grad_outputs: Tuple[torch.Tensor, ...] = ()
         self.static_grad_inputs: Tuple[Optional[torch.Tensor], ...] = ()
+        self._bwd_inputs: Tuple[torch.Tensor, ...] = ()  # replay_inputs for bwd_graph
 
         # Frozen capture metadata
         self._tensor_param_names: List[str] = []
@@ -545,50 +516,25 @@ class FSDPCudaGraphRunner:
             gc.freeze()
 
         try:
-            # ---- 3b. Optionally wrap forward body with torch.utils.checkpoint
-            #          and/or torch.compile so capture sees fused/recomputed
-            #          kernels rather than the raw eager Python body. ----
+            # ---- 3b. Optionally wrap forward body with torch.compile so
+            #          capture sees fused inductor kernels rather than
+            #          the raw eager Python body. ----
             #
-            # Composition order:
-            #   - if _CG_USE_CHECKPOINT: wrap orig with checkpoint(...)
-            #   - if _CG_COMPILE_FWD:    wrap the result with torch.compile(...)
-            # i.e. torch.compile(checkpoint(orig)) when both are on, which
-            # is the PyTorch 2.x recommended ordering (compile sees the
-            # whole checkpoint region and can fuse the recompute path).
-            #
-            # Both wrappers are temporary: we restore the original forward
-            # in the finally block so install() sees the user-written body.
-            if _CG_COMPILE_FWD or _CG_USE_CHECKPOINT:
+            # The wrapper is temporary: we restore the original forward in
+            # the finally block so install() sees the user-written body.
+            if _CG_COMPILE_FWD:
                 _orig_fwd_body = self._module.forward
-                target_fwd = _orig_fwd_body
                 try:
-                    if _CG_USE_CHECKPOINT:
-                        _ckpt_orig = target_fwd
-
-                        def _ckpt_fwd(*a, **kw):
-                            return torch.utils.checkpoint.checkpoint(
-                                _ckpt_orig, *a, use_reentrant=False, **kw
-                            )
-
-                        target_fwd = _ckpt_fwd
-                        logger.info(
-                            "%s [cg-compile-fwd] wrapped forward body with "
-                            "torch.utils.checkpoint (use_reentrant=False)",
-                            self._log_prefix,
-                        )
-                    if _CG_COMPILE_FWD and not hasattr(
-                        target_fwd, "get_compiler_config"
-                    ):
-                        target_fwd = torch.compile(target_fwd)
+                    if not hasattr(_orig_fwd_body, "get_compiler_config"):
+                        target_fwd = torch.compile(_orig_fwd_body)
+                        self._module.forward = target_fwd
+                        self._captured_fwd_was_compiled = True
+                        self._orig_fwd_body = _orig_fwd_body
                         logger.info(
                             "%s [cg-compile-fwd] compiled forward body for "
                             "inductor fusion during capture",
                             self._log_prefix,
                         )
-                    if target_fwd is not _orig_fwd_body:
-                        self._module.forward = target_fwd
-                        self._captured_fwd_was_compiled = True
-                        self._orig_fwd_body = _orig_fwd_body
                 except Exception as e:
                     logger.warning(
                         "%s [cg-compile-fwd] forward wrapping failed (%s); "
@@ -638,6 +584,19 @@ class FSDPCudaGraphRunner:
             # Reset grads after warmup
             for param in self._module.parameters():
                 param.grad = None
+
+            # When compile + no_grad_fwd are both on, the capture forward
+            # runs under torch.no_grad() which traces a DIFFERENT inductor
+            # graph than the grad-enabled warmup above. Run an extra no_grad
+            # warmup pass so triton autotuning fires here (outside capture)
+            # rather than during capture where cuda.synchronize() is illegal
+            # (cudaErrorStreamCaptureUnsupported).
+            if _CG_COMPILE_FWD and _CG_NO_GRAD_FWD:
+                with torch.cuda.stream(warmup_stream):
+                    with torch.no_grad():
+                        _ = self._call_module(static_inputs, tensor_names, frozen_kwargs)
+                torch.cuda.current_stream().wait_stream(warmup_stream)
+                torch.cuda.synchronize()
 
             # ---- Common debug helpers ----
             _rank = (
@@ -910,43 +869,84 @@ class FSDPCudaGraphRunner:
             for param in self._module.parameters():
                 param.grad = None
 
-            # Re-run forward eagerly so we have an autograd tape rooted
-            # at static_inputs producing static_outputs (or rather a
-            # parallel tape of the same shapes).
+            # When _CG_NO_GRAD_FWD is on, the fwd_graph was captured
+            # under torch.no_grad(), so it contains no autograd tape.
+            # The backward must recompute the forward (with grad) to
+            # build a tape.  We capture that recompute inside bwd_graph
+            # so all memory addresses match at replay time — critical
+            # for activation checkpointing where the checkpoint hook
+            # supplies different saved-tensor addresses each step.
+            #
+            # When _CG_NO_GRAD_FWD is off, the fwd_graph already ran
+            # with grad enabled, so the autograd tape exists and the
+            # backward just needs to run torch.autograd.grad from the
+            # replay outputs.  No forward recompute needed.
             with torch.cuda.stream(capture_stream):
                 # Make inputs require grad like at capture time
                 replay_inputs = tuple(
                     t.detach().clone().requires_grad_(t.requires_grad)
                     for t in self.static_inputs
                 )
-                replay_out = self._call_module(
-                    replay_inputs, self._tensor_param_names, self._frozen_kwargs
-                )
-                flat_replay_out = self._flatten_output_for_autograd(replay_out)
+                kwargs = dict(zip(self._tensor_param_names, replay_inputs))
+                kwargs.update(self._frozen_kwargs)
 
-                # 3. Capture the backward
-                self.bwd_graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(
-                    self.bwd_graph,
-                    pool=self._graph_pool,
-                    stream=capture_stream,
-                ):
-                    grad_ins = torch.autograd.grad(
-                        outputs=tuple(
-                            o for o in flat_replay_out if o.requires_grad
-                        ),
-                        inputs=tuple(
-                            t for t in replay_inputs if t.requires_grad
-                        ),
-                        grad_outputs=tuple(
-                            sg for sg, o in zip(static_grad_outputs, flat_replay_out)
-                            if o.requires_grad
-                        ),
-                        retain_graph=False,
-                        create_graph=False,
-                        only_inputs=True,
-                        allow_unused=True,
-                    )
+                if _CG_NO_GRAD_FWD:
+                    # Save for updating with ctx.saved_tensors before
+                    # each subsequent bwd_graph replay
+                    self._bwd_inputs = replay_inputs
+
+                    # Capture recompute forward + backward in bwd_graph
+                    self.bwd_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(
+                        self.bwd_graph,
+                        pool=self._graph_pool,
+                        stream=capture_stream,
+                    ):
+                        replay_out = self._orig_fwd(**kwargs)
+                        flat_replay_out = self._flatten_output_for_autograd(replay_out)
+                        grad_ins = torch.autograd.grad(
+                            outputs=tuple(
+                                o for o in flat_replay_out if o.requires_grad
+                            ),
+                            inputs=tuple(
+                                t for t in replay_inputs if t.requires_grad
+                            ),
+                            grad_outputs=tuple(
+                                sg for sg, o in zip(static_grad_outputs, flat_replay_out)
+                                if o.requires_grad
+                            ),
+                            retain_graph=False,
+                            create_graph=False,
+                            only_inputs=True,
+                            allow_unused=True,
+                        )
+                else:
+                    # Forward outside bwd_graph; backward inside
+                    replay_out = self._orig_fwd(**kwargs)
+                    flat_replay_out = self._flatten_output_for_autograd(replay_out)
+
+                    self.bwd_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(
+                        self.bwd_graph,
+                        pool=self._graph_pool,
+                        stream=capture_stream,
+                    ):
+                        grad_ins = torch.autograd.grad(
+                            outputs=tuple(
+                                o for o in flat_replay_out if o.requires_grad
+                            ),
+                            inputs=tuple(
+                                t for t in replay_inputs if t.requires_grad
+                            ),
+                            grad_outputs=tuple(
+                                sg for sg, o in zip(static_grad_outputs, flat_replay_out)
+                                if o.requires_grad
+                            ),
+                            retain_graph=False,
+                            create_graph=False,
+                            only_inputs=True,
+                            allow_unused=True,
+                        )
 
                 # Build static_grad_inputs aligned with self.static_inputs
                 # (with None where requires_grad=False).
@@ -1058,6 +1058,7 @@ class FSDPCudaGraphRunner:
         self.static_outputs = ()
         self.static_grad_outputs = ()
         self.static_grad_inputs = ()
+        self._bwd_inputs = ()
         self._captured = False
 
     # ------------------------------------------------------------------
