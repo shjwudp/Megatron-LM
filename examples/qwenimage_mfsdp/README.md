@@ -22,7 +22,7 @@ pip install flash-attn --no-build-isolation
 ## Download Model (run once)
 
 ```bash
-huggingface-cli download Qwen/Qwen-Image \
+hf download Qwen/Qwen-Image \
   --include "transformer/*" \
   --local-dir /tmp/qwen-image
 ```
