@@ -258,9 +258,9 @@ def train(
             # Dummy data
             x = torch.randn(args.batch_size, args.seq_len, args.model_dim,
                             device="cuda", dtype=torch.bfloat16)
-            if args.use_megatron_fsdp and hasattr(model, "set_is_last_microbatch"):
+            if args.use_megatron_fsdp and hasattr(model, "set_is_last_backward"):
                 # This toy loop has one micro-batch per optimizer step.
-                model.set_is_last_microbatch(True)
+                model.set_is_last_backward(True)
             y = model(x)
             loss = y.sum() / (args.batch_size * args.seq_len)
             loss.backward()
