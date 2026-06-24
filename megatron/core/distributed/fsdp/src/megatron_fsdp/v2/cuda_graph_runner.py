@@ -87,8 +87,10 @@ class _CudaGraphFunction(torch.autograd.Function):
         ctx.save_for_backward(*flat_inputs)
 
         # Return clones so downstream autograd does not alias static outputs
-        # (the next forward replay will overwrite them).
-        return tuple(o.clone() for o in runner.static_outputs)
+        # (the next forward replay will overwrite them).  Restore ``None``
+        # entries that were filtered during flattening.
+        flat = tuple(o.clone() for o in runner.static_outputs)
+        return runner._unflatten_output(flat)
 
     @staticmethod
     def backward(ctx, *grad_outputs):
@@ -149,6 +151,8 @@ class FSDPCudaGraphRunner:
         # Saved during capture_forward.
         self.static_inputs: Optional[Tuple[torch.Tensor, ...]] = None
         self.static_outputs: Optional[Tuple[torch.Tensor, ...]] = None
+        self._output_is_tuple: bool = False
+        self._none_mask: Optional[List[bool]] = None
         self._tensor_param_names: List[str] = []
         self._frozen_kwargs: Dict[str, Any] = {}
         self._orig_forward = None
@@ -198,13 +202,18 @@ class FSDPCudaGraphRunner:
         torch.cuda.synchronize()
         for _ in range(self._num_warmup):
             out = self._run_forward(self.static_inputs)
-            flat = self._flatten_outputs(out)
+            flat = self._flatten_output(out)
             loss = sum(o.sum() for o in flat if o.requires_grad)
             if loss.requires_grad:
                 loss.backward()
             for p in self._module.parameters():
                 p.grad = None
         torch.cuda.synchronize()
+
+        # ---- record output structure (including None positions) ----
+        out = self._run_forward(self.static_inputs)
+        self._record_output_structure(out)
+        self.static_outputs = self._flatten_output(out)
 
         # ---- capture forward graph (with grad enabled) ----
         #
@@ -227,7 +236,7 @@ class FSDPCudaGraphRunner:
                 with torch.autograd.graph.saved_tensors_hooks(
                     lambda t: t.clone(), lambda t: t
                 ):
-                    self.static_outputs = self._flatten_outputs(
+                    self.static_outputs = self._flatten_output(
                         self._run_forward(self.static_inputs)
                     )
 
@@ -413,11 +422,46 @@ class FSDPCudaGraphRunner:
         return self._orig_forward(**kw)
 
     @staticmethod
-    def _flatten_outputs(out: Any) -> Tuple[torch.Tensor, ...]:
-        """Normalise output to a tuple of tensors."""
+    def _flatten_output(out: Any) -> Tuple[torch.Tensor, ...]:
+        """Return a flat tuple of all non-``None`` tensors in *out*."""
         if isinstance(out, torch.Tensor):
             return (out,)
-        return tuple(out)
+        return tuple(t for t in out if isinstance(t, torch.Tensor))
+
+    def _record_output_structure(self, out: Any) -> None:
+        """Snapshot the output shape so ``_unflatten_output`` can restore it.
+
+        Tracks whether the original output was a single tensor vs. a tuple,
+        and which positions in the tuple were ``None``.
+        """
+        if isinstance(out, torch.Tensor):
+            self._output_is_tuple = False
+            self._none_mask = None
+        elif isinstance(out, (tuple, list)):
+            self._output_is_tuple = True
+            self._none_mask = [t is None for t in out]
+        else:
+            self._output_is_tuple = False
+            self._none_mask = None
+
+    def _unflatten_output(
+        self, flat: Tuple[torch.Tensor, ...]
+    ) -> Any:
+        """Restore the original output shape from a flat tensor tuple.
+
+        Returns a single ``torch.Tensor`` when the original output was not a
+        tuple, otherwise returns a tuple with ``None`` entries at their
+        original positions.
+        """
+        if not self._output_is_tuple:
+            return flat[0]
+        if self._none_mask is None or not any(self._none_mask):
+            return flat
+        result = list(flat)
+        for i, is_none in enumerate(self._none_mask):
+            if is_none:
+                result.insert(i, None)
+        return tuple(result)
 
 
 # ---------------------------------------------------------------------------
