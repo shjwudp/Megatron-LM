@@ -822,8 +822,9 @@ class FSDPCudaGraphRunner:
 
         Strategy:
           1. Allocate static grad-output buffers (cloned from live).
-          2. Capture forward recompute + backward into self.bwd_graph,
-             rooted at this autograd instance's saved input tensors.
+          2. If forward capture used no_grad, capture forward recompute +
+             backward into self.bwd_graph. If forward capture kept the
+             grad-enabled tape, capture only backward from self.static_outputs.
           3. Populate both activation grad-input buffers and FSDP
              parameter main-grad buffers as graph side effects.
 
@@ -850,11 +851,6 @@ class FSDPCudaGraphRunner:
 
             capture_stream = self._capture_stream or torch.cuda.current_stream()
 
-            # 2. Re-run forward inside the backward graph to build the
-            #    autograd tape used by this custom Function's backward.
-            #    Use ctx.saved_tensors, not self.static_inputs, because
-            #    self.static_inputs may already have been overwritten by a
-            #    later forward when schedules keep multiple microbatches live.
             torch.cuda.synchronize()
 
             # Parameter gradients must be produced as graph side effects.
@@ -877,19 +873,30 @@ class FSDPCudaGraphRunner:
                     param.grad = None
 
             with torch.cuda.stream(capture_stream):
-                # Make inputs require grad like the saved live inputs.
-                replay_inputs = tuple(
-                    t.detach().clone().requires_grad_(t.requires_grad)
-                    for t in saved_inputs
-                )
-                kwargs = dict(zip(self._tensor_param_names, replay_inputs))
-                kwargs.update(self._frozen_kwargs)
+                if _CG_NO_GRAD_FWD:
+                    # Forward replay from autograd.Function.forward does not
+                    # build a tape, so capture recompute + backward. The
+                    # replay input buffers must be created outside graph
+                    # capture so later backwards can copy live saved inputs
+                    # into them before bwd_graph.replay().
+                    replay_inputs = tuple(
+                        t.detach().clone().requires_grad_(t.requires_grad)
+                        for t in saved_inputs
+                    )
+                    kwargs = dict(zip(self._tensor_param_names, replay_inputs))
+                    kwargs.update(self._frozen_kwargs)
 
-                # Save for updating with ctx.saved_tensors before each
-                # subsequent bwd_graph replay.
-                self._bwd_inputs = replay_inputs
+                    self._bwd_inputs = replay_inputs
+                    input_tensors = replay_inputs
+                    flat_outputs = None
+                else:
+                    # Grad-enabled forward capture kept the tape. Capture
+                    # only backward from those static graph outputs.
+                    self._bwd_inputs = ()
+                    input_tensors = self.static_inputs
+                    flat_outputs = self.static_outputs
 
-                input_grad_targets = tuple(t for t in replay_inputs if t.requires_grad)
+                input_grad_targets = tuple(t for t in input_tensors if t.requires_grad)
                 all_grad_targets = input_grad_targets + trainable_params
 
                 self.bwd_graph = torch.cuda.CUDAGraph()
@@ -898,14 +905,17 @@ class FSDPCudaGraphRunner:
                     pool=self._graph_pool,
                     stream=capture_stream,
                 ):
-                    replay_out = self._orig_fwd(**kwargs)
-                    flat_replay_out = self._flatten_output_for_autograd(replay_out)
+                    if _CG_NO_GRAD_FWD:
+                        replay_out = self._orig_fwd(**kwargs)
+                        flat_outputs = self._flatten_output_for_autograd(replay_out)
+
+                    assert flat_outputs is not None
                     grad_outputs_for_capture = tuple(
-                        sg for sg, o in zip(static_grad_outputs, flat_replay_out)
+                        sg for sg, o in zip(static_grad_outputs, flat_outputs)
                         if o.requires_grad
                     )
                     grad_ins = torch.autograd.grad(
-                        outputs=tuple(o for o in flat_replay_out if o.requires_grad),
+                        outputs=tuple(o for o in flat_outputs if o.requires_grad),
                         inputs=all_grad_targets,
                         grad_outputs=grad_outputs_for_capture,
                         retain_graph=False,
@@ -931,7 +941,7 @@ class FSDPCudaGraphRunner:
                 # (with None where requires_grad=False).
                 grad_iter = iter(input_grad_ins)
                 static_grad_inputs: List[Optional[torch.Tensor]] = []
-                for t in replay_inputs:
+                for t in input_tensors:
                     if t.requires_grad:
                         static_grad_inputs.append(next(grad_iter))
                     else:
