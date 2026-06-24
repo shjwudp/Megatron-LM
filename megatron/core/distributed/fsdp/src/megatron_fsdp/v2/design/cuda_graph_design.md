@@ -215,20 +215,23 @@ FSDPCudaGraphRunner(module,
 ╚═══════════════════════════════════════════════════════════════╝
 ```
 
-## 9. Parameter gradient handling (FSDP main_grad)
+## 9. Parameter gradient handling
 
-FSDP's `reduce_grad()` consumes `param.main_grad`, not `param.grad`.  The
-backward graph must write parameter gradients into the correct buffers.
+Module parameters are passed through `_CudaGraphFunction.apply(runner, *user_args, *module_params)`.
+This follows `make_graphed_callables` — params participate in the autograd graph so their
+gradients flow through normal FSDP hooks.
 
-During backward capture:
+- **Forward**: only user args are staged into pool buffers; params stay at their stable addresses.
+  `fwd_graph.replay()` runs with `static_inputs` (user args) as inputs.
+- **Backward capture**: ``torch.autograd.grad(inputs=user_args + module_params, ...)``
+  computes gradients for both.  ``_static_grad_inputs`` records references to all
+  computed gradient tensors.
+- **Backward replay**: ``backward()`` returns ``(None_for_runner, *user_grads, *param_grads)``.
+  Autograd sets ``param.grad`` from the param grads; FSDP's post-backward hook
+  (``reduce_grad``) then consumes them normally via ``param.main_grad``.
 
-1. `_get_param_grad_buffer(p)` retrieves `p.main_grad` (for FSDP params) or
-   allocates `p.grad` (for non-FSDP params).
-2. `torch.autograd.grad` computes parameter gradients.
-3. The captured backward graph writes each `param_grad` into the corresponding
-   buffer via `buf.copy_(pg)` as a graph side effect.
-4. Before replay, `_restore_param_grad_buffers()` sets `p.main_grad = buf`
-   and `p.grad = None` so FSDP's post-backward hooks find the correct buffer.
+No manual ``buf.copy_()`` or grad buffer management is needed — the standard
+autograd + FSDP hook lifecycle handles everything.
 
 ## 10. Re-entrant capture prevention
 
