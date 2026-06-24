@@ -86,13 +86,14 @@ class _CudaGraphFunction(torch.autograd.Function):
         ctx.runner = runner
         ctx.save_for_backward(*flat_inputs)
 
-        # Return clones so downstream autograd does not alias static outputs
-        # (the next forward replay will overwrite them).  Restore ``None``
-        # entries that were filtered during flattening.
-        flat = tuple(o.clone() for o in runner.static_outputs)
+        # Return detach() so downstream autograd does not alias static
+        # outputs.  Replay order (all fwds then all bwds) guarantees
+        # static_outputs are not overwritten before their backward runs.
+        flat = tuple(o.detach() for o in runner.static_outputs)
         return runner._unflatten_output(flat)
 
     @staticmethod
+    @torch.autograd.function.once_differentiable
     def backward(ctx, *grad_outputs):
         runner = ctx.runner
 
@@ -197,17 +198,21 @@ class FSDPCudaGraphRunner:
             t.clone().detach().requires_grad_(t.requires_grad) for t in live_inputs
         )
 
-        # ---- warmup (eager forward + backward) ----
-        stream = self._capture_stream
+        # ---- warmup (eager forward + backward) on throwaway stream ----
+        #
+        # Isolate warmup allocations (cuDNN benchmarking, lazy init) from both
+        # the current stream and the capture stream so they don't pollute the
+        # graph pool.
         torch.cuda.synchronize()
-        for _ in range(self._num_warmup):
-            out = self._run_forward(self.static_inputs)
-            flat = self._flatten_output(out)
-            loss = sum(o.sum() for o in flat if o.requires_grad)
-            if loss.requires_grad:
-                loss.backward()
-            for p in self._module.parameters():
-                p.grad = None
+        with torch.cuda.stream(torch.cuda.Stream()):
+            for _ in range(self._num_warmup):
+                out = self._run_forward(self.static_inputs)
+                flat = self._flatten_output(out)
+                loss = sum(o.sum() for o in flat if o.requires_grad)
+                if loss.requires_grad:
+                    loss.backward()
+                for p in self._module.parameters():
+                    p.grad = None
         torch.cuda.synchronize()
 
         # ---- record output structure (including None positions) ----
@@ -224,6 +229,7 @@ class FSDPCudaGraphRunner:
         # clones instead of the originals.  This prevents autograd version
         # mismatches when ``fwd_graph.replay()`` later modifies the originals
         # inplace (e.g., TE RoPE's ``freqs`` tensor).
+        stream = self._capture_stream
         gen = _ensure_generator_graph_safe()
         self.fwd_graph = torch.cuda.CUDAGraph()
         self.fwd_graph.register_generator_state(gen)
@@ -290,8 +296,9 @@ class FSDPCudaGraphRunner:
             for o, g in zip(flat_outputs, grad_outputs)
         )
 
-        # 2. Trainable params — their gradients are written as graph
-        #    "side effects" into FSDP's main_grad buffers.
+        # 2. Trainable params are not autograd.grad targets here.  We only
+        #    initialize and remember their FSDP grad buffers so TE/Megatron
+        #    fused backward can write main_grad as a side effect.
         trainable = tuple(p for p in self._module.parameters() if p.requires_grad)
         grad_bufs: Tuple[torch.Tensor, ...] = tuple(
             _get_param_grad_buffer(p) for p in trainable
@@ -304,11 +311,11 @@ class FSDPCudaGraphRunner:
             if hasattr(p, "get_main_grad"):
                 p.grad = None
 
-        # 3. Autograd targets: static_inputs (for activation grads) + params.
+        # 3. Autograd targets: static_inputs only.  Parameter gradients are
+        #    handled by post-backward / TE side effects, not returned grads.
         input_targets = tuple(
             t for t in self.static_inputs if t.requires_grad
         )
-        all_targets = input_targets + trainable
 
         # 4. Capture bwd_graph: autograd.grad only (no forward recompute).
         torch.cuda.synchronize()
@@ -333,7 +340,7 @@ class FSDPCudaGraphRunner:
                 if outputs_with_grad:
                     grad_ins = torch.autograd.grad(
                         outputs=outputs_with_grad,
-                        inputs=all_targets,
+                        inputs=input_targets,
                         grad_outputs=grad_outs_for_capture,
                         retain_graph=False,
                         allow_unused=True,
@@ -343,16 +350,6 @@ class FSDPCudaGraphRunner:
 
                 n_input = len(input_targets)
                 input_grads = grad_ins[:n_input]
-                param_grads = grad_ins[n_input:]
-
-                # Write parameter gradients as graph side effects.
-                for param, buf, pg in zip(trainable, grad_bufs, param_grads):
-                    if pg is not None:
-                        buf.copy_(pg)
-                    else:
-                        grad_added = getattr(param, "grad_added_to_main_grad", False)
-                        if not grad_added:
-                            buf.zero_()
 
             # Build static_grad_inputs aligned with self.static_inputs.
             grad_iter = iter(input_grads)
@@ -372,7 +369,7 @@ class FSDPCudaGraphRunner:
         logger.info("Backward graph captured for module id=%s", id(self._module))
 
         return (None,) + tuple(
-            None if g is None else g.clone()
+            None if g is None else g.detach()
             for g in self._static_grad_inputs
         )
 
@@ -391,7 +388,7 @@ class FSDPCudaGraphRunner:
         self.bwd_graph.replay()
 
         return (None,) + tuple(
-            None if g is None else g.clone()
+            None if g is None else g.detach()
             for g in self._static_grad_inputs
         )
 
