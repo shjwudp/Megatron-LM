@@ -12,59 +12,58 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CUDA graph capture / replay for individual FSDP modules.
+"""Single-pass CUDA graph capture for FSDP modules with shared-pool and
+shared-buffer memory reuse.
 
-Per-module split forward/backward CUDA graph capture with a SHARED memory
-pool across modules. Designed to be a drop-in replacement for the original
-`make_graphed_callables`-based runner that interleaved fwd+bwd capture.
+Memory optimization: shared static buffers
+==========================================
 
-Key design — split fwd/bwd capture for shared-pool safety
----------------------------------------------------------
-The original `torch.cuda.make_graphed_callables` captures forward AND
-backward of one callable BACK-TO-BACK. When you do this once per module
-with a shared pool, the capture order looks like::
+In a transformer model with N identical layers, every forward graph reads
+from ``static_inputs`` (shape [B, S, H]) and every backward graph reads
+from ``static_grad_outputs`` (same shape). These are used SEQUENTIALLY
+(fwd0 -> fwd1 -> ... -> fwdN; bwdN -> ... -> bwd1 -> bwd0), never
+concurrently.
 
-    capture: fwd1, bwd1, fwd2, bwd2, fwd3, bwd3
-    runtime: fwd1, fwd2, fwd3, bwd3, bwd2, bwd1     ← MISMATCH → corruption
+By capturing ALL forward graphs reading from the SAME buffer address, and
+ALL backward graphs reading from the SAME grad buffer address, we reduce:
 
-This runner instead captures forward and backward as TWO SEPARATE
-``torch.cuda.CUDAGraph`` objects. Capture happens lazily during the
-first eager forward/backward, driven by FSDP hooks (which fire in
-execution order naturally). With one shared pool, capture order and
-runtime order match::
+    N x 2 x B*S*H  ->  1 x 2 x B*S*H   (for the input/grad buffers)
 
-    capture: fwd1, fwd2, fwd3, bwd3, bwd2, bwd1     ← driven by hook order
-    runtime: fwd1, fwd2, fwd3, bwd3, bwd2, bwd1     ← MATCH ✓
+For 80 layers, B=1, S=8192, H=12288, bf16: ~30 GB -> 384 MB.
 
-Memory savings vs. private-pool-per-layer
-------------------------------------------
-* **Workspace sharing** — cuDNN / cuBLAS scratch buffers live in the
-  pool and are reused across layers (instead of being duplicated N
-  times in N private pools).
-* **Pool packing** — the allocator packs allocations within one pool
-  much more tightly than across N independent pools.
+The ``CudaGraphPool`` manages shared buffers keyed by (shape, dtype).
+Each runner captures its graph reading from the shared buffer. At replay,
+we ``copy_`` the live tensor into the shared buffer then ``replay()``.
 
-API
----
-``FSDPCudaGraphRunner(fsdp_module, graph_pool=...)``
-    * ``capture_forward(*args, **kwargs)`` — eager forward + capture
-      forward graph. Must be called FIRST (drives capture order).
-    * ``install()`` — patch ``module.forward`` to use a custom
-      ``autograd.Function`` that replays the forward graph and, on
-      backward, lazily captures + replays a backward graph.
-    * ``uninstall()`` — restore the original ``forward``.
+Lifecycle (one pass, driven by FSDP hooks)
+==========================================
 
-Backward capture is fully lazy: the first time autograd reaches the
-custom ``Function.backward``, we run an eager backward to capture the
-backward graph, then replay it. Subsequent microbatches replay both.
+::
+
+    First microbatch (capture):
+      forward_pre_hook(layer_i):
+        1. Acquire shared input buffer from pool (by shape)
+        2. Pop hooks, warmup, capture fwd graph reading from shared buffer
+        3. Restore hooks, return output
+      backward_pre_hook(layer_i):
+        1. Acquire shared grad-output buffer from pool (by shape)
+        2. Pop hooks, capture bwd graph reading from shared grad buffer
+        3. Restore hooks, release fwd output memory hint
+        4. Replay bwd graph with live grads, return grad_inputs
+      post_backward_final:
+        install_all()
+
+    Second microbatch onward (replay):
+      _CudaGraphFunction.forward:
+        copy input -> shared buffer, replay fwd graph, clone outputs
+      _CudaGraphFunction.backward:
+        copy grads -> shared buffer, replay bwd graph, clone grad_inputs
 """
 
-import contextlib
 import gc
 import inspect
 import logging
 import os
-import warnings
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -73,100 +72,49 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-# ------------------------------------------------------------------
-# Debug toggles (env-var gated, no-op when disabled)
-# ------------------------------------------------------------------
-# MFSDP_CG_MEM_DEBUG selects a memory-debug mode. CG and no-CG are
-# measured in SEPARATE runs to avoid mutual interference between the
-# CUDA graph pool and the caching allocator:
-#
-#   MFSDP_CG_MEM_DEBUG=cg    — capture CG normally; for the first
-#                              MFSDP_CG_MEM_SNAP_LAYERS layers, dump
-#                              cg_layer{N}_rank{R}.pickle right after
-#                              the forward graph is captured.
-#   MFSDP_CG_MEM_DEBUG=nocg  — do NOT capture any CG. capture_forward
-#                              just stores debug state; install()
-#                              patches module.forward so the REAL
-#                              forward (the one that runs after the
-#                              pre_hook returns) is wrapped with
-#                              memory recording + snapshot dump.
-#                              Files: nocg_layer{N}_rank{R}.pickle.
-#   MFSDP_CG_MEM_DEBUG=1     — alias for "cg".
-#
-# Snapshots are loadable at https://pytorch.org/memory_viz — drag in
-# the cg and nocg pickles from two separate runs to compare.
-_CG_MEM_MODE_RAW: str = os.environ.get("MFSDP_CG_MEM_DEBUG", "").lower()
-if _CG_MEM_MODE_RAW in ("cg", "1", "true", "yes"):
-    _CG_MEM_MODE: str = "cg"
-elif _CG_MEM_MODE_RAW in ("nocg", "no-cg", "eager"):
-    _CG_MEM_MODE = "nocg"
-else:
-    _CG_MEM_MODE = ""
-# Optional override for the snapshot dump directory. Defaults to
-# ./cg_mem_snapshots.
-_CG_MEM_SNAPSHOT_DIR: Optional[str] = os.environ.get("MFSDP_CG_MEM_SNAPSHOT_DIR")
-# Number of leading captured layers to dump per-layer torch.cuda memory
-# snapshots for. Useful for checking whether the no-CG caching allocator
-# reuses memory across layers while the CG graph pool does not. Set to a
-# larger value to trace more layers (filenames are zero-indexed:
-# cg_layer0_rankN.pickle, cg_layer1_rankN.pickle, ...). Default 2.
-_CG_MEM_SNAP_LAYERS: int = int(os.environ.get("MFSDP_CG_MEM_SNAP_LAYERS", "2"))
-
-# MFSDP_CG_COMPILE_FWD controls whether capture_forward compiles
-# module.forward with torch.compile before warmup + capture. Without
-# this, the captured graph runs the un-fused Python-level forward body
-# (each matmul / activation allocates its own workspace and saves its
-# own activation for backward), which uses significantly more memory
-# than the no-CG path where the user's blk.compile() drives inductor
-# fusion. With this enabled, the captured graph contains inductor
-# triton kernels — same memory profile as the no-CG path.
-#
-#   MFSDP_CG_COMPILE_FWD=1   — compile forward body, capture fused kernels
-#   MFSDP_CG_COMPILE_FWD=0   — (default) legacy: capture eager forward body
-_CG_COMPILE_FWD: bool = os.environ.get("MFSDP_CG_COMPILE_FWD", "0").lower() in (
+_CG_NO_GRAD_FWD: bool = os.environ.get(
+    "MFSDP_CG_NO_GRAD_FWD", os.environ.get("_CG_NO_GRAD_FWD", "0")
+).lower() in ("1", "true", "yes", "on")
+_CG_MEM_DEBUG: bool = os.environ.get("MFSDP_CG_MEM_DEBUG", "0").lower() in (
     "1",
+    "cg",
     "true",
     "yes",
     "on",
 )
 
-# MFSDP_CG_NO_GRAD_FWD controls whether the forward CUDA graph is
-# captured under torch.no_grad().  This is a strictly better approach
-# than torch.utils.checkpoint for our separate-fwd/bwd-graph
-# architecture:
-#
-#   - The captured fwd_graph is replayed at runtime inside
-#     _CudaGraphFunction.forward, which is a torch.autograd.Function.
-#     PyTorch runs autograd Function forward methods with grad DISABLED,
-#     so fwd_graph.replay() already executes under no_grad at runtime.
-#     Capturing under no_grad makes capture-time behavior match
-#     replay-time behavior exactly (CUDA graph requirement).
-#   - SavedVariables accumulated during the capture (the 312 MB/layer
-#     inductor activation row in the analysis) are never used by the
-#     bwd graph because _capture_backward_and_run already re-runs the
-#     forward with grad enabled to build a fresh autograd tape.
-#     Capturing forward with no_grad drops those dead SavedVariables
-#     entirely — no recompute cost, no bwd-graph growth.
-#
-# Default is ON because it is more correct than the legacy behavior
-# (legacy captured with grad enabled, which is inconsistent with the
-# runtime no_grad dispatch).  Set to 0 only for debugging.
-#
-#   MFSDP_CG_NO_GRAD_FWD=1  — (default) capture fwd_graph under no_grad
-#   MFSDP_CG_NO_GRAD_FWD=0  — legacy: capture with grad enabled
-_CG_NO_GRAD_FWD: bool = os.environ.get("MFSDP_CG_NO_GRAD_FWD", "1").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
+
+# ------------------------------------------------------------------
+# Tensor aliasing trick (inspired by TE's _WeakRefTensor / make_weak_ref)
+# ------------------------------------------------------------------
+
+
+def _make_viewless_tensor(src: torch.Tensor, requires_grad: bool) -> torch.Tensor:
+    """Create a NEW tensor that shares memory with *src* but is a fresh
+    leaf in autograd -- no ._base, no grad_fn, independently requires_grad.
+
+    This bypasses the "leaf Variable used in in-place operation" error
+    because the returned tensor is a brand-new leaf that happens to
+    alias the same storage. PyTorch only checks the Python tensor
+    object's autograd metadata, not the raw data_ptr.
+
+    Equivalent to TE's `safely_set_viewless_tensor_data` pattern.
+    """
+    new_tensor = torch.empty([], dtype=src.dtype, device=src.device)
+    new_tensor.set_(
+        src.untyped_storage(),
+        storage_offset=src.storage_offset(),
+        size=src.shape,
+        stride=src.stride(),
+    )
+    new_tensor.requires_grad_(requires_grad)
+    return new_tensor
 
 
 # ------------------------------------------------------------------
 # Hook helpers
 # ------------------------------------------------------------------
 
-# All known hook attributes across PyTorch versions (including 2.x additions).
 _HOOK_ATTRS = [
     "_forward_pre_hooks",
     "_forward_hooks",
@@ -181,7 +129,6 @@ _HOOK_ATTRS = [
 
 
 def _get_forward_param_names(module_cls) -> List[str]:
-    """Return the ordered parameter names of ``forward`` (excluding 'self')."""
     sig = inspect.signature(module_cls.forward)
     return [
         name
@@ -196,246 +143,302 @@ def _get_forward_param_names(module_cls) -> List[str]:
     ]
 
 
-def _pop_hooks(module: torch.nn.Module) -> Dict[str, Any]:
-    """Remove all hooks from *module* (non-recursive) and return a snapshot."""
-    saved: Dict[str, Any] = {}
-    for attr in _HOOK_ATTRS:
-        if hasattr(module, attr):
-            saved[attr] = getattr(module, attr)
-            setattr(module, attr, OrderedDict())
-    return saved
-
-
 def _pop_hooks_recursive(
     module: torch.nn.Module,
 ) -> List[Tuple[torch.nn.Module, Dict[str, Any]]]:
-    """Remove all hooks from *module* and all its submodules recursively."""
     saved: List[Tuple[torch.nn.Module, Dict[str, Any]]] = []
     for submodule in module.modules():
-        saved.append((submodule, _pop_hooks(submodule)))
+        snap: Dict[str, Any] = {}
+        for attr in _HOOK_ATTRS:
+            if hasattr(submodule, attr):
+                snap[attr] = getattr(submodule, attr)
+                setattr(submodule, attr, OrderedDict())
+        saved.append((submodule, snap))
     return saved
 
 
-def _restore_hooks(module: torch.nn.Module, saved: Dict[str, Any]) -> None:
-    """Put the hooks back exactly as they were."""
-    for name, value in saved.items():
-        if value is not None:
-            setattr(module, name, value)
-
-
 def _restore_hooks_recursive(
-    module: torch.nn.Module,
     saved: List[Tuple[torch.nn.Module, Dict[str, Any]]],
 ) -> None:
-    """Restore hooks for all submodules saved by ``_pop_hooks_recursive``."""
-    for submodule, sub_saved in saved:
-        _restore_hooks(submodule, sub_saved)
+    for submodule, snap in saved:
+        for name, value in snap.items():
+            if value is not None:
+                setattr(submodule, name, value)
+
+
+def _ensure_generator_graph_safe(device: Optional[int] = None):
+    if device is None:
+        device = torch.cuda.current_device()
+    gen = torch.cuda.default_generators[device]
+    state = gen.get_state()
+    if hasattr(state, "is_inference") and state.is_inference():
+        with torch.no_grad():
+            gen.set_state(state.clone())
+    return gen
 
 
 # ------------------------------------------------------------------
-# Custom autograd Function — replays fwd graph, lazily captures bwd graph
+# Shared pool + buffer manager
+# ------------------------------------------------------------------
+
+
+class CudaGraphPool:
+    """Shared CUDA graph memory pool and reusable static buffer registry.
+
+    Manages:
+    * A shared ``graph_pool_handle`` for all captured graphs (workspace reuse).
+    * A registry of shared static buffers keyed by (shape, dtype, direction).
+      Multiple runners with the same input shape share ONE buffer.
+    * A single capture stream for ordered capture.
+
+    Parameters
+    ----------
+    pool:
+        Optional existing pool handle. If None, creates a new one.
+    """
+
+    def __init__(self, pool: Optional[Any] = None):
+        self.pool: Any = pool or torch.cuda.graph_pool_handle()
+        self.capture_stream: torch.cuda.Stream = torch.cuda.Stream()
+
+        # Shared buffer registry: (shape_tuple, dtype, direction) -> Tensor
+        # direction is "input" or "grad_output"
+        self._shared_buffers: Dict[Tuple[Tuple[int, ...], torch.dtype, str], torch.Tensor] = {}
+
+    def get_shared_input_buffer(
+        self,
+        shape: Tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        requires_grad: bool = True,
+    ) -> torch.Tensor:
+        """Get or create a shared static input buffer for forward graphs.
+
+        All layers with the same input shape/dtype share ONE buffer.
+        Each fwd graph is captured reading from this address; at replay,
+        we copy_ into it before replay().
+        """
+        key = (tuple(shape), dtype, "input")
+        if key not in self._shared_buffers:
+            buf = torch.empty(
+                shape, dtype=dtype, device=device
+            ).requires_grad_(requires_grad)
+            self._shared_buffers[key] = buf
+            logger.debug(
+                "CudaGraphPool: allocated shared input buffer %s %s (%.1f MB)",
+                shape, dtype, buf.nelement() * buf.element_size() / 1e6,
+            )
+        return self._shared_buffers[key]
+
+    def get_shared_grad_output_buffer(
+        self,
+        shape: Tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Get or create a shared static grad-output buffer for bwd graphs.
+
+        All layers with the same grad shape/dtype share ONE buffer.
+        Each bwd graph is captured reading from this address.
+        """
+        key = (tuple(shape), dtype, "grad_output")
+        if key not in self._shared_buffers:
+            buf = torch.empty(shape, dtype=dtype, device=device)
+            self._shared_buffers[key] = buf
+            logger.debug(
+                "CudaGraphPool: allocated shared grad_output buffer %s %s (%.1f MB)",
+                shape, dtype, buf.nelement() * buf.element_size() / 1e6,
+            )
+        return self._shared_buffers[key]
+
+    def get_shared_buffers_for_inputs(
+        self,
+        sample_tensors: Tuple[torch.Tensor, ...],
+    ) -> Tuple[torch.Tensor, ...]:
+        """Get shared input buffers matching a tuple of sample tensors.
+
+        Each position gets its own shared buffer (keyed by shape+dtype+index
+        to handle multiple input tensors with different shapes).
+
+        NOTE: The returned buffers do NOT have requires_grad set. Callers
+        must use _make_viewless_tensor() to create a grad-enabled alias
+        for autograd without triggering in-place errors on copy_().
+        """
+        buffers = []
+        for i, t in enumerate(sample_tensors):
+            key = (tuple(t.shape), t.dtype, f"input_{i}")
+            if key not in self._shared_buffers:
+                # Allocate WITHOUT requires_grad -- it's just raw storage.
+                buf = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+                self._shared_buffers[key] = buf
+            buffers.append(self._shared_buffers[key])
+        return tuple(buffers)
+
+    def get_shared_buffers_for_grad_outputs(
+        self,
+        sample_tensors: Tuple[torch.Tensor, ...],
+    ) -> Tuple[torch.Tensor, ...]:
+        """Get shared grad-output buffers matching a tuple of output tensors.
+
+        Like input buffers, these are raw (no requires_grad) storage.
+        """
+        buffers = []
+        for i, t in enumerate(sample_tensors):
+            key = (tuple(t.shape), t.dtype, f"grad_output_{i}")
+            if key not in self._shared_buffers:
+                buf = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+                self._shared_buffers[key] = buf
+            buffers.append(self._shared_buffers[key])
+        return tuple(buffers)
+
+    def synchronize(self):
+        torch.cuda.current_stream().wait_stream(self.capture_stream)
+        torch.cuda.synchronize()
+
+    def reset(self):
+        self._shared_buffers.clear()
+
+
+# ------------------------------------------------------------------
+# Autograd Function for replay
 # ------------------------------------------------------------------
 
 
 class _CudaGraphFunction(torch.autograd.Function):
-    """Autograd Function that wires a fwd/bwd CUDA graph pair into autograd.
+    """Replay fwd graph on forward, bwd graph on backward.
 
-    Forward path
-    ------------
-    1. Copy live inputs into static input buffers.
-    2. Replay the forward graph — writes into static output buffers.
-    3. Return clones of the static outputs (so the autograd tape sees
-       fresh leaf-like tensors and downstream ops never alias the
-       graph's static output memory).
-
-    Backward path
-    -------------
-    On first backward:
-      * Capture the backward graph by running an eager backward with
-        gradient inputs cloned into static grad-output buffers, while
-        gradients are accumulated into static grad-input buffers.
-    On subsequent backwards:
-      * Copy upstream grads into static grad-output buffers, replay
-        the backward graph, return static grad-inputs.
+    Static buffers are SHARED across layers -- the copy_ into them is
+    what "selects" which layer's data is active.
     """
 
     @staticmethod
     def forward(ctx, runner, *flat_inputs):
-        # 1. Stage inputs into static buffers
-        for static, live in zip(runner.static_inputs, flat_inputs):
-            if static.data_ptr() != live.data_ptr():
-                static.copy_(live)
+        # Copy live inputs -> raw (no-grad) shared buffers.
+        # The fwd graph reads from the same addresses (via viewless alias).
+        for raw_buf, live in zip(runner._raw_input_buffers, flat_inputs):
+            if raw_buf.data_ptr() != live.data_ptr():
+                raw_buf.copy_(live)
 
-        # 2. Replay the forward graph
-        runner.fwd_graph.replay()
+        # Replay forward graph
+        runner._fwd_graph.replay()
 
-        # 3. Stash for backward
         ctx.runner = runner
-        ctx.save_for_backward(*flat_inputs)
+        if _CG_NO_GRAD_FWD:
+            ctx.save_for_backward(*flat_inputs)
 
-        # Return clones so downstream ops do not alias the static
-        # output buffers (which the next forward replay overwrites).
-        return tuple(o.clone() for o in runner.static_outputs)
+        # Clone outputs OUT of pool immediately (before next layer's
+        # fwd replay could overwrite shared pool memory).
+        cloned = tuple(o.clone() for o in runner._static_outputs)
+        return cloned
 
     @staticmethod
     def backward(ctx, *grad_outputs):
         runner = ctx.runner
 
-        # ---- First backward: capture backward graph ----
-        if runner.bwd_graph is None:
-            return runner._capture_backward_and_run(ctx.saved_tensors, grad_outputs)
+        # First backward: capture bwd graph lazily
+        if runner._bwd_graph is None:
+            result = runner.capture_backward(grad_outputs, ctx.saved_tensors)
+            return (None,) + result
 
-        # ---- Subsequent backwards: replay ----
-        # Copy saved forward inputs into the bwd_graph's replay buffers
-        # so the recompute forward runs with the correct values.
+        # Subsequent backwards: replay
         if runner._bwd_inputs:
-            for static, live in zip(runner._bwd_inputs, ctx.saved_tensors):
-                if static.data_ptr() != live.data_ptr():
-                    static.copy_(live)
+            with torch.no_grad():
+                for static, live in zip(runner._bwd_inputs, ctx.saved_tensors):
+                    if static.data_ptr() != live.data_ptr():
+                        static.copy_(live)
 
-        for static, live in zip(runner.static_grad_outputs, grad_outputs):
+        for raw_buf, live in zip(runner._raw_grad_output_buffers, grad_outputs):
             if live is None:
                 continue
-            if static.data_ptr() != live.data_ptr():
-                static.copy_(live)
+            if raw_buf.data_ptr() != live.data_ptr():
+                raw_buf.copy_(live)
 
-        runner._restore_param_grad_buffers()
-        runner.bwd_graph.replay()
+        # Replay backward graph
+        runner._bwd_graph.replay()
 
-        # Return (None for runner) + clones of static grad-inputs
-        return (None,) + tuple(
+        # (None for runner) + cloned grad_inputs
+        cloned = tuple(
             None if g is None else g.clone()
-            for g in runner.static_grad_inputs
+            for g in runner._static_grad_inputs
         )
+        return (None,) + cloned
 
 
 # ------------------------------------------------------------------
-# Runner
+# Per-module runner
 # ------------------------------------------------------------------
 
 
 class FSDPCudaGraphRunner:
-    """Captures forward and backward CUDA graphs SEPARATELY for one
-    FSDP module, sharing a pool with all other modules' graphs.
+    """Per-module CUDA graph runner with shared static buffers.
 
-    Public API matches the original ``FSDPCudaGraphRunner``:
-
-        runner = FSDPCudaGraphRunner(my_fsdp_module, graph_pool=pool)
-        runner.capture_forward(*sample_args, **sample_kwargs)
-        runner.install()
-        # ... training loop runs eagerly through patched forward;
-        #     first backward captures bwd graph, subsequent ones replay
-        runner.uninstall()
-
-    The ``graph_pool`` argument is REQUIRED (well, strongly recommended)
-    when using multiple modules — pass the same handle to every module
-    so all forward + backward graphs share one pool.
+    Captures forward and backward graphs inline (one pass) during the
+    first microbatch. Uses shared input/grad buffers from ``CudaGraphPool``
+    so N layers with the same shape share a single buffer (~30GB savings
+    for large models).
 
     Parameters
     ----------
     fsdp_module:
-        The FSDP module to capture.
-    graph_pool:
-        Shared CUDA graph memory pool handle (from
-        ``torch.cuda.graph_pool_handle()``). All FSDP modules sharing
-        a pool MUST be captured in true execution order; the FSDP
-        forward hook fires in execution order, so this naturally holds.
-    gc_freeze:
-        If True (default), call ``gc.collect()`` and ``gc.freeze()``
-        before capture to prevent Python GC from stalling replay.
-    capture_stream:
-        Optional ``torch.cuda.Stream`` to use as the capture stream.
-        When sharing a pool, all captures should run on the same
-        stream — typically ``ctx.cuda_graph_stream``.
+        The FSDP module to graph.
+    shared_pool:
+        ``CudaGraphPool`` instance shared across all modules.
     num_warmup_iters:
-        Eager warmup iterations before capture (default 3). Settles
-        cuDNN benchmarking and TE FP8 scales.
+        Warmup iterations before capture (default 3).
     """
 
     def __init__(
         self,
         fsdp_module: torch.nn.Module,
-        graph_pool: Optional[Any] = None,
-        gc_freeze: bool = True,
-        capture_stream: Optional[torch.cuda.Stream] = None,
+        shared_pool: CudaGraphPool,
         num_warmup_iters: int = 3,
     ):
-        warnings.warn(
-            "FSDPCudaGraphRunner is an experimental feature. The API and "
-            "behaviour may change in future releases without notice.",
-            FutureWarning,
-            stacklevel=2,
-        )
-
-        self._module: torch.nn.Module = fsdp_module
-        self._graph_pool: Optional[Any] = graph_pool
-        self._gc_freeze: bool = gc_freeze
-        self._capture_stream: Optional[torch.cuda.Stream] = capture_stream
-        self._num_warmup_iters: int = num_warmup_iters
+        self._module = fsdp_module
+        self._pool = shared_pool
+        self._num_warmup_iters = num_warmup_iters
 
         # Module identifier for debug logging
         self._module_name = getattr(fsdp_module, "_fsdp_module_name", fsdp_module.__class__.__name__)
         self._log_prefix = f"[{self._module_name}]"
 
-        # Forward graph state
-        self.fwd_graph: Optional[torch.cuda.CUDAGraph] = None
-        self.static_inputs: Tuple[torch.Tensor, ...] = ()
-        self.static_outputs: Tuple[torch.Tensor, ...] = ()
+        # Forward state (static_inputs is SHARED across layers)
+        self._fwd_graph: Optional[torch.cuda.CUDAGraph] = None
+        self._static_inputs: Tuple[torch.Tensor, ...] = ()
+        self._raw_input_buffers: Tuple[torch.Tensor, ...] = ()
+        self._static_outputs: Tuple[torch.Tensor, ...] = ()
 
-        # Backward graph state (captured lazily on first backward)
-        self.bwd_graph: Optional[torch.cuda.CUDAGraph] = None
-        self.static_grad_outputs: Tuple[torch.Tensor, ...] = ()
-        self.static_grad_inputs: Tuple[Optional[torch.Tensor], ...] = ()
-        self._bwd_inputs: Tuple[torch.Tensor, ...] = ()  # replay_inputs for bwd_graph
-        self._bwd_trainable_params: Tuple[torch.nn.Parameter, ...] = ()
-        self._param_grad_buffers: Tuple[torch.Tensor, ...] = ()
+        # Backward state (static_grad_outputs is SHARED across layers)
+        self._bwd_graph: Optional[torch.cuda.CUDAGraph] = None
+        self._static_grad_outputs: Tuple[torch.Tensor, ...] = ()
+        self._raw_grad_output_buffers: Tuple[torch.Tensor, ...] = ()
+        self._static_grad_inputs: Tuple[Optional[torch.Tensor], ...] = ()
+        self._bwd_inputs: Tuple[torch.Tensor, ...] = ()
 
-        # Frozen capture metadata
+        # Metadata
         self._tensor_param_names: List[str] = []
         self._param_names: List[str] = []
         self._frozen_kwargs: Dict[str, Any] = {}
         self._output_is_tuple: bool = True
         self._none_mask: Optional[List[bool]] = None
 
-        # Install state
-        self._orig_fwd: Optional[Any] = None
-        self._captured: bool = False
+        # State
+        self._fwd_captured: bool = False
+        self._bwd_captured: bool = False
         self._installed: bool = False
-
-        # Inductor-fusion state for capture_forward. When
-        # _CG_COMPILE_FWD is enabled we temporarily replace
-        # self._module.forward with torch.compile(<original forward>)
-        # so warmup populates dynamo's cache and capture runs the
-        # cached triton kernels (which are CUDA-graph capturable).
-        # After capture we restore the original forward so install()
-        # sees the user-written body.
-        self._captured_fwd_was_compiled: bool = False
-        self._orig_fwd_body: Optional[Any] = None
-
-        # Debug state (nocg mode — patches module.forward to record the
-        # REAL forward call instead of running a separate debug forward)
-        self._debug_layer_index: int = -1
-        self._debug_do_snapshot: bool = False
-        self._debug_snap_dir: str = ""
-        self._debug_rank: int = 0
-        self._debug_recorded: bool = False
+        self._orig_fwd: Optional[Any] = None
 
     # ------------------------------------------------------------------
-    # 1. Forward capture
+    # Forward capture
     # ------------------------------------------------------------------
 
-    def capture_forward(self, *sample_args, **sample_kwargs) -> None:
-        """Eagerly warm up + capture the forward graph.
+    def capture_forward(self, *sample_args, **sample_kwargs) -> Any:
+        """Capture forward graph inline. Returns the module's output.
 
-        Runs ``num_warmup_iters`` eager forward+backward passes (no
-        capture) to settle cuDNN / FP8 scales, then captures one
-        forward pass into ``self.fwd_graph`` using the shared pool.
+        The forward graph reads from SHARED static input buffers
+        (acquired from CudaGraphPool). All layers with same input shape
+        read from the same address.
         """
-        assert getattr(self._module, "cuda_graph_compatible", True), (
-            "CUDA graph capture requires TracePoolAllocator in optimized phase"
-        )
-
-        # ---- 1. Introspect signature, separate tensor / non-tensor inputs ----
+        # ---- 1. Parse inputs ----
         param_names = _get_forward_param_names(self._module.__class__)
         bound: Dict[str, Any] = {}
         for i, val in enumerate(sample_args):
@@ -452,471 +455,229 @@ class FSDPCudaGraphRunner:
             if n not in tensor_names
         }
 
-        # ---- 2. Build static input buffers ----
-        # Static buffers are clones of the live samples, allocated INSIDE
-        # the shared pool's address space because we are about to enter
-        # graph capture. They become the addresses recorded in the graph.
-        flat_live = tuple(bound[n] for n in tensor_names)
-        # We hold a clone for static inputs that requires_grad mirrors live.
+        # ---- 2. Acquire SHARED static input buffers ----
+        sample_tensors = tuple(bound[n] for n in tensor_names)
+        raw_buffers = self._pool.get_shared_buffers_for_inputs(sample_tensors)
+
+        # Copy sample data into shared buffers.
+        # raw_buffers have NO requires_grad -> copy_ is safe (no autograd error).
+        for buf, sample in zip(raw_buffers, sample_tensors):
+            buf.copy_(sample.detach())
+
+        # Create viewless aliases WITH requires_grad for graph capture.
+        # These are fresh leaves sharing the same memory -- autograd sees
+        # them as new tensors, so future copy_() on the raw buffer won't
+        # trigger "leaf Variable used in in-place operation".
         static_inputs = tuple(
-            t.clone().detach().requires_grad_(t.requires_grad) for t in flat_live
+            _make_viewless_tensor(buf, requires_grad=sample.requires_grad)
+            for buf, sample in zip(raw_buffers, sample_tensors)
         )
 
-        # Zero grads, unshard main grad buffer (matches original runner).
+        self._static_inputs = static_inputs
+        # Keep raw buffer refs for replay-time copy_ (no grad -> no error)
+        self._raw_input_buffers = raw_buffers
+        self._tensor_param_names = tensor_names
+        self._param_names = param_names
+        self._frozen_kwargs = frozen_kwargs
+
+        # Zero grads, unshard main grad buffer
         for param in self._module.parameters():
             param.grad = None
-        self._unshard_main_grad_buffer()
 
-        ctx = getattr(self._module, "_fsdp_root_context", None)
-
-        # Debug: detect the first N captured layers so we can dump a
-        # torch memory snapshot for each. The capture pre-hook fires in
-        # forward execution order, so the counter matches the layer
-        # index (0-based). Snapshots are controlled by
-        # MFSDP_CG_MEM_SNAP_LAYERS (default 2: traces layer0 + layer1
-        # so we can see whether the no-CG caching allocator reuses
-        # memory between layers while the CG graph pool does not).
-        layer_index = -1
-        do_snapshot = False
-        if _CG_MEM_MODE and ctx is not None:
-            seq = getattr(ctx, "_cg_capture_seq", 0)
-            layer_index = seq
-            do_snapshot = seq < _CG_MEM_SNAP_LAYERS
-            ctx._cg_capture_seq = seq + 1
-
-        # ============================================================
-        # nocg mode: store debug state and return. install() will patch
-        # module.forward so the REAL forward (after pre_hook returns)
-        # is recorded + snapshotted. No hooks-pop, no warmup, no extra
-        # forward — the snapshot captures the actual training forward.
-        # ============================================================
-        if _CG_MEM_MODE == "nocg":
-            _rank = (
-                torch.distributed.get_rank()
-                if torch.distributed.is_available()
-                and torch.distributed.is_initialized()
-                else 0
-            )
-            _snap_dir = _CG_MEM_SNAPSHOT_DIR or "cg_mem_snapshots"
-            self._debug_layer_index = layer_index
-            self._debug_do_snapshot = do_snapshot
-            self._debug_snap_dir = _snap_dir
-            self._debug_rank = _rank
-            self._debug_recorded = False
-            self._captured = True
-            return
-
-        # ---- 3. Pop hooks so capture sees only forward() body ----
+        # Pop hooks
         saved_hooks = _pop_hooks_recursive(self._module)
-        prev_active = False
-        if ctx is not None:
-            prev_active = getattr(ctx, "cuda_graph_active", False)
-            ctx.cuda_graph_active = True
 
-        # GC freeze
-        if self._gc_freeze:
-            gc.collect()
-            gc.freeze()
+        gc.collect()
 
         try:
-            # ---- 3b. Optionally wrap forward body with torch.compile so
-            #          capture sees fused inductor kernels rather than
-            #          the raw eager Python body. ----
-            #
-            # The wrapper is temporary: we restore the original forward in
-            # the finally block so install() sees the user-written body.
-            if _CG_COMPILE_FWD:
-                _orig_fwd_body = self._module.forward
-                try:
-                    if not hasattr(_orig_fwd_body, "get_compiler_config"):
-                        target_fwd = torch.compile(_orig_fwd_body)
-                        self._module.forward = target_fwd
-                        self._captured_fwd_was_compiled = True
-                        self._orig_fwd_body = _orig_fwd_body
-                        logger.info(
-                            "%s [cg-compile-fwd] compiled forward body for "
-                            "inductor fusion during capture",
-                            self._log_prefix,
-                        )
-                except Exception as e:
-                    logger.warning(
-                        "%s [cg-compile-fwd] forward wrapping failed (%s); "
-                        "capturing eager forward (legacy behavior)",
-                        self._log_prefix,
-                        e,
-                    )
-                    if self._captured_fwd_was_compiled:
-                        self._module.forward = self._orig_fwd_body
-                        self._orig_fwd_body = None
-                        self._captured_fwd_was_compiled = False
-
-            # ---- 4. Pick / create capture stream ----
-            capture_stream = self._capture_stream
-            if capture_stream is None:
-                capture_stream = torch.cuda.Stream()
-
-            # ---- 5. Warmup on a side stream (matches PyTorch's own
-            #          make_graphed_callables) ----
+            stream = self._pool.capture_stream
             torch.cuda.synchronize()
+
+            # ---- 3. Warmup ----
             warmup_stream = torch.cuda.Stream()
             warmup_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(warmup_stream):
                 for _ in range(self._num_warmup_iters):
-                    out = self._call_module(static_inputs, tensor_names, frozen_kwargs)
-                    flat_out = self._flatten_output_for_autograd(out)
+                    out = self._call_module(static_inputs)
+                    flat_out = self._flatten_output(out)
                     if any(o.requires_grad for o in flat_out):
-                        grads = tuple(
-                            torch.empty_like(o) for o in flat_out if o.requires_grad
-                        )
                         torch.autograd.grad(
                             outputs=tuple(o for o in flat_out if o.requires_grad),
                             inputs=tuple(
                                 t for t in static_inputs + tuple(self._module.parameters())
                                 if t.requires_grad
                             ),
-                            grad_outputs=grads,
+                            grad_outputs=tuple(
+                                torch.empty_like(o) for o in flat_out if o.requires_grad
+                            ),
                             only_inputs=True,
                             allow_unused=True,
-                            retain_graph=False,
                         )
-                    # Drop references so warmup activations free.
                     del out, flat_out
+                for param in self._module.parameters():
+                    param.grad = None
             torch.cuda.current_stream().wait_stream(warmup_stream)
             torch.cuda.synchronize()
+            del warmup_stream
 
-            # Reset grads after warmup
-            for param in self._module.parameters():
-                param.grad = None
+            # Full cleanup: collect cyclic autograd garbage from warmup, THEN
+            # freeze GC and release freed blocks back to CUDA.
+            gc.collect()
+            torch.cuda.empty_cache()
+            gc.collect()  # second pass catches ref-cycles broken by first collect
+            torch.cuda.empty_cache()
 
-            # When compile + no_grad_fwd are both on, the capture forward
-            # runs under torch.no_grad() which traces a DIFFERENT inductor
-            # graph than the grad-enabled warmup above. Run an extra no_grad
-            # warmup pass so triton autotuning fires here (outside capture)
-            # rather than during capture where cuda.synchronize() is illegal
-            # (cudaErrorStreamCaptureUnsupported).
-            if _CG_COMPILE_FWD and _CG_NO_GRAD_FWD:
-                with torch.cuda.stream(warmup_stream):
-                    with torch.no_grad():
-                        _ = self._call_module(static_inputs, tensor_names, frozen_kwargs)
-                torch.cuda.current_stream().wait_stream(warmup_stream)
-                torch.cuda.synchronize()
+            # ---- 4. Capture forward ----
+            gen = _ensure_generator_graph_safe()
+            self._fwd_graph = torch.cuda.CUDAGraph()
+            self._fwd_graph.register_generator_state(gen)
 
-            # ---- Common debug helpers ----
-            _rank = (
-                torch.distributed.get_rank()
-                if torch.distributed.is_available()
-                and torch.distributed.is_initialized()
-                else 0
-            )
-            _snap_dir = _CG_MEM_SNAPSHOT_DIR or "cg_mem_snapshots"
-
-            # ============================================================
-            # cg mode: capture the forward graph
-            # ============================================================
-            # Start stack-aware recording before capture so the CG
-            # snapshot (first N layers) carries allocation call stacks.
-            _cg_record = _CG_MEM_MODE == "cg" and do_snapshot
-            if _cg_record:
-                os.makedirs(_snap_dir, exist_ok=True)
+            # ---- INSTRUMENTATION: Track memory during capture ----
+            if _CG_MEM_DEBUG:
                 torch.cuda.memory._record_memory_history(
-                    max_entries=200000, stacks="all"
+                    enabled='all', context='all', stacks='python', max_entries=500000
                 )
-            # -- memory tracking: before capture --
             torch.cuda.reset_peak_memory_stats()
-            _alloc_before = torch.cuda.memory_allocated()
-            _reserved_before = torch.cuda.memory_reserved()
+            _before_reserved = torch.cuda.memory_reserved()
+            _before_allocated = torch.cuda.memory_allocated()
 
-            # ---- 6. Capture forward graph on the shared pool ----
-            # When _CG_NO_GRAD_FWD is enabled (default), the forward body
-            # runs under torch.no_grad() during capture. This matches the
-            # runtime behavior of _CudaGraphFunction.forward (autograd
-            # Function forward methods run with grad disabled) and drops
-            # the SavedVariables that would otherwise be pinned in the
-            # graph pool for backward — they are dead weight here because
-            # _capture_backward_and_run re-runs the forward with grad
-            # enabled to build its own fresh autograd tape.
-            self.fwd_graph = torch.cuda.CUDAGraph()
-            no_grad_ctx = torch.no_grad() if _CG_NO_GRAD_FWD else contextlib.nullcontext()
-            with torch.cuda.stream(capture_stream):
-                with torch.cuda.graph(
-                    self.fwd_graph,
-                    pool=self._graph_pool,
-                    stream=capture_stream,
-                ):
-                    with no_grad_ctx:
-                        out = self._call_module(static_inputs, tensor_names, frozen_kwargs)
-
-            # -- memory tracking: after capture --
-            _alloc_after = torch.cuda.memory_allocated()
-            _reserved_after = torch.cuda.memory_reserved()
-            _peak_alloc = torch.cuda.max_memory_allocated()
-            _peak_reserved = torch.cuda.max_memory_reserved()
-
-            logger.info(
-                "%s fwd-capture mem: alloc %+.1f MB (%d→%d)  "
-                "reserved %+.1f MB (%d→%d)  "
-                "peak_alloc %d MB  peak_reserved %d MB  ",
-                self._log_prefix,
-                (_alloc_after - _alloc_before) / 1e6,
-                _alloc_before // 1_000_000, _alloc_after // 1_000_000,
-                (_reserved_after - _reserved_before) / 1e6,
-                _reserved_before // 1_000_000, _reserved_after // 1_000_000,
-                _peak_alloc // 1_000_000, _peak_reserved // 1_000_000,
-            )
-
-            # -- debug: aligned per-layer CG peak log --
-            if _CG_MEM_MODE == "cg":
-                logger.info(
-                    "%s [mem-debug] cg peak memory (MB): "
-                    "peak_alloc %.1f (delta %+.1f)  "
-                    "peak_reserved %.1f (delta %+.1f)  post %d MB",
-                    self._log_prefix,
-                    _peak_alloc / 1e6,
-                    (_peak_alloc - _alloc_before) / 1e6,
-                    _peak_reserved / 1e6,
-                    (_reserved_after - _reserved_before) / 1e6,
-                    _alloc_after // 1_000_000,
-                )
-
-            # -- debug: dump CG snapshot for the first N layers --
-            if _cg_record:
-                try:
-                    _cg_path = os.path.join(
-                        _snap_dir, f"cg_layer{layer_index}_rank{_rank}.pickle"
-                    )
-                    torch.cuda.memory._dump_snapshot(_cg_path)
-                    logger.info(
-                        "%s [mem-debug] dumped cg snapshot (layer %d): %s",
-                        self._log_prefix,
-                        layer_index,
-                        _cg_path,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "%s [mem-debug] CG snapshot dump failed (layer %d): %s",
-                        self._log_prefix,
-                        layer_index,
-                        e,
-                    )
-                finally:
-                    torch.cuda.memory._record_memory_history(enabled=None)
-
-            # Snapshot output structure (for None restoration on replay).
-            self._record_output_structure(out)
-            static_outputs_list = list(self._flatten_output_for_autograd(out))
-            self.static_outputs = tuple(static_outputs_list)
-
-        finally:
-            if ctx is not None:
-                ctx.cuda_graph_active = prev_active
-            # Restore the original forward body if we replaced it with a
-            # torch.compile call for capture. install() reads
-            # self._module.forward immediately after this and expects the
-            # user-written body (not a compiled wrapper).
-            if self._captured_fwd_was_compiled:
-                self._module.forward = self._orig_fwd_body
-                self._orig_fwd_body = None
-                self._captured_fwd_was_compiled = False
-            _restore_hooks_recursive(self._module, saved_hooks)
-            self._reshard_main_grad_buffer()
-            if self._gc_freeze:
-                try:
-                    gc.unfreeze()
-                except Exception:
-                    pass
-
-        # ---- 7. Save metadata ----
-        self.static_inputs = static_inputs
-        self._tensor_param_names = tensor_names
-        self._param_names = param_names
-        self._frozen_kwargs = frozen_kwargs
-        self._captured = True
-
-    # ------------------------------------------------------------------
-    # 1b. Debug: recorded forward (nocg mode)
-    # ------------------------------------------------------------------
-
-    def _debug_recorded_forward(self, *args, **kwargs):
-        """Debug wrapper around the real ``module.forward``.
-
-        On the first call (step 0 of this layer), records
-        stack-aware allocation history and dumps a
-        ``nocg_layer{N}_rank{R}.pickle`` snapshot right after the
-        forward returns — while the autograd tape is still intact.
-
-        Subsequent calls are pass-through (no recording overhead).
-        """
-        do_snapshot = (
-            self._debug_do_snapshot
-            and not self._debug_recorded
-        )
-        recording = do_snapshot
-        if recording:
-            os.makedirs(self._debug_snap_dir, exist_ok=True)
-            torch.cuda.memory._record_memory_history(
-                max_entries=200000, stacks="all"
-            )
-        try:
-            torch.cuda.reset_peak_memory_stats()
-            _alloc_before = torch.cuda.memory_allocated()
-            _reserved_before = torch.cuda.memory_reserved()
-
-            out = self._orig_fwd(*args, **kwargs)
-
-            _peak_alloc = torch.cuda.max_memory_allocated()
-            _peak_reserved = torch.cuda.max_memory_reserved()
-            _alloc_after = torch.cuda.memory_allocated()
-            _reserved_after = torch.cuda.memory_reserved()
-
-            if recording:
-                try:
-                    _path = os.path.join(
-                        self._debug_snap_dir,
-                        f"nocg_layer{self._debug_layer_index}_rank{self._debug_rank}.pickle",
-                    )
-                    torch.cuda.memory._dump_snapshot(_path)
-                    logger.info(
-                        "%s [mem-debug] dumped nocg snapshot (layer %d): %s",
-                        self._log_prefix,
-                        self._debug_layer_index,
-                        _path,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "%s [mem-debug] nocg snapshot dump failed (layer %d): %s",
-                        self._log_prefix,
-                        self._debug_layer_index,
-                        e,
-                    )
-        finally:
-            if recording:
-                torch.cuda.memory._record_memory_history(enabled=None)
-                self._debug_recorded = True
-
-        if do_snapshot:
-            logger.info(
-                "%s [mem-debug] nocg peak memory (MB) [layer %d]: "
-                "peak_alloc %.1f (delta %+.1f)  "
-                "peak_reserved %.1f (delta %+.1f)  post %d MB",
-                self._log_prefix,
-                self._debug_layer_index,
-                _peak_alloc / 1e6,
-                (_peak_alloc - _alloc_before) / 1e6,
-                _peak_reserved / 1e6,
-                (_reserved_after - _reserved_before) / 1e6,
-                _alloc_after // 1_000_000,
-            )
-
-        return out
-
-    # ------------------------------------------------------------------
-    # 2. Backward graph capture (lazy, called from autograd Function)
-    # ------------------------------------------------------------------
-
-    def _capture_backward_and_run(
-        self,
-        saved_inputs: Tuple[torch.Tensor, ...],
-        grad_outputs: Tuple[torch.Tensor, ...],
-    ) -> Tuple[Optional[torch.Tensor], ...]:
-        """Capture the backward graph on first invocation.
-
-        Strategy:
-          1. Allocate static grad-output buffers (cloned from live).
-          2. If forward capture used no_grad, capture forward recompute +
-             backward into self.bwd_graph. If forward capture kept the
-             grad-enabled tape, capture only backward from self.static_outputs.
-          3. Populate both activation grad-input buffers and FSDP
-             parameter main-grad buffers as graph side effects.
-
-        Returns the gradient inputs to feed back into autograd.
-        """
-        ctx = getattr(self._module, "_fsdp_root_context", None)
-        prev_active = False
-        if ctx is not None:
-            prev_active = getattr(ctx, "cuda_graph_active", False)
-            ctx.cuda_graph_active = True
-
-        # Pop hooks so capture only sees backward()
-        saved_hooks = _pop_hooks_recursive(self._module)
-
-        # Unshard main grad buffer for capture
-        self._unshard_main_grad_buffer()
-
-        try:
-            # 1. Static grad-output buffers — clone live grads
-            static_grad_outputs = tuple(
-                torch.zeros_like(o) if g is None else g.clone().detach()
-                for o, g in zip(self.static_outputs, grad_outputs)
-            )
-
-            capture_stream = self._capture_stream or torch.cuda.current_stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                with torch.cuda.graph(self._fwd_graph, pool=self._pool.pool, stream=stream):
+                    if _CG_NO_GRAD_FWD:
+                        with torch.no_grad():
+                            out = self._call_module(static_inputs)
+                    else:
+                        out = self._call_module(static_inputs)
 
             torch.cuda.synchronize()
+            _after_reserved = torch.cuda.memory_reserved()
+            _after_allocated = torch.cuda.memory_allocated()
+            _peak_reserved = torch.cuda.max_memory_reserved()
+            _peak_allocated = torch.cuda.max_memory_allocated()
 
-            # Parameter gradients must be produced as graph side effects.
-            # FSDP post-backward later consumes param.grad or param.main_grad
-            # in reduce_grad(); returning only activation input gradients from
-            # this custom autograd.Function is not enough.
-            trainable_params = tuple(p for p in self._module.parameters() if p.requires_grad)
-            param_grad_buffers: Tuple[torch.Tensor, ...] = tuple(
-                self._get_param_grad_buffer(p) for p in trainable_params
+            logger.info(
+                "%s CAPTURE MEMORY: reserved_delta=%.1f MB, allocated_delta=%.1f MB, "
+                "peak_reserved=%.1f MB, peak_allocated=%.1f MB, "
+                "peak_reserved_delta=%.1f MB, peak_allocated_delta=%.1f MB",
+                self._log_prefix,
+                (_after_reserved - _before_reserved) / 1e6,
+                (_after_allocated - _before_allocated) / 1e6,
+                _peak_reserved / 1e6,
+                _peak_allocated / 1e6,
+                (_peak_reserved - _before_reserved) / 1e6,
+                (_peak_allocated - _before_allocated) / 1e6,
             )
-            self._bwd_trainable_params = trainable_params
-            self._param_grad_buffers = param_grad_buffers
 
-            # Reset param.grad fields for normal autograd. For FSDP params,
-            # _get_param_grad_buffer() installed param.main_grad, so the
-            # captured graph writes directly there and reduce_grad() will not
-            # mistake a missing param.grad for a zero gradient.
+            # Dump full snapshot for the FIRST captured layer only
+            if _CG_MEM_DEBUG and not hasattr(self._pool, '_first_layer_dumped'):
+                self._pool._first_layer_dumped = True
+                torch.cuda.memory._dump_snapshot('/tmp/first_layer_capture.pickle')
+                logger.info(
+                    "%s Dumped memory snapshot to /tmp/first_layer_capture.pickle "
+                    "(visualize at https://pytorch.org/memory_viz)",
+                    self._log_prefix,
+                )
+
+            if _CG_MEM_DEBUG:
+                torch.cuda.memory._record_memory_history(enabled=None)
+            # ---- END INSTRUMENTATION ----
+
+            self._record_output_structure(out)
+            self._static_outputs = tuple(self._flatten_output(out))
+            self._fwd_captured = True
+
+        finally:
+            _restore_hooks_recursive(saved_hooks)
+
+        return self._call_module(static_inputs)
+
+    # ------------------------------------------------------------------
+    # Backward capture
+    # ------------------------------------------------------------------
+
+    def capture_backward(
+        self,
+        grad_outputs: Tuple[torch.Tensor, ...],
+        saved_inputs: Tuple[torch.Tensor, ...] = (),
+    ) -> Tuple[Optional[torch.Tensor], ...]:
+        """Capture backward graph inline. Returns grad_inputs.
+
+        The backward graph reads from SHARED static grad-output buffers
+        (acquired from CudaGraphPool). All layers with same output shape
+        read from the same grad address.
+        """
+        assert self._fwd_captured, "Must capture forward first"
+
+        # Pop hooks for clean capture
+        saved_hooks = _pop_hooks_recursive(self._module)
+
+        try:
+            stream = self._pool.capture_stream
+            torch.cuda.synchronize()
+
+            # ---- 1. Acquire SHARED static grad-output buffers ----
+            raw_grad_buffers = self._pool.get_shared_buffers_for_grad_outputs(
+                self._static_outputs
+            )
+
+            # Copy live grads into raw buffers (no requires_grad -> safe)
+            for buf, live in zip(raw_grad_buffers, grad_outputs):
+                if live is not None:
+                    buf.copy_(live.detach())
+
+            # Viewless aliases for capture (fresh leaves, same memory)
+            static_grad_outputs = tuple(
+                _make_viewless_tensor(buf, requires_grad=False)
+                for buf in raw_grad_buffers
+            )
+
+            self._static_grad_outputs = static_grad_outputs
+            self._raw_grad_output_buffers = raw_grad_buffers
+
+            # Zero grads
             for param in self._module.parameters():
-                if hasattr(param, "get_main_grad"):
-                    param.grad = None
+                param.grad = None
+            self._unshard_main_grad_buffer()
 
-            with torch.cuda.stream(capture_stream):
-                if _CG_NO_GRAD_FWD:
-                    # Forward replay from autograd.Function.forward does not
-                    # build a tape, so capture recompute + backward. The
-                    # replay input buffers must be created outside graph
-                    # capture so later backwards can copy live saved inputs
-                    # into them before bwd_graph.replay().
-                    replay_inputs = tuple(
-                        t.detach().clone().requires_grad_(t.requires_grad)
-                        for t in saved_inputs
-                    )
-                    kwargs = dict(zip(self._tensor_param_names, replay_inputs))
-                    kwargs.update(self._frozen_kwargs)
+            # ---- 2. Capture backward ----
+            gen = _ensure_generator_graph_safe()
 
-                    self._bwd_inputs = replay_inputs
-                    input_tensors = replay_inputs
-                    flat_outputs = None
-                else:
-                    # Grad-enabled forward capture kept the tape. Capture
-                    # only backward from those static graph outputs.
-                    self._bwd_inputs = ()
-                    input_tensors = self.static_inputs
-                    flat_outputs = self.static_outputs
+            if _CG_NO_GRAD_FWD:
+                recompute_inputs = tuple(
+                    t.detach().clone().requires_grad_(t.requires_grad)
+                    for t in saved_inputs
+                )
+                self._bwd_inputs = recompute_inputs
+                input_tensors = recompute_inputs
+                flat_outputs = None
+            else:
+                self._bwd_inputs = ()
+                input_tensors = self._static_inputs
+                flat_outputs = self._static_outputs
 
-                input_grad_targets = tuple(t for t in input_tensors if t.requires_grad)
-                all_grad_targets = input_grad_targets + trainable_params
+            inputs_for_capture = tuple(t for t in input_tensors if t.requires_grad)
 
-                self.bwd_graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(
-                    self.bwd_graph,
-                    pool=self._graph_pool,
-                    stream=capture_stream,
-                ):
+            self._bwd_graph = torch.cuda.CUDAGraph()
+            self._bwd_graph.register_generator_state(gen)
+
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                with torch.cuda.graph(self._bwd_graph, pool=self._pool.pool, stream=stream):
                     if _CG_NO_GRAD_FWD:
-                        replay_out = self._orig_fwd(**kwargs)
-                        flat_outputs = self._flatten_output_for_autograd(replay_out)
+                        recompute_out = self._call_module(input_tensors)
+                        flat_outputs = self._flatten_output(recompute_out)
 
                     assert flat_outputs is not None
+                    outputs_for_capture = tuple(o for o in flat_outputs if o.requires_grad)
                     grad_outputs_for_capture = tuple(
                         sg for sg, o in zip(static_grad_outputs, flat_outputs)
                         if o.requires_grad
                     )
+
                     grad_ins = torch.autograd.grad(
-                        outputs=tuple(o for o in flat_outputs if o.requires_grad),
-                        inputs=all_grad_targets,
+                        outputs=outputs_for_capture,
+                        inputs=inputs_for_capture,
                         grad_outputs=grad_outputs_for_capture,
                         retain_graph=False,
                         create_graph=False,
@@ -924,81 +685,51 @@ class FSDPCudaGraphRunner:
                         allow_unused=True,
                     )
 
-                    input_grad_ins = grad_ins[: len(input_grad_targets)]
-                    param_grad_ins = grad_ins[len(input_grad_targets) :]
-                    for param, grad_buffer, param_grad in zip(
-                        trainable_params, param_grad_buffers, param_grad_ins
-                    ):
-                        grad_added_to_main_grad = getattr(
-                            param, "grad_added_to_main_grad", False
-                        )
-                        if param_grad is not None:
-                            grad_buffer.copy_(param_grad)
-                        elif not grad_added_to_main_grad:
-                            grad_buffer.zero_()
+            # Map back to input positions
+            grad_iter = iter(grad_ins)
+            static_grad_inputs: List[Optional[torch.Tensor]] = []
+            for t in input_tensors:
+                if t.requires_grad:
+                    static_grad_inputs.append(next(grad_iter))
+                else:
+                    static_grad_inputs.append(None)
 
-                # Build static_grad_inputs aligned with self.static_inputs
-                # (with None where requires_grad=False).
-                grad_iter = iter(input_grad_ins)
-                static_grad_inputs: List[Optional[torch.Tensor]] = []
-                for t in input_tensors:
-                    if t.requires_grad:
-                        static_grad_inputs.append(next(grad_iter))
-                    else:
-                        static_grad_inputs.append(None)
-
-                self.static_grad_outputs = static_grad_outputs
-                self.static_grad_inputs = tuple(static_grad_inputs)
+            self._static_grad_inputs = tuple(static_grad_inputs)
+            self._bwd_captured = True
 
         finally:
-            if ctx is not None:
-                ctx.cuda_graph_active = prev_active
-            _restore_hooks_recursive(self._module, saved_hooks)
+            _restore_hooks_recursive(saved_hooks)
             self._reshard_main_grad_buffer()
 
-        # Now that capture is done, the FIRST backward also needs to
-        # actually compute correct gradients for the live grad_outputs.
-        # We do this by replaying the bwd graph with live grads.
-        for static, live in zip(self.static_grad_outputs, grad_outputs):
+        # Run first real backward with live grads
+        if self._bwd_inputs:
+            with torch.no_grad():
+                for static, live in zip(self._bwd_inputs, saved_inputs):
+                    if static.data_ptr() != live.data_ptr():
+                        static.copy_(live)
+
+        for raw_buf, live in zip(self._raw_grad_output_buffers, grad_outputs):
             if live is None:
                 continue
-            if static.data_ptr() != live.data_ptr():
-                static.copy_(live)
-        self._restore_param_grad_buffers()
-        self.bwd_graph.replay()
+            raw_buf.copy_(live)
+        self._bwd_graph.replay()
 
-        return (None,) + tuple(
+        result = tuple(
             None if g is None else g.clone()
-            for g in self.static_grad_inputs
+            for g in self._static_grad_inputs
         )
+        return result
 
     # ------------------------------------------------------------------
-    # 3. Install / uninstall patched forward
+    # Install / uninstall
     # ------------------------------------------------------------------
 
     def install(self) -> None:
-        """Patch ``module.forward``.
-
-        In normal (CG) mode, replaces forward with a custom autograd
-        Function that replays the captured graph. In nocg debug mode,
-        wraps forward with a memory-recording + snapshot wrapper.
-        """
+        """Patch module.forward -> replay graphs via _CudaGraphFunction."""
+        if not self._fwd_captured:
+            raise RuntimeError("Forward must be captured before install")
         if self._installed:
             return
-
-        if _CG_MEM_MODE == "nocg":
-            self._orig_fwd = self._module.forward
-            runner = self
-
-            def _patched_fwd(*args, **kwargs):
-                return runner._debug_recorded_forward(*args, **kwargs)
-
-            self._module.forward = _patched_fwd
-            self._installed = True
-            return
-
-        if not self._captured:
-            raise RuntimeError("Call capture_forward() first")
 
         self._orig_fwd = self._module.forward
         runner = self
@@ -1006,17 +737,14 @@ class FSDPCudaGraphRunner:
         tensor_names = self._tensor_param_names
 
         def _patched_fwd(*args, **kwargs):
-            # Re-bind args/kwargs into the same flat tensor order used at
-            # capture.
             bound: Dict[str, Any] = {}
             for i, val in enumerate(args):
                 if i < len(param_names):
                     bound[param_names[i]] = val
             bound.update(kwargs)
             flat = tuple(bound[n] for n in tensor_names)
-
             outs = _CudaGraphFunction.apply(runner, *flat)
-            return runner._unflatten_output_for_user(outs)
+            return runner._unflatten_output(outs)
 
         self._module.forward = _patched_fwd
         self._installed = True
@@ -1029,38 +757,43 @@ class FSDPCudaGraphRunner:
         self._installed = False
 
     # ------------------------------------------------------------------
-    # Properties
+    # Helpers
     # ------------------------------------------------------------------
 
-    @property
-    def captured(self) -> bool:
-        return self._captured
+    def _call_module(self, flat_inputs: Tuple[torch.Tensor, ...]) -> Any:
+        kwargs = dict(zip(self._tensor_param_names, flat_inputs))
+        kwargs.update(self._frozen_kwargs)
+        forward = self._orig_fwd if self._orig_fwd is not None else self._module.forward
+        return forward(**kwargs)
 
-    @property
-    def using_cuda_graph(self) -> bool:
-        return self._installed
+    def _record_output_structure(self, out: Any) -> None:
+        if isinstance(out, torch.Tensor):
+            self._output_is_tuple = False
+            self._none_mask = None
+        elif isinstance(out, (tuple, list)):
+            self._output_is_tuple = True
+            self._none_mask = [t is None for t in out]
+        else:
+            raise RuntimeError(f"Unsupported output type: {type(out)}")
 
-    def reset(self) -> None:
-        self.uninstall()
-        self.fwd_graph = None
-        self.bwd_graph = None
-        self.static_inputs = ()
-        self.static_outputs = ()
-        self.static_grad_outputs = ()
-        self.static_grad_inputs = ()
-        self._bwd_inputs = ()
-        self._bwd_trainable_params = ()
-        self._param_grad_buffers = ()
-        self._captured = False
+    def _flatten_output(self, out: Any) -> Tuple[torch.Tensor, ...]:
+        if isinstance(out, torch.Tensor):
+            return (out,)
+        return tuple(t for t in out if isinstance(t, torch.Tensor))
 
-    # ------------------------------------------------------------------
-    # FSDP integration helpers
-    # ------------------------------------------------------------------
+    def _unflatten_output(self, flat: Tuple[torch.Tensor, ...]) -> Any:
+        if not self._output_is_tuple:
+            return flat[0]
+        if self._none_mask is None:
+            return flat
+        full: List[Any] = []
+        it = iter(flat)
+        for is_none in self._none_mask:
+            full.append(None if is_none else next(it))
+        return tuple(full)
 
     def _unshard_main_grad_buffer(self) -> None:
         for group in getattr(self._module, "_fsdp_param_groups", []):
-            if hasattr(group, "_init_dist_grads"):
-                group._init_dist_grads()
             if hasattr(group, "main_grad_buffer") and group.main_grad_buffer is not None:
                 group.main_grad_buffer.fetch_buffer()
 
@@ -1069,80 +802,22 @@ class FSDPCudaGraphRunner:
             if hasattr(group, "release_grad_buffer"):
                 group.release_grad_buffer()
 
-    def _get_param_grad_buffer(self, param: torch.nn.Parameter) -> torch.Tensor:
-        """Return the persistent buffer that replay should populate for *param*."""
-        if hasattr(param, "get_main_grad"):
-            main_grad = param.get_main_grad()
-            param.main_grad = main_grad
-            return main_grad
+    @property
+    def captured(self) -> bool:
+        return self._fwd_captured and self._bwd_captured
 
-        if (
-            param.grad is None
-            or param.grad.shape != param.shape
-            or param.grad.dtype != param.dtype
-            or param.grad.device != param.device
-        ):
-            param.grad = torch.zeros_like(param)
-        return param.grad
+    @property
+    def using_cuda_graph(self) -> bool:
+        return self._installed
 
-    def _restore_param_grad_buffers(self) -> None:
-        for param, grad_buffer in zip(self._bwd_trainable_params, self._param_grad_buffers):
-            if hasattr(param, "get_main_grad"):
-                param.main_grad = grad_buffer
-                param.grad = None
-            else:
-                param.grad = grad_buffer
-
-    # ------------------------------------------------------------------
-    # Module call / output (un)flattening helpers
-    # ------------------------------------------------------------------
-
-    def _call_module(
-        self,
-        flat_tensor_inputs: Tuple[torch.Tensor, ...],
-        tensor_names: List[str],
-        frozen_kwargs: Dict[str, Any],
-    ) -> Any:
-        kwargs = dict(zip(tensor_names, flat_tensor_inputs))
-        kwargs.update(frozen_kwargs)
-        return self._module.forward(**kwargs)
-
-    def _record_output_structure(self, out: Any) -> None:
-        """Snapshot whether output is a tuple, single tensor, and the
-        positions of None entries (for restoration on replay)."""
-        if isinstance(out, torch.Tensor):
-            self._output_is_tuple = False
-            self._none_mask = None
-            return
-        if isinstance(out, (tuple, list)):
-            self._output_is_tuple = True
-            self._none_mask = [t is None for t in out]
-            return
-        raise RuntimeError(
-            f"Module returned unsupported output type: {type(out)}. "
-            "CUDA graph capture supports a Tensor or tuple/list of Tensors/None."
-        )
-
-    def _flatten_output_for_autograd(self, out: Any) -> Tuple[torch.Tensor, ...]:
-        """Return only the non-None tensors of *out* in declaration order."""
-        if isinstance(out, torch.Tensor):
-            return (out,)
-        return tuple(t for t in out if isinstance(t, torch.Tensor))
-
-    def _unflatten_output_for_user(
-        self, flat: Tuple[torch.Tensor, ...]
-    ) -> Any:
-        """Rebuild user-facing output from a flat tuple of tensors,
-        re-inserting None at recorded positions and unwrapping
-        single-tensor outputs."""
-        if not self._output_is_tuple:
-            return flat[0]
-
-        if self._none_mask is None:
-            return flat
-
-        full: List[Any] = []
-        it = iter(flat)
-        for is_none in self._none_mask:
-            full.append(None if is_none else next(it))
-        return tuple(full)
+    def reset(self) -> None:
+        self.uninstall()
+        self._fwd_graph = None
+        self._bwd_graph = None
+        self._static_inputs = ()
+        self._static_outputs = ()
+        self._static_grad_outputs = ()
+        self._static_grad_inputs = ()
+        self._bwd_inputs = ()
+        self._fwd_captured = False
+        self._bwd_captured = False

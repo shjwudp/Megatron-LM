@@ -24,7 +24,7 @@ from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from .allocator import TracePoolAllocator
-from .cuda_graph_runner import FSDPCudaGraphRunner
+from .cuda_graph_runner import FSDPCudaGraphRunner, CudaGraphPool
 from .fsdp_module import FSDPModule, _FSDPState
 from .utils import RegisterFSDPBackwardFunction
 
@@ -87,7 +87,7 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
         if ctx.enable_cuda_graph and ctx.cuda_graph_stream is None:
             ctx.cuda_graph_stream = torch.cuda.Stream()
             torch.cuda.set_stream(ctx.cuda_graph_stream)
-            ctx.cuda_graph_pool = torch.cuda.graph_pool_handle()
+            ctx.cuda_graph_pool = CudaGraphPool()
         ctx.forward_phase = True
         ctx.backward_phase = False
 
@@ -117,7 +117,7 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
                 id(target),
             )
         cg_runner = FSDPCudaGraphRunner(
-            target, graph_pool=ctx.cuda_graph_pool
+            target, shared_pool=ctx.cuda_graph_pool
         )
         cg_runner.capture_forward(*args, **kwargs)
         cg_runner.install()
