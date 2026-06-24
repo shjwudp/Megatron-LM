@@ -31,7 +31,7 @@ API
     * ``capture_forward(*args, **kwargs)`` — warmup + capture forward graph.
     * ``install()`` — patch ``module.forward`` to replay via autograd Function.
     * ``uninstall()`` — restore original ``forward``.
-"""
+"""  # noqa: E501
 
 import inspect
 import logging
@@ -40,6 +40,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def _is_rank0() -> bool:
+    """Return True on rank 0, or True when not in a distributed context."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +215,9 @@ class FSDPCudaGraphRunner:
         self.fwd_graph = torch.cuda.CUDAGraph()
         self.fwd_graph.register_generator_state(gen)
 
+        torch.cuda.reset_peak_memory_stats()
+        _alloc_before = torch.cuda.memory_allocated()
+
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             with torch.cuda.graph(
@@ -219,7 +229,20 @@ class FSDPCudaGraphRunner:
 
         stream.synchronize()
         self._captured = True
-        logger.info("Forward graph captured for module id=%s", id(self._module))
+
+        _alloc_after = torch.cuda.memory_allocated()
+        _peak_alloc = torch.cuda.max_memory_allocated()
+
+        if _is_rank0():
+            logger.info(
+                "Forward graph captured for module id=%s: "
+                "alloc %+.1f MB (%d→%d)  peak_alloc %d MB",
+                id(self._module),
+                (_alloc_after - _alloc_before) / 1e6,
+                _alloc_before // 1_000_000,
+                _alloc_after // 1_000_000,
+                _peak_alloc // 1_000_000,
+            )
 
     def install(self) -> None:
         """Replace ``module.forward`` with our autograd Function wrapper."""
@@ -281,6 +304,9 @@ class FSDPCudaGraphRunner:
         self.bwd_graph = torch.cuda.CUDAGraph()
         self.bwd_graph.register_generator_state(gen)
 
+        torch.cuda.reset_peak_memory_stats()
+        _alloc_before = torch.cuda.memory_allocated()
+
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             with torch.cuda.graph(
@@ -320,13 +346,25 @@ class FSDPCudaGraphRunner:
             self._static_grad_inputs = tuple(static_grad_inputs)
             self._static_grad_outputs = static_grad_outs
 
+        _alloc_after = torch.cuda.memory_allocated()
+        _peak_alloc = torch.cuda.max_memory_allocated()
+
+        if _is_rank0():
+            logger.info(
+                "Backward graph captured for module id=%s: "
+                "alloc %+.1f MB (%d→%d)  peak_alloc %d MB",
+                id(self._module),
+                (_alloc_after - _alloc_before) / 1e6,
+                _alloc_before // 1_000_000,
+                _alloc_after // 1_000_000,
+                _peak_alloc // 1_000_000,
+            )
+
         # 5. Run the FIRST backward.
         for s, l in zip(self._static_grad_outputs, grad_outputs):
             if l is not None and s.data_ptr() != l.data_ptr():
                 s.copy_(l)
         self.bwd_graph.replay()
-
-        logger.info("Backward graph captured for module id=%s", id(self._module))
 
         # Return (None for runner, *user_grads, *param_grads).
         # Autograd will use param_grads to populate param.grad; FSDP
