@@ -635,15 +635,33 @@ class FSDPCudaGraphRunner:
             # graph pool for backward — they are dead weight here because
             # _capture_backward_and_run re-runs the forward with grad
             # enabled to build its own fresh autograd tape.
+            #
+            # When _CG_NO_GRAD_FWD=0, forward is captured with grad
+            # enabled to preserve the autograd tape so backward capture
+            # can skip forward recompute. To prevent stale saved-tensor
+            # version mismatches caused by inplace ops during subsequent
+            # fwd_graph.replay() (e.g., TE RoPE's inplace modification of
+            # the freqs tensor), we intercept save_for_backward via
+            # saved_tensors_hooks and save clones instead. The clone
+            # CUDA ops are captured into fwd_graph and replayed
+            # deterministically, while the clone Python tensors on the
+            # tape keep their version counters stable across replays.
             self.fwd_graph = torch.cuda.CUDAGraph()
             no_grad_ctx = torch.no_grad() if _CG_NO_GRAD_FWD else contextlib.nullcontext()
+            _saved_hooks_ctx = (
+                contextlib.nullcontext()
+                if _CG_NO_GRAD_FWD
+                else torch.autograd.graph.saved_tensors_hooks(
+                    lambda t: t.clone(), lambda t: t
+                )
+            )
             with torch.cuda.stream(capture_stream):
                 with torch.cuda.graph(
                     self.fwd_graph,
                     pool=self._graph_pool,
                     stream=capture_stream,
                 ):
-                    with no_grad_ctx:
+                    with no_grad_ctx, _saved_hooks_ctx:
                         out = self._call_module(static_inputs, tensor_names, frozen_kwargs)
 
             # -- memory tracking: after capture --
