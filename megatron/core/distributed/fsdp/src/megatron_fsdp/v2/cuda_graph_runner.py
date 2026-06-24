@@ -31,7 +31,6 @@ Backward capture is lazy: the first ``torch.autograd.grad`` triggers capture;
 subsequent backwards replay the captured graph.
 """
 
-import contextlib
 import inspect
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -84,7 +83,6 @@ class _CudaGraphFunction(torch.autograd.Function):
         runner.fwd_graph.replay()
 
         ctx.runner = runner
-        ctx.save_for_backward(*flat_inputs)
 
         # Return detach() so downstream autograd does not alias static
         # outputs.  Replay order (all fwds then all bwds) guarantees
@@ -115,9 +113,7 @@ class FSDPCudaGraphRunner:
 
     Forward is captured with grad enabled to preserve the autograd tape.
     Backward uses the tape directly — no forward recompute inside the
-    backward graph.  ``saved_tensors_hooks`` clones saved tensors during
-    forward capture so that fwd_graph replay does not bump their autograd
-    version counters.
+    backward graph.
 
     Parameters
     ----------
@@ -224,11 +220,6 @@ class FSDPCudaGraphRunner:
         #
         # Forward is captured WITH grad so the autograd tape stays alive
         # for backward capture (no forward recompute needed in bwd_graph).
-        #
-        # ``saved_tensors_hooks`` intercepts ``save_for_backward`` and saves
-        # clones instead of the originals.  This prevents autograd version
-        # mismatches when ``fwd_graph.replay()`` later modifies the originals
-        # inplace (e.g., TE RoPE's ``freqs`` tensor).
         stream = self._capture_stream
         gen = _ensure_generator_graph_safe()
         self.fwd_graph = torch.cuda.CUDAGraph()
@@ -239,12 +230,9 @@ class FSDPCudaGraphRunner:
             with torch.cuda.graph(
                 self.fwd_graph, pool=self._graph_pool, stream=stream
             ):
-                with torch.autograd.graph.saved_tensors_hooks(
-                    lambda t: t.clone(), lambda t: t
-                ):
-                    self.static_outputs = self._flatten_output(
-                        self._run_forward(self.static_inputs)
-                    )
+                self.static_outputs = self._flatten_output(
+                    self._run_forward(self.static_inputs)
+                )
 
         stream.synchronize()
         self._captured = True

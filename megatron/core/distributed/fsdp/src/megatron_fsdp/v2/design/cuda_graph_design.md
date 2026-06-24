@@ -92,31 +92,7 @@ This preserves the autograd tape so the backward graph can call
 `torch.autograd.grad(static_outputs, ...)` directly — **no forward recompute**
 in the backward graph.
 
-### 5.2 saved_tensors_hooks — clone trick
-
-During forward capture, `saved_tensors_hooks` intercepts `save_for_backward`
-and saves **clones** instead of the originals:
-
-```python
-with torch.autograd.graph.saved_tensors_hooks(
-    lambda t: t.clone(), lambda t: t
-):
-    self.static_outputs = self._flatten_output(
-        self._run_forward(self.static_inputs)
-    )
-```
-
-**Why?** Without this, `fwd_graph.replay()` would bump the autograd version
-counters of tensors saved on the tape (e.g., TE RoPE's `freqs` tensor modified
-inplace during forward).  When `torch.autograd.grad` later traverses the tape,
-it hits a version mismatch: `"expected version 0; got version 1"`.
-
-By saving clones, the tape references clone tensors whose Python version
-counters are never modified by CUDA graph replay.  The clone CUDA ops are
-captured into `fwd_graph` and replayed deterministically, always producing
-fresh data at stable addresses.
-
-### 5.3 Output structure handling
+### 5.2 Output structure handling
 
 Module outputs may contain `None` entries (e.g., `(hidden_states, None, rotary_pos_emb)`).
 The system uses three primitives:
@@ -323,7 +299,6 @@ before each forward during replay to reset slot state.
 | Issue | Root cause | Fix | Date |
 |-------|-----------|-----|------|
 | Convergence degradation with CG | Missing `register_generator_state` on fwd_graph and bwd_graph — dropout masks baked at capture time | Added `register_generator_state(_ensure_generator_graph_safe())` on both graphs | 2026-06 |
-| `"expected version 0; got version 1"` with `_CG_NO_GRAD_FWD=0` | `fwd_graph.replay()` inplace-ops bump autograd version counters of saved tensors (e.g., TE RoPE `freqs`) | Wrap forward capture with `saved_tensors_hooks(lambda t: t.clone(), lambda t: t)` | 2026-06 |
 | `TypeError: multiple values for argument` during capture | `sig.bind(self._module, *args, **kwargs)` injected `self` on bound methods, shifting positional args | `_bind_forward_args` handles both bound and unbound signatures | 2026-06 |
 | `'NoneType' object has no attribute 'requires_grad'` | `_flatten_output` returned `tuple(out)` which preserved `None` entries; warmup iterated over them | `_flatten_output` now filters to `isinstance(t, torch.Tensor)` only | 2026-06 |
 | Re-entrant capture during warmup | Warmup calls module forward which triggers hooks on sub-modules with same target | Set `target._fsdp_cg_runner` before `capture_forward`, clean up on failure | 2026-06 |
