@@ -117,7 +117,7 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
                 id(target),
             )
         cg_runner = FSDPCudaGraphRunner(
-            target, graph_pool=ctx.cuda_graph_pool
+            target, graph_pool=ctx.cuda_graph_pool, capture_stream=ctx.cuda_graph_stream
         )
         cg_runner.capture_forward(*args, **kwargs)
         cg_runner.install()
