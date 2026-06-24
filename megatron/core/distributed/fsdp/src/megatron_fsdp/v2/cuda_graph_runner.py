@@ -299,6 +299,7 @@ class _CudaGraphFunction(torch.autograd.Function):
             if static.data_ptr() != live.data_ptr():
                 static.copy_(live)
 
+        runner._restore_param_grad_buffers()
         runner.bwd_graph.replay()
 
         # Return (None for runner) + clones of static grad-inputs
@@ -386,6 +387,8 @@ class FSDPCudaGraphRunner:
         self.static_grad_outputs: Tuple[torch.Tensor, ...] = ()
         self.static_grad_inputs: Tuple[Optional[torch.Tensor], ...] = ()
         self._bwd_inputs: Tuple[torch.Tensor, ...] = ()  # replay_inputs for bwd_graph
+        self._bwd_trainable_params: Tuple[torch.nn.Parameter, ...] = ()
+        self._param_grad_buffers: Tuple[torch.Tensor, ...] = ()
 
         # Frozen capture metadata
         self._tensor_param_names: List[str] = []
@@ -819,11 +822,10 @@ class FSDPCudaGraphRunner:
 
         Strategy:
           1. Allocate static grad-output buffers (cloned from live).
-          2. Re-run the forward eagerly (so we have a fresh autograd
-             graph rooted at the same static_inputs) on the capture
-             stream — this allocates inside the pool.
-          3. Capture an eager backward into self.bwd_graph, populating
-             static grad-input buffers.
+          2. Capture forward recompute + backward into self.bwd_graph,
+             rooted at this autograd instance's saved input tensors.
+          3. Populate both activation grad-input buffers and FSDP
+             parameter main-grad buffers as graph side effects.
 
         Returns the gradient inputs to feed back into autograd.
         """
@@ -848,109 +850,86 @@ class FSDPCudaGraphRunner:
 
             capture_stream = self._capture_stream or torch.cuda.current_stream()
 
-            # 2. Re-run forward eagerly to build a backward graph rooted
-            #    at static_inputs. This must run on the capture stream
-            #    AND inside the same pool so addresses match.
-            #
-            #    We DO NOT wrap this in `torch.cuda.graph(...)` — we want
-            #    the autograd graph to exist in Python-land. Then we wrap
-            #    only the .backward() call inside graph capture.
-            #
-            #    To keep allocations inside the pool we use the
-            #    `torch.cuda.graph` context twice: once with NO graph
-            #    (effectively just stream switch) is not enough — we
-            #    instead capture the backward directly while autograd's
-            #    saved tensors live in regular memory and gradient
-            #    allocations land in the pool.
+            # 2. Re-run forward inside the backward graph to build the
+            #    autograd tape used by this custom Function's backward.
+            #    Use ctx.saved_tensors, not self.static_inputs, because
+            #    self.static_inputs may already have been overwritten by a
+            #    later forward when schedules keep multiple microbatches live.
             torch.cuda.synchronize()
 
-            # Reset param.grad fields so AccumulateGrad nodes write
-            # into freshly allocated tensors inside the pool.
-            for param in self._module.parameters():
-                param.grad = None
+            # Parameter gradients must be produced as graph side effects.
+            # FSDP post-backward later consumes param.grad or param.main_grad
+            # in reduce_grad(); returning only activation input gradients from
+            # this custom autograd.Function is not enough.
+            trainable_params = tuple(p for p in self._module.parameters() if p.requires_grad)
+            param_grad_buffers: Tuple[torch.Tensor, ...] = tuple(
+                self._get_param_grad_buffer(p) for p in trainable_params
+            )
+            self._bwd_trainable_params = trainable_params
+            self._param_grad_buffers = param_grad_buffers
 
-            # When _CG_NO_GRAD_FWD is on, the fwd_graph was captured
-            # under torch.no_grad(), so it contains no autograd tape.
-            # The backward must recompute the forward (with grad) to
-            # build a tape.  We capture that recompute inside bwd_graph
-            # so all memory addresses match at replay time — critical
-            # for activation checkpointing where the checkpoint hook
-            # supplies different saved-tensor addresses each step.
-            #
-            # When _CG_NO_GRAD_FWD is off, the fwd_graph already ran
-            # with grad enabled, so the autograd tape exists and the
-            # backward just needs to run torch.autograd.grad from the
-            # replay outputs.  No forward recompute needed.
+            # Reset param.grad fields for normal autograd. For FSDP params,
+            # _get_param_grad_buffer() installed param.main_grad, so the
+            # captured graph writes directly there and reduce_grad() will not
+            # mistake a missing param.grad for a zero gradient.
+            for param in self._module.parameters():
+                if hasattr(param, "get_main_grad"):
+                    param.grad = None
+
             with torch.cuda.stream(capture_stream):
-                # Make inputs require grad like at capture time
+                # Make inputs require grad like the saved live inputs.
                 replay_inputs = tuple(
                     t.detach().clone().requires_grad_(t.requires_grad)
-                    for t in self.static_inputs
+                    for t in saved_inputs
                 )
                 kwargs = dict(zip(self._tensor_param_names, replay_inputs))
                 kwargs.update(self._frozen_kwargs)
 
-                if _CG_NO_GRAD_FWD:
-                    # Save for updating with ctx.saved_tensors before
-                    # each subsequent bwd_graph replay
-                    self._bwd_inputs = replay_inputs
+                # Save for updating with ctx.saved_tensors before each
+                # subsequent bwd_graph replay.
+                self._bwd_inputs = replay_inputs
 
-                    # Capture recompute forward + backward in bwd_graph
-                    self.bwd_graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(
-                        self.bwd_graph,
-                        pool=self._graph_pool,
-                        stream=capture_stream,
-                    ):
-                        replay_out = self._orig_fwd(**kwargs)
-                        flat_replay_out = self._flatten_output_for_autograd(replay_out)
-                        grad_ins = torch.autograd.grad(
-                            outputs=tuple(
-                                o for o in flat_replay_out if o.requires_grad
-                            ),
-                            inputs=tuple(
-                                t for t in replay_inputs if t.requires_grad
-                            ),
-                            grad_outputs=tuple(
-                                sg for sg, o in zip(static_grad_outputs, flat_replay_out)
-                                if o.requires_grad
-                            ),
-                            retain_graph=False,
-                            create_graph=False,
-                            only_inputs=True,
-                            allow_unused=True,
-                        )
-                else:
-                    # Forward outside bwd_graph; backward inside
+                input_grad_targets = tuple(t for t in replay_inputs if t.requires_grad)
+                all_grad_targets = input_grad_targets + trainable_params
+
+                self.bwd_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(
+                    self.bwd_graph,
+                    pool=self._graph_pool,
+                    stream=capture_stream,
+                ):
                     replay_out = self._orig_fwd(**kwargs)
                     flat_replay_out = self._flatten_output_for_autograd(replay_out)
+                    grad_outputs_for_capture = tuple(
+                        sg for sg, o in zip(static_grad_outputs, flat_replay_out)
+                        if o.requires_grad
+                    )
+                    grad_ins = torch.autograd.grad(
+                        outputs=tuple(o for o in flat_replay_out if o.requires_grad),
+                        inputs=all_grad_targets,
+                        grad_outputs=grad_outputs_for_capture,
+                        retain_graph=False,
+                        create_graph=False,
+                        only_inputs=True,
+                        allow_unused=True,
+                    )
 
-                    self.bwd_graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(
-                        self.bwd_graph,
-                        pool=self._graph_pool,
-                        stream=capture_stream,
+                    input_grad_ins = grad_ins[: len(input_grad_targets)]
+                    param_grad_ins = grad_ins[len(input_grad_targets) :]
+                    for param, grad_buffer, param_grad in zip(
+                        trainable_params, param_grad_buffers, param_grad_ins
                     ):
-                        grad_ins = torch.autograd.grad(
-                            outputs=tuple(
-                                o for o in flat_replay_out if o.requires_grad
-                            ),
-                            inputs=tuple(
-                                t for t in replay_inputs if t.requires_grad
-                            ),
-                            grad_outputs=tuple(
-                                sg for sg, o in zip(static_grad_outputs, flat_replay_out)
-                                if o.requires_grad
-                            ),
-                            retain_graph=False,
-                            create_graph=False,
-                            only_inputs=True,
-                            allow_unused=True,
+                        grad_added_to_main_grad = getattr(
+                            param, "grad_added_to_main_grad", False
                         )
+                        if param_grad is not None:
+                            grad_buffer.copy_(param_grad)
+                        elif not grad_added_to_main_grad:
+                            grad_buffer.zero_()
 
                 # Build static_grad_inputs aligned with self.static_inputs
                 # (with None where requires_grad=False).
-                grad_iter = iter(grad_ins)
+                grad_iter = iter(input_grad_ins)
                 static_grad_inputs: List[Optional[torch.Tensor]] = []
                 for t in replay_inputs:
                     if t.requires_grad:
@@ -975,6 +954,7 @@ class FSDPCudaGraphRunner:
                 continue
             if static.data_ptr() != live.data_ptr():
                 static.copy_(live)
+        self._restore_param_grad_buffers()
         self.bwd_graph.replay()
 
         return (None,) + tuple(
@@ -1059,6 +1039,8 @@ class FSDPCudaGraphRunner:
         self.static_grad_outputs = ()
         self.static_grad_inputs = ()
         self._bwd_inputs = ()
+        self._bwd_trainable_params = ()
+        self._param_grad_buffers = ()
         self._captured = False
 
     # ------------------------------------------------------------------
@@ -1067,6 +1049,8 @@ class FSDPCudaGraphRunner:
 
     def _unshard_main_grad_buffer(self) -> None:
         for group in getattr(self._module, "_fsdp_param_groups", []):
+            if hasattr(group, "_init_dist_grads"):
+                group._init_dist_grads()
             if hasattr(group, "main_grad_buffer") and group.main_grad_buffer is not None:
                 group.main_grad_buffer.fetch_buffer()
 
@@ -1074,6 +1058,30 @@ class FSDPCudaGraphRunner:
         for group in getattr(self._module, "_fsdp_param_groups", []):
             if hasattr(group, "release_grad_buffer"):
                 group.release_grad_buffer()
+
+    def _get_param_grad_buffer(self, param: torch.nn.Parameter) -> torch.Tensor:
+        """Return the persistent buffer that replay should populate for *param*."""
+        if hasattr(param, "get_main_grad"):
+            main_grad = param.get_main_grad()
+            param.main_grad = main_grad
+            return main_grad
+
+        if (
+            param.grad is None
+            or param.grad.shape != param.shape
+            or param.grad.dtype != param.dtype
+            or param.grad.device != param.device
+        ):
+            param.grad = torch.zeros_like(param)
+        return param.grad
+
+    def _restore_param_grad_buffers(self) -> None:
+        for param, grad_buffer in zip(self._bwd_trainable_params, self._param_grad_buffers):
+            if hasattr(param, "get_main_grad"):
+                param.main_grad = grad_buffer
+                param.grad = None
+            else:
+                param.grad = grad_buffer
 
     # ------------------------------------------------------------------
     # Module call / output (un)flattening helpers
