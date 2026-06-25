@@ -187,6 +187,16 @@ class CudaGraphRunner:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info("CudaGraphRunner: capturing %d modules", n)
 
+        # 0. Clone sample args into fresh leaf tensors from the
+        #    recorded originals, then drop the originals.
+        sample_args_list = [
+            tuple(t.detach().clone().requires_grad_(t.requires_grad) for t in args)
+            for args in sample_args_list
+        ]
+        self._sample_args.clear()
+        self._tensor_names.clear()
+        self._frozen_kwargs.clear()
+
         # 1. Pop all real hooks; restore them after capture.
         saved_hooks = _pop_all_hooks(root_module)
 
@@ -203,9 +213,11 @@ class CudaGraphRunner:
                 sample_args_list[i] + per_callable_module_params[i] for i in range(n)
             ]
 
-            # 4. Warmup on throwaway stream with manual unshard/reshard.
+            # 4. Warmup on throwaway stream — must run with grad enabled
+            #    because capture_and_install is called from an autograd
+            #    engine callback which has grad disabled.
             torch.cuda.synchronize()
-            with torch.cuda.stream(torch.cuda.Stream()):
+            with torch.cuda.stream(torch.cuda.Stream()), torch.enable_grad():
                 for i, (module, sample_args, static_input_surface) in enumerate(
                     zip(modules, sample_args_list, per_callable_static_input_surfaces)
                 ):
@@ -222,14 +234,24 @@ class CudaGraphRunner:
 
             for i, (module, sample_args) in enumerate(zip(modules, sample_args_list)):
                 _register_generator_state(fwd_graphs[i])
+
                 module.unshard()
-                with torch.cuda.graph(fwd_graphs[i], pool=self._graph_pool):
+                with torch.cuda.graph(fwd_graphs[i], pool=self._graph_pool), torch.enable_grad():
                     outputs = _run_module(module, sample_args, tensor_names_list[i], frozen_kwargs_list[i])
                 module.reshard()
 
                 # Record output structure from the captured outputs.
                 flat = _flatten_output(outputs)
                 is_tuple, none_mask = _record_output_structure(outputs)
+
+                if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                    grad_count = sum(1 for o in flat if o.requires_grad)
+                    logger.info(
+                        "CudaGraphRunner: fwd capture module %s: %d outputs, %d require_grad",
+                        getattr(module, "_fsdp_module_name", module.__class__.__name__),
+                        len(flat), grad_count,
+                    )
+
                 per_module_static_outputs.append(tuple(flat))
                 per_module_output_is_tuple.append(is_tuple)
                 per_module_output_none_mask.append(none_mask)
@@ -253,9 +275,16 @@ class CudaGraphRunner:
                 )
                 outputs_grad = tuple(o for o in static_outputs if o.requires_grad)
 
+                if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                    logger.info(
+                        "CudaGraphRunner: bwd capture module %s: %d static_outputs, %d require_grad",
+                        getattr(module, "_fsdp_module_name", module.__class__.__name__),
+                        len(static_outputs), len(outputs_grad),
+                    )
+
                 module.unshard(bwd_pass=True)
-                if outputs_grad:
-                    with torch.cuda.graph(bwd_graph, pool=self._graph_pool):
+                with torch.cuda.graph(bwd_graph, pool=self._graph_pool), torch.enable_grad():
+                    if outputs_grad:
                         grad_ins = torch.autograd.grad(
                             outputs=outputs_grad,
                             inputs=tuple(a for a in static_input_surface if a.requires_grad),
@@ -263,8 +292,8 @@ class CudaGraphRunner:
                             only_inputs=True,
                             allow_unused=True,
                         )
-                else:
-                    grad_ins = None
+                    else:
+                        grad_ins = None
                 module.reshard()
 
                 static_grad_inputs: List[Optional[torch.Tensor]] = []
