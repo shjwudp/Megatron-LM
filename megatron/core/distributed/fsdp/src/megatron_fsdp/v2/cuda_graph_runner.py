@@ -228,11 +228,6 @@ class FSDPCudaGraphRunner:
         gc.collect()  # second pass catches ref-cycles broken by first collect
         torch.cuda.empty_cache()
 
-        # ---- record output structure ----
-        out = self._run_forward(self.static_inputs)
-        self._record_output_structure(out)
-        self.static_outputs = self._flatten_output(out)
-
         # ---- capture forward graph (with grad enabled) ----
         gen = _ensure_generator_graph_safe()
         self.fwd_graph = torch.cuda.CUDAGraph()
