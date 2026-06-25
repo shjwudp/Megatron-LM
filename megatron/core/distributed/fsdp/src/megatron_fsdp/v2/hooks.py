@@ -55,6 +55,7 @@ def _find_fsdp_target(hook_module: nn.Module) -> Optional[FSDPModule]:
     return None
 
 
+@torch.compiler.disable
 def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
     """Pre-forward hook for FSDP modules and fine-grained sub-modules.
 
@@ -117,6 +118,7 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
         ctx.cuda_graph_runner.record_module(target, args, kwargs)
 
 
+@torch.compiler.disable
 def mfsdp_post_forward_hook(module: nn.Module, *unused):
     """Post-forward hook: reshard parameters.
 
@@ -178,6 +180,7 @@ def _register_forward_hook(module: FSDPModule):
 # ---------------------------------------------------------------------------
 
 
+@torch.compiler.disable
 def mfsdp_pre_backward_setup(
     hook_module: nn.Module, grads: Any = None, skip_final_callback: bool = False
 ):
@@ -209,6 +212,7 @@ def mfsdp_pre_backward_setup(
     target._fsdp_pre_backward_done = True
 
 
+@torch.compiler.disable
 def mfsdp_post_backward_hook(module: nn.Module):
     """Post-backward hook: reshard parameters and reduce gradients.
 
@@ -239,6 +243,7 @@ def mfsdp_post_backward_hook(module: nn.Module):
     ctx._advance_backward_module()
 
 
+@torch.compiler.disable
 def mfsdp_post_backward_final_callback(root_module: nn.Module):
     """Finalise the backward pass: drain skipped modules, reset state,
     clear fine-grained flags, and (on the first micro-batch) transition
