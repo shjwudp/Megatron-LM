@@ -380,39 +380,83 @@ def _register_generator_state(graph: torch.cuda.CUDAGraph) -> None:
 # ---------------------------------------------------------------------------
 
 
+class _GraphRunner:
+    """Holds the per-module state needed by ``Graphed``."""
+    __slots__ = (
+        "fwd_graph", "bwd_graph",
+        "module_params", "len_user_args",
+        "static_input_surface", "static_outputs",
+        "static_grad_outputs", "static_grad_inputs",
+        "output_is_tuple", "output_none_mask",
+    )
+
+    def __init__(
+        self,
+        fwd_graph, bwd_graph,
+        module_params, len_user_args,
+        static_input_surface, static_outputs,
+        static_grad_outputs, static_grad_inputs,
+        output_is_tuple, output_none_mask,
+    ):
+        self.fwd_graph = fwd_graph
+        self.bwd_graph = bwd_graph
+        self.module_params = module_params
+        self.len_user_args = len_user_args
+        self.static_input_surface = static_input_surface
+        self.static_outputs = static_outputs
+        self.static_grad_outputs = static_grad_outputs
+        self.static_grad_inputs = static_grad_inputs
+        self.output_is_tuple = output_is_tuple
+        self.output_none_mask = output_none_mask
+
+
+class Graphed(torch.autograd.Function):
+    """Module-level autograd Function; shared across all modules so
+    ``torch.compile`` sees a stable class id."""
+
+    @staticmethod
+    def forward(ctx, runner, *inputs):
+        ctx.runner = runner
+        for i in range(runner.len_user_args):
+            s = runner.static_input_surface[i]
+            if s.data_ptr() != inputs[i].data_ptr():
+                s.copy_(inputs[i])
+        runner.fwd_graph.replay()
+        assert isinstance(runner.static_outputs, tuple)
+        return tuple(o.detach() for o in runner.static_outputs)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, *grads):
+        runner = ctx.runner
+        assert len(grads) == len(runner.static_grad_outputs)
+        for g, grad in zip(runner.static_grad_outputs, grads):
+            if g is not None and g.data_ptr() != grad.data_ptr():
+                g.copy_(grad)
+        runner.bwd_graph.replay()
+        return (None,) + tuple(
+            b.detach() if b is not None else b for b in runner.static_grad_inputs
+        )
+
+
 def _make_graphed_function(
     fwd_graph, bwd_graph,
     module_params, len_user_args,
-    static_input_surface,
-    static_outputs,
-    static_grad_outputs,
-    static_grad_inputs,
-    output_is_tuple,
-    output_none_mask,
+    static_input_surface, static_outputs,
+    static_grad_outputs, static_grad_inputs,
+    output_is_tuple, output_none_mask,
 ):
-    class Graphed(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, *inputs):
-            for i in range(len_user_args):
-                if static_input_surface[i].data_ptr() != inputs[i].data_ptr():
-                    static_input_surface[i].copy_(inputs[i])
-            fwd_graph.replay()
-            assert isinstance(static_outputs, tuple)
-            return tuple(o.detach() for o in static_outputs)
-
-        @staticmethod
-        @torch.autograd.function.once_differentiable
-        def backward(ctx, *grads):
-            assert len(grads) == len(static_grad_outputs)
-            for g, grad in zip(static_grad_outputs, grads):
-                if g is not None and g.data_ptr() != grad.data_ptr():
-                    g.copy_(grad)
-            bwd_graph.replay()
-            return tuple(b.detach() if b is not None else b for b in static_grad_inputs)
+    runner = _GraphRunner(
+        fwd_graph, bwd_graph,
+        module_params, len_user_args,
+        static_input_surface, static_outputs,
+        static_grad_outputs, static_grad_inputs,
+        output_is_tuple, output_none_mask,
+    )
 
     def functionalized(*user_args):
-        out = Graphed.apply(*(tuple(user_args) + module_params))
-        return _unflatten_output(out, output_is_tuple, output_none_mask)
+        out = Graphed.apply(runner, *(tuple(user_args) + module_params))
+        return _unflatten_output(out, runner.output_is_tuple, runner.output_none_mask)
 
     return functionalized
 
