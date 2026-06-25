@@ -283,6 +283,7 @@ class CudaGraphRunner:
                     )
 
                 module.unshard(bwd_pass=True)
+                # FIXME: handle TE wgrad fusion case.
                 with torch.cuda.graph(bwd_graph, pool=self._graph_pool), torch.enable_grad():
                     if outputs_grad:
                         grad_ins = torch.autograd.grad(
@@ -315,6 +316,7 @@ class CudaGraphRunner:
             # 7. Install keyword wrappers with generated Graphed Functions.
             for i, module in enumerate(modules):
                 graphed = _make_graphed_function(
+                    module,
                     fwd_graphs[i], bwd_graphs[i],
                     per_callable_module_params[i],
                     per_callable_len_user_args[i],
@@ -383,6 +385,7 @@ def _register_generator_state(graph: torch.cuda.CUDAGraph) -> None:
 class _GraphRunner:
     """Holds the per-module state needed by ``Graphed``."""
     __slots__ = (
+        "module",
         "fwd_graph", "bwd_graph",
         "module_params", "len_user_args",
         "static_input_surface", "static_outputs",
@@ -392,12 +395,14 @@ class _GraphRunner:
 
     def __init__(
         self,
+        module,
         fwd_graph, bwd_graph,
         module_params, len_user_args,
         static_input_surface, static_outputs,
         static_grad_outputs, static_grad_inputs,
         output_is_tuple, output_none_mask,
     ):
+        self.module = module
         self.fwd_graph = fwd_graph
         self.bwd_graph = bwd_graph
         self.module_params = module_params
@@ -417,11 +422,23 @@ class Graphed(torch.autograd.Function):
     @staticmethod
     def forward(ctx, runner, *inputs):
         ctx.runner = runner
+        logger.debug(
+            "Graphed.forward: unshard module=%s id=%s",
+            getattr(runner.module, "_fsdp_module_name", runner.module.__class__.__name__),
+            id(runner.module),
+        )
+        runner.module.unshard()
         for i in range(runner.len_user_args):
             s = runner.static_input_surface[i]
             if s.data_ptr() != inputs[i].data_ptr():
                 s.copy_(inputs[i])
         runner.fwd_graph.replay()
+        runner.module.reshard()
+        logger.debug(
+            "Graphed.forward: reshard module=%s id=%s",
+            getattr(runner.module, "_fsdp_module_name", runner.module.__class__.__name__),
+            id(runner.module),
+        )
         assert isinstance(runner.static_outputs, tuple)
         return tuple(o.detach() for o in runner.static_outputs)
 
@@ -429,17 +446,30 @@ class Graphed(torch.autograd.Function):
     @torch.autograd.function.once_differentiable
     def backward(ctx, *grads):
         runner = ctx.runner
+        logger.debug(
+            "Graphed.backward: unshard(bwd) module=%s id=%s",
+            getattr(runner.module, "_fsdp_module_name", runner.module.__class__.__name__),
+            id(runner.module),
+        )
+        runner.module.unshard(bwd_pass=True)
         assert len(grads) == len(runner.static_grad_outputs)
         for g, grad in zip(runner.static_grad_outputs, grads):
             if g is not None and g.data_ptr() != grad.data_ptr():
                 g.copy_(grad)
         runner.bwd_graph.replay()
+        runner.module.reshard()
+        logger.debug(
+            "Graphed.backward: reshard module=%s id=%s",
+            getattr(runner.module, "_fsdp_module_name", runner.module.__class__.__name__),
+            id(runner.module),
+        )
         return (None,) + tuple(
             b.detach() if b is not None else b for b in runner.static_grad_inputs
         )
 
 
 def _make_graphed_function(
+    module,
     fwd_graph, bwd_graph,
     module_params, len_user_args,
     static_input_surface, static_outputs,
@@ -447,6 +477,7 @@ def _make_graphed_function(
     output_is_tuple, output_none_mask,
 ):
     runner = _GraphRunner(
+        module,
         fwd_graph, bwd_graph,
         module_params, len_user_args,
         static_input_surface, static_outputs,
