@@ -778,11 +778,14 @@ class FSDPModule:
             # the Python-side ``setattr(param, "grad_added_to_main_grad", True)`` that
             # accompanies the eager backward is captured away.  We record the per-param
             # flag during the trace micro-batch and restore it here.
-            # no_shard/ZeRO-1 keep full grads replicated until the last
-            # micro-batch, but still accumulate each micro-batch into the FP32
-            # main-grad buffer.
-            replicated_grad = param_group.sharding_strategy in ("no_shard", "optim")
-            add_to_main_grad = replicated_grad and not param_group._grad_buffer_is_fresh
+            # These paths keep full grads until the last micro-batch and
+            # accumulate each micro-batch into the FP32 main-grad buffer.
+            requires_grad_accumulation = param_group.sharding_strategy in ("no_shard", "optim") or (
+                param_group.outer_dp_sharding_strategy == "optim"
+            )
+            add_to_main_grad = (
+                requires_grad_accumulation and not param_group._grad_buffer_is_fresh
+            )
             for name, param in zip(param_names, param_group.params):
                 grad_added = getattr(param, "grad_added_to_main_grad", False)
                 recorded = getattr(param, "_mfsdp_recorded_te_wgrad", False)
@@ -813,7 +816,7 @@ class FSDPModule:
                     else:
                         main_grad.copy_(param.grad.detach())
                     del param.grad
-            if replicated_grad:
+            if requires_grad_accumulation:
                 param_group._grad_buffer_is_fresh = False
 
             if async_op:
