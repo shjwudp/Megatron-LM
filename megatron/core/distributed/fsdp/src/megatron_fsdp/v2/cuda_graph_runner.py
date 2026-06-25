@@ -223,16 +223,9 @@ class FSDPCudaGraphRunner:
             with torch.cuda.graph(
                 self.fwd_graph, pool=self._graph_pool, stream=stream
             ):
-                # Lazy backward capture uses this forward-capture tape after
-                # runtime forward replays have copied into static_inputs.
-                # Save cloned tensors so those copies do not trip autograd
-                # version checks in backward functions such as TE RoPE.
-                with torch.autograd.graph.saved_tensors_hooks(
-                    lambda t: t.clone(), lambda t: t
-                ):
-                    self.static_outputs = self._flatten_output(
-                        self._run_forward(self.static_inputs)
-                    )
+                self.static_outputs = self._flatten_output(
+                    self._run_forward(self.static_inputs)
+                )
 
         stream.synchronize()
         self._captured = True
