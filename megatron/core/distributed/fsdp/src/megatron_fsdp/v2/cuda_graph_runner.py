@@ -34,6 +34,7 @@ API
 """  # noqa: E501
 
 import inspect
+import gc
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -191,18 +192,41 @@ class FSDPCudaGraphRunner:
         self._len_user_args = len(self.static_inputs)
         self._module_params = tuple(self._module.parameters())
 
-        # ---- warmup on throwaway stream ----
+        # ---- warmup on capture stream ----
         torch.cuda.synchronize()
-        with torch.cuda.stream(torch.cuda.Stream()):
+        stream = self._capture_stream
+        with torch.cuda.stream(stream):
             for _ in range(self._num_warmup):
                 out = self._run_forward(self.static_inputs)
                 flat = self._flatten_output(out)
-                loss = sum(o.sum() for o in flat if o.requires_grad)
-                if loss.requires_grad:
-                    loss.backward()
+                if any(o.requires_grad for o in flat):
+                    torch.autograd.grad(
+                        outputs=tuple(o for o in flat if o.requires_grad),
+                        inputs=tuple(
+                            t for t in self.static_inputs + tuple(self._module.parameters())
+                            if t.requires_grad
+                        ),
+                        grad_outputs=tuple(
+                            torch.empty_like(o) for o in flat if o.requires_grad
+                        ),
+                        only_inputs=True,
+                        allow_unused=True,
+                    )
+                # loss = sum(o.sum() for o in flat if o.requires_grad)
+                # if loss.requires_grad:
+                #     loss.backward()
                 for p in self._module.parameters():
                     p.grad = None
+                del out, flat
+        torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
+
+        # Full cleanup: collect cyclic autograd garbage from warmup, THEN
+        # freeze GC and release freed blocks back to CUDA.
+        gc.collect()
+        torch.cuda.empty_cache()
+        gc.collect()  # second pass catches ref-cycles broken by first collect
+        torch.cuda.empty_cache()
 
         # ---- record output structure ----
         out = self._run_forward(self.static_inputs)
@@ -210,7 +234,6 @@ class FSDPCudaGraphRunner:
         self.static_outputs = self._flatten_output(out)
 
         # ---- capture forward graph (with grad enabled) ----
-        stream = self._capture_stream
         gen = _ensure_generator_graph_safe()
         self.fwd_graph = torch.cuda.CUDAGraph()
         self.fwd_graph.register_generator_state(gen)
