@@ -271,7 +271,7 @@ def test_reduce_grad(strategy):
             gbuf.data.fill_(float(rank + 1))
             ref = torch.full_like(gbuf.data, float(rank + 1))
             Ref.all_reduce(ref, dp_group)
-            gbuf.reduce_grad()
+            gbuf.reduce_grad(reduce_scatter=False)
             assert torch.equal(gbuf.data, ref)
         else:
             # ZeRO-1/2/3: reduce-scatter a full gradient buffer and compare

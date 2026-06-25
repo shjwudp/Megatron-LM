@@ -579,17 +579,11 @@ class DataParallelBuffer:
             # Keep temporary reduce-scatter buffers tied to the stream that uses them.
             input_buffer.record_stream(torch.cuda.current_stream())
 
-        comm_output = output_buffer
-        output_key = None
-        if grad_comm_dtype != self.dtype or not overwrite_grad:
-            output_key = (self.alloc_key, "grad_reduce_output", reduce_dim)
-            output_bucket = self.allocator.allocate(
-                key=output_key,
-                size=output_buffer.numel(),
-                dtype=grad_comm_dtype,
-                device=self.device,
-            )
-            comm_output = output_bucket.data
+        input_meta = self.buffer_index._get_shard_meta(input_shard_dims)
+        output_meta = self.buffer_index._get_shard_meta(output_shard_dims)
+        output_offset = output_meta.global_data_index - input_meta.global_data_index
+        # Stage RS output in the input buffer slice; avoids untraced temp keys in TracePool.
+        comm_output = comm_input[output_offset : output_offset + output_buffer.numel()]
 
         torch.distributed.reduce_scatter_tensor(
             output=comm_output,
@@ -603,8 +597,6 @@ class DataParallelBuffer:
                 output_buffer.copy_(comm_output)
             else:
                 output_buffer += comm_output
-        if output_key is not None:
-            self.allocator.free(output_key)
         if input_key is not None:
             self.allocator.free(input_key)
 
