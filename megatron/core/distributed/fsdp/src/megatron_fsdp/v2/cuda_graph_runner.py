@@ -87,8 +87,6 @@ class CudaGraphRunner:
 
         # Per-module state recorded during the first optimized forward.
         self._sample_kwargs: Dict[int, Dict[str, Any]] = {}
-        self._tensor_kwarg_names: Dict[int, List[str]] = {}
-        self._frozen_kwargs: Dict[int, Dict[str, Any]] = {}
         self._modules_ordered: List[torch.nn.Module] = []
 
     # ---- called from hooks ------------------------------------------------
@@ -116,24 +114,17 @@ class CudaGraphRunner:
             n for n in all_names if isinstance(bound.arguments[n], torch.Tensor)
         ]
         all_kwargs = {n: bound.arguments[n] for n in all_names}
-        frozen_kwargs = {
-            n: bound.arguments[n]
-            for n in all_names
-            if n not in tensor_names
-        }
 
         self._sample_kwargs[mid] = all_kwargs
-        self._tensor_kwarg_names[mid] = tensor_names
-        self._frozen_kwargs[mid] = frozen_kwargs
         self._modules_ordered.append(module)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info(
-                "CudaGraphRunner: recorded module %s (id=%s), %d tensor / %d total kwargs",
+                "CudaGraphRunner: recorded module %s (id=%s), %d kwargs (%d tensor)",
                 getattr(module, "_fsdp_module_name", module.__class__.__name__),
                 id(module),
-                len(tensor_names),
                 len(all_kwargs),
+                len(tensor_names),
             )
 
     def capture_and_install(self, root_module: torch.nn.Module) -> None:
@@ -211,14 +202,10 @@ class CudaGraphRunner:
         if not isinstance(graphed, tuple):
             graphed = (graphed,)
 
-        # make_graphed_callables already replaced module.forward with the
-        # graphed version.  We wrap it with the keyword-arg adapter so the
-        # caller can continue to pass kwargs normally.
+        # make_graphed_callables already replaced module.forward with
+        # the graphed version that handles kwargs natively.
         for module in modules:
-            orig = getattr(module, "_fsdp_cg_orig_forward", None)
-            if orig is None:
-                orig = module.forward  # the graphed forward installed by te-graph-runtime
-            _install_cg(module, module.forward, self._frozen_kwargs.get(id(module), {}), orig)
+            module._fsdp_cg_installed = True
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info("CudaGraphRunner: installed CUDA graphs on %d modules", n)
@@ -256,44 +243,3 @@ def _make_bwd_post_hook(module):
         # ):
         #     module.reduce_grad()
     return hook
-
-
-# ---------------------------------------------------------------------------
-# Install / uninstall keyword wrappers
-# ---------------------------------------------------------------------------
-
-
-def _install_cg(
-    module: torch.nn.Module,
-    graphed_callable: Any,
-    frozen_kwargs: Dict[str, Any],
-    orig_forward: Any,
-) -> None:
-    # Merge recorded frozen kwargs as fallbacks for any keys not present
-    # in the live call (non-tensor values like img_shapes, txt_seq_lens
-    # that are fixed per run).
-    fallback = dict(frozen_kwargs)
-
-    def wrapper(**kwargs):
-        cg_kwargs = {}
-        cg_kwargs.update(fallback)
-        cg_kwargs.update(kwargs)
-        return graphed_callable(**cg_kwargs)
-
-    try:
-        wrapper.__signature__ = inspect.signature(orig_forward)
-    except Exception:
-        pass
-
-    module._fsdp_cg_orig_forward = orig_forward
-    module._fsdp_cg_installed = True
-    module.forward = wrapper
-
-
-def uninstall_cg(module: torch.nn.Module) -> None:
-    """Restore the original ``module.forward``."""
-    orig = getattr(module, "_fsdp_cg_orig_forward", None)
-    if orig is not None:
-        module.forward = orig
-        module._fsdp_cg_installed = False
-        del module._fsdp_cg_orig_forward
