@@ -117,14 +117,6 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
             )
         ctx.cuda_graph_runner.record_module(target, args, kwargs)
 
-    cg_installed = getattr(target, "_fsdp_cg_installed", False)
-    if cg_installed:
-        logger.debug(
-            "hook pre-fwd: module=%s id=%s cg_installed=%s",
-            target._fsdp_module_name, id(target), cg_installed,
-        )
-
-
 @torch.compiler.disable
 def mfsdp_post_forward_hook(module: nn.Module, *unused):
     """Post-forward hook: reshard parameters.
@@ -144,13 +136,6 @@ def mfsdp_post_forward_hook(module: nn.Module, *unused):
     if ctx.backward_phase and id(module) == ctx.backward_module:
         return
     module.reshard()
-
-    cg_installed = getattr(module, "_fsdp_cg_installed", False)
-    if cg_installed:
-        logger.debug(
-            "hook post-fwd: module=%s id=%s",
-            module._fsdp_module_name, id(module),
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -225,13 +210,6 @@ def mfsdp_pre_backward_setup(
     _pre_backward_setup(target, skip_final_callback=skip_final_callback)
     target._fsdp_pre_backward_done = True
 
-    cg_installed = getattr(target, "_fsdp_cg_installed", False)
-    if cg_installed:
-        logger.debug(
-            "hook pre-bwd: module=%s id=%s",
-            target._fsdp_module_name, id(target),
-        )
-
 
 @torch.compiler.disable
 def mfsdp_post_backward_hook(module: nn.Module):
@@ -262,13 +240,6 @@ def mfsdp_post_backward_hook(module: nn.Module):
             submodule.reduce_grad(async_op=ctx.enable_async_reduce_grad)
         submodule.post_backward_issued = True
     ctx._advance_backward_module()
-
-    cg_installed = getattr(module, "_fsdp_cg_installed", False)
-    if cg_installed:
-        logger.debug(
-            "hook post-bwd: module=%s id=%s",
-            module._fsdp_module_name, id(module),
-        )
 
 
 @torch.compiler.disable

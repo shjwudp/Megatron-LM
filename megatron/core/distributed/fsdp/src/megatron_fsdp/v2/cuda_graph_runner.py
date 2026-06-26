@@ -179,6 +179,9 @@ class CudaGraphRunner:
         # capture_time_hooks handle unshard/reshard during warmup + capture.
         saved_hooks = _pop_all_hooks(root_module)
 
+        torch.cuda.reset_peak_memory_stats()
+        _alloc_before = torch.cuda.memory_allocated()
+
         try:
             graphed = make_graphed_callables(
                 tuple(modules),
@@ -190,6 +193,20 @@ class CudaGraphRunner:
             )
         finally:
             _restore_all_hooks(saved_hooks)
+
+        _alloc_after = torch.cuda.memory_allocated()
+        _peak_alloc = torch.cuda.max_memory_allocated()
+
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            logger.info(
+                "CudaGraphRunner: %d modules captured, "
+                "alloc %+.1f MB (%d→%d)  peak_alloc %d MB",
+                n,
+                (_alloc_after - _alloc_before) / 1e6,
+                _alloc_before // 1_000_000,
+                _alloc_after // 1_000_000,
+                _peak_alloc // 1_000_000,
+            )
 
         if not isinstance(graphed, tuple):
             graphed = (graphed,)
