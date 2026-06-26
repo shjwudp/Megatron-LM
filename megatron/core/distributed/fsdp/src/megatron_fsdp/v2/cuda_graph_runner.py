@@ -86,6 +86,7 @@ class CudaGraphRunner:
         self._captured = False
 
         # Per-module state recorded during the first optimized forward.
+        self._sample_args: Dict[int, Tuple] = {}
         self._sample_kwargs: Dict[int, Dict[str, Any]] = {}
         self._modules_ordered: List[torch.nn.Module] = []
 
@@ -94,11 +95,11 @@ class CudaGraphRunner:
     def record_module(
         self, module: torch.nn.Module, args: Tuple, kwargs: Dict[str, Any]
     ) -> None:
-        """Record sample kwargs for *module* during the first optimized forward."""
+        """Record sample args for *module* during the first optimized forward."""
         if self._captured:
             return
         mid = id(module)
-        if mid in self._sample_kwargs:
+        if mid in self._sample_args:
             return
 
         sig = inspect.signature(module.forward)
@@ -108,23 +109,27 @@ class CudaGraphRunner:
             if has_self
             else sig.bind(*args, **kwargs)
         )
-        bound.apply_defaults()
-        all_names = [n for n in sig.parameters if not (has_self and n == "self")]
-        tensor_names = [
-            n for n in all_names if isinstance(bound.arguments[n], torch.Tensor)
-        ]
-        all_kwargs = {n: bound.arguments[n] for n in all_names}
+        # Separate positional and keyword args so make_graphed_callables
+        # can reconstruct them correctly during replay.
+        sample_args = tuple(bound.args)
+        sample_kwargs = dict(bound.kwargs)
 
-        self._sample_kwargs[mid] = all_kwargs
+        self._sample_args[mid] = sample_args
+        self._sample_kwargs[mid] = sample_kwargs
         self._modules_ordered.append(module)
 
+        n_tensor = sum(1 for v in sample_args if isinstance(v, torch.Tensor))
+        n_kw_tensor = sum(
+            1 for v in sample_kwargs.values() if isinstance(v, torch.Tensor)
+        )
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info(
-                "CudaGraphRunner: recorded module %s (id=%s), %d kwargs (%d tensor)",
+                "CudaGraphRunner: recorded module %s (id=%s), "
+                "%d args (%d tensor) + %d kwargs (%d tensor)",
                 getattr(module, "_fsdp_module_name", module.__class__.__name__),
                 id(module),
-                len(all_kwargs),
-                len(tensor_names),
+                len(sample_args), n_tensor,
+                len(sample_kwargs), n_kw_tensor,
             )
 
     def capture_and_install(self, root_module: torch.nn.Module) -> None:
@@ -141,6 +146,7 @@ class CudaGraphRunner:
 
         from te_graph_runtime import make_graphed_callables
 
+        sample_args_list: List[Tuple] = []
         sample_kwargs_list: List[Dict[str, Any]] = []
         capture_hooks: List[Dict] = []
 
@@ -148,11 +154,17 @@ class CudaGraphRunner:
             mid = id(m)
             # Clone tensor values so warmup gets fresh leaves without
             # residual autograd state from the first forward+backward.
+            args = tuple(
+                v.detach().clone().requires_grad_(v.requires_grad)
+                if isinstance(v, torch.Tensor) else v
+                for v in self._sample_args[mid]
+            )
             kw = {
                 k: v.detach().clone().requires_grad_(v.requires_grad)
                 if isinstance(v, torch.Tensor) else v
                 for k, v in self._sample_kwargs[mid].items()
             }
+            sample_args_list.append(args)
             sample_kwargs_list.append(kw)
 
             capture_hooks.append({
@@ -164,6 +176,7 @@ class CudaGraphRunner:
                 "backward_hooks": {0: _make_bwd_post_hook(m)},
             })
 
+        self._sample_args.clear()
         self._sample_kwargs.clear()
 
         # Pop real FSDP hooks so make_graphed_callables passes its assertion.
@@ -176,7 +189,7 @@ class CudaGraphRunner:
         try:
             graphed = make_graphed_callables(
                 tuple(modules),
-                tuple(() for _ in range(n)),
+                tuple(sample_args_list),
                 num_warmup_iters=self._num_warmup,
                 sample_kwargs=tuple(sample_kwargs_list),
                 pool=self._graph_pool,
