@@ -155,7 +155,14 @@ class CudaGraphRunner:
 
         for m in modules:
             mid = id(m)
-            sample_kwargs_list.append(self._sample_kwargs[mid])
+            # Clone tensor values so warmup gets fresh leaves without
+            # residual autograd state from the first forward+backward.
+            kw = {
+                k: v.detach().clone().requires_grad_(v.requires_grad)
+                if isinstance(v, torch.Tensor) else v
+                for k, v in self._sample_kwargs[mid].items()
+            }
+            sample_kwargs_list.append(kw)
 
             capture_hooks.append({
                 "forward_pre_hooks": {0: _make_fwd_pre_hook(m)},
@@ -165,6 +172,8 @@ class CudaGraphRunner:
                 "backward_pre_hooks": {0: _make_bwd_pre_hook(m)},
                 "backward_hooks": {0: _make_bwd_post_hook(m)},
             })
+
+        self._sample_kwargs.clear()
 
         # Pop real FSDP hooks so make_graphed_callables passes its assertion.
         # capture_time_hooks handle unshard/reshard during warmup + capture.
