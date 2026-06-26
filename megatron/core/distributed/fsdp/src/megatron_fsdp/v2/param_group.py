@@ -259,7 +259,7 @@ class ParameterGroup:
         self.mp_policy.copy_main_weights_to_model_weights(
             self.params,
             self.param_idx,
-            self.dp_group,
+            self.mesh,
             self.model_weight_buffer,
             self.main_weight_buffer,
             self.transpose_weight_buffer,

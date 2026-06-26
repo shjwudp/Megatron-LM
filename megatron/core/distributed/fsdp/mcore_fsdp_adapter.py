@@ -381,7 +381,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.module._copy_main_weights_to_model_weights
         )
         self.ddp_config = ddp_config
-        self.no_sync = nullcontext
+        self.no_sync = self.module.no_sync
+        # Wire no_sync into the schedule's no_sync_func at overlap=False (training.py
+        # wires it only for overlap=True), so the last-micro-batch signal reaches FSDP.
+        if not ddp_config.overlap_grad_reduce and config.no_sync_func is None:
+            config.no_sync_func = self.no_sync
         self.start_param_sync = noop
         self.start_grad_sync = noop
 

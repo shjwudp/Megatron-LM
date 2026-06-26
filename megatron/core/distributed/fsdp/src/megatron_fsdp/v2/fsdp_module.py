@@ -463,7 +463,9 @@ class FSDPModule:
             gbuf = p._gbuf
             item_id = p._item_id
 
-            gbuf_data = gbuf.fetch_buffer()
+            # Full (0, 0) unsharded grad: the backward writes the full gradient
+            # (params are all-gathered during bwd); reduce_grad later scatters it.
+            gbuf_data = gbuf.fetch_buffer((0, 0))
             assert gbuf_data is not None
             assert gbuf_data.numel() > 0
 
@@ -778,13 +780,9 @@ class FSDPModule:
             # the Python-side ``setattr(param, "grad_added_to_main_grad", True)`` that
             # accompanies the eager backward is captured away.  We record the per-param
             # flag during the trace micro-batch and restore it here.
-            # These paths keep full grads until the last micro-batch and
-            # accumulate each micro-batch into the FP32 main-grad buffer.
-            requires_grad_accumulation = param_group.sharding_strategy in ("no_shard", "optim") or (
-                param_group.outer_dp_sharding_strategy == "optim"
-            )
+            grad_replicated = param_group.sharding_strategy in ("no_shard", "optim")
             add_to_main_grad = (
-                requires_grad_accumulation and not param_group._grad_buffer_is_fresh
+                grad_replicated and not param_group._grad_buffer_is_fresh
             )
             for name, param in zip(param_names, param_group.params):
                 grad_added = getattr(param, "grad_added_to_main_grad", False)
@@ -816,7 +814,7 @@ class FSDPModule:
                     else:
                         main_grad.copy_(param.grad.detach())
                     del param.grad
-            if requires_grad_accumulation:
+            if grad_replicated:
                 param_group._grad_buffer_is_fresh = False
 
             if async_op:
@@ -1116,6 +1114,23 @@ class FSDPModule:
         delayed inner grad reductions and outer-DP grad sync are issued.
         """
         self._fsdp_root_context.is_last_microbatch = is_last_backward
+
+    @contextmanager
+    def no_sync(self):
+        """Defer the outer-DP / HSDP gradient reduce until the last micro-batch
+        (like MegatronFSDP v1 / PyTorch DDP ``no_sync``).
+
+        Example::
+
+            with model.no_sync():
+                loss(mb0).backward()   # accumulate, no reduce
+            loss(mb1).backward()       # last micro-batch -> reduce fires
+        """
+        self.set_is_last_backward(False)
+        try:
+            yield
+        finally:
+            self.set_is_last_backward(True)
 
     def _sync_module_states_after_load(self):
         self._copy_main_weights_to_model_weights()

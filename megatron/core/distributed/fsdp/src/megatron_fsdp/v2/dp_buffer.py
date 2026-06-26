@@ -56,7 +56,6 @@ class DataParallelBuffer:
         self.param_idx = param_idx
         self.dtype = dtype
         self.device = device
-        self.mesh = mesh
         self.outer_dp_group = mesh.get_group(mesh_dim=0)
         self.dp_group = mesh.get_group(mesh_dim=1)
         self.allocator = allocator if allocator is not None else TemporaryBucketAllocator()
@@ -64,7 +63,7 @@ class DataParallelBuffer:
         self.alloc_key = (param_group_id, buffer_role)
         self.mp_policy = mp_policy
 
-        def inner_strategy_shards_buffer(strategy: str) -> bool:
+        def get_sharding_from_strategy(strategy: str) -> bool:
             if buffer_role in ("model_weight", "transpose_weight"):
                 return strategy == "optim_grads_params"
             if buffer_role == "main_weight":
@@ -73,33 +72,12 @@ class DataParallelBuffer:
                 return strategy in ("optim_grads", "optim_grads_params")
             raise ValueError(f"Unsupported data-parallel buffer role: {buffer_role}")
 
-        def outer_strategy_shards_buffer(strategy: str) -> bool:
-            if strategy == "no_shard":
-                return False
-            if strategy != "optim":
-                raise ValueError(f"Unsupported outer DP sharding strategy: {strategy}")
-            if buffer_role in ("model_weight", "transpose_weight"):
-                return False
-            if buffer_role in ("main_weight", "main_grad"):
-                return sharding_strategy != "no_shard"
-            raise ValueError(f"Unsupported data-parallel buffer role: {buffer_role}")
-
-        inner_sharded = inner_strategy_shards_buffer(sharding_strategy)
-        outer_sharded = outer_strategy_shards_buffer(outer_dp_sharding_strategy)
+        inner_sharded = get_sharding_from_strategy(sharding_strategy)
+        outer_sharded = get_sharding_from_strategy(outer_dp_sharding_strategy)
         self.inner_sharded = inner_sharded
         self.outer_sharded = outer_sharded
-        if outer_sharded and inner_sharded:
-            # shard_dims=(outer, inner): outer sharded, inner sharded.
-            self.storage_shard_dims = (1, 1)
-        elif outer_sharded:
-            # shard_dims=(outer, inner): outer sharded, inner not sharded.
-            self.storage_shard_dims = (1, 0)
-        elif inner_sharded:
-            # shard_dims=(outer, inner): outer not sharded, inner sharded.
-            self.storage_shard_dims = (0, 1)
-        else:
-            # shard_dims=(outer, inner): outer not sharded, inner not sharded.
-            self.storage_shard_dims = (0, 0)
+        # shard_dims=(outer, inner): 1 means sharded and 0 means replicated.
+        self.storage_shard_dims = (int(outer_sharded), int(inner_sharded))
         self.sharding_strategy = sharding_strategy
         self.outer_dp_sharding_strategy = outer_dp_sharding_strategy
         self.gradient_scaling_factor = gradient_scaling_factor
