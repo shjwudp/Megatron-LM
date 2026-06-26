@@ -115,25 +115,25 @@ class CudaGraphRunner:
         tensor_names = [
             n for n in all_names if isinstance(bound.arguments[n], torch.Tensor)
         ]
-        tensor_kwargs = {n: bound.arguments[n] for n in tensor_names}
+        all_kwargs = {n: bound.arguments[n] for n in all_names}
         frozen_kwargs = {
             n: bound.arguments[n]
             for n in all_names
             if n not in tensor_names
         }
 
-        self._sample_kwargs[mid] = tensor_kwargs
+        self._sample_kwargs[mid] = all_kwargs
         self._tensor_kwarg_names[mid] = tensor_names
         self._frozen_kwargs[mid] = frozen_kwargs
         self._modules_ordered.append(module)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info(
-                "CudaGraphRunner: recorded module %s (id=%s), %d tensor / %d frozen kwargs",
+                "CudaGraphRunner: recorded module %s (id=%s), %d tensor / %d total kwargs",
                 getattr(module, "_fsdp_module_name", module.__class__.__name__),
                 id(module),
                 len(tensor_names),
-                len(frozen_kwargs),
+                len(all_kwargs),
             )
 
     def capture_and_install(self, root_module: torch.nn.Module) -> None:
@@ -185,9 +185,10 @@ class CudaGraphRunner:
         if not isinstance(graphed, tuple):
             graphed = (graphed,)
 
-        for module, g, names in zip(modules, graphed, self._tensor_kwarg_names.values()):
+        for module, g in zip(modules, graphed):
             mid = id(module)
-            _install_cg(module, g, names, self._frozen_kwargs.get(mid, {}))
+            orig = getattr(module, "_fsdp_cg_orig_forward", None) or module.forward
+            _install_cg(module, g, self._frozen_kwargs.get(mid, {}), orig)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info("CudaGraphRunner: installed CUDA graphs on %d modules", n)
@@ -235,14 +236,18 @@ def _make_bwd_post_hook(module):
 def _install_cg(
     module: torch.nn.Module,
     graphed_callable: Any,
-    tensor_kwarg_names: List[str],
     frozen_kwargs: Dict[str, Any],
+    orig_forward: Any,
 ) -> None:
-    orig_forward = module.forward
+    # Merge recorded frozen kwargs as fallbacks for any keys not present
+    # in the live call (non-tensor values like img_shapes, txt_seq_lens
+    # that are fixed per run).
+    fallback = dict(frozen_kwargs)
 
     def wrapper(**kwargs):
-        cg_kwargs = {n: kwargs[n] for n in tensor_kwarg_names}
-        cg_kwargs.update(frozen_kwargs)
+        cg_kwargs = {}
+        cg_kwargs.update(fallback)
+        cg_kwargs.update(kwargs)
         return graphed_callable(**cg_kwargs)
 
     try:
