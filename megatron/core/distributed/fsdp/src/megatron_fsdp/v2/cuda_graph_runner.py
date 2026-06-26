@@ -30,11 +30,47 @@ orchestrates:
 
 import inspect
 import logging
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Hook save / restore
+# ---------------------------------------------------------------------------
+
+_HOOK_ATTRS = [
+    "_forward_pre_hooks",
+    "_forward_hooks",
+    "_forward_hooks_with_kwargs",
+    "_forward_pre_hooks_with_kwargs",
+    "_backward_hooks",
+    "_backward_pre_hooks",
+    "_state_dict_hooks",
+    "_load_state_dict_pre_hooks",
+    "_load_state_dict_post_hooks",
+]
+
+
+def _pop_all_hooks(module):
+    saved = []
+    for sub in module.modules():
+        snap = {}
+        for attr in _HOOK_ATTRS:
+            if hasattr(sub, attr):
+                snap[attr] = getattr(sub, attr)
+                setattr(sub, attr, OrderedDict())
+        saved.append((sub, snap))
+    return saved
+
+
+def _restore_all_hooks(saved):
+    for sub, snap in saved:
+        for name, value in snap.items():
+            if value is not None:
+                setattr(sub, name, value)
 
 
 class CudaGraphRunner:
@@ -113,31 +149,28 @@ class CudaGraphRunner:
             mid = id(m)
             sample_kwargs_list.append(self._sample_kwargs[mid])
 
-            # capture_time_hooks: unshard before forward, reshard after;
-            # unshard before backward, reshard + reduce_grad after.
             capture_hooks.append({
-                "forward_pre_hooks_with_kwargs": {
-                    0: _make_fwd_pre_hook(m),
-                },
-                "forward_hooks_with_kwargs": {
-                    0: _make_fwd_post_hook(m),
-                },
-                "backward_pre_hooks": {
-                    0: _make_bwd_pre_hook(m),
-                },
-                "backward_hooks": {
-                    0: _make_bwd_post_hook(m),
-                },
+                "forward_pre_hooks_with_kwargs": {0: _make_fwd_pre_hook(m)},
+                "forward_hooks_with_kwargs": {0: _make_fwd_post_hook(m)},
+                "backward_pre_hooks": {0: _make_bwd_pre_hook(m)},
+                "backward_hooks": {0: _make_bwd_post_hook(m)},
             })
 
-        graphed = make_graphed_callables(
-            tuple(modules),
-            tuple(() for _ in range(n)),  # sample_args: empty (all via kwargs)
-            num_warmup_iters=self._num_warmup,
-            sample_kwargs=tuple(sample_kwargs_list),
-            pool=self._graph_pool,
-            capture_time_hooks=capture_hooks,
-        )
+        # Pop real FSDP hooks so make_graphed_callables passes its assertion.
+        # capture_time_hooks handle unshard/reshard during warmup + capture.
+        saved_hooks = _pop_all_hooks(root_module)
+
+        try:
+            graphed = make_graphed_callables(
+                tuple(modules),
+                tuple(() for _ in range(n)),
+                num_warmup_iters=self._num_warmup,
+                sample_kwargs=tuple(sample_kwargs_list),
+                pool=self._graph_pool,
+                capture_time_hooks=capture_hooks,
+            )
+        finally:
+            _restore_all_hooks(saved_hooks)
 
         if not isinstance(graphed, tuple):
             graphed = (graphed,)
