@@ -569,9 +569,14 @@ def _register_backward_hook(module: FSDPModule):
 
 
 def _maybe_capture_cuda_graphs(ctx, root_module) -> None:
-    """Trigger batch CUDA graph capture via ``ctx.cuda_graph_runner``."""
+    """Trigger batch CUDA graph capture via ``ctx.cuda_graph_runner``.
+
+    Called from an autograd engine callback where grad is disabled;
+    explicitly re-enable it for warmup + capture.
+    """
     if ctx.cuda_graph_runner is not None:
-        ctx.cuda_graph_runner.capture_and_install(root_module)
+        with torch.enable_grad():
+            ctx.cuda_graph_runner.capture_and_install(root_module)
 
 
 def _register_post_backward_final_callback(
