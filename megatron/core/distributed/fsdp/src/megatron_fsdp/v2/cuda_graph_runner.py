@@ -114,18 +114,19 @@ class CudaGraphRunner:
         tensor_names = [
             n for n in all_names if isinstance(bound.arguments[n], torch.Tensor)
         ]
-        tensor_kwargs = {n: bound.arguments[n] for n in tensor_names}
+        all_kwargs = {n: bound.arguments[n] for n in all_names}
 
-        self._sample_kwargs[mid] = tensor_kwargs
+        self._sample_kwargs[mid] = all_kwargs
         self._tensor_kwarg_names[mid] = tensor_names
         self._modules_ordered.append(module)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info(
-                "CudaGraphRunner: recorded module %s (id=%s), %d tensor kwargs",
+                "CudaGraphRunner: recorded module %s (id=%s), %d tensor / %d total kwargs",
                 getattr(module, "_fsdp_module_name", module.__class__.__name__),
                 id(module),
                 len(tensor_names),
+                len(all_kwargs),
             )
 
     def capture_and_install(self, root_module: torch.nn.Module) -> None:
