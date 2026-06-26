@@ -151,8 +151,10 @@ class CudaGraphRunner:
             sample_kwargs_list.append(self._sample_kwargs[mid])
 
             capture_hooks.append({
-                "forward_pre_hooks_with_kwargs": {0: _make_fwd_pre_hook(m)},
-                "forward_hooks_with_kwargs": {0: _make_fwd_post_hook(m)},
+                "forward_pre_hooks": {0: _make_fwd_pre_hook(m)},
+                "forward_pre_hooks_with_kwargs": {0: True},
+                "forward_hooks": {0: _make_fwd_post_hook(m)},
+                "forward_hooks_with_kwargs": {0: True},
                 "backward_pre_hooks": {0: _make_bwd_pre_hook(m)},
                 "backward_hooks": {0: _make_bwd_post_hook(m)},
             })
