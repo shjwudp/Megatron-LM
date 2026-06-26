@@ -88,6 +88,7 @@ class CudaGraphRunner:
         # Per-module state recorded during the first optimized forward.
         self._sample_kwargs: Dict[int, Dict[str, Any]] = {}
         self._tensor_kwarg_names: Dict[int, List[str]] = {}
+        self._frozen_kwargs: Dict[int, Dict[str, Any]] = {}
         self._modules_ordered: List[torch.nn.Module] = []
 
     # ---- called from hooks ------------------------------------------------
@@ -114,19 +115,25 @@ class CudaGraphRunner:
         tensor_names = [
             n for n in all_names if isinstance(bound.arguments[n], torch.Tensor)
         ]
-        all_kwargs = {n: bound.arguments[n] for n in all_names}
+        tensor_kwargs = {n: bound.arguments[n] for n in tensor_names}
+        frozen_kwargs = {
+            n: bound.arguments[n]
+            for n in all_names
+            if n not in tensor_names
+        }
 
-        self._sample_kwargs[mid] = all_kwargs
+        self._sample_kwargs[mid] = tensor_kwargs
         self._tensor_kwarg_names[mid] = tensor_names
+        self._frozen_kwargs[mid] = frozen_kwargs
         self._modules_ordered.append(module)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info(
-                "CudaGraphRunner: recorded module %s (id=%s), %d tensor / %d total kwargs",
+                "CudaGraphRunner: recorded module %s (id=%s), %d tensor / %d frozen kwargs",
                 getattr(module, "_fsdp_module_name", module.__class__.__name__),
                 id(module),
                 len(tensor_names),
-                len(all_kwargs),
+                len(frozen_kwargs),
             )
 
     def capture_and_install(self, root_module: torch.nn.Module) -> None:
@@ -179,7 +186,8 @@ class CudaGraphRunner:
             graphed = (graphed,)
 
         for module, g, names in zip(modules, graphed, self._tensor_kwarg_names.values()):
-            _install_cg(module, g, names)
+            mid = id(module)
+            _install_cg(module, g, names, self._frozen_kwargs.get(mid, {}))
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info("CudaGraphRunner: installed CUDA graphs on %d modules", n)
@@ -228,19 +236,14 @@ def _install_cg(
     module: torch.nn.Module,
     graphed_callable: Any,
     tensor_kwarg_names: List[str],
+    frozen_kwargs: Dict[str, Any],
 ) -> None:
-    """Replace ``module.forward`` with a wrapper around the graphed callable.
-
-    The graphed callable from ``make_graphed_callables`` accepts positional
-    args + keyword kwargs.  We wrap it so the caller can continue to pass
-    keyword args natively.
-    """
     orig_forward = module.forward
 
     def wrapper(**kwargs):
-        flat_args = ()
         cg_kwargs = {n: kwargs[n] for n in tensor_kwarg_names}
-        return graphed_callable(*flat_args, **cg_kwargs)
+        cg_kwargs.update(frozen_kwargs)
+        return graphed_callable(**cg_kwargs)
 
     try:
         wrapper.__signature__ = inspect.signature(orig_forward)
