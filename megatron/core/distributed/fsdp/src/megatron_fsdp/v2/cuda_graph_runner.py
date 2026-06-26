@@ -109,9 +109,26 @@ class CudaGraphRunner:
             if has_self
             else sig.bind(*args, **kwargs)
         )
-        # Separate positional and keyword args so make_graphed_callables
-        # can reconstruct them correctly during replay.
-        sample_args = tuple(bound.args)
+        # Separate positional tensor args (→ sample_args) from the rest.
+        # Non-tensor positional values and all kwargs go to sample_kwargs
+        # so make_graphed_callables can reconstruct the call correctly.
+        param_names = [
+            n for n in sig.parameters
+            if not (has_self and n == "self")
+        ]
+        # positional values map to the first len(bound.args) - (1 if has_self else 0) params
+        pos_start = 1 if has_self else 0
+        pos_values = list(bound.args[pos_start:])
+        pos_names_mapped = param_names[:len(pos_values)]
+
+        tensor_args = []
+        for name, val in zip(pos_names_mapped, pos_values):
+            if isinstance(val, torch.Tensor):
+                tensor_args.append(val)
+            else:
+                bound.kwargs[name] = val
+
+        sample_args = tuple(tensor_args)
         sample_kwargs = dict(bound.kwargs)
 
         self._sample_args[mid] = sample_args
