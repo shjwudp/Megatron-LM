@@ -194,10 +194,14 @@ class CudaGraphRunner:
         if not isinstance(graphed, tuple):
             graphed = (graphed,)
 
-        for module, g in zip(modules, graphed):
-            mid = id(module)
-            orig = getattr(module, "_fsdp_cg_orig_forward", None) or module.forward
-            _install_cg(module, g, self._frozen_kwargs.get(mid, {}), orig)
+        # make_graphed_callables already replaced module.forward with the
+        # graphed version.  We wrap it with the keyword-arg adapter so the
+        # caller can continue to pass kwargs normally.
+        for module in modules:
+            orig = getattr(module, "_fsdp_cg_orig_forward", None)
+            if orig is None:
+                orig = module.forward  # the graphed forward installed by te-graph-runtime
+            _install_cg(module, module.forward, self._frozen_kwargs.get(id(module), {}), orig)
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info("CudaGraphRunner: installed CUDA graphs on %d modules", n)
