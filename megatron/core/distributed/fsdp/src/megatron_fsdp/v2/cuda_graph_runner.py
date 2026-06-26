@@ -26,16 +26,71 @@ orchestrates:
      first optimized forward pass.
   2. Calling ``make_graphed_callables`` with all modules and
      ``capture_time_hooks`` that perform unshard / reshard.
-"""
+"""  # noqa: E501
 
 import inspect
 import logging
+import os
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# NVML memory helper (real GPU memory, not just torch allocator view)
+# ---------------------------------------------------------------------------
+
+
+def _nvml_device_memory(device: Optional[int] = None) -> Optional[Tuple[int, int]]:
+    """Return (used_MiB, total_MiB) from NVML, or None if unavailable."""
+    try:
+        import pynvml
+    except ImportError:
+        return None
+    try:
+        pynvml.nvmlInit()
+    except pynvml.NVMLError:
+        return None
+    try:
+        if device is None:
+            device = torch.cuda.current_device()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device)
+        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        return (info.used // (1024 * 1024), info.total // (1024 * 1024))
+    except Exception:
+        return None
+
+
+def _mem_snapshot() -> Dict[str, int]:
+    """Capture a snapshot of memory counters across torch and NVML."""
+    snap = {
+        "torch_alloc": torch.cuda.memory_allocated() // 1_000_000,
+        "torch_reserved": torch.cuda.memory_reserved() // 1_000_000,
+    }
+    nvml = _nvml_device_memory()
+    if nvml is not None:
+        snap["nvml_used"] = nvml[0]
+        snap["nvml_total"] = nvml[1]
+    return snap
+
+
+def _fmt_mem_snapshot(before: Dict[str, int], after: Dict[str, int], peak_alloc: int) -> str:
+    """Format memory diff as a human-readable string."""
+    parts = [
+        f"torch_alloc {before['torch_alloc']}→{after['torch_alloc']} MB "
+        f"(Δ{after['torch_alloc'] - before['torch_alloc']:+d})",
+        f"torch_reserved {before['torch_reserved']}→{after['torch_reserved']} MB "
+        f"(Δ{after['torch_reserved'] - before['torch_reserved']:+d})",
+        f"peak_alloc {peak_alloc // 1_000_000} MB",
+    ]
+    if "nvml_used" in before:
+        parts.append(
+            f"nvml_used {before['nvml_used']}→{after['nvml_used']} MB "
+            f"(Δ{after['nvml_used'] - before['nvml_used']:+d})"
+        )
+    return "  ".join(parts)
 
 # ---------------------------------------------------------------------------
 # Hook save / restore
@@ -182,7 +237,7 @@ class CudaGraphRunner:
         saved_hooks = _pop_all_hooks(root_module)
 
         torch.cuda.reset_peak_memory_stats()
-        _alloc_before = torch.cuda.memory_allocated()
+        _mem_before = _mem_snapshot()
 
         try:
             graphed = make_graphed_callables(
@@ -196,18 +251,14 @@ class CudaGraphRunner:
         finally:
             _restore_all_hooks(saved_hooks)
 
-        _alloc_after = torch.cuda.memory_allocated()
+        _mem_after = _mem_snapshot()
         _peak_alloc = torch.cuda.max_memory_allocated()
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info(
-                "CudaGraphRunner: %d modules captured, "
-                "alloc %+.1f MB (%d→%d)  peak_alloc %d MB",
+                "CudaGraphRunner: %d modules captured  %s",
                 n,
-                (_alloc_after - _alloc_before) / 1e6,
-                _alloc_before // 1_000_000,
-                _alloc_after // 1_000_000,
-                _peak_alloc // 1_000_000,
+                _fmt_mem_snapshot(_mem_before, _mem_after, _peak_alloc),
             )
 
         if not isinstance(graphed, tuple):
