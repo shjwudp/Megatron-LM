@@ -92,6 +92,11 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
         ctx.forward_phase = True
         ctx.backward_phase = False
 
+        # ---- CUDA graph: batch capture (first optimized micro-batch) --------
+        # Runs here instead of in the post-backward callback so that memory
+        # overhead from the previous autograd graph has been fully released.
+        _maybe_capture_cuda_graphs(ctx, target)
+
     # ---- unshard parameters for this module -------------------------------
     if ctx.backward_phase:
         target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
@@ -312,9 +317,6 @@ def mfsdp_post_backward_final_callback(root_module: nn.Module):
             raise ValueError(
                 f"Unexpected bucket allocator phase: {bucket_alloc.phase}"
             )
-
-    # ---- CUDA graph: batch capture (after first optimized forward) -----
-    _maybe_capture_cuda_graphs(ctx, root_module)
 
 
 # ---------------------------------------------------------------------------
