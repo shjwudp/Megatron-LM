@@ -128,6 +128,52 @@ def _restore_all_hooks(saved):
                 setattr(sub, name, value)
 
 
+def _prepare_compiled_modules_for_capture(modules):
+    """Convert ``Module.compile()`` modules to compiled forward bodies.
+
+    ``nn.Module.compile()`` compiles ``Module._call_impl``, which includes
+    module-hook dispatch.  FSDP removes those hooks and replaces them with
+    ``capture_time_hooks`` while building its explicit CUDA graphs.  Keeping
+    the compiled ``_call_impl`` can therefore trigger a guard failure and a
+    lazy recompile inside CUDA stream capture.
+
+    Compile the forward body instead, with Inductor CUDA graphs disabled so
+    that the FSDP runner remains the sole CUDA-graph owner.  The returned state
+    is only for rollback if explicit graph capture fails; after successful
+    installation, the stale compiled ``_call_impl`` must remain disabled.
+    """
+    saved = []
+    try:
+        for module in modules:
+            compiled_call_impl = getattr(module, "_compiled_call_impl", None)
+            if compiled_call_impl is None:
+                continue
+
+            original_forward = module.forward
+            saved.append((module, original_forward, compiled_call_impl))
+            module._compiled_call_impl = None
+
+            # Avoid wrapping a forward body that the user already compiled
+            # directly.  This branch mainly handles ``module.compile()``.
+            if not hasattr(original_forward, "_torchdynamo_orig_callable"):
+                module.forward = torch.compile(
+                    original_forward,
+                    dynamic=False,
+                    options={"triton.cudagraphs": False},
+                )
+    except Exception:
+        _restore_compiled_modules_after_capture_failure(saved)
+        raise
+    return saved
+
+
+def _restore_compiled_modules_after_capture_failure(saved):
+    """Restore module-level compilation when explicit capture fails."""
+    for module, original_forward, compiled_call_impl in saved:
+        module.forward = original_forward
+        module._compiled_call_impl = compiled_call_impl
+
+
 class CudaGraphRunner:
     """Orchestrates per-module sample-arg recording and batch graph capture.
 
@@ -144,6 +190,7 @@ class CudaGraphRunner:
         self._sample_args: Dict[int, Tuple] = {}
         self._sample_kwargs: Dict[int, Dict[str, Any]] = {}
         self._modules_ordered: List[torch.nn.Module] = []
+        self._compiled_module_state = []
 
     # ---- called from hooks ------------------------------------------------
 
@@ -156,6 +203,13 @@ class CudaGraphRunner:
         mid = id(module)
         if mid in self._sample_args:
             return
+
+        # Normalize Module.compile() before capture setup. te-graph-runtime
+        # detects this compiled forward body and warms the capture-equivalent
+        # hook specialization before entering torch.cuda.graph.
+        self._compiled_module_state.extend(
+            _prepare_compiled_modules_for_capture([module])
+        )
 
         sig = inspect.signature(module.forward)
         has_self = "self" in sig.parameters
@@ -200,7 +254,12 @@ class CudaGraphRunner:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info("CudaGraphRunner: capturing %d modules", n)
 
-        from te_graph_runtime import make_graphed_callables
+        # Prefer installed te-graph-runtime (https://github.com/buptzyb/te-graph-runtime),
+        # fall back to vendored copy.
+        try:
+            from te_graph_runtime import make_graphed_callables
+        except ImportError:
+            from .te_graph_runtime import make_graphed_callables
 
         sample_args_list: List[Tuple] = []
         sample_kwargs_list: List[Dict[str, Any]] = []
@@ -235,14 +294,24 @@ class CudaGraphRunner:
         self._sample_args.clear()
         self._sample_kwargs.clear()
 
+        compiled_module_state = self._compiled_module_state
+        if compiled_module_state and (
+            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        ):
+            logger.info(
+                "CudaGraphRunner: converted %d Module.compile() wrappers to "
+                "compiled forward bodies",
+                len(compiled_module_state),
+            )
+
         # Pop real FSDP hooks so make_graphed_callables passes its assertion.
         # capture_time_hooks handle unshard/reshard during warmup + capture.
         saved_hooks = _pop_all_hooks(root_module)
 
-        torch.cuda.reset_peak_memory_stats()
-        _mem_before = _mem_snapshot()
-
         try:
+            torch.cuda.reset_peak_memory_stats()
+            _mem_before = _mem_snapshot()
+
             graphed = make_graphed_callables(
                 tuple(modules),
                 tuple(sample_args_list),
@@ -252,6 +321,9 @@ class CudaGraphRunner:
                 capture_time_hooks=capture_hooks,
                 capture_stream=capture_stream,
             )
+        except Exception:
+            _restore_compiled_modules_after_capture_failure(compiled_module_state)
+            raise
         finally:
             _restore_all_hooks(saved_hooks)
 
@@ -272,6 +344,7 @@ class CudaGraphRunner:
         # the graphed version that handles kwargs natively.
         for module in modules:
             module._fsdp_cg_installed = True
+        self._compiled_module_state = []
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info("CudaGraphRunner: installed CUDA graphs on %d modules", n)

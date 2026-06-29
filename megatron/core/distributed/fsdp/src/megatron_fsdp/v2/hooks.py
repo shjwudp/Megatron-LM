@@ -546,7 +546,7 @@ def _maybe_capture_cuda_graphs(ctx, root_module) -> None:
     from within an autocast region — re-enable grad and disable autocast.
     """
     if ctx.cuda_graph_runner is not None:
-        with torch.enable_grad(), torch.cuda.amp.autocast(enabled=False):
+        with torch.enable_grad():
             ctx.cuda_graph_runner.capture_and_install(
                 root_module, capture_stream=ctx.cuda_graph_stream,
             )
