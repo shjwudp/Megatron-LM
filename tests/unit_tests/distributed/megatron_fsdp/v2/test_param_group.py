@@ -293,7 +293,7 @@ def test_reduce_grad(strategy):
             gbuf.reduce_grad()
 
             # Only compare the shard region of self.data
-            # shard_dims=(outer, inner): (0, 1) means inner sharded only.
+            # shard_layout=(outer, inner): (0, 1) means inner sharded only.
             actual = gbuf.get_shard_view((0, 1))
             assert torch.equal(actual, ref_shard)
 
@@ -348,10 +348,10 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
             pg.reduce_grad(is_last_microbatch=True)
 
             if outer_strategy == "optim":
-                # shard_dims=(outer, inner): (1, 1) means both dimensions are sharded.
+                # shard_layout=(outer, inner): (1, 1) means both dimensions are sharded.
                 actual = gbuf.get_shard_view((1, 1))
             else:
-                # shard_dims=(outer, inner): (0, 1) means inner sharded only.
+                # shard_layout=(outer, inner): (0, 1) means inner sharded only.
                 actual = gbuf.get_shard_view((0, 1))
             assert torch.equal(actual, ref_shard)
 
@@ -392,7 +392,7 @@ def test_hsdp_reduce_grad_multi_microbatch(strategy):
         else:
             ref_shard = Ref.reduce_scatter(full_batch_grad, pg.dp_group)
             Ref.all_reduce(ref_shard, pg.outer_dp_group)
-            # shard_dims=(outer, inner): (0, 1) means inner sharded only.
+            # shard_layout=(outer, inner): (0, 1) means inner sharded only.
             actual = gbuf.get_shard_view((0, 1))
             assert torch.equal(actual, ref_shard)
 

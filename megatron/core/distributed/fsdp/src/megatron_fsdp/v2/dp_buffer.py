@@ -76,8 +76,8 @@ class DataParallelBuffer:
         outer_sharded = get_sharding_from_strategy(outer_dp_sharding_strategy)
         self.inner_sharded = inner_sharded
         self.outer_sharded = outer_sharded
-        # shard_dims=(outer, inner): 1 means sharded and 0 means replicated.
-        self.storage_shard_dims = (int(outer_sharded), int(inner_sharded))
+        # shard_layout=(outer, inner): 1 means sharded and 0 means replicated.
+        self.storage_shard_layout = (int(outer_sharded), int(inner_sharded))
         self.sharding_strategy = sharding_strategy
         self.outer_dp_sharding_strategy = outer_dp_sharding_strategy
         self.gradient_scaling_factor = gradient_scaling_factor
@@ -100,7 +100,7 @@ class DataParallelBuffer:
             compact_shapes = mp_policy.get_param_storage_shapes(params)
             self.buffer_index.compact(0.5, compact_shapes)
 
-        self.data_size = self.buffer_index.outer_shard_metas[self.storage_shard_dims].size
+        self.data_size = self.buffer_index.outer_shard_metas[self.storage_shard_layout].size
 
         self.data: Optional[torch.Tensor] = None
         self._unsharded_buffer: Optional[torch.Tensor] = None
@@ -176,9 +176,9 @@ class DataParallelBuffer:
         # Collect (local_start, local_end, item_id, global_start, size) for each item
         slices = []
         for item_id in range(n_items):
-            # shard_dims=(outer, inner): use this buffer's storage shard state.
+            # shard_layout=(outer, inner): use this buffer's storage shard state.
             local_start, local_end = self.buffer_index._get_item_local_range(
-                item_id, shard_dims=self.storage_shard_dims
+                item_id, shard_layout=self.storage_shard_layout
             )
             idx = self.buffer_index.item_index_map[item_id]
             slices.append((local_start, local_end, item_id, idx.global_data_index, idx.size))
@@ -261,24 +261,24 @@ class DataParallelBuffer:
         item_id: int,
         item_data: torch.Tensor,
         *,
-        shard_dims: Optional[Iterable[int]] = None,
+        shard_layout: Optional[Iterable[int]] = None,
     ) -> None:
         """Write a parameter tensor into the corresponding region of the buffer."""
-        if shard_dims is None:
-            # shard_dims=(outer, inner): use this buffer's storage shard state.
-            shard_dims = self.storage_shard_dims
+        if shard_layout is None:
+            # shard_layout=(outer, inner): use this buffer's storage shard state.
+            shard_layout = self.storage_shard_layout
         slice_start, slice_end = self.buffer_index._get_item_self_range(
-            item_id, shard_dims=shard_dims
+            item_id, shard_layout=shard_layout
         )
         storage_slice_start, storage_slice_end = self.buffer_index._get_item_self_range(
-            item_id, shard_dims=self.storage_shard_dims
+            item_id, shard_layout=self.storage_shard_layout
         )
         slice_start = max(slice_start, storage_slice_start)
         slice_end = min(slice_end, storage_slice_end)
         if slice_start >= slice_end:
             return
         storage_local_start, _ = self.buffer_index._get_item_local_range(
-            item_id, shard_dims=self.storage_shard_dims
+            item_id, shard_layout=self.storage_shard_layout
         )
         local_start = storage_local_start + slice_start - storage_slice_start
         local_end = local_start + (slice_end - slice_start)
@@ -287,24 +287,24 @@ class DataParallelBuffer:
         shard.data.copy_(item_data.flatten())
 
     def get_item(
-        self, item_id: int, *, shard_dims: Optional[Iterable[int]] = None
+        self, item_id: int, *, shard_layout: Optional[Iterable[int]] = None
     ) -> torch.Tensor:
         """Read a parameter tensor (or its shard) from the buffer."""
-        if shard_dims is None:
-            # shard_dims=(outer, inner): use this buffer's storage shard state.
-            shard_dims = self.storage_shard_dims
+        if shard_layout is None:
+            # shard_layout=(outer, inner): use this buffer's storage shard state.
+            shard_layout = self.storage_shard_layout
         slice_start, slice_end = self.buffer_index._get_item_self_range(
-            item_id, shard_dims=shard_dims
+            item_id, shard_layout=shard_layout
         )
         storage_slice_start, storage_slice_end = self.buffer_index._get_item_self_range(
-            item_id, shard_dims=self.storage_shard_dims
+            item_id, shard_layout=self.storage_shard_layout
         )
         slice_start = max(slice_start, storage_slice_start)
         slice_end = min(slice_end, storage_slice_end)
         if slice_start >= slice_end:
             return self.data[:0]
         storage_local_start, _ = self.buffer_index._get_item_local_range(
-            item_id, shard_dims=self.storage_shard_dims
+            item_id, shard_layout=self.storage_shard_layout
         )
         start = storage_local_start + slice_start - storage_slice_start
         end = start + (slice_end - slice_start)
@@ -314,8 +314,8 @@ class DataParallelBuffer:
         """Return whether this buffer currently has a full unsharded view."""
         if self._outer_dirty or self._inner_dirty:
             return False
-        # shard_dims=(outer, inner): (0, 0) means neither dimension is sharded.
-        if self.storage_shard_dims != (0, 0):
+        # shard_layout=(outer, inner): (0, 0) means neither dimension is sharded.
+        if self.storage_shard_layout != (0, 0):
             return self._unsharded_buffer is not None
         return self.data is not None
 
@@ -332,44 +332,44 @@ class DataParallelBuffer:
         """
         # If unshard_dim is set, that dimension becomes replicated in the target.
         # Otherwise, every dimension keeps the current storage state.
-        target_shard_dims = (
-            0 if unshard_dim == 0 else self.storage_shard_dims[0],
-            0 if unshard_dim == 1 else self.storage_shard_dims[1],
+        target_shard_layout = (
+            0 if unshard_dim == 0 else self.storage_shard_layout[0],
+            0 if unshard_dim == 1 else self.storage_shard_layout[1],
         )
         dirty_flags = (self._outer_dirty, self._inner_dirty)
         storage_is_dirty = (
             unshard_dim is not None
-            and self.storage_shard_dims[unshard_dim] == 0
+            and self.storage_shard_layout[unshard_dim] == 0
             and dirty_flags[unshard_dim]
         )
         # If storage is replicated but dirty, dimension d acts as a sharded source.
         # Otherwise, dimension d keeps the current storage state as the source.
-        source_shard_dims = (
-            1 if storage_is_dirty and unshard_dim == 0 else self.storage_shard_dims[0],
-            1 if storage_is_dirty and unshard_dim == 1 else self.storage_shard_dims[1],
+        source_shard_layout = (
+            1 if storage_is_dirty and unshard_dim == 0 else self.storage_shard_layout[0],
+            1 if storage_is_dirty and unshard_dim == 1 else self.storage_shard_layout[1],
         )
         # Only a source-sharded -> target-replicated transition needs all-gather.
         requires_unshard = (
             unshard_dim is not None
-            and source_shard_dims[unshard_dim] == 1
-            and target_shard_dims[unshard_dim] == 0
+            and source_shard_layout[unshard_dim] == 1
+            and target_shard_layout[unshard_dim] == 0
         )
 
         # Fast path: target is already available from clean local storage.
         if not requires_unshard:
-            output_buffer = self.fetch_buffer(target_shard_dims)
-            if bind_params and target_shard_dims == (0, 0):
+            output_buffer = self.fetch_buffer(target_shard_layout)
+            if bind_params and target_shard_layout == (0, 0):
                 self._bind_buffer_to_params(output_buffer)
             return output_buffer
 
-        output_shard_dims = (
-            0 if unshard_dim == 0 else source_shard_dims[0],
-            0 if unshard_dim == 1 else source_shard_dims[1],
+        output_shard_layout = (
+            0 if unshard_dim == 0 else source_shard_layout[0],
+            0 if unshard_dim == 1 else source_shard_layout[1],
         )
         group = self.outer_dp_group if unshard_dim == 0 else self.dp_group
 
-        input_buffer = self.fetch_buffer(source_shard_dims)
-        output_buffer = self.fetch_buffer(output_shard_dims)
+        input_buffer = self.fetch_buffer(source_shard_layout)
+        output_buffer = self.fetch_buffer(output_shard_layout)
         if torch.distributed.get_world_size(group) == 1:
             if output_buffer.data_ptr() != input_buffer.data_ptr():
                 output_buffer.copy_(input_buffer)
@@ -387,7 +387,7 @@ class DataParallelBuffer:
         setattr(self, "_outer_dirty" if unshard_dim == 0 else "_inner_dirty", False)
 
         # Parameter binding needs the full compute buffer.
-        if bind_params and output_shard_dims == (0, 0):
+        if bind_params and output_shard_layout == (0, 0):
             self._bind_buffer_to_params(output_buffer)
         return output_buffer
 
@@ -410,20 +410,20 @@ class DataParallelBuffer:
         if shard_dim is not None:
             # If storage is already replicated on this dim, unshard() returned
             # self.data or a self.data view, so no temporary buffer was allocated.
-            if self.storage_shard_dims[shard_dim] == 0:
+            if self.storage_shard_layout[shard_dim] == 0:
                 return
         self.allocator.free(self.alloc_key)
         self._unsharded_buffer = None
 
-    def get_shard_view(self, shard_dims: Optional[Iterable[int]] = None) -> torch.Tensor:
+    def get_shard_view(self, shard_layout: Optional[Iterable[int]] = None) -> torch.Tensor:
         """Return a shard view inside ``self.data``."""
         assert self.data is not None, "DataParallelBuffer data not initialized"
-        if shard_dims is None:
-            # shard_dims=(outer, inner): use this buffer's storage shard state.
-            shard_dims = self.storage_shard_dims
-        requested_meta = self.buffer_index._get_shard_meta(shard_dims)
-        # shard_dims=(outer, inner): storage_shard_dims describes self.data's shard state.
-        storage_meta = self.buffer_index.outer_shard_metas[self.storage_shard_dims]
+        if shard_layout is None:
+            # shard_layout=(outer, inner): use this buffer's storage shard state.
+            shard_layout = self.storage_shard_layout
+        requested_meta = self.buffer_index._get_shard_meta(shard_layout)
+        # shard_layout=(outer, inner): storage_shard_layout describes self.data's shard state.
+        storage_meta = self.buffer_index.outer_shard_metas[self.storage_shard_layout]
         range_start = max(requested_meta.global_data_index, storage_meta.global_data_index)
         range_end = min(
             requested_meta.global_data_index + requested_meta.size,
@@ -434,10 +434,10 @@ class DataParallelBuffer:
         local_start = storage_meta.local_data_index + range_start - storage_meta.global_data_index
         return self.data[local_start : local_start + (range_end - range_start)]
 
-    def fetch_buffer(self, shard_dims: Tuple[int, int] = (0, 0)) -> torch.Tensor:
-        """Return a buffer for ``shard_dims``, allocating temporary storage if needed.
+    def fetch_buffer(self, shard_layout: Tuple[int, int] = (0, 0)) -> torch.Tensor:
+        """Return a buffer for ``shard_layout``, allocating temporary storage if needed.
 
-        1. If ``shard_dims`` matches this buffer's storage layout, return
+        1. If ``shard_layout`` matches this buffer's storage layout, return
            ``self.data`` directly.
         2. If ``self.data`` is a known parent layout of the requested shard,
            return a view into ``self.data``. Example: storage ``(0, 1)`` can
@@ -447,20 +447,20 @@ class DataParallelBuffer:
            ``(1, 1)`` requesting ``(0, 1)`` must materialize the full buffer
            because one outer shard cannot cover the complete inner-DP shard.
         """
-        requested_shard_dims = shard_dims
+        requested_shard_layout = shard_layout
 
         # 1. Exact storage match: no view or temporary buffer needed.
-        if requested_shard_dims == self.storage_shard_dims:
+        if requested_shard_layout == self.storage_shard_layout:
             assert self.data is not None, "DataParallelBuffer data not initialized"
             return self.data
 
         # 2. Parent storage layouts can directly expose a child shard view.
         data_contains_requested = all(
             storage_dim == 0 or storage_dim == requested_dim
-            for storage_dim, requested_dim in zip(self.storage_shard_dims, requested_shard_dims)
+            for storage_dim, requested_dim in zip(self.storage_shard_layout, requested_shard_layout)
         )
         if data_contains_requested:
-            return self.get_shard_view(requested_shard_dims)
+            return self.get_shard_view(requested_shard_layout)
 
         # 3. Otherwise materialize the full buffer and return the requested view
         # from it. This covers HSDP storage (1, 1) -> requested (0, 1).
@@ -472,9 +472,9 @@ class DataParallelBuffer:
                 device=self.device,
             )
             self._unsharded_buffer = bucket.data
-        if requested_shard_dims == (0, 0):
+        if requested_shard_layout == (0, 0):
             return self._unsharded_buffer
-        requested_meta = self.buffer_index._get_shard_meta(requested_shard_dims)
+        requested_meta = self.buffer_index._get_shard_meta(requested_shard_layout)
         return self._unsharded_buffer[
             requested_meta.bucket_data_index : requested_meta.bucket_data_index
             + requested_meta.size
@@ -511,17 +511,17 @@ class DataParallelBuffer:
 
         # Inner reduce consumes fresh full grads: (0, 0) -> (0, 1).
         # Outer reduce consumes the inner-reduced view: (0, 1) -> (1, 1).
-        input_shard_dims = (
+        input_shard_layout = (
             0,
-            0 if reduce_dim == 1 else self.storage_shard_dims[1],
+            0 if reduce_dim == 1 else self.storage_shard_layout[1],
         )
         # AR keeps the same shard view; RS shards the reduced dimension.
-        output_shard_dims = (
-            1 if reduce_scatter and reduce_dim == 0 else input_shard_dims[0],
-            1 if reduce_scatter and reduce_dim == 1 else input_shard_dims[1],
+        output_shard_layout = (
+            1 if reduce_scatter and reduce_dim == 0 else input_shard_layout[0],
+            1 if reduce_scatter and reduce_dim == 1 else input_shard_layout[1],
         )
-        input_buffer = self.fetch_buffer(input_shard_dims)
-        output_buffer = self.fetch_buffer(output_shard_dims)
+        input_buffer = self.fetch_buffer(input_shard_layout)
+        output_buffer = self.fetch_buffer(output_shard_layout)
 
         # Pick the process group covering exactly the reduced dimension.
         group = self.outer_dp_group if reduce_dim == 0 else self.dp_group
@@ -556,8 +556,8 @@ class DataParallelBuffer:
             # Keep temporary reduce-scatter buffers tied to the stream that uses them.
             input_buffer.record_stream(torch.cuda.current_stream())
 
-        input_meta = self.buffer_index._get_shard_meta(input_shard_dims)
-        output_meta = self.buffer_index._get_shard_meta(output_shard_dims)
+        input_meta = self.buffer_index._get_shard_meta(input_shard_layout)
+        output_meta = self.buffer_index._get_shard_meta(output_shard_layout)
         output_offset = output_meta.global_data_index - input_meta.global_data_index
         # Stage RS output in the input buffer slice; avoids untraced temp keys in TracePool.
         comm_output = comm_input[output_offset : output_offset + output_buffer.numel()]

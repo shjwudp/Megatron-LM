@@ -1110,9 +1110,9 @@ class FSDPModule:
                 for param_group in child._fsdp_param_groups:
                     for param in param_group.params:
                         wbuf = param_group.model_weight_buffer
-                        # shard_dims=(outer, inner): (0, 0) means neither dimension is sharded.
+                        # shard_layout=(outer, inner): (0, 0) means neither dimension is sharded.
                         param_data = wbuf.get_item(
-                            param_group.param_idx[param], shard_dims=(0, 0)
+                            param_group.param_idx[param], shard_layout=(0, 0)
                         )
                         assert not torch.isnan(param_data).any(), (
                             "NaN detected in model weight buffer"

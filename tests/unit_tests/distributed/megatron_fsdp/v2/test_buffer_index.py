@@ -91,22 +91,22 @@ class TestBufferIndex:
         )
         self.ref_shard_metas = {
             (): full_meta,
-            # shard_dims=(outer, inner): (0, 0) means neither dimension is sharded.
+            # shard_layout=(outer, inner): (0, 0) means neither dimension is sharded.
             (0, 0): full_meta,
             0: full_meta,
             (0,): full_meta,
-            # shard_dims=(outer, inner): (1, 0) means outer sharded, inner not sharded.
+            # shard_layout=(outer, inner): (1, 0) means outer sharded, inner not sharded.
             (1, 0): outer_meta,
             1: inner_meta,
             (1,): inner_meta,
-            # shard_dims=(outer, inner): (0, 1) means outer not sharded, inner sharded.
+            # shard_layout=(outer, inner): (0, 1) means outer not sharded, inner sharded.
             (0, 1): inner_meta,
-            # shard_dims=(outer, inner): (1, 1) means both dimensions are sharded.
+            # shard_layout=(outer, inner): (1, 1) means both dimensions are sharded.
             (1, 1): outer_inner_meta,
         }
 
     @pytest.mark.parametrize(
-        "shard_dims",
+        "shard_layout",
         [
             (),
             0,
@@ -119,30 +119,30 @@ class TestBufferIndex:
             (1, 1),
         ],
     )
-    def test_shard_meta_matches_ref(self, shard_dims):
+    def test_shard_meta_matches_ref(self, shard_layout):
         index = BufferIndex(
             param_shapes=self.param_shapes,
             mesh=self.mesh,
             param_group_id=ParamGroupIdx(0, 0),
             chunk_size_factor=self.chunk_size_factor,
         )
-        meta = index._get_shard_meta(shard_dims)
+        meta = index._get_shard_meta(shard_layout)
         assert (
             meta.global_data_index,
             meta.local_data_index,
             meta.bucket_data_index,
             meta.size,
-        ) == self.ref_shard_metas[shard_dims]
+        ) == self.ref_shard_metas[shard_layout]
 
-        # shard_dims=(outer, inner): (0, 1) means outer not sharded, inner sharded.
+        # shard_layout=(outer, inner): (0, 1) means outer not sharded, inner sharded.
         assert index.shard_meta == index._get_shard_meta((0, 1))
-        # shard_dims=(outer, inner): (1, 1) means outer sharded, inner sharded.
+        # shard_layout=(outer, inner): (1, 1) means outer sharded, inner sharded.
         assert index.outer_shard_meta == index._get_shard_meta((1, 1))
 
     @pytest.mark.parametrize("item_id", [0, 1, 2])
-    # shard_dims=(outer, inner): 0/1 scalar cases are legacy inner-only shorthand.
-    @pytest.mark.parametrize("shard_dims", [(), 0, 1, (0,), (1,), (0, 0), (0, 1), (1, 0), (1, 1)])
-    def test_item_ranges_match_ref(self, shard_dims, item_id):
+    # shard_layout=(outer, inner): 0/1 scalar cases are legacy inner-only shorthand.
+    @pytest.mark.parametrize("shard_layout", [(), 0, 1, (0,), (1,), (0, 0), (0, 1), (1, 0), (1, 1)])
+    def test_item_ranges_match_ref(self, shard_layout, item_id):
         index = BufferIndex(
             param_shapes=self.param_shapes,
             mesh=self.mesh,
@@ -151,20 +151,20 @@ class TestBufferIndex:
         )
         item_start, item_end = self.ref_item_ranges[item_id]
         shard_global_start, shard_local_start, _, shard_size = self.ref_shard_metas[
-            shard_dims
+            shard_layout
         ]
         range_start = max(item_start, shard_global_start)
         range_end = min(item_end, shard_global_start + shard_size)
 
         assert index._get_item_global_range(item_id) == (item_start, item_end)
 
-        meta = index._get_shard_meta(shard_dims)
+        meta = index._get_shard_meta(shard_layout)
         assert (
             meta.global_data_index,
             meta.local_data_index,
             meta.bucket_data_index,
             meta.size,
-        ) == self.ref_shard_metas[shard_dims]
+        ) == self.ref_shard_metas[shard_layout]
 
         if range_start >= range_end:
             expected_self = (0, 0)
@@ -176,5 +176,5 @@ class TestBufferIndex:
                 shard_local_start + range_end - shard_global_start,
             )
 
-        assert index._get_item_self_range(item_id, shard_dims=shard_dims) == expected_self
-        assert index._get_item_local_range(item_id, shard_dims=shard_dims) == expected_local
+        assert index._get_item_self_range(item_id, shard_layout=shard_layout) == expected_self
+        assert index._get_item_local_range(item_id, shard_layout=shard_layout) == expected_local
