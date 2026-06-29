@@ -185,7 +185,10 @@ class CudaGraphRunner:
                 len(all_kwargs), n_tensor,
             )
 
-    def capture_and_install(self, root_module: torch.nn.Module) -> None:
+    def capture_and_install(
+        self, root_module: torch.nn.Module,
+        capture_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
         """Capture all graphs + install wrappers on recorded modules."""
         if self._captured or not self._modules_ordered:
             return
@@ -247,6 +250,7 @@ class CudaGraphRunner:
                 sample_kwargs=tuple(sample_kwargs_list),
                 pool=self._graph_pool,
                 capture_time_hooks=capture_hooks,
+                capture_stream=capture_stream,
             )
         finally:
             _restore_all_hooks(saved_hooks)
