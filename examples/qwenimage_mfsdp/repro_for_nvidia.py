@@ -24,10 +24,13 @@ Note: mfsdpv2 uses a 1D-only device mesh (no HSDP). When --sharding hybrid is
 requested with mfsdpv2 it falls back to full sharding on the 1D mesh.
 """
 import argparse
+import atexit
 from contextlib import contextmanager
 import os
 from pathlib import Path
+import sys
 import time
+import traceback
 
 import torch
 import torch.distributed as dist
@@ -176,7 +179,53 @@ def install_vit_nvtx_tag(model):
     return None
 
 
-# ----------------------------- args -----------------------------
+# ------------------------ memory history / OOM dump ------------------------
+class MemoryHistoryManager:
+    """Records CUDA memory history and dumps snapshots on OOM and/or exit."""
+
+    def __init__(self, out_dir: str, oom_only: bool = False):
+        self._out_dir = out_dir
+        self._oom_only = oom_only
+        self._dumped = False
+
+    def start(self):
+        Path(self._out_dir).mkdir(parents=True, exist_ok=True)
+        torch.cuda.memory._record_memory_history(
+            max_entries=200000, stacks="all",
+        )
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            print(f"[rank0] Memory history recording enabled, "
+                  f"dump dir={self._out_dir} oom_only={self._oom_only}")
+
+    def dump(self, tag: str = ""):
+        if self._dumped:
+            return
+        self._dumped = True
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        suffix = f"_{tag}" if tag else ""
+        path = os.path.join(self._out_dir, f"memory_snapshot_rank{rank}{suffix}.pickle")
+        try:
+            torch.cuda.memory._dump_snapshot(path)
+            if rank == 0:
+                print(f"[rank0] Memory snapshot dumped: {path}")
+        except Exception as e:
+            if rank == 0:
+                print(f"[rank0] Memory snapshot dump failed: {e}")
+
+    def stop(self):
+        torch.cuda.memory._record_memory_history(enabled=None)
+
+    def dump_on_normal_exit(self):
+        if self._oom_only or self._dumped:
+            return
+        self.dump()
+
+    def dump_on_oom(self):
+        self.dump(tag="OOM")
+
+
+# ------------------------------------------------------------------
 def parse():
     p = argparse.ArgumentParser()
     p.add_argument("--backend", required=True, choices=["fsdp1", "mfsdp", "mfsdpv2"])
@@ -210,7 +259,13 @@ def parse():
     p.add_argument("--cuda_profiler_capture", action="store_true",
                    help="Bracket bench steps with cudaProfilerStart/Stop for Nsight capture ranges.")
     p.add_argument("--record-memory-history", type=str, default=None, metavar="DIR",
-                   help="Enable CUDA memory recording, dump snapshot to this directory.")
+                   help="Enable CUDA memory recording (max_entries=200000). "
+                        "Dumps a snapshot to DIR on normal exit AND on OOM. "
+                        "Files: memory_snapshot_rank{N}.pickle. "
+                        "Loadable at https://pytorch.org/memory_viz.")
+    p.add_argument("--record-memory-history-oom-only", action="store_true",
+                   help="When set with --record-memory-history, only dump the "
+                        "snapshot on OOM (skip normal exit dump).")
     return p.parse_args()
 
 
@@ -418,7 +473,7 @@ def main():
             print("[nvtx] no ViT-like module found; vit_fwd tag skipped")
 
     optim = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                              lr=args.lr)
+                              lr=args.lr, fused=True)
     if args.backend == "mfsdp":
         from megatron_fsdp import fully_shard_optimizer
         fully_shard_optimizer(optim)
@@ -426,74 +481,90 @@ def main():
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
+    # ---- memory history recording ----
+    mem_mgr = None
     if args.record_memory_history:
-        torch.cuda.memory._record_memory_history(
-            max_entries=200000, stacks="all",
+        mem_mgr = MemoryHistoryManager(
+            out_dir=args.record_memory_history,
+            oom_only=args.record_memory_history_oom_only,
         )
-        if rank == 0:
-            print(f"[rank0] Memory history recording enabled, dump to {args.record_memory_history}")
+        mem_mgr.start()
+        # Dump on normal exit via atexit (unless oom_only)
+        if not args.record_memory_history_oom_only:
+            atexit.register(mem_mgr.dump_on_normal_exit)
 
     _mem_log("after_model_init", rank=rank)
 
     gen = torch.Generator(device=device).manual_seed(args.seed + rank)
     step_times = []
     cuda_profiler_active = False
+    oom_occurred = False
     with attention_backend(args.attention):
-        for step in range(args.warmup_steps + args.bench_steps):
-            if args.cuda_profiler_capture and step == args.warmup_steps:
-                torch.cuda.synchronize()
-                dist.barrier()
-                torch.cuda.profiler.start()
-                cuda_profiler_active = True
-                if rank == 0:
-                    print("[nsys] cudaProfilerStart")
-            hs, ts, pe, img_shapes, txt_lens = make_batch(args, device, dtype, gen)
-            hs.requires_grad_(True)
-            torch.cuda.synchronize(); dist.barrier()
-            t0 = time.perf_counter()
+        try:
+            for step in range(args.warmup_steps + args.bench_steps):
+                if args.cuda_profiler_capture and step == args.warmup_steps:
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    torch.cuda.profiler.start()
+                    cuda_profiler_active = True
+                    if rank == 0:
+                        print("[nsys] cudaProfilerStart")
+                hs, ts, pe, img_shapes, txt_lens = make_batch(args, device, dtype, gen)
+                hs.requires_grad_(True)
+                torch.cuda.synchronize(); dist.barrier()
+                t0 = time.perf_counter()
 
-            hs = _NvtxFwdStartBwdEnd.apply(hs)
-            t_fwd = time.perf_counter()
-            with torch.amp.autocast("cuda", dtype=dtype):
-                out = model(hidden_states=hs, timestep=ts / 1000,
-                            encoder_hidden_states=pe,
-                            img_shapes=img_shapes, txt_seq_lens=txt_lens, return_dict=False)
-                pred = (out[0] if isinstance(out, tuple) else out)[:, :hs.size(1)]
-                pred = _NvtxFwdEndBwdStart.apply(pred)
-            loss = pred.float().pow(2).mean()
-            loss.backward()
-            t_bwd = time.perf_counter()
+                hs = _NvtxFwdStartBwdEnd.apply(hs)
+                t_fwd = time.perf_counter()
+                with torch.amp.autocast("cuda", dtype=dtype):
+                    out = model(hidden_states=hs, timestep=ts / 1000,
+                                encoder_hidden_states=pe,
+                                img_shapes=img_shapes, txt_seq_lens=txt_lens, return_dict=False)
+                    pred = (out[0] if isinstance(out, tuple) else out)[:, :hs.size(1)]
+                    pred = _NvtxFwdEndBwdStart.apply(pred)
+                loss = pred.float().pow(2).mean()
+                loss.backward()
+                t_bwd = time.perf_counter()
 
-            if step < args.warmup_steps:
-                _mem_log(f"step={step} fwd_bwd fwd_ms={((t_bwd - t_fwd) * 1000):.1f} "
-                         f"bwd_ms={((time.perf_counter() - t_bwd) * 1000):.1f}", rank=rank)
+                if step < args.warmup_steps:
+                    _mem_log(f"step={step} fwd_bwd fwd_ms={((t_bwd - t_fwd) * 1000):.1f} "
+                             f"bwd_ms={((time.perf_counter() - t_bwd) * 1000):.1f}", rank=rank)
 
-            if args.verify:
-                gloss, gnorm, n = verify_stats(model, loss, device)
-
-            with nvtx_range("optimizer"):
-                if args.backend == "mfsdp":
-                    optim.step(sync_grad_before_optimizer_step=True,
-                               install_optimized_model_weights=True)
-                    optim.zero_grad(set_to_none=True, zero_grad_buffer=True)
-                elif args.backend == "mfsdpv2":
-                    optim.step()
-                    optim.zero_grad(set_to_none=True)
-                else:
-                    optim.step(); optim.zero_grad(set_to_none=True)
-
-            torch.cuda.synchronize()
-            dt = time.perf_counter() - t0
-            if step >= args.warmup_steps:
-                step_times.append(dt)
-            if rank == 0:
-                tag = "warmup" if step < args.warmup_steps else "bench "
                 if args.verify:
-                    print(f"[{args.backend}] {tag} step {step:3d} | VERIFY (timing invalid) | "
-                          f"gloss={gloss:.6f} | gnorm={gnorm:.4f} | n_grad={n}")
-                else:
-                    print(f"[{args.backend}] {tag} step {step:3d} | {dt*1000:8.2f} ms | "
-                          f"loss={loss.item():.4f}")
+                    gloss, gnorm, n = verify_stats(model, loss, device)
+
+                with nvtx_range("optimizer"):
+                    if args.backend == "mfsdp":
+                        optim.step(sync_grad_before_optimizer_step=True,
+                                   install_optimized_model_weights=True)
+                        optim.zero_grad(set_to_none=True, zero_grad_buffer=True)
+                    elif args.backend == "mfsdpv2":
+                        optim.step()
+                        optim.zero_grad(set_to_none=True)
+                    else:
+                        optim.step(); optim.zero_grad(set_to_none=True)
+
+                torch.cuda.synchronize()
+                dt = time.perf_counter() - t0
+                if step >= args.warmup_steps:
+                    step_times.append(dt)
+                if rank == 0:
+                    tag = "warmup" if step < args.warmup_steps else "bench "
+                    if args.verify:
+                        print(f"[{args.backend}] {tag} step {step:3d} | VERIFY (timing invalid) | "
+                              f"gloss={gloss:.6f} | gnorm={gnorm:.4f} | n_grad={n}")
+                    else:
+                        print(f"[{args.backend}] {tag} step {step:3d} | {dt*1000:8.2f} ms | "
+                              f"loss={loss.item():.4f}")
+
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+            oom_occurred = True
+            if rank == 0:
+                print(f"\n[rank0] OOM / CUDA error at step {step}: {exc}")
+                traceback.print_exc()
+            if mem_mgr is not None:
+                mem_mgr.dump_on_oom()
+            raise
 
     if cuda_profiler_active:
         torch.cuda.synchronize()
@@ -511,14 +582,9 @@ def main():
 
     _mem_log("final", rank=rank)
 
-    if args.record_memory_history:
-        out_dir = args.record_memory_history
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
-        snapshot_path = os.path.join(out_dir, f"memory_snapshot_rank{rank}.pickle")
-        torch.cuda.memory._dump_snapshot(snapshot_path)
-        if rank == 0:
-            print(f"[rank0] Memory snapshot dumped to {out_dir}")
-        torch.cuda.memory._record_memory_history(enabled=None)
+    if mem_mgr is not None:
+        mem_mgr.dump_on_normal_exit()
+        mem_mgr.stop()
 
     dist.destroy_process_group()
 
