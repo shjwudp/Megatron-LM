@@ -150,13 +150,11 @@ class _FSDPRootContext:
     window indicates a bug."""
 
     cuda_graph_pool: Optional[Any] = None
-    f"""Shared CUDA graph memory pool handle for CUDA graph capture.
+    """Shared CUDA graph memory pool handle for CUDA graph capture."""
 
-    Obtained via ``torch.cuda.graph_pool_handle()``.  Multiple
-    ``torch.cuda.CUDAGraph`` objects created with this handle share
-    the same backing memory pool, allowing the CUDA driver to reuse
-    graph memory across FSDP modules and reduce total GPU memory
-    consumption."""
+    cuda_graph_runner: Optional[Any] = None
+    """``CudaGraphRunner`` instance.  Created lazily on the first
+    optimized forward pre-hook and reused across micro-batches."""
 
     backward_module: Optional[int] = None
     """``id(module)`` of the FSDP module whose backward is pending next.
@@ -780,9 +778,14 @@ class FSDPModule:
             # the Python-side ``setattr(param, "grad_added_to_main_grad", True)`` that
             # accompanies the eager backward is captured away.  We record the per-param
             # flag during the trace micro-batch and restore it here.
+            zero_targets = []
+            copy_srcs = []
+            copy_dsts = []
+
             for name, param in zip(param_names, param_group.params):
                 grad_added = getattr(param, "grad_added_to_main_grad", False)
                 recorded = getattr(param, "_mfsdp_recorded_te_wgrad", False)
+
                 if grad_added or recorded:
                     if param.grad is not None:
                         del param.grad
@@ -801,11 +804,18 @@ class FSDPModule:
                         param_main_grad is None
                         or param_main_grad.data_ptr() != main_grad.data_ptr()
                     ):
-                        main_grad.zero_()
+                        zero_targets.append(main_grad.view(-1))
                 else:
                     main_grad = param.get_main_grad()
-                    main_grad.copy_(param.grad.detach())
+                    copy_srcs.append(param.grad.detach().view(-1))
+                    copy_dsts.append(main_grad.view(-1))
                     del param.grad
+
+            # 2 kernel launches total (instead of N)
+            if zero_targets:
+                torch._foreach_zero_(zero_targets)
+            if copy_dsts:
+                torch._foreach_copy_(copy_dsts, copy_srcs)
 
             if async_op:
                 # ---- Overlapped path ----

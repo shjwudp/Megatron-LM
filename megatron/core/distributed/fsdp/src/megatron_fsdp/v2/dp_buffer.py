@@ -674,7 +674,9 @@ class DataParallelBuffer:
     @torch.no_grad()
     def reduce_grad(
         self,
+        *,
         overwrite_grad: bool = False,
+        grad_comm_dtype: Optional[torch.dtype] = None,
         stream: Optional[torch.cuda.Stream] = None,
     ):
         """Reduce gradients into the optimizer-facing local shard.
@@ -690,7 +692,7 @@ class DataParallelBuffer:
         if self.sharding_strategy in ("no_shard", "optim"):
             overwrite_grad = True
 
-        grad_comm_dtype = self.mp_policy.grad_comm_dtype or self.dtype
+        grad_comm_dtype = grad_comm_dtype or self.mp_policy.grad_comm_dtype or self.dtype
 
         if self.gradient_scaling_factor in (None, 1.0):
             op = torch.distributed.ReduceOp.SUM
@@ -734,13 +736,13 @@ class DataParallelBuffer:
             input_buffer = self.fetch_buffer()
             output_offset = sm.local_data_index
 
-            stream = stream or torch.cuda.current_stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                comm_input = input_buffer.to(grad_comm_dtype)
-                if prescale:
-                    comm_input.mul_(self.gradient_scaling_factor)
-                reduced_grad_shard = comm_input[output_offset : output_offset + sm.size]
+        stream = stream or torch.cuda.current_stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            comm_input = input_buffer.to(grad_comm_dtype)
+            if prescale:
+                comm_input.mul_(self.gradient_scaling_factor)
+            reduced_grad_shard = comm_input[output_offset : output_offset + sm.size]
 
             torch.distributed.reduce_scatter_tensor(
                 output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
