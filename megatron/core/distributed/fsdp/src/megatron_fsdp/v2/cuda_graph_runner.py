@@ -303,9 +303,8 @@ def _make_bwd_pre_hook(module):
 def _make_bwd_post_hook(module):
     def hook(mod, grad_input, grad_output):
         module.reshard()
-        # if any(
-        #     pg.sharding_strategy in ("optim_grads", "optim_grads_params")
-        #     for pg in module._fsdp_param_groups
-        # ):
-        #     module.reduce_grad()
+        # Clear grad to avoid memory leak in CUDA graph capture.
+        for param_group in module._fsdp_param_groups:
+            for param in param_group.params:
+                param.grad = None
     return hook
