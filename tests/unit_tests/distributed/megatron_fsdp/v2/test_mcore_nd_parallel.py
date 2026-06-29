@@ -6,11 +6,16 @@ import torch
 from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
+from megatron.core.distributed.distributed_data_parallel_config import (
+    DistributedDataParallelConfig,
+)
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import _init_dp_mesh
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
     HAVE_TE_NVFP4,
     HAVE_TE_NVFP4_RECIPE,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.distributed.megatron_fsdp.utils import (
     make_gpt_mock_data_iterator,
@@ -35,6 +40,40 @@ def ref_cache():
 
 
 class TestMegatronFSDPE2E:
+
+    @pytest.mark.parametrize("outer_dp_size", [1, 2])
+    def test_dp_mesh_flatten_groups_reuse_full_dp_groups(self, outer_dp_size):
+        if Utils.world_size < 4 or Utils.world_size % 4 != 0:
+            pytest.skip("HSDP EP flatten coverage requires a world size divisible by 4")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+            num_distributed_optimizer_instances=outer_dp_size,
+        )
+        try:
+            required_pgs = ["tp", "expt_tp", "ep", "dp_cp", "expt_dp"]
+            if outer_dp_size > 1:
+                required_pgs.extend(["intra_dp_cp", "intra_expt_dp", "inter_dist_opt"])
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=required_pgs
+            )
+            ddp_config = DistributedDataParallelConfig(
+                num_distributed_optimizer_instances=outer_dp_size
+            )
+
+            for edp, full_group_attr in ((False, "dp_cp"), (True, "expt_dp")):
+                mesh = _init_dp_mesh(pg_collection, ddp_config, edp=edp)
+                flatten_name = "_".join(mesh.mesh_dim_names)
+                expected_group = getattr(pg_collection, full_group_attr)
+
+                for _ in range(2):
+                    flatten_group = mesh._flatten(flatten_name).get_group()
+                    assert flatten_group.group_name == expected_group.group_name
+        finally:
+            Utils.destroy_model_parallel()
 
     @staticmethod
     def _normalize_param_name(name):

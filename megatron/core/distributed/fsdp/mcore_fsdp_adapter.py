@@ -708,6 +708,59 @@ def _reset_parameters(module):
             parent_fsdp_module_map[m].reshard()
 
 
+def _build_hsdp_dp_mesh(
+    outer_group,
+    inner_group,
+    tp_group,
+    flatten_group,
+    *,
+    inner_dim_name,
+    ep_size=1,
+):
+    ranks = _get_hsdp_tp_mesh(outer_group, inner_group, tp_group, ep_size=ep_size)
+    ranks = ranks[:, :, tp_group.rank()]
+    mesh = DeviceMesh.from_group(
+        [outer_group, inner_group],
+        device_type="cuda",
+        mesh=ranks.tolist(),
+        mesh_dim_names=("dp_outer", inner_dim_name),
+    )
+
+    name = "_".join(mesh.mesh_dim_names)
+    if hasattr(mesh, "_flatten_mapping"):
+        root = mesh._get_root_mesh()
+        layout = mesh._layout.coalesce()
+        if len(layout) > 1:
+            layout = layout.nest()
+        flat_mesh = DeviceMesh(
+            root._device_type,
+            _layout=layout,
+            _rank_map=root._rank_map,
+            mesh_dim_names=(name,),
+            _root_mesh=root,
+            _init_backend=False,
+        )
+        flat_mesh._dim_group_names = [flatten_group.group_name]
+        root._pg_registry[flatten_group.group_name] = flatten_group
+        root._flatten_mapping[name] = flat_mesh
+    else:
+        from torch.distributed.device_mesh import _mesh_resources
+
+        flat_mesh = DeviceMesh.from_group(
+            flatten_group,
+            device_type=mesh.device_type,
+            mesh=mesh.mesh.flatten().tolist(),
+            mesh_dim_names=(name,),
+        )
+        root = _mesh_resources.get_root_mesh(mesh)
+        if hasattr(_mesh_resources, "flatten_name_to_root_dims"):
+            _mesh_resources.flatten_name_to_root_dims.setdefault(root, {}).pop(name, None)
+        _mesh_resources.root_to_flatten_mapping.setdefault(root, {})[name] = flat_mesh
+        _mesh_resources.child_to_root_mapping[flat_mesh] = root
+
+    return mesh
+
+
 def _init_dp_mesh(pg_collection, ddp_config, edp=False):
     assert HAVE_DTENSOR, (
         "DTensor support is required to initialize the device mesh. "
@@ -735,16 +788,20 @@ def _init_dp_mesh(pg_collection, ddp_config, edp=False):
         if outer_dp_size > 1
         else dist.new_group(ranks=[dist.get_rank()])
     )
-    mesh = _get_hsdp_tp_mesh(outer_group, inner_group, tp_group, ep_size=ep_size)
-    mesh = mesh[:, :, tp_group.rank()]
-    mesh = DeviceMesh.from_group(
-        [outer_group, inner_group],
-        device_type="cuda",
-        mesh=mesh.tolist(),
-        mesh_dim_names=("dp_outer", inner_dim_name),
+    flatten_group = getattr(pg_collection, 'expt_dp' if edp else 'dp_cp', None)
+    if flatten_group is None:
+        raise RuntimeError(
+            "[Megatron-FSDP] DeviceMesh flatten requires the full "
+            f"{'expert ' if edp else ''}data-parallel process group."
+        )
+    return _build_hsdp_dp_mesh(
+        outer_group,
+        inner_group,
+        tp_group,
+        flatten_group,
+        inner_dim_name=inner_dim_name,
+        ep_size=ep_size,
     )
-
-    return mesh
 
 
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
