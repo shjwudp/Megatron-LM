@@ -27,13 +27,15 @@ def pretrain_forward_backward(
     forward_backward_func = get_forward_backward_func()
     microbatch_idx = 0
 
-    def forward_step_func(data_iterator, model):
+    def forward_step_func(data_iterator, model, return_schedule_plan=False):
         nonlocal microbatch_idx
         is_last_backward = microbatch_idx % num_micro_batches == num_micro_batches - 1
         if hasattr(model, "set_is_last_backward"):
             model.set_is_last_backward(is_last_backward)
         microbatch_idx += 1
-        return _forward_step_func(data_iterator, model)
+        return _forward_step_func(
+            data_iterator, model, return_schedule_plan=return_schedule_plan
+        )
 
     output = forward_backward_func(
         forward_step_func=forward_step_func,
@@ -173,7 +175,7 @@ class GPTMockDataset(Dataset):
         }
 
 
-def _forward_step_func(data_iterator, model, device="cuda"):
+def _forward_step_func(data_iterator, model, device="cuda", return_schedule_plan=False):
 
     def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
 
@@ -200,6 +202,16 @@ def _forward_step_func(data_iterator, model, device="cuda"):
             else data["attention_mask"].to(device, non_blocking=True)
         )
         position_ids = data["position_ids"].to(device, non_blocking=True)
+
+    if return_schedule_plan:
+        schedule_plan = model.build_schedule_plan(
+            input_ids=tokens,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+        )
+        return schedule_plan, partial(loss_func, loss_mask)
 
     output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
 

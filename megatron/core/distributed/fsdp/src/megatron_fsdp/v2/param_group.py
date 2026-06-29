@@ -289,7 +289,6 @@ class ParameterGroup:
         if reduce_inner:
             # mesh dim 1 is inner-DP.
             self.main_grad_buffer.reduce_grad(
-                grad_comm_dtype=self.mp_policy.grad_comm_dtype,
                 overwrite_grad=self._grad_buffer_is_fresh,
                 reduce_dim=1,
                 reduce_scatter=self.sharding_strategy != "no_shard",
@@ -299,11 +298,11 @@ class ParameterGroup:
         if reduce_outer:
             # mesh dim 0 is outer-DP.
             self.main_grad_buffer.reduce_grad(
-                grad_comm_dtype=self.mp_policy.grad_comm_dtype,
                 overwrite_grad=True,
                 reduce_dim=0,
                 reduce_scatter=self.outer_dp_sharding_strategy != "no_shard",
             )
+
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""
         if self.main_grad_buffer is not None:

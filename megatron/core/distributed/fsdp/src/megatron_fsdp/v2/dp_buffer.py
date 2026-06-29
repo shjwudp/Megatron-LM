@@ -483,7 +483,6 @@ class DataParallelBuffer:
     @torch.no_grad()
     def reduce_grad(
         self,
-        grad_comm_dtype: Optional[torch.dtype] = None,
         overwrite_grad: bool = False,
         reduce_dim: Optional[int] = 1,
         reduce_scatter: bool = True,
@@ -497,7 +496,7 @@ class DataParallelBuffer:
         if reduce_dim is None:
             return
 
-        grad_comm_dtype = grad_comm_dtype or self.dtype
+        grad_comm_dtype = self.mp_policy.grad_comm_dtype or self.dtype
         # Scale exactly once, when reducing fresh full grads over inner-DP.
         # Outer-only reduce consumes an already-scaled inner-DP result.
         if reduce_dim != 1 or self.gradient_scaling_factor in (None, 1.0):
