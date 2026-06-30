@@ -1,27 +1,39 @@
 """
-Minimal single-file repro: FSDP1 vs Megatron-FSDP v1/v2 on QwenImageTransformer2DModel.
+Single-file end-to-end training test for QwenImageTransformer2DModel
+with Megatron FSDP v1/v2 and PyTorch FSDP1.
 
-Self-contained except for stock packages (`torch`, `diffusers`, `megatron-fsdp`).
-The diffusion-transformer body is the upstream diffusers model — no private fork.
+Self-contained — requires only stock packages (`torch`, `diffusers`,
+`megatron-fsdp`).  The transformer body is the upstream diffusers model.
+
+Features:
+  - FSDP1 / Megatron FSDP v1 / v2 backends
+  - Per-block torch.compile
+  - CUDA graph capture (v2 with --cuda-graph)
+  - TracePoolAllocator (v2 with --trace-pool)
+  - Gradient checkpointing (--gradient_checkpointing)
+  - FA2 / FA3 / native attention backends
+  - Memory history OOM dump (--record-memory-history)
+  - Per-step GPU memory tracking
+  - NVML real GPU memory logging
+  - Numerical verification probe (--verify)
+  - Nsight profiling support (--cuda_profiler_capture)
 
 Usage (per node):
   torchrun --nnodes=$NNODES --node_rank=$NODE_RANK \
            --nproc_per_node=8 --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-           repro_for_nvidia.py \
+           test_qwenimage.py \
            --backend {fsdp1|mfsdp|mfsdpv2} \
            --sharding {full|hybrid} \
            --batch_size 4 --height 512 --width 512 \
            --bench_steps 20 --warmup_steps 3 \
-           --compile --verify
+           --compile --cuda-graph --trace-pool
 
-Reports per-step latency (averaged over `bench_steps`) and peak GPU memory.
-`--verify` adds a global gloss/gnorm probe between backward() and step() so the
-two backends can be checked for numerical agreement; it forces a sync each step
-so absolute ms include extra overhead — only the *relative* delta between
-backends within the same probe mode is meaningful.
+Reports per-step latency, peak GPU memory, and per-step memory summary.
+`--verify` probes global loss + grad-norm for numerical agreement across
+backends (adds sync overhead — only relative deltas are meaningful).
 
-Note: mfsdpv2 uses a 1D-only device mesh (no HSDP). When --sharding hybrid is
-requested with mfsdpv2 it falls back to full sharding on the 1D mesh.
+Note: mfsdpv2 uses a 1D device mesh (no HSDP).  `--sharding hybrid` with
+mfsdpv2 falls back to full sharding on the 1D mesh.
 """
 import argparse
 import atexit

@@ -1,7 +1,7 @@
 # FSDP1 vs Megatron-FSDP — QwenImage Benchmark
 
 Minimal repro comparing PyTorch FSDP1 against Megatron-FSDP on
-`QwenImageTransformer2DModel`.  All code is self-contained in `repro_for_nvidia.py`;
+`QwenImageTransformer2DModel`.  All code is self-contained in `test_qwenimage.py`;
 only stock packages are required below.
 
 ## Environment Setup (run once)
@@ -33,7 +33,7 @@ hf download Qwen/Qwen-Image \
 
 ```bash
 # Tier 1: FA3 (_flash_3)
-torchrun --nproc_per_node=4 repro_for_nvidia.py \
+torchrun --nproc_per_node=4 test_qwenimage.py \
   --backend mfsdp --sharding full \
   --pretrained_model_name_or_path /tmp/qwen-image \
   --num_gpus_per_node 4 --batch_size 4 --height 512 --width 512 \
@@ -41,14 +41,14 @@ torchrun --nproc_per_node=4 repro_for_nvidia.py \
 
 # Tier 2: FA2 (flash) — if FA3 unavailable
 nsys profile \
-torchrun --nproc_per_node=4 repro_for_nvidia.py \
+torchrun --nproc_per_node=4 test_qwenimage.py \
   --backend mfsdp --sharding full \
   --pretrained_model_name_or_path /tmp/qwen-image \
   --num_gpus_per_node 4 --batch_size 4 --height 512 --width 512 \
   --attention flash --compile --bench_steps 3 --warmup_steps 1
 
 # Tier 3: native attention — no flash-attn needed
-torchrun --nproc_per_node=4 repro_for_nvidia.py \
+torchrun --nproc_per_node=4 test_qwenimage.py \
   --backend mfsdp --sharding full \
   --pretrained_model_name_or_path /tmp/qwen-image \
   --num_gpus_per_node 4 --batch_size 4 --height 512 --width 512 \
@@ -56,7 +56,7 @@ torchrun --nproc_per_node=4 repro_for_nvidia.py \
 
 # PyTorch FSDP1 for comparison (swap --backend)
 nsys profile \
-torchrun --nproc_per_node=4 repro_for_nvidia.py \
+torchrun --nproc_per_node=4 test_qwenimage.py \
   --backend fsdp1 --sharding full \
   --pretrained_model_name_or_path /tmp/qwen-image \
   --num_gpus_per_node 4 --batch_size 4 --height 512 --width 512 \
@@ -66,7 +66,7 @@ torchrun --nproc_per_node=4 repro_for_nvidia.py \
 ### Single node, 8 GPU (hybrid shard)
 
 ```bash
-torchrun --nproc_per_node=8 repro_for_nvidia.py \
+torchrun --nproc_per_node=8 test_qwenimage.py \
   --backend mfsdp --sharding hybrid \
   --pretrained_model_name_or_path /tmp/qwen-image \
   --batch_size 4 --height 512 --width 512 \
@@ -76,7 +76,7 @@ torchrun --nproc_per_node=8 repro_for_nvidia.py \
 ### With numerical verification (adds sync overhead)
 
 ```bash
-torchrun --nproc_per_node=4 repro_for_nvidia.py \
+torchrun --nproc_per_node=4 test_qwenimage.py \
   --backend mfsdp --sharding full \
   --pretrained_model_name_or_path /tmp/qwen-image \
   --num_gpus_per_node 4 --batch_size 4 --height 512 --width 512 \
@@ -88,7 +88,7 @@ torchrun --nproc_per_node=4 repro_for_nvidia.py \
 ```bash
 torchrun --nnodes=$NNODES --node_rank=$NODE_RANK \
   --nproc_per_node=8 --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-  repro_for_nvidia.py \
+  test_qwenimage.py \
   --backend mfsdp --sharding hybrid \
   --pretrained_model_name_or_path /tmp/qwen-image \
   --batch_size 4 --height 512 --width 512 \
