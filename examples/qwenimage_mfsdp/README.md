@@ -102,7 +102,7 @@ torchrun --nnodes=$NNODES --node_rank=$NODE_RANK \
 
 | Backend | 8×H100 | 4×GB200 |
 |---------|--------|---------|
-| **fsdp1** | 759 ms / 60.2 GB | 679 ms / 75.4 GB |
+| **fsdp1** | 729 ms / 60.2 GB | 679 ms / 75.4 GB |
 | **mfsdpv2** | 769 ms / 59.3 GB | 647 ms / 74.7 GB |
 | **mfsdpv2+cg** | **674 ms** / 68.3 GB | **364 ms** / 88.7 GB |
 

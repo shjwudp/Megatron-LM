@@ -319,8 +319,11 @@ torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
   compute operations (all-gather, reduce-scatter) run on side streams
   (`ag_stream`, `rs_stream`). CUDA events inserted at the boundary between
   allocation and compute, and between compute and free, guarantee ordering
-  without ``record_stream``. Keeping allocations on the default stream avoids
-  non-deterministic caching-allocator behaviour and peak memory regressions.
+  without ``record_stream``.  ``record_stream`` is intentionally avoided
+  because it forces the caching allocator to hold memory blocks until the
+  recorded stream finishes, preventing reuse across iterations and causing
+  significant peak memory regressions
+  ([discussion](https://dev-discuss.pytorch.org/t/1486)).
 
 ## Unit Tests
 
