@@ -95,6 +95,20 @@ torchrun --nnodes=$NNODES --node_rank=$NODE_RANK \
   --attention _flash_3 --compile --bench_steps 20 --warmup_steps 3
 ```
 
+## Benchmarks
+
+`QwenImageTransformer2DModel`, `bs=4`, `512×512`, `bf16`, `torch.compile`, FA2.
+`[mfsdpv2+cg]` uses `--cuda-graph --trace-pool`.
+
+| Backend | 8×H100 | 4×GB200 |
+|---------|--------|---------|
+| **fsdp1** | 759 ms / 60.2 GB | 679 ms / 75.4 GB |
+| **mfsdpv2** | 769 ms / 59.3 GB | 647 ms / 74.7 GB |
+| **mfsdpv2+cg** | **674 ms** / 68.3 GB | **364 ms** / 88.7 GB |
+
+CG delivers **11% faster** on H100 and **44% faster** on GB200 at the cost
+of higher peak memory (pool-backed graph buffers).
+
 ## torch FSDP1 (reference API)
 
 ```python
