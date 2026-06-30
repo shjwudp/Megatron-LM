@@ -586,6 +586,7 @@ class DataParallelBuffer:
     def unshard(
         self,
         bind_params: bool = False,
+        stream: Optional[torch.cuda.Stream] = None,
     ) -> torch.Tensor:
         """All-gather the full buffer from all shards and bind parameter storage.
 
