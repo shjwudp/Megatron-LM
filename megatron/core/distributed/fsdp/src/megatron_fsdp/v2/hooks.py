@@ -179,7 +179,7 @@ def _register_forward_hook(module: FSDPModule):
 def _maybe_capture_cuda_graphs(ctx, root_module) -> None:
     """Trigger batch CUDA graph capture via ``ctx.cuda_graph_runner``."""
     if ctx.cuda_graph_runner is not None:
-        with torch.enable_grad(), torch.cuda.amp.autocast(enabled=False):
+        with torch.enable_grad():
             ctx.cuda_graph_runner.capture_and_install(
                 root_module, capture_stream=ctx.cuda_graph_stream,
             )
@@ -330,8 +330,20 @@ def mfsdp_post_backward_final_callback(root_module: nn.Module):
 
 
 def _maybe_capture_cuda_graphs(ctx, root_module) -> None:
-    """Trigger batch CUDA graph capture via ``ctx.cuda_graph_runner``."""
+    """Trigger batch CUDA graph capture via ``ctx.cuda_graph_runner``.
+
+    Guarded by asserts: TracePoolAllocator must be in use and in
+    ``"optimized"`` phase (stable buffer addresses required for CG).
+    """
     if ctx.cuda_graph_runner is not None:
+        allocator = ctx.bucket_allocator
+        assert isinstance(allocator, TracePoolAllocator), (
+            "CUDA graph capture requires TracePoolAllocator"
+        )
+        assert allocator.phase == "optimized", (
+            f"CUDA graph capture requires allocator phase='optimized', "
+            f"got '{allocator.phase}'"
+        )
         with torch.enable_grad(), torch.cuda.amp.autocast(enabled=False):
             ctx.cuda_graph_runner.capture_and_install(
                 root_module, capture_stream=ctx.cuda_graph_stream,
