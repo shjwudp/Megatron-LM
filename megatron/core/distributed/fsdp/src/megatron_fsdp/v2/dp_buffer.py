@@ -397,10 +397,18 @@ class DataParallelBuffer:
             f"Buffer size {buffer.numel()} does not match expected size "
             f"{self.buffer_index.bucket_meta.size}"
         )
+        elem_size = buffer.element_size()
         for p in self.params:
             item_id = self.param_idx[p]
             start, end = self.buffer_index._get_item_global_range(item_id)
             idx_shape = self.buffer_index.item_index_map[item_id].shape
+            # Skip slice if param.data already points to the same buffer region
+            if (
+                p.data.data_ptr() == buffer.data_ptr() + start * elem_size
+                and p.data.numel() == end - start
+                and p.data.shape == idx_shape
+            ):
+                continue
             param_data = buffer[start:end].view(idx_shape)
             self.mp_policy.bind_unsharded_param(p, param_data, self.buffer_role)
 
