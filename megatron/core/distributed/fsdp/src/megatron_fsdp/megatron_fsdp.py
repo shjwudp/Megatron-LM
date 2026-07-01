@@ -50,6 +50,7 @@ try:
     from megatron.core.distributed.distributed_data_parallel_config import (
         DistributedDataParallelConfig,
     )
+    from megatron.core.transformer.cuda_graphs import is_graph_capturing
     from megatron.core.utils import is_submodule
 
     logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
@@ -58,6 +59,9 @@ except ImportError:
     logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
     from .distributed_data_parallel_config import DistributedDataParallelConfig
     from .utils import is_submodule
+
+    def is_graph_capturing():
+        return torch.cuda.is_current_stream_capturing()
 
 
 class TrainingState(Enum):
@@ -274,6 +278,10 @@ class MegatronFSDP(torch.nn.Module):
         )
         self.report_nan_in_param_grad = report_nan_in_param_grad
 
+        # Params whose fused wgrad is captured inside a CUDA graph. During replay,
+        # FSDP must not reallocate or zero their main_grad before reduction.
+        self._cuda_graph_fused_wgrad_params = set()
+
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
         # If not provided, Megatron-FSDP will default to a simple data parallel index
         # supported by torch.distributed.group.WORLD.
@@ -340,15 +348,8 @@ class MegatronFSDP(torch.nn.Module):
         self._init_fsdp_param_and_grad_buffer()
         self._register_fsdp_hooks(self.module)
         self.microbatch_count = 0
-
-        # Add a reference from the distributed parameters to self for API
-        # accessibility, e.g. when attaching MegatronFSDP scheduled ops
-        # to the distributed optimizer.step() and optimizer.zero_grad().
         self.is_param_fsdp_distributed = False
         self._replace_param_with_distributed_if_needed()
-        for param in self.module.parameters():
-            # Attach MegatronFSDP reference to the parameter.
-            setattr(param, "_megatron_fsdp_model", self)
 
     def _check_module_parameter_types(self):
         """
@@ -601,24 +602,32 @@ class MegatronFSDP(torch.nn.Module):
             # Sharded Gradient Buffer
             gbuf = group.hfsdp_helper_gbuf if group.hfsdp_helper_gbuf else group.main_grad_buffer
             if gbuf.is_data_distributed:
+                # If TransformerEngine gradient accumulation is fused, then param.get_main_grad()
+                # already holds the wgrad and param.grad_added_to_main_grad=True.
                 if not param.grad_added_to_main_grad:
-                    # Get `main_grad` will allocate bucket, check that the currently
-                    # used main_grad buffer does not exceed the scope of two FSDP Unit
-                    # Modules, i.e., the buffer limit imposed by double-buffer allocator.
-                    if self.ddp_config.fsdp_double_buffer:
-                        self.grad_reduce_pipeline._enforce_double_buffer_limit([group_id])
-
-                    param.main_grad = param.get_main_grad()
-                    if param.grad is not None:
-                        if self.report_nan_in_param_grad:
-                            _check_nan_in_grad(to_local_if_dtensor(param.grad))
-                        # Copy the gradient into the allocated main gradient bucket.
-                        # It will be reduce-scattered and accumulated into gbuf.
-                        param.main_grad.copy_(to_local_if_dtensor(param.grad))
-                        del param.grad
+                    # CUDA graph replay runs fused wgrad GEMMs that already wrote
+                    # into the captured main_grad address. Do not reallocate or
+                    # clear that buffer before the reduce-scatter consumes it.
+                    if id(param) in self._cuda_graph_fused_wgrad_params:
+                        param.grad_added_to_main_grad = True
                     else:
-                        # Prepare for fused wgrad accumulation.
-                        param.main_grad.zero_()
+                        # Get `main_grad` will allocate bucket, check that the currently
+                        # used main_grad buffer does not exceed the scope of two FSDP Unit
+                        # Modules, i.e., the buffer limit imposed by double-buffer allocator.
+                        if self.ddp_config.fsdp_double_buffer:
+                            self.grad_reduce_pipeline._enforce_double_buffer_limit([group_id])
+
+                        param.main_grad = param.get_main_grad()
+                        if param.grad is not None:
+                            if self.report_nan_in_param_grad:
+                                _check_nan_in_grad(to_local_if_dtensor(param.grad))
+                            # Copy the gradient into the allocated main gradient bucket.
+                            # It will be reduce-scattered and accumulated into gbuf.
+                            param.main_grad.copy_(to_local_if_dtensor(param.grad))
+                            del param.grad
+                        else:
+                            # Prepare for fused wgrad accumulation.
+                            param.main_grad.zero_()
             # Unsharded Gradient Buffer
             else:
                 if not param.grad_added_to_main_grad:
@@ -696,6 +705,23 @@ class MegatronFSDP(torch.nn.Module):
                 - In hybrid FSDP configurations, an outer FSDP group gradient reduction
                 may be triggered.
             """
+            # During CUDA graph capture, fused wgrad GEMMs allocate main_grad
+            # buffers and write into addresses that are baked into the graph.
+            # Remember those params for replay and free the fixed-pool slots so
+            # capture itself does not exhaust the double-buffer pool.
+            if is_graph_capturing():
+                for param in param_list:
+                    if hasattr(param, 'main_grad') and param.main_grad is not None:
+                        self._cuda_graph_fused_wgrad_params.add(id(param))
+                    bucket_id = self.param_and_grad_buffer.param_to_param_group.get(param)
+                    if bucket_id is not None:
+                        gbuf = self.param_and_grad_buffer.parameter_groups[
+                            bucket_id
+                        ].main_grad_buffer
+                        if gbuf is not None:
+                            gbuf.free_bucket_storage()
+                return
+
             # Filter out shared parameters whose gradients are handled by the root hook.
             param_list = [p for p in param_list if not getattr(p, "_is_shared", False)]
 
@@ -982,6 +1008,12 @@ class MegatronFSDP(torch.nn.Module):
                 )
                 return output
 
+            # Tag for cuda_graphs.py: this forward hook wraps a pre-backward handler.
+            # cuda_graphs.py will withhold it from TE and extract the inner handler
+            # into backward_pre_hooks for per-callable manual invocation.
+            # Attribute name must match _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR in cuda_graphs.py.
+            forward_hook._cuda_graph_backward_pre_handler = custom_backward_handler
+
             # Register the post-forward hook that attaches the custom backward hook
             # on the output tensor(s).
             return module.register_forward_hook(forward_hook)
@@ -1061,13 +1093,16 @@ class MegatronFSDP(torch.nn.Module):
             # and reduce-scatter gradients after the backward pass.
             if isinstance(module, tuple(fsdp_unit_modules)):
                 if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+                    _post_bwd_hook = functools.partial(
+                        _register_post_backward_hook, _post_backward_release_module
+                    )
+                    # Tag for cuda_graphs.py: this forward_pre hook wraps a post-backward handler.
+                    # cuda_graphs.py will withhold it from TE and extract the inner handler
+                    # into backward_hooks for per-callable manual invocation.
+                    # Attribute name must match _CUDA_GRAPH_BACKWARD_HANDLER_ATTR in cuda_graphs.py.
+                    _post_bwd_hook._cuda_graph_backward_handler = _post_backward_release_module
                     self.forward_pre_hooks[f"module {name} register post-backward hook"] = (
-                        module.register_forward_pre_hook(
-                            functools.partial(
-                                _register_post_backward_hook, _post_backward_release_module
-                            ),
-                            with_kwargs=True,
-                        )
+                        module.register_forward_pre_hook(_post_bwd_hook, with_kwargs=True)
                     )
                 grad_acc_param_list = [p for p in module.parameters() if p.requires_grad]
             else:
@@ -1289,7 +1324,7 @@ class MegatronFSDP(torch.nn.Module):
         """
         Synchronize parameter all-gather operations for all model parameters.
         """
-        self.all_gather_pipeline.reset()
+        self.all_gather_pipeline.reset(preserve_non_fsdp_units=True)
         self._replace_param_with_distributed_if_needed()
 
     def synchronize_gradient_reduce(self):
@@ -1358,6 +1393,8 @@ class MegatronFSDP(torch.nn.Module):
             # DTensor parameter is managed by Megatron FSDP.
             if not hasattr(dist_param, "__fsdp_param__"):
                 dist_param.__fsdp_param__ = True
+            if not hasattr(dist_param, "_megatron_fsdp_model"):
+                dist_param._megatron_fsdp_model = self
             _replace_module_parameter(self.module, name, dist_param)
 
         # Handle shared weights
@@ -1370,6 +1407,8 @@ class MegatronFSDP(torch.nn.Module):
 
         for name, _ in self.module.named_parameters():
             assert name in self.raw_param, f"Raw parameter {name} not found in module."
+            if not hasattr(self.raw_param[name], "_megatron_fsdp_model"):
+                self.raw_param[name]._megatron_fsdp_model = self
             _replace_module_parameter(self.module, name, self.raw_param[name])
 
         # Handle shared weights

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2025, Songlin Yang, Jan Kautz, Ali Hatamizadeh.
 
 # Some of this code was adopted from https://github.com/huggingface/transformers
@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
@@ -14,12 +15,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
@@ -28,6 +30,7 @@ from megatron.core.ssm.mamba_context_parallel import (
     _undo_attention_load_balancing,
 )
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -43,7 +46,13 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    if os.environ.get("MCORE_GDN_USE_OPT_WRAPPER", "0") == "1":
+        try:
+            from mcore_gdn_opt.gated_delta_rule import chunk_gated_delta_rule
+        except ImportError:
+            from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    else:
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
 except ImportError:
@@ -55,6 +64,12 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+# Triton's autotune key for causal_conv1d includes cdiv(total_tokens, 1024).
+# Dynamic CP causes total_tokens to vary per microbatch, triggering repeated
+# autotuning.  Aligning to this boundary collapses most variations into a
+# small number of buckets.
+_CONV_PAD_ALIGNMENT = 4096
 
 
 @dataclass
@@ -86,6 +101,7 @@ class GatedDeltaNet(MegatronModule):
         use_qk_l2norm: bool = True,
         A_init_range: Tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
+        name: str | None = None,
         **kwargs,
     ):
         """
@@ -100,6 +116,7 @@ class GatedDeltaNet(MegatronModule):
             A_init_range: The initialization range for the attention weights.
             pg_collection: The required process groups to use for tensor model parallel and context
                 parallel.
+            name (str | None): module instance name passed top-down from its paranet module
         """
 
         if not HAVE_FLA:
@@ -122,6 +139,7 @@ class GatedDeltaNet(MegatronModule):
         self.cp_size = self.pg_collection.cp.size()
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
+        self.gdn_pre_gated_delta_rule_fusion = config.gdn_pre_gated_delta_rule_fusion
 
         # Attributes from config
         self.config = config
@@ -137,6 +155,22 @@ class GatedDeltaNet(MegatronModule):
         self.v_dim = self.value_head_dim * self.num_value_heads
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
+
+        # GDN uses head-parallel CP: each CP rank handles a slice of heads.
+        # The static cp_size (== max dynamic cp_size) must evenly divide the
+        # per-TP head counts so that every possible runtime cp_size also divides.
+        num_key_heads_per_tp = self.num_key_heads // self.tp_size
+        num_value_heads_per_tp = self.num_value_heads // self.tp_size
+        assert num_key_heads_per_tp % self.cp_size == 0, (
+            f"GDN head-parallel CP requires the static (max) cp_size ({self.cp_size}) "
+            f"to evenly divide num_key_heads per TP rank ({num_key_heads_per_tp}); "
+            f"all runtime dynamic cp_size values divide the static one and so will also divide."
+        )
+        assert num_value_heads_per_tp % self.cp_size == 0, (
+            f"GDN head-parallel CP requires the static (max) cp_size ({self.cp_size}) "
+            f"to evenly divide num_value_heads per TP rank ({num_value_heads_per_tp}); "
+            f"all runtime dynamic cp_size values divide the static one and so will also divide."
+        )
 
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
         # TODO: for now, output gate is forced for GDN.
@@ -160,6 +194,7 @@ class GatedDeltaNet(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            name=(name + ".in_proj") if name is not None else None,
         )
 
         # Conv1d for QKV
@@ -232,7 +267,26 @@ class GatedDeltaNet(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            name=(name + ".out_proj") if name is not None else None,
         )
+
+        # Whole-module recompute: when "gdn" is in recompute_modules (selective granularity),
+        # the entire GatedDeltaNet compute is wrapped in a normal checkpoint and recomputed
+        # in the backward pass.
+        self.recompute_gdn = False
+        # gdn_norm_out / gdn_qkv: discard-output recompute of the gated output norm + HP-to-CP
+        # all-to-all block (gdn_norm_out) and/or the QKV projection + preparation block (gdn_qkv:
+        # in_proj -> CP a2a -> conv1d -> _prepare_qkv -> g/beta). When both are enabled the two
+        # discard-output checkpoints share a CheckpointManager that replays their recompute in
+        # forward order (qkv -> norm_out), since norm_out's recompute consumes the qkv `gate`.
+        self.recompute_norm_out = False
+        self.recompute_qkv = False
+        # Per-forward CheckpointManager for the GDN discard-output recompute (set in forward()).
+        self.gdn_recompute_manager = None
+        if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
+            self.recompute_gdn = "gdn" in self.config.recompute_modules
+            self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            self.recompute_qkv = "gdn_qkv" in self.config.recompute_modules
 
         self.reset_parameters()
 
@@ -289,8 +343,11 @@ class GatedDeltaNet(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        cp_size = cp_group.size()
+
         seq_len, batch, _ = hidden_states.shape
-        seq_len = seq_len * self.sp_size * self.cp_size
+        seq_len = seq_len * self.sp_size * cp_size
 
         if inference_context is not None:
             assert (
@@ -312,12 +369,14 @@ class GatedDeltaNet(MegatronModule):
                 packed_seq_params.cu_seqlens_q,
                 seq_len,
                 "cu_seqlens_q",
+                cp_size=self.cp_size,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
                 packed_seq_params.cu_seqlens_kv,
                 seq_len,
                 "cu_seqlens_kv",
+                cp_size=self.cp_size,
             )
             assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
@@ -332,6 +391,144 @@ class GatedDeltaNet(MegatronModule):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
+        if self.recompute_gdn and self.training:
+
+            def _checkpointed_compute(hidden_states):
+                return self._forward_compute(
+                    hidden_states,
+                    batch,
+                    seq_len,
+                    cp_size,
+                    cp_group,
+                    cu_seqlens_q,
+                    packed_seq_params,
+                )
+
+            out, out_bias = tensor_parallel.checkpoint(_checkpointed_compute, False, hidden_states)
+        else:
+            out, out_bias = self._forward_compute(
+                hidden_states, batch, seq_len, cp_size, cp_group, cu_seqlens_q, packed_seq_params
+            )
+
+        return out, out_bias
+
+    def _forward_compute(
+        self, hidden_states, batch, seq_len, cp_size, cp_group, cu_seqlens_q, packed_seq_params
+    ):
+        """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> gated norm -> out_proj).
+
+        Extracted from ``forward`` so the entire module can be wrapped in a recompute
+        checkpoint when ``recompute_modules`` contains ``"gdn"`` (selective full-module
+        recompute, normal checkpointing).
+
+        Returns:
+            Tuple of (output, output_bias).
+        """
+        # gdn_qkv (QKV proj+prep) and gdn_norm_out (gated norm + a2a) are discard-output
+        # checkpoints; the QKV output `gate` feeds the gated-norm block, so when both are on the
+        # CheckpointManager replays them in forward order (qkv -> norm_out) from one unified grad
+        # hook on `out`.
+        recompute_qkv = self.recompute_qkv and self.training
+        recompute_norm_out = self.recompute_norm_out and self.training
+        self.gdn_recompute_manager = (
+            CheckpointManager() if (recompute_qkv or recompute_norm_out) else None
+        )
+
+        # QKV projection + prep block (in_proj -> CP a2a cp2hp -> conv1d -> _prepare_qkv -> g/beta).
+        def _qkv_proj_and_prepare(hidden_states):
+            return self._compute_qkv_for_gated_delta_rule(
+                hidden_states, batch, seq_len, cp_size, cp_group, cu_seqlens_q, packed_seq_params
+            )
+
+        # gdn_qkv: discard the QKV-prep outputs now and regenerate them from a grad hook in the
+        # backward, freeing the large GDN QKV-prep activations. Synchronous recompute (no async
+        # reload), so it is safe with the fla/compiled gated_delta_rule backward.
+        if recompute_qkv:
+            query, key, value, gate, beta, g = tensor_parallel.CheckpointWithoutOutput(
+                fp8=(self.config.fp8 or self.config.fp4),
+                ckpt_manager=self.gdn_recompute_manager,
+            ).checkpoint(_qkv_proj_and_prepare, hidden_states)
+        else:
+            query, key, value, gate, beta, g = _qkv_proj_and_prepare(hidden_states)
+
+        nvtx_range_push(suffix="gated_delta_rule")
+        core_attn_out, _ = self.gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens_q,
+        )
+        nvtx_range_pop(suffix="gated_delta_rule")
+
+        def _gated_norm_and_a2a(core_attn_out: torch.Tensor, gate: torch.Tensor):
+            # RMSNorm
+            nvtx_range_push(suffix="gated_norm")
+            norm_out = self._apply_gated_norm(core_attn_out, gate)
+            nvtx_range_pop(suffix="gated_norm")
+
+            # Transpose: b s x --> s b x
+            # From bshd back to sbhd format
+            norm_out = norm_out.reshape(batch, seq_len, -1)
+            norm_out = norm_out.transpose(0, 1).contiguous()
+
+            # CP all to all: HP to CP
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
+                outputs = []
+                for norm_out_i in unpacked_norm_out:
+                    norm_out_i = tensor_a2a_hp2cp(
+                        norm_out_i, seq_dim=0, head_dim=-1, cp_group=cp_group
+                    )
+                    outputs.append(norm_out_i)
+                norm_out = torch.cat(outputs, dim=0)
+            else:
+                norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group)
+
+            return norm_out
+
+        # gdn_norm_out: discard the gated-norm + a2a outputs now and regenerate them from a grad
+        # hook in the backward, freeing the gated-norm activations. Synchronous recompute, so it is
+        # safe with the fla/compiled gated_delta_rule backward.
+        if recompute_norm_out:
+            norm_out = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=self.gdn_recompute_manager
+            ).checkpoint(_gated_norm_and_a2a, core_attn_out, gate)
+        else:
+            norm_out = _gated_norm_and_a2a(core_attn_out, gate)
+
+        # Output projection
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+
+        # Discard the checkpointed block outputs (now consumed) and register the unified recompute
+        # hook on `out` — its grad is computed first in backward, before the backwards that need
+        # them. The manager replays the registered checkpoints in forward order (qkv -> norm_out),
+        # so the qkv `gate` is restored before the gated-norm recompute consumes it.
+        if self.gdn_recompute_manager is not None:
+            self.gdn_recompute_manager.discard_all_outputs_and_register_unified_recompute(out)
+            self.gdn_recompute_manager = None
+
+        return out, out_bias
+
+    def _compute_qkv_for_gated_delta_rule(
+        self, hidden_states, batch, seq_len, cp_size, cp_group, cu_seqlens_q, packed_seq_params
+    ):
+        """QKV projection + preparation block for the gated delta rule.
+
+        Runs in_proj -> CP all-to-all (cp2hp) -> conv1d -> _prepare_qkv -> g/beta (or the fused
+        streamed pre-GDR path when enabled), producing the tensors consumed by
+        ``self.gated_delta_rule`` plus the ``gate`` for the gated norm. Extracted so it can be
+        checkpointed when ``recompute_modules`` contains ``"gdn_qkv"``.
+
+        Returns:
+            Tuple of (query, key, value, gate, beta, g).
+        """
         # Input projection
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
@@ -339,14 +536,14 @@ class GatedDeltaNet(MegatronModule):
 
         # CP All to All: CP to HP
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // self.cp_size, dim=0)
+            unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // cp_size, dim=0)
             outputs = []
             for qkvzba_i in unpacked_qkvzba:
                 qkvzba_i = tensor_a2a_cp2hp(
                     qkvzba_i,
                     seq_dim=0,
                     head_dim=-1,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=cp_group,
                     split_sections=[
                         self.qk_dim_local_tp,
                         self.qk_dim_local_tp,
@@ -363,7 +560,7 @@ class GatedDeltaNet(MegatronModule):
                 qkvzba,
                 seq_dim=0,
                 head_dim=-1,
-                cp_group=self.pg_collection.cp,
+                cp_group=cp_group,
                 split_sections=[
                     self.qk_dim_local_tp,
                     self.qk_dim_local_tp,
@@ -374,6 +571,32 @@ class GatedDeltaNet(MegatronModule):
                 ],
             )
 
+        if self.gdn_pre_gated_delta_rule_fusion:
+            # Existing all-to-all CP reaches this point in hidden-parallel layout.
+            # Chunkwise CP has a different sequence and halo contract; revisit
+            # fused pre-GDR metadata before enabling this path there.
+            nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
+            seq_idx = (
+                packed_seq_params.seq_idx
+                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+                else None
+            )
+            query, key, value, gate, beta, g = self._fused_streamed_pre_gated_delta_rule(
+                qkvzba, cu_seqlens_q=cu_seqlens_q, seq_idx=seq_idx
+            )
+            nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
+        else:
+            nvtx_range_push(suffix="pre_gated_delta_rule")
+            query, key, value, gate, beta, g = self.pre_gated_delta_rule(
+                qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q
+            )
+            nvtx_range_pop(suffix="pre_gated_delta_rule")
+
+        return query, key, value, gate, beta, g
+
+    def pre_gated_delta_rule(self, qkvzba, batch, seq_len, cp_size, cp_group, cu_seqlens_q=None):
+        """Prepare QKV, gate, beta, and decay tensors before the gated delta rule."""
+
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
         qkvzba = qkvzba.transpose(0, 1)
@@ -382,10 +605,10 @@ class GatedDeltaNet(MegatronModule):
         qkv, gate, beta, alpha = torch.split(
             qkvzba,
             [
-                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
-                self.v_dim_local_tp // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
+                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size,
+                self.v_dim_local_tp // cp_size,
+                self.num_value_heads // self.tp_size // cp_size,
+                self.num_value_heads // self.tp_size // cp_size,
             ],
             dim=-1,
         )
@@ -402,16 +625,13 @@ class GatedDeltaNet(MegatronModule):
             self.v_dim_local_tp,
         ]
         conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
+            self.conv1d.weight, dim=0, cp_group=cp_group, split_sections=qkv_channels_split_sections
         )
         conv1d_bias = (
             get_parameter_local_cp(
                 self.conv1d.bias,
                 dim=0,
-                cp_group=self.pg_collection.cp,
+                cp_group=cp_group,
                 split_sections=qkv_channels_split_sections,
             )
             if self.conv_bias
@@ -426,84 +646,79 @@ class GatedDeltaNet(MegatronModule):
                 stride=self.conv1d.stride,
                 padding=self.conv1d.padding,
                 dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
+                groups=self.conv_dim_local_tp // cp_size,
             )
             qkv = self.act_fn(conv_out[..., :seq_len])
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         else:
             assert self.activation in ["silu", "swish"]
+            _orig_seq = qkv.shape[1]
+            _pad_n = -_orig_seq % _CONV_PAD_ALIGNMENT
+            _conv_input = qkv
+            _conv_cu_seqlens = cu_seqlens_q
+            if _pad_n > 0:
+                _conv_input = torch.nn.functional.pad(qkv, (0, 0, 0, _pad_n))
+                # cu_seqlens_q is None in non-packed-sequence mode; only the
+                # last-segment offset needs to grow to cover the padding tail.
+                if cu_seqlens_q is not None:
+                    _conv_cu_seqlens = cu_seqlens_q.clone()
+                    _conv_cu_seqlens[-1] += _pad_n
             qkv, _ = causal_conv1d(
-                x=qkv,  # FLA conv1d accepts [b, s, d] format input
+                x=_conv_input,  # FLA conv1d accepts [b, s, d] format input
                 weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
                 bias=conv1d_bias,
                 activation=self.activation,
                 initial_state=None,
                 output_final_state=False,
-                cu_seqlens=cu_seqlens_q,
+                cu_seqlens=_conv_cu_seqlens,
             )
+            if _pad_n > 0:
+                qkv = qkv[:, :_orig_seq, :]
         nvtx_range_pop(suffix="conv1d")
 
         # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
         nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
         query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
-            qkv, gate, beta, alpha, batch, seq_len
+            qkv, gate, beta, alpha, batch, seq_len, cp_size
         )
         nvtx_range_pop(suffix="prepare_qkv_for_gated_delta_rule")
 
         # Calculate g and beta
         nvtx_range_push(suffix="g_and_beta")
-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
-        dt_bias_local_cp = get_parameter_local_cp(
-            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
-        )
+        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group)
+        dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group)
         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
 
-        nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-        )
-        nvtx_range_pop(suffix="gated_delta_rule")
+        return query, key, value, gate, beta, g
 
-        # RMSNorm
-        nvtx_range_push(suffix="gated_norm")
-        norm_out = self._apply_gated_norm(core_attn_out, gate)
-        nvtx_range_pop(suffix="gated_norm")
+    def _fused_streamed_pre_gated_delta_rule(self, qkvzba, cu_seqlens_q=None, seq_idx=None):
+        """Call the streamed fused pre-GDR wrapper."""
 
-        # Transpose: b s x --> s b x
-        # From bshd back to sbhd format
-        norm_out = norm_out.reshape(batch, seq_len, -1)
-        norm_out = norm_out.transpose(0, 1).contiguous()
-
-        # CP all to all: HP to CP
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
-            outputs = []
-            for norm_out_i in unpacked_norm_out:
-                norm_out_i = tensor_a2a_hp2cp(
-                    norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-                )
-                outputs.append(norm_out_i)
-            norm_out = torch.cat(outputs, dim=0)
-        else:
-            norm_out = tensor_a2a_hp2cp(
-                norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+        try:
+            from megatron.core.fusions.fused_pre_gated_delta_rule import (
+                fused_streamed_pre_gated_delta_rule,
             )
+        except ImportError as exc:
+            raise ImportError(
+                "gdn_pre_gated_delta_rule_fusion requires the streamed pre-GDR fusion "
+                "dependencies, including causal-conv1d."
+            ) from exc
 
-        # Output projection
-        nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix="out_proj")
-
-        return out, out_bias
+        return fused_streamed_pre_gated_delta_rule(
+            qkvzba,
+            self.conv1d.weight,
+            self.conv1d.bias if self.conv_bias else None,
+            self.A_log,
+            self.dt_bias,
+            num_key_heads=self.qk_dim_local_tp // self.key_head_dim,
+            num_value_heads=self.v_dim_local_tp // self.value_head_dim,
+            key_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+            use_qk_l2norm=self.use_qk_l2norm,
+            cu_seqlens=cu_seqlens_q,
+            seq_idx=seq_idx,
+        )
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
@@ -518,16 +733,14 @@ class GatedDeltaNet(MegatronModule):
         return y
 
     @jit_fuser
-    def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len):
+    def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len, cp_size):
         """
         Prepare query, key, value, gate, beta, alpha tensors for gated delta rule.
         Fuses split, reshape, L2 norm, repeat_interleave, and contiguous operations.
         """
         # Split qkv into query_key and value
         query_key, value = torch.split(
-            qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
-            dim=-1,
+            qkv, [2 * self.qk_dim_local_tp // cp_size, self.v_dim_local_tp // cp_size], dim=-1
         )
 
         # Reshape query_key and value
@@ -539,8 +752,7 @@ class GatedDeltaNet(MegatronModule):
             query_key = l2norm(query_key.contiguous())
 
         # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
-        query, key = torch.split(query_key, [split_size, split_size], dim=2)
+        query, key = query_key.chunk(2, dim=2)
 
         # Expand query and key if needed (grouped query attention)
         if self.num_value_heads // self.num_key_heads > 1:
@@ -568,19 +780,28 @@ class GatedDeltaNet(MegatronModule):
         beta = beta.sigmoid()
         return g, beta
 
-    def _resolve_cu_seqlens(self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name):
+    def _resolve_cu_seqlens(
+        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
+    ):
         """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
         if cu_seqlens_padded is not None:
             cu_seqlens = cu_seqlens_padded
         else:
             cu_seqlens = cu_seqlens_actual
 
-        total_cu = cu_seqlens[-1].item()
+        total_cu = cu_seqlens[-1].cpu().item()
         if total_cu != total_seq_len:
             raise ValueError(
                 f"GDN: {name}[-1]={total_cu} does not match "
                 f"total_sequence_length={total_seq_len}. "
                 f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
+            )
+
+        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        if (seq_lengths % cp_size != 0).any():
+            raise ValueError(
+                f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
+                f"but got lengths: {seq_lengths.tolist()}"
             )
 
         return cu_seqlens
@@ -685,10 +906,11 @@ class GatedDeltaNet(MegatronModule):
 
 def _unpack_sequence(x, cu_seqlens, dim=1):
     unpacked_x = []
-    num_seqs = cu_seqlens.shape[0] - 1
+    cu_seqlens_list = cu_seqlens.tolist()
+    num_seqs = len(cu_seqlens_list) - 1
     for i in range(num_seqs):
-        idx_start = cu_seqlens[i].item()
-        idx_end = cu_seqlens[i + 1].item()
+        idx_start = cu_seqlens_list[i]
+        idx_end = cu_seqlens_list[i + 1]
         chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
         unpacked_x.append(x[tuple(chunked_index)])
     return unpacked_x

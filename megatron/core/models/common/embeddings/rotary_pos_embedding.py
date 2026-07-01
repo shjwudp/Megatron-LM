@@ -205,6 +205,47 @@ class RotaryEmbedding(nn.Module):
 
         return emb
 
+    def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq=False, cp_group=None):
+        """Materialize cached cos/sin tensors for ``[seq_len, ..., dim]``."""
+        self.max_seq_len_cached = seq_len
+        self.offset_cached = offset
+        self.dtype_cached = dtype
+        self.packed_seq_cached = packed_seq
+
+        emb = self.forward(seq_len, offset, packed_seq=packed_seq, cp_group=cp_group)
+        self.register_buffer("cos_cached", emb.cos().to(dtype).contiguous(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype).contiguous(), persistent=False)
+
+    def get_cached_cos_sin(
+        self,
+        seq_len,
+        offset=0,
+        dtype=torch.get_default_dtype(),
+        packed_seq=False,
+        cp_group=None,
+        mscale=None,
+    ):
+        """Get cached cos and sin values.
+
+        The cache is rebuilt on first use or whenever ``seq_len`` grows
+        beyond the cached length, or any of ``offset`` / ``dtype`` /
+        ``packed_seq`` changes from the previous call.
+        ``YarnRotaryEmbedding`` overrides this to also bake its
+        concentration factor into the cached cos/sin (controlled by
+        ``mscale``); for the base class without a concentration
+        factor the argument is accepted-and-ignored for API uniformity.
+        """
+        del mscale  # base class has no concentration factor
+        if (
+            not hasattr(self, "max_seq_len_cached")
+            or seq_len > self.max_seq_len_cached
+            or offset != self.offset_cached
+            or dtype != self.dtype_cached
+            or packed_seq != self.packed_seq_cached
+        ):
+            self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq, cp_group)
+        return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
+
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         state_dict.pop(f'{prefix}inv_freq', None)
         return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
@@ -341,6 +382,8 @@ class MultimodalRotaryEmbedding(nn.Module):
         position_ids: torch.Tensor,
         mrope_section: List[int],
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        return_raw_freqs: bool = False,
+        packed_seq: bool = False,
     ) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
 
@@ -350,9 +393,14 @@ class MultimodalRotaryEmbedding(nn.Module):
                 height and width in rope calculation.
             cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
                 Defaults to None.
+            return_raw_freqs (bool, optional): If True, return the raw per-axis frequencies with
+                shape [3, batchsize, seqlens, dim / 2] for fused mRoPE application.
+            packed_seq (bool, optional): Whether the sequence uses THD packing. Packed sequences
+                keep full position frequencies because THD RoPE applies CP partitioning later.
 
         Returns:
-            Tensor: Embeddings after applying RoPE.
+            Tensor: Embeddings after applying RoPE, or raw per-axis frequencies when
+            return_raw_freqs is True.
         """
         seq = position_ids.to(device=self.inv_freq.device, dtype=self.inv_freq.dtype)
 
@@ -366,6 +414,13 @@ class MultimodalRotaryEmbedding(nn.Module):
         # shape (3, bs, seq_length, dim)
         freqs = (inv_freq_expanded @ seq_expanded).transpose(2, 3)
 
+        if cp_group is None:
+            cp_group = self.cp_group
+        if return_raw_freqs:
+            if cp_group is not None and cp_group.size() > 1 and not packed_seq:
+                freqs = get_pos_emb_on_this_cp_rank(freqs, 2, cp_group)
+            return freqs.contiguous()
+
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
         if self.interleaved_mrope:
@@ -376,9 +431,9 @@ class MultimodalRotaryEmbedding(nn.Module):
                 emb = torch.cat((freqs, freqs), dim=-1)  # shape (bs, seq_length, 2 * dim)
             else:
                 bs = freqs.shape[0]
-                emb = torch.stack((freqs.view(bs, -1, 1), freqs.view(bs, -1, 1)), dim=-1).view(
-                    bs, freqs.shape[1], -1
-                )
+                emb = torch.stack(
+                    (freqs.reshape(bs, -1, 1), freqs.reshape(bs, -1, 1)), dim=-1
+                ).view(bs, freqs.shape[1], -1)
         else:
             # Original section-based layout (Qwen2-VL style).
             if not self.rotary_interleaved:
@@ -386,8 +441,8 @@ class MultimodalRotaryEmbedding(nn.Module):
             else:
                 bs = freqs.shape[1]
                 emb = torch.stack(
-                    (freqs.view(3, bs, -1, 1), freqs.view(3, bs, -1, 1)), dim=-1
-                ).view(3, bs, freqs.shape[0], -1)
+                    (freqs.reshape(3, bs, -1, 1), freqs.reshape(3, bs, -1, 1)), dim=-1
+                ).view(3, bs, freqs.shape[2], -1)
             # generate freqs with mrope_section: cycle T/H/W per section chunk
             mrope_section_doubled = list(mrope_section) * 2
             emb = torch.cat(
@@ -396,9 +451,7 @@ class MultimodalRotaryEmbedding(nn.Module):
 
         # shape (seq_length, bs, 1, 2 * dim)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
-        if cp_group is None:
-            cp_group = self.cp_group
-        if cp_group is not None and cp_group.size() > 1:
+        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
             # CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)

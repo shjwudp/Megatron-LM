@@ -1,9 +1,11 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
+
+from ..utils import is_torch_min_version
 
 
 @dataclass
@@ -48,6 +50,11 @@ class DistributedDataParallelConfig:
        value of max(40000000, 1000000 * dp_size) parameters (larger DP sizes need larger
        buckets to ensure collectives do not become latency-bound)."""
 
+    num_buckets: Optional[int] = None
+    """Number of buckets for data-parallel communication. Should only specify one of
+       `bucket_size` and `num_buckets`. If `num_buckets` is specified, `bucket_size`
+       will be determined at runtime."""
+
     pad_buckets_for_high_nccl_busbw: bool = False
     """If true, make sure the bucket size is divisible by a large power of 2 (2^16) to
        ensure NCCL collectives have high bus bandwidth at large DP counts, since NCCL
@@ -83,15 +90,6 @@ class DistributedDataParallelConfig:
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
 
-    use_megatron_fsdp_v2: bool = False
-    """If true, use the `fully_shard` API for FSDP sharding the model.
-    """
-
-    mfsdp_cuda_graph_modules: list = field(default_factory=list)
-    """If set and ``use_megatron_fsdp_v2`` is set, enable CUDA graph capture
-    on specific FSDP module types.  Valid values: ``'mamba'`` (MambaLayer),
-    ``'transformer'`` (TransformerLayer).  Example: ``['mamba', 'transformer']``.
-    Only leaf FSDP modules (without FSDP children) are eligible."""
     use_custom_fsdp: bool = False
     """
     NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
@@ -142,15 +140,6 @@ class DistributedDataParallelConfig:
       This option will be automatically set to True when nccl_ub=True.
     """
 
-    fsdp_trace_pool: bool = False
-    """If true, use TracePoolAllocator for Megatron FSDP v2 communication buffers
-      instead of the default StorageFreeingBucketAllocator.  The TracePoolAllocator
-      traces the first micro-batch to build a static key-to-address plan, providing
-      stable buffer addresses required for CUDA graph capture.  This flag only takes
-      effect in the Megatron FSDP v2 path.  In the v1 path, use ``fsdp_double_buffer``
-      for FixedPoolAllocator-based double buffering.
-    """
-
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
     """Whether to fall back to persistent buffer when a bucket does not
        fit FSDP double buffer size. If true, FSDP will use the persistently 
@@ -165,7 +154,9 @@ class DistributedDataParallelConfig:
     If True, use all-gather during the initial Megatron-FSDP parameter
     synchronization step. This can increase overlap between the first
     parameter all-gather and computation, helping to better hide the
-    initial communication cost.
+    initial communication cost. Should be deactivated when using
+    full-iteration CG, or partial CG if AG/RS is launched beyond the
+    CG capture scope but is waited on during the capture scope.
     """
 
     outer_dp_sharding_strategy: str = 'no_shard'
@@ -224,8 +215,26 @@ class DistributedDataParallelConfig:
       main gradients to parameter dtype for `.grad`.
     """
 
-    use_megatron_fsdp_v2: bool = False
-    """If true, use the `fully_shard` API for FSDP sharding the model.
+    megatron_fsdp_cuda_graph_mode: bool = False
+    """If set to True, Megatron-FSDP will practice CUDA graph-safe operations, such as
+    not dereferencing `param.grad` after the optimizer step to preserve references for
+    CUDA graph replay. Can affect memory utilization in some cases, such as when the
+    gradient shard is not a view of the Megatron-FSDP sharded gradient buffer, so
+    FusedAdam(use_decoupled_grad=True) + megatron_fsdp_use_decoupled_grad=True or
+    setting megatron_fsdp_main_params_dtype == megatron_fsdp_main_grads_dtype is
+    recommended to avoid casting the gradient to the parameter precision and creating
+    a casted-copy of the gradient shard that cannot be dereferenced due to replay.
+    """
+
+    megatron_fsdp_enable_fine_grained_param_gather: bool = False
+    """If set to True, enables fine-grained parameter gathering for Megatron-FSDP.
+      This feature increases the overlap between parameter all-gather and forward computation,
+      at the cost of more frequent communication calls.
+      For MXFP8, this approach helps save memory during fine-grained activation
+      recomputation, because MXFP8 forward and backward passes use different
+      parameter representations (rowwise data for forward, colwise data for backward).
+      In this mode, only the rowwise parameters of modules involved in recomputation
+      will be unsharded.
     """
 
     def __post_init__(self):
@@ -235,7 +244,7 @@ class DistributedDataParallelConfig:
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 
-        if self.nccl_ub:
+        if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
@@ -247,3 +256,7 @@ class DistributedDataParallelConfig:
                 "Only need to explicitly specify param_name patterns for FP32 local accumulation "
                 "if .main_grads aren't already in FP32"
             )
+
+        if self.num_buckets is not None:
+            assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
+            assert self.num_buckets > 0, "num_buckets must be greater than 0"
