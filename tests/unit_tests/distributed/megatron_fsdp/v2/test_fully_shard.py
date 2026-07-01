@@ -585,6 +585,60 @@ class TestIgnoredParams:
 
 
 class TestLifecycle:
+    def test_async_singleton_unused_grad_zeros_stale_full_temp(self):
+        """An unused EDP=1 param must not reduce stale full-gradient storage."""
+        torch.manual_seed(42)
+        world_size = _world_size()
+        mesh = DeviceMesh(
+            _device().type,
+            torch.arange(world_size, dtype=torch.int).reshape(world_size, 1),
+            mesh_dim_names=("dp_outer", "dp"),
+        )
+        model = SimpleMLP(64).to(_device())
+        fully_shard(
+            model,
+            mesh=mesh,
+            sharding_strategy="optim_grads_params",
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=True,
+        )
+
+        param_group = model._fsdp_param_groups[0]
+        grad_buffer = param_group.main_grad_buffer
+        assert grad_buffer is not None
+        assert grad_buffer.dp_group.size() == 1
+        assert grad_buffer.inner_sharded
+
+        param_group._init_dist_grads()
+        param = param_group.params[0]
+        item_id = param_group.param_idx[param]
+        stale_main_grad = param.get_main_grad()
+        stale_main_grad.fill_(123.0)
+        param.main_grad = stale_main_grad
+        param.grad_added_to_main_grad = False
+        param._mfsdp_recorded_te_wgrad = False
+        assert param.grad is None
+        assert param_group._grad_buffer_is_fresh
+
+        ctx = model._fsdp_root_context
+        try:
+            model.reduce_grad(async_op=True)
+            model.finish_grad_sync()
+            torch.cuda.current_stream().synchronize()
+
+            optimizer_grad = param_group.dist_params[item_id].grad
+            assert optimizer_grad is not None
+            torch.testing.assert_close(
+                optimizer_grad._local_tensor,
+                torch.zeros_like(optimizer_grad._local_tensor),
+            )
+        finally:
+            pending = ctx.reduce_grad_buckets[id(model)]
+            while pending:
+                event, pending_group = pending.pop()
+                event.synchronize()
+                pending_group.release_grad_buffer()
+
     def test_params_unsharded_during_forward(self):
         """During forward, model parameters should be in unsharded state (full tensors)."""
         torch.manual_seed(42)

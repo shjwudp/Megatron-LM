@@ -817,13 +817,7 @@ class FSDPModule:
                         setattr(param, "_mfsdp_recorded_te_wgrad", True)
                 elif param.grad is None:
                     if not add_to_main_grad:
-                        main_grad = param.get_main_grad()
-                        param_main_grad = getattr(param, "main_grad", None)
-                        if (
-                            param_main_grad is None
-                            or param_main_grad.data_ptr() != main_grad.data_ptr()
-                        ):
-                            main_grad.zero_()
+                        param.get_main_grad().zero_()
                 else:
                     main_grad = param.get_main_grad()
                     if add_to_main_grad:
