@@ -83,7 +83,12 @@ def _build_groups(strategy, mesh=None, mp_policy=None, outer_dp_sharding_strateg
     """
     rank = torch.distributed.get_rank()
     device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
-    dp_group = torch.distributed.group.WORLD if mesh is None else mesh.get_group(mesh_dim=1)
+    if mesh is None:
+        from torch.distributed.device_mesh import init_device_mesh
+        ws = torch.distributed.get_world_size()
+        mesh = init_device_mesh(device.type, (1, ws),
+                                mesh_dim_names=("dp_outer", "dp"))
+    dp_group = mesh.get_group(mesh_dim="dp")
 
     # Fixed seed so all ranks start with identical weights
     torch.manual_seed(42)
