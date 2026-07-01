@@ -352,6 +352,15 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     )
         fully_shard(module, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
 
+        # Pre-initialize CUDA graph stream/pool so the default stream is not
+        # permanently changed in mfsdp_forward_pre_hook (which would break
+        # non-captured submodules such as vision encoders).
+        if ddp_config.mfsdp_cuda_graph_modules:
+            try:
+                module.init_cuda_graph_resources()
+            except Exception:
+                pass  # module may not be a root FSDPModule (non-v2 path)
+
         # Propagate relevant attributes from original parameters to the new
         # distributed parameters created by FSDP.  This is REQUIRED for
         # correctness: the optimizer's param group builder

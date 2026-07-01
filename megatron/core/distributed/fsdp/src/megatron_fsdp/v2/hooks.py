@@ -86,9 +86,12 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
     # ---- root: forward-phase setup (once per micro-batch) ------------------
     if target._fsdp_state._is_root:
         if ctx.enable_cuda_graph and ctx.cuda_graph_stream is None:
+            # Auto-init fallback for non-MCore users who did not call
+            # init_cuda_graph_resources() manually.  This sets the global
+            # default stream and may interfere with non-captured modules.
             ctx.cuda_graph_stream = torch.cuda.Stream()
-            with torch.cuda.stream(ctx.cuda_graph_stream):
-                ctx.cuda_graph_pool = torch.cuda.graph_pool_handle()
+            torch.cuda.set_stream(ctx.cuda_graph_stream)
+            ctx.cuda_graph_pool = torch.cuda.graph_pool_handle()
         ctx.forward_phase = True
         ctx.backward_phase = False
 

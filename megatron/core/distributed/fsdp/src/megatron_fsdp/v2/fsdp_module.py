@@ -244,6 +244,25 @@ class FSDPModule:
         """
         self._fsdp_state.enable_cuda_graph = True
 
+    def init_cuda_graph_resources(self) -> None:
+        """Manually initialize CUDA graph stream and memory pool.
+
+        Must be called from the root FSDP module BEFORE the first
+        forward pass, while the module is resharded.  Pre-creates the
+        ``cuda_graph_stream`` and ``graph_pool_handle`` so downstream
+        code can run without a global ``torch.cuda.set_stream()`` call.
+
+        When this is called, the ``mfsdp_forward_pre_hook`` will detect
+        that the stream already exists and skip its lazy-init path
+        (which would otherwise set the global default stream).
+        """
+        ctx = self._fsdp_root_context
+        if ctx.cuda_graph_stream is not None:
+            return  # already initialized
+        ctx.cuda_graph_stream = torch.cuda.Stream()
+        with torch.cuda.stream(ctx.cuda_graph_stream):
+            ctx.cuda_graph_pool = torch.cuda.graph_pool_handle()
+
     def release_memory_pool(self) -> None:
         """Release all persistent communication-buffer memory and any CUDA graphs.
 
