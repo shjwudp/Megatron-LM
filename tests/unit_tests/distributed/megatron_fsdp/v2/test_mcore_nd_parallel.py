@@ -131,6 +131,37 @@ class TestMegatronFSDPE2E:
         finally:
             Utils.destroy_model_parallel()
 
+    def test_edp1_singleton_inner_reduce_accumulates_gradient(self):
+        if Utils.world_size < 2:
+            pytest.skip("EDP=1 coverage requires at least two ranks for EP partitioning")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=Utils.world_size,
+            expert_tensor_parallel_size=1,
+        )
+        try:
+            param_group = self._make_edp1_gradient_param_group(
+                gradient_scaling_factor=1.0
+            )
+            grad_buffer = param_group.main_grad_buffer
+            assert grad_buffer is not None
+            param_group._init_dist_grads()
+            grad_buffer.data.fill_(2.0)
+            full_grad = grad_buffer.fetch_buffer((0, 0))
+            assert full_grad.data_ptr() != grad_buffer.data.data_ptr()
+            full_grad.fill_(4.0)
+
+            grad_buffer.reduce_grad(
+                overwrite_grad=False, reduce_dim=1, reduce_scatter=True
+            )
+
+            assert torch.equal(grad_buffer.data, torch.full_like(grad_buffer.data, 6.0))
+            grad_buffer.reshard()
+        finally:
+            Utils.destroy_model_parallel()
+
     @staticmethod
     def _normalize_param_name(name):
         while name.startswith("module."):

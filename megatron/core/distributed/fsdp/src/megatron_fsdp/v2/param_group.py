@@ -287,9 +287,17 @@ class ParameterGroup:
             return
 
         if reduce_inner:
+            # ZeRO-2/3 reduce each microbatch into a persistent optimizer shard:
+            # overwrite that shard on the first reduce, then accumulate into it.
+            # no_shard/ZeRO-1 instead accumulate the full gradient before their
+            # final reduction, so that reduction always overwrites its output.
+            accumulate_reduced_grad = (
+                self.sharding_strategy in ("optim_grads", "optim_grads_params")
+                and not self._grad_buffer_is_fresh
+            )
             # mesh dim 1 is inner-DP.
             self.main_grad_buffer.reduce_grad(
-                overwrite_grad=self._grad_buffer_is_fresh,
+                overwrite_grad=not accumulate_reduced_grad,
                 reduce_dim=1,
                 reduce_scatter=self.sharding_strategy != "no_shard",
             )

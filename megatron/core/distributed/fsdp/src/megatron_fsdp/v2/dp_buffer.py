@@ -531,7 +531,10 @@ class DataParallelBuffer:
             if reduce_dim == 1 and self.gradient_scaling_factor not in (None, 1.0):
                 input_buffer.mul_(self.gradient_scaling_factor)
             if output_buffer.data_ptr() != input_buffer.data_ptr():
-                output_buffer.copy_(input_buffer)
+                if overwrite_grad:
+                    output_buffer.copy_(input_buffer)
+                else:
+                    output_buffer.add_(input_buffer)
             return
 
         comm_input = input_buffer
