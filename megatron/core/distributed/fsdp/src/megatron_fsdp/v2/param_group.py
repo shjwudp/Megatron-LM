@@ -433,7 +433,7 @@ class ParameterGroup:
         ]
 
         self.dist_grads = []
-        for p in self.params:
+        for dist_param, p in zip(self.dist_params, self.params):
             item_id = self.param_idx[p]
             # shard_layout=(outer, inner): (1, 1) outer+inner, (0, 1) inner, (0, 0) full.
             shard_layout = (1, 1) if is_outer_optim_shard else (0, 1) if is_grad_shard else (0, 0)
@@ -444,7 +444,7 @@ class ParameterGroup:
                     p.shape,
                     self.mesh,
                     placements,
-                    post_process_uneven=True,
+                    copy_chunk_meta_from=dist_param,
                 )
                 # NOTE: Do not materialize empty local grad shards in self.dist_grads.
                 # Empty shards are semantically no-ops, but passing zero-numel DTensor
