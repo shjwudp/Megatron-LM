@@ -37,14 +37,18 @@ Single-GPU tests:
         -k "test_double_shard_rejected or test_no_params_module"
 """
 
+import shutil
 import sys
 from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import StateDictOptions
 from torch.distributed.checkpoint.state_dict import get_state_dict as torch_get_state_dict
+from torch.distributed.checkpoint.state_dict import set_state_dict as torch_set_state_dict
+from torch.distributed.tensor import DeviceMesh
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
@@ -53,9 +57,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-    MixedPrecisionPolicy,
-)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
+
+SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
 # ------------------------------------------------------------------ #
 #  Distributed environment (NCCL session-scoped)
@@ -84,6 +88,15 @@ def _world_size():
 
 def _device():
     return torch.device(f"cuda:{_rank() % torch.cuda.device_count()}")
+
+
+def _build_hsdp_mesh():
+    world_size = _world_size()
+    if world_size < 4 or world_size % 2 != 0:
+        pytest.skip("HSDP checkpoint coverage requires an even world size >= 4")
+
+    mesh = torch.arange(world_size, dtype=torch.int).reshape(2, world_size // 2)
+    return DeviceMesh(_device().type, mesh, mesh_dim_names=("dp_outer", "dp"))
 
 
 # ------------------------------------------------------------------ #
@@ -180,6 +193,12 @@ class MOETransformerLayer(nn.Module):
 # ------------------------------------------------------------------ #
 
 
+def _set_last_backward(model, is_last_backward: bool = True):
+    """Mark the next FSDP v2 backward as the optimizer-step boundary."""
+    if hasattr(model, "set_is_last_backward"):
+        model.set_is_last_backward(is_last_backward)
+
+
 def _forward_backward(model, x):
     """Run forward + backward and return loss."""
     out = model(x)
@@ -263,15 +282,16 @@ class TestFullyShardBasic:
         fully_shard(model, sharding_strategy="no_shard", enable_async_reduce_grad=False)
 
         x = torch.randn(2, 64, device=_device())
+        _set_last_backward(model)
         loss = _forward_backward(model, x)
         assert not torch.isnan(torch.tensor(loss)), "Loss is NaN"
         model.finish_grad_sync()
 
         for param_group in model._fsdp_param_groups:
             assert param_group.model_weight_buffer is not None
-            assert not param_group.model_weight_buffer.is_distributed
+            assert not param_group.model_weight_buffer.inner_sharded
             assert param_group.main_grad_buffer is not None
-            assert not param_group.main_grad_buffer.is_distributed
+            assert not param_group.main_grad_buffer.inner_sharded
             for dist_grad in param_group.dist_grads:
                 if dist_grad is None:
                     continue
@@ -985,3 +1005,114 @@ class TestCheckpoint:
 
         model_sd, opt_sd = get_state_dict(model, optimizer)
         assert len(model_sd) > 0
+
+    def test_get_state_dict_hsdp_outer_optim(self):
+        """HSDP outer-optim checkpoint state should survive a DCP roundtrip."""
+        from torch.distributed.tensor import DTensor
+        from torch.distributed.tensor.placement_types import Shard
+
+        def build_model_and_optimizer(seed):
+            torch.manual_seed(seed)
+            model = SimpleMLP(64).to(device)
+            fully_shard(
+                model,
+                mesh=mesh,
+                sharding_strategy="optim_grads_params",
+                outer_dp_sharding_strategy="optim",
+                mp_policy=MixedPrecisionPolicy(
+                    main_params_dtype=torch.float32,
+                    main_grads_dtype=torch.float32,
+                ),
+                enable_async_reduce_grad=False,
+            )
+            return model, torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+        def run_one_step(model, optimizer, seed):
+            torch.manual_seed(seed)
+            x = torch.randn(2, 64, device=device)
+            _set_last_backward(model)
+            loss = model(x).sum()
+            loss.backward()
+            model.finish_grad_sync()
+            optimizer.step()
+
+        def clone_dtensor_values(state_dict):
+            return {
+                name: value.to_local().detach().clone()
+                for name, value in state_dict.items()
+                if isinstance(value, DTensor)
+            }
+
+        def clone_optimizer_dtensor_values(state_dict):
+            values = {}
+            for name, state_tensors in state_dict.get("state", {}).items():
+                values[name] = {
+                    key: value.to_local().detach().clone()
+                    for key, value in state_tensors.items()
+                    if isinstance(value, DTensor) and value.to_local().dim() > 0
+                }
+            return {name: tensors for name, tensors in values.items() if tensors}
+
+        def assert_hsdp_dtensor_metadata(dtensor):
+            assert len(dtensor.placements) == 2
+            assert isinstance(dtensor.placements[0], Shard)
+            assert isinstance(dtensor.placements[1], Shard)
+            assert hasattr(dtensor._local_tensor, "__create_chunk_list__")
+            assert hasattr(dtensor._local_tensor, "__create_write_items__")
+
+        device = _device()
+        mesh = _build_hsdp_mesh()
+        model, optimizer = build_model_and_optimizer(seed=42)
+        run_one_step(model, optimizer, seed=43)
+
+        model_sd, opt_sd = get_state_dict(model, optimizer)
+        expected_model = clone_dtensor_values(model_sd)
+        expected_optim = clone_optimizer_dtensor_values(opt_sd)
+        assert expected_model, "HSDP model checkpoint should contain DTensor params"
+        assert expected_optim, "HSDP optimizer checkpoint should contain DTensor state"
+
+        for dtensor in (value for value in model_sd.values() if isinstance(value, DTensor)):
+            assert_hsdp_dtensor_metadata(dtensor)
+        for state_tensors in opt_sd.get("state", {}).values():
+            for value in state_tensors.values():
+                if isinstance(value, DTensor) and value.to_local().dim() > 0:
+                    assert_hsdp_dtensor_metadata(value)
+
+        ckpt_dir = Path(SHARED_TMP_DIR) / "test_get_state_dict_hsdp_outer_optim"
+        if _rank() == 0:
+            shutil.rmtree(ckpt_dir, ignore_errors=True)
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+        torch.distributed.barrier()
+
+        dcp.save({"model": model_sd, "optimizer": opt_sd}, checkpoint_id=str(ckpt_dir))
+        torch.distributed.barrier()
+
+        load_model, load_optimizer = build_model_and_optimizer(seed=123)
+        run_one_step(load_model, load_optimizer, seed=124)
+        load_model_sd, load_opt_sd = get_state_dict(load_model, load_optimizer)
+        dcp.load({"model": load_model_sd, "optimizer": load_opt_sd}, checkpoint_id=str(ckpt_dir))
+        torch_set_state_dict(
+            load_model,
+            load_optimizer,
+            model_state_dict=load_model_sd,
+            optim_state_dict=load_opt_sd,
+            options=StateDictOptions(strict=False),
+        )
+
+        loaded_model_sd, loaded_opt_sd = get_state_dict(load_model, load_optimizer)
+        loaded_model = clone_dtensor_values(loaded_model_sd)
+        loaded_optim = clone_optimizer_dtensor_values(loaded_opt_sd)
+
+        assert loaded_model.keys() == expected_model.keys()
+        for name, expected in expected_model.items():
+            assert torch.allclose(loaded_model[name], expected), name
+
+        assert loaded_optim.keys() == expected_optim.keys()
+        for name, expected_tensors in expected_optim.items():
+            assert loaded_optim[name].keys() == expected_tensors.keys()
+            for key, expected in expected_tensors.items():
+                assert torch.allclose(loaded_optim[name][key], expected), f"{name}.{key}"
+
+        if _rank() == 0:
+            shutil.rmtree(ckpt_dir, ignore_errors=True)
+        torch.distributed.barrier()

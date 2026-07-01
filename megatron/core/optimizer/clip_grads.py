@@ -179,6 +179,9 @@ def clip_grad_by_total_norm_fp32(
                 params.append(param)
                 grads.append(to_local_if_dtensor(param.grad).detach())
 
+    if not grads:
+        return
+
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')

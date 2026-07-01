@@ -96,12 +96,21 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
     return ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(local_shape))
 
 
-def update_uneven_dtensor_chunk_metadata(dtensor: DTensor, source: str = "init") -> dict:
+def update_uneven_dtensor_chunk_metadata(
+    dtensor: DTensor,
+    source: str = "init",
+    *,
+    chunk_metadata: Optional[tuple] = None,
+) -> None:
     """
     Update the DTensor's chunk metadata to handle uneven sharding.
     This function modifies the DTensor in-place to include chunk metadata
     and write items closures for saving and loading.
     """
+    if chunk_metadata is not None:
+        _set_chunk_metadata(dtensor, *chunk_metadata, source=source)
+        return
+
     # Get uneven chunk metadata for the DTensor
     # TODO: Optimize gather_and_compute_chunk_metadata synchronization:
     # 1. Add pre-check validation to verify tensor shape consistency
@@ -582,8 +591,8 @@ def make_uneven_dtensor(
     Args:
         local_tensor: Local shard tensor.
         shape: Global shape of the full DTensor.
-        dp_mesh: 1D device mesh.
-        placements: DTensor placements (e.g., [Shard(0)]).
+        dp_mesh: Device mesh.
+        placements: DTensor placements (e.g., [Shard(0)] or [Replicate(), Shard(0)]).
         post_process_uneven: If True, call ``update_uneven_dtensor_chunk_metadata``.
         copy_chunk_meta_from: If set, copy ``__create_chunk_list__`` /
             ``__create_write_items__`` from this DTensor.
@@ -591,7 +600,10 @@ def make_uneven_dtensor(
             are tuples of ints (one per dimension).  Sets chunk metadata
             closures without collectives.
     """
-    assert dp_mesh.ndim == 1, "Only 1D mesh is supported for now"
+    if len(placements) != dp_mesh.ndim:
+        raise ValueError(
+            f"Expected {dp_mesh.ndim} placements for DeviceMesh, got {len(placements)}."
+        )
     if local_tensor.numel() == 0:
         local_shape = (0,) + tuple(shape[1:]) if len(shape) > 1 else (0,)
         local_tensor = local_tensor.reshape(local_shape)
@@ -613,7 +625,11 @@ def make_uneven_dtensor(
         # existing uneven DTensor instead of recomputing it.
         copy_chunk_metadata(copy_chunk_meta_from, dtensor)
     elif chunk_metadata is not None:
-        _set_chunk_metadata(dtensor, *chunk_metadata, source="make_uneven")
+        update_uneven_dtensor_chunk_metadata(
+            dtensor,
+            source="make_uneven",
+            chunk_metadata=chunk_metadata,
+        )
     return dtensor
 
 

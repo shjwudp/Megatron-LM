@@ -25,8 +25,20 @@ def pretrain_forward_backward(
     *, model, data_iterator, sequence_length=128, micro_batch_size=2, num_micro_batches=1
 ):
     forward_backward_func = get_forward_backward_func()
+    microbatch_idx = 0
+
+    def forward_step_func(data_iterator, model, return_schedule_plan=False):
+        nonlocal microbatch_idx
+        is_last_backward = microbatch_idx % num_micro_batches == num_micro_batches - 1
+        if hasattr(model, "set_is_last_backward"):
+            model.set_is_last_backward(is_last_backward)
+        microbatch_idx += 1
+        return _forward_step_func(
+            data_iterator, model, return_schedule_plan=return_schedule_plan
+        )
+
     output = forward_backward_func(
-        forward_step_func=_forward_step_func,
+        forward_step_func=forward_step_func,
         data_iterator=data_iterator,
         model=model,
         num_microbatches=num_micro_batches,

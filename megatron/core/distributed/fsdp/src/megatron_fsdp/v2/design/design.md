@@ -609,11 +609,11 @@ def reduce_grad(self, grad_comm_dtype=None):
     sm = self.buffer_index.shard_meta
     local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
 
-    if not self.is_distributed and self.sharding_strategy == "no_shard":
+    if not self.inner_sharded and self.sharding_strategy == "no_shard":
         torch.distributed.all_reduce(self.data, group=self.dp_group)
         return
 
-    if self.is_distributed:
+    if self.inner_sharded:
         full_grad = self.fetch_unsharded_buffer()  # temporary full grad buffer
         input_buffer = full_grad
         output_offset = sm.bucket_data_index

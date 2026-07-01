@@ -244,11 +244,7 @@ def mfsdp_post_backward_hook(module: nn.Module):
             continue
         ctx.backward_done_modules.add(id(submodule))
         submodule.reshard()
-        if any(
-            param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
-            for param_group in submodule._fsdp_param_groups
-        ):
-            submodule.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+        submodule.reduce_grad(async_op=ctx.enable_async_reduce_grad)
         submodule.post_backward_issued = True
     ctx._advance_backward_module()
 
@@ -283,11 +279,7 @@ def mfsdp_post_backward_final_callback(root_module: nn.Module):
         if module.post_backward_issued:
             continue
         module.reshard()
-        if any(
-            param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
-            for param_group in module._fsdp_param_groups
-        ):
-            module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+        module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
 
     # ---- drain pending async reduce-grad events -----------------------
     stream = ctx.rs_stream

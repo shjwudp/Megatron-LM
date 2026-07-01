@@ -18,6 +18,7 @@ v2/
 ├── allocator.py                 # BucketAllocator (Temporary, StorageFreeing, TracePool)
 ├── mixed_precision.py           # MixedPrecisionPolicy, FP8Policy, NVFP4Policy
 ├── utils.py                     # Internal utilities (mesh init, backward Function)
+├── design/hsdp_design.md        # HSDP mesh, buffer layouts, and conversions
 ├── design.md                    # Overlap, memory, and synchronization design
 ├── nvfp4_design.md              # NVFP4 primary-weights design
 ├── mcore_fsdp_checkpoint_design.md  # Checkpoint save/load and format conversion design
@@ -190,12 +191,15 @@ strategy controls which buffers and communication collectives are used.
 
 ### Parallelism
 
-- **Tensor Parallelism (TP):** Not supported. v2 currently operates on a 1D
-  DP-only DeviceMesh. Parameters that are already partitioned by TP layers
-  (e.g., `ColumnParallelLinear`, `RowParallelLinear`) are not correctly handled.
+- **Tensor Parallelism (TP):** The FSDP DeviceMesh contains DP/EDP dimensions,
+  not a TP placement. Parameters that are already partitioned by TP layers
+  (e.g., `ColumnParallelLinear`, `RowParallelLinear`) are not represented with
+  TP-aware DTensor metadata.
   See [tp_support_design.md](tp_support_design.md) for the planned design.
-- **Hybrid Sharding (HSDP):** Not supported. v2 does not yet support an outer
-  DP dimension for hybrid (inter-node + intra-node) sharding.
+- **Hybrid Sharding (HSDP):** A 2D `(dp_outer, dp/edp)` mesh supports outer
+  replication and outer optimizer-state sharding. Outer `optim` currently
+  requires inner `optim_grads_params`; NVFP4 outer optimizer sharding is not
+  supported. See [design/hsdp_design.md](design/hsdp_design.md).
 
 ### Sharding Strategies
 
