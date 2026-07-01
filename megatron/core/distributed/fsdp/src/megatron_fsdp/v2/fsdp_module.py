@@ -761,6 +761,7 @@ class FSDPModule:
             if module is self:
                 break
 
+    @torch.compiler.disable
     def reduce_grad(self, async_op: bool = False):
         """
         Reduce gradients across data-parallel ranks.

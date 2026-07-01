@@ -87,8 +87,8 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
     if target._fsdp_state._is_root:
         if ctx.enable_cuda_graph and ctx.cuda_graph_stream is None:
             ctx.cuda_graph_stream = torch.cuda.Stream()
-            torch.cuda.set_stream(ctx.cuda_graph_stream)
-            ctx.cuda_graph_pool = torch.cuda.graph_pool_handle()
+            with torch.cuda.stream(ctx.cuda_graph_stream):
+                ctx.cuda_graph_pool = torch.cuda.graph_pool_handle()
         ctx.forward_phase = True
         ctx.backward_phase = False
 

@@ -28,6 +28,7 @@ orchestrates:
      ``capture_time_hooks`` that perform unshard / reshard.
 """  # noqa: E501
 
+from contextlib import nullcontext
 import inspect
 import logging
 import os
@@ -312,15 +313,24 @@ class CudaGraphRunner:
             torch.cuda.reset_peak_memory_stats()
             _mem_before = _mem_snapshot()
 
-            graphed = make_graphed_callables(
-                tuple(modules),
-                tuple(sample_args_list),
-                num_warmup_iters=self._num_warmup,
-                sample_kwargs=tuple(sample_kwargs_list),
-                pool=self._graph_pool,
-                capture_time_hooks=capture_hooks,
-                capture_stream=capture_stream,
+            # Temporarily set the capture stream as default so that
+            # module ops (which use torch.cuda.current_stream()) are
+            # captured on the same stream as the CUDA graph.
+            _stream_ctx = (
+                torch.cuda.stream(capture_stream)
+                if capture_stream is not None
+                else nullcontext()
             )
+            with _stream_ctx:
+                graphed = make_graphed_callables(
+                    tuple(modules),
+                    tuple(sample_args_list),
+                    num_warmup_iters=self._num_warmup,
+                    sample_kwargs=tuple(sample_kwargs_list),
+                    pool=self._graph_pool,
+                    capture_time_hooks=capture_hooks,
+                    capture_stream=capture_stream,
+                )
         except Exception:
             _restore_compiled_modules_after_capture_failure(compiled_module_state)
             raise
