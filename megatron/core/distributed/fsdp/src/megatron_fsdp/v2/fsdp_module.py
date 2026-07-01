@@ -530,13 +530,10 @@ class FSDPModule:
             meta_params = [
                 n for n, p in m.named_parameters() if p.is_meta
             ]
-            if meta_params and torch.distributed.get_rank() == 0:
-                logger.warning(
-                    "Module still has %d meta parameter(s) before .to(%s): %s",
-                    len(meta_params),
-                    materialization_device,
-                    meta_params,
-                )
+            assert not meta_params, (
+                f"Module still has {len(meta_params)} meta parameter(s) "
+                f"before .to({materialization_device}): {meta_params}"
+            )
             m.to(materialization_device)
 
         if mesh is not None and mesh.size() > 1:
