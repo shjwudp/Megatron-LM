@@ -531,7 +531,7 @@ class FSDPModule:
                 n for n, p in m.named_parameters() if p.is_meta
             ]
             assert not meta_params, (
-                f"Module still has {len(meta_params)} meta parameter(s) "
+                f"Module '{name}' still has {len(meta_params)} meta parameter(s) "
                 f"before .to({materialization_device}): {meta_params}"
             )
             m.to(materialization_device)
