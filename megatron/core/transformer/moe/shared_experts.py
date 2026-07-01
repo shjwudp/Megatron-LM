@@ -200,10 +200,12 @@ class SharedExpertMLP(MLP):
 
         if self.use_shared_expert_gate and self.gate_weight is not None:
             if self.gate_weight.is_meta:
-                self.gate_weight.data = torch.empty(
-                    self.gate_weight.shape,
-                    dtype=self.config.params_dtype,
-                    device=torch.cuda.current_device(),
+                self.gate_weight = torch.nn.Parameter(
+                    torch.empty(
+                        self.gate_weight.shape,
+                        dtype=self.config.params_dtype,
+                        device=torch.cuda.current_device(),
+                    )
                 )
             if self.config.perform_initialization:
                 self.config.init_method(self.gate_weight)
