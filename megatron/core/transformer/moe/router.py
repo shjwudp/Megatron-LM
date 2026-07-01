@@ -74,14 +74,6 @@ class Router(MegatronModule):
 
     def reset_parameters(self):
         """Reset the router parameters."""
-        if self.weight.is_meta:
-            self.weight = torch.nn.Parameter(
-                torch.empty(self.weight.shape, device=torch.cuda.current_device())
-            )
-        if self.bias is not None and self.bias.is_meta:
-            self.bias = torch.nn.Parameter(
-                torch.empty(self.bias.shape, device=torch.cuda.current_device())
-            )
         if self.config.perform_initialization:
             self.config.init_method(self.weight)
             if self.bias is not None:

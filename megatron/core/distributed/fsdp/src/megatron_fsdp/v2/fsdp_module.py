@@ -505,6 +505,14 @@ class FSDPModule:
             if all(not p.is_meta for p in m.parameters(recurse=False)):
                 continue
 
+            m._apply(
+                lambda t: (
+                    torch.empty_like(t, device=materialization_device)
+                    if t.is_meta
+                    else t
+                ),
+                recurse=False,
+            )
             init_context = (
                 mp_policy.model_init_context(m)
                 if mp_policy is not None
@@ -522,7 +530,7 @@ class FSDPModule:
 
             # Move materialized parameters to the same target device (e.g., GPU)
             meta_params = [
-                n for n, p in m.named_parameters() if p.is_meta
+                n for n, p in m.named_parameters(recurse=False) if p.is_meta
             ]
             assert not meta_params, (
                 f"Module '{name}' still has {len(meta_params)} meta parameter(s) "
