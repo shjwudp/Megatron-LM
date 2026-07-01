@@ -7,15 +7,16 @@ import torch
 from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
-from megatron.core.distributed.distributed_data_parallel_config import (
-    DistributedDataParallelConfig,
-)
+from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import _init_dp_mesh
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
     HAVE_TE_NVFP4,
     HAVE_TE_NVFP4_RECIPE,
+    MixedPrecisionPolicy,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.distributed.megatron_fsdp.utils import (
@@ -41,6 +42,29 @@ def ref_cache():
 
 
 class TestMegatronFSDPE2E:
+
+    @staticmethod
+    def _make_edp1_gradient_param_group(gradient_scaling_factor):
+        required_pgs = ["tp", "expt_tp", "ep", "dp_cp", "expt_dp"]
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=required_pgs
+        )
+        edp_mesh = _init_dp_mesh(
+            pg_collection, DistributedDataParallelConfig(), edp=True
+        )
+        assert edp_mesh.size(0) == 1
+        assert edp_mesh.size(1) == 1
+
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        param = torch.nn.Parameter(torch.ones(16, dtype=torch.bfloat16, device=device))
+        return ParameterGroup(
+            params=[param],
+            param_group_id=ParamGroupIdx(0, 0),
+            mp_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
+            mesh=edp_mesh,
+            sharding_strategy="optim_grads_params",
+            gradient_scaling_factor=gradient_scaling_factor,
+        )
 
     @pytest.mark.parametrize("outer_dp_size", [1, 2])
     def test_dp_mesh_flatten_groups_reuse_full_dp_groups(self, outer_dp_size):
@@ -73,6 +97,37 @@ class TestMegatronFSDPE2E:
                 for _ in range(2):
                     flatten_group = mesh._flatten(flatten_name).get_group()
                     assert flatten_group.group_name == expected_group.group_name
+        finally:
+            Utils.destroy_model_parallel()
+
+    def test_edp1_singleton_inner_reduce_scales_gradient(self):
+        if Utils.world_size < 2:
+            pytest.skip("EDP=1 coverage requires at least two ranks for EP partitioning")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=Utils.world_size,
+            expert_tensor_parallel_size=1,
+        )
+        try:
+            param_group = self._make_edp1_gradient_param_group(
+                gradient_scaling_factor=0.25
+            )
+            grad_buffer = param_group.main_grad_buffer
+            assert grad_buffer is not None
+            param_group._init_dist_grads()
+            grad_buffer.data.zero_()
+            full_grad = grad_buffer.fetch_buffer((0, 0))
+            assert full_grad.data_ptr() != grad_buffer.data.data_ptr()
+            full_grad.fill_(8.0)
+
+            grad_buffer.reduce_grad(
+                overwrite_grad=True, reduce_dim=1, reduce_scatter=True
+            )
+
+            assert torch.equal(grad_buffer.data, torch.full_like(grad_buffer.data, 2.0))
+            grad_buffer.reshard()
         finally:
             Utils.destroy_model_parallel()
 

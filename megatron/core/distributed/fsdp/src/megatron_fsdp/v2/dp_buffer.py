@@ -526,6 +526,10 @@ class DataParallelBuffer:
         # Pick the process group covering exactly the reduced dimension.
         group = self.outer_dp_group if reduce_dim == 0 else self.dp_group
         if torch.distributed.get_world_size(group) == 1:
+            # A singleton inner-DP group bypasses both NCCL premul-sum and the
+            # BF16 prescale path above, so apply its scaling locally.
+            if reduce_dim == 1 and self.gradient_scaling_factor not in (None, 1.0):
+                input_buffer.mul_(self.gradient_scaling_factor)
             if output_buffer.data_ptr() != input_buffer.data_ptr():
                 output_buffer.copy_(input_buffer)
             return
