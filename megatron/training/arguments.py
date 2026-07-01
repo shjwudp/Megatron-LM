@@ -1233,6 +1233,14 @@ def validate_args(args, defaults={}):
                 "--inference-dynamic-batching-sampling-backend=torch."
             ) from e
 
+    if getattr(args, 'use_megatron_fsdp_v2', False):
+        args.use_megatron_fsdp = True
+
+    if getattr(args, 'mfsdp_cuda_graph_modules', None):
+        assert getattr(args, 'use_megatron_fsdp_v2', False), (
+            "--mfsdp-cuda-graph requires --use-megatron-fsdp-v2"
+        )
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -4006,6 +4014,31 @@ def _add_distributed_args(parser):
         default=False,
         help='Disable symmetric (window) registration for NCCL userbuffer registration.'
         'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.',
+    )
+    group.add_argument(
+        '--use-megatron-fsdp',
+        action='store_true',
+        dest='use_megatron_fsdp',
+        help='Use Megatron FSDP implementation for data-parallel sharding.',
+    )
+    group.add_argument(
+        '--use-megatron-fsdp-v2',
+        action='store_true',
+        dest='use_megatron_fsdp_v2',
+        help='Use PyTorch fully shard API for FSDP implementation. '
+        'This option is only effective when use-megatron-fsdp is set. ',
+    )
+    group.add_argument(
+        '--mfsdp-cuda-graph',
+        nargs='+',
+        default=[],
+        choices=['mamba', 'transformer', 'moe_router', 'attn'],
+        dest='mfsdp_cuda_graph_modules',
+        help='Enable CUDA graph capture on specific FSDP module types '
+        'when using Megatron FSDP v2 (--use-megatron-fsdp-v2). '
+        'Choices: mamba (MambaLayer), transformer (TransformerLayer). '
+        'Can be combined, e.g. --mfsdp-cuda-graph mamba transformer. '
+        'Only non-nested (leaf) FSDP modules are eligible.',
     )
     group.add_argument(
         '--fsdp-manual-registration',
