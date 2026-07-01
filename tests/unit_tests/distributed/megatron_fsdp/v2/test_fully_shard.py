@@ -639,6 +639,85 @@ class TestLifecycle:
                 event.synchronize()
                 pending_group.release_grad_buffer()
 
+    def test_async_singleton_consumes_grad_added_before_skipped_microbatch(self):
+        """A fused-wgrad marker from one microbatch must not poison a skipped one."""
+        torch.manual_seed(42)
+        world_size = _world_size()
+        mesh = DeviceMesh(
+            _device().type,
+            torch.arange(world_size, dtype=torch.int).reshape(world_size, 1),
+            mesh_dim_names=("dp_outer", "dp"),
+        )
+        model = SimpleMLP(64).to(_device())
+        fully_shard(
+            model,
+            mesh=mesh,
+            sharding_strategy="optim_grads_params",
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=True,
+        )
+
+        param_group = model._fsdp_param_groups[0]
+        grad_buffer = param_group.main_grad_buffer
+        assert grad_buffer is not None
+        assert grad_buffer.dp_group.size() == 1
+        assert grad_buffer.inner_sharded
+        param_group._init_dist_grads()
+        param = param_group.params[0]
+        item_id = param_group.param_idx[param]
+        ctx = model._fsdp_root_context
+
+        def drain_pending():
+            pending = ctx.reduce_grad_buckets[id(model)]
+            while pending:
+                event, pending_group = pending.pop()
+                event.synchronize()
+                pending_group.release_grad_buffer()
+
+        try:
+            # Microbatch 1 contributes a valid fused wgrad.
+            first_main_grad = param.get_main_grad()
+            first_main_grad.fill_(2.0)
+            param.main_grad = first_main_grad
+            param.grad_added_to_main_grad = True
+            param._mfsdp_recorded_te_wgrad = False
+            assert param.grad is None
+            assert param_group._grad_buffer_is_fresh
+
+            model.reduce_grad(async_op=True)
+            model.finish_grad_sync()
+            torch.cuda.current_stream().synchronize()
+
+            optimizer_grad = param_group.dist_params[item_id].grad
+            assert optimizer_grad is not None
+            torch.testing.assert_close(
+                optimizer_grad._local_tensor,
+                torch.full_like(optimizer_grad._local_tensor, 2.0),
+            )
+            assert param.grad_added_to_main_grad is False
+            drain_pending()
+            assert not hasattr(param, "main_grad")
+
+            # Microbatch 2 skips this parameter. Dirty scratch storage must not
+            # be interpreted as another fused wgrad when pre-backward did not run.
+            stale_main_grad = param.get_main_grad()
+            stale_main_grad.fill_(123.0)
+            assert not hasattr(param, "main_grad")
+            assert param.grad is None
+
+            model.reduce_grad(async_op=True)
+            model.finish_grad_sync()
+            torch.cuda.current_stream().synchronize()
+
+            optimizer_grad = param_group.dist_params[item_id].grad
+            assert optimizer_grad is not None
+            torch.testing.assert_close(
+                optimizer_grad._local_tensor,
+                torch.full_like(optimizer_grad._local_tensor, 2.0),
+            )
+        finally:
+            drain_pending()
+
     def test_params_unsharded_during_forward(self):
         """During forward, model parameters should be in unsharded state (full tensors)."""
         torch.manual_seed(42)

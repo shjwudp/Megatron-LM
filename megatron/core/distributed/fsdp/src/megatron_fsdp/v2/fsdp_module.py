@@ -825,6 +825,10 @@ class FSDPModule:
                     else:
                         main_grad.copy_(param.grad.detach())
                     del param.grad
+                # Consume this per-backward marker here. A skipped module may not run
+                # _pre_backward_setup on the next microbatch, so leaving it set would
+                # make stale scratch storage look like a fused wgrad.
+                param.grad_added_to_main_grad = False
             if grad_replicated:
                 param_group._grad_buffer_is_fresh = False
 
