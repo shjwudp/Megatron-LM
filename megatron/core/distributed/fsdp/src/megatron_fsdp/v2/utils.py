@@ -18,7 +18,7 @@ from typing import Callable
 import torch
 import torch.nn as nn
 from torch.distributed import distributed_c10d
-from torch.distributed.tensor import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh
 
 
 @dataclass(frozen=True, slots=True)

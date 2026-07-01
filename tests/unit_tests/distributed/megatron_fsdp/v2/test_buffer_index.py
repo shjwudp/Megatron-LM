@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from torch.distributed.tensor import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import BufferIndex

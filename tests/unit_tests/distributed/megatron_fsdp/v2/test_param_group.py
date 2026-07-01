@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy

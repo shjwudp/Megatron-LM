@@ -17,7 +17,7 @@ from collections import namedtuple
 from typing import Dict, Iterable, List, Tuple
 
 import torch
-from torch.distributed.tensor import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh
 
 from .utils import ParamGroupIdx
 

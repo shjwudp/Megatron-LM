@@ -48,7 +48,7 @@ import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import StateDictOptions
 from torch.distributed.checkpoint.state_dict import get_state_dict as torch_get_state_dict
 from torch.distributed.checkpoint.state_dict import set_state_dict as torch_set_state_dict
-from torch.distributed.tensor import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (

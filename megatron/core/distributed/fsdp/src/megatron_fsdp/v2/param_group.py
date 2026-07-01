@@ -24,7 +24,7 @@ import math
 from typing import Dict, List, Optional
 
 import torch
-from torch.distributed.tensor import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from ..uneven_dtensor import make_uneven_dtensor, update_uneven_dtensor_chunk_metadata

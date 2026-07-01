@@ -16,7 +16,7 @@ import logging
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
-from torch.distributed.tensor import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh
 
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .buffer_index import BufferIndex
