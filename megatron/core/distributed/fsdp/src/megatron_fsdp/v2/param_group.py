@@ -352,6 +352,11 @@ class ParameterGroup:
         """
         self.dist_params = []
         self.dist_grads = []  # placeholder, populated in _init_dist_grads
+        # Gradient DTensors are recreated whenever zero_grad(set_to_none=True)
+        # releases the backing buffer. Their shard layout is static, so retain
+        # only the local chunk coordinates and avoid repeating metadata
+        # collectives on every rebuild.
+        self._dist_grad_chunk_metadata: List[Optional[tuple]] = [None for _ in self.params]
         s = self.sharding_strategy
 
         is_param_shard = s == "optim_grads_params"
@@ -447,19 +452,28 @@ class ParameterGroup:
             shard_layout = (1, 1) if is_outer_optim_shard else (0, 1) if is_grad_shard else (0, 0)
             grad_data = gbuf.get_item(item_id, shard_layout=shard_layout)
             if p.requires_grad:
+                chunk_metadata = self._dist_grad_chunk_metadata[item_id]
                 grad_dtensor = make_uneven_dtensor(
                     grad_data,
                     p.shape,
                     self.mesh,
                     placements,
-                    post_process_uneven=True,
+                    post_process_uneven=chunk_metadata is None,
+                    chunk_metadata=chunk_metadata,
                 )
+                if chunk_metadata is None:
+                    local_chunk = grad_dtensor._local_tensor.__create_chunk_list__()[0]
+                    self._dist_grad_chunk_metadata[item_id] = (
+                        tuple(local_chunk.offsets),
+                        tuple(local_chunk.sizes),
+                    )
                 # NOTE: Do not materialize empty local grad shards in self.dist_grads.
                 # Empty shards are semantically no-ops, but passing zero-numel DTensor
                 # grads into fused multi-tensor optimizers such as TE FusedAdam can
-                # break updates for neighboring non-empty shards.  We still construct
-                # grad_dtensor above so every rank enters the metadata collective in
-                # the same parameter order.
+                # break updates for neighboring non-empty shards. We still construct
+                # grad_dtensor above so the first initialization enters the metadata
+                # collective in the same parameter order and caches the empty shard
+                # before discarding its DTensor.
                 self.dist_grads.append(grad_dtensor if grad_data.numel() > 0 else None)
             else:
                 self.dist_grads.append(None)
