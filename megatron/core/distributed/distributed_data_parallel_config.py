@@ -99,6 +99,10 @@ class DistributedDataParallelConfig:
     ``'transformer'`` (TransformerLayer).  Example: ``['mamba', 'transformer']``.
     Only leaf FSDP modules (without FSDP children) are eligible."""
 
+    fsdp_trace_pool: bool = False
+    """If true, use TracePoolAllocator for stable buffer addresses (required for
+    MFSDP v2 CUDA graph capture)."""
+
     use_custom_fsdp: bool = False
     """
     NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
