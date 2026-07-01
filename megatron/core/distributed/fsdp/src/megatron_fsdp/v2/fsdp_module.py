@@ -498,19 +498,13 @@ class FSDPModule:
         before DTensor wrapping so every rank shards the same initialized value.
         """
         materialization_device = torch.cuda.current_device()
-        for name, m in self.named_modules():
+        for name, m in reversed(list(self.named_modules())):
             if m in ignored_modules:
                 continue
             # Skip modules that don't have meta parameters
             if all(not p.is_meta for p in m.parameters(recurse=False)):
                 continue
 
-            m._apply(
-                lambda t: torch.empty_like(t, device=materialization_device)
-                if t.is_meta
-                else t,
-                recurse=False,
-            )
             init_context = (
                 mp_policy.model_init_context(m)
                 if mp_policy is not None
