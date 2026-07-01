@@ -4016,12 +4016,6 @@ def _add_distributed_args(parser):
         'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.',
     )
     group.add_argument(
-        '--use-megatron-fsdp',
-        action='store_true',
-        dest='use_megatron_fsdp',
-        help='Use Megatron FSDP implementation for data-parallel sharding.',
-    )
-    group.add_argument(
         '--use-megatron-fsdp-v2',
         action='store_true',
         dest='use_megatron_fsdp_v2',
