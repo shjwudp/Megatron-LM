@@ -803,13 +803,14 @@ class FSDPModule:
             # the Python-side ``setattr(param, "grad_added_to_main_grad", True)`` that
             # accompanies the eager backward is captured away.  We record the per-param
             # flag during the trace micro-batch and restore it here.
-            grad_replicated = param_group.sharding_strategy in ("no_shard", "optim")
-            add_to_main_grad = (
-                grad_replicated and not param_group._grad_buffer_is_fresh
-            )
+            zero_targets = []
+            copy_srcs = []
+            copy_dsts = []
+
             for name, param in zip(param_names, param_group.params):
                 grad_added = getattr(param, "grad_added_to_main_grad", False)
                 recorded = getattr(param, "_mfsdp_recorded_te_wgrad", False)
+
                 if grad_added or recorded:
                     if param.grad is not None:
                         del param.grad
@@ -822,23 +823,24 @@ class FSDPModule:
                     if grad_added and self._fsdp_state.enable_cuda_graph:
                         setattr(param, "_mfsdp_recorded_te_wgrad", True)
                 elif param.grad is None:
-                    if not add_to_main_grad:
-                        main_grad = param.get_main_grad()
-                        param_main_grad = getattr(param, "main_grad", None)
-                        if (
-                            param_main_grad is None
-                            or param_main_grad.data_ptr() != main_grad.data_ptr()
-                        ):
-                            main_grad.zero_()
+                    main_grad = param.get_main_grad()
+                    param_main_grad = getattr(param, "main_grad", None)
+                    if (
+                        param_main_grad is None
+                        or param_main_grad.data_ptr() != main_grad.data_ptr()
+                    ):
+                        zero_targets.append(main_grad.view(-1))
                 else:
                     main_grad = param.get_main_grad()
-                    if add_to_main_grad:
-                        main_grad.add_(param.grad.detach())
-                    else:
-                        main_grad.copy_(param.grad.detach())
+                    copy_srcs.append(param.grad.detach().view(-1))
+                    copy_dsts.append(main_grad.view(-1))
                     del param.grad
-            if grad_replicated:
-                param_group._grad_buffer_is_fresh = False
+
+            # 2 kernel launches total (instead of N)
+            if zero_targets:
+                torch._foreach_zero_(zero_targets)
+            if copy_dsts:
+                torch._foreach_copy_(copy_dsts, copy_srcs)
 
             if async_op:
                 # ---- Overlapped path ----
