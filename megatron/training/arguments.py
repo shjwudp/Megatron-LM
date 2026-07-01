@@ -4090,6 +4090,13 @@ def _add_distributed_args(parser):
         "This is required for user buffer registration and is enabled by default when using NCCL user buffers.",
     )
     group.add_argument(
+        '--fsdp-trace-pool',
+        action='store_true',
+        help="Use TracePoolAllocator for stable buffer addresses during Megatron FSDP. "
+        "Enables CUDA graph capture and avoids re-allocating communication buffers. "
+        "Automatically enabled when --fsdp-double-buffer is set.",
+    )
+    group.add_argument(
         '--suggested-communication-unit-size',
         type=int,
         default=None,
