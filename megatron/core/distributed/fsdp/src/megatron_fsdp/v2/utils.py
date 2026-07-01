@@ -82,7 +82,7 @@ def _prepare_fsdp_mesh(mesh: DeviceMesh) -> DeviceMesh:
     outer_dim_name = "dp_outer" if inner_dim_name != "dp_outer" else "outer"
     return DeviceMesh(
         mesh.device_type,
-        mesh.mesh.reshape(1, -1),
+        mesh.mesh.reshape(-1, 1),
         mesh_dim_names=(outer_dim_name, inner_dim_name),
     )
 

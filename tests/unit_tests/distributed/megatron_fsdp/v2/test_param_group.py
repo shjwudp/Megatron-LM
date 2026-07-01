@@ -86,7 +86,7 @@ def _build_groups(strategy, mesh=None, mp_policy=None, outer_dp_sharding_strateg
     if mesh is None:
         from torch.distributed.device_mesh import init_device_mesh
         ws = torch.distributed.get_world_size()
-        mesh = init_device_mesh(device.type, (1, ws),
+        mesh = init_device_mesh(device.type, (ws, 1),
                                 mesh_dim_names=("dp_outer", "dp"))
     dp_group = mesh.get_group(mesh_dim="dp")
 

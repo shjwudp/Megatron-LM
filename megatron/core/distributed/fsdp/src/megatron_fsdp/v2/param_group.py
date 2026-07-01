@@ -78,7 +78,7 @@ class ParameterGroup:
         if mesh is None:
             world_ranks = torch.arange(
                 torch.distributed.get_world_size(torch.distributed.group.WORLD)
-            ).reshape(1, -1)
+            ).reshape(-1, 1)
             mesh = DeviceMesh(
                 self.device.type,
                 world_ranks,
