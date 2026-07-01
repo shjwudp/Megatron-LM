@@ -502,7 +502,8 @@ class FSDPModule:
         for name, m in self.named_modules():
             if m in ignored_modules:
                 continue
-            # Skip modules that don't have meta parameters
+            # Match v1 meta init: reset modules that own meta parameters. Buffer-only
+            # meta modules may intentionally keep lazy state initialized in forward.
             if all(not p.is_meta for p in m.parameters(recurse=False)):
                 continue
 
@@ -527,8 +528,9 @@ class FSDPModule:
                         f"Module {name} contains meta parameters but cannot reset them"
                     )
 
-            # Move materialized parameters to the same target device (e.g., GPU)
-            m.to(materialization_device)
+            # Move only this module's direct tensors. named_modules() visits each child
+            # separately, so it is moved only after its own materialization and reset.
+            m._apply(lambda t: t.to(materialization_device), recurse=False)
 
         if mesh is not None and mesh.size() > 1:
             for param in self.parameters():
