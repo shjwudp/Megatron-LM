@@ -868,7 +868,9 @@ def _make_graphed_callables(
 
     def _run_warmup_backward(func_idx, func, outputs, warmup_iter, callable_idx) -> None:
         static_input_surface = per_callable_static_input_surfaces[func_idx]
-        inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
+        inputs = tuple(
+            i for i in static_input_surface if isinstance(i, torch.Tensor) and i.requires_grad
+        )
         outputs_requiring_grad = tuple(o for o in outputs if o is not None and o.requires_grad)
         grad_outputs = _make_grad_outputs(outputs)
 
@@ -1148,7 +1150,11 @@ def _make_graphed_callables(
                             func,
                             static_grad_outputs,
                         )
-                        inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
+                        inputs = tuple(
+                            i
+                            for i in static_input_surface
+                            if isinstance(i, torch.Tensor) and i.requires_grad
+                        )
                         with _none_grad_context_wrapper(inputs), _graph_context_wrapper(
                             bwd_graph, pool=mempool, stream=capture_stream
                         ):
@@ -1272,7 +1278,11 @@ def _make_graphed_callables(
             if is_training:
                 func = graph_callables[bwd_idx]
                 _call_capture_time_backward_pre_hooks(bwd_idx, func, static_grad_outputs)
-                inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
+                inputs = tuple(
+                    i
+                    for i in static_input_surface
+                    if isinstance(i, torch.Tensor) and i.requires_grad
+                )
                 with _none_grad_context_wrapper(inputs), _graph_context_wrapper(
                     bwd_graph, pool=mempool
                 ):
@@ -1457,23 +1467,25 @@ def _make_graphed_callables(
                 user_kwargs.pop("cuda_graph_event")
             else:
                 cuda_graph_event = None
+            # Check that required kwargs are provided
+            for key in kwargs_keys:
+                if key not in user_kwargs:
+                    raise TypeError(
+                        f"Graphed callable was initialized with kwarg {key} ,"
+                        "but it was not provided in graph replay"
+                    )
+
             # Runs the autograd function with inputs == all inputs to
             # the graph that might require grad (explicit user args +
             # module parameters)
             # Assumes module params didn't change since capture.
-            # Reconstruct the same flattened arg order as capture time.
-            # User may pass some recorded kwargs as positional args, so
-            # check user_args first (by position), then user_kwargs.
-            user_pos_args = list(user_args)
-            kwarg_values = []
-            for key in kwargs_keys:
-                if key in user_kwargs:
-                    kwarg_values.append(user_kwargs[key])
-                elif user_pos_args:
-                    kwarg_values.append(user_pos_args.pop(0))
-                # else: key was a default not passed — skip (not a tensor)
+            # Reconstruct the same flattened arg order as capture time:
+            # the explicit positional user args followed by the captured
+            # kwarg values in the order recorded at capture.
+            flatten_user_args, _ = _tree_flatten(user_args)
+            kwarg_values = [user_kwargs[key] for key in kwargs_keys]
             flatten_user_kwargs, _ = _tree_flatten(kwarg_values)
-            func_args = tuple(flatten_user_kwargs) + module_params
+            func_args = tuple(flatten_user_args) + tuple(flatten_user_kwargs) + module_params
             out = Graphed.apply(
                 skip_fp8_weight_update, cuda_graph_stream, cuda_graph_event, *func_args
             )
