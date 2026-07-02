@@ -142,7 +142,7 @@ def build_fsdp_model(
     n_layers: int,
     use_megatron_fsdp: bool,
     use_activation_checkpointing: bool = False,
-    enable_cuda_graph: bool = True,
+    enable_cuda_graph: bool = False,
     enable_trace_pool: bool = False,
 ) -> Tuple["FSDPModule", torch.distributed.device_mesh.DeviceMesh]:
     if use_megatron_fsdp:
@@ -342,13 +342,13 @@ def train(
             if step % args.log_interval == 0 and rank == 0:
                 t_now = time.time()
                 elapsed = t_now - t_start
-                it_s = elapsed / max(step - start_step + 1, 1)
+                s_per_step = elapsed / max(step - start_step + 1, 1)
                 alloc = _fmt_bytes(torch.cuda.memory_allocated())
                 max_reserved = _fmt_bytes(torch.cuda.max_memory_reserved())
                 print(
                     f"[rank0] epoch={epoch} step={step} loss={global_loss:.4e} "
                     f"alloc={alloc} max_reserved={max_reserved} "
-                    f"it={elapsed:.1f}s ({it_s * 1000:.0f}ms/it)"
+                    f"elapsed={elapsed:.1f}s ({s_per_step * 1000:.0f}ms/step)"
                 )
 
             if args.ckpt_dir and step % args.ckpt_interval == 0 and step > 0:
@@ -395,8 +395,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=5)
     parser.add_argument("--use-megatron-fsdp", action="store_true", help="Use Megatron-FSDP instead of PyTorch FSDP2")
     parser.add_argument("--activation-checkpoint", action="store_true", help="Enable activation checkpointing on transformer layers")
-    parser.add_argument("--no-cuda-graph", action="store_false", dest="cuda_graph",
-                        default=True, help="Disable CUDA graph capture")
+    parser.add_argument("--cuda-graph", action="store_true", default=False,
+                        help="Enable CUDA graph capture (Megatron-FSDP only). Off by default "
+                        "to keep the Megatron-FSDP and PyTorch FSDP2 paths aligned.")
     parser.add_argument("--use-trace-pool", action="store_true", default=False,
                         help="Use TracePoolAllocator for stable buffer addresses")
     parser.add_argument("--release-memory-pool", action="store_true", default=False,
