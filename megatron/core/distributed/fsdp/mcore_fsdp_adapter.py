@@ -319,8 +319,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "skip_backward_callback": config.delay_wgrad_compute,
             "skip_final_backward_callback": config.overlap_moe_expert_parallel_comm,
         }
-        if ddp_config.use_megatron_fsdp:
-            kwargs["enable_full_iteration_cuda_graph"] = config.cuda_graph_impl == "full_iteration"
+        kwargs["enable_full_iteration_cuda_graph"] = config.cuda_graph_impl == "full_iteration"
         if config.calculate_per_token_loss:
             gradient_scaling_factor = None
             expert_gradient_scaling_factor = None
@@ -341,7 +340,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         # can reuse those slots across their non-overlapping lifetimes. Their
         # native wgrads are not delayed, so normal post-backward hooks are safe.
         if (
-            ddp_config.use_megatron_fsdp
+            config.cuda_graph_impl == "full_iteration"
             and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
         ):
             standalone_kwargs = dict(kwargs)

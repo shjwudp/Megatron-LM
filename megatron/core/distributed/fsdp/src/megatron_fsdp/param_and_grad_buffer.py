@@ -3921,13 +3921,12 @@ class AllGatherPipeline:
         """Return the number of buckets."""
         return self.buffer.num_buckets
 
-    def reset(self, preserve_non_fsdp_units: bool = True):
+    def reset(self, preserve_non_fsdp_units: bool = False):
         """Reset the pipeline state.
 
-        Non-FSDP-unit buckets are preserved by default because their params may
-        be read across module boundaries. Setting preserve_non_fsdp_units=False
-        releases all bucket storage and is intended only for debugging when the
-        model will not be reused.
+        Non-FSDP-unit buckets may be preserved for CUDA Graph replay because
+        their params can be read across module boundaries. The default retains
+        the legacy behavior and releases every bucket.
         """
         if len(self.param_gather_event_map) > 0:
             warnings.warn(

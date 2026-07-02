@@ -187,14 +187,16 @@ After the first call, `_init_dist_grads()` is a no-op. Subsequent calls just
 do the reduce as before. `overwrite_grad=False` ensures proper accumulation
 across micro-batches.
 
-FP8 ZeRO-3 support groups containing bounded normalization parameters and an
-optional bounded router are a narrow exception to the usual per-micro-batch
-reduce-scatter schedule. Their temporary full grad buffer is zeroed before the
-first backward, accumulates local gradients across micro-batches, and is
-reduce-scattered once by `finish_grad_sync()`. The persistent optimizer-facing
-shard remains lazy and `_grad_buffer_is_fresh` still makes that one
-reduce-scatter overwrite stale shard storage. Their small replicated
-compute-weight buffer is independent of this lazy-gradient lifecycle.
+In full-iteration CUDA graph mode, FP8 ZeRO-3 support groups containing bounded
+normalization parameters and an optional bounded router are a narrow exception
+to the usual per-micro-batch reduce-scatter schedule. Their temporary full grad
+buffer is zeroed before the first backward, accumulates local gradients across
+micro-batches, and is reduce-scattered once by `finish_grad_sync()`. The
+persistent optimizer-facing shard remains lazy and `_grad_buffer_is_fresh`
+still makes that one reduce-scatter overwrite stale shard storage. Their small
+replicated compute-weight buffer is independent of this lazy-gradient
+lifecycle. Eager and per-module CUDA graph modes retain the existing
+per-micro-batch synchronization behavior.
 
 ### Full-iteration CUDA graph
 

@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -1119,11 +1118,7 @@ class _HybridEPManager(_DispatchManager):
             # Use a static budget even when rank capacity factor is unset, so the dispatch
             # buffer shape is graph-stable without depending on capacity-factor mode.
             pad_multiple = get_align_size_for_quantization(self.config)
-            budget_factor = float(
-                os.environ.get("MCORE_HYBRIDEP_FULLCG_STATIC_BUDGET_FACTOR", "1.2")
-            )
-            if budget_factor <= 0:
-                raise ValueError("MCORE_HYBRIDEP_FULLCG_STATIC_BUDGET_FACTOR must be positive")
+            budget_factor = 1.2
             budget = int(padded_num_tokens * self.config.moe_router_topk * budget_factor)
             if pad_multiple > 0:
                 budget += -budget % pad_multiple
@@ -1205,22 +1200,11 @@ class _HybridEPManager(_DispatchManager):
         # the actual expert token counts. Rewriting those counts to include static
         # padding would make the stash treat every capacity row as live activation.
         if is_static_budget and not self.config.moe_paged_stash:
-            static_budget_mode = os.environ.get("MCORE_HYBRIDEP_STATIC_BUDGET_MODE", "").lower()
-            use_v1_static_budget = static_budget_mode in {"v1", "legacy"}
-            use_probs_only_static_budget = static_budget_mode in {"probs_only", "prob_only"}
-            disable_static_budget_zero = (
-                os.environ.get("MCORE_DISABLE_HYBRIDEP_STATIC_BUDGET_ZERO") == "1"
-                or use_v1_static_budget
-            )
             is_capturing = (
                 torch.cuda.is_available()
                 and getattr(torch.cuda, "is_current_stream_capturing", lambda: False)()
             )
-            if use_v1_static_budget:
-                padded_tokens_per_expert = tokens_per_expert.to(torch.int64)
-                padded_tokens_per_expert_list = None
-                actual_tokens_per_expert_list = None
-            elif is_capturing:
+            if is_capturing:
                 padded_tokens_per_expert_list = getattr(
                     self, "_cuda_graph_padded_tokens_per_expert_list", None
                 )
@@ -1241,64 +1225,20 @@ class _HybridEPManager(_DispatchManager):
                 if self.config.cuda_graph_impl == "full_iteration":
                     self._cuda_graph_padded_tokens_per_expert_list = padded_tokens_per_expert_list
                     self._cuda_graph_actual_tokens_per_expert_list = actual_tokens_per_expert_list
-            if (
-                not use_v1_static_budget
-                and not is_capturing
-                and os.environ.get("MCORE_DEBUG_HYBRIDEP_STATIC_BUDGET") == "1"
-                and not getattr(self, "_debug_hybridep_static_budget_reported", False)
-            ):
-                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                hidden_rows = dispatched_hidden.shape[0]
-                probs_rows = self.dispatched_probs.shape[0]
-                hidden_abs = dispatched_hidden.detach().float().abs().flatten(1).sum(dim=1)
-                probs_abs = self.dispatched_probs.detach().float().abs()
-                if probs_abs.dim() > 1:
-                    probs_abs = probs_abs.flatten(1).sum(dim=1)
-                hidden_nonzero_rows = int((hidden_abs != 0).sum().item())
-                probs_nonzero_rows = int((probs_abs != 0).sum().item())
-                hidden_nan = int(torch.isnan(dispatched_hidden).sum().item())
-                probs_nan = int(torch.isnan(self.dispatched_probs).sum().item())
-                logger.warning(
-                    "[MCORE_DEBUG_HYBRIDEP_STATIC_BUDGET] "
-                    f"rank={rank} hidden_rows={hidden_rows} probs_rows={probs_rows} "
-                    f"padded_sum={sum(padded_tokens_per_expert_list)} "
-                    f"actual_sum={sum(actual_tokens_per_expert_list)} "
-                    f"num_permuted_tokens={self.num_permuted_tokens} "
-                    f"pad_multiple={self.pad_multiple} "
-                    f"hidden_nonzero_rows={hidden_nonzero_rows} "
-                    f"probs_nonzero_rows={probs_nonzero_rows} "
-                    f"hidden_nan={hidden_nan} probs_nan={probs_nan} "
-                    f"padded_tokens_per_expert={padded_tokens_per_expert_list} "
-                    f"actual_tokens_per_expert={actual_tokens_per_expert_list}"
-                )
-                self._debug_hybridep_static_budget_reported = True
-            if disable_static_budget_zero:
-                self._static_budget_padded_tokens_per_expert = None
-                self._static_budget_actual_tokens_per_expert = None
-            elif use_probs_only_static_budget:
-                self.dispatched_probs = zero_hybridep_static_budget_padding_by_expert(
-                    self.dispatched_probs,
-                    padded_tokens_per_expert_list,
-                    actual_tokens_per_expert_list,
-                    tensor_name="dispatched prob",
-                )
-                self._static_budget_padded_tokens_per_expert = None
-                self._static_budget_actual_tokens_per_expert = None
-            else:
-                dispatched_hidden = zero_hybridep_static_budget_padding_by_expert(
-                    dispatched_hidden,
-                    padded_tokens_per_expert_list,
-                    actual_tokens_per_expert_list,
-                    tensor_name="dispatched hidden state",
-                )
-                self.dispatched_probs = zero_hybridep_static_budget_padding_by_expert(
-                    self.dispatched_probs,
-                    padded_tokens_per_expert_list,
-                    actual_tokens_per_expert_list,
-                    tensor_name="dispatched prob",
-                )
-                self._static_budget_padded_tokens_per_expert = padded_tokens_per_expert_list
-                self._static_budget_actual_tokens_per_expert = actual_tokens_per_expert_list
+            dispatched_hidden = zero_hybridep_static_budget_padding_by_expert(
+                dispatched_hidden,
+                padded_tokens_per_expert_list,
+                actual_tokens_per_expert_list,
+                tensor_name="dispatched hidden state",
+            )
+            self.dispatched_probs = zero_hybridep_static_budget_padding_by_expert(
+                self.dispatched_probs,
+                padded_tokens_per_expert_list,
+                actual_tokens_per_expert_list,
+                tensor_name="dispatched prob",
+            )
+            self._static_budget_padded_tokens_per_expert = padded_tokens_per_expert_list
+            self._static_budget_actual_tokens_per_expert = actual_tokens_per_expert_list
             tokens_per_expert = padded_tokens_per_expert
         if self.moe_expert_rank_capacity_factor is not None:
             over_budget = self.handle[-1] != 0  # this is overflow_flag

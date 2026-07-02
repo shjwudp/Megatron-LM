@@ -403,9 +403,10 @@ repeat).
 
 ### 3.8 Untied embedding and output units
 
-The v2 adapter makes the direct owners of untied embedding and output weights separate FSDP
-units. This prevents their large buffers from being concatenated into the root unit and lets
-the full-iteration trace pool reuse stable slots across their non-overlapping execution.
+In full-iteration CUDA graph mode, the v2 adapter makes the direct owners of untied embedding and
+output weights separate FSDP units. This prevents their large buffers from being concatenated
+into the root unit and lets the full-iteration trace pool reuse stable slots across their
+non-overlapping execution. Other execution modes retain the existing FSDP-unit layout.
 
 Unlike TransformerLayer and TEGroupedMLP units, these native modules keep the standard
 autograd post-backward callback when `delay_wgrad_compute=True`. Output-layer wgrad is complete

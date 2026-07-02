@@ -257,9 +257,10 @@ addresses for any tensors touched by the captured graph, so the adapter passes
 `use_megatron_fsdp_v2` is active and the transformer config requests
 full-iteration capture.
 
-Forward-only validation/evaluation remains eager under the training
-full-iteration wrapper.  This keeps training CUDA graph capture independent from
-validation warmup side-stream state (for example FGAO h2d/d2h streams).
+Training and forward-only validation/evaluation keep separate warmup counters,
+static input buffers, graph objects, and result buffers. Megatron-FSDP v2 uses
+the v2-specific stream and autograd capture handling below; non-v2 execution
+retains the wrapper's original capture context and error mode.
 
 The full-iteration path uses the same `TracePoolAllocator` stable-address
 foundation as per-module CUDA graphs, but it does not pop FSDP hooks.  Instead,

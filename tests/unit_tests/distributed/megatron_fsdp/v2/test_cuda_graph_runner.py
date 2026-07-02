@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -38,7 +38,9 @@ def test_capture_backward_post_hook_clears_only_unsharded_parameter_grads():
 
     reshard_calls = []
     module = SimpleNamespace(
-        _fsdp_param_groups=[SimpleNamespace(params=[full_param], dist_params=[dist_param])],
+        _fsdp_param_groups=[
+            SimpleNamespace(params=[full_param], dist_params=[dist_param])
+        ],
         reshard=lambda: reshard_calls.append(True),
     )
 
@@ -61,7 +63,9 @@ def test_module_compile_is_converted_to_compiled_forward_for_capture():
         saved = _prepare_compiled_modules_for_capture([module])
 
     compile_mock.assert_called_once_with(
-        original_forward, dynamic=False, options={"triton.cudagraphs": False}
+        original_forward,
+        dynamic=False,
+        options={"triton.cudagraphs": False},
     )
     assert module._compiled_call_impl is None
     assert module.forward is compiled_forward
@@ -87,3 +91,4 @@ def test_module_compile_is_normalized_when_first_forward_is_recorded():
     assert module._compiled_call_impl is None
     assert module.forward is compiled_forward
     assert len(runner._compiled_module_state) == 1
+

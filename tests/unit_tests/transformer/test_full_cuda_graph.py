@@ -10,6 +10,7 @@ import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
 from megatron.core.full_cuda_graph import (
     FullCudaGraphWrapper,
+    _has_v2_fsdp_modules,
     _stop_v2_fsdp_communication,
     _synchronize_fsdp_param_gathers,
 )
@@ -48,6 +49,16 @@ def test_synchronize_fsdp_param_gathers_walks_unique_modules():
     assert synchronized == 1
     assert child.stop_calls == 0
     assert child.gather_calls == 1
+
+
+def test_has_v2_fsdp_modules_walks_nested_model_list():
+    root = torch.nn.Module()
+    v1_child = _FSDPStopModule(use_megatron_fsdp_v2=False)
+    v2_child = _FSDPStopModule()
+    root.add_module("v1_child", v1_child)
+
+    assert not _has_v2_fsdp_modules([root, v1_child])
+    assert _has_v2_fsdp_modules([root, v2_child])
 
 
 def test_stop_v2_fsdp_communication_skips_v1_modules():

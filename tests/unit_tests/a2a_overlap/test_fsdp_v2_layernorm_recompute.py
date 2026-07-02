@@ -273,6 +273,7 @@ class TestFSDPV2LayerNormRecompute:
             "fp8_param": True,
             "overlap_moe_expert_parallel_comm": True,
             "delay_wgrad_compute": True,
+            "cuda_graph_impl": "full_iteration",
             "recompute_granularity": "selective",
             "recompute_modules": ["moe_act", "layernorm"],
         }

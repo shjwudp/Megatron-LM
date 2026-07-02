@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ from typing import Callable
 import torch
 import torch.nn as nn
 from torch.distributed import distributed_c10d
-from torch.distributed.tensor import DeviceMesh
+from torch.distributed.tensor import DeviceMesh, init_device_mesh
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,13 +40,11 @@ class RegisterFSDPBackwardFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, post_backward: Callable, *inputs: torch.Tensor):
-        """Pass tensors through while saving the post-backward callback."""
         ctx.post_backward = post_backward
         return inputs
 
     @staticmethod
     def backward(ctx, *grads: torch.Tensor):
-        """Run the saved callback and return input gradients unchanged."""
         ctx.post_backward()
         return (None,) + grads
 

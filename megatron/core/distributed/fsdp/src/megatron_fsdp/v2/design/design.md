@@ -126,11 +126,13 @@ dynamic recording phase.
 
 ### Untied embedding and output FSDP units
 
-For ZeRO-3, the MCore adapter wraps modules that directly own parameters marked
-`is_embedding_or_output_parameter` as child FSDP units when embeddings and output weights are
-untied. Without this split, both large matrices remain in the root parameter group even though
-they execute at opposite ends of the iteration. Full-iteration CUDA graphs would then keep a
-concatenated root weight slot and a concatenated root gradient slot resident for every replay.
+For ZeRO-3 with `cuda_graph_impl="full_iteration"`, the MCore adapter wraps modules that
+directly own parameters marked `is_embedding_or_output_parameter` as child FSDP units when
+embeddings and output weights are untied. Without this split, both large matrices remain in the
+root parameter group even though they execute at opposite ends of the iteration. Full-iteration
+CUDA graphs would then keep a concatenated root weight slot and a concatenated root gradient slot
+resident for every replay. Eager and per-module CUDA graph modes retain their existing FSDP-unit
+layout.
 
 The child units share the root `TracePoolAllocator`, so non-overlapping embedding/output weight
 and gradient lifetimes can map to the same stable slots. These units retain the normal autograd
@@ -848,12 +850,6 @@ After `ParameterGroup._init_buffers()` copies parameter data into the internal w
 are freed via `_free_storage(p.data)`. The module holds DTensor shard views and `unshard()`
 rebinds `.data` to the all-gathered buffer, so the original storage is dead and freeing it
 reduces peak memory during model construction.
-
-After all parameter groups have initialized, `fully_shard()` runs `gc.collect()` followed by
-`torch.cuda.empty_cache()`. This returns the dead original-parameter segments before persistent
-model buffers, paged-stash buffers, or CUDA-graph allocations can reuse a few holes and pin the
-rest of those expandable segments for the lifetime of training. The cleanup is once per wrapped
-FSDP module and mirrors the initialization cleanup in the v1 implementation.
 
 ---
 

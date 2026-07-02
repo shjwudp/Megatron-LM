@@ -446,6 +446,7 @@ class FSDPModule:
         mp_policy: MixedPrecisionPolicy,
         gradient_scaling_factor: Optional[float] = None,
         sharding_strategy: str = "optim_grads_params",
+        enable_full_iteration_cuda_graph: bool = False,
     ):
         """
         Initialize parameter groups and build param name mapping.
@@ -477,6 +478,7 @@ class FSDPModule:
             ignored_params=ignored_params,
             gradient_scaling_factor=gradient_scaling_factor,
             sharding_strategy=sharding_strategy,
+            enable_full_iteration_cuda_graph=enable_full_iteration_cuda_graph,
         )
         setattr(self, "_fsdp_param_groups", fsdp_param_groups)
 
@@ -1265,6 +1267,7 @@ def _get_module_fsdp_param_groups(
     ignored_params: Optional[set[nn.Parameter]] = None,
     gradient_scaling_factor: Optional[float] = None,
     sharding_strategy: str = "optim_grads_params",
+    enable_full_iteration_cuda_graph: bool = False,
 ) -> List[ParameterGroup]:
     """
     Group module parameters by buffer-compatible attributes and create ParameterGroups.
@@ -1291,8 +1294,11 @@ def _get_module_fsdp_param_groups(
     fsdp_param_groups = []
     for i, params in enumerate(param_groups.values()):
         param_names = [param_to_name[param] for param in params]
-        defer_full_param_and_grad_sync = _should_defer_fp8_norm_sync(
-            module, param_names, params, mp_policy, sharding_strategy
+        defer_full_param_and_grad_sync = (
+            enable_full_iteration_cuda_graph
+            and _should_defer_fp8_norm_sync(
+                module, param_names, params, mp_policy, sharding_strategy
+            )
         )
         fsdp_param_groups.append(
             ParameterGroup(
