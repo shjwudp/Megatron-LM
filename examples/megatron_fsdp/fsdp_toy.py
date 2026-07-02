@@ -346,7 +346,7 @@ def train(
                 alloc = _fmt_bytes(torch.cuda.memory_allocated())
                 max_reserved = _fmt_bytes(torch.cuda.max_memory_reserved())
                 print(
-                    f"[rank0] epoch={epoch} step={step} loss={global_loss:.4f} "
+                    f"[rank0] epoch={epoch} step={step} loss={global_loss:.4e} "
                     f"alloc={alloc} max_reserved={max_reserved} "
                     f"it={elapsed:.1f}s ({it_s * 1000:.0f}ms/it)"
                 )
@@ -365,13 +365,13 @@ def train(
         ratio = final_loss / max(initial_loss, 1e-12)
         if rank == 0:
             print(
-                f"[rank0] convergence: initial_loss={initial_loss:.4f} "
-                f"final_loss={final_loss:.4f} ratio={ratio:.3f} "
+                f"[rank0] convergence: initial_loss={initial_loss:.4e} "
+                f"final_loss={final_loss:.4e} ratio={ratio:.3f} "
                 f"(threshold={args.convergence_threshold})"
             )
         assert final_loss < initial_loss * args.convergence_threshold, (
-            f"Convergence check failed: final_loss={final_loss:.4f} is not < "
-            f"initial_loss={initial_loss:.4f} * {args.convergence_threshold}"
+            f"Convergence check failed: final_loss={final_loss:.4e} is not < "
+            f"initial_loss={initial_loss:.4e} * {args.convergence_threshold}"
         )
 
 
