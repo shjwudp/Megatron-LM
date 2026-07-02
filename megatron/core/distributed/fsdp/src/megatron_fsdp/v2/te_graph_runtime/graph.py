@@ -378,6 +378,31 @@ def _none_grad_context_wrapper(inputs):
 
 
 @contextlib.contextmanager
+def _static_grad_context_wrapper(inputs, grad_buffers):
+    """Bind leaf gradients to caller-owned buffers during capture.
+
+    :param inputs: Leaf tensors participating in captured backward.
+    :type inputs: Tuple[torch.Tensor, ...]
+    :param grad_buffers: Optional static gradient buffer for each input.
+    :type grad_buffers: Tuple[Optional[torch.Tensor], ...]
+    :raises ValueError: If inputs and buffers have different lengths.
+    """
+    if len(inputs) != len(grad_buffers):
+        raise ValueError("Static gradient buffers must match backward inputs")
+    original_input_grads = tuple(input_tensor.grad for input_tensor in inputs)
+    static_buffers = tuple(buffer for buffer in grad_buffers if buffer is not None)
+    if static_buffers:
+        torch._foreach_zero_(static_buffers)
+    for input_tensor, grad_buffer in zip(inputs, grad_buffers):
+        input_tensor.grad = grad_buffer
+    try:
+        yield
+    finally:
+        for input_tensor, original_grad in zip(inputs, original_input_grads):
+            input_tensor.grad = original_grad
+
+
+@contextlib.contextmanager
 def _graph_context_wrapper(*args, **kwargs):
     """Wrapper around `torch.cuda.graph`.
 
@@ -413,6 +438,11 @@ def _make_graphed_callables(
     post_warmup_hook: Optional[Callable] = None,
     capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]] = None,
     capture_stream: Optional[torch.cuda.Stream] = None,
+    _module_params: Optional[Sequence[Sequence[torch.nn.Parameter]]] = None,
+    _parameter_grad_buffers: Optional[
+        Sequence[Sequence[Optional[torch.Tensor]]]
+    ] = None,
+    _parameter_grad_consumers: Optional[Sequence[Optional[Callable]]] = None,
 ) -> SingleOrTuple[Callable]:
     """
     Helper method for `make_graphed_callables`
@@ -440,6 +470,56 @@ def _make_graphed_callables(
         sample_kwargs = (sample_kwargs,)
 
     capture_time_hooks = _canonicalize_capture_time_hooks(len(callables), capture_time_hooks)
+    if _module_params is None:
+        explicit_module_params = None
+    else:
+        explicit_module_params = tuple(tuple(params) for params in _module_params)
+        if len(explicit_module_params) != len(callables):
+            raise ValueError(
+                "_module_params must have one entry per callable: "
+                f"got {len(explicit_module_params)} entries for {len(callables)} callables"
+            )
+        if any(
+            not isinstance(param, torch.nn.Parameter)
+            for params in explicit_module_params
+            for param in params
+        ):
+            raise TypeError("_module_params entries must contain torch.nn.Parameter objects")
+    if _parameter_grad_buffers is None:
+        parameter_grad_buffers = None
+    else:
+        parameter_grad_buffers = tuple(
+            tuple(buffers) for buffers in _parameter_grad_buffers
+        )
+        if explicit_module_params is None:
+            raise ValueError("_parameter_grad_buffers requires _module_params")
+        if len(parameter_grad_buffers) != len(explicit_module_params):
+            raise ValueError("_parameter_grad_buffers must have one entry per callable")
+        for params, buffers in zip(explicit_module_params, parameter_grad_buffers):
+            if len(params) != len(buffers):
+                raise ValueError("Each parameter gradient buffer list must match _module_params")
+            for param, buffer in zip(params, buffers):
+                if buffer is None:
+                    continue
+                if not isinstance(buffer, torch.Tensor):
+                    raise TypeError("Parameter gradient buffers must be tensors or None")
+                if (
+                    buffer.shape != param.shape
+                    or buffer.dtype != param.dtype
+                    or buffer.device != param.device
+                ):
+                    raise ValueError(
+                        "Parameter gradient buffers must match parameter shape, dtype, and device"
+                    )
+    if _parameter_grad_consumers is None:
+        parameter_grad_consumers = (None,) * len(callables)
+    else:
+        parameter_grad_consumers = tuple(_parameter_grad_consumers)
+        if len(parameter_grad_consumers) != len(callables):
+            raise ValueError(
+                "_parameter_grad_consumers must have one entry per callable: "
+                f"got {len(parameter_grad_consumers)} consumers for {len(callables)} callables"
+            )
 
     # Check training/inference
     is_training = all(c.training for c in callables)
@@ -681,12 +761,17 @@ def _make_graphed_callables(
     per_callable_len_user_args = [len(args) for args in flatten_sample_args]
     if _order is None:
         per_callable_module_params = [
-            tuple(c.parameters()) if isinstance(c, torch.nn.Module) else () for c in callables
+            explicit_module_params[i]
+            if explicit_module_params is not None
+            else tuple(c.parameters()) if isinstance(c, torch.nn.Module) else ()
+            for i, c in enumerate(callables)
         ]
         per_callable_static_input_surfaces = [
             flatten_sample_args[i] + per_callable_module_params[i] for i in range(len(callables))
         ]
     else:
+        if explicit_module_params is not None:
+            raise ValueError("_module_params is not supported with pipeline _order")
         per_callable_module_params = []
         for m_chunk in range(num_model_chunks):
             for _ in range(num_microbatches):
@@ -1273,9 +1358,22 @@ def _make_graphed_callables(
                 func = graph_callables[bwd_idx]
                 _call_capture_time_backward_pre_hooks(bwd_idx, func, static_grad_outputs)
                 inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
-                with _none_grad_context_wrapper(inputs), _graph_context_wrapper(
+                if parameter_grad_buffers is None:
+                    input_grad_buffers = (None,) * len(inputs)
+                else:
+                    buffers_by_param_id = {
+                        id(param): buffer
+                        for param, buffer in zip(
+                            explicit_module_params[bwd_idx],
+                            parameter_grad_buffers[bwd_idx],
+                        )
+                    }
+                    input_grad_buffers = tuple(
+                        buffers_by_param_id.get(id(input_tensor)) for input_tensor in inputs
+                    )
+                with _graph_context_wrapper(
                     bwd_graph, pool=mempool
-                ):
+                ), _static_grad_context_wrapper(inputs, input_grad_buffers):
                     torch.autograd.backward(
                         tuple(o for o in static_outputs if o is not None and o.requires_grad),
                         grad_tensors=tuple(o for o in static_grad_outputs if o is not None),
@@ -1331,6 +1429,7 @@ def _make_graphed_callables(
         static_grad_outputs,
         static_grad_inputs,
         returned_param_grad_clone_slots,
+        parameter_grad_consumer,
     ):
         class Graphed(torch.autograd.Function):
             """Autograd function for graph replay."""
@@ -1403,6 +1502,13 @@ def _make_graphed_callables(
                 else:
                     bwd_graph.replay()
 
+                module_param_start = len(static_grad_inputs) - len(module_params)
+                if parameter_grad_consumer is not None:
+                    parameter_grad_consumer(
+                        tuple(module_params),
+                        tuple(static_grad_inputs[module_param_start:]),
+                    )
+
                 # Update FP8 scale factors if needed
                 if ctx.is_first_module:
                     FP8GlobalStateManager.reduce_and_update_fp8_tensors(forward=False)
@@ -1416,6 +1522,9 @@ def _make_graphed_callables(
                 grad_inputs = []
                 for idx, grad_input in enumerate(static_grad_inputs):
                     if grad_input is None:
+                        grad_inputs.append(None)
+                    elif parameter_grad_consumer is not None and idx >= module_param_start:
+                        # The runtime consumed this parameter gradient before its hook runs.
                         grad_inputs.append(None)
                     elif returned_param_grad_clone_slots[idx]:
                         # Returned parameter grads may be installed directly as param.grad.
@@ -1521,6 +1630,7 @@ def _make_graphed_callables(
             per_callable_static_grad_outputs[i],
             per_callable_static_grad_inputs[i],
             per_callable_returned_param_grad_clone_slots[i],
+            parameter_grad_consumers[i],
         )
 
         func = graph_callables[i]
@@ -1668,6 +1778,11 @@ def make_graphed_callables(
     post_warmup_hook: Optional[Callable] = None,
     capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]] = None,
     capture_stream: Optional[torch.cuda.Stream] = None,
+    _module_params: Optional[Sequence[Sequence[torch.nn.Parameter]]] = None,
+    _parameter_grad_buffers: Optional[
+        Sequence[Sequence[Optional[torch.Tensor]]]
+    ] = None,
+    _parameter_grad_consumers: Optional[Sequence[Optional[Callable]]] = None,
 ) -> Union[Callable, Tuple[Callable, ...]]:
     """
     Make CUDA graph version of Transformer Engine modules
@@ -1714,6 +1829,12 @@ def make_graphed_callables(
         replay of another callable, may overwrite retained hook or `.grad`
         tensors. Only disable this when the caller consumes returned parameter
         gradients before any such overwrite can occur.
+    _parameter_grad_consumers: sequence of callable, optional
+        Callbacks that consume parameter gradients immediately after replay.
+    _module_params: sequence of parameter sequences, optional
+        Overrides ``module.parameters()`` for each callable's input surface.
+    _parameter_grad_buffers: sequence of tensor sequences, optional
+        Optional caller-owned buffers for captured parameter gradients.
     pre_warmup_hook: callable, default = None
                       A hook function that will be called once before all warmup iterations
                       (not once per callable).
@@ -1942,6 +2063,9 @@ def make_graphed_callables(
         post_warmup_hook=post_warmup_hook,
         capture_time_hooks=capture_time_hooks,
         capture_stream=capture_stream,
+        _module_params=_module_params,
+        _parameter_grad_buffers=_parameter_grad_buffers,
+        _parameter_grad_consumers=_parameter_grad_consumers,
     )
 
     # Ensures warmup does not affect numerics for ops such as dropout.

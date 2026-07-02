@@ -444,6 +444,7 @@ def _pre_backward_setup(
     for param_group in module._fsdp_param_groups:
         for param in param_group.params:
             param.grad_added_to_main_grad = False
+            param._mfsdp_cg_grad_published = False
             if param_group.sharding_strategy in (
                 "optim_grads_params",
                 "optim_grads",
