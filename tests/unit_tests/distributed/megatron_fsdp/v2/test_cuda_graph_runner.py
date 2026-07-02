@@ -22,9 +22,11 @@ import torch
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.cuda_graph_runner import (
     CudaGraphRunner,
     _make_bwd_post_hook,
+    _make_parameter_grad_consumer,
     _prepare_compiled_modules_for_capture,
     _restore_compiled_modules_after_capture_failure,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.te_graph_runtime import graph
 
 
 def test_capture_backward_post_hook_clears_only_unsharded_parameter_grads():
@@ -92,3 +94,35 @@ def test_module_compile_is_normalized_when_first_forward_is_recorded():
     assert module.forward is compiled_forward
     assert len(runner._compiled_module_state) == 1
 
+
+def test_parameter_grad_consumer_publishes_and_zeros_main_grads():
+    """Publish replayed grads before M-FSDP's post-backward reduction."""
+    module = torch.nn.Linear(3, 2)
+    params = tuple(module.parameters())
+    main_grads = {id(param): torch.full_like(param, 9) for param in params}
+    for param in params:
+        param.get_main_grad = lambda p=param: main_grads[id(p)]
+    module._fsdp_param_groups = [SimpleNamespace(params=list(params))]
+
+    consume = _make_parameter_grad_consumer(module, params)
+    consume(params, (torch.full_like(params[0], 2), None))
+
+    assert torch.equal(main_grads[id(params[0])], torch.full_like(params[0], 2))
+    assert torch.count_nonzero(main_grads[id(params[1])]) == 0
+    assert all(param._mfsdp_cg_grad_published for param in params)
+
+
+def test_static_grad_context_accumulates_into_caller_buffer_and_restores_grad():
+    """Accumulate a leaf gradient in the M-FSDP-owned static buffer."""
+    graph._require_torch()
+    param = torch.nn.Parameter(torch.tensor([2.0]))
+    original_grad = torch.tensor([7.0])
+    param.grad = original_grad
+    main_grad = torch.tensor([9.0])
+
+    with graph._static_grad_context_wrapper((param,), (main_grad,)):
+        param.square().sum().backward()
+        assert param.grad.data_ptr() == main_grad.data_ptr()
+        assert torch.equal(main_grad, torch.tensor([4.0]))
+
+    assert param.grad.data_ptr() == original_grad.data_ptr()
