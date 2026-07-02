@@ -18,7 +18,7 @@ import logging
 import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,20 @@ from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
 
 logger = logging.getLogger(__name__)
+
+
+def _foreach_apply(
+    op: Callable[..., Any],
+    tensors: List[torch.Tensor],
+    other_tensors: Optional[List[torch.Tensor]] = None,
+) -> None:
+    """Apply a unary or binary foreach operation to non-empty tensor lists."""
+    if not tensors:
+        return
+    if other_tensors is None:
+        op(tensors)
+    else:
+        op(tensors, other_tensors)
 
 
 class _FSDPState:
@@ -787,7 +801,7 @@ class FSDPModule:
                             f"NaN in parameter grad for {name}"
                         )
 
-            # Copy .grad -> main grad buffer on main stream (fast memcpy).
+            # Stage .grad -> main grad buffer on the main stream.
             # When gradient_accumulation_fusion is active for FSDP params, the backward
             # kernel writes directly into main_grad (weight.main_grad = get_main_grad() in
             # layers.py) and sets grad_added_to_main_grad=True. In that case we must NOT
@@ -801,12 +815,18 @@ class FSDPModule:
             add_to_main_grad = (
                 grad_replicated and not param_group._grad_buffer_is_fresh
             )
-            for name, param in zip(param_names, param_group.params):
+            stage_tensors: List[torch.Tensor] = []
+            stage_sources: List[torch.Tensor] = []
+            zero_tensors: List[torch.Tensor] = []
+            params_with_grad = []
+
+            for param in param_group.params:
+                grad = param.grad
+                if grad is not None:
+                    params_with_grad.append(param)
                 grad_added = getattr(param, "grad_added_to_main_grad", False)
                 recorded = getattr(param, "_mfsdp_recorded_te_wgrad", False)
                 if grad_added or recorded:
-                    if param.grad is not None:
-                        del param.grad
                     # Record TE wgrad-fusion flags for CUDA graph restore.
                     # The trace backward ran eagerly, so TE set
                     # grad_added_to_main_grad on each param it wrote to.
@@ -815,20 +835,32 @@ class FSDPModule:
                     # the CG replay backward.
                     if grad_added and self._fsdp_state.enable_cuda_graph:
                         setattr(param, "_mfsdp_recorded_te_wgrad", True)
-                elif param.grad is None:
+                elif grad is None:
                     if not add_to_main_grad:
-                        param.get_main_grad().zero_()
+                        zero_tensors.append(param.get_main_grad())
                 else:
-                    main_grad = param.get_main_grad()
-                    if add_to_main_grad:
-                        main_grad.add_(param.grad.detach())
-                    else:
-                        main_grad.copy_(param.grad.detach())
+                    stage_tensors.append(param.get_main_grad())
+                    stage_sources.append(grad.detach())
+
+            stage_op = torch._foreach_add_ if add_to_main_grad else torch._foreach_copy_
+            _foreach_apply(stage_op, stage_tensors, stage_sources)
+            _foreach_apply(torch._foreach_zero_, zero_tensors)
+
+            for param in params_with_grad:
+                if param.grad is not None:
                     del param.grad
+
+            stage_tensors.clear()
+            stage_sources.clear()
+            zero_tensors.clear()
+            grad = None
+
+            for param in param_group.params:
                 # Consume this per-backward marker here. A skipped module may not run
                 # _pre_backward_setup on the next microbatch, so leaving it set would
                 # make stale scratch storage look like a fused wgrad.
                 param.grad_added_to_main_grad = False
+
             if grad_replicated:
                 param_group._grad_buffer_is_fresh = False
 
