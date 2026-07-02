@@ -174,6 +174,57 @@ def _restore_compiled_modules_after_capture_failure(saved):
         module._compiled_call_impl = compiled_call_impl
 
 
+def _make_parameter_grad_consumer(module: torch.nn.Module, module_params):
+    """Publish replayed parameter gradients to M-FSDP main-grad buffers.
+
+    :param module: Captured FSDP module that owns the parameters.
+    :type module: torch.nn.Module
+    :param module_params: Full parameters installed while the module is unsharded.
+    :type module_params: Tuple[torch.nn.Parameter, ...]
+    :return: Callback accepting the runtime parameter list and matching gradients.
+    :rtype: Callable[[Tuple[torch.nn.Parameter, ...], Tuple[Optional[torch.Tensor], ...]], None]
+    """
+    module_params = tuple(module_params)
+
+    def consume(runtime_params, parameter_grads):
+        """Copy static graph gradients into full main-grad views.
+
+        :param runtime_params: Parameters retained by graph warmup.
+        :type runtime_params: Tuple[torch.nn.Parameter, ...]
+        :param parameter_grads: Gradients matching ``runtime_params``.
+        :type parameter_grads: Tuple[Optional[torch.Tensor], ...]
+        """
+        grads_by_param_id = {id(param): None for param in module_params}
+        for param, grad in zip(runtime_params, parameter_grads):
+            grads_by_param_id[id(param)] = grad
+        for param_group in module._fsdp_param_groups:
+            zero_targets = []
+            copy_srcs = []
+            copy_dsts = []
+            for param in param_group.params:
+                if not param.requires_grad:
+                    continue
+                if getattr(param, "_mfsdp_recorded_te_wgrad", False):
+                    continue
+                main_grad = param.get_main_grad()
+                graph_grad = grads_by_param_id[id(param)]
+                if graph_grad is None:
+                    zero_targets.append(main_grad.view(-1))
+                elif graph_grad.data_ptr() == main_grad.data_ptr():
+                    pass
+                else:
+                    copy_srcs.append(graph_grad.detach().view(-1))
+                    copy_dsts.append(main_grad.view(-1))
+                param._mfsdp_cg_grad_published = True
+
+            if zero_targets:
+                torch._foreach_zero_(zero_targets)
+            if copy_dsts:
+                torch._foreach_copy_(copy_dsts, copy_srcs)
+
+    return consume
+
+
 class CudaGraphRunner:
     """Orchestrates per-module sample-arg recording and batch graph capture.
 
@@ -254,16 +305,15 @@ class CudaGraphRunner:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info("CudaGraphRunner: capturing %d modules", n)
 
-        # Prefer installed te-graph-runtime (https://github.com/buptzyb/te-graph-runtime),
-        # fall back to vendored copy.
-        try:
-            from te_graph_runtime import make_graphed_callables
-        except ImportError:
-            from .te_graph_runtime import make_graphed_callables
+        # The installed package does not provide the M-FSDP binding contract.
+        from .te_graph_runtime import make_graphed_callables
 
         sample_args_list: List[Tuple] = []
         sample_kwargs_list: List[Dict[str, Any]] = []
         capture_hooks: List[Dict] = []
+        graph_module_params = []
+        parameter_grad_buffers = []
+        parameter_grad_consumers = []
 
         for m in modules:
             mid = id(m)
@@ -290,6 +340,35 @@ class CudaGraphRunner:
                 "backward_pre_hooks": {0: _make_bwd_pre_hook(m)},
                 "backward_hooks": {0: _make_bwd_post_hook(m)},
             })
+            owned_params = tuple(
+                param
+                for param_group in m._fsdp_param_groups
+                for param in param_group.params
+            )
+            for param_group in m._fsdp_param_groups:
+                if param_group.requires_grad:
+                    param_group._init_dist_grads()
+                    param_group.main_grad_buffer.fetch_buffer()
+            graph_module_params.append(owned_params)
+            grad_buffers = []
+            for param in owned_params:
+                if not param.requires_grad:
+                    grad_buffers.append(None)
+                    continue
+                if getattr(param, "_mfsdp_recorded_te_wgrad", False):
+                    grad_buffers.append(None)
+                    continue
+                main_grad = param.get_main_grad()
+                if (
+                    main_grad.shape == param.shape
+                    and main_grad.dtype == param.dtype
+                    and main_grad.device == param.device
+                ):
+                    grad_buffers.append(main_grad)
+                else:
+                    grad_buffers.append(None)
+            parameter_grad_buffers.append(tuple(grad_buffers))
+            parameter_grad_consumers.append(_make_parameter_grad_consumer(m, owned_params))
 
         self._sample_args.clear()
         self._sample_kwargs.clear()
@@ -320,6 +399,9 @@ class CudaGraphRunner:
                 pool=self._graph_pool,
                 capture_time_hooks=capture_hooks,
                 capture_stream=capture_stream,
+                _module_params=tuple(graph_module_params),
+                _parameter_grad_buffers=tuple(parameter_grad_buffers),
+                _parameter_grad_consumers=tuple(parameter_grad_consumers),
             )
         except Exception:
             _restore_compiled_modules_after_capture_failure(compiled_module_state)
