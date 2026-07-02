@@ -269,11 +269,35 @@ manually for the TransformerLayer via `set_fsdp_reshard_hooks` →
 are handled by `mfsdp_post_backward_final_callback` (called at
 `combined_1f1b.py:629`), which runs after all `backward_dw()` calls complete.
 
+The explicit layer callback also establishes a producer-to-consumer CUDA
+stream dependency before it reads gradients. `TransformerLayerNode` queues
+normal backward and delayed wgrad kernels on the node stream, then makes the
+current stream wait for that node stream before invoking the post-backward
+hook. The wait is GPU-asynchronous and applies to both delayed and inline
+wgrad callback paths.
+
 For EP overlap **without** `delay_wgrad_compute`, the autograd hook fires at
 the right time (all grads are ready inline during backward), so it is
 **not** skipped.
 
-### 3.5 Hook fire count — what to expect
+### 3.5 Per-microbatch LayerNorm recompute state
+
+The overlap schedule can have several plans for the same transformer layer in
+flight at once. Each plan therefore owns its own
+`CheckpointWithoutOutput` instance through `TransformerLayerState`. Storing
+that checkpoint on the shared layer lets a later microbatch replace state that
+an earlier microbatch still needs for router backward.
+
+### 3.6 LayerNorm checkpoint lifetime through HybridEP combine
+
+HybridEP dispatch keeps a view of the pre-MLP LayerNorm output alive until
+combine completes. The schedule retains the checkpoint through routed-expert
+compute, then discards its output immediately before BDA and registers the
+recompute hook on the routed-expert output. This orders recompute after combine
+backward and before dispatch/router backward without moving LayerNorm work to a
+communication stream.
+
+### 3.7 Hook fire count — what to expect
 
 `mfsdp_forward_pre_hook` fires on **every** `Module.__call__()`, not just on
 the FSDP unit modules.  Because the EP overlap schedule invokes sub-modules
