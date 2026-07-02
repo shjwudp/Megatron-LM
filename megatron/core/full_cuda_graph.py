@@ -301,9 +301,14 @@ class FullCudaGraphWrapper:
 
         training = not kwargs['forward_only']
         training_str = 'training' if training else 'validation'
+        use_v2_fsdp = _has_v2_fsdp_modules(model)
+        if not training and use_v2_fsdp:
+            # Validation warmup may leave v2 FSDP side-stream work that cannot be
+            # joined from a new CUDA graph capture. Keep this path eager while
+            # preserving the existing validation graph behavior for non-v2 models.
+            return self.forward_backward_func(*args, **kwargs)
         curr_iteration = self.curr_iter(training_str)
         capture_iteration = curr_iteration == self.cuda_graph_warmup_steps
-        use_v2_fsdp = _has_v2_fsdp_modules(model)
         data_iterator = kwargs['data_iterator']
         data_list = self.data_read(data_iterator, model, training, num_microbatches)
         kwargs['data_iterator'] = data_list
