@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,10 +41,10 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.ssm.mamba_layer import MambaLayer
-from megatron.core.transformer.moe.router import Router as MoERouter
 from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.moe.router import Router as MoERouter
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
 
@@ -66,6 +66,25 @@ from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 from .checkpoint import _propagate_chunk_metadata_to_state_dict
 
 logger = logging.getLogger(__name__)
+
+
+def _get_embedding_output_fsdp_units(module: nn.Module) -> List[nn.Module]:
+    """Return multiple disjoint modules that directly own embedding/output weights."""
+    units = []
+    seen_params = set()
+    for candidate in module.modules():
+        params = [
+            param
+            for param in candidate.parameters(recurse=False)
+            if getattr(param, "is_embedding_or_output_parameter", False)
+        ]
+        if not params or any(param in seen_params for param in params):
+            continue
+        units.append(candidate)
+        seen_params.update(params)
+    # A single owner means a tied weight or a pipeline stage with only one
+    # endpoint. There is no concatenated root buffer to split in either case.
+    return units if len(units) > 1 else []
 
 
 class FullyShardedDataParallel(_BaseDataParallel):
@@ -249,15 +268,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
         device: Optional[torch.device] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
-        if ddp_config.use_megatron_fsdp:
-            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import fully_shard
-            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-                FullyShardFP8Policy,
-                MixedPrecisionPolicy,
-                FullyShardNVFP4Policy,
-            )
-        else:
-            from torch.distributed.fsdp import fully_shard
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import fully_shard
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
+            FullyShardFP8Policy,
+            FullyShardNVFP4Policy,
+            MixedPrecisionPolicy,
+        )
 
         if (
             fsdp_unit_modules is None
@@ -303,6 +319,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "skip_backward_callback": config.delay_wgrad_compute,
             "skip_final_backward_callback": config.overlap_moe_expert_parallel_comm,
         }
+        if ddp_config.use_megatron_fsdp:
+            kwargs["enable_full_iteration_cuda_graph"] = config.cuda_graph_impl == "full_iteration"
         if config.calculate_per_token_loss:
             gradient_scaling_factor = None
             expert_gradient_scaling_factor = None
@@ -316,6 +334,27 @@ class FullyShardedDataParallel(_BaseDataParallel):
             gradient_scaling_factor = 1.0 / dp_world_size
             expert_gradient_scaling_factor = 1.0 / dp_world_size
 
+        # Untied embedding and output weights execute at opposite ends of the
+        # iteration. Keeping both in the root FSDP unit concatenates them into
+        # one large weight/grad buffer whose full-CG slots cannot be reused.
+        # Shard their direct owner modules independently so the trace allocator
+        # can reuse those slots across their non-overlapping lifetimes. Their
+        # native wgrads are not delayed, so normal post-backward hooks are safe.
+        if (
+            ddp_config.use_megatron_fsdp
+            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        ):
+            standalone_kwargs = dict(kwargs)
+            standalone_kwargs["skip_backward_callback"] = False
+            for standalone_unit in _get_embedding_output_fsdp_units(module):
+                fully_shard(
+                    standalone_unit,
+                    mesh=dp_mesh,
+                    gradient_scaling_factor=gradient_scaling_factor,
+                    enable_cuda_graph=False,
+                    **standalone_kwargs,
+                )
+
         if fsdp_unit_modules is not None:
             cuda_graph_on = set(ddp_config.mfsdp_cuda_graph_modules)
             # Iterate modules post order to ensure that child modules are fully sharded
@@ -328,17 +367,19 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     grad_sf = gradient_scaling_factor
                     mesh = dp_mesh
 
-                if any([
-                    isinstance(m, MambaLayer) and "mamba" in cuda_graph_on,
-                    isinstance(m, Attention) and "attn" in cuda_graph_on,
-                    isinstance(m, MoERouter) and "moe_router" in cuda_graph_on,
-                ]):
+                if any(
+                    [
+                        isinstance(m, MambaLayer) and "mamba" in cuda_graph_on,
+                        isinstance(m, Attention) and "attn" in cuda_graph_on,
+                        isinstance(m, MoERouter) and "moe_router" in cuda_graph_on,
+                    ]
+                ):
                     fully_shard(
                         m,
                         enable_cuda_graph=True,
                         mesh=mesh,
                         gradient_scaling_factor=grad_sf,
-                        **kwargs
+                        **kwargs,
                     )
                 elif isinstance(m, tuple(fsdp_unit_modules)):
                     fully_shard(
@@ -346,7 +387,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                         mesh=mesh,
                         gradient_scaling_factor=grad_sf,
                         enable_cuda_graph=False,
-                        **kwargs
+                        **kwargs,
                     )
         fully_shard(module, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
 
@@ -385,12 +426,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     ]:
                         if hasattr(param, attr_name):
                             setattr(dist_param, attr_name, getattr(param, attr_name))
-
-        # Per-module NaN checking is disabled by default on the fully_shard
-        # path to avoid the per-parameter synchronization overhead on every
-        # unshard. Enable via a manual call to module._set_nan_check(True).
-        # if ddp_config.check_for_nan_in_grad:
-        #     module._set_nan_check(True)
 
         super().__init__(config=config, module=module)
 

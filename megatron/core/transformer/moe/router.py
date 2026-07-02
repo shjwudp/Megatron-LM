@@ -1,6 +1,6 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from typing import Optional, Union
 
 import torch

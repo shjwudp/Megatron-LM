@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,6 +37,7 @@ Single-GPU tests:
         -k "test_double_shard_rejected or test_no_params_module"
 """
 
+import gc
 import sys
 from pathlib import Path
 
@@ -53,9 +54,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-    MixedPrecisionPolicy,
-)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
 
 # ------------------------------------------------------------------ #
 #  Distributed environment (NCCL session-scoped)
@@ -219,6 +218,27 @@ def _count_fsdp_modules(module):
 
 
 class TestFullyShardBasic:
+    def test_reclaims_original_parameter_cache_after_buffer_init(self, monkeypatch):
+        events = []
+        real_collect = gc.collect
+        real_empty_cache = torch.cuda.empty_cache
+
+        def collect():
+            events.append("collect")
+            return real_collect()
+
+        def empty_cache():
+            events.append("empty_cache")
+            return real_empty_cache()
+
+        monkeypatch.setattr(gc, "collect", collect)
+        monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+
+        model = SimpleMLP(64).to(_device())
+        fully_shard(model)
+
+        assert events[-2:] == ["collect", "empty_cache"]
+
     def test_module_class_becomes_fsdp(self):
         """fully_shard should dynamically convert the module class to a FSDPModule mixin."""
         torch.manual_seed(42)
@@ -510,9 +530,7 @@ class TestMixedPrecision:
     def test_fp32_grad_reduce(self):
         """grad_reduce_in_fp32=True should use fp32 gradient communication."""
         torch.manual_seed(42)
-        mp_policy = MixedPrecisionPolicy(
-            grad_comm_dtype=torch.float32
-        )
+        mp_policy = MixedPrecisionPolicy(grad_comm_dtype=torch.float32)
         model = SimpleMLP(64).to(_device()).bfloat16()
         fully_shard(model, mp_policy=mp_policy)
 
@@ -661,8 +679,10 @@ class MLPWithCheckpointing(nn.Module):
     def __init__(self, hidden=64, num_layers=3):
         super().__init__()
         self.layers = nn.ModuleList(
-            [nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
-             for _ in range(num_layers)]
+            [
+                nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
+                for _ in range(num_layers)
+            ]
         )
         self._use_activation_checkpointing = False
 
@@ -684,10 +704,12 @@ class LargePerLayerModel(nn.Module):
 
     def __init__(self, hidden=256, num_layers=4):
         super().__init__()
-        self.layers = nn.ModuleList([
-            nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
-            for _ in range(num_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
+                for _ in range(num_layers)
+            ]
+        )
 
     def forward(self, x):
         for layer in self.layers:
@@ -748,11 +770,7 @@ class TestActivationCheckpointing:
         model.enable_activation_checkpointing()
 
         for layer in model.layers:
-            fully_shard(
-                layer,
-                enable_unshard_prefetch=True,
-                enable_async_reduce_grad=True,
-            )
+            fully_shard(layer, enable_unshard_prefetch=True, enable_async_reduce_grad=True)
         fully_shard(model, enable_unshard_prefetch=True, enable_async_reduce_grad=True)
 
         x = torch.randn(2, 128, device=device, requires_grad=True)

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -490,9 +490,9 @@ def split_dtensor(
             split_points.append(split_points[-1] + size)
 
     # One collective call — result reused for all splits below.
-    assert hasattr(dtensor._local_tensor, "__create_chunk_list__"), (
-        "DTensor local tensor is missing chunk metadata."
-    )
+    assert hasattr(
+        dtensor._local_tensor, "__create_chunk_list__"
+    ), "DTensor local tensor is missing chunk metadata."
     chunk_meta = dtensor._local_tensor.__create_chunk_list__()[0]
     chunk_slice = slice(chunk_meta.offsets[dim], chunk_meta.offsets[dim] + chunk_meta.sizes[dim])
     local_offset = chunk_meta.offsets[dim]

@@ -16,6 +16,18 @@
 
 No changes to `utils.py` are needed for either overlap feature.
 
+### TE Fused GroupedMLP Pre-Hook Forwarding
+
+Transformer Engine's fused GroupedMLP path bypasses the original FC1/FC2
+module calls, so `TEGroupedMLP` explicitly forwards their pre-forward hooks
+before invoking the fused operation. Hook dispatch must preserve PyTorch's
+registration contract: hook IDs listed in `_forward_pre_hooks_with_kwargs`
+receive `(module, args, kwargs)`, while other hooks receive `(module, args)`.
+This is required for Megatron-FSDP v2, whose fine-grained unshard hook is
+registered with `with_kwargs=True`. The fused path passes empty args/kwargs
+because these hooks may trigger parameter all-gathers but may not modify
+inputs; any non-`None` hook return remains an error.
+
 ---
 
 ## `_FSDPRootContext` — Shared Coordination Object
@@ -44,7 +56,8 @@ class _FSDPRootContext:
     # --- Unshard prefetch tracking ---
     unshard_done_events: Dict[int, Optional[torch.cuda.Event]]
     # module_id -> Event: signals when that module's all-gather is complete.
-    # None means "not yet launched" or "already consumed by a wait".
+    # A private sentinel records singleton-DP unshards completed on the caller
+    # stream without creating an event. None means "not yet launched".
 
     # --- Reduce-scatter grad overlap tracking ---
     reduce_grad_buckets: Dict[int, List[Tuple[torch.cuda.Event, ParameterGroup]]]
@@ -111,6 +124,21 @@ for child in self.modules():
 `forward_order` is **static** (module tree topology, computed once). There is no first-pass
 dynamic recording phase.
 
+### Untied embedding and output FSDP units
+
+For ZeRO-3, the MCore adapter wraps modules that directly own parameters marked
+`is_embedding_or_output_parameter` as child FSDP units when embeddings and output weights are
+untied. Without this split, both large matrices remain in the root parameter group even though
+they execute at opposite ends of the iteration. Full-iteration CUDA graphs would then keep a
+concatenated root weight slot and a concatenated root gradient slot resident for every replay.
+
+The child units share the root `TracePoolAllocator`, so non-overlapping embedding/output weight
+and gradient lifetimes can map to the same stable slots. These units retain the normal autograd
+post-backward callback even when TransformerLayer callbacks are skipped for delayed TE wgrad:
+their native embedding/output gradients are not delayed. The split requires at least two
+disjoint direct owner modules. A tied weight or pipeline stage with only one endpoint is left in
+the root unit because it has no concatenated root buffer to split.
+
 **Safety constraint.** `_init_fsdp_state()` must be called **before** any forward/backward pass
 runs.  The method includes a runtime guard that rejects re-initialization if any child
 FSDPModule is still unsharded (`unshard_done_events` live) or has pending reduce-scatter
@@ -131,6 +159,12 @@ module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 # _register_backward_pre_hook (called inside register_multi_grad_hook):
 module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
 ```
+
+During activation recompute, the forward pre-hook first requests the backward
+MXFP8 columnwise buffer and then requests the forward rowwise buffer. A
+persistent columnwise buffer can make the first request communication-free;
+the two phase requests remain explicit because grouping them with
+`_coalescing_manager` does not combine their payloads into one NCCL kernel.
 
 ### `FSDPModule.unshard(async_op, bwd_pass)`
 
@@ -198,6 +232,35 @@ the NCCL collective, causing convergence divergence.
 **NVTX profiling.** `unshard()`, `reshard()`, and `reduce_grad()` each push/pop a
 `torch.cuda.nvtx` range (`"MFSDP unshard"`, `"MFSDP reshard"`, `"MFSDP reduce_grad"`)
 for profiling visibility in tools like Nsight Systems.
+
+**All-gather coalescing.** `FSDPModule.unshard()` coalesces consecutive weight-buffer
+all-gathers that use the same process group before calling the mixed-precision
+`post_unshard()` hook. This mirrors v1's bucket-group coalescing without changing
+v2's `ParameterGroup` ownership model: each group still owns its buffers and TE
+post-processing, but the module-level loop can submit several buffer all-gathers
+through one NCCL grouped launch. The post-processing step intentionally happens
+after the coalesced all-gather has been queued on the same stream, preserving the
+ordering expected by FP8/NVFP4 rebuild hooks. With `async_ops=True`, the
+coalescing manager launches the grouped collective when its context exits and
+yields a manager that owns the resulting `Work`. The async path calls
+`manager.wait()` while `ag_stream` is current before recording the module's
+readiness event. This inserts the NCCL completion dependency into `ag_stream`;
+otherwise the readiness event can run before the backend stream finishes
+writing the gathered buffers.
+
+When every weight buffer in a module belongs to a world-size-one DP group, no
+communication can overlap with compute. That path copies the local shard on the
+caller stream, skips the coalescing manager and AG-stream synchronization, and
+stores a non-event sentinel in `unshard_done_events`. The sentinel preserves the
+same prefetch/reshard state machine without adding cross-stream event nodes to a
+full-iteration CUDA graph. Modules with any DP group larger than one retain the
+normal AG-stream collective and readiness event.
+
+The gradient path applies the same rule per parameter group. A world-size-one
+gradient buffer performs local scaling and shard accumulation on the caller
+stream, releases its temporary full buffer immediately, and does not append an
+RS event to `reduce_grad_buckets`. Real multi-rank reductions retain the normal
+RS-stream overlap and delayed release behavior.
 
 Prefetched modules' data also becomes valid when their own pre-hook later calls `event.wait()`
 for them. If a module's pre-hook arrives and its event is already set (prefetch was launched
@@ -427,9 +490,72 @@ buffer before compute:
    rank, then clears the flag. The same call can bind params to `self.data` for
    the current compute phase.
 
+Current Transformer Engine releases perform the FP8/MXFP8 weight conversion,
+including scale and amax metadata updates, through
+`cast_master_weights_to_fp8`. The compatibility path for older TE releases
+retains its existing batched multi-tensor metadata copies; full-iteration CUDA
+graphs do not replace those copies with a separate per-tensor implementation.
+
+The root weight refresh batches FP8 updates by data-parallel process-group
+identity, with at most eight `ParameterGroup` requests in one TE call. A full
+batch is applied immediately while the module tree is traversed; tail batches
+are flushed at the end. Per-parameter master shards, logical offsets, and
+rowwise/columnwise target fragments are preserved. The bound reduces MXFP8
+amax reductions and kernel-launch fragmentation without retaining every FSDP
+unit's shard views or allocating one full-model packed-amax buffer. Different
+process groups, non-FP8 copies, NVFP4 updates, and dirty-buffer marking retain
+their existing behavior.
+
 The rowwise/model buffer is refreshed on forward unshard. For MXFP8, the
 transpose buffer is refreshed on backward unshard, where
 `weight_buffers_for_unshard(..., bwd_pass=True)` selects it.
+
+When `keep_fp8_transpose_cache=True`, v2 stores the MXFP8 transpose buffer as a
+replicated persistent compute buffer while retaining sharded main weights and
+optimizer state. After an optimizer step, only the local virtual shard is
+updated and the buffer is marked dirty. The first backward unshard of the next
+iteration all-gathers those shards in place and clears the dirty bit; later
+micro-batches reuse the clean columnwise payload without another all-gather.
+This is an explicit memory/performance tradeoff: it retains one full
+columnwise FP8 payload per rank. With the flag disabled, the transpose buffer
+keeps the ordinary temporary ZeRO-3 lifecycle.
+
+### FP8 normalization groups with iteration-delayed synchronization
+
+Under FP8 parameter gather, Transformer-layer normalization parameters and the
+MoE router stay in BF16 while the large attention/MLP matrices use quantized
+storage. For a ZeRO-3 parameter group containing hidden-size-bounded
+LayerNorm/RMSNorm parameters and, optionally, the bounded
+`[num_moe_experts, hidden_size]` router matrix, v2 keeps ZeRO-3 ownership for
+the optimizer-facing state but gives the small BF16 compute-weight buffer a
+replicated lifetime. This avoids recording the same small all-gather in every
+micro-batch of a full-iteration CUDA graph:
+
+1. The model-weight buffer is replicated while the FP32 main-weight buffer and
+   optimizer-facing DTensor remain sharded. After the optimizer updates this
+   rank's shard, the replicated buffer is marked dirty; the first micro-batch
+   of the next iteration all-gathers the updated shards in place. Later
+   micro-batches reuse the clean full buffer without another all-gather.
+2. Backward gradients accumulate in the temporary full gradient buffer across
+   micro-batches. TE fused accumulation keeps `overwrite_main_grad=False` for
+   this group; ordinary `.grad` tensors use `copy_` on the first micro-batch
+   and `add_` afterwards.
+3. `finish_grad_sync()` performs one reduce-scatter into the persistent local
+   grad shard and releases the full grad buffer. Its common force-reshard call
+   is a no-op for the replicated compute buffer; dirty tracking after the
+   optimizer step guarantees that the next iteration gathers updated shards
+   rather than reusing stale weights.
+
+The group's declared strategy remains `optim_grads_params`: main weights,
+persistent gradients, optimizer parameters, and optimizer state remain
+sharded. Only the small BF16 compute-weight buffer is replicated, while the
+temporary full gradient buffer spans the micro-batches.
+The selector requires an enabled FP8 policy, at least one exact normalization
+parameter, and no other parameters except the shape- and name-bounded router
+matrix. This preserves the existing same-dtype buffer and removes the whole
+small-group collective instead of splitting off a second collective. BF16
+training, quantized matrix weights, and any group containing another matrix
+retain the standard per-micro-batch ZeRO-3 lifecycle.
 
 ---
 
@@ -722,6 +848,12 @@ After `ParameterGroup._init_buffers()` copies parameter data into the internal w
 are freed via `_free_storage(p.data)`. The module holds DTensor shard views and `unshard()`
 rebinds `.data` to the all-gathered buffer, so the original storage is dead and freeing it
 reduces peak memory during model construction.
+
+After all parameter groups have initialized, `fully_shard()` runs `gc.collect()` followed by
+`torch.cuda.empty_cache()`. This returns the dead original-parameter segments before persistent
+model buffers, paged-stash buffers, or CUDA-graph allocations can reuse a few holes and pin the
+rest of those expandable segments for the lifetime of training. The cleanup is once per wrapped
+FSDP module and mirrors the initialization cleanup in the v1 implementation.
 
 ---
 

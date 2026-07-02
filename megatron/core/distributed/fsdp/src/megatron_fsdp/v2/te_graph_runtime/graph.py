@@ -1,16 +1,16 @@
-# Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
 """Standalone TE-compatible CUDA graph callable runtime."""
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
 import contextlib
 import gc
+import warnings
+from collections.abc import Iterable, Sequence
 from math import ceil, prod
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
-import warnings
 
 UPSTREAM_TE_VERSION = "v2.16"
 UPSTREAM_TE_COMMIT = "4220403e831d29e93868f7793693ea83f6b8b05b"
@@ -54,26 +54,32 @@ class _FP8GlobalStateManagerStub:
 
     @staticmethod
     def is_first_fp8_module() -> bool:
+        """Return whether the current module starts an FP8 region."""
         return False
 
     @staticmethod
     def reduce_and_update_fp8_tensors(*args, **kwargs) -> None:
+        """Provide the no-TE amax update hook."""
         return None
 
     @staticmethod
     def is_fp8_enabled() -> bool:
+        """Return whether FP8 execution is enabled."""
         return False
 
     @staticmethod
     def get_fp8_recipe() -> None:
+        """Return the active FP8 recipe when TE is available."""
         return None
 
     @staticmethod
     def get_fp8_group() -> None:
+        """Return the active FP8 process group when TE is available."""
         return None
 
     @staticmethod
     def add_fp8_tensors_to_global_buffer(*args, **kwargs) -> None:
+        """Provide the no-TE global FP8 buffer registration hook."""
         return None
 
 
@@ -82,6 +88,7 @@ FP8GlobalStateManager = _FP8GlobalStateManagerStub
 
 @contextlib.contextmanager
 def _null_autocast(*args, **kwargs):
+    """Provide a no-op autocast context when TE is unavailable."""
     yield
 
 
@@ -89,6 +96,7 @@ autocast = _null_autocast
 
 
 def get_default_fp8_recipe():
+    """Raise a targeted error when an FP8 recipe is requested without TE."""
     raise RuntimeError(
         "FP8 graph capture requires transformer_engine. Install te-graph-runtime[te] "
         "or disable FP8/TE-specific options."
@@ -100,8 +108,8 @@ def _require_torch():
     global _torch, torch, _tree_flatten, _tree_unflatten, _graph_pool_handle
     if _torch is None:
         import torch as imported_torch
-        from torch.utils._pytree import tree_flatten, tree_unflatten
         from torch._C import _graph_pool_handle as imported_graph_pool_handle
+        from torch.utils._pytree import tree_flatten, tree_unflatten
 
         _torch = imported_torch
         torch = imported_torch
@@ -125,21 +133,25 @@ def _load_optional_te() -> bool:
         from transformer_engine.common.recipe import DelayedScaling as te_DelayedScaling
         from transformer_engine.common.recipe import Recipe as te_Recipe
         from transformer_engine.pytorch.constants import dist_group_type as te_dist_group_type
-        from transformer_engine.pytorch.quantization import (
-            autocast as te_autocast,
-            FP8GlobalStateManager as te_FP8GlobalStateManager,
-            get_default_fp8_recipe as te_get_default_fp8_recipe,
-        )
         from transformer_engine.pytorch.distributed import (
             get_all_rng_states as te_get_all_rng_states,
+        )
+        from transformer_engine.pytorch.distributed import (
             graph_safe_rng_available as te_graph_safe_rng_available,
         )
         from transformer_engine.pytorch.module.base import (
             TransformerEngineBaseModule as te_TransformerEngineBaseModule,
         )
-        from transformer_engine.pytorch.ops.op import BasicOperation as te_BasicOperation
         from transformer_engine.pytorch.ops import Sequential as te_Sequential
         from transformer_engine.pytorch.ops.fuser import OperationFuser as te_OperationFuser
+        from transformer_engine.pytorch.ops.op import BasicOperation as te_BasicOperation
+        from transformer_engine.pytorch.quantization import (
+            FP8GlobalStateManager as te_FP8GlobalStateManager,
+        )
+        from transformer_engine.pytorch.quantization import autocast as te_autocast
+        from transformer_engine.pytorch.quantization import (
+            get_default_fp8_recipe as te_get_default_fp8_recipe,
+        )
     except Exception as exc:  # pragma: no cover - exact import failure is environment-specific
         _TE_AVAILABLE = False
         _TE_IMPORT_ERROR = exc
@@ -163,15 +175,18 @@ def _load_optional_te() -> bool:
 
 
 def _prepare_runtime() -> bool:
+    """Initialize lazy torch and optional Transformer Engine bindings."""
     _require_torch()
     return _load_optional_te()
 
 
 def get_all_rng_states() -> Dict[Any, Any]:
+    """Return graph-safe RNG states registered by the standalone runtime."""
     return {}
 
 
 def graph_safe_rng_available() -> bool:
+    """Return whether the installed torch exposes graph-safe RNG APIs."""
     _torch_mod = _require_torch()
     return (
         hasattr(_torch_mod.cuda.CUDAGraph, "register_generator_state")
@@ -220,13 +235,16 @@ class _WeakRefTensor:
         self.shape = tuple(int(i) for i in shape)
 
     def data_ptr(self):
+        """Return the wrapped CUDA data pointer."""
         return self._data_ptr
 
     def numel(self):
+        """Return the number of elements in the wrapped tensor shape."""
         return prod(self.shape)
 
     @property
     def __cuda_array_interface__(self):
+        """Expose the wrapped storage through the CUDA array interface."""
         return {
             "shape": self.shape,
             "typestr": _torch_dtype_to_np_typestr(self.dtype),
@@ -249,7 +267,11 @@ def make_weak_ref(x):
         return new_tensor
 
     if isinstance(x, _torch_mod.Tensor):
-        return convert_to_torch_tensor(_WeakRefTensor(x.data_ptr(), x.dtype, x.shape)) if x.is_cuda else x
+        return (
+            convert_to_torch_tensor(_WeakRefTensor(x.data_ptr(), x.dtype, x.shape))
+            if x.is_cuda
+            else x
+        )
     if isinstance(x, tuple):
         return tuple(make_weak_ref(i) for i in x)
     if isinstance(x, list):
@@ -262,8 +284,6 @@ def make_weak_ref(x):
         f"Invalid type {type(x).__name__} to make weak ref. Valid types are: "
         "torch.Tensor, tuple, list, dict, int, float, bool, and None."
     )
-
-
 
 
 _IS_GRAPH_CAPTURING = False
@@ -286,8 +306,7 @@ def _empty_capture_time_hooks() -> Dict[str, Dict[Any, Any]]:
 
 
 def _canonicalize_capture_time_hooks(
-    num_callables: int,
-    capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]],
+    num_callables: int, capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]]
 ) -> List[Dict[str, Dict[Any, Any]]]:
     if capture_time_hooks is None:
         return [_empty_capture_time_hooks() for _ in range(num_callables)]
@@ -694,8 +713,7 @@ def _make_graphed_callables(
                     per_callable_module_params.append(
                         tuple(callables[_prefix_num_layers[m_chunk] + l_no].parameters())
                         if isinstance(
-                            callables[_prefix_num_layers[m_chunk] + l_no],
-                            torch.nn.Module,
+                            callables[_prefix_num_layers[m_chunk] + l_no], torch.nn.Module
                         )
                         else ()
                     )
@@ -722,7 +740,9 @@ def _make_graphed_callables(
         module_param_start = len(static_grad_inputs) - len(module_params)
         return tuple(
             idx >= module_param_start
-            and not getattr(module_params[idx - module_param_start], "skip_backward_post_hook", False)
+            and not getattr(
+                module_params[idx - module_param_start], "skip_backward_post_hook", False
+            )
             for idx in range(len(static_grad_inputs))
         )
 
@@ -778,16 +798,10 @@ def _make_graphed_callables(
         for hook_id, hook in hooks["forward_pre_hooks"].items():
             if hook_id in with_kwargs:
                 _check_capture_time_hook_return(
-                    hook(func, args, kwargs),
-                    "forward_pre_hooks",
-                    "args/kwargs",
+                    hook(func, args, kwargs), "forward_pre_hooks", "args/kwargs"
                 )
             else:
-                _check_capture_time_hook_return(
-                    hook(func, args),
-                    "forward_pre_hooks",
-                    "args",
-                )
+                _check_capture_time_hook_return(hook(func, args), "forward_pre_hooks", "args")
 
     def _call_capture_time_forward_hooks(callable_idx, func, args, kwargs, outputs) -> None:
         hooks = capture_time_hooks[callable_idx]
@@ -795,31 +809,23 @@ def _make_graphed_callables(
         for hook_id, hook in hooks["forward_hooks"].items():
             if hook_id in with_kwargs:
                 _check_capture_time_hook_return(
-                    hook(func, args, kwargs, outputs),
-                    "forward_hooks",
-                    "output",
+                    hook(func, args, kwargs, outputs), "forward_hooks", "output"
                 )
             else:
                 _check_capture_time_hook_return(
-                    hook(func, args, outputs),
-                    "forward_hooks",
-                    "output",
+                    hook(func, args, outputs), "forward_hooks", "output"
                 )
 
     def _call_capture_time_backward_pre_hooks(callable_idx, func, grad_outputs) -> None:
         for hook in capture_time_hooks[callable_idx]["backward_pre_hooks"].values():
             _check_capture_time_hook_return(
-                hook(func, grad_outputs),
-                "backward_pre_hooks",
-                "grad_output",
+                hook(func, grad_outputs), "backward_pre_hooks", "grad_output"
             )
 
     def _call_capture_time_backward_hooks(callable_idx, func, grad_inputs, grad_outputs) -> None:
         for hook in capture_time_hooks[callable_idx]["backward_hooks"].values():
             _check_capture_time_hook_return(
-                hook(func, grad_inputs, grad_outputs),
-                "backward_hooks",
-                "grad_input",
+                hook(func, grad_inputs, grad_outputs), "backward_hooks", "grad_input"
             )
 
     def _make_grad_outputs(outputs):
@@ -843,7 +849,9 @@ def _make_graphed_callables(
             # If forward is called on a te.ops.Sequential it is not called on its constituent ops.
             elif isinstance(module, Sequential):
                 if module._module_groups is None:
-                    raise RuntimeError("module._module_groups should have been initialized by warmup")
+                    raise RuntimeError(
+                        "module._module_groups should have been initialized by warmup"
+                    )
                 for module_group in module._module_groups:
                     if isinstance(module_group, OperationFuser):
                         for basic_op in module_group._basic_ops:
@@ -875,8 +883,7 @@ def _make_graphed_callables(
         _call_capture_time_backward_pre_hooks(callable_idx, func, grad_outputs)
         with _none_grad_context_wrapper(inputs):
             torch.autograd.backward(
-                outputs_requiring_grad,
-                grad_tensors=tuple(o for o in grad_outputs if o is not None),
+                outputs_requiring_grad, grad_tensors=tuple(o for o in grad_outputs if o is not None)
             )
             grad_inputs = tuple(input.grad for input in inputs)
         _call_capture_time_backward_hooks(callable_idx, func, grad_inputs, grad_outputs)
@@ -894,12 +901,18 @@ def _make_graphed_callables(
                 required_grad_input_idx.append(i)
         module_params_with_grad = []
         for grad_inputs_idx, inputs_idx in enumerate(required_grad_input_idx):
-            if grad_inputs[grad_inputs_idx] is None and grad_inputs_idx < num_required_grad_sample_args:
+            if (
+                grad_inputs[grad_inputs_idx] is None
+                and grad_inputs_idx < num_required_grad_sample_args
+            ):
                 if not allow_unused_input:
                     raise RuntimeError(
                         "The input tensor requires grad, but the grad is None after backward pass."
                     )
-            elif grad_inputs[grad_inputs_idx] is not None and grad_inputs_idx >= num_required_grad_sample_args:
+            elif (
+                grad_inputs[grad_inputs_idx] is not None
+                and grad_inputs_idx >= num_required_grad_sample_args
+            ):
                 module_params_with_grad.append(static_input_surface[inputs_idx])
         if len(module_params_with_grad) != len(per_callable_module_params[func_idx]):
             if warmup_iter != 0:
@@ -925,10 +938,7 @@ def _make_graphed_callables(
             warmup_outputs = []
             for func_idx, func in zip(warmup_func_idx, warmup_func):
                 outputs = _run_warmup_forward(
-                    func_idx,
-                    func,
-                    func_idx,
-                    register_discovery_hooks=register_discovery_hooks,
+                    func_idx, func, func_idx, register_discovery_hooks=register_discovery_hooks
                 )
                 warmup_outputs.append((func_idx, func, outputs))
             if is_training:
@@ -961,17 +971,13 @@ def _make_graphed_callables(
                     m_chunk = -c_id - 1
                     for l_no in reversed(range(_num_layers_per_chunk[m_chunk])):
                         callable_idx = _prefix_num_layers[m_chunk] + l_no
-                        per_callable_bwd_idx = (
-                            _prefix_num_layers[m_chunk] * num_microbatches
-                        ) + (bwd_idx[m_chunk] * _num_layers_per_chunk[m_chunk] + l_no)
+                        per_callable_bwd_idx = (_prefix_num_layers[m_chunk] * num_microbatches) + (
+                            bwd_idx[m_chunk] * _num_layers_per_chunk[m_chunk] + l_no
+                        )
                         func = callables[callable_idx]
                         outputs = per_fwd_outputs[per_callable_bwd_idx]
                         _run_warmup_backward(
-                            per_callable_bwd_idx,
-                            func,
-                            outputs,
-                            warmup_iter,
-                            callable_idx,
+                            per_callable_bwd_idx, func, outputs, warmup_iter, callable_idx
                         )
                     bwd_idx[m_chunk] += 1
 
@@ -994,16 +1000,14 @@ def _make_graphed_callables(
             for func in callables
         )
         if num_warmup_iters > 0 and compiled_callables:
-            _run_warmup_iteration(
-                num_warmup_iters,
-                register_discovery_hooks=False,
-            )
+            _run_warmup_iteration(num_warmup_iters, register_discovery_hooks=False)
 
         if post_warmup_hook is not None:
             post_warmup_hook()
     torch.cuda.synchronize()
 
     import gc
+
     gc.collect()
     torch.cuda.empty_cache()
     gc.collect()
@@ -1094,9 +1098,8 @@ def _make_graphed_callables(
                         per_callable_bwd_idx -= _num_layers_per_chunk[m_chunk]
                         if not is_training:
                             raise RuntimeError("Only training mode supports backward_dw.")
-                        # If no one module needs the backward_dw, the bwd_dw_graph will be empty.
-                        # So skip capturing it. For backward_dw, the order value is c_id - 0.5 to indicate
-                        # the specific order of backward_dw.
+                        # If no module needs backward_dw, the bwd_dw_graph will be empty,
+                        # so skip capturing it. Its order value is c_id - 0.5.
                         if ceil(c_id) - c_id != 0.5:
                             raise ValueError(
                                 "The order diff of wgrad and dgrad must be 0.5, "
@@ -1107,7 +1110,9 @@ def _make_graphed_callables(
                                 "No module needs wgrad computation but get float in order"
                             )
                         bwd_dw_graph = bwd_dw_graphs[per_callable_bwd_idx]
-                        with _graph_context_wrapper(bwd_dw_graph, pool=mempool, stream=capture_stream):
+                        with _graph_context_wrapper(
+                            bwd_dw_graph, pool=mempool, stream=capture_stream
+                        ):
                             for module in visited_te_modules[per_callable_bwd_idx]:
                                 if (
                                     hasattr(module, "need_backward_dw")
@@ -1144,13 +1149,14 @@ def _make_graphed_callables(
                     if is_training:
                         func = graph_callables[per_callable_bwd_idx]
                         _call_capture_time_backward_pre_hooks(
-                            callable_idx,
-                            func,
-                            static_grad_outputs,
+                            callable_idx, func, static_grad_outputs
                         )
-                        inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
-                        with _none_grad_context_wrapper(inputs), _graph_context_wrapper(
-                            bwd_graph, pool=mempool, stream=capture_stream
+                        inputs = tuple(
+                            i for i in static_input_surface if i is not None and i.requires_grad
+                        )
+                        with (
+                            _none_grad_context_wrapper(inputs),
+                            _graph_context_wrapper(bwd_graph, pool=mempool, stream=capture_stream),
                         ):
                             torch.autograd.backward(
                                 tuple(
@@ -1161,10 +1167,7 @@ def _make_graphed_callables(
                             )
                             grad_inputs = tuple(input.grad for input in inputs)
                         _call_capture_time_backward_hooks(
-                            callable_idx,
-                            func,
-                            grad_inputs,
-                            static_grad_outputs,
+                            callable_idx, func, grad_inputs, static_grad_outputs
                         )
 
                     # Constructs a tuple suitable for returning from Graphed.backward:
@@ -1183,8 +1186,7 @@ def _make_graphed_callables(
                     per_callable_static_grad_outputs[per_callable_bwd_idx] = static_grad_outputs
                     per_callable_static_grad_inputs[per_callable_bwd_idx] = static_grad_inputs
                     returned_param_grad_clone_slots = _returned_param_grad_clone_slots(
-                        static_grad_inputs,
-                        per_callable_module_params[per_callable_bwd_idx],
+                        static_grad_inputs, per_callable_module_params[per_callable_bwd_idx]
                     )
                     per_callable_returned_param_grad_clone_slots[per_callable_bwd_idx] = (
                         returned_param_grad_clone_slots
@@ -1273,8 +1275,9 @@ def _make_graphed_callables(
                 func = graph_callables[bwd_idx]
                 _call_capture_time_backward_pre_hooks(bwd_idx, func, static_grad_outputs)
                 inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
-                with _none_grad_context_wrapper(inputs), _graph_context_wrapper(
-                    bwd_graph, pool=mempool
+                with (
+                    _none_grad_context_wrapper(inputs),
+                    _graph_context_wrapper(bwd_graph, pool=mempool),
                 ):
                     torch.autograd.backward(
                         tuple(o for o in static_outputs if o is not None and o.requires_grad),
@@ -1306,8 +1309,7 @@ def _make_graphed_callables(
             per_callable_static_grad_inputs.append(static_grad_inputs)
             per_callable_returned_param_grad_clone_slots.append(
                 _returned_param_grad_clone_slots(
-                    static_grad_inputs,
-                    per_callable_module_params[bwd_idx],
+                    static_grad_inputs, per_callable_module_params[bwd_idx]
                 )
             )
 
@@ -1540,9 +1542,11 @@ def _make_graphed_callables(
                                     # Only Set the FP8 meta for the modules included by forward
                                     continue
                                 if isinstance(m, TransformerEngineBaseModule):
-                                    from transformer_engine.pytorch.attention.dot_product_attention import (
-                                        DotProductAttention,
+                                    from transformer_engine.pytorch.attention import (
+                                        dot_product_attention,
                                     )
+
+                                    DotProductAttention = dot_product_attention.DotProductAttention
 
                                     if (
                                         isinstance(m, DotProductAttention)
@@ -1554,7 +1558,7 @@ def _make_graphed_callables(
                                     m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
                                     m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
                                     FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
-                                        m.fp8_meta,
+                                        m.fp8_meta
                                     )
                                 elif isinstance(m, BasicOperation):
                                     for mode in ("forward", "backward"):
@@ -1566,7 +1570,7 @@ def _make_graphed_callables(
                                                 "recipe"
                                             ] = FP8GlobalStateManager.get_fp8_recipe()
                                             FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
-                                                m._fp8_metas[mode],
+                                                m._fp8_metas[mode]
                                             )
                         return graphed(*user_args, **user_kwargs)
                     return orig_fwd(*user_args, **user_kwargs)
@@ -1593,8 +1597,7 @@ def _make_graphed_callables(
 
 
 def save_fp8_tensors(
-    modules: Iterable[torch.nn.Module],
-    recipe: Optional[Recipe],
+    modules: Iterable[torch.nn.Module], recipe: Optional[Recipe]
 ) -> Optional[List[Any]]:
     """
     Returns the FP8 tensors for all modules
@@ -1620,8 +1623,7 @@ def save_fp8_tensors(
 
 
 def restore_fp8_tensors(
-    modules: Iterable[torch.nn.Module],
-    fp8_tensors: Optional[List[Any]],
+    modules: Iterable[torch.nn.Module], fp8_tensors: Optional[List[Any]]
 ) -> None:
     """Restore FP8 tensors."""
 
@@ -1679,8 +1681,9 @@ def make_graphed_callables(
 
     .. warning::
 
-       Arguments 'fp8_enabled', 'fp8_calibrating', 'fp8_recipe', 'fp8_group', and 'fp8_weight_caching' are deprecated.
-       Use arguments 'enabled', 'calibrating', 'recipe', 'amax_reduction_group', and 'cache_quantized_params' instead.
+       Arguments 'fp8_enabled', 'fp8_calibrating', 'fp8_recipe', 'fp8_group',
+       and 'fp8_weight_caching' are deprecated. Use 'enabled', 'calibrating',
+       'recipe', 'amax_reduction_group', and 'cache_quantized_params' instead.
 
     Graphing parameters
     -------------------
@@ -1753,12 +1756,12 @@ def make_graphed_callables(
                           distributed group over which amaxes for the quantized tensors
                           are reduced at the end of each training step.
     cache_quantized_params: bool, default = False
-                            Whether or not to cache quantized weights across microbatches. if set to `True`,
-                            the `is_first_microbatch` boolean argument must be passed into the forward
-                            method for TransformerEngine modules. When storing primary weights in low precision
-                            using TE's `quantized_model_init` API and using an quantization aware optimizer,
-                            this arg must be set to `False` if calculating weight transposes' outside TE, e.g.,
-                            in the optimizer step.
+                            Whether to cache quantized weights across microbatches. If set to
+                            `True`, pass `is_first_microbatch` into TransformerEngine module
+                            forwards. When storing primary weights in low precision with TE's
+                            `quantized_model_init` and a quantization-aware optimizer, set this
+                            to `False` when calculating weight transposes outside TE, for example
+                            during the optimizer step.
 
     """
 

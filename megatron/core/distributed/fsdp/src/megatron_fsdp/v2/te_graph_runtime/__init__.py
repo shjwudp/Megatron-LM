@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """TE-compatible CUDA graph callable runtime.
 
 Vendored from https://github.com/buptzyb/te-graph-runtime
@@ -17,4 +19,4 @@ __all__ = [
     "UPSTREAM_TE_VERSION",
     "make_graphed_callables",
 ]
-
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.

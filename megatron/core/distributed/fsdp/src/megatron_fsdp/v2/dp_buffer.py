@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -381,6 +381,7 @@ class DataParallelBuffer:
 
         dp_rank = torch.distributed.get_rank(dp_group)
         dp_world_size = torch.distributed.get_world_size(dp_group)
+        self._dp_world_size = dp_world_size
 
         # Always build layout with logical shapes and shared chunk_size_factor
         # so that all buffers share the same proportional item-offset mapping.
@@ -442,10 +443,7 @@ class DataParallelBuffer:
         return True
 
     def _move_data_to(
-        self,
-        target_device: torch.device,
-        pin_memory: bool = False,
-        non_blocking: bool = True,
+        self, target_device: torch.device, pin_memory: bool = False, non_blocking: bool = True
     ) -> None:
         """Move ``self.data`` to *target_device*, optionally using pinned memory.
 
@@ -584,9 +582,7 @@ class DataParallelBuffer:
 
     @torch.no_grad()
     def unshard(
-        self,
-        bind_params: bool = False,
-        stream: Optional[torch.cuda.Stream] = None,
+        self, bind_params: bool = False, stream: Optional[torch.cuda.Stream] = None
     ) -> torch.Tensor:
         """All-gather the full buffer from all shards and bind parameter storage.
 
@@ -603,14 +599,20 @@ class DataParallelBuffer:
 
         sm = self.buffer_index.shard_meta
         shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
+        caller_stream = torch.cuda.current_stream()
         stream = stream or torch.cuda.current_stream()
-        stream.wait_stream(torch.cuda.current_stream())
+        stream.wait_stream(caller_stream)
         with torch.cuda.stream(stream):
-            torch.distributed.all_gather_into_tensor(
-                output_tensor=full_buffer,
-                input_tensor=shard_buffer,
-                group=self.dp_group,
-            )
+            if self._dp_world_size == 1:
+                full_buffer.copy_(shard_buffer)
+            else:
+                torch.distributed.all_gather_into_tensor(
+                    output_tensor=full_buffer, input_tensor=shard_buffer, group=self.dp_group
+                )
+            if full_buffer.is_cuda:
+                # Temporary all-gather buckets may be released from another stream before
+                # the collective finishes; record the producer stream for allocator safety.
+                full_buffer.record_stream(stream)
 
         if bind_params:
             self._bind_buffer_to_params(full_buffer)
@@ -640,6 +642,54 @@ class DataParallelBuffer:
         self.allocator.free(self.alloc_key)
         self._unsharded_buffer = None
 
+    @torch.no_grad()
+    def release_unsharded_buffer_for_reuse(self) -> None:
+        """End this buffer's allocator lifetime while retaining its tensor view.
+
+        Full-iteration CUDA graphs need the tensor object and its eventual slot
+        address to remain stable through capture. The trace planner still needs
+        the logical free event so non-overlapping buffers can share that slot.
+        """
+        if not self.is_distributed or self._unsharded_buffer is None:
+            return
+        self.allocator.free(self.alloc_key)
+
+    @torch.no_grad()
+    def rebind_unsharded_buffer_to_allocator(self, *, zero: bool = False) -> bool:
+        """Rebind a cached full buffer to the optimized allocator slot.
+
+        During the TracePoolAllocator trace phase, ``fetch_buffer()`` caches the
+        trace bucket in ``_unsharded_buffer``.  Once ``plan()`` switches the
+        allocator to optimized slots, callers that intentionally keep the cached
+        buffer alive (full-iteration CUDA graph) must refresh this reference so
+        capture records the planned stable address instead of the trace bucket.
+        """
+        if not self.is_distributed or self._unsharded_buffer is None:
+            return False
+        if getattr(self.allocator, "phase", None) != "optimized":
+            return False
+
+        old_buffer = self._unsharded_buffer
+        bucket = self.allocator.allocate(
+            key=self.alloc_key,
+            size=self.buffer_index.bucket_meta.size,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        new_buffer = bucket.data
+        self.allocator.free(self.alloc_key)
+
+        if zero:
+            new_buffer.zero_()
+        else:
+            new_buffer.copy_(old_buffer)
+
+        dirty = getattr(old_buffer, "_dirty", None)
+        if dirty is not None:
+            setattr(new_buffer, "_dirty", dirty)
+        self._unsharded_buffer = new_buffer
+        return new_buffer.data_ptr() != old_buffer.data_ptr()
+
     def fetch_buffer(self, *, as_shard: bool = False) -> torch.Tensor:
         """Return the buffer, allocating the full unsharded view if needed.
 
@@ -653,7 +703,12 @@ class DataParallelBuffer:
         caching-allocator behaviour.
         """
         if self.is_distributed:
-            if self._unsharded_buffer is None:
+            trace_storage_was_released = (
+                self._unsharded_buffer is not None
+                and getattr(self.allocator, "phase", None) == "trace"
+                and self._unsharded_buffer._typed_storage()._size() == 0
+            )
+            if self._unsharded_buffer is None or trace_storage_was_released:
                 bucket = self.allocator.allocate(
                     key=self.alloc_key,
                     size=self.buffer_index.bucket_meta.size,
@@ -708,15 +763,20 @@ class DataParallelBuffer:
         local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
 
         if not self.is_distributed and self.sharding_strategy == "no_shard":
-            stream = stream or torch.cuda.current_stream()
-            stream.wait_stream(torch.cuda.current_stream())
+            caller_stream = torch.cuda.current_stream()
+            stream = stream or caller_stream
+            stream.wait_stream(caller_stream)
             with torch.cuda.stream(stream):
                 comm_input = (
                     self.data if grad_comm_dtype == self.dtype else self.data.to(grad_comm_dtype)
                 )
                 if prescale:
                     comm_input.mul_(self.gradient_scaling_factor)
-                torch.distributed.all_reduce(comm_input, group=self.dp_group, op=op)
+                if self._dp_world_size == 1:
+                    if not prescale and self.gradient_scaling_factor not in (None, 1.0):
+                        comm_input.mul_(self.gradient_scaling_factor)
+                else:
+                    torch.distributed.all_reduce(comm_input, group=self.dp_group, op=op)
                 if grad_comm_dtype != self.dtype:
                     self.data.copy_(comm_input.to(self.dtype))
                 return
@@ -736,17 +796,22 @@ class DataParallelBuffer:
             input_buffer = self.fetch_buffer()
             output_offset = sm.local_data_index
 
-        stream = stream or torch.cuda.current_stream()
-        stream.wait_stream(torch.cuda.current_stream())
+        caller_stream = torch.cuda.current_stream()
+        stream = stream or caller_stream
+        stream.wait_stream(caller_stream)
         with torch.cuda.stream(stream):
             comm_input = input_buffer.to(grad_comm_dtype)
             if prescale:
                 comm_input.mul_(self.gradient_scaling_factor)
             reduced_grad_shard = comm_input[output_offset : output_offset + sm.size]
 
-            torch.distributed.reduce_scatter_tensor(
-                output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
-            )
+            if self._dp_world_size == 1:
+                if not prescale and self.gradient_scaling_factor not in (None, 1.0):
+                    reduced_grad_shard.mul_(self.gradient_scaling_factor)
+            else:
+                torch.distributed.reduce_scatter_tensor(
+                    output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
+                )
 
             # If the reduced shard is already in the local grad buffer, skip copy/accumulation.
             if local_grad_shard.data_ptr() == reduced_grad_shard.data_ptr():

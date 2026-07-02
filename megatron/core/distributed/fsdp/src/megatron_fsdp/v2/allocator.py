@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -54,10 +54,7 @@ class BucketAllocator:
         raise NotImplementedError
 
     def free(
-        self,
-        key: Optional[AllocatorKey] = None,
-        *,
-        param_group_id: Optional[AllocatorKey] = None,
+        self, key: Optional[AllocatorKey] = None, *, param_group_id: Optional[AllocatorKey] = None
     ) -> None:
         """Free the bucket associated with the given key."""
         raise NotImplementedError
@@ -86,16 +83,11 @@ class TemporaryBucketAllocator(BucketAllocator):
         key = _resolve_key(key, param_group_id)
         assert dtype is not None and device is not None
         if key not in self.buckets:
-            self.buckets[key] = Bucket(
-                data=torch.empty(size, dtype=dtype, device=device)
-            )
+            self.buckets[key] = Bucket(data=torch.empty(size, dtype=dtype, device=device))
         return self.buckets[key]
 
     def free(
-        self,
-        key: Optional[AllocatorKey] = None,
-        *,
-        param_group_id: Optional[AllocatorKey] = None,
+        self, key: Optional[AllocatorKey] = None, *, param_group_id: Optional[AllocatorKey] = None
     ) -> None:
         key = _resolve_key(key, param_group_id)
         if key in self.buckets:
@@ -122,18 +114,13 @@ class StorageFreeingBucketAllocator(BucketAllocator):
         key = _resolve_key(key, param_group_id)
         assert dtype is not None and device is not None
         if key not in self.buckets:
-            self.buckets[key] = Bucket(
-                data=torch.empty(size, dtype=dtype, device=device)
-            )
+            self.buckets[key] = Bucket(data=torch.empty(size, dtype=dtype, device=device))
             return self.buckets[key]
         _alloc_storage(self.buckets[key].data, torch.Size([size]))
         return self.buckets[key]
 
     def free(
-        self,
-        key: Optional[AllocatorKey] = None,
-        *,
-        param_group_id: Optional[AllocatorKey] = None,
+        self, key: Optional[AllocatorKey] = None, *, param_group_id: Optional[AllocatorKey] = None
     ) -> None:
         key = _resolve_key(key, param_group_id)
         if key in self.buckets:
@@ -187,6 +174,7 @@ class TracePoolAllocator(BucketAllocator):
         size: int  # Capacity in elements
         dtype: torch.dtype
         device: torch.device
+        stream: Optional[torch.cuda.Stream] = None
         in_use: bool = False
 
     @dataclasses.dataclass
@@ -207,6 +195,7 @@ class TracePoolAllocator(BucketAllocator):
         self._seq: int = 0
         self._trace: List["TracePoolAllocator._TraceEvent"] = []
         self._trace_meta: Dict[AllocatorKey, Tuple[int, torch.dtype, torch.device]] = {}
+        self._trace_streams: Dict[AllocatorKey, torch.cuda.Stream] = {}
         self._buckets: Dict[AllocatorKey, Bucket] = {}
         self._active_keys: Set[AllocatorKey] = set()
 
@@ -237,10 +226,7 @@ class TracePoolAllocator(BucketAllocator):
             return self._optimized_allocate(key, size, dtype, device)
 
     def free(
-        self,
-        key: Optional[AllocatorKey] = None,
-        *,
-        param_group_id: Optional[AllocatorKey] = None,
+        self, key: Optional[AllocatorKey] = None, *, param_group_id: Optional[AllocatorKey] = None
     ) -> None:
         key = _resolve_key(key, param_group_id)
         if self._phase == "released":
@@ -262,9 +248,9 @@ class TracePoolAllocator(BucketAllocator):
             self._trace.append(self._TraceEvent(seq=self._seq, op="alloc", key=key))
             self._seq += 1
             self._trace_meta[key] = (size, dtype, device)
-            self._buckets[key] = Bucket(
-                data=torch.empty(size, dtype=dtype, device=device)
-            )
+            if device.type == "cuda":
+                self._trace_streams[key] = torch.cuda.current_stream(device)
+            self._buckets[key] = Bucket(data=torch.empty(size, dtype=dtype, device=device))
         else:
             self._trace.append(self._TraceEvent(seq=self._seq, op="alloc", key=key))
             self._seq += 1
@@ -331,9 +317,7 @@ class TracePoolAllocator(BucketAllocator):
                 key_max_size[key] = meta[0]
 
         # Step 3: Group keys by (dtype, device)
-        groups: Dict[
-            Tuple[torch.dtype, torch.device], List[AllocatorKey]
-        ] = defaultdict(list)
+        groups: Dict[Tuple[torch.dtype, torch.device], List[AllocatorKey]] = defaultdict(list)
         for key in intervals_per_key:
             meta = self._trace_meta.get(key)
             if meta is not None:
@@ -430,17 +414,23 @@ class TracePoolAllocator(BucketAllocator):
                 color_of[k] = len(slot_sizes)
                 slot_sizes.append(size_k)
 
-        # Allocate each slot as a SEPARATE tensor
+        # Allocate each slot as a SEPARATE tensor. Prefer the trace stream of
+        # the largest key assigned to the slot so expandable CUDA segments can
+        # reuse the storage that the trace allocation just released.
         global_slot_offset = len(self._slots)
         slot_tensors: List[torch.Tensor] = []
+        slot_streams: List[Optional[torch.cuda.Stream]] = [None] * len(slot_sizes)
 
-        for slot_size in slot_sizes:
-            t = torch.empty(slot_size, dtype=dtype, device=device)
+        for k in keys_sorted:
+            slot_idx = color_of[k]
+            if slot_streams[slot_idx] is None:
+                slot_streams[slot_idx] = self._trace_streams.get(k)
+
+        for slot_size, stream in zip(slot_sizes, slot_streams):
+            t = self._allocate_slot_tensor(slot_size, dtype, device, stream)
             slot_tensors.append(t)
             self._slots.append(
-                self._SlotInfo(
-                    tensor=t, size=slot_size, dtype=dtype, device=device
-                )
+                self._SlotInfo(tensor=t, size=slot_size, dtype=dtype, device=device, stream=stream)
             )
 
         # Map each key to its slot and pre-compute the view
@@ -454,6 +444,15 @@ class TracePoolAllocator(BucketAllocator):
 
         return sum(slot_sizes)
 
+    @staticmethod
+    def _allocate_slot_tensor(
+        size: int, dtype: torch.dtype, device: torch.device, stream: Optional[torch.cuda.Stream]
+    ) -> torch.Tensor:
+        if stream is None:
+            return torch.empty(size, dtype=dtype, device=device)
+        with torch.cuda.stream(stream):
+            return torch.empty(size, dtype=dtype, device=device)
+
     # -- Phase 3: optimized runtime ------------------------------------- #
 
     def _optimized_allocate(
@@ -461,9 +460,7 @@ class TracePoolAllocator(BucketAllocator):
     ) -> Bucket:
         slot_idx = self._key_to_slot[key]
         slot = self._slots[slot_idx]
-        assert size <= slot.size, (
-            f"requested {size} > slot capacity {slot.size} (key={key!r})"
-        )
+        assert size <= slot.size, f"requested {size} > slot capacity {slot.size} (key={key!r})"
         slot.in_use = True
         self._active_keys.add(key)
         # Return a view of the pre-allocated slot tensor
@@ -484,6 +481,7 @@ class TracePoolAllocator(BucketAllocator):
         self._seq = 0
         self._trace.clear()
         self._trace_meta.clear()
+        self._trace_streams.clear()
         self._buckets.clear()
         self._active_keys.clear()
         self._slots.clear()
@@ -512,9 +510,9 @@ class TracePoolAllocator(BucketAllocator):
             self.reset()
             return
 
-        assert self._phase == "optimized", (
-            f"release() requires 'optimized' or 'trace' phase, got '{self._phase}'"
-        )
+        assert (
+            self._phase == "optimized"
+        ), f"release() requires 'optimized' or 'trace' phase, got '{self._phase}'"
         for slot in self._slots:
             _free_storage(slot.tensor)
             slot.tensor = torch.empty(0, dtype=slot.dtype, device=slot.device)
@@ -532,7 +530,7 @@ class TracePoolAllocator(BucketAllocator):
             return
 
         for slot_idx, slot in enumerate(self._slots):
-            new_tensor = torch.empty(slot.size, dtype=slot.dtype, device=slot.device)
+            new_tensor = self._allocate_slot_tensor(slot.size, slot.dtype, slot.device, slot.stream)
             slot.tensor = new_tensor
 
         for key, slot_idx in self._key_to_slot.items():
@@ -558,10 +556,12 @@ class TracePoolAllocator(BucketAllocator):
 
     @property
     def phase(self) -> str:
+        """Return the allocator lifecycle phase."""
         return self._phase
 
     @property
     def total_pool_bytes(self) -> int:
+        """Return total bytes held by planned slot tensors."""
         total = 0
         for slot in self._slots:
             total += slot.size * slot.tensor.element_size()
@@ -587,9 +587,7 @@ class TracePoolAllocator(BucketAllocator):
         if self._phase in ("optimized", "released"):
             lines.append(f"\nslots: {len(self._slots)} ({self._phase})")
             for i, slot in enumerate(self._slots):
-                keys_in_slot = [
-                    k for k, idx in self._key_to_slot.items() if idx == i
-                ]
+                keys_in_slot = [k for k, idx in self._key_to_slot.items() if idx == i]
                 if self._phase == "optimized":
                     addr_str = f"addr=0x{slot.tensor.data_ptr():x}"
                 else:
@@ -616,9 +614,7 @@ class TracePoolAllocator(BucketAllocator):
         return "\n".join(lines)
 
 
-def _intervals_overlap(
-    ivs_a: List[Tuple[int, int]], ivs_b: List[Tuple[int, int]]
-) -> bool:
+def _intervals_overlap(ivs_a: List[Tuple[int, int]], ivs_b: List[Tuple[int, int]]) -> bool:
     """Check if any interval in ivs_a overlaps with any interval in ivs_b.
 
     Two intervals (a_start, a_end) and (b_start, b_end) overlap iff
