@@ -376,8 +376,14 @@ def _make_bwd_pre_hook(module):
 def _make_bwd_post_hook(module):
     def hook(mod, grad_input, grad_output):
         module.reshard()
-        # Clear grad to avoid memory leak in CUDA graph capture.
-        for param_group in module._fsdp_param_groups:
-            for param in param_group.params:
-                param.grad = None
+        # NOTE: do NOT clear param.grad here. Nulling grads at capture time made
+        # non-TE (plain nn.Linear) params appear grad-less during warmup, so they
+        # were filtered out of the graph's static_input_surface and never received
+        # gradients on replay (their main_grad was then zeroed by reduce_grad).
+        # Grad cleanup is delegated to graph.py (make_graphed_callables):
+        #   - _none_grad_context_wrapper nulls/restores grads around the capture
+        #     backward, and returned param grads are cloned on return
+        #     (_clone_param_grads_on_return=True) to avoid aliasing static buffers;
+        #   - FSDP reduce_grad copies param.grad -> main_grad and deletes param.grad
+        #     each step, so nothing accumulates or leaks between iterations.
     return hook
