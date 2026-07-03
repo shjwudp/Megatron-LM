@@ -370,6 +370,7 @@ def _none_grad_context_wrapper(inputs):
     """
     original_input_grads = []
     for input_tensor in inputs:
+        assert input_tensor.grad is None, f"Input tensor grad must be None before graph capture. input_tensor={input_tensor}, input_tensor.grad={input_tensor.grad}"
         original_input_grads.append(input_tensor.grad)
         input_tensor.grad = None
     yield
@@ -715,6 +716,31 @@ def _make_graphed_callables(
     bwd_dw_graphs = [torch.cuda.CUDAGraph() for _ in range(len(flatten_sample_args))]
     graph_callables = [None for _ in range(len(flatten_sample_args))]
 
+    def _refresh_module_param_surface(idx, func):
+        """Rebind the module-param tail of the input surface to the live params.
+
+        A backward pre-hook performs the callable's final parameter replacement
+        (e.g. FSDP unshard rebinds the unsharded compute leaves), so
+        ``func.parameters()`` here yields the exact autograd leaves the captured
+        backward differentiates. Snapshotting ``parameters()`` once at build time
+        is unsafe because a module may be in a different shard state then (its
+        registered parameter can be swapped between the sharded and unsharded
+        views across shard/unshard cycles). Refreshing keeps the input surface,
+        ``per_callable_module_params`` (used for clone slots and for the replay
+        ``func_args``), all referencing the correct objects so returned grads
+        land on the parameters the caller reads. The sample-arg prefix is
+        preserved unchanged.
+        """
+        surface = per_callable_static_input_surfaces[idx]
+        if not isinstance(func, torch.nn.Module):
+            return surface
+        n_args = per_callable_len_user_args[idx]
+        refreshed_params = tuple(func.parameters())
+        surface = tuple(surface[:n_args]) + refreshed_params
+        per_callable_static_input_surfaces[idx] = surface
+        per_callable_module_params[idx] = refreshed_params
+        return surface
+
     def _returned_param_grad_clone_slots(static_grad_inputs, module_params):
         """Snapshot static grad slots that need clones before Graphed.backward returns."""
         if not _clone_param_grads_on_return:
@@ -867,12 +893,14 @@ def _make_graphed_callables(
         return flatten_outputs
 
     def _run_warmup_backward(func_idx, func, outputs, warmup_iter, callable_idx) -> None:
-        static_input_surface = per_callable_static_input_surfaces[func_idx]
-        inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
         outputs_requiring_grad = tuple(o for o in outputs if o is not None and o.requires_grad)
         grad_outputs = _make_grad_outputs(outputs)
 
         _call_capture_time_backward_pre_hooks(callable_idx, func, grad_outputs)
+        # Refresh the surface to the now-unsharded, backward-ready leaves before
+        # reading grads, so the grad filtering below operates on the real params.
+        static_input_surface = _refresh_module_param_surface(func_idx, func)
+        inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
         with _none_grad_context_wrapper(inputs):
             torch.autograd.backward(
                 outputs_requiring_grad,
@@ -1148,6 +1176,9 @@ def _make_graphed_callables(
                             func,
                             static_grad_outputs,
                         )
+                        static_input_surface = _refresh_module_param_surface(
+                            per_callable_bwd_idx, func
+                        )
                         inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
                         with _none_grad_context_wrapper(inputs), _graph_context_wrapper(
                             bwd_graph, pool=mempool, stream=capture_stream
@@ -1272,6 +1303,7 @@ def _make_graphed_callables(
             if is_training:
                 func = graph_callables[bwd_idx]
                 _call_capture_time_backward_pre_hooks(bwd_idx, func, static_grad_outputs)
+                static_input_surface = _refresh_module_param_surface(bwd_idx, func)
                 inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
                 with _none_grad_context_wrapper(inputs), _graph_context_wrapper(
                     bwd_graph, pool=mempool

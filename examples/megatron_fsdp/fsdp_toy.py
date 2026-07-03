@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import argparse
+import logging
 import os
 import time
 from pathlib import Path
@@ -417,6 +418,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        force=True,
+    )
     args = parse_args()
 
     if args.record_memory_history:
