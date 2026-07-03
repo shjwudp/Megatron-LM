@@ -239,6 +239,9 @@ def mfsdp_post_backward_hook(module: nn.Module):
         "hooks must not fire during CUDA graph capture"
     )
 
+    if torch.distributed.get_rank() == 0:
+        print(f"mfsdp_post_backward_hook: module={module._fsdp_module_name}, id={id(module)}")
+
     for submodule in module._get_fsdp_modules(recursive=True):
         if submodule.post_backward_issued:
             continue
@@ -248,6 +251,10 @@ def mfsdp_post_backward_hook(module: nn.Module):
             param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
             for param_group in submodule._fsdp_param_groups
         ):
+            for param_names, param_group in submodule._named_param_groups:
+                for param_name, param in zip(param_names, param_group.params):
+                    if torch.distributed.get_rank() == 0:
+                        print(f"mfsdp_post_backward_hook: param={param_name}, grad is None: {param.grad is None}")
             submodule.reduce_grad(async_op=ctx.enable_async_reduce_grad)
         submodule.post_backward_issued = True
     ctx._advance_backward_module()
