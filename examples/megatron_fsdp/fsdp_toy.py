@@ -26,6 +26,75 @@ from torch.distributed.checkpoint.state_dict import set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
+import sys
+
+
+# -----------------------
+# Debug: graph-break probe (--debug-compile)
+# -----------------------
+
+def _debug_compile_breaks(model: nn.Module, args, device) -> None:
+    """Probe: show exactly what graph breaks happen in an FSDP model.
+
+    Uses ``torch._dynamo.explain`` to enumerate **every graph break and why**,
+    then attempts ``torch.compile(model, fullgraph=True)`` to demonstrate
+    that eager-mode FSDP (with backward hooks, .data rebinding, stream ops)
+    fails full-graph compilation.  Exits after the probe — no training.
+    """
+    rank = dist.get_rank()
+
+    x0 = torch.randn(args.batch_size, args.seq_len, args.model_dim,
+                     device=device, dtype=torch.bfloat16)
+
+    # ---- 1) List every graph break + reason ----------------------------
+    if rank == 0:
+        print("\n" + "=" * 72)
+        print("[debug-compile] torch._dynamo.explain(model)(x)")
+        print("=" * 72)
+    explanation = torch._dynamo.explain(model)(x0)
+    if rank == 0:
+        print(f"\nGraph break count = {explanation.graph_break_count}")
+        print("-" * 50)
+        for i, break_ in enumerate(explanation.break_reasons):
+            print(f"  Break #{i + 1}: {break_}")
+
+    # ---- 2) Attempt fullgraph=True compilation --------------------------
+    if rank == 0:
+        print("\n" + "=" * 72)
+        print("[debug-compile] torch.compile(model, fullgraph=True)(x)")
+        print("=" * 72)
+    try:
+        compiled = torch.compile(model, fullgraph=True)
+        y = compiled(x0)
+        if rank == 0:
+            print("  (unexpected) fullgraph compilation SUCCEEDED")
+    except Exception as exc:
+        if rank == 0:
+            msg = str(exc).split("\n")[0][:200]
+            print(f"  fullgraph=True FAILED as expected: {type(exc).__name__}: {msg}")
+
+    # ---- 3) Contrast: fullgraph=False (silently splits) ----------------
+    if rank == 0:
+        print("\n" + "=" * 72)
+        print("[debug-compile] torch.compile(model, fullgraph=False)(x)")
+        print("  Silently splits into subgraphs around FSDP hooks — no error, but")
+        print("  each subgraph can't see the all-gather/reduce-scatter it should overlap.")
+        print("=" * 72)
+    try:
+        compiled = torch.compile(model, fullgraph=False)
+        y = compiled(x0)
+        if rank == 0:
+            print("  fullgraph=False compiled (subgraphs only, no full-graph optimizations)")
+    except Exception as exc:
+        if rank == 0:
+            print(f"  Failed: {exc}")
+
+    if rank == 0:
+        print("=" * 72)
+        print("[debug-compile] done — exiting (no training with --debug-compile)\n")
+    dist.barrier()
+    dist.destroy_process_group()
+    sys.exit(0)
 
 # -----------------------
 # Model definitions
@@ -413,6 +482,9 @@ def parse_args() -> argparse.Namespace:
                         help="Random seed for model init and teacher-student data.")
     parser.add_argument("--convergence-threshold", type=float, default=0.5,
                         help="With --use-real-data, assert final_loss < initial_loss * this.")
+    parser.add_argument("--debug-compile", action="store_true",
+                        help="Probe: run torch._dynamo.explain + torch.compile(fullgraph=True) "
+                        "to show exactly which FSDP hooks/ops break the graph, then exit.")
     return parser.parse_args()
 
 
@@ -437,6 +509,11 @@ def main() -> None:
         enable_trace_pool=args.use_trace_pool,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    if args.debug_compile:
+        device = torch.device(f"cuda:{dist.get_rank()}")
+        _debug_compile_breaks(model, args, device)
+        # _debug_compile_breaks calls sys.exit(0) — never reaches here.
 
     data = None
     if args.use_real_data:
