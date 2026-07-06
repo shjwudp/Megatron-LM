@@ -8,9 +8,11 @@ logger = logging.getLogger(__name__)
 try:
     import multistorageclient as msc
 
+    _msc_available = True
     logger.info('The multistorageclient package is available.')
 except ModuleNotFoundError:
     msc = None
+    _msc_available = False
 
 
 class _FeatureFlag:
@@ -39,7 +41,7 @@ class _FeatureFlag:
             )
         if not self.is_enabled():
             raise RuntimeError(
-                "The MSC feature is disabled. Please enable it by passing --enable-msc."
+                "The MSC feature is disabled. Please enable by removing the --disable-msc argument."
             )
         return msc
 
@@ -52,7 +54,7 @@ class _FeatureFlag:
         self._enabled = state['_enabled']
 
 
-MultiStorageClientFeature = _FeatureFlag(default=False)
+MultiStorageClientFeature = _FeatureFlag(_msc_available)
 
 
 def open_file(*args, **kwargs):

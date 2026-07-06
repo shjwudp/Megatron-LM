@@ -49,7 +49,7 @@ class TESpecProvider(BackendSpecProvider):
         """Which column parallel linear module TE backend uses"""
         return TEColumnParallelLinear
 
-    def row_parallel_linear(self) -> type[TERowParallelLinear]:
+    def row_parallel_linear(self) -> type:
         """Which row parallel linear module TE backend uses"""
         return TERowParallelLinear
 

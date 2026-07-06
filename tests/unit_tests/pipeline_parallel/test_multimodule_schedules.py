@@ -61,7 +61,6 @@ def destroy_all_grids():
         grid.destroy()
     _active_grids.clear()
     BridgeCommunicator.destroy_broadcast_pgs()
-    BridgeCommunicator.destroy_bridge_pgs()
 
 
 def get_pg_collection(grid):

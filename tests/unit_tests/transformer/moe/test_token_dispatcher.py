@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import dataclasses
 import math
 from types import SimpleNamespace
@@ -15,10 +16,9 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
-from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
 from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher
-from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -145,23 +145,21 @@ class MoEModelTestContainer:
             add_bias_linear=kwargs.get("add_bias_linear", False),
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
-            calculate_per_token_loss=kwargs.get("calculate_per_token_loss", False),
         )
 
         # init moe layer
         self.moe_layer = self.new_moe_layer()
 
     def new_moe_layer(self, **kargs):
-        submodules = get_submodules(
-            get_gpt_layer_local_submodules(
-                num_experts=self.config.num_moe_experts,
-                moe_grouped_gemm=self.config.moe_grouped_gemm,
-            ).mlp
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=self.config.num_moe_experts, moe_grouped_gemm=self.config.moe_grouped_gemm
         )
-        assert isinstance(submodules, MoESubmodules)
         new_config = dataclasses.replace(self.config, **kargs)
-        moe_layer = MoELayer(new_config, submodules).cuda().to(dtype=self.test_dtype)
-        moe_layer.set_layer_number(0)
+        moe_layer = (
+            MoELayer(new_config, submodules.mlp.submodules, layer_number=0)
+            .cuda()
+            .to(dtype=self.test_dtype)
+        )
         return moe_layer
 
     def __del__(self):
@@ -465,12 +463,6 @@ def is_deep_ep_available():
     return HAVE_DEEP_EP
 
 
-def is_deep_ep_v2_available():
-    from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP_V2
-
-    return HAVE_DEEP_EP_V2
-
-
 def is_hybrid_ep_available():
     from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
 
@@ -642,18 +634,9 @@ def test_sequence_packing_thd_e2e_proxy_model(dispatcher):
         Utils.destroy_model_parallel()
 
 
-def skip_if_flex_backend_unavailable(moe_flex_dispatcher_backend):
-    if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
-        pytest.skip("Deep EP is not available")
-    if moe_flex_dispatcher_backend == "deepepv2" and not is_deep_ep_v2_available():
-        pytest.skip("Deep EP v2 is not available")
-    if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
-        pytest.skip("Hybrid EP is not available")
-
-
 @pytest.mark.skipif(
-    not is_deep_ep_available() and not is_deep_ep_v2_available() and not is_hybrid_ep_available(),
-    reason="Deep EP, Deep EP v2 and Hybrid EP are not available",
+    not is_deep_ep_available() and not is_hybrid_ep_available(),
+    reason="Deep EP and Hybrid EP are not available",
 )
 class TestFlexDispatcher:
     def setup_method(self, method):
@@ -667,7 +650,7 @@ class TestFlexDispatcher:
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "deepepv2", "hybridep"])
+    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep"])
     @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
     def test_forward_backward(
         self,
@@ -677,7 +660,10 @@ class TestFlexDispatcher:
         moe_flex_dispatcher_backend,
         moe_permute_fusion_into_hybridep,
     ):
-        skip_if_flex_backend_unavailable(moe_flex_dispatcher_backend)
+        if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
+            pytest.skip("Deep EP is not available")
+        if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
+            pytest.skip("Hybrid EP is not available")
         if moe_permute_fusion_into_hybridep:
             if permute_fusion or moe_flex_dispatcher_backend != "hybridep":
                 pytest.skip(
@@ -708,7 +694,7 @@ class TestFlexDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "deepepv2", "hybridep"])
+    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep"])
     @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
     def test_capacity_forward_backward(
         self,
@@ -718,7 +704,10 @@ class TestFlexDispatcher:
         moe_flex_dispatcher_backend,
         moe_permute_fusion_into_hybridep,
     ):
-        skip_if_flex_backend_unavailable(moe_flex_dispatcher_backend)
+        if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
+            pytest.skip("Deep EP is not available")
+        if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
+            pytest.skip("Hybrid EP is not available")
         if moe_permute_fusion_into_hybridep:
             if permute_fusion or moe_flex_dispatcher_backend != "hybridep":
                 pytest.skip(
@@ -754,7 +743,7 @@ class TestFlexDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", [True])
-    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "deepepv2", "hybridep"])
+    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep"])
     @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
     def test_router_padding_for_fp8_forward_backward(
         self,
@@ -764,7 +753,10 @@ class TestFlexDispatcher:
         moe_flex_dispatcher_backend,
         moe_permute_fusion_into_hybridep,
     ):
-        skip_if_flex_backend_unavailable(moe_flex_dispatcher_backend)
+        if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
+            pytest.skip("Deep EP is not available")
+        if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
+            pytest.skip("Hybrid EP is not available")
         if moe_permute_fusion_into_hybridep:
             if permute_fusion or moe_flex_dispatcher_backend != "hybridep":
                 pytest.skip(

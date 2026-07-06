@@ -1,14 +1,12 @@
 #!/bin/bash
 
 CHECKPOINT_PATH=${1:-"checkpoints/llama3_8b_fsdp_fp8"}
-DATA_ARG=${2:-"MOCK"}       # Data prefix, or "MOCK"
-TOKENIZER_ARG=${3:-"MOCK"}  # Path to tokenizer model, or "MOCK"
-NSYS_PROFILE_PATH=${4:-"nsys_profiles/llama3_8b_fsdp_fp8"}
-TENSORBOARD_LOGS_PATH=${5:-"tensorboard_logs/llama3_8b_fsdp_fp8"}
+TENSORBOARD_LOGS_PATH=${2:-"tensorboard_logs/llama3_8b_fsdp_fp8"}
+TOKENIZER_ARG=${3:-"MOCK"} # Path to tokenizer model, or "MOCK"
+DATA_ARG=${4:-"MOCK"}     # Data prefix, or "MOCK"
 
 # Create directories if they don't exist
 mkdir -p "$(dirname "$CHECKPOINT_PATH")"
-mkdir -p "$(dirname "$NSYS_PROFILE_PATH")"
 mkdir -p "$(dirname "$TENSORBOARD_LOGS_PATH")"
 
 # Distributed training setup
@@ -22,18 +20,6 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 # Path to the pretrain_gpt.py script, assuming this script 
 # is run from the root of the Megatron-LM repository.
 PRETRAIN_SCRIPT_PATH="pretrain_gpt.py"
-
-# NSight Profiling
-NSYS_PROFILE=${NSYS_PROFILE:-0}
-
-# Optional `uv run` venv prefix. With uv, nsys (and its child workers) all
-# inherit the project venv. Without uv, fall back to the ambient `python`.
-USE_UV=${USE_UV:-1}
-if [ "${USE_UV}" = 1 ]; then
-    VENV_PREFIX="uv run"
-else
-    VENV_PREFIX=""
-fi
 
 # Model & Training Parameters
 USE_MEGATRON_FSDP=${USE_MEGATRON_FSDP:-1}
@@ -103,7 +89,6 @@ TRAINING_ARGS=(
     --adam-beta2 0.95
     --bf16
     --cross-entropy-loss-fusion
-    --no-check-for-nan-in-loss-and-grad
     --manual-gc
     --empty-unused-memory-level 1
     --exit-duration-in-mins 235
@@ -119,7 +104,7 @@ if [ "${USE_MEGATRON_FSDP}" = 1 ]; then
         --calculate-per-token-loss
         --init-model-with-meta-device
         --ckpt-format fsdp_dtensor
-        --grad-reduce-in-bf16   # Will be deprecated soon!
+        --grad-reduce-in-bf16
         --use-nccl-ub
         --fsdp-double-buffer
         --fsdp-manual-registration
@@ -131,10 +116,6 @@ if [ "${USE_MEGATRON_FSDP}" = 1 ]; then
         # --megatron-fsdp-main-params-dtype fp32
         # --megatron-fsdp-main-grads-dtype auto
         # --megatron-fsdp-grad-comm-dtype auto
-        # To use decoupled (mixed-precision) gradients...
-        # --use-precision-aware-optimizer
-        # To use full-iteration CUDA graphs with Megatron-FSDP...
-        # --cuda-graph-impl full_iteration
     )
 fi
 
@@ -202,31 +183,14 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-interval 100
     --save-interval 1000
     --log-throughput
+    --profile
+    --profile-step-start 4
+    --profile-step-end 6
     --distributed-timeout-minutes 60
     --save "$CHECKPOINT_PATH"
     --load "$CHECKPOINT_PATH" 
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
 )
-
-# Profiling (NSYS_PROFILE=1 bash ...)
-if [ "${NSYS_PROFILE}" = 1 ]; then
-    TRAINING_ARGS+=(
-        --profile
-        --profile-step-start 8
-        --profile-step-end 12
-        --profile-ranks 0
-    )
-    PROFILE_CMD=(
-        nsys profile
-        --sample=none --cpuctxsw=none
-        --trace=cuda,nvtx,cublas,cudnn
-        --capture-range=cudaProfilerApi --capture-range-end=stop
-        --cuda-graph-trace=node --cuda-memory-usage=true
-        -f true -x true -o "$NSYS_PROFILE_PATH"
-    )
-else
-    PROFILE_CMD=()
-fi
 
 # Ensure pretrain_gpt.py is found
 if [ ! -f "$PRETRAIN_SCRIPT_PATH" ]; then
@@ -235,8 +199,8 @@ if [ ! -f "$PRETRAIN_SCRIPT_PATH" ]; then
     exit 1
 fi
 
-# Run the training command.
-$VENV_PREFIX "${PROFILE_CMD[@]}" python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
+# Run the training command
+torchrun ${DISTRIBUTED_ARGS[@]} \
     "$PRETRAIN_SCRIPT_PATH" \
     ${MODEL_ARGS[@]} \
     ${TRAINING_ARGS[@]} \

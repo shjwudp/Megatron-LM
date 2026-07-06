@@ -7,14 +7,13 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
-from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import (
     get_default_pg_collection,
     get_updated_expert_bias,
     router_gating_linear,
 )
 from megatron.core.transformer.moe.router import Router, TopKRouter
-from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -49,11 +48,10 @@ class TestTop2Router:
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
         )
-        submodules = get_submodules(
-            get_gpt_layer_local_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=num_moe_experts, moe_grouped_gemm=False
         )
-        assert isinstance(submodules, MoESubmodules)
-        self.sequential_mlp = MoELayer(self.transformer_config, submodules)
+        self.sequential_mlp = MoELayer(self.transformer_config, submodules.mlp.submodules)
         self.router = cast(Router, self.sequential_mlp.router)
 
     def teardown_method(self, method):
@@ -319,11 +317,10 @@ class TestGroupLimitedRouter:
         )
 
         # init MoE layer
-        submodules = get_submodules(
-            get_gpt_layer_local_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=num_moe_experts, moe_grouped_gemm=False
         )
-        assert isinstance(submodules, MoESubmodules)
-        self.moe_layer = MoELayer(self.transformer_config, submodules).cuda()
+        self.moe_layer = MoELayer(self.transformer_config, submodules.mlp.submodules).cuda()
         self.router = cast(Router, self.moe_layer.router)
 
     def teardown_method(self, method):
@@ -425,11 +422,10 @@ class TestAuxLossFreeTop2Router:
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
         )
-        submodules = get_submodules(
-            get_gpt_layer_local_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=num_moe_experts, moe_grouped_gemm=False
         )
-        assert isinstance(submodules, MoESubmodules)
-        self.moe_layer = MoELayer(self.transformer_config, submodules)
+        self.moe_layer = MoELayer(self.transformer_config, submodules.mlp.submodules)
         self.router = cast(Router, self.moe_layer.router)
         assert self.router.expert_bias is not None
         assert self.router.local_tokens_per_expert is not None
@@ -472,14 +468,11 @@ class TestAuxLossFreeTop2Router:
     def test_router_forward_fusion_equivalence(self, score_function):
         with torch.no_grad():
             # Build two fresh routers to avoid bias update interference
-            submodules = get_submodules(
-                get_gpt_layer_local_submodules(
-                    num_experts=self.transformer_config.num_moe_experts, moe_grouped_gemm=False
-                ).mlp
+            submodules = get_gpt_layer_local_submodules(
+                num_experts=self.transformer_config.num_moe_experts, moe_grouped_gemm=False
             )
-            assert isinstance(submodules, MoESubmodules)
-            moe_layer_ref = MoELayer(self.transformer_config, submodules)
-            moe_layer_fused = MoELayer(self.transformer_config, submodules)
+            moe_layer_ref = MoELayer(self.transformer_config, submodules.mlp.submodules)
+            moe_layer_fused = MoELayer(self.transformer_config, submodules.mlp.submodules)
             router_ref = moe_layer_ref.router.cuda()
             router_fused = moe_layer_fused.router.cuda()
 
@@ -533,10 +526,6 @@ def test_router_gating_linear(router_dtype):
     assert output.dtype == router_dtype
     assert ref_inp.grad.dtype == ref_inp.dtype
     assert ref_weight.grad.dtype == ref_weight.dtype
-    # Relax atol for float32: TE general_gemm produces results ~6.5e-3 away from
-    # torch.nn.functional.linear, which exceeds the default 1e-3 atol.
-    if router_dtype == torch.float32:
-        tols = dict(rtol=2.0e-2, atol=1.0e-2)
     assert torch.allclose(output, ref_output, **tols)
     assert torch.allclose(inp.grad, ref_inp.grad, **tols)
     assert torch.allclose(weight.grad, ref_weight.grad, **tols)
@@ -695,12 +684,10 @@ class TestHashRouting:
     def test_moe_layer_hash_routing_integration(self):
         """End-to-end MoELayer forward/backward with hash routing; raises without input_ids."""
         config = _hash_routing_config(moe_n_hash_layers=1)
-        submodules = get_submodules(
-            get_gpt_layer_local_submodules(
-                num_experts=config.num_moe_experts, moe_grouped_gemm=False
-            ).mlp
+        submodules = get_gpt_layer_local_submodules(
+            num_experts=config.num_moe_experts, moe_grouped_gemm=False
         )
-        moe_layer = MoELayer(config, submodules, layer_number=1).cuda()
+        moe_layer = MoELayer(config, submodules.mlp.submodules, layer_number=1).cuda()
 
         hidden_states = torch.randn(8, 2, 16, device="cuda", requires_grad=True)
         input_ids = torch.randint(0, 128, (2, 8), device="cuda")

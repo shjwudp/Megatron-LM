@@ -160,10 +160,10 @@ class InternViTRMSNorm(MegatronModule):
             return super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
 
-def get_mlp_module_spec(use_te: bool = True):
+def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     # Dense MLP w/ or w/o TE modules.
-    return partial(
-        MLP.as_mlp_submodule,
+    return ModuleSpec(
+        module=MLP,
         submodules=MLPSubmodules(
             linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
             linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,

@@ -46,10 +46,10 @@ class MegatronTokenizerText(MegatronTokenizerBase):
 
         if config_template is not None:
             self.chat_template = config_template
-        elif kwargs_template is not None:
-            self.chat_template = kwargs_template
-        else:
+        elif tokenizer_template is not None:
             self.chat_template = tokenizer_template
+        else:
+            self.chat_template = kwargs_template
 
     def _restore_model(self, **kwargs) -> MegatronTokenizerTextAbstract:
         """Returns tokenizer library object."""
