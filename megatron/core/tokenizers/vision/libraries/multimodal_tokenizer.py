@@ -257,7 +257,6 @@ class MegatronMultimodalTokenizer:
             add_generation_prompt=add_generation_prompt,
             return_assistant_token_mask=False,
             return_tensors="np",
-            return_dict=False,
             chat_template=self._prompt_config.custom_chat_template,
         )[0]
 
@@ -273,10 +272,7 @@ class MegatronMultimodalTokenizer:
                 raise ValueError(f"empty turn in conversation: {conversation}. Skipping.")
 
             turn_tokens = self.tokenizer.apply_chat_template(
-                [turn],
-                tokenize=True,
-                return_dict=False,
-                chat_template=self._prompt_config.custom_chat_template,
+                [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
             )
 
             # There should be only one BOS at the very beginning.

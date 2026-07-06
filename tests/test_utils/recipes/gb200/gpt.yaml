@@ -11,7 +11,6 @@ spec:
   n_repeat: 5
   platforms: dgx_gb200
   script_setup: |
-    set -euo pipefail
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
@@ -35,8 +34,6 @@ spec:
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
   script: |-
-    set -euo pipefail
-    : "${{RUN_ID:=pr-$$}}"
     ls
     cd /opt/megatron-lm
 
@@ -54,8 +51,8 @@ spec:
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
-        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
-        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
     )
 
     set +x 
@@ -78,7 +75,7 @@ products:
   - test_case: [gpt3_mcore_tp1_pp2]
     products:
       - environment: [dev]
-        scope: [nightly, L0-smoke]
+        scope: [nightly]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_tp1_pp2_resume_torch_dist]
     products:
@@ -110,7 +107,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files]
     products:
       - environment: [dev]
-        scope: [nightly, L0-smoke]
+        scope: [nightly]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp1_dist_optimizer_fim_dataset]
     products:
