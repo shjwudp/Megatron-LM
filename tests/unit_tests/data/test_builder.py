@@ -368,7 +368,6 @@ def test_fast_builder(
             rank=0,
             make_vocab_size_divisible_by=128,
             tensor_model_parallel_size=1,
-            pad_vocab_size=True,
         )
     )
 

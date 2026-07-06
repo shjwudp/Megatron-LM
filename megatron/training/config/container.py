@@ -28,7 +28,6 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -100,8 +99,6 @@ class ConfigContainerBase:
         Returns:
             A new instance of this class initialized with the YAML file values
         """
-        from omegaconf import OmegaConf
-
         if MultiStorageClientFeature.is_enabled():
             msc = MultiStorageClientFeature.import_package()
             yaml_path_exists = msc.os.path.exists(yaml_path)
@@ -168,8 +165,8 @@ class ConfigContainerBase:
         """
         if isinstance(value, ConfigContainerBase):
             return value.to_dict()
-        elif isinstance(value, Serializable):
-            return value.as_dict()
+        # elif isinstance(value, Serializable): # TODO (@maanug): re-enable after upstreaming ModelConfig+Serializable
+        #     return value.as_dict()
         elif hasattr(value, "to_cfg_dict"):
             # Allow non-Container classes to implement own custom method
             return value.to_cfg_dict()
@@ -240,7 +237,7 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     train: TrainingConfig
     validation: ValidationConfig = field(default_factory=ValidationConfig)
-    model: HybridModelConfig | GPTModelConfig
+    # model: GPTModelConfig | MambaModelConfig  # TODO (@maanug): add support
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
     # dataset: GPTDatasetConfig # TODO (@maanug): add support
