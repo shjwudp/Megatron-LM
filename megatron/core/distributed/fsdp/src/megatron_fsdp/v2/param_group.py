@@ -460,12 +460,14 @@ class ParameterGroup:
                 if self.main_grad_buffer.data is not None:
                     self.main_grad_buffer.data.zero_()
             for dist_param in self.dist_params:
-                if dist_param.grad is not None:
-                    dist_param.grad = None
+                grad = getattr(dist_param, "grad", None)
+                if grad is not None:
+                    _zero_tensor_storage(grad)
+                    setattr(dist_param, "_mfsdp_keep_grad_for_cuda_graph", True)
                 decoupled_grad = getattr(dist_param, "decoupled_grad", None)
                 if decoupled_grad is not None:
                     _zero_tensor_storage(decoupled_grad)
-                    setattr(dist_param, "_mfsdp_keep_decoupled_grad_for_cuda_graph", True)
+                    setattr(dist_param, "_mfsdp_keep_grad_for_cuda_graph", True)
             self._grad_buffer_is_fresh = True
             return
 

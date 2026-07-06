@@ -417,8 +417,8 @@ the CUDA graph private pool provides stable replay addresses and lifetime reuse.
 
 - `_pre_backward_setup()` pre-allocates local dist grads before capture.
 - `_maybe_free_grad_data()` keeps optimizer-facing local gradient storage resident.
-- FSDP and optimizer zero-grad preserve `dist_grad`/`decoupled_grad` identities
-  and clear their local storage in place.
+- FSDP and optimizer zero-grad preserve optimizer-facing `grad`/`decoupled_grad`
+  identities and clear their local storage in place.
 - Full-iteration mode uses `StorageFreeingBucketAllocator`; `TracePoolAllocator`
   remains available for explicit and per-module CUDA graph modes.
 

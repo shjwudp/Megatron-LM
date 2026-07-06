@@ -199,8 +199,8 @@ gradient shard and `decoupled_grad` object must keep stable identities.
 - `_pre_backward_setup()` allocates dist grads before capture.
 - `_maybe_free_grad_data()` keeps optimizer-facing gradient storage alive.
 - `zero_grad()` keeps optimizer-facing objects and clears local storage in place.
-- Optimizer zero-grad keeps marked `decoupled_grad` DTensors and zeroes their
-  local storage.
+- Optimizer zero-grad keeps marked `grad`/`decoupled_grad` DTensors and zeroes
+  their local storage.
 - Full unsharded weight and gradient buffers remain transient. They allocate and
   reshard inside capture, so the CUDA graph private pool owns their stable replay
   addresses and reuses non-overlapping lifetimes.

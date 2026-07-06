@@ -814,7 +814,7 @@ class FSDPModule:
                 if param_group.mp_policy.use_decoupled_grad:
                     setattr(dist_param, "decoupled_grad", dist_grad)
                     if param_group.enable_full_iteration_cuda_graph and dist_grad is not None:
-                        setattr(dist_param, "_mfsdp_keep_decoupled_grad_for_cuda_graph", True)
+                        setattr(dist_param, "_mfsdp_keep_grad_for_cuda_graph", True)
                     if dist_param.grad is not None:
                         del dist_param.grad
                 else:
@@ -823,6 +823,8 @@ class FSDPModule:
                         f"dist grad dtype {dist_grad.dtype}"
                     )
                     setattr(dist_param, "grad", dist_grad)
+                    if param_group.enable_full_iteration_cuda_graph and dist_grad is not None:
+                        setattr(dist_param, "_mfsdp_keep_grad_for_cuda_graph", True)
                     if hasattr(dist_param, "decoupled_grad"):
                         dist_param.decoupled_grad = None
 
