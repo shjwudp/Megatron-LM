@@ -785,13 +785,8 @@ class FSDPModule:
             for name, param in zip(param_names, param_group.params):
                 grad_added = getattr(param, "grad_added_to_main_grad", False)
                 recorded = getattr(param, "_mfsdp_recorded_te_wgrad", False)
-                cg_published = getattr(param, "_mfsdp_cg_grad_published", False)
 
-                if cg_published:
-                    if param.grad is not None:
-                        del param.grad
-                    param._mfsdp_cg_grad_published = False
-                elif grad_added or recorded:
+                if grad_added or recorded:
                     if param.grad is not None:
                         del param.grad
                     # Record TE wgrad-fusion flags for CUDA graph restore.
