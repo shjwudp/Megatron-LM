@@ -3,6 +3,48 @@
 FSDP v2 implements HSDP as layout transitions over a two-dimensional
 data-parallel mesh.
 
+## Notation
+
+### Mesh and layout
+
+| Symbol | Meaning |
+| --- | --- |
+| `O`, `I` | Outer and inner mesh sizes; the mesh shape is `(O, I)` |
+| `o`, `i` | This rank's outer and inner mesh coordinates |
+| `B` | Padded bucket size |
+| Shard layout `(a, b)` | Outer- and inner-sharding flags; `1` is sharded and `0` is replicated |
+| `unshard_dim`, `reduce_dim`, `shard_dim` | Mesh dimension ID: `0` is outer and `1` is inner |
+
+Mesh shapes, rank coordinates, and shard layouts are distinct tuple types:
+`(O, I)` is a mesh shape, `(o, i)` is a rank coordinate, and values such as
+`(0, 1)` are shard layouts.
+
+### Process groups
+
+| Group | Role |
+| --- | --- |
+| `dp_cp` / `expt_dp` | Full flattened data-parallel group for dense/expert parameters |
+| `intra_dp_cp` / `intra_expt_dp` | Inner-DP/EDP group when `O > 1`; otherwise the corresponding full group is used |
+| `inter_dist_opt` | Outer-DP group when `O > 1`; otherwise a singleton group |
+
+The mesh dimension names are `dp_outer` for the outer dimension and
+`dp_or_edp` for the inner dense-DP or expert-EDP dimension.
+
+### Sharding strategies
+
+The inner `sharding_strategy` supports all four strategies below. The outer
+`outer_dp_sharding_strategy` supports `no_shard` and `optim`; outer
+`optim` requires inner `optim_grads_params`.
+
+| Strategy | State sharded along the selected mesh dimension |
+| --- | --- |
+| `no_shard` | None |
+| `optim` | Main weights and optimizer state |
+| `optim_grads` | Main weights, optimizer state, and main gradients |
+| `optim_grads_params` | Main weights, optimizer state, main gradients, and model/transpose weights |
+
+See the [FSDP v2 design](design.md) for the complete strategy definitions.
+
 ## Mesh
 
 ```text
@@ -46,8 +88,7 @@ shard_layout = (outer_sharded, inner_sharded)
 `unshard_dim`, `reduce_dim`, and `shard_dim` are mesh dimension IDs:
 0 selects outer and 1 selects inner.
 
-Let `B` be the padded bucket size, `(O, I)` the mesh shape, and `(o, i)`
-the rank coordinate. `BufferIndex` defines:
+Using the notation above, `BufferIndex` defines:
 
 | Layout | Rank-owned global interval |
 | --- | --- |
@@ -130,16 +171,20 @@ bound only from `(0, 0)`; reshard releases temporary storage.
 The flows below assume inner `optim_grads_params`. The optimizer-step
 boundary is identified by `set_is_last_backward(True)`.
 
+The unshard tables distinguish the persistent model-storage allocation from
+the currently valid weight view. Under the assumed inner strategy,
+`_inner_dirty` remains `False`, so only `_outer_dirty` is shown.
+
 ### Outer `no_shard`
 
 #### Reduce grad
 
-```text
-backward gradient (0,0)
-  -> inner reduce-scatter accumulates (0,1)
-  -> on the step boundary, outer all-reduce remains (0,1)
-  -> optimizer consumes (0,1)
-```
+| Step | Operation | Resulting layout |
+| --- | --- | --- |
+| Backward gradient | — | `(0, 0)` |
+| Reduce or accumulate inner gradient shard | Inner reduce-scatter | `(0, 1)` |
+| Synchronize outer replicas at the step boundary | Outer all-reduce | `(0, 1)` |
+| Optimizer consumes gradient | — | `(0, 1)` |
 
 The outer all-reduce gives every outer rank the same inner gradient shard.
 Main weights and optimizer state are also replicated on outer, so every outer
@@ -147,13 +192,13 @@ rank applies the same update.
 
 #### Unshard
 
-```text
-main weight (0,1), replicated on outer
-  -> copy the complete inner shard into model storage (0,1)
-  -> skip outer all-gather; _outer_dirty remains False
-  -> inner all-gather materializes compute weight (0,0)
-  -> bind parameters
-```
+| Step | Operation | Persistent model storage | Current valid weight view | `_outer_dirty` |
+| --- | --- | --- | --- | --- |
+| Main weight, replicated on outer | — | — | `(0, 1)` | — |
+| Copy the complete inner shard into model storage | Copy | `(0, 1)` | `(0, 1)` | `False` |
+| Skip outer all-gather | — | `(0, 1)` | `(0, 1)` | `False` |
+| Materialize compute weight | Inner all-gather | `(0, 1)` | `(0, 0)` | `False` |
+| Bind parameters | — | `(0, 1)` | `(0, 0)` | `False` |
 
 The model-weight storage is already complete on outer after the copy. Reshard
 releases the temporary `(0, 0)` compute buffer and keeps the persistent
@@ -163,12 +208,12 @@ releases the temporary `(0, 0)` compute buffer and keeps the persistent
 
 #### Reduce grad
 
-```text
-backward gradient (0,0)
-  -> inner reduce-scatter accumulates (0,1)
-  -> on the step boundary, outer reduce-scatter produces (1,1)
-  -> optimizer consumes (1,1)
-```
+| Step | Operation | Resulting layout |
+| --- | --- | --- |
+| Backward gradient | — | `(0, 0)` |
+| Reduce or accumulate inner gradient shard | Inner reduce-scatter | `(0, 1)` |
+| Shard across outer ranks at the step boundary | Outer reduce-scatter | `(1, 1)` |
+| Optimizer consumes gradient | — | `(1, 1)` |
 
 The outer reduce-scatter leaves each outer rank with one slice of the inner
 gradient shard. Main weights and optimizer state use the same `(1, 1)`
@@ -176,13 +221,13 @@ ownership.
 
 #### Unshard
 
-```text
-main weight (1,1)
-  -> copy the local slice into model storage (0,1), set _outer_dirty=True
-  -> outer all-gather reconstructs (0,1), set _outer_dirty=False
-  -> inner all-gather materializes compute weight (0,0)
-  -> bind parameters
-```
+| Step | Operation | Persistent model storage | Current valid weight view | `_outer_dirty` |
+| --- | --- | --- | --- | --- |
+| Main weight | — | — | `(1, 1)` | — |
+| Copy the local slice into model storage | Copy | `(0, 1)` | `(1, 1)` | `True` |
+| Reconstruct the complete inner shard | Outer all-gather | `(0, 1)` | `(0, 1)` | `False` |
+| Materialize compute weight | Inner all-gather | `(0, 1)` | `(0, 0)` | `False` |
+| Bind parameters | — | `(0, 1)` | `(0, 0)` | `False` |
 
 The persistent model-weight allocation has layout `(0, 1)`, but immediately
 after the copy only its local `(1, 1)` slice is current. While
