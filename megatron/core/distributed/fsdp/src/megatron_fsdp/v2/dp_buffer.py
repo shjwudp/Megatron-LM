@@ -256,6 +256,7 @@ class DataParallelBuffer:
             pass  # silent on success
         return valid
 
+    @torch.no_grad()
     def set_item(
         self,
         item_id: int,
@@ -264,51 +265,31 @@ class DataParallelBuffer:
         shard_layout: Optional[Iterable[int]] = None,
     ) -> None:
         """Write a parameter tensor into the corresponding region of the buffer."""
-        if shard_layout is None:
-            # shard_layout=(outer, inner): use this buffer's storage shard state.
-            shard_layout = self.storage_shard_layout
-        slice_start, slice_end = self.buffer_index._get_item_self_range(
-            item_id, shard_layout=shard_layout
+        requested_layout = (
+            shard_layout if shard_layout is not None else self.storage_shard_layout
         )
-        storage_slice_start, storage_slice_end = self.buffer_index._get_item_self_range(
-            item_id, shard_layout=self.storage_shard_layout
+        source_slice, local_slice = self.buffer_index.local_slice_for(
+            self.buffer_index._get_item_global_range(item_id),
+            requested_layout,
+            self.storage_shard_layout,
         )
-        slice_start = max(slice_start, storage_slice_start)
-        slice_end = min(slice_end, storage_slice_end)
-        if slice_start >= slice_end:
+        if source_slice is None or local_slice is None:
             return
-        storage_local_start, _ = self.buffer_index._get_item_local_range(
-            item_id, shard_layout=self.storage_shard_layout
-        )
-        local_start = storage_local_start + slice_start - storage_slice_start
-        local_end = local_start + (slice_end - slice_start)
-        shard = self.data[local_start:local_end]
-        item_data = item_data.flatten()[slice_start:slice_end]
-        shard.data.copy_(item_data.flatten())
+        self.data[local_slice].copy_(item_data.flatten()[source_slice])
 
     def get_item(
         self, item_id: int, *, shard_layout: Optional[Iterable[int]] = None
     ) -> torch.Tensor:
         """Read a parameter tensor (or its shard) from the buffer."""
-        if shard_layout is None:
-            # shard_layout=(outer, inner): use this buffer's storage shard state.
-            shard_layout = self.storage_shard_layout
-        slice_start, slice_end = self.buffer_index._get_item_self_range(
-            item_id, shard_layout=shard_layout
+        requested_layout = (
+            shard_layout if shard_layout is not None else self.storage_shard_layout
         )
-        storage_slice_start, storage_slice_end = self.buffer_index._get_item_self_range(
-            item_id, shard_layout=self.storage_shard_layout
+        _, local_slice = self.buffer_index.local_slice_for(
+            self.buffer_index._get_item_global_range(item_id),
+            requested_layout,
+            self.storage_shard_layout,
         )
-        slice_start = max(slice_start, storage_slice_start)
-        slice_end = min(slice_end, storage_slice_end)
-        if slice_start >= slice_end:
-            return self.data[:0]
-        storage_local_start, _ = self.buffer_index._get_item_local_range(
-            item_id, shard_layout=self.storage_shard_layout
-        )
-        start = storage_local_start + slice_start - storage_slice_start
-        end = start + (slice_end - slice_start)
-        return self.data[start:end]
+        return self.data[:0] if local_slice is None else self.data[local_slice]
 
     def is_unsharded(self) -> bool:
         """Return whether this buffer currently has a full unsharded view."""
@@ -416,23 +397,17 @@ class DataParallelBuffer:
         self._unsharded_buffer = None
 
     def get_shard_view(self, shard_layout: Optional[Iterable[int]] = None) -> torch.Tensor:
-        """Return a shard view inside ``self.data``."""
+        """Return a shard view inside the persistent data buffer."""
         assert self.data is not None, "DataParallelBuffer data not initialized"
-        if shard_layout is None:
-            # shard_layout=(outer, inner): use this buffer's storage shard state.
-            shard_layout = self.storage_shard_layout
-        requested_meta = self.buffer_index._get_shard_meta(shard_layout)
-        # shard_layout=(outer, inner): storage_shard_layout describes self.data's shard state.
-        storage_meta = self.buffer_index.outer_shard_metas[self.storage_shard_layout]
-        range_start = max(requested_meta.global_data_index, storage_meta.global_data_index)
-        range_end = min(
-            requested_meta.global_data_index + requested_meta.size,
-            storage_meta.global_data_index + storage_meta.size,
+        requested_layout = (
+            shard_layout if shard_layout is not None else self.storage_shard_layout
         )
-        if range_start >= range_end:
-            return self.data[:0]
-        local_start = storage_meta.local_data_index + range_start - storage_meta.global_data_index
-        return self.data[local_start : local_start + (range_end - range_start)]
+        _, local_slice = self.buffer_index.local_slice_for(
+            (0, self.buffer_index.bucket_meta.size),
+            requested_layout,
+            self.storage_shard_layout,
+        )
+        return self.data[:0] if local_slice is None else self.data[local_slice]
 
     def fetch_buffer(self, shard_layout: Tuple[int, int] = (0, 0)) -> torch.Tensor:
         """Return a buffer for ``shard_layout``, allocating temporary storage if needed.

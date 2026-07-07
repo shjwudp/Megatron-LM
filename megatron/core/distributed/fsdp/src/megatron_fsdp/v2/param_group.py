@@ -27,7 +27,11 @@ import torch
 from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from ..uneven_dtensor import make_uneven_dtensor, update_uneven_dtensor_chunk_metadata
+from ..uneven_dtensor import (
+    copy_chunk_metadata,
+    make_uneven_dtensor,
+    update_uneven_dtensor_chunk_metadata,
+)
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
 from .mixed_precision import MixedPrecisionPolicy
@@ -352,11 +356,6 @@ class ParameterGroup:
         """
         self.dist_params = []
         self.dist_grads = []  # placeholder, populated in _init_dist_grads
-        # Gradient DTensors are recreated whenever zero_grad(set_to_none=True)
-        # releases the backing buffer. Their shard layout is static, so retain
-        # only the local chunk coordinates and avoid repeating metadata
-        # collectives on every rebuild.
-        self._dist_grad_chunk_metadata: List[Optional[tuple]] = [None for _ in self.params]
         s = self.sharding_strategy
 
         is_param_shard = s == "optim_grads_params"
@@ -446,37 +445,24 @@ class ParameterGroup:
         ]
 
         self.dist_grads = []
-        for p in self.params:
+        for p, dist_param in zip(self.params, self.dist_params):
             item_id = self.param_idx[p]
             # shard_layout=(outer, inner): (1, 1) outer+inner, (0, 1) inner, (0, 0) full.
             shard_layout = (1, 1) if is_outer_optim_shard else (0, 1) if is_grad_shard else (0, 0)
             grad_data = gbuf.get_item(item_id, shard_layout=shard_layout)
-            if p.requires_grad:
-                chunk_metadata = self._dist_grad_chunk_metadata[item_id]
-                grad_dtensor = make_uneven_dtensor(
-                    grad_data,
-                    p.shape,
-                    self.mesh,
-                    placements,
-                    post_process_uneven=chunk_metadata is None,
-                    chunk_metadata=chunk_metadata,
-                )
-                if chunk_metadata is None:
-                    local_chunk = grad_dtensor._local_tensor.__create_chunk_list__()[0]
-                    self._dist_grad_chunk_metadata[item_id] = (
-                        tuple(local_chunk.offsets),
-                        tuple(local_chunk.sizes),
-                    )
-                # NOTE: Do not materialize empty local grad shards in self.dist_grads.
-                # Empty shards are semantically no-ops, but passing zero-numel DTensor
-                # grads into fused multi-tensor optimizers such as TE FusedAdam can
-                # break updates for neighboring non-empty shards. We still construct
-                # grad_dtensor above so the first initialization enters the metadata
-                # collective in the same parameter order and caches the empty shard
-                # before discarding its DTensor.
-                self.dist_grads.append(grad_dtensor if grad_data.numel() > 0 else None)
-            else:
+            # Empty local shards are optimizer no-ops. Keeping them as None also
+            # avoids fused multi-tensor optimizer failures on neighboring shards.
+            if not p.requires_grad or grad_data.numel() == 0:
                 self.dist_grads.append(None)
+                continue
+            grad_dtensor = make_uneven_dtensor(
+                grad_data,
+                p.shape,
+                self.mesh,
+                placements,
+            )
+            copy_chunk_metadata(dist_param, grad_dtensor)
+            self.dist_grads.append(grad_dtensor)
 
         self._grad_buffer_is_fresh = True
 

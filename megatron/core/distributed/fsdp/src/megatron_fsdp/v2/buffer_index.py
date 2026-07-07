@@ -14,7 +14,7 @@
 
 import math
 from collections import namedtuple
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch.distributed.tensor import DeviceMesh
@@ -299,7 +299,7 @@ class BufferIndex:
         self._refresh_shard_metas()
 
     # ------------------------------------------------------------------ #
-    #  Internal index query methods — three coordinate domains:
+    #  Index query methods — three coordinate domains:
     #
     #  _get_item_self_range   → (start, end) relative to the item's own
     #                            start.  Tells what portion of this item
@@ -336,6 +336,41 @@ class BufferIndex:
             else:
                 raise ValueError(f"Unsupported shard_layout: {shard_layout}")
         return self.outer_shard_metas[(outer_sharded, inner_sharded)]
+
+    def local_slice_for(
+        self,
+        global_range: Tuple[int, int],
+        requested_layout: Iterable[int] | int | None,
+        storage_layout: Iterable[int] | int | None,
+    ) -> Tuple[Optional[slice], Optional[slice]]:
+        """Clip global_range to requested and storage shard layouts.
+
+        The source slice indexes the object described by global_range relative
+        to global_range[0]. The local slice indexes storage physically laid out
+        as storage_layout. Returns (None, None) when the intersection is empty.
+        """
+        global_start, global_end = global_range
+        requested_meta = self._get_shard_meta(requested_layout)
+        storage_meta = self._get_shard_meta(storage_layout)
+        start = max(
+            global_start,
+            requested_meta.global_data_index,
+            storage_meta.global_data_index,
+        )
+        end = min(
+            global_end,
+            requested_meta.global_data_index + requested_meta.size,
+            storage_meta.global_data_index + storage_meta.size,
+        )
+        if start >= end:
+            return None, None
+
+        source_slice = slice(start - global_start, end - global_start)
+        local_start = (
+            storage_meta.local_data_index + start - storage_meta.global_data_index
+        )
+        local_slice = slice(local_start, local_start + end - start)
+        return source_slice, local_slice
 
     def _get_item_global_range(self, item_id: int) -> Tuple[int, int]:
         """Return (start, end) in the full unsharded buffer for the given item."""

@@ -24,6 +24,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Buf
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
 
 
+CANONICAL_LAYOUTS = ((0, 0), (0, 1), (1, 0), (1, 1))
+
+
 @pytest.fixture(scope="session", autouse=True)
 def dist_env():
     if not torch.distributed.is_initialized():
@@ -178,3 +181,88 @@ class TestBufferIndex:
 
         assert index._get_item_self_range(item_id, shard_layout=shard_layout) == expected_self
         assert index._get_item_local_range(item_id, shard_layout=shard_layout) == expected_local
+
+    def _expected_local_slices(self, global_range, requested_layout, storage_layout):
+        global_start, global_end = global_range
+        requested_start, _, _, requested_size = self.ref_shard_metas[requested_layout]
+        storage_start, storage_local_start, _, storage_size = self.ref_shard_metas[
+            storage_layout
+        ]
+        start = max(global_start, requested_start, storage_start)
+        end = min(
+            global_end,
+            requested_start + requested_size,
+            storage_start + storage_size,
+        )
+        if start >= end:
+            return None, None
+
+        source_slice = slice(start - global_start, end - global_start)
+        local_start = storage_local_start + start - storage_start
+        return source_slice, slice(local_start, local_start + end - start)
+
+    @pytest.mark.parametrize("item_id", [0, 1, 2])
+    @pytest.mark.parametrize("requested_layout", CANONICAL_LAYOUTS)
+    @pytest.mark.parametrize("storage_layout", CANONICAL_LAYOUTS)
+    def test_local_slice_for_item(self, item_id, requested_layout, storage_layout):
+        index = BufferIndex(
+            param_shapes=self.param_shapes,
+            mesh=self.mesh,
+            param_group_id=ParamGroupIdx(0, 0),
+            chunk_size_factor=self.chunk_size_factor,
+        )
+        global_range = self.ref_item_ranges[item_id]
+
+        assert index.local_slice_for(
+            global_range, requested_layout, storage_layout
+        ) == self._expected_local_slices(
+            global_range, requested_layout, storage_layout
+        )
+
+    @pytest.mark.parametrize("requested_layout", CANONICAL_LAYOUTS)
+    @pytest.mark.parametrize("storage_layout", CANONICAL_LAYOUTS)
+    def test_local_slice_for_whole_bucket(self, requested_layout, storage_layout):
+        index = BufferIndex(
+            param_shapes=self.param_shapes,
+            mesh=self.mesh,
+            param_group_id=ParamGroupIdx(0, 0),
+            chunk_size_factor=self.chunk_size_factor,
+        )
+        global_range = (0, self.ref_bucket_size)
+
+        assert index.local_slice_for(
+            global_range, requested_layout, storage_layout
+        ) == self._expected_local_slices(
+            global_range, requested_layout, storage_layout
+        )
+
+    @pytest.mark.parametrize(
+        ("legacy_layout", "canonical_layout"),
+        [
+            (None, (0, 0)),
+            (0, (0, 0)),
+            (1, (0, 1)),
+            ((), (0, 0)),
+            ((0,), (0, 0)),
+            ((1,), (0, 1)),
+        ],
+    )
+    def test_local_slice_for_legacy_layout(self, legacy_layout, canonical_layout):
+        index = BufferIndex(
+            param_shapes=self.param_shapes,
+            mesh=self.mesh,
+            param_group_id=ParamGroupIdx(0, 0),
+            chunk_size_factor=self.chunk_size_factor,
+        )
+        global_range = (0, self.ref_bucket_size)
+
+        assert index.local_slice_for(
+            global_range, legacy_layout, (0, 0)
+        ) == index.local_slice_for(
+            global_range, canonical_layout, (0, 0)
+        )
+        assert index.local_slice_for(
+            global_range, (0, 0), legacy_layout
+        ) == index.local_slice_for(
+            global_range, (0, 0), canonical_layout
+        )

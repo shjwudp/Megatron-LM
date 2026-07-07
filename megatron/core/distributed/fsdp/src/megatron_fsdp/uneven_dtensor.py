@@ -97,20 +97,13 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
 
 
 def update_uneven_dtensor_chunk_metadata(
-    dtensor: DTensor,
-    source: str = "init",
-    *,
-    chunk_metadata: Optional[tuple] = None,
+    dtensor: DTensor, source: str = "init"
 ) -> None:
     """
     Update the DTensor's chunk metadata to handle uneven sharding.
     This function modifies the DTensor in-place to include chunk metadata
     and write items closures for saving and loading.
     """
-    if chunk_metadata is not None:
-        _set_chunk_metadata(dtensor, *chunk_metadata, source=source)
-        return
-
     # Get uneven chunk metadata for the DTensor
     # TODO: Optimize gather_and_compute_chunk_metadata synchronization:
     # 1. Add pre-check validation to verify tensor shape consistency
@@ -584,7 +577,6 @@ def make_uneven_dtensor(
     *,
     post_process_uneven: bool = False,
     copy_chunk_meta_from: Optional[DTensor] = None,
-    chunk_metadata: Optional[tuple] = None,
 ):
     """Create a DTensor from a possibly uneven local shard with known global shape.
 
@@ -596,9 +588,6 @@ def make_uneven_dtensor(
         post_process_uneven: If True, call ``update_uneven_dtensor_chunk_metadata``.
         copy_chunk_meta_from: If set, copy ``__create_chunk_list__`` /
             ``__create_write_items__`` from this DTensor.
-        chunk_metadata: ``(offsets, sizes)`` tuple where *offsets* and *sizes*
-            are tuples of ints (one per dimension).  Sets chunk metadata
-            closures without collectives.
     """
     if len(placements) != dp_mesh.ndim:
         raise ValueError(
@@ -624,12 +613,6 @@ def make_uneven_dtensor(
         # sharding as an existing uneven DTensor, so we can copy the chunk metadata from the
         # existing uneven DTensor instead of recomputing it.
         copy_chunk_metadata(copy_chunk_meta_from, dtensor)
-    elif chunk_metadata is not None:
-        update_uneven_dtensor_chunk_metadata(
-            dtensor,
-            source="make_uneven",
-            chunk_metadata=chunk_metadata,
-        )
     return dtensor
 
 
