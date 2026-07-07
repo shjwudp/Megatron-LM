@@ -385,14 +385,14 @@ def _static_grad_context_wrapper(inputs, grad_buffers):
     :type inputs: Tuple[torch.Tensor, ...]
     :param grad_buffers: Optional static gradient buffer for each input.
     :type grad_buffers: Tuple[Optional[torch.Tensor], ...]
-    :raises ValueError: If inputs and buffers have different lengths.
     """
+    torch_module = _require_torch()
     if len(inputs) != len(grad_buffers):
         raise ValueError("Static gradient buffers must match backward inputs")
     original_input_grads = tuple(input_tensor.grad for input_tensor in inputs)
     static_buffers = tuple(buffer for buffer in grad_buffers if buffer is not None)
     if static_buffers:
-        torch._foreach_zero_(static_buffers)
+        torch_module._foreach_zero_(static_buffers)
     for input_tensor, grad_buffer in zip(inputs, grad_buffers):
         input_tensor.grad = grad_buffer
     try:
@@ -400,6 +400,76 @@ def _static_grad_context_wrapper(inputs, grad_buffers):
     finally:
         for input_tensor, original_grad in zip(inputs, original_input_grads):
             input_tensor.grad = original_grad
+
+
+def _get_compatible_main_grad_buffer(input_tensor):
+    """Return a caller-owned buffer compatible with a parameter gradient.
+
+    :param input_tensor: Leaf tensor that may expose ``get_main_grad``.
+    :type input_tensor: torch.Tensor
+    :return: Compatible main-grad buffer, or None when direct binding is unsafe.
+    :rtype: Optional[torch.Tensor]
+    """
+    torch_module = _require_torch()
+    get_main_grad = getattr(input_tensor, "get_main_grad", None)
+    if not callable(get_main_grad):
+        return None
+
+    grad_buffer = get_main_grad()
+    if not isinstance(grad_buffer, torch_module.Tensor):
+        return None
+    if grad_buffer.requires_grad:
+        return None
+    if grad_buffer.shape != input_tensor.shape:
+        return None
+    if grad_buffer.dtype != input_tensor.dtype:
+        return None
+    if grad_buffer.device != input_tensor.device:
+        return None
+    if grad_buffer.layout != torch_module.strided or input_tensor.layout != torch_module.strided:
+        return None
+    if grad_buffer.stride() != input_tensor.stride():
+        return None
+    return grad_buffer
+
+
+def _get_static_grad_buffers(inputs):
+    """Return compatible caller-owned gradient buffers for captured leaves.
+
+    :param inputs: Leaf tensors participating in captured backward.
+    :type inputs: Tuple[torch.Tensor, ...]
+    :return: Optional static gradient buffer aligned with each input.
+    :rtype: Tuple[Optional[torch.Tensor], ...]
+    """
+    return tuple(_get_compatible_main_grad_buffer(input_tensor) for input_tensor in inputs)
+
+
+def _refresh_module_parameter_surface(func, user_inputs, parameter_indices=None):
+    """Read module parameters after capture-time replacement hooks run.
+
+    :param func: Callable whose current module parameters should be read.
+    :type func: Callable
+    :param user_inputs: Flattened user tensors that precede module parameters.
+    :type user_inputs: Tuple[torch.Tensor, ...]
+    :param parameter_indices: Parameter positions retained after warmup gradient
+        discovery, defaults to None.
+    :type parameter_indices: Optional[Tuple[int, ...]]
+    :raises RuntimeError: If a retained position is absent from the live module.
+    :return: Current module parameters and the combined static input surface.
+    :rtype: Tuple[Tuple[torch.nn.Parameter, ...], Tuple[torch.Tensor, ...]]
+    """
+    torch_module = _require_torch()
+    module_params = (
+        tuple(func.parameters()) if isinstance(func, torch_module.nn.Module) else ()
+    )
+    if parameter_indices is not None:
+        if parameter_indices and max(parameter_indices) >= len(module_params):
+            raise RuntimeError(
+                "Module parameter count changed after CUDA graph warmup: "
+                f"retained index {max(parameter_indices)}, current count {len(module_params)}"
+            )
+        module_params = tuple(module_params[idx] for idx in parameter_indices)
+    return module_params, user_inputs + module_params
 
 
 @contextlib.contextmanager
@@ -438,11 +508,6 @@ def _make_graphed_callables(
     post_warmup_hook: Optional[Callable] = None,
     capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]] = None,
     capture_stream: Optional[torch.cuda.Stream] = None,
-    _module_params: Optional[Sequence[Sequence[torch.nn.Parameter]]] = None,
-    _parameter_grad_buffers: Optional[
-        Sequence[Sequence[Optional[torch.Tensor]]]
-    ] = None,
-    _parameter_grad_consumers: Optional[Sequence[Optional[Callable]]] = None,
 ) -> SingleOrTuple[Callable]:
     """
     Helper method for `make_graphed_callables`
@@ -470,56 +535,6 @@ def _make_graphed_callables(
         sample_kwargs = (sample_kwargs,)
 
     capture_time_hooks = _canonicalize_capture_time_hooks(len(callables), capture_time_hooks)
-    if _module_params is None:
-        explicit_module_params = None
-    else:
-        explicit_module_params = tuple(tuple(params) for params in _module_params)
-        if len(explicit_module_params) != len(callables):
-            raise ValueError(
-                "_module_params must have one entry per callable: "
-                f"got {len(explicit_module_params)} entries for {len(callables)} callables"
-            )
-        if any(
-            not isinstance(param, torch.nn.Parameter)
-            for params in explicit_module_params
-            for param in params
-        ):
-            raise TypeError("_module_params entries must contain torch.nn.Parameter objects")
-    if _parameter_grad_buffers is None:
-        parameter_grad_buffers = None
-    else:
-        parameter_grad_buffers = tuple(
-            tuple(buffers) for buffers in _parameter_grad_buffers
-        )
-        if explicit_module_params is None:
-            raise ValueError("_parameter_grad_buffers requires _module_params")
-        if len(parameter_grad_buffers) != len(explicit_module_params):
-            raise ValueError("_parameter_grad_buffers must have one entry per callable")
-        for params, buffers in zip(explicit_module_params, parameter_grad_buffers):
-            if len(params) != len(buffers):
-                raise ValueError("Each parameter gradient buffer list must match _module_params")
-            for param, buffer in zip(params, buffers):
-                if buffer is None:
-                    continue
-                if not isinstance(buffer, torch.Tensor):
-                    raise TypeError("Parameter gradient buffers must be tensors or None")
-                if (
-                    buffer.shape != param.shape
-                    or buffer.dtype != param.dtype
-                    or buffer.device != param.device
-                ):
-                    raise ValueError(
-                        "Parameter gradient buffers must match parameter shape, dtype, and device"
-                    )
-    if _parameter_grad_consumers is None:
-        parameter_grad_consumers = (None,) * len(callables)
-    else:
-        parameter_grad_consumers = tuple(_parameter_grad_consumers)
-        if len(parameter_grad_consumers) != len(callables):
-            raise ValueError(
-                "_parameter_grad_consumers must have one entry per callable: "
-                f"got {len(parameter_grad_consumers)} consumers for {len(callables)} callables"
-            )
 
     # Check training/inference
     is_training = all(c.training for c in callables)
@@ -759,19 +774,15 @@ def _make_graphed_callables(
     # The names are kept for consistency with
     # PyTorch make_graphed_callables.
     per_callable_len_user_args = [len(args) for args in flatten_sample_args]
+    per_callable_parameter_grad_indices = [None] * len(flatten_sample_args)
     if _order is None:
         per_callable_module_params = [
-            explicit_module_params[i]
-            if explicit_module_params is not None
-            else tuple(c.parameters()) if isinstance(c, torch.nn.Module) else ()
-            for i, c in enumerate(callables)
+            tuple(c.parameters()) if isinstance(c, torch.nn.Module) else () for c in callables
         ]
         per_callable_static_input_surfaces = [
             flatten_sample_args[i] + per_callable_module_params[i] for i in range(len(callables))
         ]
     else:
-        if explicit_module_params is not None:
-            raise ValueError("_module_params is not supported with pipeline _order")
         per_callable_module_params = []
         for m_chunk in range(num_model_chunks):
             for _ in range(num_microbatches):
@@ -805,11 +816,23 @@ def _make_graphed_callables(
         if not _clone_param_grads_on_return:
             return (False,) * len(static_grad_inputs)
         module_param_start = len(static_grad_inputs) - len(module_params)
-        return tuple(
-            idx >= module_param_start
-            and not getattr(module_params[idx - module_param_start], "skip_backward_post_hook", False)
-            for idx in range(len(static_grad_inputs))
-        )
+        clone_slots = []
+        for idx, grad_input in enumerate(static_grad_inputs):
+            if idx < module_param_start:
+                clone_slots.append(False)
+                continue
+            param = module_params[idx - module_param_start]
+            main_grad = _get_compatible_main_grad_buffer(param)
+            uses_main_grad = (
+                grad_input is not None
+                and main_grad is not None
+                and grad_input.data_ptr() == main_grad.data_ptr()
+            )
+            clone_slots.append(
+                not uses_main_grad
+                and not getattr(param, "skip_backward_post_hook", False)
+            )
+        return tuple(clone_slots)
 
     # For cases with multiple active RNG states, e.g. TP.
     if graph_safe_rng_available():
@@ -952,12 +975,15 @@ def _make_graphed_callables(
         return flatten_outputs
 
     def _run_warmup_backward(func_idx, func, outputs, warmup_iter, callable_idx) -> None:
-        static_input_surface = per_callable_static_input_surfaces[func_idx]
-        inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
         outputs_requiring_grad = tuple(o for o in outputs if o is not None and o.requires_grad)
         grad_outputs = _make_grad_outputs(outputs)
 
         _call_capture_time_backward_pre_hooks(callable_idx, func, grad_outputs)
+        live_module_params, static_input_surface = _refresh_module_parameter_surface(
+            func,
+            flatten_sample_args[func_idx],
+        )
+        inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
         with _none_grad_context_wrapper(inputs):
             torch.autograd.backward(
                 outputs_requiring_grad,
@@ -969,32 +995,42 @@ def _make_graphed_callables(
         # Filter module params that get None grad from grad_inputs and remove them
         # from static_input_surface. This is to ensure that the backward hooks
         # registered to these params are not wrongly triggered.
-        num_required_grad_sample_args = sum(
-            isinstance(arg, torch.Tensor) and arg.requires_grad
-            for arg in flatten_sample_args[func_idx]
-        )
-        required_grad_input_idx = []
-        for i, arg in enumerate(static_input_surface):
-            if isinstance(arg, torch.Tensor) and arg.requires_grad:
-                required_grad_input_idx.append(i)
-        module_params_with_grad = []
-        for grad_inputs_idx, inputs_idx in enumerate(required_grad_input_idx):
-            if grad_inputs[grad_inputs_idx] is None and grad_inputs_idx < num_required_grad_sample_args:
+        required_grad_input_indices = [
+            idx
+            for idx, arg in enumerate(static_input_surface)
+            if isinstance(arg, torch.Tensor) and arg.requires_grad
+        ]
+        grad_by_surface_index = dict(zip(required_grad_input_indices, grad_inputs))
+        user_input_count = len(flatten_sample_args[func_idx])
+        for surface_idx in required_grad_input_indices:
+            if surface_idx < user_input_count and grad_by_surface_index[surface_idx] is None:
                 if not allow_unused_input:
                     raise RuntimeError(
                         "The input tensor requires grad, but the grad is None after backward pass."
                     )
-            elif grad_inputs[grad_inputs_idx] is not None and grad_inputs_idx >= num_required_grad_sample_args:
-                module_params_with_grad.append(static_input_surface[inputs_idx])
-        if len(module_params_with_grad) != len(per_callable_module_params[func_idx]):
-            if warmup_iter != 0:
-                raise RuntimeError(
-                    "no-grad params should only be used as inputs in the first warmup"
-                    f" iteration, but found in iteration {warmup_iter}"
-                )
-            per_callable_module_params[func_idx] = tuple(module_params_with_grad)
-            static_input_surface = flatten_sample_args[func_idx] + tuple(module_params_with_grad)
-            per_callable_static_input_surfaces[func_idx] = static_input_surface
+
+        parameter_grad_indices = tuple(
+            param_idx
+            for param_idx, param in enumerate(live_module_params)
+            if param.requires_grad
+            and grad_by_surface_index[user_input_count + param_idx] is not None
+        )
+        recorded_indices = per_callable_parameter_grad_indices[func_idx]
+        if recorded_indices is None:
+            per_callable_parameter_grad_indices[func_idx] = parameter_grad_indices
+        elif recorded_indices != parameter_grad_indices:
+            raise RuntimeError(
+                "Module parameters producing gradients changed across CUDA graph warmup "
+                f"iterations: expected {recorded_indices}, found {parameter_grad_indices} "
+                f"at iteration {warmup_iter}"
+            )
+        module_params_with_grad = tuple(
+            live_module_params[param_idx] for param_idx in parameter_grad_indices
+        )
+        per_callable_module_params[func_idx] = module_params_with_grad
+        per_callable_static_input_surfaces[func_idx] = (
+            flatten_sample_args[func_idx] + module_params_with_grad
+        )
 
         # Run wgrad. This is essential for some TE modules when they have
         # delay_wgrad_compute enabled.
@@ -1233,15 +1269,34 @@ def _make_graphed_callables(
                             func,
                             static_grad_outputs,
                         )
+                        module_params, static_input_surface = (
+                            _refresh_module_parameter_surface(
+                                func,
+                                flatten_sample_args[per_callable_bwd_idx],
+                                per_callable_parameter_grad_indices[per_callable_bwd_idx],
+                            )
+                        )
+                        per_callable_module_params[per_callable_bwd_idx] = module_params
+                        per_callable_static_input_surfaces[per_callable_bwd_idx] = (
+                            static_input_surface
+                        )
                         inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
-                        with _none_grad_context_wrapper(inputs), _graph_context_wrapper(
-                            bwd_graph, pool=mempool, stream=capture_stream
+                        input_grad_buffers = _get_static_grad_buffers(inputs)
+                        with (
+                            _graph_context_wrapper(
+                                bwd_graph, pool=mempool, stream=capture_stream
+                            ),
+                            _static_grad_context_wrapper(inputs, input_grad_buffers),
                         ):
                             torch.autograd.backward(
                                 tuple(
-                                    o for o in static_outputs if o is not None and o.requires_grad
+                                    o
+                                    for o in static_outputs
+                                    if o is not None and o.requires_grad
                                 ),
-                                grad_tensors=tuple(o for o in static_grad_outputs if o is not None),
+                                grad_tensors=tuple(
+                                    o for o in static_grad_outputs if o is not None
+                                ),
                                 retain_graph=retain_graph_in_backward,
                             )
                             grad_inputs = tuple(input.grad for input in inputs)
@@ -1357,23 +1412,19 @@ def _make_graphed_callables(
             if is_training:
                 func = graph_callables[bwd_idx]
                 _call_capture_time_backward_pre_hooks(bwd_idx, func, static_grad_outputs)
+                module_params, static_input_surface = _refresh_module_parameter_surface(
+                    func,
+                    flatten_sample_args[bwd_idx],
+                    per_callable_parameter_grad_indices[bwd_idx],
+                )
+                per_callable_module_params[bwd_idx] = module_params
+                per_callable_static_input_surfaces[bwd_idx] = static_input_surface
                 inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
-                if parameter_grad_buffers is None:
-                    input_grad_buffers = (None,) * len(inputs)
-                else:
-                    buffers_by_param_id = {
-                        id(param): buffer
-                        for param, buffer in zip(
-                            explicit_module_params[bwd_idx],
-                            parameter_grad_buffers[bwd_idx],
-                        )
-                    }
-                    input_grad_buffers = tuple(
-                        buffers_by_param_id.get(id(input_tensor)) for input_tensor in inputs
-                    )
-                with _graph_context_wrapper(
-                    bwd_graph, pool=mempool
-                ), _static_grad_context_wrapper(inputs, input_grad_buffers):
+                input_grad_buffers = _get_static_grad_buffers(inputs)
+                with (
+                    _graph_context_wrapper(bwd_graph, pool=mempool),
+                    _static_grad_context_wrapper(inputs, input_grad_buffers),
+                ):
                     torch.autograd.backward(
                         tuple(o for o in static_outputs if o is not None and o.requires_grad),
                         grad_tensors=tuple(o for o in static_grad_outputs if o is not None),
@@ -1429,7 +1480,6 @@ def _make_graphed_callables(
         static_grad_outputs,
         static_grad_inputs,
         returned_param_grad_clone_slots,
-        parameter_grad_consumer,
     ):
         class Graphed(torch.autograd.Function):
             """Autograd function for graph replay."""
@@ -1502,13 +1552,6 @@ def _make_graphed_callables(
                 else:
                     bwd_graph.replay()
 
-                module_param_start = len(static_grad_inputs) - len(module_params)
-                if parameter_grad_consumer is not None:
-                    parameter_grad_consumer(
-                        tuple(module_params),
-                        tuple(static_grad_inputs[module_param_start:]),
-                    )
-
                 # Update FP8 scale factors if needed
                 if ctx.is_first_module:
                     FP8GlobalStateManager.reduce_and_update_fp8_tensors(forward=False)
@@ -1522,9 +1565,6 @@ def _make_graphed_callables(
                 grad_inputs = []
                 for idx, grad_input in enumerate(static_grad_inputs):
                     if grad_input is None:
-                        grad_inputs.append(None)
-                    elif parameter_grad_consumer is not None and idx >= module_param_start:
-                        # The runtime consumed this parameter gradient before its hook runs.
                         grad_inputs.append(None)
                     elif returned_param_grad_clone_slots[idx]:
                         # Returned parameter grads may be installed directly as param.grad.
@@ -1630,7 +1670,6 @@ def _make_graphed_callables(
             per_callable_static_grad_outputs[i],
             per_callable_static_grad_inputs[i],
             per_callable_returned_param_grad_clone_slots[i],
-            parameter_grad_consumers[i],
         )
 
         func = graph_callables[i]
@@ -1778,11 +1817,6 @@ def make_graphed_callables(
     post_warmup_hook: Optional[Callable] = None,
     capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]] = None,
     capture_stream: Optional[torch.cuda.Stream] = None,
-    _module_params: Optional[Sequence[Sequence[torch.nn.Parameter]]] = None,
-    _parameter_grad_buffers: Optional[
-        Sequence[Sequence[Optional[torch.Tensor]]]
-    ] = None,
-    _parameter_grad_consumers: Optional[Sequence[Optional[Callable]]] = None,
 ) -> Union[Callable, Tuple[Callable, ...]]:
     """
     Make CUDA graph version of Transformer Engine modules
@@ -1829,12 +1863,6 @@ def make_graphed_callables(
         replay of another callable, may overwrite retained hook or `.grad`
         tensors. Only disable this when the caller consumes returned parameter
         gradients before any such overwrite can occur.
-    _parameter_grad_consumers: sequence of callable, optional
-        Callbacks that consume parameter gradients immediately after replay.
-    _module_params: sequence of parameter sequences, optional
-        Overrides ``module.parameters()`` for each callable's input surface.
-    _parameter_grad_buffers: sequence of tensor sequences, optional
-        Optional caller-owned buffers for captured parameter gradients.
     pre_warmup_hook: callable, default = None
                       A hook function that will be called once before all warmup iterations
                       (not once per callable).
@@ -2063,9 +2091,6 @@ def make_graphed_callables(
         post_warmup_hook=post_warmup_hook,
         capture_time_hooks=capture_time_hooks,
         capture_stream=capture_stream,
-        _module_params=_module_params,
-        _parameter_grad_buffers=_parameter_grad_buffers,
-        _parameter_grad_consumers=_parameter_grad_consumers,
     )
 
     # Ensures warmup does not affect numerics for ops such as dropout.
