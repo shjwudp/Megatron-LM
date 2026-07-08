@@ -242,6 +242,25 @@ pre-hook later arrives, it skips the already-launched all-gather, waits for its 
 runs `post_unshard()` on the caller stream. Removing the phase from the pending set makes
 re-entry and activation recompute idempotent.
 
+### Fine-grained unshard for activation recompute
+
+Activation checkpointing exposes an `is_recomputing()` dynamic state that is true only
+while a checkpointed forward is being rerun. This state complements the FSDP root's
+`backward_phase`: combined 1F1B can execute a normal forward while that shared phase is set
+for the paired backward, so `backward_phase` alone cannot select the targeted path.
+
+When a fine-grained child forward hook fires during actual recompute, the parent FSDP unit
+first performs its backward unshard and then calls `unshard_for_submodule()`. FSDP init maps
+each child module's direct parameters (`parameters(recurse=False)`) to their parameter-group
+indices, so the helper gathers only missing forward buffers from those groups. It does not
+prefetch a neighboring unit or set the module-wide readiness event. Normal forwards retain
+the full forward unshard path, including normal forwards paired with backward by combined
+1F1B. The targeted helper follows the same stream-ownership contract as whole-unit
+unshard: allocation and tensor rebinding remain on the caller stream, only collectives run
+on `ag_stream`, and the caller waits for completion before running post-processing for the
+selected groups. Because the child consumes those buffers immediately, this path does not
+use the deferred module-prefetch state.
+
 ### `_get_prefetch_next_modules(bwd_pass)`
 
 ```python
