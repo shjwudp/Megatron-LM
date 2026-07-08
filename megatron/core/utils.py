@@ -1069,37 +1069,8 @@ def get_data_parallel_group_if_dtensor(
 ) -> Optional["ProcessGroup"]:
     """Gets the data parallel group of the given tensor if it is a DTensor."""
     if HAVE_DTENSOR and isinstance(tensor, DTensor):
-        # The callers compute stats from ``tensor.to_local()``. For placements
-        # [Replicate(), Shard(0)] reduce only on the inner shard dim; reducing
-        # the full outer x inner mesh would count the replicated outer values twice.
-        # For [Shard(0), Shard(0)], reduce on the flattened outer x inner shard mesh.
-        mesh = tensor.device_mesh
-        mesh_dim_names = mesh.mesh_dim_names
-        shard_dim_names = (
-            tuple(
-                mesh_dim_name
-                for mesh_dim_name, placement in zip(mesh_dim_names, tensor.placements)
-                if isinstance(placement, Shard)
-            )
-            if mesh_dim_names is not None
-            else None
-        )
-        if shard_dim_names == ():
-            return None
-
-        if shard_dim_names is not None:
-            shard_mesh = mesh[shard_dim_names]
-        elif mesh.ndim == 1:
-            shard_mesh = mesh
-        else:
-            raise ValueError(f"DTensor shard-stat group requires named mesh dims: {mesh}.")
-
-        current_group = (
-            shard_mesh.get_group() if shard_mesh.ndim == 1 else shard_mesh._flatten().get_group()
-        )
-        assert data_parallel_group is None or tuple(
-            torch.distributed.get_process_group_ranks(current_group)
-        ) == tuple(torch.distributed.get_process_group_ranks(data_parallel_group))
+        current_group = tensor.device_mesh.get_group()
+        assert data_parallel_group is None or current_group == data_parallel_group
         return current_group
     return None
 
