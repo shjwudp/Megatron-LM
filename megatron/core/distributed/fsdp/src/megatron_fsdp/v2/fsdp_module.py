@@ -6,7 +6,7 @@ import logging
 import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -19,20 +19,6 @@ from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
 
 logger = logging.getLogger(__name__)
-
-
-def _foreach_apply(
-    op: Callable[..., Any],
-    tensors: List[torch.Tensor],
-    other_tensors: Optional[List[torch.Tensor]] = None,
-) -> None:
-    """Apply a unary or binary foreach operation to non-empty tensor lists."""
-    if not tensors:
-        return
-    if other_tensors is None:
-        op(tensors)
-    else:
-        op(tensors, other_tensors)
 
 
 class _FSDPState:
@@ -817,9 +803,13 @@ class FSDPModule:
                     stage_tensors.append(param.get_main_grad())
                     stage_sources.append(grad.detach())
 
-            stage_op = torch._foreach_add_ if add_to_main_grad else torch._foreach_copy_
-            _foreach_apply(stage_op, stage_tensors, stage_sources)
-            _foreach_apply(torch._foreach_zero_, zero_tensors)
+            if stage_tensors:
+                if add_to_main_grad:
+                    torch._foreach_add_(stage_tensors, stage_sources)
+                else:
+                    torch._foreach_copy_(stage_tensors, stage_sources)
+            if zero_tensors:
+                torch._foreach_zero_(zero_tensors)
 
             for param in params_with_grad:
                 if param.grad is not None:

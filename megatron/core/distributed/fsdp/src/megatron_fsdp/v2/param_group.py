@@ -244,32 +244,27 @@ class ParameterGroup:
         After unshard, parameters point to full unsharded storage. FP8
         parameters rebind their TE raw payload instead of ``param.data``.
         """
-        current_stream = torch.cuda.current_stream()
-        stream = stream or current_stream
-        if stream != current_stream:
-            stream.wait_stream(current_stream)
-        with torch.cuda.stream(stream):
-            self._ensure_buffers_on_gpu()
+        self._ensure_buffers_on_gpu()
 
-            for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
-                self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
-            ):
-                if weight_buffer is not None:
-                    if self.outer_dp_sharding_strategy == "optim":
-                        # mesh dim 0 is outer-DP.
-                        weight_buffer.unshard(
-                            unshard_dim=0,
-                            bind_params=False,
-                            stream=stream,
-                        )
-                    # mesh dim 1 is inner-DP.
+        for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
+            self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
+        ):
+            if weight_buffer is not None:
+                if self.outer_dp_sharding_strategy == "optim":
+                    # mesh dim 0 is outer-DP.
                     weight_buffer.unshard(
-                        unshard_dim=1,
-                        bind_params=bind_params,
+                        unshard_dim=0,
+                        bind_params=False,
                         stream=stream,
                     )
+                # mesh dim 1 is inner-DP.
+                weight_buffer.unshard(
+                    unshard_dim=1,
+                    bind_params=bind_params,
+                    stream=stream,
+                )
 
-            self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
+        self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
 
     def has_unsharded_weight_buffers(self, bwd_pass: bool = False) -> bool:
         """Return whether this phase can skip launching another distributed unshard."""
@@ -314,57 +309,52 @@ class ParameterGroup:
         ZeRO-1 keeps grads replicated during backward and reduce-scatters
         the replicated buffer once when the optimizer syncs.
         """
-        current_stream = torch.cuda.current_stream()
-        stream = stream or current_stream
-        if stream != current_stream:
-            stream.wait_stream(current_stream)
-        with torch.cuda.stream(stream):
-            self._ensure_buffers_on_gpu()
-            if self.main_grad_buffer is None:
-                return
+        self._ensure_buffers_on_gpu()
+        if self.main_grad_buffer is None:
+            return
 
-            reduce_inner = self.sharding_strategy in (
-                "optim_grads",
-                "optim_grads_params",
-            ) or (
-                is_last_microbatch and self.sharding_strategy in ("no_shard", "optim")
-            )
-            reduce_outer = self.outer_dp_sharding_strategy in (
-                "optim_grads",
-                "optim_grads_params",
-            ) or (
-                is_last_microbatch
-                and self.outer_dp_sharding_strategy in ("no_shard", "optim")
-            )
-            if not reduce_inner and not reduce_outer:
-                return
+        reduce_inner = self.sharding_strategy in (
+            "optim_grads",
+            "optim_grads_params",
+        ) or (
+            is_last_microbatch and self.sharding_strategy in ("no_shard", "optim")
+        )
+        reduce_outer = self.outer_dp_sharding_strategy in (
+            "optim_grads",
+            "optim_grads_params",
+        ) or (
+            is_last_microbatch
+            and self.outer_dp_sharding_strategy in ("no_shard", "optim")
+        )
+        if not reduce_inner and not reduce_outer:
+            return
 
-            if reduce_inner:
-                # ZeRO-2/3 reduce each microbatch into a persistent optimizer shard:
-                # overwrite that shard on the first reduce, then accumulate into it.
-                # no_shard/ZeRO-1 instead accumulate the full gradient before their
-                # final reduction, so that reduction always overwrites its output.
-                accumulate_reduced_grad = (
-                    self.sharding_strategy in ("optim_grads", "optim_grads_params")
-                    and not self._grad_buffer_is_fresh
-                )
-                # mesh dim 1 is inner-DP.
-                self.main_grad_buffer.reduce_grad(
-                    overwrite_grad=not accumulate_reduced_grad,
-                    reduce_dim=1,
-                    reduce_scatter=self.sharding_strategy != "no_shard",
-                    stream=stream,
-                )
-                # The buffer now contains reduced gradients rather than fresh storage.
-                self._grad_buffer_is_fresh = False
-            if reduce_outer:
-                # mesh dim 0 is outer-DP.
-                self.main_grad_buffer.reduce_grad(
-                    overwrite_grad=True,
-                    reduce_dim=0,
-                    reduce_scatter=self.outer_dp_sharding_strategy != "no_shard",
-                    stream=stream,
-                )
+        if reduce_inner:
+            # ZeRO-2/3 reduce each microbatch into a persistent optimizer shard:
+            # overwrite that shard on the first reduce, then accumulate into it.
+            # no_shard/ZeRO-1 instead accumulate the full gradient before their
+            # final reduction, so that reduction always overwrites its output.
+            accumulate_reduced_grad = (
+                self.sharding_strategy in ("optim_grads", "optim_grads_params")
+                and not self._grad_buffer_is_fresh
+            )
+            # mesh dim 1 is inner-DP.
+            self.main_grad_buffer.reduce_grad(
+                overwrite_grad=not accumulate_reduced_grad,
+                reduce_dim=1,
+                reduce_scatter=self.sharding_strategy != "no_shard",
+                stream=stream,
+            )
+            # The buffer now contains reduced gradients rather than fresh storage.
+            self._grad_buffer_is_fresh = False
+        if reduce_outer:
+            # mesh dim 0 is outer-DP.
+            self.main_grad_buffer.reduce_grad(
+                overwrite_grad=True,
+                reduce_dim=0,
+                reduce_scatter=self.outer_dp_sharding_strategy != "no_shard",
+                stream=stream,
+            )
 
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""
