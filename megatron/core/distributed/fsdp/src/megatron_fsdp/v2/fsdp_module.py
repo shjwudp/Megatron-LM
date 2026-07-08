@@ -512,7 +512,7 @@ class FSDPModule:
         After materialization, full parameters are broadcast from DP rank 0
         before DTensor wrapping so every rank shards the same initialized value.
         """
-        materialization_device = torch.cuda.current_device()
+        materialization_device = torch.device("cuda", torch.cuda.current_device())
         for name, m in self.named_modules():
             if m in ignored_modules:
                 continue
