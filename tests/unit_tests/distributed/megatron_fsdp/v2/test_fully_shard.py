@@ -53,9 +53,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-    MixedPrecisionPolicy,
-)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
 
 # ------------------------------------------------------------------ #
 #  Distributed environment (NCCL session-scoped)
@@ -280,6 +278,58 @@ class TestFullyShardBasic:
                 torch.distributed.all_gather(gathered, local_grad)
                 for replica in gathered:
                     torch.testing.assert_close(replica, local_grad)
+
+    @pytest.mark.parametrize(
+        "sharding_strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"]
+    )
+    @pytest.mark.parametrize(
+        ("model_dtype", "main_grad_dtype"),
+        [
+            pytest.param(torch.float32, None, id="fp32"),
+            pytest.param(torch.bfloat16, torch.float32, id="bf16-param-fp32-grad"),
+        ],
+    )
+    def test_cuda_graph_accumulates_microbatches(
+        self, sharding_strategy, model_dtype, main_grad_dtype
+    ):
+        """Accumulate one eager and one replayed M-FSDP microbatch.
+
+        :param sharding_strategy: M-FSDP gradient sharding strategy.
+        :type sharding_strategy: str
+        :param model_dtype: Compute parameter dtype.
+        :type model_dtype: torch.dtype
+        :param main_grad_dtype: Optimizer gradient dtype.
+        :type main_grad_dtype: Optional[torch.dtype]
+        """
+        model = SimpleMLP(4, bias=True).to(_device(), dtype=model_dtype)
+        fully_shard(
+            model,
+            sharding_strategy=sharding_strategy,
+            mp_policy=MixedPrecisionPolicy(
+                main_params_dtype=main_grad_dtype, main_grads_dtype=main_grad_dtype
+            ),
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+            enable_cuda_graph=True,
+        )
+
+        for value in (2.0, 3.0):
+            sample = torch.full(
+                (2, 4), value, device=_device(), dtype=model_dtype, requires_grad=True
+            )
+            model(sample).sum().backward()
+        model.finish_grad_sync()
+        torch.cuda.synchronize()
+
+        for param_names, param_group in model._named_param_groups:
+            for name, dist_grad in zip(param_names, param_group.dist_grads):
+                if dist_grad is None:
+                    continue
+                local_expected = 10.0 if name.endswith("weight") else 4.0
+                expected = local_expected * _world_size()
+                torch.testing.assert_close(
+                    dist_grad.to_local(), torch.full_like(dist_grad.to_local(), expected)
+                )
 
     @pytest.mark.parametrize(
         "enable_unshard_prefetch,enable_async_reduce_grad",
@@ -510,9 +560,7 @@ class TestMixedPrecision:
     def test_fp32_grad_reduce(self):
         """grad_reduce_in_fp32=True should use fp32 gradient communication."""
         torch.manual_seed(42)
-        mp_policy = MixedPrecisionPolicy(
-            grad_comm_dtype=torch.float32
-        )
+        mp_policy = MixedPrecisionPolicy(grad_comm_dtype=torch.float32)
         model = SimpleMLP(64).to(_device()).bfloat16()
         fully_shard(model, mp_policy=mp_policy)
 
@@ -661,8 +709,10 @@ class MLPWithCheckpointing(nn.Module):
     def __init__(self, hidden=64, num_layers=3):
         super().__init__()
         self.layers = nn.ModuleList(
-            [nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
-             for _ in range(num_layers)]
+            [
+                nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
+                for _ in range(num_layers)
+            ]
         )
         self._use_activation_checkpointing = False
 
@@ -684,10 +734,12 @@ class LargePerLayerModel(nn.Module):
 
     def __init__(self, hidden=256, num_layers=4):
         super().__init__()
-        self.layers = nn.ModuleList([
-            nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
-            for _ in range(num_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
+                for _ in range(num_layers)
+            ]
+        )
 
     def forward(self, x):
         for layer in self.layers:
@@ -748,11 +800,7 @@ class TestActivationCheckpointing:
         model.enable_activation_checkpointing()
 
         for layer in model.layers:
-            fully_shard(
-                layer,
-                enable_unshard_prefetch=True,
-                enable_async_reduce_grad=True,
-            )
+            fully_shard(layer, enable_unshard_prefetch=True, enable_async_reduce_grad=True)
         fully_shard(model, enable_unshard_prefetch=True, enable_async_reduce_grad=True)
 
         x = torch.randn(2, 128, device=device, requires_grad=True)
