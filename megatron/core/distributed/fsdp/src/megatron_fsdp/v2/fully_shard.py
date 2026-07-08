@@ -1,16 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 Public fully_shard API for Megatron-FSDP2.
@@ -22,7 +10,6 @@ The implementation is split across:
 
 from typing import Callable, Optional
 
-import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Shard
@@ -39,6 +26,7 @@ from .mixed_precision import MixedPrecisionPolicy
 from .utils import _init_default_fully_shard_mesh, _prepare_fsdp_mesh
 
 __all__ = ["FSDPModule", "fully_shard"]
+_fsdp_class_cache = {}  # module-level cache
 
 
 def fully_shard(
@@ -60,6 +48,7 @@ def fully_shard(
     sharding_strategy: str = "optim_grads_params",
     outer_dp_sharding_strategy: str = "no_shard",
     enable_cuda_graph: bool = False,
+    enable_full_iteration_cuda_graph: bool = False,
     fine_grained_hooks: bool = False,
     skip_backward_callback: bool = False,  # Skip autograd RegisterFSDPBackwardFunction.
     skip_final_backward_callback: bool = False,
@@ -75,6 +64,8 @@ def fully_shard(
     5. Replaces module parameters with DTensor representations
 
     Args:
+        enable_full_iteration_cuda_graph: If ``True``, keep graph-visible FSDP
+            optimizer gradient objects stable across full-iteration graph replay.
         fine_grained_hooks: If ``True``, register pre-forward/backward hooks
             on every sub-module (for EP-overlap / 1F1B schedules).
         skip_backward_callback: If ``True``, skip the autograd post-backward
@@ -100,7 +91,9 @@ def fully_shard(
         mp_policy = MixedPrecisionPolicy()
 
     cls = module.__class__
-    new_cls = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
+    if cls not in _fsdp_class_cache:
+        _fsdp_class_cache[cls] = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
+    new_cls = _fsdp_class_cache[cls]
     module.__class__ = new_cls
 
     use_trace_pool = (
@@ -111,11 +104,7 @@ def fully_shard(
             for m in module.modules()
             if isinstance(m, FSDPModule) and m is not module
         )
-    ) and sharding_strategy in (
-        "optim",
-        "optim_grads",
-        "optim_grads_params",
-    )
+    ) and sharding_strategy in ("optim", "optim_grads", "optim_grads_params")
     bucket_allocator = TracePoolAllocator() if use_trace_pool else StorageFreeingBucketAllocator()
 
     module._init_named_param_groups(
@@ -131,6 +120,7 @@ def fully_shard(
         enable_async_reduce_grad=enable_async_reduce_grad,
         bucket_allocator=bucket_allocator,
         enable_cuda_graph=enable_cuda_graph,
+        enable_full_iteration_cuda_graph=enable_full_iteration_cuda_graph,
     )
     module._init_param_main_grad_func()
 
@@ -143,9 +133,7 @@ def fully_shard(
     )
     _register_forward_hook(module)
     _register_backward_pre_hook(
-        module,
-        fine_grained=fine_grained_hooks,
-        skip_final_callback=skip_final_backward_callback,
+        module, fine_grained=fine_grained_hooks, skip_final_callback=skip_final_backward_callback
     )
     # When delay_wgrad_compute is enabled, skip the autograd post-backward
     # hook.  Per-layer reshard+reduce_grad still fires via set_fsdp_reshard_hooks

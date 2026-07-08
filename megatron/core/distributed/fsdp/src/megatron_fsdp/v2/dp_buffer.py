@@ -1,16 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -136,10 +124,7 @@ class DataParallelBuffer:
         return True
 
     def _move_data_to(
-        self,
-        target_device: torch.device,
-        pin_memory: bool = False,
-        non_blocking: bool = True,
+        self, target_device: torch.device, pin_memory: bool = False, non_blocking: bool = True
     ) -> None:
         """Move ``self.data`` to *target_device*, optionally using pinned memory.
 
@@ -305,12 +290,18 @@ class DataParallelBuffer:
         self,
         unshard_dim: Optional[int] = 1,
         bind_params: bool = False,
+        stream: Optional[torch.cuda.Stream] = None,
     ) -> torch.Tensor:
         """All-gather selected dimensions and optionally bind params.
 
         ``unshard_dim`` uses mesh dim ids: ``None`` does not unshard,
         ``0`` unshards outer-DP, and ``1`` unshards inner-DP.
         """
+        current_stream = torch.cuda.current_stream()
+        stream = stream or current_stream
+        if stream != current_stream:
+            stream.wait_stream(current_stream)
+
         # If unshard_dim is set, that dimension becomes replicated in the target.
         # Otherwise, every dimension keeps the current storage state.
         target_shard_layout = (
@@ -352,18 +343,22 @@ class DataParallelBuffer:
         input_buffer = self.fetch_buffer(source_shard_layout)
         output_buffer = self.fetch_buffer(output_shard_layout)
         if torch.distributed.get_world_size(group) == 1:
-            if output_buffer.data_ptr() != input_buffer.data_ptr():
-                output_buffer.copy_(input_buffer)
+            with torch.cuda.stream(stream):
+                if output_buffer.data_ptr() != input_buffer.data_ptr():
+                    output_buffer.copy_(input_buffer)
+                if output_buffer.is_cuda:
+                    output_buffer.record_stream(stream)
         else:
-            torch.distributed.all_gather_into_tensor(
-                output_tensor=output_buffer,
-                input_tensor=input_buffer,
-                group=group,
-            )
-            if output_buffer.is_cuda:
-                # Temporary all-gather buckets may be released from another stream before
-                # the collective finishes; record the producer stream for allocator safety.
-                output_buffer.record_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                torch.distributed.all_gather_into_tensor(
+                    output_tensor=output_buffer,
+                    input_tensor=input_buffer,
+                    group=group,
+                )
+                if output_buffer.is_cuda:
+                    # Temporary all-gather buckets may be released from another stream before
+                    # the collective finishes; record the producer stream for allocator safety.
+                    output_buffer.record_stream(stream)
 
         setattr(self, "_outer_dirty" if unshard_dim == 0 else "_inner_dirty", False)
 
@@ -458,9 +453,12 @@ class DataParallelBuffer:
     @torch.no_grad()
     def reduce_grad(
         self,
+        *,
         overwrite_grad: bool = False,
         reduce_dim: Optional[int] = 1,
         reduce_scatter: bool = True,
+        grad_comm_dtype: Optional[torch.dtype] = None,
+        stream: Optional[torch.cuda.Stream] = None,
     ):
         """Reduce gradients into the optimizer-facing local shard.
 
@@ -471,7 +469,12 @@ class DataParallelBuffer:
         if reduce_dim is None:
             return
 
-        grad_comm_dtype = self.mp_policy.grad_comm_dtype or self.dtype
+        current_stream = torch.cuda.current_stream()
+        stream = stream or current_stream
+        if stream != current_stream:
+            stream.wait_stream(current_stream)
+
+        grad_comm_dtype = grad_comm_dtype or self.mp_policy.grad_comm_dtype or self.dtype
         # Scale exactly once, when reducing fresh full grads over inner-DP.
         # Outer-only reduce consumes an already-scaled inner-DP result.
         if reduce_dim != 1 or self.gradient_scaling_factor in (None, 1.0):
@@ -501,15 +504,18 @@ class DataParallelBuffer:
         # Pick the process group covering exactly the reduced dimension.
         group = self.outer_dp_group if reduce_dim == 0 else self.dp_group
         if torch.distributed.get_world_size(group) == 1:
-            # A singleton inner-DP group bypasses both NCCL premul-sum and the
-            # BF16 prescale path above, so apply its scaling locally.
-            if reduce_dim == 1 and self.gradient_scaling_factor not in (None, 1.0):
-                input_buffer.mul_(self.gradient_scaling_factor)
-            if output_buffer.data_ptr() != input_buffer.data_ptr():
-                if overwrite_grad:
-                    output_buffer.copy_(input_buffer)
-                else:
-                    output_buffer.add_(input_buffer)
+            if input_buffer.is_cuda:
+                input_buffer.record_stream(stream)
+            with torch.cuda.stream(stream):
+                # A singleton inner-DP group bypasses both NCCL premul-sum and the
+                # BF16 prescale path above, so apply its scaling locally.
+                if reduce_dim == 1 and self.gradient_scaling_factor not in (None, 1.0):
+                    input_buffer.mul_(self.gradient_scaling_factor)
+                if output_buffer.data_ptr() != input_buffer.data_ptr():
+                    if overwrite_grad:
+                        output_buffer.copy_(input_buffer)
+                    else:
+                        output_buffer.add_(input_buffer)
             return
 
         comm_input = input_buffer
@@ -523,20 +529,22 @@ class DataParallelBuffer:
                 device=self.device,
             )
             comm_input = input_bucket.data
-            comm_input.copy_(input_buffer)
+            with torch.cuda.stream(stream):
+                comm_input.copy_(input_buffer)
+        if comm_input.is_cuda:
+            comm_input.record_stream(stream)
         if prescale:
-            comm_input.mul_(self.gradient_scaling_factor)
+            with torch.cuda.stream(stream):
+                comm_input.mul_(self.gradient_scaling_factor)
 
         if not reduce_scatter:
-            torch.distributed.all_reduce(comm_input, group=group, op=op)
+            with torch.cuda.stream(stream):
+                torch.distributed.all_reduce(comm_input, group=group, op=op)
+                if input_key is not None:
+                    output_buffer.copy_(comm_input.to(self.dtype))
             if input_key is not None:
-                output_buffer.copy_(comm_input.to(self.dtype))
                 self.allocator.free(input_key)
             return
-
-        if input_buffer.is_cuda:
-            # Keep temporary reduce-scatter buffers tied to the stream that uses them.
-            input_buffer.record_stream(torch.cuda.current_stream())
 
         input_meta = self.buffer_index._get_shard_meta(input_shard_layout)
         output_meta = self.buffer_index._get_shard_meta(output_shard_layout)
@@ -544,18 +552,19 @@ class DataParallelBuffer:
         # Stage RS output in the input buffer slice; avoids untraced temp keys in TracePool.
         comm_output = comm_input[output_offset : output_offset + output_buffer.numel()]
 
-        torch.distributed.reduce_scatter_tensor(
-            output=comm_output,
-            input=comm_input,
-            group=group,
-            op=op,
-        )
+        with torch.cuda.stream(stream):
+            torch.distributed.reduce_scatter_tensor(
+                output=comm_output,
+                input=comm_input,
+                group=group,
+                op=op,
+            )
 
-        if output_buffer.data_ptr() != comm_output.data_ptr():
-            if overwrite_grad:
-                output_buffer.copy_(comm_output)
-            else:
-                output_buffer += comm_output
+            if output_buffer.data_ptr() != comm_output.data_ptr():
+                if overwrite_grad:
+                    output_buffer.copy_(comm_output)
+                else:
+                    output_buffer += comm_output
         if input_key is not None:
             self.allocator.free(input_key)
 

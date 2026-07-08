@@ -1,19 +1,69 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 # Silent CUDA Graph inside Megatron FSDP v2 — Design
 
 > **Experimental** — CUDA graph support in Megatron FSDP v2 is an experimental
 > feature.  The API and behaviour may change in future releases without notice.
 
+## Acknowledgements
+
+Built on [te-graph-runtime](https://github.com/buptzyb/te-graph-runtime) by
+[@buptzyb](https://github.com/buptzyb) (Robin Zhang) — a standalone
+TE-compatible `make_graphed_callables` with `capture_time_hooks` support.
+Vendored under `te_graph_runtime/` with local modifications for FSDP v2.
+
+> **Provenance.**  `te_graph_runtime/graph.py` is itself derived from
+> TransformerEngine's own graph module
+> (`transformer_engine/pytorch/graph.py`) — it is the *same* `make_graphed_callables`
+> implementation, extracted into a standalone package and extended with
+> `capture_time_hooks`.  Treat it as a fork of the TE source: keep it in sync
+> with upstream TE and prefer upstreaming fixes back rather than letting the two
+> copies diverge.
+
 ## 1. Motivation
 
-mcore's CUDA graph system (`cuda_graph_impl="local"`, `cuda_graphs.py`) was
-designed for DDP's memory model — each layer receives freshly-allocated tensor
-inputs/outputs.  Megatron FSDP v2 shares the same pool-backed buffers across layers,
-and the FSDP hooks (unshard/reshard) are not captured in the graph in the
-same way.
+**The core conflict: a CUDA graph is static, but FSDP parameters are not.**
+A captured CUDA graph bakes in fixed memory addresses and a fixed sequence of
+kernels — replay reads and writes exactly the buffers that were live at capture
+time.  FSDP, by design, does the opposite to every parameter on every
+micro-batch:
 
-This doc describes a CUDA graph system built INTO Megatron FSDP v2, using
-`TracePoolAllocator` as the stable-memory foundation.  The user enables it
-with a single flag — everything else is automatic.
+- **`unshard`** all-gathers the sharded parameter into a *temporary* unsharded
+  buffer immediately before the layer runs, and
+- **`reshard`** frees that buffer immediately after, returning to the sharded
+  state.
+
+So a parameter's full, usable form only exists transiently, and — with a naive
+allocator — at a *different address* each time it is re-materialized.  Capturing
+the forward/backward of an FSDP layer with a stock
+`torch.cuda.make_graphed_callables` is therefore impossible on two counts:
+
+1. **Moving memory.**  The graph would hard-code the capture-time unshard
+   buffer address; the next micro-batch resharded and re-gathered the parameter
+   elsewhere, so replay would read stale or freed memory.
+2. **Hooks in the captured region.**  The unshard/reshard (and grad-reduce)
+   work is driven by module hooks that launch collectives and allocate/free
+   buffers — none of which can legally run inside `torch.cuda.graph()` capture,
+   and none of which should be *replayed* as static kernels anyway.
+
+**How this design resolves it.**  Two pieces make FSDP layers capturable:
+
+- The [`TracePoolAllocator`](../allocator.py) pins each parameter's unshard
+  buffer to a **fixed address** across micro-batches (see README §"Why MFSDP v2
+  can support CUDA graphs").  This removes the moving-memory problem — every
+  replay finds the weights exactly where capture left them, *provided* the hooks
+  re-gather them into that same slot before replay.
+- `te-graph-runtime`'s `make_graphed_callables` with **`capture_time_hooks`**
+  runs FSDP `unshard`/`reshard` **outside** the graphed region — they execute
+  during warmup and capture to place/free the weights, but are never recorded
+  into the graph and never replayed.  The graph captures only the layer's math;
+  memory movement stays in Python.
+
+A single batched call then captures every eligible module in forward-execution
+order into one shared memory pool.  MCore's existing CUDA graph system does not
+help here: it was built for DDP's memory model, where each layer receives
+freshly-allocated inputs/outputs and parameters are always resident, so it never
+had to reconcile capture with per-layer reshard.
 
 ## 2. One knob
 
@@ -21,330 +71,355 @@ with a single flag — everything else is automatic.
 fully_shard(module, enable_cuda_graph=True)
 ```
 
-No `--cuda-graph-warmup-steps`, no `--cuda-graph-scope`, no coordination with
-the pipeline schedule.  The system automatically captures and replays on the
-first optimized microbatch.
+## 3. Workflow at a glance
 
-## 3. Why TracePoolAllocator is the enabler
+CUDA graph capture rides on the `TracePoolAllocator`'s existing
+trace → plan → optimized progression, adding just a *record* step and a
+*capture* step.  End to end it spans three micro-batches — the same three
+stages §5 later walks through hook-by-hook:
 
-CUDA graphs require **stable buffer addresses**.  After `plan()` allocates
-the pool tensor, every slot has a fixed offset.  The returned views' addresses
-are deterministic every micro-batch.
+- **Stage 1 · MB0 — trace.**  Forward/backward run fully eagerly while the
+  allocator records every buffer alloc/free; `plan()` then pins each buffer to a
+  **fixed address**.  Nothing is captured yet — those fixed addresses are the
+  precondition that makes capture legal at all (see §1).
+- **Stage 2 · MB1 — record + capture.**  With addresses now stable, the forward
+  records sample inputs per eligible layer, and the backward's final callback
+  captures forward+backward graphs for all of them in one batched call — then
+  swaps each layer's `forward` for a graph-replaying version.
+- **Stage 3 · MB2+ — replay.**  Each layer's forward/backward is a graph replay.
+  FSDP's real `unshard` / `reshard` / `reduce_grad` hooks still fire *around* the
+  replay — landing weights at the fixed addresses before, consuming gradients
+  after — but never execute inside the graph.
 
-During graph replay, the graphed CUDA kernels operate on the exact addresses
-that were recorded during capture.  The allocator is **not called** for
-graphed modules during replay — the graph uses the addresses directly.  Pool
-slots are pre-allocated by `plan()`, so no dynamic allocation occurs inside
-the graph region.
+From here the document zooms in: §4 describes the components that implement
+these stages, §5 expands the same three stages with exact hook ordering, and §6
+contrasts hook behavior during capture vs. replay.
 
-## 4. Lifecycle
+## 4. Architecture
 
-```
-╔═══════════════════════════════════════════════════════════════╗
-║ Stage 1 — Microbatch 0 (trace)                                ║
-║                                                                ║
-║  forward:   _trace_allocate / _trace_free  → trace recorded   ║
-║  backward:  _trace_allocate / _trace_free  → trace continues  ║
-║  plan():    pool built, _seq_ops populated, phase="optimized"  ║
-║  snapshot_slots():  freeze slot state for replay              ║
-╚═══════════════════════════════════════════════════════════════╝
-                          │
-╔═══════════════════════════════════════════════════════════════╗
-║ Stage 2 — Microbatch 1+ (capture + eager forward)             ║
-║                                                                ║
-║  root_forward_pre_hook:                                        ║
-║    reset_cursor()                                              ║
-║    restore_slots()  (restore capture-time slot state)          ║
-║  forward (per graphed FSDPModule):                             ║
-║    forward_pre_hook detects enable_cuda_graph=True:            ║
-║      1. Creates FSDPCudaGraphRunner(module)                    ║
-║      2. Runner sets cuda_graph_active=True, pops hooks         ║
-║      3. Calls torch.cuda.make_graphed_callables(shim, ...)    ║
-║         → warms up, captures forward+backward graph            ║
-║      4. Runner restores hooks, clears cuda_graph_active        ║
-║      5. install() patches module.forward to graph replay       ║
-║    Module then runs _orig_forward eagerly (this call)          ║
-║  backward:                                                      ║
-║    post_backward hooks fire normally                            ║
-║    reshard / reduce_grad run normally                           ║
-║  post-bwd:                                                      ║
-║    enable_flexible_mode()                                       ║
-╚═══════════════════════════════════════════════════════════════╝
-                          │
-╔═══════════════════════════════════════════════════════════════╗
-║ Stage 3 — Microbatch 2+ (replay)                               ║
-║                                                                ║
-║  root_forward_pre_hook:                                        ║
-║    reset_cursor()                                              ║
-║    restore_slots()                                             ║
-║  forward (per graphed FSDPModule):                             ║
-║    forward_pre_hook: runner already exists → skip capture      ║
-║    patched forward: graphed(*flat) → replays captured graph    ║
-║    → forward+backward complete within graph callable           ║
-║    → NO Python FSDP hooks fire during graph                    ║
-║    → allocator NOT called for graphed modules                  ║
-║  forward (per non-graphed FSDPModule):                         ║
-║    normal eager: hooks fire → alloc calls                     ║
-║  backward:                                                      ║
-║    post_backward hooks fire normally (after graph returns)     ║
-║    reshard / reduce_grad run normally                          ║
-║  post-bwd:                                                      ║
-║    enable_flexible_mode()                                       ║
-╚═══════════════════════════════════════════════════════════════╝
-```
+### 4.0 Why te-graph-runtime instead of torch.cuda.make_graphed_callables?
 
-## 5. FSDPCudaGraphRunner
+| Feature | `torch.cuda.make_graphed_callables` | `te-graph-runtime` |
+|---------|-------------------------------------|-------------------|
+| **Module hooks** | Asserts modules have NO hooks at capture time | `capture_time_hooks` — hooks that run outside graph capture, not registered on modules |
+| **Keyword args** | Positional tensor args only | `sample_kwargs` passes keyword tensor args natively |
+| **TE/FP8** | No TE-specific support | TE FP8/FP4 recipes, amax reduction, delayed wgrad, RNG tracker state |
+| **Parameter grad lifetime** | Standard PyTorch lifetime | TE PR #2937 grad lifetime fix |
 
-The runner encapsulates per-module CUDA graph capture and replay:
+FSDP v2 modules require unshard/reshard hooks around every forward/backward —
+even during warmup and capture.  PyTorch's version rejects modules with hooks.
+`te-graph-runtime`'s `capture_time_hooks` runs these essential operations
+outside the CUDA graph region without violating the no-hooks assertion.
 
-```python
-class FSDPCudaGraphRunner:
-    def capture_forward(self, *sample_args, **sample_kwargs):
-        # 1. Build a _ForwardShim that freezes non-tensor kwargs
-        # 2. Disable side-stream collectives on the root context
-        # 3. Pop FSDP hooks from the module (save/restore)
-        # 4. Call torch.cuda.make_graphed_callables(shim, ...)
-        #    → handles warmup (3 iters) + capture internally
-        # 5. Restore hooks and side-stream settings
+### 4.1 te-graph-runtime
 
-    def install(self):
-        # Patches module.forward to a wrapper that flattens
-        # args/kwargs → positional tensors and calls graphed(*flat)
-```
+`make_graphed_callables` wraps each module with a `Graphed` autograd Function
+that replays forward and backward CUDA graphs.  It handles warmup, capture
+order (fwds in forward-module order, bwds in reverse), shared memory pool, and
+autograd wiring internally.
 
-**Why `make_graphed_callables`?** PyTorch's built-in utility handles:
-- Warmup iterations to settle cuDNN/cuBLAS auto-tuning and TE FP8 scales
-- Memory pool allocation for captured tensors
-- AccumulateGrad node creation on the capture stream (avoids
-  `cudaErrorStreamCaptureImplicit` by keeping `.grad` tensors alive from
-  warmup through capture)
+> **Shared lineage with TransformerEngine.**  This is the same
+> `make_graphed_callables` implementation that TransformerEngine ships and uses
+> for its own CUDA graph capture — `te-graph-runtime` is a standalone extract of
+> it (plus `capture_time_hooks`).  Behavior, argument surface, and quirks
+> therefore track TE's graphed-callable path; fixes here should be kept in sync
+> with (and ideally upstreamed to) TE to avoid divergence.
 
-**Why pop hooks?** The graph records the module's `forward()` only — no
-FSDP all-gather or reduce-scatter collectives.  Hooks are restored
-immediately after capture, before the eager forward call.
+**Warmup and capture share the same CUDA stream for activation reuse** — intermediate
+tensors (cuDNN/cuBLAS workspaces, attention intermediates) allocated during
+warmup stay at the same addresses in the same CUDA context, so the capture
+phase reuses them instead of freeing and reallocating.  This saves significant
+GPU memory vs. a throwaway warmup stream that would fragment the caching
+allocator with stale allocations.
 
-## 6. Per-FSDPModule selectivity
+Key features we rely on:
+
+- **`capture_time_hooks`** — hook functions that run during warmup + capture
+  but are NOT captured into the CUDA graph.  Used for FSDP unshard/reshard.
+- **`sample_kwargs`** — keyword tensor arguments passed natively to modules,
+  avoiding positional shim complexity.
+- **`pool`** — shared `graph_pool_handle` for all modules.
+- **`capture_stream`** — optional parameter to serialize captures on the same
+  stream (important for shared-pool correctness).
+
+### 4.2 CudaGraphRunner
+
+A lightweight orchestrator stored on `ctx.cuda_graph_runner`:
 
 ```python
-# Only specific leaf layers graphed
-for layer in model.layers:
-    fully_shard(layer, enable_cuda_graph=True)
-fully_shard(model, enable_cuda_graph=False)
+class CudaGraphRunner:
+    def record_module(self, module, args, kwargs):
+        """Record sample args during the first optimized forward."""
+    def capture_and_install(self, root_module, capture_stream=None):
+        """Pop hooks → make_graphed_callables → restore hooks."""
 ```
 
-Each `FSDPModule` carries a flag in `_FSDPState`:
+### 4.3 capture_time_hooks
+
+Four minimal hooks attached via `capture_time_hooks` to each module:
+
+| Hook | Trigger | Action |
+|------|---------|--------|
+| `forward_pre_hooks_with_kwargs` | Before warmup/capture forward | `module.unshard()` |
+| `forward_hooks_with_kwargs` | After warmup/capture forward | `module.reshard()` |
+| `backward_pre_hooks` | Before warmup/capture backward | `module.unshard(bwd_pass=True)` |
+| `backward_hooks` | After warmup/capture backward | `module.reshard()` + clear `param.grad` |
+
+These run outside `torch.cuda.graph()` — unshard/reshard are never captured.
+
+### 4.4 Inside `make_graphed_callables` (deep dive)
+
+`make_graphed_callables` is the single most important dependency of this
+system, and the correctness of the FSDP integration rests on its exact
+contract.  This subsection documents what it does, the invariants it assumes,
+and where the FSDP integration must cooperate.  Line references are to
+`te_graph_runtime/graph.py`.
+
+#### 4.4.1 Signature and return value
 
 ```python
-class _FSDPState:
-    enable_cuda_graph: bool = False
+graphed = make_graphed_callables(
+    modules,                # tuple(nn.Module) — captured in this order
+    sample_args,            # tuple(tuple)     — positional sample tensors per module
+    num_warmup_iters=3,
+    sample_kwargs=...,      # tuple(dict)      — keyword sample tensors per module
+    pool=...,               # shared graph_pool_handle
+    capture_time_hooks=..., # per-module unshard/reshard hooks (not captured)
+    capture_stream=...,     # stream shared by warmup + capture
+)
 ```
 
-All modules share the same `TracePoolAllocator` — slot assignments are fixed
-by `plan()` regardless of which modules are graphed.
+For each module it returns a `functionalized` callable and **replaces
+`module.forward` in place** with it (`graph.py` builds one per callable in the
+final loop).  After installation, calling `module(...)` runs the graphed path
+instead of the eager forward.
 
-### Nesting limitation
+#### 4.4.2 The static input surface
 
-A parent FSDP module that contains other FSDP modules as children **cannot**
-use `enable_cuda_graph=True`.  Only leaf FSDP modules (those without FSDP
-children) are eligible.  This is enforced in `_init_fsdp_state` with a
-`RuntimeError`.
+For every callable the "static input surface" is
 
-The reason: CUDA graph capture runs the module's forward without FSDP hooks
-(the hooks are popped).  For a parent module, the forward calls child
-FSDP-module forwards, which may themselves have CUDA graph logic or require
-FSDP unshard/reshard.  Limiting CUDA graph to leaf modules avoids this
-complexity.
+```
+static_input_surface = flatten(sample_args) + flatten(sample_kwargs) + tuple(module.parameters())
+```
 
-## 7. Capture stream invariants
+(`graph.py:686-688`).  Two consequences drive the whole design:
 
-During CUDA graph capture, `FSDPCudaGraphRunner.capture_forward` disables
-side-stream collectives and sets `cuda_graph_active=True` so that hooks
-defer reshard and skip post-backward cleanup while the graph is being built.
+1. **Parameters are part of the graph's input surface.**  Their gradients are
+   produced by the captured backward and returned from `Graphed.backward`, so
+   FSDP needs no manual param-grad buffer plumbing (see §8).
+2. **Only the *user* args are copied in at replay** — not the parameters.
+   `Graphed.forward` copies incoming tensors into the static buffers for
+   `i in range(len_user_args)` and *only* when `data_ptr()` differs
+   (`graph.py:1351-1357`).  Module parameters are never copied; the graph reads
+   them **at the addresses they occupied during capture**.  This is the exact
+   reason the FSDP integration requires the `TracePoolAllocator`: `unshard()`
+   must place each parameter back at the same fixed address on every
+   micro-batch, or replay reads stale/garbage weights.
 
-The root context provides:
+#### 4.4.3 Phases
+
+| Phase | What happens | Where |
+|-------|--------------|-------|
+| **Warmup** | Runs each callable `num_warmup_iters` times (default 3) on `capture_stream`, forward + backward, to flush lazy init (cuDNN benchmarking, cuBLAS/attention workspaces, TE module discovery) out of the captured region.  `capture_time_hooks` fire here, so params are unsharded for warmup. | `graph.py:923-1003` |
+| **Forward capture** | For each callable **in forward order**, run `func(*args, **kwargs)` under `torch.cuda.graph(pool, stream)`; record `static_outputs`. | `graph.py:1240-1254` |
+| **Backward capture** | For each callable **in reverse order**, run `torch.autograd.backward` under graph capture with pre-allocated `static_grad_outputs`; record `static_grad_inputs` (including param grads). | `graph.py:1256-1312` |
+
+Warmup and capture deliberately share one stream so intermediate workspace
+tensors keep the same addresses and are reused rather than reallocated (§4.1).
+
+#### 4.4.4 The `Graphed` autograd Function
+
+Replay is wrapped in a `torch.autograd.Function` (`graph.py:1335-1426`):
+
+- **`forward`**: copy changed user inputs into the static surface → replay
+  `fwd_graph` (optionally on a side stream with event sync-back) → return
+  `static_outputs.detach()`.
+- **`backward`** (`@once_differentiable`): copy incoming grads into
+  `static_grad_outputs` (skipping when the pointer already matches) → replay
+  `bwd_graph` → return `static_grad_inputs`.  Returned **parameter** grads are
+  `.detach().clone()`d (`graph.py:1420-1423`) so autograd consumers never see
+  the graph's internal static buffers; non-param input grads are returned as
+  detached views.
+
+`functionalized` (`graph.py:1428-1480`) is the user-facing wrapper: it strips
+the `cuda_graph_stream` / `cuda_graph_event` control kwargs, **reconstructs the
+capture-time flattened argument order** from `user_args` (by position) and
+`user_kwargs` (by name) — the local fix that lets a recorded kwarg be passed
+positionally at replay — appends `module_params`, and calls `Graphed.apply`.
+
+#### 4.4.5 Invariants the caller must uphold
+
+- **No module hooks at capture.**  `make_graphed_callables` asserts the modules
+  carry no hooks; FSDP therefore pops all real hooks and passes unshard/reshard
+  as `capture_time_hooks` instead (§6.1).
+- **Fixed parameter addresses across micro-batches** (see §4.4.2) — provided by
+  `TracePoolAllocator` in the `"optimized"` phase.
+- **Static shapes, dtypes, and control flow.**  The captured graph encodes one
+  concrete shape/dtype path; varying sequence length, batch size, or branch
+  taken per micro-batch is unsupported.
+- **Parameters unchanged in identity since capture.**  Replay assumes the same
+  `module.parameters()` objects/addresses; re-wrapping or reallocating params
+  after capture invalidates the graph.
+- **Outputs are assumed to require grad.**  Backward capture allocates a
+  `static_grad_output` for every output that `requires_grad`; a module that
+  returns a mix must keep that structure stable.
+- **RNG correctness.**  Dropout and other RNG ops are made replay-correct via
+  `register_generator_state` on the fwd/bwd graphs (`graph.py:730-735`); without
+  it every replay would reuse the captured mask (§9).
+
+#### 4.4.6 Why this shapes the FSDP integration
+
+The copy-in/replay/copy-out contract means the graphed region is a **pure
+function of its static buffers**.  Everything that must vary per micro-batch —
+parameter all-gather (`unshard`), buffer release (`reshard`), and gradient
+reduction (`reduce_grad`) — is deliberately kept *outside* the graph: unshard
+lands the weights at the fixed capture addresses before replay, and reshard /
+reduce-scatter consume the param grads autograd installs after replay.  The
+graph owns the math; FSDP owns the memory movement around it.
+
+## 5. Lifecycle
+
+The three stages below are the detailed, hook-by-hook expansion of the
+trace → capture → replay flow introduced in §3 (Stage 1/2/3 map 1:1).
+
+```
+CUDA Graph Lifecycle (trace → capture → replay)
+
+Stage 1 · Microbatch 0 — TRACE
+  • forward + backward run eagerly
+  • allocator records every alloc / free  →  trace events
+  • plan(): conflict-graph coloring → fixed per-key slots
+    phase = "optimized" (addresses now deterministic)
+
+        ↓
+
+Stage 2 · Microbatch 1 — RECORD + CAPTURE
+  • root_forward_pre_hook: create shared graph_pool + capture_stream,
+    set capture_stream as current stream
+  • forward (per module): unshard → record_module → eager forward → reshard
+  • backward (eager): unshard → reshard + reduce_grad
+  • post_backward_final_callback → capture_and_install():
+      1. clone sample kwargs (fresh leaves)
+      2. pop all FSDP hooks
+      3. make_graphed_callables → warmup + fwd capture + bwd capture
+         (replaces module.forward with graphed version)
+      4. restore FSDP hooks
+      5. mark _fsdp_cg_installed
+
+        ↓
+
+Stage 3 · Microbatch 2+ — REPLAY
+  • forward (per module): unshard → fwd_graph.replay → reshard
+    (_fsdp_cg_installed → skip record)
+  • backward: unshard → bwd_graph.replay → reshard + reduce_grad
+```
+
+Real FSDP hooks (`unshard` / `reshard` / `reduce_grad`) run **around** every
+stage but are never captured into the graph — see §6.
+
+## 6. Hook strategy
+
+### 6.1 During capture (`make_graphed_callables`)
+
+Real FSDP hooks are **popped** from the entire module tree before calling
+`make_graphed_callables` (it asserts modules have no hooks).  `capture_time_hooks`
+handle unshard/reshard during warmup, forward capture, and backward capture.
+
+### 6.2 During replay
+
+Real FSDP hooks are **restored** after capture.  They fire normally around
+`module.__call__`:
+
+- `forward_pre_hook` → unshard
+- `module.forward` (graphed) → fwd replay
+- `forward_hook` → reshard
+- `backward_pre_hook` → unshard (bwd_pass)
+- `Graphed.backward` → bwd replay
+- `backward_hook` → reshard + reduce_grad
+
+## 7. Capture stream & shared pool
 
 ```python
-@dataclass
-class _FSDPRootContext:
-    cuda_graph_active: bool = False
-    """True only during CUDA graph capture (inside FSDPCudaGraphRunner).
-    Suppresses side-stream vs default-stream mismatches and defers reshard."""
+# hooks.py — root forward pre-hook (once, when enable_cuda_graph and
+# cuda_graph_stream is None)
+ctx.cuda_graph_stream = torch.cuda.Stream()
+torch.cuda.set_stream(ctx.cuda_graph_stream)   # becomes the current stream
+ctx.cuda_graph_pool = torch.cuda.graph_pool_handle()
 
-    @property
-    def cuda_graph_compatible(self) -> bool:
-        """Return True when both side-stream collectives are disabled."""
-        return (not self.enable_unshard_prefetch) and (not self.enable_async_reduce_grad)
+# CudaGraphRunner passes them to make_graphed_callables:
+make_graphed_callables(
+    modules,
+    sample_args,
+    pool=ctx.cuda_graph_pool,
+    capture_stream=ctx.cuda_graph_stream,
+)
 ```
 
-``FSDPModule.cuda_graph_compatible`` adds an additional check that the
-allocator is in ``"optimized"`` phase:
+## 8. Parameter gradients
 
-```python
-@property
-def cuda_graph_compatible(self) -> bool:
-    ctx = self._fsdp_root_context
-    if not isinstance(ctx.bucket_allocator, TracePoolAllocator):
-        return False
-    if ctx.bucket_allocator.phase != "optimized":
-        return False
-    return ctx.cuda_graph_compatible
-```
+`param.grad` is the hand-off point between the graphed region and FSDP's
+ordinary gradient path.  Because `make_graphed_callables` puts
+`module.parameters()` in the graph's input surface (§4.4.2), the **captured
+backward computes each parameter's gradient value** — but everything that
+*touches `param.grad`* stays **outside** the graph:
 
-During replay, ``cuda_graph_active`` is **not** set — the graph callable
-runs forward+backward atomically inside ``graphed(*flat)``, and the standard
-hook lifecycle handles reshard/reduce_grad normally after the graph returns.
+1. **Graph (captured):** `bwd_graph.replay()` computes the gradient values into
+   the graph's static gradient buffers.
+2. **Autograd (eager, not captured):** `Graphed.backward` clones those values
+   out and returns them; PyTorch's autograd engine writes them into
+   `param.grad` through the normal `AccumulateGrad` path.
+3. **FSDP post-backward hook (eager, not captured):** `reduce_grad` copies
+   `param.grad` into `param.main_grad`, reduce-scatters, then clears
+   `param.grad`.
 
-## 8. Hook changes
+In short: **the graph only produces gradient values; FSDP consumes them via
+`param.grad` exactly as in the non-graph path.**  Nothing about grad
+accumulation, reduction, or resharding is captured, so no manual gradient-buffer
+plumbing is needed and the FSDP grad path stays CUDA-graph-agnostic.
 
-### 8.1 Forward pre-hook — capture trigger
+## 9. Known issues & fixes
 
-```python
-# hooks.py — _register_forward_pre_hook
-def unshard_param_groups(fsdp_module, args, kwargs):
-    # ... unshard as normal ...
-    if fsdp_module._fsdp_state.enable_cuda_graph and (
-        not hasattr(fsdp_module, "_fsdp_cg_runner")
-    ):
-        cg_runner = FSDPCudaGraphRunner(fsdp_module)
-        cg_runner.capture_forward(*args, **kwargs)
-        cg_runner.install()
-        fsdp_module._fsdp_cg_runner = cg_runner
-```
+| Issue | Root cause | Fix | Date |
+|-------|-----------|-----|------|
+| `cudaErrorStreamCaptureInvalidated` with `torch.compile` | Shared warmup/capture stream; compile recompilation breaks capture | Separate throwaway warmup stream (workaround; ideal: keep shared stream and fix compile guard mismatch) | 2026-06 |
+| OOM during warmup | `warmup_outputs` held tensor refs across `gc.collect` + `empty_cache` | `param.grad = None` prevents gradient accumulation across warmup iterations | 2026-06 |
+| Non-tensor kwargs crash `.requires_grad` | `tree_flatten` passes `None` into `static_input_surface` | 6 `is not None` / `isinstance` guards in te-graph-runtime | 2026-06 |
+| Positional `hidden_states` missing in replay | `kwargs_keys` validation rejected positional args | `functionalized` checks both `user_args` and `user_kwargs` | 2026-06 |
 
-Capture happens exactly once — the first time the module is called in
-an optimized forward pass.  Subsequent calls skip because `_fsdp_cg_runner`
-already exists.
-
-### 8.2 Defer post-forward reshard
-
-```python
-# hooks.py — _register_forward_hook → reshard_param_groups
-def reshard_param_groups(module, *unused):
-    ctx = module._fsdp_root_context
-    if ctx.backward_phase and id(module) == ctx.backward_module:
-        return
-    if ctx.cuda_graph_active:
-        return  # deferred; cleanup runs after capture returns
-    module.reshard()
-```
-
-### 8.3 Suppress post_backward during capture
-
-```python
-# hooks.py — _register_backward_hook → post_backward
-def post_backward(module):
-    ctx = module._fsdp_root_context
-    if ctx.cuda_graph_active:
-        return  # hooks are popped during capture; nothing to do
-    ctx.backward_done_modules.add(id(module))
-    ctx._advance_backward_module()
-    module.reshard()
-    ...
-```
-
-### 8.4 Final callback — skips during capture
-
-```python
-# hooks.py — _post_backward_final_callback
-def _post_backward_final_callback(root_state, root_module):
-    ctx = root_module._fsdp_root_context
-    if ctx.cuda_graph_active:
-        return  # capture manages cleanup; hooks are already popped
-    stream = ctx.rs_stream
-    for module in reversed(ctx.forward_order):
-        ...
-    ctx.cuda_graph_active = False  # not reached during capture — clears
-                                   # any stale state at end of replay
-```
-
-``cuda_graph_active`` is **only needed during capture** (when
-``FSDPCudaGraphRunner.capture_forward`` calls ``make_graphed_callables``).
-The runner pops hooks before capture and restores them after, so normal
-post-forward / post-backward cleanup runs correctly outside the graph region.
-
-During replay, the graph callable runs forward+backward atomically inside
-``graphed(*flat)``.  After it returns, the standard hook lifecycle handles
-reshard and reduce_grad normally — no ``cuda_graph_active`` guard is required.
-
-### 8.5 Root forward pre-hook — restore slots
-
-```python
-# hooks.py — _register_root_forward_pre_hook
-def root_forward_pre_hook(_hook_module, args):
-    ctx = fsdp_module._fsdp_root_context
-    ...
-    if isinstance(ba, TracePoolAllocator) and ba.phase == "optimized":
-        ba.disable_flexible_mode()
-        ba.reset_cursor()
-        if any(getattr(m._fsdp_state, "enable_cuda_graph", False)
-               for m in ctx.forward_order):
-            ba.restore_slots()
-```
-
-## 9. Allocator interface
-
-The allocator requires three methods to support CUDA graph replay:
-
-```python
-class TracePoolAllocator:
-    _captured_slot_state: List[bool]  # snapshot of slot.in_use at capture end
-
-    def snapshot_slots(self):
-        """Freeze current slot in_use state after all graphs are captured."""
-        self._captured_slot_state = [s.in_use for s in self._slots]
-
-    def restore_slots(self):
-        """Restore slot state to capture-time snapshot before each replay."""
-        for i, in_use in enumerate(self._captured_slot_state):
-            self._slots[i].in_use = in_use
-```
-
-`snapshot_slots()` is called in the post-backward callback after `plan()`
-(trace→optimized transition).  `restore_slots()` is called in the root
-forward pre-hook before each replay to ensure the same slot availability
-as during capture.
-
-## 10. Slot state management
-
-After the trace phase and `plan()`, `snapshot_slots()` freezes the
-allocator's slot `in_use` state.  Before each forward pass during replay,
-`restore_slots()` resets slots to that snapshot.  This ensures:
-
-- Flexible-mode allocs between microbatches see correct slot availability.
-- Non-graphed modules during replay advance `in_use` flags correctly.
-- The next replay starts from the same clean state.
-
-## 11. Risks
-
-| Risk | Mitigation |
-|------|-----------|
-| Side-stream all-gather invisible to graph → corrupt param buffers | `cuda_graph_compatible` assertion + runner disables side streams during capture |
-| Post-forward reshard frees buffers too early | `cuda_graph_active` guard in `reshard_param_groups` defers reshard during capture |
-| AccumulateGrad nodes carry stale stream → `cudaErrorStreamCaptureImplicit` | `make_graphed_callables` handles warmup + capture on the same stream, keeping `.grad` tensors alive through warmup |
-| Non-deterministic FP8/RNG across warmup iterations | `make_graphed_callables` runs 3 warmup iterations before capture — FP8 scales settle, RNG advances |
-| Slot `in_use` flags stale after replay | `restore_slots()` resets to capture-end snapshot before each forward |
-| Capture triggered for nested FSDP modules | `_init_fsdp_state` rejects `enable_cuda_graph=True` on modules with FSDP children |
-| Graph capture OOM (pool too large) | Pool is pre-allocated by `plan()`; CUDA graph mempool uses same pattern |
-
-## 12. Files
+## 10. Files
 
 | File | Role |
 |------|------|
-| `cuda_graph_runner.py` | `FSDPCudaGraphRunner` — capture via `make_graphed_callables`, install/uninstall forward patch |
-| `fsdp_module.py` | `_FSDPRootContext.cuda_graph_active` flag, `cuda_graph_compatible` property, nested FSDP check in `_init_fsdp_state` |
-| `hooks.py` | Capture trigger in forward pre-hook, reshard deferral in forward/backward hooks, slot restore in root forward pre-hook, cleanup in final callback |
-| `allocator.py` | `TracePoolAllocator.snapshot_slots()` / `restore_slots()` for stable slot state |
-| `fully_shard.py` | Accept `enable_cuda_graph` kwarg; passes to `_enable_cuda_graph()` |
+| `cuda_graph_runner.py` | `CudaGraphRunner` — sample arg recording, hook save/restore, batch capture orchestration |
+| `hooks.py` | Capture trigger, shared pool+stream creation |
+| `fsdp_module.py` | `_FSDPRootContext.cuda_graph_runner` / `cuda_graph_stream` / `cuda_graph_pool` |
+| `te_graph_runtime/` | Vendored `make_graphed_callables` with local modifications |
+| `design/cuda_graph_design.md` | This document |
 
-## 13. No user-visible knobs
+## 11. No user-visible knobs
 
 | What happens | User action |
 |---|---|
-| Trace collection | Automatic (MB0 forward) |
+| Trace collection | Automatic (MB0) |
 | Pool planning | Automatic (MB0 post-backward) |
-| Slot snapshot | Automatic (after plan) |
-| Graph capture | Automatic (first optimized MB forward, via `FSDPCudaGraphRunner`) |
-| Graph replay | Automatic (subsequent MBs, via patched forward) |
-| Slot state management | Automatic (snapshot/restore around replay) |
-| Side-stream suppression | Automatic (`cuda_graph_active` flag in hooks) |
-| Flexible mode toggling | Automatic (existing hook lifecycle) |
+| Sample arg recording | Automatic (MB1 forward pre-hook) |
+| Graph capture | Automatic (MB1 post-backward, via `make_graphed_callables`) |
+| Graph replay | Automatic (MB2+, via `Graphed.apply`) |
+| RNG state | Handled by `make_graphed_callables` internally |
+| Slot state | Automatic (fixed per-key slots after `plan()`) |
+
+## 12. Full-iteration optimizer-gradient storage
+
+The default-off `enable_full_iteration_cuda_graph` mode preserves only the
+optimizer-facing gradient objects that cross the full-iteration graph boundary.
+Transient full weight and gradient buffers allocate and reshard inside capture;
+the CUDA graph private pool provides stable replay addresses and lifetime reuse.
+
+- `_pre_backward_setup()` pre-allocates local dist grads before capture.
+- `_maybe_free_grad_data()` keeps optimizer-facing local gradient storage resident.
+- FSDP and optimizer zero-grad preserve optimizer-facing `grad`/`decoupled_grad`
+  identities and clear their local storage in place.
+- Full-iteration mode uses `StorageFreeingBucketAllocator`; `TracePoolAllocator`
+  remains available for explicit and per-module CUDA graph modes.
+
+All behavior is gated by `enable_full_iteration_cuda_graph=False` by default.

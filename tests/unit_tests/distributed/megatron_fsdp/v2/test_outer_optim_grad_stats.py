@@ -13,6 +13,7 @@ from megatron.core.optimizer.clip_grads import (
     _all_reduce_grad_stats,
     get_grad_norm_fp32,
 )
+from megatron.core.optimizer.optimizer import MegatronOptimizer
 
 
 @pytest.mark.parametrize(
@@ -41,6 +42,45 @@ def test_grad_stats_reduce_each_composite_group(monkeypatch, op):
     calls.clear()
     _all_reduce_grad_stats(torch.tensor(1.0), op, None)
     assert calls == [(op, None)]
+
+
+def test_has_grad_norm_group_reduces_each_composite_group(monkeypatch):
+    """The cached group-presence flag must cover the full HSDP Cartesian domain."""
+    intra_group = object()
+    inter_group = object()
+    calls = []
+    real_tensor = torch.tensor
+
+    monkeypatch.setattr(
+        torch,
+        "tensor",
+        lambda data, dtype=None, device=None: real_tensor(data, dtype=dtype),
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda _tensor, op=None, group=None: calls.append((op, group)),
+    )
+
+    class MockOptimizer:
+        has_grad_norm_group = MegatronOptimizer.has_grad_norm_group
+
+        def get_parameters(self):
+            return [SimpleNamespace(grad_norm_group="mtp")]
+
+        def get_grad_stats_parallel_group(self):
+            return (intra_group, inter_group)
+
+    optimizer = MockOptimizer()
+    assert optimizer.has_grad_norm_group("mtp") is True
+    assert calls == [
+        (torch.distributed.ReduceOp.MAX, intra_group),
+        (torch.distributed.ReduceOp.MAX, inter_group),
+    ]
+
+    calls.clear()
+    assert optimizer.has_grad_norm_group("mtp") is True
+    assert calls == []
 
 
 def test_composite_groups_match_full_cartesian_grad_norm():
