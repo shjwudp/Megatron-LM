@@ -624,6 +624,9 @@ class FullyShardV2MuonOptimizer(MegatronOptimizer):
     def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
         return []
 
+    def count_zeros(self) -> float:
+        return 0.0
+
     # --- Step contract used by ChainedOptimizer. ---
     def prepare_grads(self) -> bool:
         # FSDP gradients are already reduced into the grad buffers; no loss-scale

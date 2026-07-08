@@ -56,7 +56,6 @@ from ..fp4_utils import is_nvfp4tensor, quantize_nvfp4_param_shard
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
-from .clip_grads import GradStatsParallelGroup
 from .cpu_offloading.optimizer_state_offloader import OptimizerStateOffloader
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
@@ -802,10 +801,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         param_range_map = gbuf_range_map["param_map"][param]
         return param_range_map
 
-    def get_grad_stats_parallel_group(self) -> GradStatsParallelGroup:
+    def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """
         With the distributed optimizer, gradient statistics (num_zeros & norm) are reduced over
-        every rank that owns a unique optimizer gradient shard.
+        all ranks in the distributed optimizer instance (versus only the model-parallel ranks
+        with the non-distributed optimizer).
         """
         return getattr(self, 'grad_stats_parallel_group', None)
 

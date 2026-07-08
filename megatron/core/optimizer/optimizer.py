@@ -48,13 +48,7 @@ from ..dist_checkpointing.optimizer import (
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
-from .clip_grads import (
-    GradStatsParallelGroup,
-    _all_reduce_grad_stats,
-    clip_grad_by_total_norm_fp32,
-    count_zeros_fp32,
-    get_grad_norm_fp32,
-)
+from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
 
@@ -272,15 +266,13 @@ class MegatronOptimizer(ABC):
                 if _is_separate_grad_norm_group(param_grad_norm_group):
                     local = local or param_grad_norm_group == grad_norm_group
             flag = torch.tensor([1 if local else 0], dtype=torch.int, device='cuda')
-            _all_reduce_grad_stats(
-                flag,
-                torch.distributed.ReduceOp.MAX,
-                self.get_grad_stats_parallel_group(),
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MAX, group=self.get_grad_stats_parallel_group()
             )
             cache[grad_norm_group] = bool(flag.item() > 0)
         return cache[grad_norm_group]
 
-    def get_grad_stats_parallel_group(self) -> GradStatsParallelGroup:
+    def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """Process group for reducing gradient statistics (num_zeros & norm).
 
         The two most common cases are:
@@ -680,10 +672,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             )
 
         # Update across all model parallel instances.
-        _all_reduce_grad_stats(
+        torch.distributed.all_reduce(
             self.found_inf,
-            torch.distributed.ReduceOp.MAX,
-            self.get_grad_stats_parallel_group(),
+            op=torch.distributed.ReduceOp.MAX,
+            group=self.get_grad_stats_parallel_group(),
         )
 
         # Check for nan.
@@ -1578,7 +1570,7 @@ class ChainedOptimizer(MegatronOptimizer):
             for optimizer in self.chained_optimizers
         )
 
-    def get_grad_stats_parallel_group(self) -> GradStatsParallelGroup:
+    def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         assert self.grads_states_parallel_group_is_shared(), (
             "Can't use get_grad_stats_parallel_group() for ChainedOptimizer, "
             "since grads states parallel group are not shared across all optimizers"

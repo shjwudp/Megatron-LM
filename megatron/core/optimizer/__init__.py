@@ -60,7 +60,6 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
-from .clip_grads import GradStatsParallelGroup
 from .distrib_optimizer import DistributedOptimizer
 from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
@@ -458,7 +457,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     data_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup] = None,
     data_parallel_group_idx: Optional[int] = None,
-    intra_dist_opt_group: GradStatsParallelGroup = None,
+    intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
     distributed_optimizer_instance_id: Optional[int] = 0,
     pg_collection: Optional[ProcessGroupCollection] = None,
     skip_megatron_wrapping: bool = False,
@@ -982,7 +981,7 @@ def _build_megatron_fsdp_v2_muon_optimizer(
     dp_cp_group,
     dp_cp_group_gloo,
     data_parallel_group_idx,
-    grad_stats_domain,
+    intra_dist_opt_group,
     distributed_optimizer_instance_id,
     pg_collection,
 ) -> MegatronOptimizer:
@@ -1055,7 +1054,7 @@ def _build_megatron_fsdp_v2_muon_optimizer(
                 data_parallel_group=dp_cp_group,
                 data_parallel_group_gloo=dp_cp_group_gloo,
                 data_parallel_group_idx=data_parallel_group_idx,
-                intra_dist_opt_group=grad_stats_domain,
+                intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
             )
@@ -1079,25 +1078,6 @@ def _build_megatron_fsdp_v2_muon_optimizer(
     if len(optimizers) == 1:
         return optimizers[0]
     return ChainedOptimizer(optimizers)
-
-
-def _get_fsdp_grad_stats_domain(
-    ddp_config,
-    model_parallel_group: torch.distributed.ProcessGroup,
-    intra_dist_opt_group: Optional[torch.distributed.ProcessGroup],
-    inter_dist_opt_group: Optional[torch.distributed.ProcessGroup],
-) -> GradStatsParallelGroup:
-    """Select the ranks that own unique optimizer gradient shards."""
-    if ddp_config.data_parallel_sharding_strategy == "no_shard":
-        return model_parallel_group
-    if (
-        ddp_config.use_megatron_fsdp_v2
-        and ddp_config.outer_dp_sharding_strategy == "optim"
-        and inter_dist_opt_group is not None
-    ):
-        assert intra_dist_opt_group is not None
-        return (intra_dist_opt_group, inter_dist_opt_group)
-    return intra_dist_opt_group
 
 
 def get_megatron_optimizer(
@@ -1189,8 +1169,8 @@ def get_megatron_optimizer(
 
     model_parallel_rank = get_pg_rank(mp_group)
 
-    inter_dist_opt_group = process_groups_dict['inter_dist_opt_group']
     if get_pg_size(dp_cp_group) > get_pg_size(intra_dp_cp_group):
+        inter_dist_opt_group = process_groups_dict['inter_dist_opt_group']
         distributed_optimizer_instance_id = get_pg_rank(inter_dist_opt_group)
     else:
         distributed_optimizer_instance_id = 0
@@ -1199,9 +1179,14 @@ def get_megatron_optimizer(
     model_chunk_offset = 0
     ddp_config = model_chunks[0].ddp_config  # Use the first model chunk's DDP config
     if ddp_config.use_megatron_fsdp:
-        grad_stats_domain = _get_fsdp_grad_stats_domain(
-            ddp_config, mp_group, intra_dist_opt_group, inter_dist_opt_group
-        )
+        # FSDP v2 already builds dp_cp as the flattened outer x inner HSDP group.
+        if (
+            ddp_config.use_megatron_fsdp_v2
+            and ddp_config.outer_dp_sharding_strategy == 'optim'
+            and ddp_config.data_parallel_sharding_strategy != 'no_shard'
+        ):
+            intra_dist_opt_group = dp_cp_group
+
         # Emerging optimizers (e.g. Muon): route matrices -> FullyShardV2Muon and
         # the rest -> Adam, here where the FSDP process groups are in scope.
         if config.optimizer not in ('adam', 'sgd'):
@@ -1214,10 +1199,17 @@ def get_megatron_optimizer(
                 dp_cp_group=dp_cp_group,
                 dp_cp_group_gloo=intra_dp_cp_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
-                grad_stats_domain=grad_stats_domain,
+                intra_dist_opt_group=intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
             )
+        # For no_shard, gradients are replicated across DP ranks after all-reduce, so grad stats
+        # should only be reduced over TP/PP (model_parallel_group) to avoid inflating the norm.
+        effective_intra_dist_opt_group = (
+            mp_group
+            if ddp_config.data_parallel_sharding_strategy == 'no_shard'
+            else intra_dist_opt_group
+        )
         for model_chunk, overlap_param_gather_with_optimizer_step in zip(
             all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
         ):
@@ -1239,7 +1231,7 @@ def get_megatron_optimizer(
                 data_parallel_group=dp_cp_group,
                 data_parallel_group_gloo=intra_dp_cp_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
-                intra_dist_opt_group=grad_stats_domain,
+                intra_dist_opt_group=effective_intra_dist_opt_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
             )

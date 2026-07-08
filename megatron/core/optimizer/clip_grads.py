@@ -2,7 +2,7 @@
 
 """Gradient clipping."""
 
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
 import torch
 from torch import inf
@@ -52,30 +52,10 @@ from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
 
-GradStatsParallelGroup = Optional[
-    Union[torch.distributed.ProcessGroup, Tuple[torch.distributed.ProcessGroup, ...]]
-]
-
-
-def _all_reduce_grad_stats(
-    tensor: torch.Tensor,
-    op: torch.distributed.ReduceOp,
-    group: GradStatsParallelGroup,
-) -> None:
-    """Reduce a scalar statistic over one or more orthogonal process groups.
-
-    A tuple represents a Cartesian process domain without creating a flattened
-    process group. ``None`` retains the existing WORLD-group behavior.
-    """
-    groups = group if isinstance(group, tuple) else (group,)
-    for process_group in groups:
-        torch.distributed.all_reduce(tensor, op=op, group=process_group)
-
-
 def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
-    grad_stats_parallel_group: GradStatsParallelGroup = None,
+    grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> float:
     """Calculate the p-norm of gradients in FP32 precision.
 
@@ -90,8 +70,8 @@ def get_grad_norm_fp32(
             of Tensors or a single Tensor used to calculate the gradient norm.
         norm_type (Union[int, float]): The type of the p-norm to use. Can be
             'inf' for infinity norm. Defaults to 2.
-        grad_stats_parallel_group (ProcessGroup or tuple, optional): The orthogonal
-            process-group domain used to reduce gradient statistics.
+        grad_stats_parallel_group (ProcessGroup, optional): The process group
+            used for reducing gradient statistics (e.g., norms and zero counts).
 
     Returns:
         float: The total norm of the parameters, treated as a single vector.
@@ -119,8 +99,8 @@ def get_grad_norm_fp32(
             torch.distributed.all_reduce(
                 total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=data_parallel_group
             )
-        _all_reduce_grad_stats(
-            total_norm_cuda, torch.distributed.ReduceOp.MAX, grad_stats_parallel_group
+        torch.distributed.all_reduce(
+            total_norm_cuda, op=torch.distributed.ReduceOp.MAX, group=grad_stats_parallel_group
         )
         total_norm = total_norm_cuda[0].item()
 
@@ -153,8 +133,8 @@ def get_grad_norm_fp32(
             torch.distributed.all_reduce(
                 total_norm, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
             )
-        _all_reduce_grad_stats(
-            total_norm, torch.distributed.ReduceOp.SUM, grad_stats_parallel_group
+        torch.distributed.all_reduce(
+            total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
         if multi_tensor_scale_tensor_impl is not None:
             total_norm = total_norm.pow(1.0 / norm_type)
@@ -199,9 +179,6 @@ def clip_grad_by_total_norm_fp32(
                 params.append(param)
                 grads.append(to_local_if_dtensor(param.grad).detach())
 
-    if not grads:
-        return
-
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
@@ -221,7 +198,7 @@ def clip_grad_by_total_norm_fp32(
 
 def count_zeros_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
-    grad_stats_parallel_group: GradStatsParallelGroup,
+    grad_stats_parallel_group: torch.distributed.ProcessGroup,
     use_decoupled_grad: bool = False,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> float:
@@ -236,14 +213,14 @@ def count_zeros_fp32(
     Args:
         parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of
             Tensors or a single Tensor whose gradients will be checked for zeros.
-        grad_stats_parallel_group (ProcessGroup or tuple): The orthogonal
-            process-group domain used to reduce the zero count.
+        grad_stats_parallel_group (ProcessGroup): The process group used for
+            reducing the zero count across distributed ranks.
         use_decoupled_grad (bool, optional): If True, reads from the
             '.decoupled_grad' attribute instead of the standard '.grad'.
             Defaults to False.
 
     Returns:
-        float: The total number of zeros across the gradient-stat domain.
+        float: The total number of zeros in the gradients across the process group.
     """
 
     if isinstance(parameters, torch.Tensor):
@@ -293,8 +270,8 @@ def count_zeros_fp32(
             total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
         )
     # Sum across all model-parallel GPUs.
-    _all_reduce_grad_stats(
-        total_num_zeros, torch.distributed.ReduceOp.SUM, grad_stats_parallel_group
+    torch.distributed.all_reduce(
+        total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
     )
 
     total_num_zeros = total_num_zeros.item()
