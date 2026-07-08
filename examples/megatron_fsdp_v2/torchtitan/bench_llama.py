@@ -13,17 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark LLM decoder (LLaMA 3) Megatron-FSDP v2 vs PyTorch FSDP2.
+"""Benchmark LLaMA 3: Megatron-FSDP v2 vs PyTorch FSDP2.
 
-Self-contained — vendored torchtitan model, no torchtitan infra dependency.
-Measures throughput (tokens/s), peak GPU memory, and optional convergence.
+Uses the torchtitan model definition (``pip install torchtitan`` required).
+Measures throughput (tokens/s), peak GPU memory, and ms/step.
 
 Usage:
-    torchrun --nproc_per_node=8 examples/megatron_fsdp_v2/torchtitan/bench_llama.py \
+    torchrun --nproc_per_node=8 examples/megatron_fsdp_v2/torchtitan/bench_llama.py \\
         --backend mfsdp --model 8b --batch-size 1 --seq-len 8192 --bench-steps 20 --warmup-steps 5
 
 Benchmark both backends in one run:
-    torchrun --nproc_per_node=8 examples/megatron_fsdp_v2/torchtitan/bench_llama.py \
+    torchrun --nproc_per_node=8 examples/megatron_fsdp_v2/torchtitan/bench_llama.py \\
         --bench-both --model 8b --batch-size 1 --seq-len 8192 --bench-steps 20 --warmup-steps 5
 """
 
@@ -36,7 +36,38 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 
-from vendor.llama3_model import build_llama3_model
+
+# ---------------------------------------------------------------------------
+# Model configs (Llama 3.1 — matches torchtitan's config_registry)
+# ---------------------------------------------------------------------------
+
+LLAMA3_CONFIGS: dict[str, dict] = {
+    "debugmodel": {
+        "dim": 256, "n_layers": 2, "n_heads": 16, "n_kv_heads": 8,
+        "ffn_dim_multiplier": None, "multiple_of": 256,
+        "vocab_size": 128256, "norm_eps": 1e-5,
+        "rope_theta": 500000.0, "max_seq_len": 2048,
+    },
+    "8b": {
+        "dim": 4096, "n_layers": 32, "n_heads": 32, "n_kv_heads": 8,
+        "ffn_dim_multiplier": 1.3, "multiple_of": 1024,
+        "vocab_size": 128256, "norm_eps": 1e-5,
+        "rope_theta": 500000.0, "max_seq_len": 8192,
+    },
+}
+
+
+def build_torchtitan_llama3(model_size: str) -> nn.Module:
+    """Build the real torchtitan Llama 3.1 model via its config system."""
+    from torchtitan.models.llama3 import model as llama3_model
+    from torchtitan.models.llama3.model_config import ModelConfig
+
+    if model_size not in LLAMA3_CONFIGS:
+        raise ValueError(f"Unknown model size '{model_size}'. Choices: {list(LLAMA3_CONFIGS)}")
+    cfg = LLAMA3_CONFIGS[model_size]
+    spec = ModelConfig(**cfg, n_kv_heads=cfg["n_kv_heads"],
+                       ffn_dim_multiplier=cfg.get("ffn_dim_multiplier"))
+    return llama3_model.Transformer(spec)
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +108,7 @@ def bench_one(args, device):
 
     # --- build model ---
     with torch.device("meta"):
-        model = build_llama3_model(args.model)
+        model = build_torchtitan_llama3(args.model)
 
     mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("dp",))
 
@@ -88,8 +119,7 @@ def bench_one(args, device):
         model = wrap_fsdp_megatron(model, mesh, mp, args.sharding_strategy)
     else:
         from torch.distributed.fsdp import MixedPrecisionPolicy
-        mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16,
-                                  buffer_dtype=torch.bfloat16)
+        mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16)
         model = wrap_fsdp_torch(model, mesh, mp, args.sharding_strategy)
 
     model.to_empty(device=device)
@@ -115,7 +145,7 @@ def bench_one(args, device):
         t0 = time.perf_counter()
 
         logits = model(tokens)
-        loss = logits.float().mean()  # dummy loss (no real convergence target, pure perf)
+        loss = logits.float().mean()
         loss.backward()
         optim.step()
         optim.zero_grad(set_to_none=True)
@@ -137,7 +167,7 @@ def bench_one(args, device):
 
 
 # ---------------------------------------------------------------------------
-# Dual-bench (run both backends in one torchrun)
+# Dual-bench
 # ---------------------------------------------------------------------------
 
 def bench_both(args, device):
@@ -169,9 +199,8 @@ def bench_both(args, device):
 def parse_args():
     p = argparse.ArgumentParser(description="LLaMA 3 FSDP benchmark (Megatron-FSDP v2 vs PyTorch FSDP2)")
     p.add_argument("--backend", choices=["torchfsdp", "mfsdp"], default="mfsdp")
-    p.add_argument("--bench-both", action="store_true",
-                   help="Run both backends in sequence and print a comparison.")
-    p.add_argument("--model", choices=["debugmodel", "8b"], default="debugmodel")
+    p.add_argument("--bench-both", action="store_true")
+    p.add_argument("--model", choices=list(LLAMA3_CONFIGS), default="debugmodel")
     p.add_argument("--sharding-strategy", default="optim_grads_params",
                    choices=["no_shard", "optim", "optim_grads", "optim_grads_params"])
     p.add_argument("--batch-size", type=int, default=1)
