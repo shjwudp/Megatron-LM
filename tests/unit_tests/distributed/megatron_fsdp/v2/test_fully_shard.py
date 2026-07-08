@@ -53,9 +53,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-    MixedPrecisionPolicy,
-)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
 
 # ------------------------------------------------------------------ #
 #  Distributed environment (NCCL session-scoped)
@@ -100,6 +98,22 @@ class SimpleMLP(nn.Module):
 
     def forward(self, x):
         return self.fc(x)
+
+
+class MixedDtypeBuffers(nn.Module):
+    """Module whose FSDP unit owns communication buffers with different dtypes."""
+
+    def __init__(self, hidden=64):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(hidden, hidden))
+        nn.init.normal_(self.weight)
+        self.uint8_weight = nn.Parameter(
+            torch.arange(hidden * hidden, dtype=torch.uint8).reshape(hidden, hidden),
+            requires_grad=False,
+        )
+
+    def forward(self, x):
+        return x @ self.weight
 
 
 class TinyLLM(nn.Module):
@@ -299,6 +313,86 @@ class TestFullyShardBasic:
         loss = out.sum()
         loss.backward()
         assert not torch.isnan(torch.tensor(loss.item()))
+
+    def test_unshard_coalescing_keeps_mixed_dtypes_separate(self, monkeypatch):
+        """Coalesced all-gathers should not group buffers with different dtypes."""
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import (
+            fsdp_module as fsdp_module_mod,
+        )
+
+        torch.manual_seed(42)
+        model = MixedDtypeBuffers(16).to(_device())
+        fully_shard(model, enable_unshard_prefetch=True, enable_async_reduce_grad=False)
+
+        captured_run_dtypes = []
+
+        def capture_unshard(dp_group, weight_buffers, *, async_op, stream, caller_stream):
+            del dp_group, async_op, caller_stream
+            captured_run_dtypes.append(
+                tuple(weight_buffer.dtype for weight_buffer in weight_buffers)
+            )
+            for weight_buffer in weight_buffers:
+                weight_buffer.unshard(bind_params=True, stream=stream)
+
+        monkeypatch.setattr(fsdp_module_mod, "_unshard_weight_buffers", capture_unshard)
+
+        try:
+            model.unshard(async_op=True)
+            assert captured_run_dtypes
+            for run_dtypes in captured_run_dtypes:
+                assert len(set(run_dtypes)) == 1, (
+                    "Unshard coalescing must keep mixed dtype buffers in separate runs, "
+                    f"got {run_dtypes}"
+                )
+        finally:
+            model.reshard()
+
+    def test_prefetch_defers_post_unshard_to_caller_stream(self, monkeypatch):
+        """Prefetch should allocate now but run post-processing when consumed."""
+        torch.manual_seed(42)
+        model = TinyLLM(vocab=32, hidden=16, num_layers=1).to(_device())
+        layer = model.layers[0]
+        fully_shard(layer, enable_unshard_prefetch=True, enable_async_reduce_grad=False)
+        fully_shard(model, enable_unshard_prefetch=True, enable_async_reduce_grad=False)
+
+        ctx = model._fsdp_root_context
+        caller_stream = torch.cuda.current_stream()
+        allocation_streams = []
+        post_streams = []
+
+        allocator = ctx.bucket_allocator
+        original_allocate = allocator.allocate
+
+        def capture_allocate(*args, **kwargs):
+            allocation_streams.append(torch.cuda.current_stream())
+            return original_allocate(*args, **kwargs)
+
+        monkeypatch.setattr(allocator, "allocate", capture_allocate)
+        for param_group in layer._fsdp_param_groups:
+            original_post_unshard = param_group.post_unshard
+
+            def capture_post_unshard(bwd_pass=False, *, _original=original_post_unshard):
+                post_streams.append(torch.cuda.current_stream())
+                return _original(bwd_pass=bwd_pass)
+
+            monkeypatch.setattr(param_group, "post_unshard", capture_post_unshard)
+
+        try:
+            model.unshard(async_op=True)
+            assert False in ctx.unshard_pending_post[id(layer)]
+            assert not post_streams, "Prefetch must not run post-unshard processing"
+            assert allocation_streams
+            assert all(stream == caller_stream for stream in allocation_streams)
+
+            model.reshard()
+            layer.unshard(async_op=True)
+
+            assert False not in ctx.unshard_pending_post[id(layer)]
+            assert post_streams
+            assert all(stream == caller_stream for stream in post_streams)
+        finally:
+            model.reshard()
+            layer.reshard()
 
 
 # ------------------------------------------------------------------ #
@@ -510,9 +604,7 @@ class TestMixedPrecision:
     def test_fp32_grad_reduce(self):
         """grad_reduce_in_fp32=True should use fp32 gradient communication."""
         torch.manual_seed(42)
-        mp_policy = MixedPrecisionPolicy(
-            grad_comm_dtype=torch.float32
-        )
+        mp_policy = MixedPrecisionPolicy(grad_comm_dtype=torch.float32)
         model = SimpleMLP(64).to(_device()).bfloat16()
         fully_shard(model, mp_policy=mp_policy)
 
@@ -661,8 +753,10 @@ class MLPWithCheckpointing(nn.Module):
     def __init__(self, hidden=64, num_layers=3):
         super().__init__()
         self.layers = nn.ModuleList(
-            [nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
-             for _ in range(num_layers)]
+            [
+                nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
+                for _ in range(num_layers)
+            ]
         )
         self._use_activation_checkpointing = False
 
@@ -684,10 +778,12 @@ class LargePerLayerModel(nn.Module):
 
     def __init__(self, hidden=256, num_layers=4):
         super().__init__()
-        self.layers = nn.ModuleList([
-            nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
-            for _ in range(num_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
+                for _ in range(num_layers)
+            ]
+        )
 
     def forward(self, x):
         for layer in self.layers:
@@ -748,11 +844,7 @@ class TestActivationCheckpointing:
         model.enable_activation_checkpointing()
 
         for layer in model.layers:
-            fully_shard(
-                layer,
-                enable_unshard_prefetch=True,
-                enable_async_reduce_grad=True,
-            )
+            fully_shard(layer, enable_unshard_prefetch=True, enable_async_reduce_grad=True)
         fully_shard(model, enable_unshard_prefetch=True, enable_async_reduce_grad=True)
 
         x = torch.randn(2, 128, device=device, requires_grad=True)
