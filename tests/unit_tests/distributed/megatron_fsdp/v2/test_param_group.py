@@ -225,7 +225,7 @@ def test_unshard_reshard(strategy):
         wbuf = pg.model_weight_buffer
         assert wbuf is not None
 
-        shard_before = wbuf.data.clone()
+        shard_before = wbuf.data.view(torch.uint8).clone()
         unsharded = wbuf.unshard()
 
         if not w_dist:
@@ -243,7 +243,10 @@ def test_unshard_reshard(strategy):
         wbuf.reshard()
         if w_dist:
             assert wbuf._unsharded_buffer is None
-        assert torch.equal(wbuf.data, shard_before)
+        # Compare the persistent storage bit-for-bit. The buffer can contain
+        # uninitialized padding, including NaNs for which torch.equal is false
+        # even when the before/after bit patterns are identical.
+        assert torch.equal(wbuf.data.view(torch.uint8), shard_before)
 
     torch.distributed.barrier()
 
