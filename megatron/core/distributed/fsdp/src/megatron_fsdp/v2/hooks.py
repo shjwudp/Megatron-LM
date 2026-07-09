@@ -97,6 +97,24 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
         target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
     target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 
+    # ---- cast forward inputs (root only) -----------------------------------
+    if target._fsdp_state._is_root and target._fsdp_param_groups:
+        mp_policy = target._fsdp_param_groups[0].mp_policy
+        if mp_policy.cast_forward_inputs and mp_policy.param_dtype is not None:
+            forward_dtype = mp_policy.param_dtype
+
+            def _cast_fp_tensor(t):
+                return (
+                    t.to(forward_dtype)
+                    if isinstance(t, torch.Tensor)
+                    and torch.is_floating_point(t)
+                    and t.dtype != forward_dtype
+                    else t
+                )
+
+            args = tree_map(_cast_fp_tensor, args)
+            kwargs = tree_map(_cast_fp_tensor, kwargs)
+
     # ---- free stale grad data (safe to repeat, idempotent) ----------------
     for param_group in target._fsdp_param_groups:
         param_group._maybe_free_grad_data()
@@ -116,6 +134,8 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
                 graph_pool=ctx.cuda_graph_pool,
             )
         ctx.cuda_graph_runner.record_module(target, args, kwargs)
+
+    return args, kwargs
 
 
 @torch.compiler.disable

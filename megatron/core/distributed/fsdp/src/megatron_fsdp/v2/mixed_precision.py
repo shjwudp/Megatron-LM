@@ -179,9 +179,11 @@ class FullyShardNVFP4Policy:
 class MixedPrecisionPolicy:
     """Mixed precision policy owned by the v2 ``fully_shard`` path."""
 
+    param_dtype: Optional[torch.dtype] = None
     main_params_dtype: Optional[torch.dtype] = None
     main_grads_dtype: Optional[torch.dtype] = None
     grad_comm_dtype: Optional[torch.dtype] = None
+    cast_forward_inputs: bool = True
     fp8_param_gather: bool = False
     fp8_recipe: Optional[str] = None
     keep_fp8_transpose_cache: bool = False
@@ -292,11 +294,12 @@ class MixedPrecisionPolicy:
                     return True
         return False
 
-    @staticmethod
-    def model_weight_buffer_dtype(tensor: torch.Tensor) -> torch.dtype:
+    def model_weight_buffer_dtype(self, tensor: torch.Tensor) -> torch.dtype:
         """Return the model-weight buffer dtype for ``tensor``."""
         if is_fp8_param(tensor) or is_nvfp4_param(tensor):
             return torch.uint8
+        if self.param_dtype is not None:
+            return self.param_dtype
         return tensor.dtype
 
     def get_param_storage_shapes(self, params: List[torch.Tensor]) -> Optional[List[torch.Size]]:

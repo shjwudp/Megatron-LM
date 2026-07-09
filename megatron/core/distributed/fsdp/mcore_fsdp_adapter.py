@@ -149,6 +149,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 if ddp_config.grad_reduce_in_fp32
                 else ddp_config.megatron_fsdp_grad_comm_dtype
             ),
+            cast_forward_inputs=False,
         )
         log_single_rank(
             logger,
@@ -292,6 +293,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             nvfp4=FullyShardNVFP4Policy(
                 enabled=ddp_config.fp4_param_gather, recipe=config.fp4_recipe
             ),
+            cast_forward_inputs=False,
         )
         kwargs = {
             "mp_policy": fully_shard_mp_policy,
