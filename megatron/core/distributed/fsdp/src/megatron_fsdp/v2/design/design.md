@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 # Design: Megatron FSDP v2 Implementation
 
 ---
@@ -44,7 +46,11 @@ class _FSDPRootContext:
     # --- Unshard prefetch tracking ---
     unshard_done_events: Dict[int, Optional[torch.cuda.Event]]
     # module_id -> Event: signals when that module's all-gather is complete.
-    # None means "not yet launched" or "already consumed by a wait".
+    # None means "not yet launched" or "resharded"; the event persists after waits.
+
+    unshard_pending_post: Dict[int, Set[bool]]
+    # module_id -> {bwd_pass}: communication has been launched for this
+    # forward/backward phase, but caller-stream post-processing is pending.
 
     # --- Reduce-scatter grad overlap tracking ---
     reduce_grad_buckets: Dict[int, List[Tuple[torch.cuda.Event, ParameterGroup]]]
@@ -104,6 +110,7 @@ root_context = _FSDPRootContext(
     forward_order=forward_order,
     reduce_grad_buckets={id(m): [] for m in forward_order},
     unshard_done_events={id(m): None for m in forward_order},
+    unshard_pending_post={id(m): set() for m in forward_order},
     enable_unshard_prefetch=enable_unshard_prefetch,
     enable_async_reduce_grad=enable_async_reduce_grad,
 )
@@ -147,15 +154,8 @@ module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
 ### `FSDPModule.unshard(async_op, bwd_pass)`
 
 ```python
-stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
-
-# *** Critical: synchronize ag_stream with current_stream before launching AG ***
-# This ensures main-stream writes to parameter data (e.g. reshard after forward,
-# or tensor-parallel slice writes) are visible before the all-gather reads them.
-# Without this barrier, stale or partially-written parameter shards may be
-# gathered, causing convergence divergence.
-if async_op:
-    stream.wait_stream(torch.cuda.current_stream())
+caller_stream = torch.cuda.current_stream()  # capture before any stream switch
+stream = ctx.ag_stream if async_op else caller_stream
 
 # Build the work list: self + (optionally) next module to prefetch
 if async_op:
@@ -167,14 +167,35 @@ for module in [self] + prefetch:
     if all(pg.has_unsharded_weight_buffers(bwd_pass=bwd_pass) for pg in module._fsdp_param_groups):
         continue          # Required buffers are already unsharded — skip
 
-    with torch.cuda.stream(stream):
-        for _, param_group in module._named_param_groups:
-            param_group.unshard()
-            # → DataParallelBuffer.unshard():
-            #     for sharded buffers, allocate an unsharded bucket, launch
-            #     all_gather_into_tensor, and rebind p.data → unsharded buffer slice
-            #     (even before AG done!); replicated buffers bind directly to self.data.
-            # NOTE: async_op is NOT passed; the stream context handles dispatch.
+    # Caller stream: prepare GPU-resident shards, group compatible buffers,
+    # and allocate every temporary full buffer before switching streams.
+    buffer_runs = build_buffer_runs(module, bwd_pass=bwd_pass)
+    for dp_group, weight_buffers in buffer_runs:
+        full_buffers = [buffer.fetch_buffer(as_shard=False) for buffer in weight_buffers]
+
+        # The wait is inserted after allocation/preparation so all caller work
+        # needed by this run is visible to the communication stream.
+        if async_op:
+            stream.wait_stream(caller_stream)
+
+        # Side-stream scope contains collectives and their Work wait only.
+        cm = (
+            _coalescing_manager(dp_group, async_ops=async_op)
+            if len(weight_buffers) > 1
+            else nullcontext()
+        )
+        with torch.cuda.stream(stream):
+            with cm as manager:
+                for buffer in weight_buffers:
+                    buffer.unshard(bind_params=False, stream=stream)
+            if async_op and manager is not None:
+                manager.wait()
+
+        # Caller stream: rebind tensor metadata; do not run TE post-processing yet.
+        for buffer, full_buffer in zip(weight_buffers, full_buffers):
+            buffer._bind_buffer_to_params(full_buffer)
+
+    ctx.unshard_pending_post[id(module)].add(bwd_pass)
 
     if async_op:
         event = stream.record_event()
@@ -186,34 +207,52 @@ for module in [self] + prefetch:
 if ctx.unshard_done_events[id(self)] is not None:
     ctx.unshard_done_events[id(self)].wait()          # main stream waits on ag_stream event
 
+# TE post-processing may launch kernels, so run it on the caller only after
+# this module's communication event has joined the caller stream.
+if bwd_pass in ctx.unshard_pending_post[id(self)]:
+    for _, param_group in self._named_param_groups:
+        param_group.post_unshard(bwd_pass=bwd_pass)
+    ctx.unshard_pending_post[id(self)].remove(bwd_pass)
+
 # Install full parameter tensors into the nn.Module (safe after event.wait)
 for param_names, param_group in self._named_param_groups:
     for name, param in zip(param_names, param_group.params):
         _replace_module_parameter(self, name, param)  # swaps nn.Parameter object
 ```
 
-**Important: `p.data` rebind race.**
-`DataParallelBuffer.unshard()` rebinds `p.data` to the unsharded buffer slice
-**inside the `with torch.cuda.stream(stream)` block**, before the all-gather completes when
-side-stream prefetch is enabled. The memory is already allocated and the slice indices are correct; only the
-NCCL fill is in-flight. The outer `unshard()` guards correctness by calling `event.wait()`
-before calling `_replace_module_parameter`, so the module's parameters are safe to read by
-the time the forward kernel uses them.
+**Stream ownership and buffer lifetime.** Temporary full buffers are allocated on the
+caller stream, while only the all-gather collective and its `Work.wait()` execute with
+`ag_stream` current. Tensor rebinding is metadata-only and returns to the caller stream.
+The caller waits for the module event before running mixed-precision `post_unshard()` or
+installing full parameters into the module. Because allocation, final use, and free are
+ordered on the caller stream, the explicit stream events fully describe the cross-stream
+lifetime and `Tensor.record_stream()` is neither needed nor used.
 
-**Stream ordering barrier.** When `async_op=True`, `unshard()` inserts a
-`stream.wait_stream(torch.cuda.current_stream())` on `ag_stream` before launching any
-all-gather. This ensures that writes performed on the main stream (e.g., reshard after a
-previous forward, or tensor-parallel slice updates) are fully visible to the all-gather
-kernel. Without this barrier, stale or partially-written parameter shards may be read by
-the NCCL collective, causing convergence divergence.
+**Stream ordering barrier.** When `async_op=True`, the caller stream is captured before
+any stream switch. Each communication run allocates its output buffer and completes shard
+preparation first, then inserts `ag_stream.wait_stream(caller_stream)` immediately before
+launching the all-gather. This ensures caller-stream allocations and writes are visible to
+the collective without making `ag_stream` wait for future compute. The edge also makes
+`ag_stream` join a full-iteration CUDA graph capture before the capture stream waits on
+the recorded unshard event; otherwise CUDA reports `cudaErrorStreamCaptureIsolation` at
+the first captured async unshard.
 
 **NVTX profiling.** `unshard()`, `reshard()`, and `reduce_grad()` each push/pop a
 `torch.cuda.nvtx` range (`"MFSDP unshard"`, `"MFSDP reshard"`, `"MFSDP reduce_grad"`)
 for profiling visibility in tools like Nsight Systems.
 
-Prefetched modules' data also becomes valid when their own pre-hook later calls `event.wait()`
-for them. If a module's pre-hook arrives and its event is already set (prefetch was launched
-by the previous module), it just waits on the event and skips re-launching the AG.
+**All-gather coalescing.** `FSDPModule.unshard()` coalesces consecutive weight-buffer
+all-gathers that use the same process group, dtype, and device. Each `ParameterGroup`
+still owns its buffers and post-processing, while the module-level loop submits
+communication-compatible all-gathers through one grouped launch. With
+`async_ops=True`, the coalescing manager owns the resulting `Work`; the async path calls
+`manager.wait()` while `ag_stream` is current before recording the communication event,
+so that event cannot run before the backend finishes writing the gathered buffers.
+
+Prefetched modules keep their `bwd_pass` value in `unshard_pending_post`. When their own
+pre-hook later arrives, it skips the already-launched all-gather, waits for its event, and
+runs `post_unshard()` on the caller stream. Removing the phase from the pending set makes
+re-entry and activation recompute idempotent.
 
 ### `_get_prefetch_next_modules(bwd_pass)`
 
@@ -228,6 +267,11 @@ Exactly one module is prefetched per step. Multi-module lookahead is a future ex
 ### `FSDPModule.reshard()`
 
 ```python
+pending_post = ctx.unshard_pending_post[id(self)]
+unshard_event = ctx.unshard_done_events[id(self)]
+if pending_post and unshard_event is not None:
+    unshard_event.wait()  # skipped prefetch: join AG before freeing its buffer
+
 for param_names, param_group in self._named_param_groups:
     param_group.reshard()                           # → DataParallelBuffer.reshard()
                                                     #   frees TemporaryBucketAllocator bucket
@@ -235,7 +279,13 @@ for param_names, param_group in self._named_param_groups:
     for name, dist_param in zip(param_names, param_group.dist_params):
         _replace_module_parameter(self, name, dist_param)   # reinstall sharded DTensor
 ctx.unshard_done_events[id(self)] = None    # reset so next iteration can prefetch again
+pending_post.clear()                         # discard any unused prefetched post phase
 ```
+
+The conditional wait handles prefetched modules that are skipped by model control flow.
+Their caller-owned output buffer cannot be freed until the side-stream all-gather has
+completed. Modules that reached their pre-hook already consumed the pending phase, so the
+normal compute-to-free path does not add a redundant wait.
 
 ---
 
@@ -269,28 +319,48 @@ def reduce_grad(self, async_op: bool = False):
                     #   → DataParallelBuffer.reshard() (frees unsharded grad bucket)
             if module is self: break
 
-    # --- Step 2: Copy .grad → main_grad_buffer (on main stream, fast memcpy) ---
+    # --- Step 2: Stage .grad → main_grad_buffer ---
     for param_names, param_group in self._named_param_groups:
         if not param_group.requires_grad: continue
 
+        zero_targets = []
+        copy_srcs = []
+        copy_dsts = []
         for name, param in zip(param_names, param_group.params):
             main_grad = param.get_main_grad()
             if param.grad is None:
                 if not getattr(param, 'grad_added_to_main_grad', False):
-                    main_grad.zero_()       # no TE fusion: zero the slot
+                    zero_targets.append(main_grad.view(-1))
             else:
-                main_grad.copy_(param.grad.detach())   # normal backward: copy .grad
+                copy_srcs.append(param.grad.detach().view(-1))
+                copy_dsts.append(main_grad.view(-1))
                 del param.grad
+
+        stage_on_rs_stream = async_op and getattr(
+            self._fsdp_state, "enable_full_iteration_cuda_graph", False
+        )
+        if stage_on_rs_stream:
+            stream.wait_stream(torch.cuda.current_stream())
+            for source in copy_srcs:
+                source.record_stream(stream)
+            with torch.cuda.stream(stream):
+                if zero_targets:
+                    torch._foreach_zero_(zero_targets)
+                if copy_dsts:
+                    torch._foreach_copy_(copy_dsts, copy_srcs)
+        else:
+            if zero_targets:
+                torch._foreach_zero_(zero_targets)
+            if copy_dsts:
+                torch._foreach_copy_(copy_dsts, copy_srcs)
 
         # --- Step 3: Reduce-scatter on rs_stream ---
         if async_op:
-            stream.wait_stream(torch.cuda.current_stream())    # ensure .grad copy is visible to rs_stream
-            with torch.cuda.stream(stream):
-                param_group.reduce_grad()
-                #   → DataParallelBuffer.reduce_grad() (synchronous within this stream):
-                #       fetch_unsharded_buffer() allocates full grad buffer
-                #       reduce_scatter_tensor(output=grad_shard, input=full_grad)
-                #       self.data[local_idx:...] += grad_shard
+            param_group.reduce_grad(stream=stream)
+            #   → DataParallelBuffer.reduce_grad() (synchronous within this stream):
+            #       fetch_unsharded_buffer() allocates full grad buffer
+            #       reduce_scatter_tensor(output=grad_shard, input=full_grad)
+            #       self.data[local_idx:...] += grad_shard
             event = stream.record_event()
             ctx.reduce_grad_buckets[id(self)].append((event, param_group))
             # param_group.release_grad_buffer() is NOT called here; deferred until drain/final CB
@@ -309,9 +379,17 @@ def reduce_grad(self, async_op: bool = False):
 ```
 
 **Key design point — `DataParallelBuffer.reduce_grad()` has no `async_op` parameter.**
-The operation is inherently synchronous *within whatever stream is current* when called. The
-"async" behavior is achieved entirely by the caller dispatching into `rs_stream` via
-`with torch.cuda.stream(stream)`. This avoids any API changes to `DataParallelBuffer`.
+The operation is inherently synchronous *within its selected stream*. The caller passes
+`rs_stream` through `ParameterGroup.reduce_grad(stream=...)`, and the buffer implementation
+uses that stream for the collective. This avoids exposing asynchronous work handles through
+the buffer API.
+
+For full-iteration CUDA graphs, the batched zero/copy staging is also dispatched to
+`rs_stream` immediately before reduce-scatter. `rs_stream.wait_stream(current_stream())`
+orders the staging after backward, while `record_stream(rs_stream)` keeps detached `.grad`
+sources alive after their Python references are deleted. This removes staging kernels from
+the captured caller stream and lets them overlap with the next module's backward compute.
+Eager, per-module CUDA graph, and synchronous-reduction paths retain caller-stream staging.
 
 **`grad_added_to_main_grad` and `overwrite_main_grad` flags:**
 When TransformerEngine's `gradient_accumulation_fusion` is active, the backward kernel writes
@@ -585,24 +663,27 @@ ag_stream:    |AG(L[0])  AG(L[1])|        AG(L[2])|                |
 
 pre-hook L[0]: async unshard L[0] + prefetch L[1] on ag_stream
                event[L[0]].wait() → main stream unblocks
+               post_unshard(L[0]) on main stream
                _replace_module_parameter(L[0])
 
 pre-hook L[1]: event[L[1]] already set → wait (likely done)
+               post_unshard(L[1]) on main stream
                _replace_module_parameter(L[1])
                async prefetch L[2] on ag_stream
 
 pre-hook L[2]: event[L[2]].wait() → main stream unblocks
+               post_unshard(L[2]) on main stream
                _replace_module_parameter(L[2])
 
 BACKWARD PASS (enable_async_reduce_grad=True)
 ---------------------------------------------------------
-main stream:  |bwd L[2]|copy grad[2]|bwd L[1]|copy grad[1]|bwd L[0]|copy grad[0]|
+main stream:  |bwd L[2]-----------|bwd L[1]-----------|bwd L[0]-----------|
 ag_stream:    |AG(L[1]) prefetch    |AG(L[0]) prefetch     |                      |
-rs_stream:    |                RS(L[2]) ------|     RS(L[1]) ------|   RS(L[0])---|
+rs_stream:    |stage+RS(L[2]) ------|stage+RS(L[1]) ------|stage+RS(L[0])---------|
 
-post-bwd L[2]: reshard, copy grad[2]→main_grad, rs_stream.wait(main), RS(L[2]), event[2]
-post-bwd L[1]: drain event[2-2]? (i=1, no drain), copy grad[1], RS(L[1]), event[1]
-post-bwd L[0]: drain event[L[2]] (i=2, drain backward_order[0]=L[2]), RS(L[0]), event[0]
+post-bwd L[2]: reshard, rs_stream.wait(main), stage grad[2], RS(L[2]), event[2]
+post-bwd L[1]: drain event[2-2]? (i=1, no drain), stage grad[1], RS(L[1]), event[1]
+post-bwd L[0]: drain event[L[2]] (i=2, drain backward_order[0]=L[2]), stage grad[0], RS(L[0]), event[0]
 
 final_callback:
   drain event[L[1]], event[L[0]]

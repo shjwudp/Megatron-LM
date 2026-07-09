@@ -1,16 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 Parameter Group for FSDP
@@ -32,6 +20,14 @@ from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
 from .mixed_precision import MixedPrecisionPolicy
 from .utils import ParamGroupIdx
+
+
+def _zero_tensor_storage(tensor: torch.Tensor) -> None:
+    """Zero a Tensor or DTensor by writing only its local storage."""
+    local_tensor = getattr(tensor, "_local_tensor", None)
+    target = local_tensor if local_tensor is not None else tensor
+    with torch.no_grad():
+        target.zero_()
 
 
 class ParameterGroup:
@@ -99,6 +95,7 @@ class ParameterGroup:
 
         self.gradient_scaling_factor = gradient_scaling_factor
         self.allocator = allocator if allocator is not None else TemporaryBucketAllocator()
+        self.enable_full_iteration_cuda_graph = False
 
         # Buffer references (initialized in _init_buffers)
         self.model_weight_buffer: Optional[DataParallelBuffer] = None
@@ -112,6 +109,7 @@ class ParameterGroup:
         self._init_buffers()
 
     def set_allocator(self, allocator: BucketAllocator) -> None:
+        """Replace the allocator used by every buffer in this parameter group."""
         self.allocator = allocator
         for buffer in (
             self.model_weight_buffer,
@@ -219,6 +217,21 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
+    def weight_buffers_for_unshard(self, bwd_pass: bool = False):
+        """Return weight buffers that must be unsharded for this pass."""
+        self._ensure_buffers_on_gpu()
+        return [
+            weight_buffer
+            for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
+                self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
+            )
+            if weight_buffer is not None
+        ]
+
+    def post_unshard(self, bwd_pass: bool = False):
+        """Run post-unshard processing after required buffers have been gathered."""
+        self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
+
     def unshard(
         self,
         bwd_pass: bool = False,
@@ -231,15 +244,9 @@ class ParameterGroup:
         After unshard, parameters point to full unsharded storage. FP8
         parameters rebind their TE raw payload instead of ``param.data``.
         """
-        self._ensure_buffers_on_gpu()
-
-        for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
-            self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
-        ):
-            if weight_buffer is not None:
-                weight_buffer.unshard(bind_params=bind_params, stream=stream)
-
-        self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
+        for weight_buffer in self.weight_buffers_for_unshard(bwd_pass=bwd_pass):
+            weight_buffer.unshard(bind_params=bind_params, stream=stream)
+        self.post_unshard(bwd_pass=bwd_pass)
 
     def has_unsharded_weight_buffers(self, bwd_pass: bool = False) -> bool:
         """Return whether this phase can skip launching another distributed unshard."""
@@ -284,10 +291,7 @@ class ParameterGroup:
         # _grad_buffer_is_fresh is True after zero_grad() or lazy buffer init,
         # so the first reduce_grad after either event overwrites instead of
         # accumulating — no stale data from uninitialised or zeroed buffers.
-        self.main_grad_buffer.reduce_grad(
-            overwrite_grad=self._grad_buffer_is_fresh,
-            stream=stream,
-        )
+        self.main_grad_buffer.reduce_grad(overwrite_grad=self._grad_buffer_is_fresh, stream=stream)
         self._grad_buffer_is_fresh = False
 
     def release_grad_buffer(self):
@@ -309,11 +313,13 @@ class ParameterGroup:
         meaningful data.  Free the backing tensor — ``_init_dist_grads``
         will re-allocate on the next ``reduce_grad``.
         """
+        if self.enable_full_iteration_cuda_graph:
+            return
         if self.main_grad_buffer is None or self.main_grad_buffer.data is None:
             return
         if any(
-            [getattr(p, "grad", None) is not None for p in self.dist_params] +
-            [getattr(p, "decoupled_grad", None) is not None for p in self.dist_params]
+            [getattr(p, "grad", None) is not None for p in self.dist_params]
+            + [getattr(p, "decoupled_grad", None) is not None for p in self.dist_params]
         ):
             return
         self.main_grad_buffer.data = None
@@ -417,11 +423,13 @@ class ParameterGroup:
             dist_param = self.dist_params[i]
             if dist_param is not None:
                 if self.main_weight_buffer is not None:
-                    data = self.main_weight_buffer.get_item(self.param_idx[param],
-                                                            as_shard=is_param_shard)
+                    data = self.main_weight_buffer.get_item(
+                        self.param_idx[param], as_shard=is_param_shard
+                    )
                 elif self.model_weight_buffer is not None:
-                    data = self.model_weight_buffer.get_item(self.param_idx[param],
-                                                             as_shard=is_param_shard)
+                    data = self.model_weight_buffer.get_item(
+                        self.param_idx[param], as_shard=is_param_shard
+                    )
                 else:
                     continue
                 object.__setattr__(dist_param._local_tensor, 'data', data)
@@ -442,8 +450,12 @@ class ParameterGroup:
         Returns True if any buffer was moved (views were rebuilt).
         """
         moved = False
-        for buf in (self.model_weight_buffer, self.main_weight_buffer,
-                    self.main_grad_buffer, self.transpose_weight_buffer):
+        for buf in (
+            self.model_weight_buffer,
+            self.main_weight_buffer,
+            self.main_grad_buffer,
+            self.transpose_weight_buffer,
+        ):
             if buf is not None and buf._ensure_data_on_gpu():
                 moved = True
         if moved:
@@ -452,6 +464,22 @@ class ParameterGroup:
 
     def zero_grad(self, set_to_none: bool = True):
         """Zero the main gradient buffer and mark grads as zeroed."""
+        if self.enable_full_iteration_cuda_graph:
+            if self.main_grad_buffer is not None:
+                if self.main_grad_buffer.data is not None:
+                    self.main_grad_buffer.data.zero_()
+            for dist_param in self.dist_params:
+                grad = getattr(dist_param, "grad", None)
+                if grad is not None:
+                    _zero_tensor_storage(grad)
+                    setattr(dist_param, "_mfsdp_keep_grad_for_cuda_graph", True)
+                decoupled_grad = getattr(dist_param, "decoupled_grad", None)
+                if decoupled_grad is not None:
+                    _zero_tensor_storage(decoupled_grad)
+                    setattr(dist_param, "_mfsdp_keep_grad_for_cuda_graph", True)
+            self._grad_buffer_is_fresh = True
+            return
+
         if set_to_none:
             for dist_param in self.dist_params:
                 if dist_param.grad is not None:

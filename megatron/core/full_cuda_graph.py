@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Full iteration CUDA graph for training."""
 
@@ -16,6 +16,16 @@ logger = logging.getLogger(__name__)
 # tools/debug_cuda_graph_pool_memory*.py).
 _shared_graph_pool = None
 _shared_capture_stream = None
+
+
+def _has_megatron_fsdp_v2(model):
+    """Return whether the model contains a Megatron FSDP v2 wrapper."""
+    roots = model if isinstance(model, (list, tuple)) else (model,)
+    return any(
+        getattr(getattr(module, "ddp_config", None), "use_megatron_fsdp_v2", False)
+        for root in roots
+        for module in root.modules()
+    )
 
 
 def get_shared_capture_stream():
@@ -75,14 +85,21 @@ def copy_tensors_in_struct(src):
 def clone_tensors_in_struct(tgt, src):
     """Copy src to pre-existing tensors in tgt."""
     if isinstance(src, tuple):
-        raise Exception(f"Unsupported copy for tuple yet: {type(src)}")
+        if not isinstance(tgt, tuple) or len(tgt) != len(src):
+            return copy_tensors_in_struct(src)
+        return tuple(clone_tensors_in_struct(t, s) for t, s in zip(tgt, src))
     elif isinstance(src, list):
+        if not isinstance(tgt, list) or len(tgt) != len(src):
+            return copy_tensors_in_struct(src)
         for i in range(len(src)):
             if isinstance(src[i], (tuple, list, dict, torch.Tensor)):
-                clone_tensors_in_struct(tgt[i], src[i])
+                tgt[i] = clone_tensors_in_struct(tgt[i], src[i])
             else:
                 tgt[i] = src[i]
+        return tgt
     elif isinstance(src, dict):
+        if not isinstance(tgt, dict):
+            return copy_tensors_in_struct(src)
         for k in src:
             if isinstance(src[k], (tuple, list, dict, torch.Tensor)):
                 clone_tensors_in_struct(tgt[k], src[k])
@@ -199,6 +216,9 @@ class FullCudaGraphWrapper:
         num_microbatches = kwargs['num_microbatches']
 
         training = not kwargs['forward_only']
+        if not training and _has_megatron_fsdp_v2(model):
+            return self.forward_backward_func(*args, **kwargs)
+
         data_iterator = kwargs['data_iterator']
         data_list = self.data_read(data_iterator, model, training, num_microbatches)
         kwargs['data_iterator'] = data_list
