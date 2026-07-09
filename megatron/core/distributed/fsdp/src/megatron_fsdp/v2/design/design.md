@@ -88,9 +88,18 @@ bucket_allocator = TracePoolAllocator() if enable_trace_pool else StorageFreeing
 module._init_named_param_groups(..., bucket_allocator=bucket_allocator)
 
 forward_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
+high_priority = -1
 root_context = _FSDPRootContext(
-    ag_stream=torch.cuda.Stream() if enable_unshard_prefetch else torch.cuda.current_stream(),
-    rs_stream=torch.cuda.Stream() if enable_async_reduce_grad else torch.cuda.current_stream(),
+    ag_stream=(
+        torch.cuda.Stream(priority=high_priority)
+        if enable_unshard_prefetch
+        else torch.cuda.current_stream()
+    ),
+    rs_stream=(
+        torch.cuda.Stream(priority=high_priority)
+        if enable_async_reduce_grad
+        else torch.cuda.current_stream()
+    ),
     bucket_allocator=bucket_allocator,
     forward_order=forward_order,
     reduce_grad_buckets={id(m): [] for m in forward_order},
@@ -107,6 +116,9 @@ for child in self.modules():
         child._fsdp_state._is_root = False
         setattr(child, "_fsdp_root_context", root_context)
 ```
+
+The overlap streams use priority `-1` (matching PyTorch FSDP2) so their
+communication-side work is not delayed behind default-priority compute.
 
 `forward_order` is **static** (module tree topology, computed once). There is no first-pass
 dynamic recording phase.

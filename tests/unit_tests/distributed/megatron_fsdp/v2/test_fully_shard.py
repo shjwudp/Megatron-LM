@@ -294,6 +294,19 @@ class TestFullyShardBasic:
             enable_unshard_prefetch=enable_unshard_prefetch,
             enable_async_reduce_grad=enable_async_reduce_grad,
         )
+        ctx = model._fsdp_root_context
+        current_stream = torch.cuda.current_stream()
+        if enable_unshard_prefetch:
+            assert ctx.ag_stream.cuda_stream != current_stream.cuda_stream
+            assert ctx.ag_stream.priority == -1
+        else:
+            assert ctx.ag_stream.cuda_stream == current_stream.cuda_stream
+        if enable_async_reduce_grad:
+            assert ctx.rs_stream.cuda_stream != current_stream.cuda_stream
+            assert ctx.rs_stream.priority == -1
+        else:
+            assert ctx.rs_stream.cuda_stream == current_stream.cuda_stream
+
         x = torch.randn(2, 64, device=_device())
         out = model(x)
         loss = out.sum()

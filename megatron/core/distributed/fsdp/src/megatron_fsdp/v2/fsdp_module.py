@@ -582,14 +582,17 @@ class FSDPModule:
                     "completed gradient reduction before re-initializing FSDP state."
                 )
 
+        # Match PyTorch FSDP2's overlap streams so communication-side work is
+        # not delayed behind default-priority compute.
+        high_priority = -1
         root_context = _FSDPRootContext(
             ag_stream=(
-                torch.cuda.Stream()
+                torch.cuda.Stream(priority=high_priority)
                 if enable_unshard_prefetch
                 else torch.cuda.current_stream()
             ),
             rs_stream=(
-                torch.cuda.Stream()
+                torch.cuda.Stream(priority=high_priority)
                 if enable_async_reduce_grad
                 else torch.cuda.current_stream()
             ),
