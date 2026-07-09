@@ -29,10 +29,6 @@ Debug OOM with memory snapshots (loadable at https://pytorch.org/memory_viz):
     torchrun --nproc_per_node=8 examples/megatron_fsdp_v2/torchtitan/bench_llama.py \\
         --backend mfsdp --flavor 8B --batch-size 1 --seq-len 8192 \\
         --record-memory-history /tmp/mem_dump [--record-memory-history-oom-only]
-
-Activation checkpointing is **enabled by default** (--activation-checkpoint full).
-This dramatically reduces activation memory (e.g. from 32× to ~2× layer activations).
-Use --activation-checkpoint none for raw comparison with torch FSDP2 behavior.
 """
 
 import argparse
@@ -148,8 +144,7 @@ def wrap_fsdp_megatron(model: nn.Module, mesh, mp_policy, sharding_strategy):
 def build_llama(args):
     """Build a Llama 3.1 model via torchtitan's model_registry.
 
-    Returns (model, config) tuple.  Applies activation checkpointing when
-    ``--activation-checkpoint`` is not 'none'.
+    Returns (model, config) tuple.
     """
     from torchtitan.models.llama3 import llama3_configs, Llama3Model
 
@@ -158,18 +153,7 @@ def build_llama(args):
         raise ValueError(f"Unknown flavor '{flavor}'. Choices: {list(llama3_configs)}")
     cfg = llama3_configs[flavor]
     config = cfg() if callable(cfg) else cfg
-    model = Llama3Model(config)
-
-    if args.activation_checkpoint != "none":
-        from torchtitan.distributed.activation_checkpoint import (
-            FullAC,
-            SelectiveAC,
-        )
-        ac_cls = FullAC if args.activation_checkpoint == "full" else SelectiveAC
-        ac = ac_cls(ac_cls.Config())
-        ac.apply(model)
-
-    return model, config
+    return Llama3Model(config), config
 
 
 # ---------------------------------------------------------------------------
@@ -266,12 +250,6 @@ def parse_args():
     p = argparse.ArgumentParser(description="LLaMA 3.1 FSDP benchmark (Megatron-FSDP v2 vs PyTorch FSDP2)")
     p.add_argument("--backend", choices=["torchfsdp", "mfsdp"], default="mfsdp")
     p.add_argument("--flavor", default="debugmodel")
-    p.add_argument("--activation-checkpoint", default="full",
-                   choices=["none", "selective", "full"],
-                   help="Activation checkpointing mode (torchtitan). "
-                        "'full' wraps each transformer block entirely; "
-                        "'selective' saves only expensive ops. "
-                        "Default: 'full' for memory safety; use 'none' to match torchfsdp behavior.")
     p.add_argument("--sharding-strategy", default="optim_grads_params",
                    choices=["no_shard", "optim", "optim_grads", "optim_grads_params"])
     p.add_argument("--batch-size", type=int, default=1)
