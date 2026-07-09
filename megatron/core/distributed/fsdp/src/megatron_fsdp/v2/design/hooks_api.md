@@ -33,9 +33,11 @@ Pre-forward: unshard parameters for the target FSDPModule.
 - Resolves target via `_find_fsdp_target`.  No-op if `None`.
 - Root phase: sets `ctx.forward_phase = True`, creates CG stream lazily.
 - Unshards parameters (forward + optional backward pass).
-- During an activation-checkpoint recompute, gathers only missing forward buffers owned
-  directly by the fine-grained child module. `is_recomputing()` distinguishes this path
-  within the shared FSDP `backward_phase`, so an overlapped normal forward remains full-unit.
+- During an activation-checkpoint recompute, gathers only missing forward buffers from
+  parameter groups selected by the fine-grained child module's direct parameters. This is
+  group-level targeting, so sibling parameters in the same dtype/device group may be
+  gathered together. `is_recomputing()` distinguishes this path within the shared FSDP
+  `backward_phase`, so an overlapped normal forward remains full-unit.
 - Frees stale grad data.
 - **CUDA graph capture**: only when `isinstance(hook_module, FSDPModule)` (skipped for sub-modules).
 

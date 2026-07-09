@@ -62,6 +62,23 @@ def _select_unshard_stream(ctx, *, async_op: bool):
     return caller_stream, stream
 
 
+def _get_direct_param_group_indices(
+    submodule: nn.Module, param_to_group_idx: Dict[nn.Parameter, int]
+) -> Tuple[int, ...]:
+    """Return group-level recompute targets for a submodule's direct parameters.
+
+    ParameterGroup objects are formed by shared communication properties such as dtype and
+    device, so a direct child parameter can target a group that also contains sibling params.
+    """
+    return tuple(
+        dict.fromkeys(
+            param_to_group_idx[param]
+            for param in submodule.parameters(recurse=False)
+            if param in param_to_group_idx
+        )
+    )
+
+
 class _FSDPState:
     """
     Internal state for FSDP module tracking.
@@ -659,12 +676,8 @@ class FSDPModule:
                 if hasattr(submodule, '_fsdp_parent_module'):
                     continue
                 submodule._fsdp_parent_module = weakref.ref(module)
-                submodule._mfsdp_direct_param_group_indices = tuple(
-                    dict.fromkeys(
-                        param_to_group_idx[param]
-                        for param in submodule.parameters(recurse=False)
-                        if param in param_to_group_idx
-                    )
+                submodule._mfsdp_direct_param_group_indices = _get_direct_param_group_indices(
+                    submodule, param_to_group_idx
                 )
 
         if enable_cuda_graph:

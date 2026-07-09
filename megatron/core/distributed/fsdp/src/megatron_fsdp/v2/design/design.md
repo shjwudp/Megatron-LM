@@ -252,7 +252,9 @@ for the paired backward, so `backward_phase` alone cannot select the targeted pa
 When a fine-grained child forward hook fires during actual recompute, the parent FSDP unit
 first performs its backward unshard and then calls `unshard_for_submodule()`. FSDP init maps
 each child module's direct parameters (`parameters(recurse=False)`) to their parameter-group
-indices, so the helper gathers only missing forward buffers from those groups. It does not
+indices, so the helper gathers only missing forward buffers from those groups. This is
+group-level targeting: parameter groups are built from shared communication properties such
+as dtype and device, so a selected group may also contain sibling parameters. It does not
 prefetch a neighboring unit or set the module-wide readiness event. Normal forwards retain
 the full forward unshard path, including normal forwards paired with backward by combined
 1F1B. The targeted helper follows the same stream-ownership contract as whole-unit

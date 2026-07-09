@@ -56,6 +56,16 @@ def test_overlapped_normal_forward_keeps_full_unshard(monkeypatch):
     target.unshard_for_submodule.assert_not_called()
 
 
+def test_direct_param_mapping_is_group_level_for_shared_dtype_children():
+    parent = nn.Module()
+    parent.child_a = nn.Linear(4, 4, bias=False)
+    parent.child_b = nn.Linear(4, 4, bias=False)
+    param_to_group_idx = {parent.child_a.weight: 0, parent.child_b.weight: 0}
+
+    assert fsdp_module._get_direct_param_group_indices(parent.child_a, param_to_group_idx) == (0,)
+    assert fsdp_module._get_direct_param_group_indices(parent.child_b, param_to_group_idx) == (0,)
+
+
 def test_targeted_unshard_preserves_caller_stream_ownership(monkeypatch):
     caller_stream = object()
     completion_event = Mock()
