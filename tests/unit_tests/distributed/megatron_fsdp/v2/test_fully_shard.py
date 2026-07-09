@@ -313,6 +313,35 @@ class TestFullyShardBasic:
         loss.backward()
         assert not torch.isnan(torch.tensor(loss.item()))
 
+    def test_async_reduce_grad_drains_previous_module(self):
+        """Async reduce-grad should retain at most one module's gradient bucket."""
+        model = TinyLLM(vocab=128, hidden=64, num_layers=2).to(_device())
+        for layer in model.layers:
+            fully_shard(layer)
+        fully_shard(model)
+
+        calls = []
+
+        class FakeEvent:
+            def wait(self):
+                calls.append("wait")
+
+        class FakeParamGroup:
+            def release_grad_buffer(self):
+                calls.append("release")
+
+        ctx = model._fsdp_root_context
+        backward_order = list(reversed(ctx.forward_order))
+        previous_module = backward_order[0]
+        current_module = backward_order[1]
+        buckets = ctx.reduce_grad_buckets[id(previous_module)]
+        buckets.append((FakeEvent(), FakeParamGroup()))
+
+        current_module._wait_for_previous_async_reduce_grad()
+
+        assert calls == ["wait", "release"]
+        assert not buckets
+
 
 # ------------------------------------------------------------------ #
 #  2. Scenarios — LLM-style nesting (embedding + layers + lm_head)

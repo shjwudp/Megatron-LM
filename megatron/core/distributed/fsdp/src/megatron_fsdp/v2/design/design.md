@@ -257,12 +257,12 @@ module.post_backward_issued = True
 def reduce_grad(self, async_op: bool = False):
     stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
 
-    # --- Step 1: Sliding drain — free grad buffers 2 positions back in backward order ---
+    # --- Step 1: Sliding drain — free the previous grad buffer in backward order ---
     if async_op:
         backward_order = list(reversed(ctx.forward_order))
         for i, module in enumerate(backward_order):
-            if i - 2 >= 0:
-                for event, param_group in drain(ctx.reduce_grad_buckets[id(backward_order[i-2])]):
+            if i > 0:
+                for event, param_group in drain(ctx.reduce_grad_buckets[id(backward_order[i-1])]):
                     event.wait()
                     param_group.release_grad_buffer()
                     #   → deletes param.main_grad views (prevents TE grad-accum-fusion leak)
@@ -328,22 +328,22 @@ directly into `param.main_grad` (bypassing `.grad`). Two flags coordinate this:
   gradients and produce NaN after the first step. This flag tells TE to **overwrite** instead
   of accumulate.
 
-### Sliding Drain: The `i-2` Rule
+### Sliding Drain: The `i-1` Rule
 
-The drain loop ensures at most **2 modules' gradient buffers** are live at any time:
+The drain loop ensures at most **1 module's gradient buffer** is live at any time:
 
 ```
 Backward processing order (reversed forward):
-  layer[N]   ← current (i=0): i-2=-2  → no drain
-  layer[N-1] ← current (i=1): i-2=-1  → no drain
-  layer[N-2] ← current (i=2): i-2=0   → drain layer[N]    (i-2=0)
-  layer[N-3] ← current (i=3): i-2=1   → drain layer[N-1]  (i-2=1)
+  layer[N]   ← current (i=0): no previous module → no drain
+  layer[N-1] ← current (i=1): drain layer[N]     (i-1=0)
+  layer[N-2] ← current (i=2): drain layer[N-1]   (i-1=1)
+  layer[N-3] ← current (i=3): drain layer[N-2]   (i-1=2)
   ...
 ```
 
-By the time RS for `layer[N-2]` starts, `layer[N]`'s RS event is expected to be done
-(two backward steps of compute have elapsed). `event.wait()` makes this explicit and safe
-even if the timing estimate is wrong.
+By the time RS for `layer[N-1]` starts, `layer[N]`'s RS event is expected to be done
+(one backward step of compute has elapsed). `event.wait()` throttles the next backward step
+if needed, preventing a lagging collective from competing with multiple layers of compute.
 
 ### `_post_backward_final_callback`
 

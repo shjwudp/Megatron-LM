@@ -726,15 +726,15 @@ class FSDPModule:
         torch.cuda.nvtx.range_pop()
 
     def _wait_for_previous_async_reduce_grad(self):
-        """Release older async reduce buffers in backward order."""
+        """Release the previous async reduce buffer in backward order."""
         ctx = self._fsdp_root_context
         if not ctx.enable_async_reduce_grad:
             return
 
         backward_order = list(reversed(ctx.forward_order))
         for i, module in enumerate(backward_order):
-            if i - 2 >= 0:
-                buckets = ctx.reduce_grad_buckets[id(backward_order[i - 2])]
+            if i > 0:
+                buckets = ctx.reduce_grad_buckets[id(backward_order[i - 1])]
                 while len(buckets) > 0:
                     event, param_group = buckets.pop()
                     event.wait()
