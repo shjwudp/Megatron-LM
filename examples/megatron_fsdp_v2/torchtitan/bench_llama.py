@@ -121,8 +121,8 @@ def wrap_fsdp_torch(model: nn.Module, mesh, mp_policy):
     from torch.distributed.fsdp import fully_shard
 
     for layer in model.layers.values():
-        fully_shard(layer, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=True)
-    fully_shard(model, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=True)
+        fully_shard(layer, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
     return model
 
 
@@ -130,10 +130,8 @@ def wrap_fsdp_megatron(model: nn.Module, mesh, mp_policy, sharding_strategy):
     from megatron_fsdp.v2 import fully_shard
 
     for layer in model.layers.values():
-        fully_shard(layer, mesh=mesh, mp_policy=mp_policy, sharding_strategy=sharding_strategy,
-                    enable_unshard_prefetch=True, enable_async_reduce_grad=True)
-    fully_shard(model, mesh=mesh, mp_policy=mp_policy, sharding_strategy=sharding_strategy,
-                enable_unshard_prefetch=True, enable_async_reduce_grad=True)
+        fully_shard(layer, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(model, mesh=mesh, mp_policy=mp_policy)
     return model
 
 
@@ -181,13 +179,11 @@ def bench_one(args, device, mem_mgr=None):
 
     if args.backend == "mfsdp":
         from megatron_fsdp.v2 import MixedPrecisionPolicy
-        mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16,
-                                  main_params_dtype=torch.bfloat16, main_grads_dtype=torch.bfloat16,
-                                  grad_comm_dtype=torch.bfloat16)
+        mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, main_grads_dtype=torch.bfloat16)
         model = wrap_fsdp_megatron(model, mesh, mp, args.sharding_strategy)
     else:
-        from torch.distributed.fsdp import MixedPrecisionPolicy as TorchMixedPrecisionPolicy
-        mp = TorchMixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16)
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+        mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16)
         model = wrap_fsdp_torch(model, mesh, mp)
 
     model.to_empty(device=device)
