@@ -493,7 +493,7 @@ class FSDPModule:
         # Materialize parameters starting from leaf modules so that
         # submodules with meta parameters are materialized before
         # their parents. This ensures proper initialization order.
-        for name, m in reversed(self.named_modules()):
+        for name, m in reversed(list(self.named_modules())):
             if m in ignored_modules:
                 continue
             # Skip modules that don't have meta parameters
