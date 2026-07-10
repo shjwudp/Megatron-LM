@@ -796,6 +796,27 @@ class FSDPModule:
         pending_post.clear()
         torch.cuda.nvtx.range_pop()
 
+    def _log_parameter_groups(self):
+        """Log parameter group information for debugging."""
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        name = getattr(self, "_fsdp_module_name", type(self).__name__)
+        is_root = getattr(self._fsdp_state, "_is_root", False)
+        ngroups = len(self._fsdp_param_groups)
+        print(f"[R{rank}] FSDPModule._log_parameter_groups "
+              f"name={name} is_root={is_root} param_groups={ngroups}")
+        for i, param_group in enumerate(self._fsdp_param_groups):
+            nparams = len(param_group.params)
+            total_elems = sum(p.numel() for p in param_group.params)
+            main_dtype = param_group.mp_policy.main_params_dtype
+            shard = param_group.sharding_strategy
+            model_buf = param_group.model_weight_buffer
+            buf_size_mb = model_buf.data_size / (1024 * 1024) if hasattr(model_buf, "data_size") else 0
+            is_dist = model_buf.is_distributed if hasattr(model_buf, "is_distributed") else False
+            dp_size = torch.distributed.get_world_size(model_buf.dp_group) if model_buf.dp_group is not None else 1
+            print(f"[R{rank}]   pg[{i}] params={nparams} elems={total_elems} "
+                  f"main_dtype={main_dtype} shard={shard} "
+                  f"buf={buf_size_mb:.1f}MB distributed={is_dist} dp_size={dp_size}")
+
     def _wait_for_previous_async_reduce_grad(self):
         """Release the previous async reduce buffer in backward order."""
         ctx = self._fsdp_root_context
