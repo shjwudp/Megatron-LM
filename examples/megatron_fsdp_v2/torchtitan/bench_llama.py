@@ -175,6 +175,20 @@ def bench_one(args, device, mem_mgr=None):
     with torch.device("meta"):
         model, config = build_llama(args)
 
+    # Materialize and initialize before wrapping so both FSDP implementations
+    # start from identical real tensors. M-FSDP otherwise materializes during
+    # fully_shard(), while torch FSDP leaves its sharded tensors on meta until
+    # to_empty() is called.
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    model.to_empty(device=device)
+    model.init_weights()
+
+    meta_tensors = [name for name, param in model.named_parameters() if param.is_meta]
+    meta_tensors.extend(name for name, buffer in model.named_buffers() if buffer.is_meta)
+    if meta_tensors:
+        raise RuntimeError(f"Model initialization left tensors on meta device: {meta_tensors}")
+
     mesh = init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("dp",))
 
     if args.backend == "mfsdp":
@@ -186,7 +200,10 @@ def bench_one(args, device, mem_mgr=None):
         mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16)
         model = wrap_fsdp_torch(model, mesh, mp)
 
-    model.to_empty(device=device)
+    # Model initialization consumes RNG state. Restore the per-rank seed so
+    # both backend runs generate the same input sequence.
+    torch.manual_seed(args.seed + rank)
+    torch.cuda.manual_seed(args.seed + rank)
     model.train()
 
     if args.debug_fsdp and rank == 0:
