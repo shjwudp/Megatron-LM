@@ -33,7 +33,7 @@ def fully_shard(
     module: nn.Module,
     *,
     mesh: Optional[DeviceMesh] = None,
-    reshard_after_forward: Optional[bool | int] = None,  # TODO: implement
+    reshard_after_forward: Optional[bool | int] = None,
     shard_placement_fn: Optional[
         Callable[[nn.Parameter], Optional[Shard]]
     ] = None,  # TODO: implement
@@ -119,6 +119,7 @@ def fully_shard(
         bucket_allocator=bucket_allocator,
         enable_cuda_graph=enable_cuda_graph,
         enable_full_iteration_cuda_graph=enable_full_iteration_cuda_graph,
+        reshard_after_forward=bool(reshard_after_forward) if reshard_after_forward is not None else None,
     )
     module._init_param_main_grad_func()
 

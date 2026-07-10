@@ -192,8 +192,7 @@ def bench_one(args, device, mem_mgr=None):
     if args.debug_fsdp and rank == 0:
         print(f"[mfsdp] debug logging enabled, "
               f"forward_order={len(model._fsdp_root_context.forward_order)} modules")
-        for module in model._fsdp_root_context.forward_order:
-            module._log_parameter_groups()
+        model._log_parameter_groups()
 
     params = [p for p in model.parameters() if p.requires_grad]
     optim = torch.optim.AdamW(params, lr=1e-4, fused=True)

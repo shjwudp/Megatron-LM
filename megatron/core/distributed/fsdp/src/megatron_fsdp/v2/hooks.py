@@ -163,6 +163,11 @@ def mfsdp_post_forward_hook(module: nn.Module, *unused):
     if ctx.backward_phase and id(module) == ctx.backward_module:
         _fsdp_debug("post_forward SKIP (backward_phase match)", module)
         return
+
+    if not getattr(module._fsdp_state, "reshard_after_forward", True):
+        _fsdp_debug("post_forward SKIP (reshard_after_forward=False)", module)
+        return
+
     _fsdp_debug("reshard", module)
     module.reshard()
 

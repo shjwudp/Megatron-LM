@@ -76,6 +76,7 @@ class _FSDPState:
         self._post_backward_callback_queued = False
         self.enable_cuda_graph: bool = False
         self.enable_full_iteration_cuda_graph: bool = False
+        self.reshard_after_forward: bool = True
 
 
 @dataclass
@@ -570,6 +571,7 @@ class FSDPModule:
         bucket_allocator: BucketAllocator,
         enable_cuda_graph: bool = False,
         enable_full_iteration_cuda_graph: bool = False,
+        reshard_after_forward: Optional[bool] = None,
     ):
         """Initialize FSDP state and mark nested FSDP modules as non-root.
 
@@ -634,6 +636,12 @@ class FSDPModule:
         )
         setattr(self, "_fsdp_state", _FSDPState())
         self._fsdp_state.enable_full_iteration_cuda_graph = enable_full_iteration_cuda_graph
+        # Root keeps params unsharded after forward (matching torch FSDP2) so
+        # backward starts without a redundant all-gather. Children default to
+        # reshard_after_forward=True unless explicitly overridden.
+        self._fsdp_state.reshard_after_forward = (
+            reshard_after_forward if reshard_after_forward is not None else False
+        )
         setattr(self, "_fsdp_root_context", root_context)
 
         module_idx = 0
