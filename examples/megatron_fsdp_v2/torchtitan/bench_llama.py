@@ -299,6 +299,8 @@ def main():
             atexit.register(mem_mgr.dump_on_normal_exit)
 
     if args.debug_fsdp:
+        import logging as _logging
+        _logging.getLogger("megatron_fsdp").setLevel(_logging.INFO)
         import megatron_fsdp.v2.hooks as mfsdp_hooks
         mfsdp_hooks._DEBUG_FSDP = True
         if rank == 0:
