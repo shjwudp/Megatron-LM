@@ -18,6 +18,24 @@ from .utils import RegisterFSDPBackwardFunction
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Debug logging helper — toggle via ``megatron_fsdp.v2.hooks._DEBUG_FSDP = True``
+# or ``--debug-fsdp`` in bench_llama.py.
+# ---------------------------------------------------------------------------
+
+_DEBUG_FSDP: bool = False
+
+
+def _fsdp_debug(msg: str, module: Optional[nn.Module] = None) -> None:
+    """Log debug info when ``_DEBUG_FSDP`` is enabled."""
+    if not _DEBUG_FSDP:
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    name = getattr(module, "_fsdp_module_name", "?") if module is not None else "?"
+    stream = torch.cuda.current_stream()
+    stream_id = getattr(stream, "cuda_stream", stream)
+    print(f"[R{rank}][S{stream_id}] mfsdp_debug {msg} mod={name}")
+
 
 # ---------------------------------------------------------------------------
 # Public helpers
@@ -83,6 +101,13 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
         target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
     target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 
+    if _DEBUG_FSDP:
+        phase = "bwd" if ctx.backward_phase else "fwd"
+        prefetch = ctx.get_prefetch_next_modules(target, bwd_pass=ctx.backward_phase)
+        prefetch_name = getattr(prefetch[0], "_fsdp_module_name", "?") if prefetch else "none"
+        async_str = "async" if ctx.enable_unshard_prefetch else "sync"
+        _fsdp_debug(f"unshard_{phase} {async_str} prefetch={prefetch_name}", target)
+
     # ---- cast forward inputs (root only) -----------------------------------
     if target._fsdp_state._is_root and target._fsdp_param_groups:
         mp_policy = target._fsdp_param_groups[0].mp_policy
@@ -136,7 +161,9 @@ def mfsdp_post_forward_hook(module: nn.Module, *unused):
     ctx = module._fsdp_root_context
     assert not ctx.cuda_graph_active, "hooks must not fire during CUDA graph capture"
     if ctx.backward_phase and id(module) == ctx.backward_module:
+        _fsdp_debug("post_forward SKIP (backward_phase match)", module)
         return
+    _fsdp_debug("reshard", module)
     module.reshard()
 
 
@@ -236,11 +263,15 @@ def mfsdp_post_backward_hook(module: nn.Module):
         if submodule.post_backward_issued:
             continue
         ctx.backward_done_modules.add(id(submodule))
+        if _DEBUG_FSDP:
+            _fsdp_debug("post_bwd reshard", submodule)
         submodule.reshard()
         if any(
             param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
             for param_group in submodule._fsdp_param_groups
         ):
+            if _DEBUG_FSDP:
+                _fsdp_debug(f"post_bwd reduce_grad async={ctx.enable_async_reduce_grad}", submodule)
             submodule.reduce_grad(async_op=ctx.enable_async_reduce_grad)
         submodule.post_backward_issued = True
     ctx._advance_backward_module()
@@ -409,6 +440,12 @@ def _pre_backward_setup(module: FSDPModule, skip_final_callback: bool = False):
 
     # ---- unshard params for backward compute --------------------------
     module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
+
+    if _DEBUG_FSDP:
+        prefetch = ctx.get_prefetch_next_modules(module, bwd_pass=True)
+        prefetch_name = getattr(prefetch[0], "_fsdp_module_name", "?") if prefetch else "none"
+        async_str = "async" if ctx.enable_unshard_prefetch else "sync"
+        _fsdp_debug(f"pre_bwd unshard_bwd {async_str} prefetch={prefetch_name}", module)
 
     # ---- reset per-module bookkeeping ---------------------------------
     module.post_backward_issued = False

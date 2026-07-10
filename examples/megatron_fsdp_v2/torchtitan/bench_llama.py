@@ -262,6 +262,8 @@ def parse_args():
     p.add_argument("--record-memory-history-oom-only", action="store_true",
                    help="When set with --record-memory-history, only dump the "
                         "snapshot on OOM (skip normal exit dump).")
+    p.add_argument("--debug-fsdp", action="store_true",
+                   help="Enable verbose M-FSDP v2 debug logging (unshard/reshard/prefetch events).")
     p.add_argument("--seed", type=int, default=1234)
     return p.parse_args()
 
@@ -289,6 +291,12 @@ def main():
         mem_mgr.start()
         if not args.record_memory_history_oom_only:
             atexit.register(mem_mgr.dump_on_normal_exit)
+
+    if args.debug_fsdp:
+        import megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks as mfsdp_hooks
+        mfsdp_hooks._DEBUG_FSDP = True
+        if rank == 0:
+            print("[mfsdp] debug logging enabled")
 
     try:
         bench_one(args, device, mem_mgr=mem_mgr)
