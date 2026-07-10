@@ -293,7 +293,7 @@ def main():
             atexit.register(mem_mgr.dump_on_normal_exit)
 
     if args.debug_fsdp:
-        import megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks as mfsdp_hooks
+        import megatron_fsdp.v2.hooks as mfsdp_hooks
         mfsdp_hooks._DEBUG_FSDP = True
         if rank == 0:
             print("[mfsdp] debug logging enabled")
