@@ -182,7 +182,8 @@ def bench_one(args, device, mem_mgr=None):
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
     model.to_empty(device=device)
-    model.init_weights()
+    with torch.no_grad():
+        model.init_weights()
 
     meta_tensors = [name for name, param in model.named_parameters() if param.is_meta]
     meta_tensors.extend(name for name, buffer in model.named_buffers() if buffer.is_meta)
