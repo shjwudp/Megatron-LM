@@ -4,34 +4,10 @@ Example scripts for training and checkpoint conversion using [Megatron-FSDP](../
 
 ## Scripts
 
-### `fsdp_toy.py`
+### `toy_model/`
 
-Standalone toy example (not Megatron-LM) demonstrating Megatron-FSDP v2 usage:
-
-- Basic model wrapping with `fully_shard()`
-- CUDA graph capture (`--cuda-graph`, off by default)
-  > **Experimental** — CUDA graph support is experimental and may change.
-- Activation checkpointing (`--activation-checkpoint`)
-- Distributed checkpointing
-
-```bash
-torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
-    --model-dim 512 --n-layers 2 --batch-size 4 \
-    --use-megatron-fsdp
-
-# With CUDA graph (Megatron-FSDP only)
-torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
-    --model-dim 512 --n-layers 2 --batch-size 4 \
-    --use-megatron-fsdp --cuda-graph
-```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--model-dim` | `1024` | Hidden dimension size |
-| `--n-layers` | `3` | Number of transformer layers |
-| `--use-megatron-fsdp` | off | Use Megatron-FSDP v2 instead of PyTorch FSDP2 |
-| `--cuda-graph` | off | Enable CUDA graph capture on transformer layers (Megatron-FSDP only) |
-| `--activation-checkpoint` | off | Enable activation checkpointing |
+Standalone toy example demonstrating Megatron-FSDP v2 usage on a small MLP model, with
+PyTorch FSDP2 comparison. Moved to [`examples/megatron_fsdp_v2/toy_model/`](../megatron_fsdp_v2/toy_model/).
 
 ### `qwen3-30b-a3b.gbs128_mbs4_seq4096_n2_mfsdp2_mxfp8_wandb.sh`
 

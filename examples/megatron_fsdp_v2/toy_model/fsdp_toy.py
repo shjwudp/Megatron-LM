@@ -72,10 +72,7 @@ class ToyModel(nn.Module):
 # Synthetic supervised data (teacher-student)
 # -----------------------
 
-def set_seed(seed: int) -> None:
-    """Seed CPU + CUDA RNGs so all ranks initialize identically."""
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+import _utils
 
 
 class TeacherStudentData:
@@ -102,7 +99,7 @@ class TeacherStudentData:
         self.seed = seed
         # Build the teacher identically on all ranks (seed differs from student
         # init so the student does not start at the solution).
-        set_seed(seed)
+        _utils.set_seed(seed)
         self.teacher = ToyModel(dim=dim, n_layers=n_layers).to(device=device, dtype=dtype)
         self.teacher.eval()
         for p in self.teacher.parameters():
@@ -126,17 +123,6 @@ class TeacherStudentData:
 # Distributed init / mesh
 # -----------------------
 
-def init_distributed() -> torch.distributed.device_mesh.DeviceMesh:
-    """Initialize process group and device mesh."""
-    if not dist.is_initialized():
-        dist.init_process_group("nccl")
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
-    torch.cuda.set_device(rank)
-    mesh = init_device_mesh("cuda", mesh_shape=(world_size,))
-    return mesh
-
-
 def build_fsdp_model(
     dim: int,
     n_layers: int,
@@ -153,7 +139,7 @@ def build_fsdp_model(
     else:
         from torch.distributed.fsdp import FSDPModule, fully_shard
 
-    mesh = init_distributed()
+    mesh = _utils.init_distributed()
     model = ToyModel(dim=dim, n_layers=n_layers).to(device="cuda", dtype=torch.bfloat16)
 
     if use_activation_checkpointing:
@@ -287,14 +273,6 @@ def load_checkpoint_if_available(
 # Training loop
 # -----------------------
 
-def _fmt_bytes(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} TB"
-
-
 def train(
     args: argparse.Namespace,
     model: nn.Module,
@@ -343,8 +321,8 @@ def train(
                 t_now = time.time()
                 elapsed = t_now - t_start
                 s_per_step = elapsed / max(step - start_step + 1, 1)
-                alloc = _fmt_bytes(torch.cuda.memory_allocated())
-                max_reserved = _fmt_bytes(torch.cuda.max_memory_reserved())
+                alloc = _utils.fmt_bytes(torch.cuda.memory_allocated())
+                max_reserved = _utils.fmt_bytes(torch.cuda.max_memory_reserved())
                 print(
                     f"[rank0] epoch={epoch} step={step} loss={global_loss:.4e} "
                     f"alloc={alloc} max_reserved={max_reserved} "
@@ -426,7 +404,7 @@ def main() -> None:
         )
 
     # Seed before model construction so all ranks share identical initial weights.
-    set_seed(args.seed)
+    _utils.set_seed(args.seed)
 
     model, _ = build_fsdp_model(
         dim=args.model_dim,
