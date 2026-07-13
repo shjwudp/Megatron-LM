@@ -416,6 +416,9 @@ class DataParallelBuffer:
            return either that full buffer or a view from it. Example: storage
            ``(1, 1)`` requesting ``(0, 1)`` must materialize the full buffer
            because one outer shard cannot cover the complete inner-DP shard.
+
+        Memory allocation always occurs on the caller stream for deterministic
+        caching-allocator behaviour.
         """
         requested_shard_layout = shard_layout
 

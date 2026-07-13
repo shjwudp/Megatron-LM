@@ -318,16 +318,13 @@ torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
 ## Gotchas / Pitfalls
 
 - **Zero-numel gradient shards and fused optimizers.** When a parameter's local shard is empty on some DP ranks (e.g., small biases on high DP counts), creating a `DTensor` gradient with `numel() == 0` and passing it to fused multi-tensor optimizers (TE `FusedAdam`) can silently corrupt updates for neighboring non-empty parameters. This manifests only as convergence divergence with no error — see [design.md § Pitfall](design.md) for details and the fix in `param_group.py`.
-- **Temporary communication bucket lifecycle.** All temporary all-gather /
-  reduce-scatter buckets are allocated on the default CUDA stream and only
-  compute operations (all-gather, reduce-scatter) run on side streams
-  (`ag_stream`, `rs_stream`). CUDA events inserted at the boundary between
-  allocation and compute, and between compute and free, guarantee ordering
-  without ``record_stream``.  ``record_stream`` is intentionally avoided
-  because it forces the caching allocator to hold memory blocks until the
-  recorded stream finishes, preventing reuse across iterations and causing
-  significant peak memory regressions
-  ([discussion](https://dev-discuss.pytorch.org/t/1486)).
+- **Temporary communication bucket lifecycle.** Temporary all-gather /
+  reduce-scatter buckets are allocated on the caller CUDA stream. Parameter
+  all-gathers run on `ag_stream`; gradient collectives run on `rs_stream`,
+  where full-iteration graphs may also stage add/copy/zero work immediately
+  before reduction. CUDA events order preparation, communication, consumption,
+  and free. All all-gather outputs additionally record their producer stream so
+  the allocator cannot recycle a temporary buffer while communication is using it.
 
 ## Unit Tests
 
