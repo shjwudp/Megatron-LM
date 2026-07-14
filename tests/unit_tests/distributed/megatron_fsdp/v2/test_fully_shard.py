@@ -58,6 +58,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import mfsdp_forward_pre_hook
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
 
 SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
@@ -1002,6 +1003,154 @@ class LargePerLayerModel(nn.Module):
 
 
 class TestActivationCheckpointing:
+    def test_recompute_successor_uses_updated_weight_after_optimizer_step(self):
+        """A recompute-prefetched successor must not reuse pre-step weights.
+
+        Layer 1 finishes backward before layer 0 is recomputed. A normal
+        forward-prefetch from that recompute can incorrectly resurrect layer
+        1's full model-weight buffer after its post-backward reshard. Under
+        outer ``no_shard``, copying the optimizer's FP32 main shard updates
+        only persistent BF16 storage, so the resurrected full buffer would be
+        stale on the next forward.
+
+        Use per-layer FSDP units (and an FSDP root), but no nested expert unit:
+        this isolates successor prefetch from the separate nested post-forward
+        lifecycle path.
+        """
+        torch.manual_seed(42)
+        device = _device()
+        mesh = _build_hsdp_mesh()
+
+        class TwoLayerCheckpointModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList(
+                    [
+                        nn.Sequential(
+                            nn.Linear(32, 32), nn.GELU(), nn.Linear(32, 32)
+                        )
+                        for _ in range(2)
+                    ]
+                )
+
+            def forward(self, x):
+                for layer in self.layers:
+                    x = torch.utils.checkpoint.checkpoint(
+                        layer, x, use_reentrant=False
+                    )
+                return x
+
+        model = TwoLayerCheckpointModel().to(device=device, dtype=torch.bfloat16)
+        shard_kwargs = dict(
+            mesh=mesh,
+            sharding_strategy="optim_grads_params",
+            outer_dp_sharding_strategy="no_shard",
+            mp_policy=MixedPrecisionPolicy(
+                main_params_dtype=torch.float32,
+                main_grads_dtype=torch.float32,
+                grad_comm_dtype=torch.float32,
+            ),
+            enable_unshard_prefetch=True,
+            enable_async_reduce_grad=True,
+        )
+        for index, layer in enumerate(model.layers):
+            model.layers[index] = fully_shard(layer, **shard_kwargs)
+        model = fully_shard(model, **shard_kwargs)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.25)
+
+        successor = model.layers[1]
+        param_group = successor._fsdp_param_groups[0]
+        model_buffer = param_group.model_weight_buffer
+        main_buffer = param_group.main_weight_buffer
+        assert main_buffer is not None
+        assert model_buffer.storage_shard_layout == (0, 1)
+        assert main_buffer.storage_shard_layout == (0, 1)
+
+        _set_last_backward(model)
+        x = torch.randn(4, 32, device=device, dtype=torch.bfloat16, requires_grad=True)
+        with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+            loss = model(x).float().square().mean()
+            loss.backward()
+        model.finish_grad_sync()
+
+        main_before = main_buffer.data.detach().clone()
+        optimizer.step()
+        assert not torch.equal(main_buffer.data, main_before), "SGD did not update successor"
+        model._copy_main_weights_to_model_weights()
+        assert torch.equal(model_buffer.data, main_buffer.data.to(model_buffer.dtype))
+
+        expected_full = torch.empty(
+            model_buffer.buffer_index.bucket_meta.size,
+            dtype=model_buffer.dtype,
+            device=device,
+        )
+        torch.distributed.all_gather_into_tensor(
+            expected_full,
+            model_buffer.data,
+            group=model_buffer.inner_dp_group,
+        )
+
+        observed_full = []
+
+        def capture_successor_full_buffer(_module, _args):
+            assert model_buffer._unsharded_buffer is not None
+            observed_full.append(model_buffer._unsharded_buffer.detach().clone())
+
+        handle = successor.register_forward_pre_hook(capture_successor_full_buffer)
+        try:
+            x_next = torch.randn(4, 32, device=device, dtype=torch.bfloat16)
+            model(x_next)
+        finally:
+            handle.remove()
+
+        assert len(observed_full) == 1
+        for item_id in range(len(param_group.params)):
+            start, end = model_buffer.buffer_index._get_item_global_range(item_id)
+            torch.testing.assert_close(
+                observed_full[0][start:end],
+                expected_full[start:end],
+                rtol=0,
+                atol=0,
+            )
+
+    def test_recompute_forward_self_unshard_disables_prefetch(self, monkeypatch):
+        """Recompute may unshard itself but must not advance forward prefetch."""
+        torch.manual_seed(42)
+        model = TinyLLM(vocab=32, hidden=16, num_layers=1).to(_device())
+        target = model.layers[0]
+        fully_shard(
+            target,
+            enable_unshard_prefetch=True,
+            enable_async_reduce_grad=False,
+        )
+        fully_shard(
+            model,
+            enable_unshard_prefetch=True,
+            enable_async_reduce_grad=False,
+        )
+
+        assert not target._fsdp_state._is_root
+        ctx = model._fsdp_root_context
+        ctx.backward_phase = True
+        ctx.backward_module = id(target)
+
+        calls = []
+
+        def capture_unshard(
+            async_op=False,
+            bwd_pass=False,
+            prefetch=True,
+        ):
+            calls.append((async_op, bwd_pass, prefetch))
+
+        monkeypatch.setattr(target, "unshard", capture_unshard)
+        mfsdp_forward_pre_hook(target, (), {})
+
+        assert calls == [
+            (True, True, True),
+            (True, False, False),
+        ]
+
     def test_activation_checkpointing_forward_backward(self):
         """Forward + backward with activation checkpointing should produce finite loss."""
         torch.manual_seed(42)

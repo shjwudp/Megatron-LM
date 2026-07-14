@@ -697,7 +697,12 @@ class FSDPModule:
         if any(module._fsdp_state.enable_cuda_graph for module in forward_order):
             root_context.enable_cuda_graph = True
 
-    def unshard(self, async_op: bool = False, bwd_pass: bool = False):
+    def unshard(
+        self,
+        async_op: bool = False,
+        bwd_pass: bool = False,
+        prefetch: bool = True,
+    ):
         """
         Unshard parameters by all-gathering from the sharded buffer.
 
@@ -710,7 +715,7 @@ class FSDPModule:
         caller_stream, stream = _select_unshard_stream(ctx, async_op=async_op)
 
         # Unshard this module and optionally prefetch next modules in the forward/backward pass
-        if async_op:
+        if async_op and prefetch:
             prefetch_modules = ctx.get_prefetch_next_modules(self, bwd_pass=bwd_pass)
         else:
             prefetch_modules = []
