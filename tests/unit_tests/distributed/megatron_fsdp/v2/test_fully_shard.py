@@ -39,6 +39,7 @@ Single-GPU tests:
 
 import shutil
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -348,8 +349,16 @@ class TestFullyShardBasic:
 
         captured_run_dtypes = []
 
-        def capture_unshard(dp_group, weight_buffers, *, async_op, stream, caller_stream):
-            del dp_group, async_op, caller_stream
+        def capture_unshard(
+            outer_dp_group,
+            inner_dp_group,
+            weight_buffers,
+            *,
+            async_op,
+            stream,
+            caller_stream,
+        ):
+            del outer_dp_group, inner_dp_group, async_op, caller_stream
             captured_run_dtypes.append(
                 tuple(weight_buffer.dtype for weight_buffer in weight_buffers)
             )
@@ -424,8 +433,11 @@ class TestFullyShardBasic:
             model.reshard()
             layer.reshard()
 
-    def test_outer_optim_keeps_each_buffer_outer_then_inner(self, monkeypatch):
-        """Outer optimizer sharding must not enter the inner-DP coalesced helper."""
+    @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
+    def test_weight_unshard_coalesces_outer_before_inner(
+        self, monkeypatch, outer_strategy
+    ):
+        """Outer runs should finish before inner AGs; no_shard outer is a no-op."""
         from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import (
             fsdp_module as fsdp_module_mod,
         )
@@ -434,69 +446,119 @@ class TestFullyShardBasic:
         )
 
         torch.manual_seed(42)
-        model = MixedDtypeBuffers(16).to(_device())
+        model = SimpleMLP(16).to(_device())
+        model.fc.bias.requires_grad_(False)
         fully_shard(
             model,
             mesh=_build_hsdp_mesh(),
             sharding_strategy="optim_grads_params",
-            outer_dp_sharding_strategy="optim",
+            outer_dp_sharding_strategy=outer_strategy,
             enable_unshard_prefetch=True,
             enable_async_reduce_grad=False,
         )
 
         original_unshard = DataParallelBuffer.unshard
+        original_coalescing_manager = fsdp_module_mod._coalescing_manager
         original_all_gather = torch.distributed.all_gather_into_tensor
-        dimensions_by_buffer = {}
-        expected_groups = []
+        manager_groups = []
+        active_manager_groups = []
+        unshard_calls = []
         collective_groups = []
-        dirty_buffers = []
+        weight_buffers = []
 
         for param_group in model._fsdp_param_groups:
-            for weight_buffer in param_group.weight_buffers_for_unshard():
-                # Model checkpoint/optimizer refresh marks the replicated outer
-                # storage dirty; force that state so dim 0 launches a real AG.
+            weight_buffers.extend(param_group.weight_buffers_for_unshard())
+
+        assert len(weight_buffers) == 2
+        first_buffer, second_buffer = weight_buffers
+        assert first_buffer.outer_dp_group is second_buffer.outer_dp_group
+        assert first_buffer.inner_dp_group is second_buffer.inner_dp_group
+        assert first_buffer.dtype == second_buffer.dtype
+        assert first_buffer.device == second_buffer.device
+        outer_dp_group = first_buffer.outer_dp_group
+        inner_dp_group = first_buffer.inner_dp_group
+
+        if outer_strategy == "optim":
+            for weight_buffer in weight_buffers:
+                # Force the post-optimizer/checkpoint state so dim 0 launches AG.
                 weight_buffer._outer_dirty = True
-                dirty_buffers.append(weight_buffer)
-                expected_groups.extend(
-                    [weight_buffer.outer_dp_group, weight_buffer.dp_group]
-                )
+
+        @contextmanager
+        def capture_coalescing_manager(group, *args, **kwargs):
+            manager_groups.append(group)
+            with original_coalescing_manager(group, *args, **kwargs) as event:
+                active_manager_groups.append(group)
+                try:
+                    yield event
+                finally:
+                    active_manager_groups.pop()
 
         def capture_unshard(buffer, *args, **kwargs):
             unshard_dim = kwargs.get("unshard_dim", args[0] if args else 1)
-            dimensions_by_buffer.setdefault(id(buffer), []).append(unshard_dim)
+            active_group = (
+                active_manager_groups[-1] if active_manager_groups else None
+            )
+            unshard_calls.append((id(buffer), unshard_dim, active_group))
             return original_unshard(buffer, *args, **kwargs)
 
         def capture_all_gather(*args, **kwargs):
             collective_groups.append(kwargs["group"])
             return original_all_gather(*args, **kwargs)
 
-        def reject_coalesced_inner(*args, **kwargs):
-            pytest.fail("outer-optim buffers must bypass inner-DP coalescing")
-
         monkeypatch.setattr(DataParallelBuffer, "unshard", capture_unshard)
+        monkeypatch.setattr(
+            fsdp_module_mod,
+            "_coalescing_manager",
+            capture_coalescing_manager,
+        )
         monkeypatch.setattr(
             torch.distributed,
             "all_gather_into_tensor",
             capture_all_gather,
         )
-        monkeypatch.setattr(
-            fsdp_module_mod,
-            "_unshard_weight_buffers",
-            reject_coalesced_inner,
-        )
 
         try:
             model.unshard(async_op=True)
-            assert dimensions_by_buffer
-            assert all(
-                dimensions == [0, 1] for dimensions in dimensions_by_buffer.values()
-            )
-            assert len(collective_groups) == len(expected_groups)
+            assert len(manager_groups) == 2
             assert all(
                 actual is expected
-                for actual, expected in zip(collective_groups, expected_groups)
+                for actual, expected in zip(
+                    manager_groups,
+                    [outer_dp_group, inner_dp_group],
+                )
             )
-            assert all(not weight_buffer._outer_dirty for weight_buffer in dirty_buffers)
+            expected_unshard_calls = [
+                (id(first_buffer), 0, outer_dp_group),
+                (id(second_buffer), 0, outer_dp_group),
+                (id(first_buffer), 1, inner_dp_group),
+                (id(second_buffer), 1, inner_dp_group),
+            ]
+            assert len(unshard_calls) == len(expected_unshard_calls)
+            assert all(
+                actual_buffer == expected_buffer
+                and actual_dim == expected_dim
+                and actual_group is expected_group
+                for (actual_buffer, actual_dim, actual_group), (
+                    expected_buffer,
+                    expected_dim,
+                    expected_group,
+                ) in zip(unshard_calls, expected_unshard_calls)
+            )
+            expected_collective_groups = (
+                [outer_dp_group, outer_dp_group]
+                if outer_strategy == "optim"
+                else []
+            )
+            expected_collective_groups.extend([inner_dp_group, inner_dp_group])
+            assert len(collective_groups) == len(expected_collective_groups)
+            assert all(
+                actual is expected
+                for actual, expected in zip(
+                    collective_groups,
+                    expected_collective_groups,
+                )
+            )
+            assert all(not weight_buffer._outer_dirty for weight_buffer in weight_buffers)
         finally:
             model.reshard()
 

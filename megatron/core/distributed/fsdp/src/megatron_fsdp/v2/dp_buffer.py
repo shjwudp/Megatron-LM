@@ -45,7 +45,7 @@ class DataParallelBuffer:
         self.dtype = dtype
         self.device = device
         self.outer_dp_group = mesh.get_group(mesh_dim=0)
-        self.dp_group = mesh.get_group(mesh_dim=1)
+        self.inner_dp_group = mesh.get_group(mesh_dim=1)
         self.allocator = allocator if allocator is not None else TemporaryBucketAllocator()
         self.buffer_role = buffer_role
         self.alloc_key = (param_group_id, buffer_role)
@@ -338,7 +338,7 @@ class DataParallelBuffer:
             0 if unshard_dim == 0 else source_shard_layout[0],
             0 if unshard_dim == 1 else source_shard_layout[1],
         )
-        group = self.outer_dp_group if unshard_dim == 0 else self.dp_group
+        group = self.outer_dp_group if unshard_dim == 0 else self.inner_dp_group
 
         input_buffer = self.fetch_buffer(source_shard_layout)
         output_buffer = self.fetch_buffer(output_shard_layout)
@@ -505,7 +505,7 @@ class DataParallelBuffer:
         output_buffer = self.fetch_buffer(output_shard_layout)
 
         # Pick the process group covering exactly the reduced dimension.
-        group = self.outer_dp_group if reduce_dim == 0 else self.dp_group
+        group = self.outer_dp_group if reduce_dim == 0 else self.inner_dp_group
         if torch.distributed.get_world_size(group) == 1:
             if input_buffer.is_cuda:
                 input_buffer.record_stream(stream)

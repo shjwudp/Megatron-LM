@@ -717,7 +717,7 @@ def reduce_grad(self, grad_comm_dtype=None):
     local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
 
     if not self.inner_sharded and self.sharding_strategy == "no_shard":
-        torch.distributed.all_reduce(self.data, group=self.dp_group)
+        torch.distributed.all_reduce(self.data, group=self.inner_dp_group)
         return
 
     if self.inner_sharded:
@@ -731,7 +731,7 @@ def reduce_grad(self, grad_comm_dtype=None):
         accumulate_output = False
     grad_shard = input_buffer[output_offset : output_offset + sm.size]
     torch.distributed.reduce_scatter_tensor(
-        output=grad_shard, input=input_buffer, group=self.dp_group
+        output=grad_shard, input=input_buffer, group=self.inner_dp_group
     )
     if accumulate_output:
         # ZeRO-2/3 accumulate into persistent shard for micro-batch grad accumulation.

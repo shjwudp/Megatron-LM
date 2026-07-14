@@ -108,7 +108,7 @@ class TestMegatronFSDPE2E:
             param_group = model._fsdp_param_groups[0]
             grad_buffer = param_group.main_grad_buffer
             assert grad_buffer is not None
-            assert grad_buffer.dp_group.size() == 1
+            assert grad_buffer.inner_dp_group.size() == 1
             assert grad_buffer.inner_sharded
             param_group._init_dist_grads()
 

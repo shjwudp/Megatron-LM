@@ -23,14 +23,15 @@ logger = logging.getLogger(__name__)
 
 
 def _unshard_weight_buffers(
-    dp_group,
+    outer_dp_group,
+    inner_dp_group,
     weight_buffers,
     *,
     async_op: bool,
     stream: torch.cuda.Stream,
     caller_stream: torch.cuda.Stream,
 ) -> None:
-    """Unshard one inner-DP communication-compatible buffer run."""
+    """Unshard one communication-compatible buffer run by mesh dimension."""
     # Allocate on the caller stream before entering the communication stream.
     full_buffers = [
         weight_buffer.fetch_buffer((0, 0)) for weight_buffer in weight_buffers
@@ -38,54 +39,32 @@ def _unshard_weight_buffers(
     if async_op:
         stream.wait_stream(caller_stream)
 
-    cm = (
-        _coalescing_manager(dp_group, async_ops=async_op)
-        if len(weight_buffers) > 1 and torch.distributed.get_world_size(dp_group) > 1
-        else nullcontext()
-    )
-    with torch.cuda.stream(stream):
+    def unshard_dimension(group, unshard_dim: int) -> None:
+        cm = (
+            _coalescing_manager(group, async_ops=async_op)
+            if len(weight_buffers) > 1
+            and torch.distributed.get_world_size(group) > 1
+            else nullcontext()
+        )
         with cm as coalescing_event:
             for weight_buffer in weight_buffers:
-                # The full buffer is already allocated, so only the collective
-                # is dispatched while the communication stream is current.
                 weight_buffer.unshard(
-                    unshard_dim=1,
+                    unshard_dim=unshard_dim,
                     bind_params=False,
                     stream=stream,
                 )
         if async_op and coalescing_event is not None:
             coalescing_event.wait()
 
+    with torch.cuda.stream(stream):
+        # Dim 0 is state-driven: no_shard and clean buffers fast-path, while
+        # dirty outer=optim buffers issue the outer all-gather.
+        unshard_dimension(outer_dp_group, unshard_dim=0)
+        unshard_dimension(inner_dp_group, unshard_dim=1)
+
     # Rebinding only updates tensor metadata and stays on the caller stream.
     for weight_buffer, full_buffer in zip(weight_buffers, full_buffers):
         weight_buffer._bind_buffer_to_params(full_buffer)
-
-
-def _unshard_outer_optim_weight_buffer(
-    weight_buffer,
-    *,
-    async_op: bool,
-    stream: torch.cuda.Stream,
-    caller_stream: torch.cuda.Stream,
-) -> None:
-    """Unshard one outer-optim buffer without cross-buffer coalescing."""
-    full_buffer = weight_buffer.fetch_buffer((0, 0))
-    if async_op:
-        stream.wait_stream(caller_stream)
-
-    # Keep the existing per-buffer dependency: the inner-DP gather consumes
-    # the outer-refreshed shard produced by the first gather.
-    weight_buffer.unshard(
-        unshard_dim=0,
-        bind_params=False,
-        stream=stream,
-    )
-    weight_buffer.unshard(
-        unshard_dim=1,
-        bind_params=False,
-        stream=stream,
-    )
-    weight_buffer._bind_buffer_to_params(full_buffer)
 
 
 def _select_unshard_stream(ctx, *, async_op: bool):
@@ -744,9 +723,9 @@ class FSDPModule:
             if bwd_pass and id(module) in ctx.backward_done_modules:
                 continue  # Skip prefetch for modules whose backward is already done
 
-            # Build communication-compatible runs on the caller stream. Inner-DP
-            # buffers retain incoming coalescing. Outer-optim buffers stay as
-            # individual outer->inner operations to preserve the existing order.
+            # Build communication-compatible runs on the caller stream. Each run
+            # processes outer-DP before inner-DP; buffer state determines whether
+            # either dimension launches a collective.
             buffer_runs = []
             for param_names, param_group in module._named_param_groups:
                 # Optional NaN checking for debugging
@@ -757,20 +736,10 @@ class FSDPModule:
                         ).any(), f"NaN detected in dist param for parameter {name}"
 
                 for weight_buffer in param_group.weight_buffers_for_unshard(bwd_pass=bwd_pass):
-                    if param_group.outer_dp_sharding_strategy == "optim":
-                        buffer_runs.append(
-                            (
-                                False,
-                                weight_buffer.outer_dp_group,
-                                weight_buffer.dtype,
-                                weight_buffer.device,
-                                [weight_buffer],
-                            )
-                        )
-                    elif (
+                    if (
                         buffer_runs
-                        and buffer_runs[-1][0]
-                        and buffer_runs[-1][1] is weight_buffer.dp_group
+                        and buffer_runs[-1][0] is weight_buffer.outer_dp_group
+                        and buffer_runs[-1][1] is weight_buffer.inner_dp_group
                         and buffer_runs[-1][2] == weight_buffer.dtype
                         and buffer_runs[-1][3] == weight_buffer.device
                     ):
@@ -778,31 +747,23 @@ class FSDPModule:
                     else:
                         buffer_runs.append(
                             (
-                                True,
-                                weight_buffer.dp_group,
+                                weight_buffer.outer_dp_group,
+                                weight_buffer.inner_dp_group,
                                 weight_buffer.dtype,
                                 weight_buffer.device,
                                 [weight_buffer],
                             )
                         )
 
-            for coalesce, dp_group, _, _, weight_buffers in buffer_runs:
-                if coalesce:
-                    _unshard_weight_buffers(
-                        dp_group,
-                        weight_buffers,
-                        async_op=async_op,
-                        stream=stream,
-                        caller_stream=caller_stream,
-                    )
-                else:
-                    assert len(weight_buffers) == 1
-                    _unshard_outer_optim_weight_buffer(
-                        weight_buffers[0],
-                        async_op=async_op,
-                        stream=stream,
-                        caller_stream=caller_stream,
-                    )
+            for outer_dp_group, inner_dp_group, _, _, weight_buffers in buffer_runs:
+                _unshard_weight_buffers(
+                    outer_dp_group,
+                    inner_dp_group,
+                    weight_buffers,
+                    async_op=async_op,
+                    stream=stream,
+                    caller_stream=caller_stream,
+                )
 
             # Post-processing may launch Transformer Engine kernels. Defer it
             # until this module's caller stream has waited for communication.

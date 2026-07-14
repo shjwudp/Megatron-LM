@@ -261,8 +261,9 @@ class ParameterGroup:
         """
         for weight_buffer in self.weight_buffers_for_unshard(bwd_pass=bwd_pass):
             if self.outer_dp_sharding_strategy == "optim":
-                # mesh dim 0 is outer-DP. Keep this refresh separate from
-                # inner-DP coalescing since the inner gather depends on it.
+                # outer=optim copies only the local optimizer shard into the
+                # replicated model buffer, so mesh dim 0 must refresh that
+                # replica before the inner-DP gather consumes it.
                 weight_buffer.unshard(
                     unshard_dim=0,
                     bind_params=False,
