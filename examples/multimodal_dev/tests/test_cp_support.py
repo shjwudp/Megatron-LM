@@ -5,16 +5,21 @@
 Tests cover:
   1. _cp_split_tensor — zigzag split correctness, reconstruction, and edge cases
   2. _NoCPGroup — dummy process group behaviour
-  3. _thd_cp_partition_index — TE-based per-sample THD CP partitioning
-  4. Cross-validation against megatron.core.utils.get_batch_on_this_cp_rank
+  3. Qwen3.5-VL vision RoPE — core THD call-contract compatibility
+  4. _thd_cp_partition_index — TE-based per-sample THD CP partitioning
+  5. Cross-validation against megatron.core.utils.get_batch_on_this_cp_rank
 
 Run with:  pytest examples/multimodal_dev/tests/test_cp_support.py -v
 """
+
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from examples.multimodal_dev.models.base import _cp_split_tensor, _NoCPGroup
+from examples.multimodal_dev.models.qwen35_vl.specs import _apply_rope_fp32_no_cp
+from megatron.core.models.common.embeddings import rope_utils
 
 
 class TestCpSplitTensor:
@@ -179,6 +184,34 @@ class TestNoCPGroup:
     def test_rank_is_zero(self):
         g = _NoCPGroup()
         assert g.rank() == 0
+
+
+class TestVisionRope:
+    """Tests for the Qwen3.5-VL vision RoPE wrapper."""
+
+    def test_forwards_max_seqlen_to_thd_rope(self, monkeypatch):
+        """Keep the wrapper compatible with the core THD RoPE call contract."""
+        captured_kwargs = {}
+
+        def fake_apply_rotary_pos_emb_thd(t, _cu_seqlens, _freqs, **kwargs):
+            captured_kwargs.update(kwargs)
+            return t
+
+        monkeypatch.setattr(rope_utils, "_apply_rotary_pos_emb_thd", fake_apply_rotary_pos_emb_thd)
+
+        input_tensor = torch.zeros(4, 2, 8, dtype=torch.bfloat16)
+        output = _apply_rope_fp32_no_cp(
+            input_tensor,
+            torch.zeros(4, 1, 1, 8),
+            SimpleNamespace(rotary_interleaved=False, multi_latent_attention=False),
+            cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
+            max_seqlen=4,
+        )
+
+        assert captured_kwargs["max_seqlen"] == 4
+        assert captured_kwargs["cp_group"].size() == 1
+        assert captured_kwargs["cp_group"].rank() == 0
+        assert output.dtype == input_tensor.dtype
 
 
 try:
