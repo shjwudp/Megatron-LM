@@ -16,7 +16,6 @@ from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from ..uneven_dtensor import (
-    copy_chunk_metadata,
     make_uneven_dtensor,
     update_uneven_dtensor_chunk_metadata,
 )
@@ -514,8 +513,8 @@ class ParameterGroup:
                 p.shape,
                 self.mesh,
                 placements,
+                copy_chunk_meta_from=dist_param,
             )
-            copy_chunk_metadata(dist_param, grad_dtensor)
             self.dist_grads.append(grad_dtensor)
 
         self._grad_buffer_is_fresh = True

@@ -346,8 +346,6 @@ class DataParallelBuffer:
             with torch.cuda.stream(stream):
                 if output_buffer.data_ptr() != input_buffer.data_ptr():
                     output_buffer.copy_(input_buffer)
-                if output_buffer.is_cuda:
-                    output_buffer.record_stream(stream)
         else:
             with torch.cuda.stream(stream):
                 torch.distributed.all_gather_into_tensor(
@@ -355,10 +353,6 @@ class DataParallelBuffer:
                     input_tensor=input_buffer,
                     group=group,
                 )
-                if output_buffer.is_cuda:
-                    # Temporary all-gather buckets may be released from another stream before
-                    # the collective finishes; record the producer stream for allocator safety.
-                    output_buffer.record_stream(stream)
 
         setattr(self, "_outer_dirty" if unshard_dim == 0 else "_inner_dirty", False)
 

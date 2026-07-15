@@ -1260,6 +1260,9 @@ class FSDPModule:
                 loss(mb0).backward()   # accumulate, no reduce
             loss(mb1).backward()       # last micro-batch -> reduce fires
         """
+        if not self._fsdp_state._is_root:
+            yield
+            return
         self.set_is_last_backward(False)
         try:
             yield

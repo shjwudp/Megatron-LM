@@ -155,11 +155,10 @@ for module in [self] + prefetch:
     if all(pg.has_unsharded_weight_buffers(bwd_pass=bwd_pass) for pg in module._fsdp_param_groups):
         continue          # Required buffers are already unsharded — skip
 
-    # Caller stream: prepare GPU-resident shards and build ordered actions.
-    # Inner-DP entries may contain a compatible run. Each outer-optim entry
-    # contains one buffer because its inner gather depends on its outer refresh.
+    # Caller stream: group consecutive buffers that have matching outer/inner
+    # process groups, dtype, and device.
     buffer_runs = build_buffer_runs(module, bwd_pass=bwd_pass)
-    for coalesce, dp_group, weight_buffers in buffer_runs:
+    for outer_dp_group, inner_dp_group, weight_buffers in buffer_runs:
         full_buffers = [buffer.fetch_buffer((0, 0)) for buffer in weight_buffers]
 
         # The wait is inserted after allocation/preparation so all caller work
@@ -167,28 +166,27 @@ for module in [self] + prefetch:
         if async_op:
             stream.wait_stream(caller_stream)
 
-        if not coalesce:
-            assert len(weight_buffers) == 1
-            buffer = weight_buffers[0]
-            buffer.unshard(unshard_dim=0, bind_params=False, stream=stream)
-            buffer.unshard(unshard_dim=1, bind_params=False, stream=stream)
-        else:
-            # Side-stream scope contains inner-DP collectives and their Work wait only.
+        def unshard_dimension(group, unshard_dim):
             cm = (
-                _coalescing_manager(dp_group, async_ops=async_op)
+                _coalescing_manager(group, async_ops=async_op)
                 if len(weight_buffers) > 1
+                and torch.distributed.get_world_size(group) > 1
                 else nullcontext()
             )
-            with torch.cuda.stream(stream):
-                with cm as manager:
-                    for buffer in weight_buffers:
-                        buffer.unshard(
-                            unshard_dim=1,
-                            bind_params=False,
-                            stream=stream,
-                        )
-                if async_op and manager is not None:
-                    manager.wait()
+            with cm as coalescing_event:
+                for buffer in weight_buffers:
+                    buffer.unshard(
+                        unshard_dim=unshard_dim,
+                        bind_params=False,
+                        stream=stream,
+                    )
+            if async_op and coalescing_event is not None:
+                coalescing_event.wait()
+
+        with torch.cuda.stream(stream):
+            # Buffer state decides whether either dimension needs a collective.
+            unshard_dimension(outer_dp_group, unshard_dim=0)
+            unshard_dimension(inner_dp_group, unshard_dim=1)
 
         # Caller stream: rebind tensor metadata; do not run TE post-processing yet.
         for buffer, full_buffer in zip(weight_buffers, full_buffers):
@@ -240,15 +238,16 @@ the first captured async unshard.
 `torch.cuda.nvtx` range (`"MFSDP unshard"`, `"MFSDP reshard"`, `"MFSDP reduce_grad"`)
 for profiling visibility in tools like Nsight Systems.
 
-**All-gather coalescing.** `FSDPModule.unshard()` coalesces consecutive inner-DP
-weight-buffer all-gathers that use the same process group, dtype, and device. Each
-`ParameterGroup` still owns its buffers and post-processing, while the module-level loop
-submits communication-compatible inner gathers through one grouped launch. HSDP
-outer-optim buffers deliberately bypass this grouping and retain their existing
-per-buffer `outer AG -> inner AG` dependency. With `async_ops=True`, the coalescing
-manager owns the resulting `Work`; the async path calls `manager.wait()` while
-`ag_stream` is current before recording the communication event, so that event cannot
-run before the backend finishes writing the gathered buffers.
+**All-gather coalescing.** `FSDPModule.unshard()` groups consecutive weight buffers
+that have the same outer-DP group, inner-DP group, dtype, and device. Each run processes
+the outer dimension before the inner dimension, and each dimension uses one grouped
+launch when it contains multiple buffers and its process group has more than one rank.
+Buffer state determines whether a given `unshard()` call actually launches a collective,
+so clean outer-optim buffers and unsharded dimensions remain fast paths. Each
+`ParameterGroup` still owns its buffers and post-processing. With `async_ops=True`,
+the coalescing manager owns the resulting `Work`; the async path calls
+`coalescing_event.wait()` while `ag_stream` is current before advancing to the next
+dimension or recording the module event.
 
 Prefetched modules keep their `bwd_pass` value in `unshard_pending_post`. When their own
 pre-hook later arrives, it skips the already-launched all-gather, waits for its event, and
@@ -875,10 +874,6 @@ fully-synchronized parameters and gradients.
    For networks with many small modules, a size-aware multi-step lookahead
    (analogous to `suggested_AG_prefetch_size` in the old `AllGatherPipeline`) would
    yield better overlap.
-
-2. **Outer-DP coalescing.** HSDP uses the existing `ag_stream` for both stages and
-   preserves the required per-buffer `outer AG -> inner AG` order. Outer-optim buffers
-   are not yet coalesced across buffers; only compatible inner-DP runs are grouped.
 
 ---
 

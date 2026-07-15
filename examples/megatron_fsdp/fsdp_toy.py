@@ -320,7 +320,7 @@ def train(
 
     for epoch in range(args.epochs):
         for _ in range(args.steps_per_epoch):
-            if args.use_megatron_fsdp and hasattr(model, "set_is_last_backward"):
+            if hasattr(model, "set_is_last_backward"):
                 # This toy loop has one micro-batch per optimizer step.
                 model.set_is_last_backward(True)
 

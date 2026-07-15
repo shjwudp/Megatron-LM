@@ -813,10 +813,11 @@ def quantize_main_weights_to_nvfp4(
         te_model_params, te_main_params, te_start_offsets, data_parallel_group, **kwargs
     )
 
-    shard_meta = wbuf.buffer_index.shard_meta
+    inner_shard_meta = wbuf.buffer_index.shard_meta
     wbuf.data.copy_(
         full_weight_buffer[
-            shard_meta.bucket_data_index : shard_meta.bucket_data_index + shard_meta.size
+            inner_shard_meta.bucket_data_index : inner_shard_meta.bucket_data_index
+            + inner_shard_meta.size
         ]
     )
 

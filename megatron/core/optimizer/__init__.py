@@ -1179,13 +1179,18 @@ def get_megatron_optimizer(
     model_chunk_offset = 0
     ddp_config = model_chunks[0].ddp_config  # Use the first model chunk's DDP config
     if ddp_config.use_megatron_fsdp:
+        # For no_shard, gradients are replicated across DP ranks after all-reduce, so grad stats
+        # should only be reduced over TP/PP (model_parallel_group) to avoid inflating the norm.
+        if ddp_config.data_parallel_sharding_strategy == 'no_shard':
+            fsdp_grad_stats_parallel_group = mp_group
         # FSDP v2 already builds dp_cp as the flattened outer x inner HSDP group.
-        if (
+        elif (
             ddp_config.use_megatron_fsdp_v2
             and ddp_config.outer_dp_sharding_strategy == 'optim'
-            and ddp_config.data_parallel_sharding_strategy != 'no_shard'
         ):
-            intra_dist_opt_group = dp_cp_group
+            fsdp_grad_stats_parallel_group = dp_cp_group
+        else:
+            fsdp_grad_stats_parallel_group = intra_dist_opt_group
 
         # Emerging optimizers (e.g. Muon): route matrices -> FullyShardV2Muon and
         # the rest -> Adam, here where the FSDP process groups are in scope.
@@ -1199,17 +1204,10 @@ def get_megatron_optimizer(
                 dp_cp_group=dp_cp_group,
                 dp_cp_group_gloo=intra_dp_cp_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
-                intra_dist_opt_group=intra_dist_opt_group,
+                intra_dist_opt_group=fsdp_grad_stats_parallel_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
             )
-        # For no_shard, gradients are replicated across DP ranks after all-reduce, so grad stats
-        # should only be reduced over TP/PP (model_parallel_group) to avoid inflating the norm.
-        effective_intra_dist_opt_group = (
-            mp_group
-            if ddp_config.data_parallel_sharding_strategy == 'no_shard'
-            else intra_dist_opt_group
-        )
         for model_chunk, overlap_param_gather_with_optimizer_step in zip(
             all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
         ):
@@ -1231,7 +1229,7 @@ def get_megatron_optimizer(
                 data_parallel_group=dp_cp_group,
                 data_parallel_group_gloo=intra_dp_cp_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
-                intra_dist_opt_group=effective_intra_dist_opt_group,
+                intra_dist_opt_group=fsdp_grad_stats_parallel_group,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
             )
