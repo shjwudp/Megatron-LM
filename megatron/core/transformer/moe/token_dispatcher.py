@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import math
+import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -42,6 +44,30 @@ from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 logger = logging.getLogger(__name__)
+
+_HYBRIDEP_CHUNK_SIZE_ENV_VARS = (
+    "NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API",
+    "NUM_OF_TOKENS_PER_CHUNK_COMBINE_API",
+    "NUM_OF_TOKENS_PER_CHUNK_PREPROCESSING_API",
+)
+
+
+def _get_hybridep_token_alignment() -> int:
+    """Return an input-token alignment compatible with configured HybridEP kernels."""
+    alignment = HYBRIDEP_TOKEN_ALIGNMENT
+    for env_var in _HYBRIDEP_CHUNK_SIZE_ENV_VARS:
+        value = os.environ.get(env_var)
+        if value is None:
+            continue
+        try:
+            chunk_size = int(value)
+        except ValueError as exc:
+            raise ValueError(f"{env_var} must be a positive integer, got {value!r}") from exc
+        if chunk_size <= 0:
+            raise ValueError(f"{env_var} must be a positive integer, got {value!r}")
+        alignment = math.lcm(alignment, chunk_size)
+    return alignment
+
 
 """ We use the following notation throughout this file:
      H: hidden size
@@ -1093,7 +1119,8 @@ class _HybridEPManager(_DispatchManager):
                     max_num_tokens_across_ep, op=torch.distributed.ReduceOp.MAX, group=self.group
                 )
                 padded_num_tokens = int(max_num_tokens_across_ep.item())
-            padded_num_tokens += -padded_num_tokens % HYBRIDEP_TOKEN_ALIGNMENT
+            token_alignment = _get_hybridep_token_alignment()
+            padded_num_tokens += -padded_num_tokens % token_alignment
         self._padded_num_tokens = padded_num_tokens
 
         routing_map = routing_map.reshape(num_tokens, self.num_experts)
