@@ -17,7 +17,10 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
-from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher
+from megatron.core.transformer.moe.token_dispatcher import (
+    MoETokenDispatcher,
+    _get_hybridep_token_alignment,
+)
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -83,6 +86,42 @@ def test_set_cudagraph_attr_supports_nested_paths():
     dispatcher.set_cudagraph_attr("_comm_manager.routing_map", routing_map)
 
     assert dispatcher._comm_manager.routing_map is routing_map
+
+
+@pytest.mark.parametrize(
+    "chunk_sizes,expected_alignment",
+    [
+        ({}, 64),
+        ({"NUM_OF_TOKENS_PER_CHUNK_COMBINE_API": "128"}, 128),
+        (
+            {
+                "NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API": "96",
+                "NUM_OF_TOKENS_PER_CHUNK_COMBINE_API": "128",
+                "NUM_OF_TOKENS_PER_CHUNK_PREPROCESSING_API": "192",
+            },
+            384,
+        ),
+    ],
+)
+def test_get_hybridep_token_alignment(monkeypatch, chunk_sizes, expected_alignment):
+    for env_var in (
+        "NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API",
+        "NUM_OF_TOKENS_PER_CHUNK_COMBINE_API",
+        "NUM_OF_TOKENS_PER_CHUNK_PREPROCESSING_API",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+    for env_var, value in chunk_sizes.items():
+        monkeypatch.setenv(env_var, value)
+
+    assert _get_hybridep_token_alignment() == expected_alignment
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-an-int"])
+def test_get_hybridep_token_alignment_rejects_invalid_chunk_size(monkeypatch, value):
+    monkeypatch.setenv("NUM_OF_TOKENS_PER_CHUNK_COMBINE_API", value)
+
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        _get_hybridep_token_alignment()
 
 
 class MoEModelTestContainer:
