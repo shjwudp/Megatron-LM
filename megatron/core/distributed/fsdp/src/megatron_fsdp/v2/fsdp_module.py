@@ -522,7 +522,10 @@ class FSDPModule:
         before DTensor wrapping so every rank shards the same initialized value.
         """
         materialization_device = f"cuda:{torch.cuda.current_device()}"
-        for name, m in self.named_modules():
+        # ``Module.to()`` below is recursive, so materialize children before
+        # their parents. Otherwise a parent that owns a direct meta parameter
+        # tries to move still-meta descendants and raises ``NotImplementedError``.
+        for name, m in reversed(list(self.named_modules())):
             if m in ignored_modules:
                 continue
             # Skip modules that don't have meta parameters

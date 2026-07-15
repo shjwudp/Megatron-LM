@@ -806,6 +806,19 @@ reduces peak memory during model construction.
 
 ---
 
+## Meta-Device Materialization Order
+
+`FSDPModule._materialize_meta_module()` initializes modules in reverse
+`named_modules()` order (leaves before parents). Each module first allocates
+storage for its direct meta parameters and runs its parameter reset hook. The
+subsequent `Module.to()` call is recursive, so all descendants must already be
+materialized before a parent is processed; parent-first traversal otherwise
+attempts to copy a still-meta child tensor and raises `NotImplementedError`.
+
+Nested FSDP modules remain excluded through `ignored_modules`. They are
+materialized by their own earlier `fully_shard()` call and are not reset again
+when an enclosing FSDP unit is initialized.
+
 ## Configuration
 
 ```python

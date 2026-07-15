@@ -170,6 +170,41 @@ class ExpertBlock(nn.Module):
         return self.fc2(torch.relu(self.fc1(x)))
 
 
+class MetaInitOrderLeaf(nn.Module):
+    """Leaf module that records when its meta parameters are initialized."""
+
+    def __init__(self, init_order):
+        super().__init__()
+        self.init_order = init_order
+        self.weight = nn.Parameter(torch.empty(64))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.init_order.append("leaf")
+        nn.init.ones_(self.weight)
+
+    def forward(self, x):
+        return x * self.weight
+
+
+class MetaInitOrderParent(nn.Module):
+    """Parent owning both a direct parameter and a parameterized child."""
+
+    def __init__(self, init_order):
+        super().__init__()
+        self.init_order = init_order
+        self.child = MetaInitOrderLeaf(init_order)
+        self.scale = nn.Parameter(torch.empty(64))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.init_order.append("parent")
+        nn.init.ones_(self.scale)
+
+    def forward(self, x):
+        return self.child(x) * self.scale
+
+
 class MOETransformerLayer(nn.Module):
     """Simulates a transformer layer with MoE: attention → MoE experts.
 
@@ -233,6 +268,18 @@ def _count_fsdp_modules(module):
 
 
 class TestFullyShardBasic:
+    def test_meta_parameters_materialize_leaf_to_parent(self):
+        """Recursive parent moves must only run after child meta materialization."""
+        init_order = []
+        with torch.device("meta"):
+            model = MetaInitOrderParent(init_order)
+        init_order.clear()
+
+        fully_shard(model)
+
+        assert init_order == ["leaf", "parent"]
+        _assert_dtensor_params(model)
+
     def test_module_class_becomes_fsdp(self):
         """fully_shard should dynamically convert the module class to a FSDPModule mixin."""
         torch.manual_seed(42)
