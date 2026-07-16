@@ -281,7 +281,9 @@ def test_trace_prefetches_static_main_grad_before_backward():
     )
     module = SimpleNamespace(
         _fsdp_root_context=SimpleNamespace(cuda_graph_active=False, enable_unshard_prefetch=False),
-        _fsdp_state=SimpleNamespace(_is_root=False, enable_cuda_graph=True),
+        _fsdp_state=SimpleNamespace(
+            _is_root=False, enable_cuda_graph=True, enable_full_iteration_cuda_graph=False
+        ),
         _fsdp_param_groups=(param_group,),
         unshard=lambda **kwargs: unshard_calls.append(kwargs),
     )
