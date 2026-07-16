@@ -239,10 +239,6 @@ class DistributedDataParallelConfig:
       main gradients to parameter dtype for `.grad`.
     """
 
-    use_megatron_fsdp_v2: bool = False
-    """If true, use the `fully_shard` API for FSDP sharding the model.
-    """
-
     megatron_fsdp_prefetch_recompute_forward_weights: bool = False
     """If set to True, Megatron-FSDP prefetches rowwise weights needed by activation
       recomputation during backward before prefetching backward transpose weights.
