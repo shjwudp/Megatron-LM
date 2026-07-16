@@ -415,8 +415,8 @@ def test_cuda_graph_links_adjacent_static_surfaces():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires a GPU")
-def test_cuda_graph_replay_te_fused_wgrad_main_grad():
-    """Overwrite TE fused wgrad with the M-FSDP sharded microbatch policy."""
+def test_cuda_graph_replay_preserves_mfsdp_microbatch_accumulation():
+    """Accumulate two M-FSDP microbatches without static main-grad binding."""
     module = torch.nn.Linear(4, 3, bias=False, device="cuda", dtype=torch.bfloat16)
     main_grad = torch.zeros_like(module.weight, dtype=torch.float32)
     module.weight.__fsdp_param__ = True
