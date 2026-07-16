@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -76,6 +76,7 @@ def test_reduce_grad_skips_aliased_main_grad_copy():
     dist_param = SimpleNamespace(dtype=param.dtype, grad=None)
     param_group = SimpleNamespace(
         requires_grad=True,
+        sharding_strategy="optim_grads_params",
         params=(param,),
         dist_params=(dist_param,),
         dist_grads=(None,),
