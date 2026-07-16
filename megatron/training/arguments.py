@@ -1259,15 +1259,23 @@ def validate_args(args, defaults={}):
         args.use_distributed_optimizer = True
         # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
         args.reuse_grad_buf_for_mxfp8_param_ag = False
-        # Optimizer compatibility check. Megatron-FSDP supports sgd/adam, plus the
-        # single-root distributed Muon (FullyShardV2Muon) on the v2 path only
-        # (the v2 ParameterGroup sets the dist_param back-references it needs).
-        assert args.optimizer in ('sgd', 'adam') or (
-            args.optimizer == 'muon' and getattr(args, 'use_megatron_fsdp_v2', False)
-        ), (
-            f"Megatron-FSDP does not support the {args.optimizer} optimizer "
-            "(muon requires --use-megatron-fsdp-v2)."
-        )
+        if args.moe_single_grouped_weight or args.moe_single_grouped_bias:
+            # Megatron-FSDP currently remaps module parameters through plain Tensor and TE
+            # Float8Tensor/MXFP8Tensor storage paths. TE GroupedTensor parameters need their
+            # grouped backing storage remapped instead; quantized grouped tensors also need
+            # grouped scale/amax handling. DDP has a separate GroupedTensor-aware path.
+            raise ValueError(
+                "Megatron-FSDP does not currently support moe_single_grouped_weight or "
+                "moe_single_grouped_bias. Disable single grouped MoE parameters or use the "
+                "regular DDP/distributed optimizer path until Megatron-FSDP supports TE "
+                "GroupedTensor param buffers."
+            )
+        # Optimizer compatibility check.
+        assert args.optimizer in (
+            'sgd',
+            'adam',
+            *(('muon',) if getattr(args, 'use_megatron_fsdp_v2', False) else ()),
+        ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         if (
             args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]
