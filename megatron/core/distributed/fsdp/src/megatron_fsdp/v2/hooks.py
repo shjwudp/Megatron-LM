@@ -11,8 +11,6 @@ import torch.nn as nn
 from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
-from megatron.core.tensor_parallel.random import is_checkpointing
-
 from .allocator import TracePoolAllocator
 from .cuda_graph_runner import CudaGraphRunner
 from .fsdp_module import FSDPModule, _FSDPState
@@ -33,7 +31,13 @@ def _is_activation_recompute(module: FSDPModule) -> bool:
         return False
     if id(module) == ctx.backward_module:
         return True
-    return torch.is_grad_enabled() and is_checkpointing()
+    try:
+        from megatron.core.tensor_parallel.random import is_checkpointing
+        MCORE_CHECKPOINTING = is_checkpointing()
+    except ImportError:
+        MCORE_CHECKPOINTING = False
+
+    return torch.is_grad_enabled() and MCORE_CHECKPOINTING
 
 
 def _find_fsdp_target(hook_module: nn.Module) -> Optional[FSDPModule]:
