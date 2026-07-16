@@ -180,15 +180,6 @@ def _register_forward_hook(module: FSDPModule):
     module._mfsdp_forward_hook = module.register_forward_hook(mfsdp_post_forward_hook)
 
 
-def _maybe_capture_cuda_graphs(ctx, root_module) -> None:
-    """Trigger batch CUDA graph capture via ``ctx.cuda_graph_runner``."""
-    if ctx.cuda_graph_runner is not None:
-        with torch.enable_grad():
-            ctx.cuda_graph_runner.capture_and_install(
-                root_module, capture_stream=ctx.cuda_graph_stream
-            )
-
-
 # ---------------------------------------------------------------------------
 # Internal: backward hook helpers
 # ---------------------------------------------------------------------------
@@ -327,7 +318,7 @@ def _maybe_capture_cuda_graphs(ctx, root_module) -> None:
         assert allocator.phase == "optimized", (
             f"CUDA graph capture requires allocator phase='optimized', " f"got '{allocator.phase}'"
         )
-        with torch.enable_grad(), torch.cuda.amp.autocast(enabled=False):
+        with torch.enable_grad():
             ctx.cuda_graph_runner.capture_and_install(
                 root_module, capture_stream=ctx.cuda_graph_stream
             )
