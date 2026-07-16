@@ -82,11 +82,11 @@ def test_reduce_grad_skips_aliased_main_grad_copy():
         dist_grads=(None,),
         mp_policy=SimpleNamespace(use_decoupled_grad=False),
         _init_dist_grads=lambda: None,
-        reduce_grad=lambda: reduce_calls.append(True),
+        reduce_grad=lambda **_: reduce_calls.append(True),
         release_grad_buffer=lambda: release_calls.append(True),
     )
     module = SimpleNamespace(
-        _fsdp_root_context=SimpleNamespace(rs_stream=None),
+        _fsdp_root_context=SimpleNamespace(rs_stream=None, is_last_microbatch=True),
         _fsdp_state=SimpleNamespace(enable_cuda_graph=True),
         _named_param_groups=[(("weight",), param_group)],
         _wait_for_previous_async_reduce_grad=lambda: None,
