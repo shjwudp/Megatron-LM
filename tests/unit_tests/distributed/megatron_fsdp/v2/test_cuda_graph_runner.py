@@ -312,26 +312,12 @@ def test_static_grad_context_accumulates_into_main_grad_buffer():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires a GPU")
-@pytest.mark.parametrize(
-    ("overwrite_main_grad", "values", "expected"),
-    [
-        pytest.param(True, (2.0,), 4.0, id="overwrite"),
-        # pytest.param(False, (2.0, 3.0), 10.0, id="accumulate"),
-    ],
-)
-def test_cuda_graph_replay_te_fused_wgrad_main_grad(overwrite_main_grad, values, expected):
-    """Write TE fused wgrad with the M-FSDP microbatch policy.
-    :param overwrite_main_grad: Whether each microbatch replaces main grad.
-    :type overwrite_main_grad: bool
-    :param values: Runtime input values for consecutive microbatches.
-    :type values: Tuple[float, ...]
-    :param expected: Expected final value in every main-grad element.
-    :type expected: float
-    """
+def test_cuda_graph_replay_preserves_mfsdp_microbatch_accumulation():
+    """Accumulate two M-FSDP microbatches without static main-grad binding."""
     module = torch.nn.Linear(4, 3, bias=False, device="cuda")
     main_grad = torch.zeros_like(module.weight)
     module.weight.__fsdp_param__ = True
-    module.weight.overwrite_main_grad = overwrite_main_grad
+    module.weight.overwrite_main_grad = False
     module.weight.get_main_grad = lambda: main_grad
     sample = torch.ones(2, 4, device="cuda")
 
@@ -339,11 +325,11 @@ def test_cuda_graph_replay_te_fused_wgrad_main_grad(overwrite_main_grad, values,
         module, (), sample_kwargs={"input": sample}, num_warmup_iters=1
     )
 
-    for value in values:
+    for value in (2.0, 3.0):
         graphed(input=torch.full_like(sample, value)).sum().backward()
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(module.weight.grad, torch.full_like(module.weight, expected))
+    torch.testing.assert_close(module.weight.grad, torch.full_like(module.weight, 10.0))
     torch.testing.assert_close(main_grad, torch.zeros_like(main_grad))
 
 
@@ -415,13 +401,27 @@ def test_cuda_graph_links_adjacent_static_surfaces():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires a GPU")
-def test_cuda_graph_replay_preserves_mfsdp_microbatch_accumulation():
-    """Accumulate two M-FSDP microbatches without static main-grad binding."""
+@pytest.mark.parametrize(
+    ("overwrite_main_grad", "values", "expected"),
+    [
+        pytest.param(True, (2.0,), 4.0, id="overwrite"),
+        # pytest.param(False, (2.0, 3.0), 10.0, id="accumulate"),
+    ],
+)
+def test_cuda_graph_replay_te_fused_wgrad_main_grad(overwrite_main_grad, values, expected):
+    """Write TE fused wgrad with the M-FSDP microbatch policy.
+    :param overwrite_main_grad: Whether each microbatch replaces main grad.
+    :type overwrite_main_grad: bool
+    :param values: Runtime input values for consecutive microbatches.
+    :type values: Tuple[float, ...]
+    :param expected: Expected final value in every main-grad element.
+    :type expected: float
+    """
     module = torch.nn.Linear(4, 3, bias=False, device="cuda", dtype=torch.bfloat16)
     main_grad = torch.zeros_like(module.weight, dtype=torch.float32)
     module.weight.__fsdp_param__ = True
     module.weight.grad_added_to_main_grad = False
-    module.weight.overwrite_main_grad = True
+    module.weight.overwrite_main_grad = overwrite_main_grad
     module.weight._mfsdp_recorded_te_wgrad = True
     module.weight.get_main_grad = lambda: main_grad
     module.forward = partial(
@@ -442,11 +442,11 @@ def test_cuda_graph_replay_preserves_mfsdp_microbatch_accumulation():
 
     main_grad.zero_()
     module.weight.grad = None
-    for value in (2.0, 3.0):
+    for value in values:
         graphed(input=torch.full_like(sample, value)).sum().backward()
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(main_grad, torch.full_like(main_grad, 6.0))
+    torch.testing.assert_close(main_grad, torch.full_like(main_grad, expected))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires a GPU")
