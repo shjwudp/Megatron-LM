@@ -39,6 +39,7 @@ Single-GPU tests:
 
 import shutil
 import sys
+from abc import ABC
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -57,7 +58,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     preprocess_state_dict_for_uneven_dtensor,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import (
+    _apply_fsdp_mixin,
+    fully_shard,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import mfsdp_forward_pre_hook
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
 
@@ -1363,6 +1367,23 @@ class TestActivationCheckpointing:
 
 
 class TestSafety:
+    def test_fsdp_mixin_fallback_for_abc_module_layout(self):
+        """Fallback mixin order supports ABC/nn.Module layouts like TopKRouter."""
+
+        class ABCRouterLike(ABC, nn.Module):
+            def __init__(self):
+                super().__init__()
+
+        module = ABCRouterLike()
+
+        _apply_fsdp_mixin(module)
+
+        assert isinstance(module, FSDPModule)
+        assert isinstance(module, ABCRouterLike)
+        assert module.__class__.__mro__.index(ABCRouterLike) < module.__class__.__mro__.index(
+            FSDPModule
+        )
+
     def test_double_shard_rejected(self):
         """Calling fully_shard on an already-wrapped module should raise ValueError."""
         torch.manual_seed(42)

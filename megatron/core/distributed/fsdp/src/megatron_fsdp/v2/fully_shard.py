@@ -29,6 +29,36 @@ __all__ = ["FSDPModule", "fully_shard"]
 _fsdp_class_cache = {}  # module-level cache
 
 
+def _apply_fsdp_mixin(module: nn.Module) -> None:
+    """Dynamically add the :class:`FSDPModule` mixin to ``module``.
+
+    The normal MRO keeps ``FSDPModule`` first so its methods take precedence
+    over methods inherited from ``torch.nn.Module``.  Some module classes, e.g.
+    ``TopKRouter`` through its ABC/MegatronModule hierarchy, have a CPython
+    object layout that rejects reassignment to that dynamic subclass.  In that
+    case, use the original class first and append ``FSDPModule`` as a mixin.
+    The fallback preserves the original object layout while keeping
+    ``isinstance(module, FSDPModule)`` true for FSDP runtime discovery.
+    """
+
+    cls = module.__class__
+    new_cls = _fsdp_class_cache.get(cls)
+    if new_cls is not None:
+        module.__class__ = new_cls
+        return
+
+    new_cls = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
+    try:
+        module.__class__ = new_cls
+    except TypeError as exc:
+        if "object layout differs" not in str(exc):
+            raise
+        new_cls = type(f"FSDP{cls.__name__}", (cls, FSDPModule), {})
+        module.__class__ = new_cls
+
+    _fsdp_class_cache[cls] = new_cls
+
+
 def fully_shard(
     module: nn.Module,
     *,
@@ -90,11 +120,7 @@ def fully_shard(
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy()
 
-    cls = module.__class__
-    if cls not in _fsdp_class_cache:
-        _fsdp_class_cache[cls] = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
-    new_cls = _fsdp_class_cache[cls]
-    module.__class__ = new_cls
+    _apply_fsdp_mixin(module)
 
     use_trace_pool = (
         enable_trace_pool
