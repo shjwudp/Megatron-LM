@@ -18,3 +18,16 @@ examples, see [`examples/megatron_fsdp`](../megatron_fsdp/README.md).
 
 Unless an example README says otherwise, run commands from the root of the
 Megatron-LM repository.
+
+## Validated case studies
+
+The example READMEs include reproducible performance and convergence results
+collected on GB200 GPUs at commit `6791bfacb9ed`:
+
+- [`fsdp_toy`](fsdp_toy/README.md#case-study-results) compares PyTorch FSDP2,
+  Megatron-FSDP v2, the v2 CUDA-graph/trace-pool path, and HSDP.
+- [`diffusers_qwenimage`](diffusers_qwenimage/README.md#benchmarks) compares
+  PyTorch FSDP1 with Megatron-FSDP v2 on a pretrained 60-block diffusion
+  transformer and verifies fixed-batch flow-matching convergence.
+- [`qwen3_30b_a3b_mxfp8`](qwen3_30b_a3b_mxfp8/README.md) covers the production
+  Megatron training loop and MXFP8 parameter-gather capability.

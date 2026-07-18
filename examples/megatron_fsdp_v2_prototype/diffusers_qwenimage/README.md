@@ -103,17 +103,75 @@ torchrun --nnodes=$NNODES --node_rank=$NODE_RANK \
 
 ## Benchmarks
 
-`QwenImageTransformer2DModel`, `bs=4`, `512×512`, `bf16`, `torch.compile`, FA2.
-`[mfsdpv2+cg]` uses `--cuda-graph --trace-pool`.
+Fresh results were collected on 2026-07-17 at Megatron-LM commit
+`6791bfacb9ed` (job `20260717-232029-4b48`). All cases ran sequentially on the
+same 4-GPU GB200 node with the pretrained 60-block QwenImage transformer, BF16,
+batch size 4 per rank, 512×512 images, text length 388, full sharding,
+`torch.compile`, and FA2. Results use 3 warmup and 20 measured complete training
+steps. `mfsdpv2+cg` adds `--cuda-graph --trace-pool`.
 
-| Backend | 8×H100 | 4×GB200 |
-|---------|--------|---------|
-| **fsdp1** | 729 ms / 60.2 GB | 679 ms / 75.4 GB |
-| **mfsdpv2** | 769 ms / 59.3 GB | 647 ms / 74.7 GB |
-| **mfsdpv2+cg** | **674 ms** / 68.3 GB | **364 ms** / 88.7 GB |
+| Backend | Average step | Global samples/s | Peak memory |
+| --- | ---: | ---: | ---: |
+| PyTorch FSDP1 | 500.31 ms | 31.98 | 75.39 GB |
+| Megatron-FSDP v2 | 655.13 ms | 24.42 | **74.66 GB** |
+| Megatron-FSDP v2 + CUDA graph + trace pool | **404.57 ms** | **39.55** | 86.70 GB |
 
-CG delivers **11% faster** on H100 and **44% faster** on GB200 at the cost
-of higher peak memory (pool-backed graph buffers).
+The eager Megatron-FSDP v2 path uses 0.73 GB less peak memory than FSDP1 but is
+slower for this workload. CUDA graph capture and trace-pool allocation change
+the result materially: throughput improves by 61.9% over eager Megatron-FSDP
+v2 and by 23.7% over PyTorch FSDP1, at the cost of 11.31 GB more peak memory
+than FSDP1.
+
+### Nsight Systems comparison
+
+The eager result was repeated as two isolated Nsight Systems jobs using the
+same node type and arguments (`--compile`, FA2, 3 warmup steps). The profiler
+was gated by `--cuda_profiler_capture`, so model loading, compilation, and
+warmup are outside the capture; each report contains 3 complete training
+steps. Jobs `20260718-084609-bed6` (FSDP1) and `20260718-085130-1fbf`
+(Megatron-FSDP v2) both completed successfully.
+
+| Profile metric | PyTorch FSDP1 | Megatron-FSDP v2 | v2 - FSDP1 |
+| --- | ---: | ---: | ---: |
+| Profiled step | 714.64 ms | 818.69 ms | +104.05 ms (+14.6%) |
+| Forward NVTX range | 255.45 ms | **243.12 ms** | -12.33 ms |
+| Backward NVTX range | **427.79 ms** | 491.62 ms | +63.84 ms |
+| Optimizer NVTX range | **5.26 ms** | 16.84 ms | +11.58 ms |
+| All-gather GPU time / rank-step | 267.09 ms | **260.72 ms** | -6.37 ms |
+| Reduce-scatter GPU time / rank-step | **190.43 ms** | 360.31 ms | +169.89 ms |
+| `cudaLaunchKernel` calls / rank-step | **1,517** | 2,355 | +55.3% |
+
+The traces confirm that the eager gap is not caused by forward model compute
+or parameter all-gather: v2 is slightly faster in both. The dominant correlate
+is gradient reduction during backward. Both backends issue 61 BF16 ring-LL
+reduce-scatter calls per rank-step, but their aggregate GPU duration is 89.2%
+higher in v2; the v2 backward critical path is consequently 14.9% longer.
+The optimizer adds another 11.58 ms. This identifies reduce-scatter scheduling
+and overlap as the next tuning target, without claiming kernel duration alone
+proves whether the cause is exposure or compute/communication contention.
+
+The raw reports are named `qwenimage-fsdp1.nsys-rep` and
+`qwenimage-mfsdpv2.nsys-rep`; matching `*.stats.txt` files contain the
+`cuda_gpu_kern_sum`, `cuda_api_sum`, and `nvtx_sum` tables. Nsight overhead is
+material, so the 20-step non-profiled table above remains the throughput
+measurement.
+
+### Convergence verification
+
+Job `20260717-233136-efb3` ran 50 measured steps with `--real-data --lr 1e-5`.
+Here `--real-data` means the example's deterministic fixed flow-matching batch
+(`v = x1 - x0`), which is intentionally overfit to verify optimizer and
+gradient correctness; it is not an external image dataset. All cases passed
+the predefined `final_loss < 0.95 * initial_loss` assertion.
+
+| Backend | Initial loss | Final loss | Final / initial | Result |
+| --- | ---: | ---: | ---: | --- |
+| PyTorch FSDP1 | 9.5744 | 4.7141 | 0.492 | Pass |
+| Megatron-FSDP v2 | 9.5747 | 4.7814 | 0.499 | Pass |
+| Megatron-FSDP v2 + CUDA graph + trace pool | 9.5740 | 4.6584 | 0.487 | Pass |
+
+The three final/initial ratios agree within 0.012, providing a convergence
+cross-check in addition to the performance comparison.
 
 ## torch FSDP1 (reference API)
 

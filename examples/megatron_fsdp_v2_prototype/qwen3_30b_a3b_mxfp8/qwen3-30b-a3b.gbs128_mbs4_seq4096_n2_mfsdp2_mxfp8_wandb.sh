@@ -122,7 +122,7 @@ PRETRAIN_ARGS=(
     --moe-token-dispatcher-type alltoall
     --sequence-parallel
     --cross-entropy-loss-fusion
-    --cross-entropy-fusion-impl te
+    --cross-entropy-fusion-impl native
     --wandb-project megatron-fsdp
     --wandb-exp-name ${NAME}
     --wandb-save-dir $OUTPUT_PATH/wandb
