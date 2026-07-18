@@ -663,6 +663,61 @@ class TestFullyShardBasic:
         finally:
             model.reshard()
 
+    def test_outer_optim_refreshes_replica_in_next_forward(self):
+        """The last backward lazily refreshes BF16 HSDP replicas before forward."""
+        torch.manual_seed(42)
+        model = SimpleMLP(16).to(device=_device(), dtype=torch.bfloat16)
+        fully_shard(
+            model,
+            mesh=_build_hsdp_mesh(),
+            sharding_strategy="optim_grads_params",
+            outer_dp_sharding_strategy="optim",
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+        )
+
+        param_group = model._fsdp_param_groups[0]
+        model_buffer = param_group.model_weight_buffer
+        assert param_group.main_weight_buffer is None
+        assert model_buffer.storage_shard_layout == (0, 1)
+        assert not model_buffer._outer_dirty
+
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.25)
+        x = torch.full((2, 16), _rank() + 1, device=_device(), dtype=torch.bfloat16)
+
+        model.set_is_last_backward(False)
+        model(x).float().sum().backward()
+        assert not model._fsdp_root_context.model_weight_refresh_pending
+
+        model.set_is_last_backward(True)
+        model(x).float().sum().backward()
+        model.finish_grad_sync()
+
+        ctx = model._fsdp_root_context
+        assert ctx.model_weight_refresh_pending
+
+        optimizer.step()
+        # No optimizer integration performed an explicit model-weight copy.
+        assert ctx.model_weight_refresh_pending
+        assert not model_buffer._outer_dirty
+
+        # The normal pre-forward hook marks the direct model-weight storage
+        # dirty before unshard, which refreshes the outer replicas exactly once.
+        model(torch.zeros_like(x))
+        assert not ctx.model_weight_refresh_pending
+        assert not model_buffer._outer_dirty
+
+        outer_replicas = [
+            torch.empty_like(model_buffer.data)
+            for _ in range(torch.distributed.get_world_size(model_buffer.outer_dp_group))
+        ]
+        torch.distributed.all_gather(
+            outer_replicas,
+            model_buffer.data,
+            group=model_buffer.outer_dp_group,
+        )
+        assert all(torch.equal(replica, outer_replicas[0]) for replica in outer_replicas[1:])
+
     def test_skipped_prefetch_waits_before_reshard(self, monkeypatch):
         """A skipped prefetched module must join its AG before freeing buffers."""
         torch.manual_seed(42)
