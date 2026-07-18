@@ -141,20 +141,51 @@ steps. Jobs `20260718-084609-bed6` (FSDP1) and `20260718-085130-1fbf`
 | Reduce-scatter GPU time / rank-step | **190.43 ms** | 360.31 ms | +169.89 ms |
 | `cudaLaunchKernel` calls / rank-step | **1,517** | 2,355 | +55.3% |
 
-The traces confirm that the eager gap is not caused by forward model compute
-or parameter all-gather: v2 is slightly faster in both. The dominant correlate
-is gradient reduction during backward. Both backends issue 61 BF16 ring-LL
-reduce-scatter calls per rank-step, but their aggregate GPU duration is 89.2%
-higher in v2; the v2 backward critical path is consequently 14.9% longer.
-The optimizer adds another 11.58 ms. This identifies reduce-scatter scheduling
-and overlap as the next tuning target, without claiming kernel duration alone
-proves whether the cause is exposure or compute/communication contention.
+The reports were exported to SQLite to distinguish NCCL payload time from
+cross-rank arrival skew. Both jobs ran on the same physical node. The apparent
+reduce-scatter regression is primarily **cavitation**, not lower NCCL
+bandwidth:
+
+| Reduce-scatter timeline metric | PyTorch FSDP1 | Megatron-FSDP v2 |
+| --- | ---: | ---: |
+| Calls / rank-step | 61 | 61 |
+| Mean cross-rank start skew / call | 3.868 ms | 6.744 ms |
+| Mean cross-rank finish skew / call | 0.041 ms | 0.021 ms |
+| Mean fastest-rank kernel duration | 0.904 ms | **0.868 ms** |
+| Mean slowest-rank kernel duration | 4.777 ms | 7.596 ms |
+| GPU 3 idle inside the RS phase / step | 89.59 ms | 217.67 ms |
+| GPU 3 gaps over 1 ms / step | 0 | 60.7 |
+
+In v2, ranks 0–2 enter each collective almost together, while rank 3 enters
+6.744 ms later on average. All four ranks then finish within 0.021 ms. The
+early NCCL kernels therefore spend most of their reported 7.6 ms resident and
+waiting for the pacing rank; the last rank performs the actual transfer in
+about 0.87 ms. This is why summing NCCL kernel durations reports 360.31
+ms/rank-step even though the transfer itself is not slower than FSDP1.
+
+The pacing-rank gaps map directly to eager gradient staging. Megatron-FSDP v2
+launches 1,022 BF16 `param.grad`-to-`main_grad` foreach-copy kernels per step
+(23.3 ms of GPU work); FSDP1 has none of this kernel signature. Across the
+three v2 steps, 180 of the 182 GPU-3 gaps longer than 1 ms end at one of those
+copy kernels—exactly 60 per step. Their mean gap is 2.761 ms, matching the
+2.675 ms mean CPU `MFSDP reduce_grad` range on the pacing rank. Ranks 0–2 queue
+the same copies 33–51 ms ahead of GPU execution, but rank 3 queues them only
+0.143 ms ahead, so the per-module Python scan and copy launch become exposed
+and repeatedly drain that GPU's work queue.
+
+The primary optimization target is therefore the eager grad-staging path:
+accumulate directly into `main_grad` (or otherwise avoid the per-parameter
+copies), cache the per-module staging plan instead of rescanning parameters,
+or stage the copies consistently on the reduce-scatter stream. A higher-
+priority communication stream and explicit CPU/NUMA rank binding are useful
+follow-up mitigations, but do not remove the copy/launch work. The strong CUDA
+graph result is consistent with eliminating most of this host launch jitter.
 
 The raw reports are named `qwenimage-fsdp1.nsys-rep` and
-`qwenimage-mfsdpv2.nsys-rep`; matching `*.stats.txt` files contain the
-`cuda_gpu_kern_sum`, `cuda_api_sum`, and `nvtx_sum` tables. Nsight overhead is
-material, so the 20-step non-profiled table above remains the throughput
-measurement.
+`qwenimage-mfsdpv2.nsys-rep`; matching `*.sqlite` exports contain the event
+timelines, and `*.stats.txt` files contain the `cuda_gpu_kern_sum`,
+`cuda_api_sum`, and `nvtx_sum` tables. Nsight overhead is material, so the
+20-step non-profiled table above remains the throughput measurement.
 
 ### Convergence verification
 
