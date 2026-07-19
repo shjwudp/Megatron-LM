@@ -209,6 +209,7 @@ class CudaGraphRunner:
         self._sample_args: Dict[int, Tuple] = {}
         self._sample_kwargs: Dict[int, Dict[str, Any]] = {}
         self._sample_outputs: Dict[int, Any] = {}
+        self._sample_input_shapes: Dict[int, Tuple[Optional[Tuple[int, ...]], ...]] = {}
         self._modules_ordered: List[torch.nn.Module] = []
         self._compiled_module_state = []
 
@@ -235,6 +236,7 @@ class CudaGraphRunner:
         }
         self._sample_args[mid] = tuple()  # all via kwargs
         self._sample_kwargs[mid] = all_kwargs
+        self._sample_input_shapes[mid] = self._input_shapes(args, kwargs)
         self._modules_ordered.append(module)
 
         n_tensor = sum(1 for v in all_kwargs.values() if isinstance(v, torch.Tensor))
@@ -259,6 +261,38 @@ class CudaGraphRunner:
         if self._captured or mid not in self._sample_args or mid in self._sample_outputs:
             return
         self._sample_outputs[mid] = output
+
+    @staticmethod
+    def _input_shapes(
+        args: Tuple, kwargs: Dict[str, Any]
+    ) -> Tuple[Optional[Tuple[int, ...]], ...]:
+        """Flatten input shapes without retaining tensor storage."""
+        leaves, _ = tree_flatten((args, kwargs))
+        return tuple(
+            tuple(value.shape) if isinstance(value, torch.Tensor) else None for value in leaves
+        )
+
+    def validate_module_input_shapes(
+        self, module: torch.nn.Module, args: Tuple, kwargs: Dict[str, Any]
+    ) -> None:
+        """Reject variable input shapes before CUDA graph replay."""
+        expected_shapes = self._sample_input_shapes[id(module)]
+        actual_shapes = self._input_shapes(args, kwargs)
+        if actual_shapes == expected_shapes:
+            return
+
+        changed = [
+            f"leaf {index}: expected {expected}, got {actual}"
+            for index, (expected, actual) in enumerate(zip(expected_shapes, actual_shapes))
+            if expected != actual
+        ]
+        if len(expected_shapes) != len(actual_shapes):
+            changed.append(f"leaf count: expected {len(expected_shapes)}, got {len(actual_shapes)}")
+        module_name = getattr(module, "_fsdp_module_name", module.__class__.__name__)
+        raise RuntimeError(
+            f"M-FSDP CUDA graph input shape mismatch for module '{module_name}': "
+            + "; ".join(changed)
+        )
 
     def capture_and_install(
         self, root_module: torch.nn.Module, capture_stream: Optional[torch.cuda.Stream] = None

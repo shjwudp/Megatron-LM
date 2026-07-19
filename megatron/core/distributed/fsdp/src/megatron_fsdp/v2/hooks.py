@@ -86,6 +86,16 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
     assert not ctx.cuda_graph_active, "hooks must not fire during CUDA graph capture"
     is_recompute = _is_activation_recompute(target)
 
+    # Reject variable input shapes before graph replay. Otherwise the failure
+    # can surface asynchronously as an unrelated cuBLAS or illegal-memory error.
+    if (
+        isinstance(hook_module, FSDPModule)
+        and target._fsdp_state.enable_cuda_graph
+        and getattr(target, "_fsdp_cg_installed", False)
+        and ctx.cuda_graph_runner is not None
+    ):
+        ctx.cuda_graph_runner.validate_module_input_shapes(target, args, kwargs)
+
     # ---- root: forward-phase setup (once per micro-batch) ------------------
     if target._fsdp_state._is_root and not is_recompute:
         # A plain torch optimizer clears ``dist_param.grad`` without entering

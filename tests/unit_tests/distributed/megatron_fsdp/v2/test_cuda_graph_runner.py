@@ -206,6 +206,20 @@ def test_module_compile_is_normalized_when_first_forward_is_recorded():
     assert len(runner._compiled_module_state) == 1
 
 
+def test_cuda_graph_runner_validates_replay_input_shapes():
+    """Accept new storage with the captured shape and reject variable shapes."""
+    module = torch.nn.Linear(4, 4)
+    module._fsdp_module_name = "decoder.layers.0.self_attention"
+    runner = CudaGraphRunner(graph_pool=None)
+    runner.record_module(module, (torch.ones(2, 4),), {})
+
+    runner.validate_module_input_shapes(module, (torch.zeros(2, 4),), {})
+
+    with pytest.raises(RuntimeError, match="decoder.layers.0.self_attention") as error:
+        runner.validate_module_input_shapes(module, (torch.zeros(3, 4),), {})
+    assert "leaf 0: expected (2, 4), got (3, 4)" in str(error.value)
+
+
 def test_parameter_surface_refresh_uses_current_registered_parameters():
     """Use parameters installed by a capture-time replacement hook."""
     module = torch.nn.Linear(2, 2)
