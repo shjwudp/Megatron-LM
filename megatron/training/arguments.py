@@ -1293,10 +1293,6 @@ def validate_args(args, defaults={}):
             args.ckpt_format == "fsdp_dtensor"
         ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
 
-        assert (
-            args.ckpt_format == "fsdp_dtensor"
-        ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
-
         if args.megatron_fsdp_prefetch_recompute_forward_weights:
             assert args.data_parallel_sharding_strategy == "optim_grads_params", (
                 "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
