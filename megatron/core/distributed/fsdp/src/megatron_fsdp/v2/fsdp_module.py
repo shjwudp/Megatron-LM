@@ -193,8 +193,8 @@ class _FSDPRootContext:
     """Whether hooks should manage the side stream for CUDA graph capture."""
 
     cuda_graph_stream: Optional[torch.cuda.Stream] = None
-    """Side stream for CUDA graph capture/replay.  Created lazily on the
-    first forward pre-hook and shared across all FSDP modules."""
+    """Side stream for CUDA graph capture/replay. Created when the root FSDP
+    context is initialized and shared across all FSDP modules."""
 
     cuda_graph_active: bool = False
     """True while ``make_graphed_callables`` is inside its capture
@@ -698,6 +698,8 @@ class FSDPModule:
 
         if any(module._fsdp_state.enable_cuda_graph for module in forward_order):
             root_context.enable_cuda_graph = True
+            root_context.cuda_graph_stream = torch.cuda.Stream()
+            root_context.cuda_graph_pool = torch.cuda.graph_pool_handle()
 
     def unshard(
         self,
