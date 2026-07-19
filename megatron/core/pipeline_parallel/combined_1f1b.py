@@ -6,9 +6,7 @@ from typing import List, Union
 
 import torch
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
-    get_megatron_fsdp_overlap_adapter,
-)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
@@ -67,10 +65,13 @@ def combined_1f1b_schedule_for_no_pipelining(
     """
 
     set_streams(high_priority=config.high_priority_a2a_comm_stream)
+    fsdp_wrapper = find_megatron_fsdp(model)
 
-    fsdp_wrapper = get_megatron_fsdp_overlap_adapter(model)
     if fsdp_wrapper is not None:
-        fsdp_wrapper.prepare_forward_schedule()
+        # The overlap schedule bypasses MegatronFSDP.forward(), which normally
+        # swaps distributed (optimizer-managed) parameters back to raw parameters.
+        # We must do this explicitly before the schedule accesses layers directly.
+        fsdp_wrapper._replace_param_with_raw_if_needed()
 
     # The forward step for the first microbatch is executed alone, no a2a overlapping
     output_tensor, num_tokens, _ = combined_forward_backward_step(
@@ -89,7 +90,6 @@ def combined_1f1b_schedule_for_no_pipelining(
         checkpoint_activations_microbatch=None,
         is_first_microbatch=check_first_val_step(True),
         current_microbatch=0,
-        fsdp_wrapper=fsdp_wrapper,
     )
     # The forward step is executed in parallel with the backward step of another microbatch
     # EP A2A in forward step is hidden by the attention/mlp computation in the backward step
@@ -202,10 +202,12 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
 
     set_streams(high_priority=config.high_priority_a2a_comm_stream)
 
-    # Interleaved pipeline with FSDP(optim_grads_params) is not yet supported.
+    # Interleaved pipeline with FSDP(optim_grads_params) is not yet supported:
+    # _replace_param_with_raw_if_needed() and root pre/post_backward() are not
+    # handled for multi-chunk models in this path.
     if isinstance(model, (list, tuple)):
         for m in model:
-            assert get_megatron_fsdp_overlap_adapter(m) is None, (
+            assert find_megatron_fsdp(m) is None, (
                 "EP overlap 1F1B with FSDP is not supported for interleaved "
                 "pipeline parallelism (virtual_pipeline_model_parallel_size > 1). "
                 "Use pipeline_model_parallel_size=1 or disable FSDP."
@@ -396,15 +398,20 @@ def combined_forward_backward_step(
         # schedule bypasses normal FSDP forward/backward hooks, so we release
         # each layer's all-gathered parameters explicitly after its compute.
         # Only needed for optim_grads_params strategy (where params are sharded).
-        forward_fsdp_wrapper = get_megatron_fsdp_overlap_adapter(f_model)
+        forward_fsdp_wrapper = find_megatron_fsdp(f_model)
         if (
             forward_fsdp_wrapper is not None
-            and forward_fsdp_wrapper.data_parallel_sharding_strategy == "optim_grads_params"
+            and forward_fsdp_wrapper.ddp_config.data_parallel_sharding_strategy
+            == "optim_grads_params"
         ):
-            post_fwd, post_bwd = forward_fsdp_wrapper.get_reshard_hooks()
             for i in range(f_schedule_plan.num_layers()):
                 layer_plan = f_schedule_plan.get_layer(i)
-                layer_plan.set_fsdp_reshard_hooks(post_fwd, post_bwd)
+                # Wire explicit FSDP reshard hooks for the EP-overlap schedule,
+                # which bypasses the normal TransformerLayer-level FSDP hooks.
+                layer_plan.set_fsdp_reshard_hooks(
+                    forward_fsdp_wrapper.post_forward_release_module,
+                    forward_fsdp_wrapper.post_backward_release_module,
+                )
 
     # backward preprocess, the same as the backward_step()
     unwrap_input_tensor_grad = False
