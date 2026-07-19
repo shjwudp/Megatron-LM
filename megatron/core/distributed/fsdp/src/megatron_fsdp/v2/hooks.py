@@ -109,13 +109,10 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
         if ctx.model_weight_refresh_pending:
             target._copy_main_weights_to_model_weights()
         if ctx.enable_cuda_graph and ctx.cuda_graph_stream is None:
-            producer_stream = torch.cuda.current_stream()
             ctx.cuda_graph_stream = torch.cuda.Stream()
-            # Model inputs and initialization work may still be in flight on
-            # the caller's stream. Preserve that dependency before moving the
-            # first trace micro-batch onto the dedicated graph stream.
-            ctx.cuda_graph_stream.wait_stream(producer_stream)
-            torch.cuda.set_stream(ctx.cuda_graph_stream)
+            # capture_and_install() receives this stream explicitly. Keep the
+            # eager trace pass on its caller stream so uncaptured operations
+            # retain their normal stream-ordering guarantees.
             ctx.cuda_graph_pool = torch.cuda.graph_pool_handle()
         ctx.forward_phase = True
         ctx.backward_phase = False
