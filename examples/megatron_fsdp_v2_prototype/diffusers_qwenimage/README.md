@@ -69,6 +69,21 @@ torchrun --nproc_per_node=4 test_qwenimage.py \
   --attention flash --compile --bench_steps 20 --warmup_steps 3
 ```
 
+### Megatron-FSDP v2 with CUDA graphs
+
+CUDA graphs are available only with the `mfsdpv2` backend. Enabling CUDA
+graphs automatically selects `TracePoolAllocator`; `--trace-pool` is therefore
+not required in the CUDA-graph command.
+
+```bash
+torchrun --nproc_per_node=4 test_qwenimage.py \
+  --backend mfsdpv2 --sharding full \
+  --pretrained_model_name_or_path /tmp/qwen-image \
+  --num_gpus_per_node 4 --batch_size 4 --height 512 --width 512 \
+  --attention flash --compile --cuda-graph \
+  --bench_steps 20 --warmup_steps 3 --real-data
+```
+
 ### Single node, 8 GPU (hybrid shard)
 
 ```bash
@@ -101,19 +116,53 @@ torchrun --nnodes=$NNODES --node_rank=$NODE_RANK \
   --attention _flash_3 --compile --bench_steps 20 --warmup_steps 3
 ```
 
-## Benchmarks
+## Benchmark results
 
-`QwenImageTransformer2DModel`, `bs=4`, `512×512`, `bf16`, `torch.compile`, FA2.
-`[mfsdpv2+cg]` uses `--cuda-graph --trace-pool`.
+The following comparison uses one reproducible configuration for all cases. It
+was measured at merged `mfsdp_refactor` commit `31334f8807d6`, including the
+lazy gradient-storage, trace-pool gradient-lifetime, and gradient-DTensor
+wrapper-reuse fixes.
 
-| Backend | 8×H100 | 4×GB200 |
-|---------|--------|---------|
-| **fsdp1** | 729 ms / 60.2 GB | 679 ms / 75.4 GB |
-| **mfsdpv2** | 769 ms / 59.3 GB | 647 ms / 74.7 GB |
-| **mfsdpv2+cg** | **674 ms** / 68.3 GB | **364 ms** / 88.7 GB |
+| Setting | Value |
+| --- | --- |
+| Hardware | 4×GB200 |
+| Model | Pretrained 60-block `QwenImageTransformer2DModel` |
+| Data | Real-data training path |
+| Sharding | Full shard |
+| Per-rank batch size | 4 |
+| Image size | 512×512 |
+| Precision and attention | BF16, FlashAttention 2 |
+| Compilation | Per-block `torch.compile` |
+| Measurement | 3 warmup steps + 20 measured steps |
 
-CG delivers **11% faster** on H100 and **44% faster** on GB200 at the cost
-of higher peak memory (pool-backed graph buffers).
+### Eager performance and convergence
+
+| Backend | Average step | Median step | Peak memory | Final / initial loss |
+| --- | ---: | ---: | ---: | ---: |
+| PyTorch FSDP1 | 516.03 ms | **491.23 ms** | 75.39 GB | 0.642 |
+| Megatron-FSDP v2 | 505.89 ms | 506.46 ms | **74.67 GB** | 0.634 |
+| Megatron-FSDP v2 + CUDA graph | **385.89 ms** | **385.53 ms** | 86.72 GB | 0.641 |
+
+All three runs pass the 20-step convergence threshold of 0.7. Eager v2 is 1.96%
+faster than FSDP1 by average step because FSDP1 contains one 824.48 ms tail,
+while FSDP1 is 3.10% faster by median step. Eager v2 uses 0.72 GB less peak
+memory. Compared with eager v2, CUDA graph improves average step time by 23.72%
+and median step time by 23.88%, while increasing peak memory by 12.05 GB.
+
+The eager v2 result no longer contains the approximately 0.9-second rank-local
+stalls seen before gradient-DTensor wrapper reuse. The memory result confirms
+that wrapper caching does not retain the released flat gradient storage.
+
+### CUDA graph validation
+
+CUDA graph capture succeeds for all 60 transformer blocks. `TracePoolAllocator`
+plans six slots containing 3,318.4 MB of elements, and the run completes all 20
+measured iterations without a slot collision. Capture increases peak allocated
+memory from 74.67 GB in eager v2 to 86.72 GB.
+
+The `--cuda-graph` option selects `TracePoolAllocator` internally. The explicit
+`--trace-pool` used for this measurement documents that allocator choice but
+does not select a different execution path.
 
 ## torch FSDP1 (reference API)
 
