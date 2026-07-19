@@ -87,3 +87,4 @@ execution pattern.
 | `param_group.py` | Preserves optimizer-facing gradient storage and zeroes it in place. |
 | `fsdp_module.py` | Releases transient buffers while keeping graph-visible gradient objects stable. |
 | `training.py` | Wraps the forward/backward function with `FullCudaGraphWrapper`. |
+| `tests/unit_tests/distributed/megatron_fsdp/v2/test_full_cuda_graph_integration.py` | Covers v2 model detection and eager forward-only execution. |
