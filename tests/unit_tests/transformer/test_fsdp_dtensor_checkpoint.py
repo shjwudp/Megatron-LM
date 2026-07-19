@@ -33,7 +33,9 @@ import re
 import pytest
 import torch
 
+from megatron.core.distributed.fsdp import checkpoint as mfsdp_v2_checkpoint
 from megatron.core.distributed.fsdp.checkpoint import _detect_gdn_layers
+from megatron.core.distributed.fsdp.checkpoint import _get_expert_index_from_key as _v2_expert_idx
 from megatron.core.distributed.fsdp.checkpoint import _match_gdn_key as _match_gdn_key_v2
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     get_mcore_tensor_parallel_partition_dim,
@@ -79,6 +81,49 @@ class TestGetExpertIndexFromKey:
     def test_embedding_key_returns_none(self):
         key = "embedding.word_embeddings.weight"
         assert get_expert_index_from_key(key) is None
+
+
+class TestMegatronFSDPV2ExpertKeyRemap:
+    """Regression coverage for v2 expert-key remapping after SwiGLU splitting."""
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "decoder.layers.0.mlp.experts.linear_fc1.weight3",
+            "decoder.layers.0.mlp.experts.linear_fc1.weight3_w",
+            "decoder.layers.0.mlp.experts.linear_fc1.weight3_v",
+            "decoder.layers.0.mlp.experts.linear_fc1.bias3_w",
+            "decoder.layers.0.mlp.experts.linear_fc2.weight3",
+            "decoder.layers.0.mlp.experts.local_experts.3.linear_fc1.weight",
+        ],
+    )
+    def test_v2_get_expert_index_handles_swiglu_split_keys(self, key):
+        assert _v2_expert_idx(key) == 3
+
+    def test_v2_handle_experts_remaps_swiglu_split_grouped_keys(self, monkeypatch):
+        monkeypatch.setattr(
+            mfsdp_v2_checkpoint.mpu, "get_expert_model_parallel_world_size", lambda: 2
+        )
+        monkeypatch.setattr(
+            mfsdp_v2_checkpoint.mpu, "get_expert_model_parallel_rank", lambda: 1
+        )
+        state_dict = {
+            "decoder.layers.0.mlp.experts.linear_fc1.weight0_w": "w",
+            "decoder.layers.0.mlp.experts.linear_fc1.weight0_v": "v",
+            "decoder.layers.0.mlp.experts.linear_fc1.bias0_w": "bw",
+            "decoder.layers.0.mlp.experts.linear_fc2.weight0": "fc2",
+            "decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.weight": "seq",
+        }
+
+        remapped = mfsdp_v2_checkpoint.handle_experts_in_state_dict(state_dict, num_experts=8)
+
+        assert remapped == {
+            "decoder.layers.0.mlp.experts.linear_fc1.weight4_w": "w",
+            "decoder.layers.0.mlp.experts.linear_fc1.weight4_v": "v",
+            "decoder.layers.0.mlp.experts.linear_fc1.bias4_w": "bw",
+            "decoder.layers.0.mlp.experts.linear_fc2.weight4": "fc2",
+            "decoder.layers.0.mlp.experts.local_experts.4.linear_fc1.weight": "seq",
+        }
 
 
 # ============================================================================

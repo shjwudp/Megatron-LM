@@ -39,8 +39,10 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 
 import megatron.core.parallel_state as mpu
 from megatron.core import dist_checkpointing
-from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import copy_chunk_metadata
-from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import get_chunk_meta_source
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    copy_chunk_metadata,
+    get_chunk_meta_source,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     get_state_dict as _get_state_dict,
 )
@@ -174,13 +176,21 @@ def handle_experts_in_state_dict(model_state_dict: dict, num_experts: int) -> di
                 key, expert_index, local_expert_start, ep_rank,
             )
         # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
-        if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
+        if 'mlp.experts.linear_fc1.' in key or 'mlp.experts.linear_fc2.' in key:
             if key.endswith('_w') or key.endswith('_v'):
-                new_key = key.replace(
-                    f'weight{expert_index}{key[-2:]}', f'weight{new_idx}{key[-2:]}'
-                )
+                suffix = key[-2:]
+                new_key = key
+                for param_name in ("weight", "bias"):
+                    new_key = new_key.replace(
+                        f'{param_name}{expert_index}{suffix}',
+                        f'{param_name}{new_idx}{suffix}',
+                    )
             else:
-                new_key = key.replace(f'weight{expert_index}', f'weight{new_idx}')
+                new_key = key
+                for param_name in ("weight", "bias"):
+                    new_key = new_key.replace(
+                        f'{param_name}{expert_index}', f'{param_name}{new_idx}'
+                    )
         # SequentialMLP: index is between 'local_experts.' and next '.'
         elif 'mlp.experts.local_experts' in key:
             new_key = key.replace(f'local_experts.{expert_index}.', f'local_experts.{new_idx}.')
@@ -198,10 +208,23 @@ def handle_experts_in_state_dict(model_state_dict: dict, num_experts: int) -> di
 
 
 def _get_expert_index_from_key(key: str):
-    """Extract expert index from key (``weight{N}`` or ``local_experts.N.``)."""
-    m = re.search(r'(?:weight(\d+)$)|(?:local_experts\.(\d+)\.)', key)
-    if m:
-        return int(m.group(1) or m.group(2))
+    """Extract expert index from grouped or sequential MoE parameter keys."""
+    if any(
+        token in key
+        for token in (
+            'mlp.experts.linear_fc1.weight',
+            'mlp.experts.linear_fc1.bias',
+            'mlp.experts.linear_fc2.weight',
+            'mlp.experts.linear_fc2.bias',
+        )
+    ):
+        m = re.search(r'^.*\.mlp\.experts\.linear_fc\d\.(?:weight|bias)(\d+)(?:_[wv])?$', key)
+        if m:
+            return int(m.group(1))
+    if 'mlp.experts.local_experts' in key:
+        m = re.search(r'^.*\.mlp\.experts\.local_experts\.(\d+)\.', key)
+        if m:
+            return int(m.group(1))
     return None
 
 
