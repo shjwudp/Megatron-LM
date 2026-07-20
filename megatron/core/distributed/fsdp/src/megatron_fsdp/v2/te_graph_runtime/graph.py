@@ -908,6 +908,8 @@ def _make_graphed_callables(
     # For cases with multiple active RNG states, e.g. TP.
     if graph_safe_rng_available():
         for _, state in get_all_rng_states().items():
+            if torch.is_tensor(state):
+                continue
             for fwd_graph, bwd_graph, bwd_dw_graph in zip(fwd_graphs, bwd_graphs, bwd_dw_graphs):
                 fwd_graph.register_generator_state(state)
                 bwd_graph.register_generator_state(state)
@@ -2136,11 +2138,21 @@ def make_graphed_callables(
 
     # Save RNG state.
     if graph_safe_rng_available():
-        generators = [
+        rng_state_targets = [
             torch.cuda.default_generators[torch.cuda.current_device()],
             *get_all_rng_states().values(),
         ]
-        original_rng_states = [state.get_state() for state in generators]
+        original_rng_states = []
+        for state in rng_state_targets:
+            if hasattr(state, "get_state"):
+                original_rng_states.append(state.get_state())
+            elif torch.is_tensor(state):
+                original_rng_states.append(state.clone())
+            else:
+                raise TypeError(
+                    "Expected a CUDA RNG generator state object or Tensor state buffer, "
+                    f"but got {type(state).__name__}."
+                )
     else:
         original_rng_states = torch.cuda.get_rng_state()
 
@@ -2166,8 +2178,16 @@ def make_graphed_callables(
 
     # Ensures warmup does not affect numerics for ops such as dropout.
     if graph_safe_rng_available():
-        for gen, state in zip(generators, original_rng_states):
-            gen.set_state(state)
+        for target, state in zip(rng_state_targets, original_rng_states):
+            if hasattr(target, "set_state"):
+                target.set_state(state)
+            elif torch.is_tensor(target):
+                target.copy_(state)
+            else:
+                raise TypeError(
+                    "Expected a CUDA RNG generator state object or Tensor state buffer, "
+                    f"but got {type(target).__name__}."
+                )
     else:
         torch.cuda.set_rng_state(original_rng_states)
 
