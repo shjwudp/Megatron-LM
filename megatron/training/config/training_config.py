@@ -612,7 +612,18 @@ class CheckpointConfig:
     When True (default), each tensor shard is checked to be accessed exactly once as main
     replica by some rank. Disabling skips this validation"""
 
-    strict_fsdp_dtensor_load: bool = True
+    strict_fsdp_dtensor_load: bool = field(
+        default=True,
+        metadata={
+            "argparse_meta": {
+                "arg_names": [
+                    "--no-strict-fsdp-dtensor-load",
+                    "--disable-strict-fsdp-dtensor-load",
+                ],
+                "dest": "strict_fsdp_dtensor_load",
+            }
+        },
+    )
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
 
     dist_ckpt_strictness: Literal[
