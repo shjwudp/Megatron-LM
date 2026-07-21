@@ -130,6 +130,7 @@ class _MegatronFSDP2DDPConfigProxy:
 
     @property
     def data_parallel_sharding_strategy(self):
+        """Return the first v2 parameter group's sharding strategy."""
         for module in self.root_module.modules():
             if hasattr(module, '_fsdp_param_groups'):
                 for param_group in module._fsdp_param_groups:
@@ -154,6 +155,7 @@ class _MegatronFSDP2CompatProxy:
         """No-op: v2 parameters are installed by its fine-grained hooks."""
 
     def pre_backward(self):
+        """Run the v2 pre-backward setup expected by the overlap schedule."""
         from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
             mfsdp_pre_backward_setup,
         )
@@ -161,6 +163,7 @@ class _MegatronFSDP2CompatProxy:
         mfsdp_pre_backward_setup(self.root_module, skip_final_callback=True)
 
     def post_backward(self):
+        """Run the v2 post-backward callback expected by the overlap schedule."""
         from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
             mfsdp_post_backward_final_callback,
         )
@@ -168,6 +171,7 @@ class _MegatronFSDP2CompatProxy:
         mfsdp_post_backward_final_callback(self.root_module)
 
     def post_forward_release_module(self, module, *unused):
+        """Release a module through the v2 post-forward hook."""
         from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
             mfsdp_post_forward_hook,
         )
@@ -175,6 +179,7 @@ class _MegatronFSDP2CompatProxy:
         return mfsdp_post_forward_hook(module, *unused)
 
     def post_backward_release_module(self, module, *unused):
+        """Release a module through the v2 post-backward hook."""
         from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
             mfsdp_post_backward_hook,
         )
