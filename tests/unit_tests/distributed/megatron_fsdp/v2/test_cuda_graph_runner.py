@@ -37,9 +37,157 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.te_graph_runtime.graph 
     _refresh_module_parameter_surface,
     _returned_param_grad_clone_slots,
     _static_grad_context_wrapper,
+    cuda_graph_checkpoint_context_fn,
+    cuda_graph_checkpoint_phase,
+    current_cuda_graph_checkpoint_phase,
+    current_cuda_graph_checkpoint_region,
     make_graphed_callables,
+    resolve_replay_phase,
+    wrap_cuda_graph_checkpoint,
 )
 from megatron.core.tensor_parallel.layers import linear_with_grad_accumulation_and_async_allreduce
+
+
+def test_cuda_graph_checkpoint_context_marks_and_restores_phases():
+    """Expose explicit non-reentrant phases without leaking context state."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    assert current_cuda_graph_checkpoint_phase() is None
+    assert current_cuda_graph_checkpoint_region() is None
+    forward_context, recompute_context = cuda_graph_checkpoint_context_fn()
+    assert isinstance(forward_context, TorchDispatchMode)
+    assert isinstance(recompute_context, TorchDispatchMode)
+    assert type(forward_context).ignore_compile_internals()
+    with forward_context:
+        assert current_cuda_graph_checkpoint_phase() == "forward"
+        forward_region = current_cuda_graph_checkpoint_region()
+        assert forward_region is not None
+    with recompute_context:
+        assert current_cuda_graph_checkpoint_phase() == "recompute"
+        assert current_cuda_graph_checkpoint_region() is forward_region
+    assert current_cuda_graph_checkpoint_phase() is None
+    assert current_cuda_graph_checkpoint_region() is None
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_phase", "grad_enabled", "expected"),
+    [
+        ("forward", True, "forward"),
+        ("recompute", True, "recompute"),
+        (None, True, "forward"),
+        (None, False, "inference"),
+    ],
+)
+def test_resolve_replay_phase_does_not_guess_recompute(checkpoint_phase, grad_enabled, expected):
+    """Resolve explicit phases without inferring recompute from pending state."""
+    assert resolve_replay_phase(checkpoint_phase, grad_enabled) == expected
+
+
+def test_cuda_graph_checkpoint_phase_requires_region_token():
+    """Reject a public phase marker that cannot pair forward and recompute."""
+    with pytest.raises(ValueError, match="region token"):
+        with cuda_graph_checkpoint_phase("forward", None):
+            pass
+
+
+@pytest.mark.parametrize("use_reentrant", [True, False])
+def test_cuda_graph_checkpoint_wrapper_marks_recompute(use_reentrant):
+    """Mark original forward and recompute for both checkpoint variants.
+
+    :param use_reentrant: Whether checkpointing uses reentrant autograd.
+    :type use_reentrant: bool
+    """
+    phases = []
+    regions = []
+
+    def function(value):
+        """Record the phase at the checkpoint boundary."""
+        phases.append(current_cuda_graph_checkpoint_phase())
+        regions.append(current_cuda_graph_checkpoint_region())
+        return value.sin().square()
+
+    checkpoint_fn = wrap_cuda_graph_checkpoint(
+        partial(torch.utils.checkpoint.checkpoint, use_reentrant=use_reentrant)
+    )
+    value = torch.randn(4, requires_grad=True)
+    checkpoint_fn(function, value).sum().backward()
+
+    assert phases == ["forward", "recompute"]
+    assert regions[0] is regions[1]
+    assert regions[0] is not None
+    assert current_cuda_graph_checkpoint_phase() is None
+    assert current_cuda_graph_checkpoint_region() is None
+
+
+@pytest.mark.parametrize("use_reentrant", [True, False])
+def test_cuda_graph_checkpoint_wrapper_keeps_outer_no_grad_unmarked(use_reentrant):
+    """Keep no-grad evaluation outside the checkpoint phase state.
+
+    :param use_reentrant: Whether checkpointing uses reentrant autograd.
+    :type use_reentrant: bool
+    """
+    phases = []
+    regions = []
+
+    def function(value):
+        """Record marker state inside the checkpoint body."""
+        phases.append(current_cuda_graph_checkpoint_phase())
+        regions.append(current_cuda_graph_checkpoint_region())
+        return value.sin()
+
+    checkpoint_fn = wrap_cuda_graph_checkpoint(
+        partial(torch.utils.checkpoint.checkpoint, use_reentrant=use_reentrant)
+    )
+    with torch.no_grad():
+        output = checkpoint_fn(function, torch.randn(4))
+
+    assert output.grad_fn is None
+    assert phases == [None]
+    assert regions == [None]
+
+
+def test_cuda_graph_checkpoint_wrapper_assigns_distinct_regions():
+    """Assign a distinct region token to each checkpoint invocation."""
+    regions = []
+
+    def function(value):
+        """Record each checkpoint invocation token."""
+        regions.append(current_cuda_graph_checkpoint_region())
+        return value.sin().square()
+
+    checkpoint_fn = wrap_cuda_graph_checkpoint(
+        partial(torch.utils.checkpoint.checkpoint, use_reentrant=True)
+    )
+    first = torch.randn(4, requires_grad=True)
+    second = torch.randn(4, requires_grad=True)
+    (checkpoint_fn(function, first) + checkpoint_fn(function, second)).sum().backward()
+
+    assert regions[0] is not regions[1]
+    assert regions[0] is regions[3]
+    assert regions[1] is regions[2]
+
+
+def test_cuda_graph_checkpoint_wrapper_runs_under_torch_compile():
+    """Keep non-reentrant checkpoint contexts valid under torch.compile."""
+    checkpoint_fn = wrap_cuda_graph_checkpoint(
+        partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
+    )
+
+    def body(value):
+        """Run the operation checkpointed by the compiled function."""
+        return value.sin().square()
+
+    def run(value):
+        """Invoke the phase-aware checkpoint wrapper."""
+        return checkpoint_fn(body, value)
+
+    value = torch.randn(8, requires_grad=True)
+    expected_value = value.detach().clone().requires_grad_()
+    compiled = torch.compile(run, backend="eager", fullgraph=True)
+    compiled(value).sum().backward()
+    body(expected_value).sum().backward()
+
+    torch.testing.assert_close(value.grad, expected_value.grad)
 
 
 def test_capture_backward_post_hook_clears_only_unsharded_parameter_grads():

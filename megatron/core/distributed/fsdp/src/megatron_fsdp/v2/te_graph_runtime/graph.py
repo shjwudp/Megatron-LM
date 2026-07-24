@@ -11,7 +11,10 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
+import functools
 import gc
+import inspect
 import warnings
 from collections.abc import Iterable, Sequence
 from math import ceil, prod
@@ -25,7 +28,12 @@ __all__ = [
     "UPSTREAM_TE_COMMIT",
     "UPSTREAM_TE_GRAPH_PATH",
     "UPSTREAM_TE_VERSION",
+    "cuda_graph_checkpoint_context_fn",
+    "cuda_graph_checkpoint_phase",
+    "current_cuda_graph_checkpoint_region",
     "make_graphed_callables",
+    "resolve_replay_phase",
+    "wrap_cuda_graph_checkpoint",
 ]
 
 _torch = None
@@ -35,6 +43,201 @@ _tree_unflatten = None
 _graph_pool_handle = None
 _TE_AVAILABLE = None
 _TE_IMPORT_ERROR = None
+_CUDA_GRAPH_CHECKPOINT_PHASE = contextvars.ContextVar(
+    "mfsdp_cuda_graph_checkpoint_phase", default=None
+)
+_CUDA_GRAPH_CHECKPOINT_REGION = contextvars.ContextVar(
+    "mfsdp_cuda_graph_checkpoint_region", default=None
+)
+_CUDA_GRAPH_CHECKPOINT_MODE_TYPE = None
+
+
+def current_cuda_graph_checkpoint_phase() -> Optional[str]:
+    """Return the active checkpoint phase, if any."""
+    return _CUDA_GRAPH_CHECKPOINT_PHASE.get()
+
+
+def current_cuda_graph_checkpoint_region() -> Optional[object]:
+    """Return the active checkpoint region token, if any."""
+    return _CUDA_GRAPH_CHECKPOINT_REGION.get()
+
+
+def resolve_replay_phase(checkpoint_phase: Optional[str], grad_enabled: bool) -> str:
+    """Map a call to forward, recompute, or inference replay."""
+    if checkpoint_phase not in (None, "forward", "recompute"):
+        raise ValueError(f"Unknown CUDA graph checkpoint phase {checkpoint_phase!r}")
+    if checkpoint_phase is not None:
+        return checkpoint_phase
+    return "forward" if grad_enabled else "inference"
+
+
+@contextlib.contextmanager
+def cuda_graph_checkpoint_phase(phase: str, region_id: object):
+    """Mark one checkpoint region as original forward or recompute."""
+    if phase not in ("forward", "recompute"):
+        raise ValueError(f"Unknown CUDA graph checkpoint phase {phase!r}")
+    if region_id is None:
+        raise ValueError("CUDA graph checkpoint phase requires a region token")
+    phase_token = _CUDA_GRAPH_CHECKPOINT_PHASE.set(phase)
+    region_token = _CUDA_GRAPH_CHECKPOINT_REGION.set(region_id)
+    try:
+        yield
+    finally:
+        _CUDA_GRAPH_CHECKPOINT_REGION.reset(region_token)
+        _CUDA_GRAPH_CHECKPOINT_PHASE.reset(phase_token)
+
+
+def _cuda_graph_checkpoint_phase_mode(phase, user_context=None, region_id=None):
+    """Create a phase marker that remains visible through ``torch.compile``."""
+    if phase not in ("forward", "recompute"):
+        raise ValueError(f"Unknown CUDA graph checkpoint phase {phase!r}")
+    _require_torch()
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    global _CUDA_GRAPH_CHECKPOINT_MODE_TYPE
+    if _CUDA_GRAPH_CHECKPOINT_MODE_TYPE is None:
+
+        class _CudaGraphCheckpointPhaseMode(TorchDispatchMode):
+            """Pass tensor operations through while marking checkpoint phase."""
+
+            @classmethod
+            def ignore_compile_internals(cls):
+                return True
+
+            def __init__(self, checkpoint_phase, composed_context, checkpoint_region):
+                super().__init__()
+                self.checkpoint_phase = checkpoint_phase
+                self.checkpoint_region = checkpoint_region
+                self.composed_context = composed_context
+                self.phase_token = None
+                self.region_token = None
+                self.user_context_entered = False
+
+            def __enter__(self):
+                self.phase_token = _CUDA_GRAPH_CHECKPOINT_PHASE.set(self.checkpoint_phase)
+                self.region_token = _CUDA_GRAPH_CHECKPOINT_REGION.set(self.checkpoint_region)
+                try:
+                    if self.composed_context is not None:
+                        self.composed_context.__enter__()
+                        self.user_context_entered = True
+                    return super().__enter__()
+                except BaseException:
+                    if self.user_context_entered:
+                        self.composed_context.__exit__(None, None, None)
+                        self.user_context_entered = False
+                    _CUDA_GRAPH_CHECKPOINT_REGION.reset(self.region_token)
+                    self.region_token = None
+                    _CUDA_GRAPH_CHECKPOINT_PHASE.reset(self.phase_token)
+                    self.phase_token = None
+                    raise
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                suppress = False
+                try:
+                    suppress = super().__exit__(exc_type, exc_value, traceback)
+                finally:
+                    try:
+                        if self.user_context_entered:
+                            suppress = (
+                                self.composed_context.__exit__(exc_type, exc_value, traceback)
+                                or suppress
+                            )
+                    finally:
+                        self.user_context_entered = False
+                        if self.region_token is not None:
+                            _CUDA_GRAPH_CHECKPOINT_REGION.reset(self.region_token)
+                            self.region_token = None
+                        if self.phase_token is not None:
+                            _CUDA_GRAPH_CHECKPOINT_PHASE.reset(self.phase_token)
+                            self.phase_token = None
+                return suppress
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                del types
+                return func(*args, **({} if kwargs is None else kwargs))
+
+        _CUDA_GRAPH_CHECKPOINT_MODE_TYPE = _CudaGraphCheckpointPhaseMode
+
+    return _CUDA_GRAPH_CHECKPOINT_MODE_TYPE(phase, user_context, region_id)
+
+
+def cuda_graph_checkpoint_context_fn():
+    """Create F and RF contexts that share one checkpoint region token."""
+    region_id = object()
+    return (
+        _cuda_graph_checkpoint_phase_mode("forward", region_id=region_id),
+        _cuda_graph_checkpoint_phase_mode("recompute", region_id=region_id),
+    )
+
+
+def _composed_cuda_graph_checkpoint_context_fn(user_context_fn):
+    """Compose checkpoint phase markers with existing user contexts."""
+    forward_context, recompute_context = user_context_fn()
+    region_id = object()
+    return (
+        _cuda_graph_checkpoint_phase_mode("forward", forward_context, region_id),
+        _cuda_graph_checkpoint_phase_mode("recompute", recompute_context, region_id),
+    )
+
+
+def _checkpoint_callable_option(checkpoint_fn, name, default):
+    """Resolve a checkpoint option from partials or its signature."""
+    candidate = checkpoint_fn
+    while isinstance(candidate, functools.partial):
+        if candidate.keywords and name in candidate.keywords:
+            return candidate.keywords[name]
+        candidate = candidate.func
+    try:
+        parameter = inspect.signature(checkpoint_fn).parameters.get(name)
+    except (TypeError, ValueError):
+        parameter = None
+    if parameter is not None and parameter.default is not inspect.Parameter.empty:
+        return parameter.default
+    return default
+
+
+def wrap_cuda_graph_checkpoint(checkpoint_fn):
+    """Add F and RF phase markers to a checkpoint callable.
+
+    The original forward and its recomputation share one region token.
+    """
+    if not callable(checkpoint_fn):
+        raise TypeError("checkpoint_fn must be callable")
+
+    metadata_source = checkpoint_fn
+    while isinstance(metadata_source, functools.partial):
+        metadata_source = metadata_source.func
+
+    configured_use_reentrant = _checkpoint_callable_option(checkpoint_fn, "use_reentrant", None)
+    configured_context_fn = _checkpoint_callable_option(checkpoint_fn, "context_fn", None)
+    _cuda_graph_checkpoint_phase_mode("forward")
+
+    @functools.wraps(metadata_source)
+    def checkpoint_with_phase(function, *args, **kwargs):
+        torch_module = _require_torch()
+        use_reentrant = kwargs.get("use_reentrant", configured_use_reentrant)
+        if not torch_module.is_grad_enabled():
+            return checkpoint_fn(function, *args, **kwargs)
+        if use_reentrant is not False:
+            region_id = object()
+
+            def reentrant_function(*function_args, **function_kwargs):
+                phase = "recompute" if torch_module.is_grad_enabled() else "forward"
+                with cuda_graph_checkpoint_phase(phase, region_id):
+                    return function(*function_args, **function_kwargs)
+
+            return checkpoint_fn(reentrant_function, *args, **kwargs)
+
+        original_context_fn = kwargs.get("context_fn", configured_context_fn)
+        if original_context_fn is None:
+            kwargs["context_fn"] = cuda_graph_checkpoint_context_fn
+        else:
+            kwargs["context_fn"] = functools.partial(
+                _composed_cuda_graph_checkpoint_context_fn, original_context_fn
+            )
+        return checkpoint_fn(function, *args, **kwargs)
+
+    return checkpoint_with_phase
 
 
 class _UnavailableTEType:

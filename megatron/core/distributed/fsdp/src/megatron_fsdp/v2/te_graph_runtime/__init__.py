@@ -12,12 +12,22 @@ from .graph import (
     UPSTREAM_TE_COMMIT,
     UPSTREAM_TE_GRAPH_PATH,
     UPSTREAM_TE_VERSION,
+    cuda_graph_checkpoint_context_fn,
+    cuda_graph_checkpoint_phase,
+    current_cuda_graph_checkpoint_region,
     make_graphed_callables,
+    resolve_replay_phase,
+    wrap_cuda_graph_checkpoint,
 )
 
 __all__ = [
     "UPSTREAM_TE_COMMIT",
     "UPSTREAM_TE_GRAPH_PATH",
     "UPSTREAM_TE_VERSION",
+    "cuda_graph_checkpoint_context_fn",
+    "cuda_graph_checkpoint_phase",
+    "current_cuda_graph_checkpoint_region",
     "make_graphed_callables",
+    "resolve_replay_phase",
+    "wrap_cuda_graph_checkpoint",
 ]

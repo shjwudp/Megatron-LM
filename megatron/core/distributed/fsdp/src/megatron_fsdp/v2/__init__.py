@@ -30,6 +30,12 @@ from .dp_buffer import DataParallelBuffer
 from .fully_shard import FSDPModule, fully_shard
 from .mixed_precision import FullyShardFP8Policy, FullyShardNVFP4Policy, MixedPrecisionPolicy
 from .param_group import ParameterGroup
+from .te_graph_runtime import (
+    cuda_graph_checkpoint_context_fn,
+    cuda_graph_checkpoint_phase,
+    current_cuda_graph_checkpoint_region,
+    wrap_cuda_graph_checkpoint,
+)
 
 __all__ = [
     "FSDPModule",
@@ -41,7 +47,11 @@ __all__ = [
     "BufferIndex",
     "DataParallelBuffer",
     "Bucket",
+    "cuda_graph_checkpoint_context_fn",
+    "cuda_graph_checkpoint_phase",
+    "current_cuda_graph_checkpoint_region",
     "TemporaryBucketAllocator",
+    "wrap_cuda_graph_checkpoint",
     "make_uneven_dtensor",
     "get_state_dict",
     "preprocess_state_dict_for_uneven_dtensor",
