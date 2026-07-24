@@ -669,7 +669,7 @@ def test_cuda_graph_replay_restores_leaf_grad_and_reuses_main_grad(dtype):
     sample = torch.ones(2, 4, device="cuda", dtype=dtype)
 
     graphed = make_graphed_callables(
-        module, (), sample_kwargs={"input": sample}, num_warmup_iters=1
+        module, (), sample_kwargs={"input": sample}, num_warmup_iters=1, use_main_grad=True
     )
 
     assert module.weight.grad is None
