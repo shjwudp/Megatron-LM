@@ -329,22 +329,19 @@ def test_module_compile_is_converted_to_compiled_forward_for_capture():
     assert module.forward == original_forward
 
 
-def test_module_compile_is_normalized_when_first_forward_is_recorded():
+def test_module_compile_normalization_is_deferred_until_capture():
     module = torch.nn.Linear(2, 2)
-    module._compiled_call_impl = object()
-
-    def compiled_forward(input):
-        return input
+    original_forward = module.forward
+    compiled_call_impl = object()
+    module._compiled_call_impl = compiled_call_impl
 
     runner = CudaGraphRunner(graph_pool=None)
     sample = torch.ones(1, 2)
+    runner.record_module(module, (sample,), {})
 
-    with patch.object(torch, "compile", return_value=compiled_forward):
-        runner.record_module(module, (sample,), {})
-
-    assert module._compiled_call_impl is None
-    assert module.forward is compiled_forward
-    assert len(runner._compiled_module_state) == 1
+    assert module._compiled_call_impl is compiled_call_impl
+    assert module.forward == original_forward
+    assert runner._compiled_module_state == []
 
 
 def test_parameter_surface_refresh_uses_current_registered_parameters():
@@ -440,6 +437,8 @@ def test_capture_backward_pre_hook_prefetches_only_te_fused_wgrad():
     """Materialize capture buffers only for recorded TE fused-wgrad groups."""
     fused_param = torch.nn.Parameter(torch.ones(4))
     fused_param._mfsdp_recorded_te_wgrad = True
+    fused_main_grad = torch.full_like(fused_param, 2)
+    fused_param.get_main_grad = lambda: fused_main_grad
     regular_param = torch.nn.Parameter(torch.ones(4))
     fused_init_calls = []
     fused_fetch_calls = []
@@ -447,11 +446,13 @@ def test_capture_backward_pre_hook_prefetches_only_te_fused_wgrad():
     regular_fetch_calls = []
     fused_group = SimpleNamespace(
         params=(fused_param,),
+        sharding_strategy="optim_grads_params",
         main_grad_buffer=SimpleNamespace(fetch_buffer=lambda: fused_fetch_calls.append(True)),
         _init_dist_grads=lambda: fused_init_calls.append(True),
     )
     regular_group = SimpleNamespace(
         params=(regular_param,),
+        sharding_strategy="optim_grads_params",
         main_grad_buffer=SimpleNamespace(fetch_buffer=lambda: regular_fetch_calls.append(True)),
         _init_dist_grads=lambda: regular_init_calls.append(True),
     )
@@ -466,6 +467,7 @@ def test_capture_backward_pre_hook_prefetches_only_te_fused_wgrad():
     assert unshard_calls == [{"bwd_pass": True}]
     assert fused_init_calls == [True]
     assert fused_fetch_calls == [True]
+    assert fused_param.main_grad is fused_main_grad
     assert regular_init_calls == []
     assert regular_fetch_calls == []
 
@@ -486,7 +488,9 @@ def test_trace_prefetches_static_main_grad_before_backward():
         _init_dist_grads=lambda: init_calls.append(True),
     )
     module = SimpleNamespace(
-        _fsdp_root_context=SimpleNamespace(cuda_graph_active=False, enable_unshard_prefetch=False),
+        _fsdp_root_context=SimpleNamespace(
+            cuda_graph_active=False, enable_unshard_prefetch=False, cuda_graph_runner=None
+        ),
         _fsdp_state=SimpleNamespace(
             _is_root=False, enable_cuda_graph=True, enable_full_iteration_cuda_graph=False
         ),
