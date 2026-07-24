@@ -3379,6 +3379,7 @@ try:
         out: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
         grad: bool = False,
+        accumulate: bool = False,
     ) -> List[torch.Tensor]:
         """
         Wrapper for TE's general_gemm function.
@@ -3392,7 +3393,7 @@ try:
             quantization_params=None,
             gelu=None,
             gelu_in=None,
-            accumulate=False,
+            accumulate=accumulate,
             layout=layout,
             out=out,
             bias=bias,

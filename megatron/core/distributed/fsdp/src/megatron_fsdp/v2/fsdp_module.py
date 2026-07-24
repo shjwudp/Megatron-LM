@@ -2,6 +2,7 @@
 
 """FSDPModule implementation for Megatron-FSDP2."""
 
+import gc
 import logging
 import weakref
 from contextlib import contextmanager, nullcontext
@@ -81,6 +82,7 @@ class _FSDPState:
         self._post_backward_callback_queued = False
         self.enable_cuda_graph: bool = False
         self.enable_full_iteration_cuda_graph: bool = False
+        self.cuda_graph_activation_recompute: bool = False
 
 
 @dataclass
@@ -185,6 +187,9 @@ class _FSDPRootContext:
     enable_cuda_graph: bool = False
     """Whether hooks should manage the side stream for CUDA graph capture."""
 
+    cuda_graph_activation_recompute: bool = False
+    """Whether forward, recompute forward, and backward use separate graphs."""
+
     cuda_graph_stream: Optional[torch.cuda.Stream] = None
     """Side stream for CUDA graph capture/replay.  Created lazily on the
     first forward pre-hook and shared across all FSDP modules."""
@@ -270,6 +275,93 @@ class FSDPModule:
             return False
         return True
 
+    def _install_cuda_graph_forward_dispatch(self) -> None:
+        """Keep a stable graph break around a CUDA-graph-owned forward.
+
+        :return: None.
+        :rtype: None
+        """
+        if "_mfsdp_cuda_graph_forward_impl" in self.__dict__:
+            return
+        self._mfsdp_cuda_graph_forward_impl = self.forward
+
+        @torch.compiler.disable
+        def dispatch(*args, **kwargs):
+            return self.__dict__["_mfsdp_cuda_graph_forward_impl"](*args, **kwargs)
+
+        self._mfsdp_cuda_graph_forward_dispatch = dispatch
+        self.forward = dispatch
+
+    def compile(self, *args, **kwargs) -> None:
+        """Compile the forward body while preserving CUDA Graph dispatch.
+
+        :param args: Positional arguments forwarded to :func:`torch.compile`.
+        :type args: Any
+        :param kwargs: Keyword arguments forwarded to :func:`torch.compile`.
+        :type kwargs: Any
+        :return: None.
+        :rtype: None
+        """
+        if "_mfsdp_cuda_graph_forward_impl" not in self.__dict__:
+            return super().compile(*args, **kwargs)
+        self._mfsdp_cuda_graph_forward_impl = torch.compile(
+            self.__dict__["_mfsdp_cuda_graph_forward_impl"], *args, **kwargs
+        )
+
+    def enable_cuda_graph(self, activation_recompute: bool = False) -> None:
+        """Enable CUDA graph capture for this FSDP module.
+
+        Must be called while the module is resharded (before the first
+        forward pass).  Sets the ``enable_cuda_graph`` flag on both the
+        per-module FSDP state and the shared root context.  The side
+        stream is created lazily on the first root forward pre-hook.
+
+        With ``activation_recompute=True`` the checkpoint must carry phase
+        markers; see :func:`wrap_cuda_graph_checkpoint` and :func:`fully_shard`.
+
+        Usage::
+
+            fully_shard(layer, mesh=mesh)
+            layer.enable_cuda_graph()   # call before first forward
+
+        :param activation_recompute: Capture forward, recompute forward, and
+            backward as separate graphs.
+        :type activation_recompute: bool
+        """
+        if not isinstance(activation_recompute, bool):
+            raise TypeError("activation_recompute must be a bool")
+        ctx = self._fsdp_root_context
+        for module in ctx.forward_order:
+            state = module._fsdp_state
+            if (
+                state.enable_cuda_graph
+                and state.cuda_graph_activation_recompute != activation_recompute
+            ):
+                raise RuntimeError(
+                    "All M-FSDP CUDA Graph modules must use the same " "activation-recompute mode"
+                )
+        self._fsdp_state.enable_cuda_graph = True
+        self._fsdp_state.cuda_graph_activation_recompute = activation_recompute
+        ctx.enable_cuda_graph = True
+        ctx.cuda_graph_activation_recompute = activation_recompute
+        self._install_cuda_graph_forward_dispatch()
+
+    def release_pending(self) -> bool:
+        """Release activation-recompute forwards abandoned before backward.
+
+        Call this after a skipped batch or NaN guard that discards a forward
+        output without running backward; a later backward on that output is
+        rejected.
+
+        :raises RuntimeError: If activation-recompute graph state does not exist.
+        :return: Whether any module had a pending forward.
+        :rtype: bool
+        """
+        runner = self._fsdp_root_context.cuda_graph_runner
+        if runner is None:
+            raise RuntimeError("release_pending() requires activation-recompute CUDA graph state")
+        return runner.release_pending()
+
     def release_memory_pool(self) -> None:
         """Release all persistent communication-buffer memory and any CUDA graphs.
 
@@ -282,10 +374,30 @@ class FSDPModule:
         are re-captured by the hooks on the next forward pass.
 
         Typical use: temporarily free GPU memory (e.g. for checkpoint I/O).
+
+        Raises if a replicated fused-wgrad buffer has not been synchronized;
+        callers must finish gradient synchronization before destroying its
+        owning graph and allocator state.
         """
         ctx = self._fsdp_root_context
+        root_module = ctx.get_root_module()
+        if root_module is not None and root_module is not self:
+            root_module.release_memory_pool()
+            return
+
         allocator = ctx.bucket_allocator
-        for module in self._get_fsdp_modules(recursive=True):
+        fsdp_modules = self._get_fsdp_modules(recursive=True)
+        if any(
+            getattr(pg, "_main_grad_buffer_has_unreduced_data", False)
+            for module in fsdp_modules
+            for pg in module._fsdp_param_groups
+        ):
+            raise RuntimeError(
+                "release_memory_pool() requires finish_grad_sync() when "
+                "main-grad buffers contain unreduced gradients"
+            )
+
+        for module in fsdp_modules:
             for pg in module._fsdp_param_groups:
                 pg.release_grad_buffer()
 
@@ -311,6 +423,10 @@ class FSDPModule:
         if not ctx.enable_cuda_graph:
             return
 
+        if ctx.cuda_graph_runner is not None:
+            ctx.cuda_graph_runner.reset()
+            ctx.cuda_graph_runner = None
+
         for module in ctx.forward_order:
             if hasattr(module, "_fsdp_cg_runner"):
                 runner = module._fsdp_cg_runner
@@ -321,6 +437,7 @@ class FSDPModule:
         ctx.cuda_graph_active = False
         ctx.cuda_graph_stream = None
         ctx.cuda_graph_pool = None
+        gc.collect()
 
     @staticmethod
     def _clear_cuda_graph_sentinels(ctx: "_FSDPRootContext") -> None:
@@ -486,26 +603,32 @@ class FSDPModule:
         unsharded gradient buffers.
         """
 
-        def main_grad_getter(p):
-            """Get main gradient from buffer with proper offset/size."""
-            gbuf = p._gbuf
-            item_id = p._item_id
+        def make_main_grad_getter(param_group):
+            """Build a lazy main-gradient accessor for one parameter group."""
 
-            # Full (0, 0) unsharded grad: the backward writes the full gradient
-            # (params are all-gathered during bwd); reduce_grad later scatters it.
-            gbuf_data = gbuf.fetch_buffer((0, 0))
-            assert gbuf_data is not None
-            assert gbuf_data.numel() > 0
+            def main_grad_getter(p):
+                """Return the caller parameter's main-gradient view."""
+                gbuf = p._gbuf
+                if gbuf.data is None:
+                    param_group._init_dist_grads()
+                item_id = p._item_id
 
-            # Get offset and size from buffer index
-            start, end = gbuf.buffer_index._get_item_global_range(item_id)
-            param_shape = gbuf.buffer_index.item_index_map[item_id].shape
-            grad_data = gbuf_data[start:end].view(param_shape)
+                gbuf_data = gbuf.fetch_buffer()
+                assert gbuf_data is not None
+                assert gbuf_data.numel() > 0
 
-            return grad_data
+                # Get offset and size from buffer index
+                start, end = gbuf.buffer_index._get_item_global_range(item_id)
+                param_shape = gbuf.buffer_index.item_index_map[item_id].shape
+                grad_data = gbuf_data[start:end].view(param_shape)
+
+                return grad_data
+
+            return main_grad_getter
 
         # Attach getter to each parameter
         for param_group in self._fsdp_param_groups:
+            main_grad_getter = make_main_grad_getter(param_group)
             for param in param_group.params:
                 setattr(param, "_gbuf", param_group.main_grad_buffer)
                 setattr(param, "_item_id", param_group.param_idx[param])
@@ -584,6 +707,7 @@ class FSDPModule:
         bucket_allocator: BucketAllocator,
         enable_cuda_graph: bool = False,
         enable_full_iteration_cuda_graph: bool = False,
+        cuda_graph_activation_recompute: bool = False,
     ):
         """Initialize FSDP state and mark nested FSDP modules as non-root.
 
@@ -658,6 +782,8 @@ class FSDPModule:
             setattr(module, "_fsdp_module_name", name)
             module._fsdp_pre_backward_done = False
             module.post_backward_issued = False
+            module._fsdp_post_backward_hook_seen = False
+            module._fsdp_cg_pending_backwards = 0
             module_idx += 1
 
         # Annotate every non-FSDPModule sub-module with its nearest parent
@@ -682,10 +808,21 @@ class FSDPModule:
                     f"has FSDP children: {child_names}. "
                     f"Only leaf FSDP modules (no FSDP children) can use CUDA graph capture."
                 )
-            self._fsdp_state.enable_cuda_graph = True
+            self.enable_cuda_graph(activation_recompute=cuda_graph_activation_recompute)
 
-        if any(module._fsdp_state.enable_cuda_graph for module in forward_order):
+        cuda_graph_modules = [
+            module for module in forward_order if module._fsdp_state.enable_cuda_graph
+        ]
+        recompute_modes = {
+            module._fsdp_state.cuda_graph_activation_recompute for module in cuda_graph_modules
+        }
+        if len(recompute_modes) > 1:
+            raise RuntimeError(
+                "All M-FSDP CUDA Graph modules must use the same " "activation-recompute mode"
+            )
+        if cuda_graph_modules:
             root_context.enable_cuda_graph = True
+            root_context.cuda_graph_activation_recompute = recompute_modes.pop()
 
     def unshard(self, async_op: bool = False, bwd_pass: bool = False, prefetch: bool = True):
         """
@@ -881,12 +1018,8 @@ class FSDPModule:
                 if grad_added or recorded:
                     if param.grad is not None:
                         del param.grad
-                    # Record TE wgrad-fusion flags for CUDA graph restore.
-                    # The trace backward ran eagerly, so TE set
-                    # grad_added_to_main_grad on each param it wrote to.
-                    # Under CUDA graph replay only the GPU kernel runs;
-                    # we record the flags here and restore them in
-                    # the CG replay backward.
+                    # Record the flag on the trace micro-batch so CUDA graph
+                    # replay can restore it (see the note above the loop).
                     if grad_added and self._fsdp_state.enable_cuda_graph:
                         setattr(param, "_mfsdp_recorded_te_wgrad", True)
                 elif grad is None:

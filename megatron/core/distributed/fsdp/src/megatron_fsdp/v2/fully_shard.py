@@ -49,6 +49,7 @@ def fully_shard(
     outer_dp_sharding_strategy: str = "no_shard",
     enable_cuda_graph: bool = False,
     enable_full_iteration_cuda_graph: bool = False,
+    cuda_graph_activation_recompute: bool = False,
     fine_grained_hooks: bool = False,
     skip_backward_callback: bool = False,  # Skip autograd RegisterFSDPBackwardFunction.
     skip_final_backward_callback: bool = False,
@@ -66,6 +67,11 @@ def fully_shard(
     Args:
         enable_full_iteration_cuda_graph: If ``True``, keep graph-visible FSDP
             optimizer gradient objects stable across full-iteration graph replay.
+        enable_cuda_graph: Capture supported FSDP modules as CUDA graphs.
+        cuda_graph_activation_recompute: Capture the original forward, recompute
+            forward, and backward as separate graphs. Requires
+            ``enable_cuda_graph=True`` and a checkpoint wrapped with
+            ``wrap_cuda_graph_checkpoint`` (or ``cuda_graph_checkpoint_context_fn``).
         fine_grained_hooks: If ``True``, register pre-forward/backward hooks
             on every sub-module (for EP-overlap / 1F1B schedules).
         skip_backward_callback: If ``True``, skip the autograd post-backward
@@ -94,6 +100,8 @@ def fully_shard(
             "The input module has already been fully sharded. "
             "Please do not call fully_shard on the same module more than once."
         )
+    if cuda_graph_activation_recompute and not enable_cuda_graph:
+        raise ValueError("cuda_graph_activation_recompute=True requires enable_cuda_graph=True")
     mesh = _prepare_fsdp_mesh(mesh or _init_default_fully_shard_mesh())
 
     if mp_policy is None:
@@ -130,7 +138,10 @@ def fully_shard(
         bucket_allocator=bucket_allocator,
         enable_cuda_graph=enable_cuda_graph,
         enable_full_iteration_cuda_graph=enable_full_iteration_cuda_graph,
+        cuda_graph_activation_recompute=cuda_graph_activation_recompute,
     )
+    if enable_cuda_graph:
+        module._install_cuda_graph_forward_dispatch()
     module._init_param_main_grad_func()
 
     _register_forward_pre_hook(

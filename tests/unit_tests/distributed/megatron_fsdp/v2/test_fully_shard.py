@@ -1371,7 +1371,7 @@ class TestActivationCheckpointing:
         monkeypatch.setattr(target, "unshard", capture_unshard)
         mfsdp_forward_pre_hook(target, (), {})
 
-        assert calls == [(True, True, True), (True, False, False)]
+        assert calls == [(True, True, True), (False, False, False)]
 
     def test_activation_checkpointing_forward_backward(self):
         """Forward + backward with activation checkpointing should produce finite loss."""
