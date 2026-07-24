@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import gc
 import warnings
+from collections import deque
 from collections.abc import Iterable, Sequence
 from math import ceil, prod
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
@@ -20,6 +22,28 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 UPSTREAM_TE_VERSION = "v2.16"
 UPSTREAM_TE_COMMIT = "4220403e831d29e93868f7793693ea83f6b8b05b"
 UPSTREAM_TE_GRAPH_PATH = "transformer_engine/pytorch/graph.py"
+_MFSDP_CAPTURE_CAPABILITIES = frozenset(
+    {
+        "activation_recompute",
+        "activation_recompute_argument_binding",
+        "activation_recompute_discard_tape",
+        "activation_recompute_per_callable_checkpoint_mode",
+        "activation_recompute_preflight",
+        "activation_recompute_phase_resolution",
+        "activation_recompute_release_pending",
+        "activation_recompute_region_schedule",
+        "activation_recompute_three_graph",
+        "capture_grad_buffer_release",
+        "checkpoint_phase_marker",
+        "checkpoint_region_marker",
+        "fp8_activation_recompute_metadata",
+        "parameter_surface_refresh",
+        "registered_buffer_validation",
+        "static_dgrad_reuse",
+        "static_fwd_reuse",
+        "static_grad_binding",
+    }
+)
 
 __all__ = [
     "UPSTREAM_TE_COMMIT",
@@ -35,6 +59,9 @@ _tree_unflatten = None
 _graph_pool_handle = None
 _TE_AVAILABLE = None
 _TE_IMPORT_ERROR = None
+_FP8_ACTIVATION_RECOMPUTE_PHASE = contextvars.ContextVar(
+    "te_graph_fp8_activation_recompute_phase", default=None
+)
 
 
 class _UnavailableTEType:
@@ -59,26 +86,32 @@ class _FP8GlobalStateManagerStub:
 
     @staticmethod
     def is_first_fp8_module() -> bool:
+        """Return false when Transformer Engine is unavailable."""
         return False
 
     @staticmethod
     def reduce_and_update_fp8_tensors(*args, **kwargs) -> None:
+        """Ignore FP8 state updates when Transformer Engine is unavailable."""
         return None
 
     @staticmethod
     def is_fp8_enabled() -> bool:
+        """Return false when Transformer Engine is unavailable."""
         return False
 
     @staticmethod
     def get_fp8_recipe() -> None:
+        """Return no FP8 recipe when Transformer Engine is unavailable."""
         return None
 
     @staticmethod
     def get_fp8_group() -> None:
+        """Return no FP8 group when Transformer Engine is unavailable."""
         return None
 
     @staticmethod
     def add_fp8_tensors_to_global_buffer(*args, **kwargs) -> None:
+        """Ignore FP8 tensor registration without Transformer Engine."""
         return None
 
 
@@ -87,13 +120,22 @@ FP8GlobalStateManager = _FP8GlobalStateManagerStub
 
 @contextlib.contextmanager
 def _null_autocast(*args, **kwargs):
+    """Provide a no-op autocast context."""
     yield
 
 
 autocast = _null_autocast
 
 
+@contextlib.contextmanager
+def activation_recompute_forward(*args, **kwargs):
+    """Fallback TE recompute context when Transformer Engine is unavailable."""
+    del args, kwargs
+    yield
+
+
 def get_default_fp8_recipe():
+    """Reject FP8 recipe discovery when Transformer Engine is unavailable."""
     raise RuntimeError(
         "FP8 graph capture requires transformer_engine. Install te-graph-runtime[te] "
         "or disable FP8/TE-specific options."
@@ -120,7 +162,8 @@ def _load_optional_te() -> bool:
     """Load TransformerEngine internals when available, without delegating graphing."""
     global _TE_AVAILABLE, _TE_IMPORT_ERROR
     global DelayedScaling, Recipe, dist_group_type
-    global autocast, FP8GlobalStateManager, get_default_fp8_recipe
+    global autocast, activation_recompute_forward
+    global FP8GlobalStateManager, get_default_fp8_recipe
     global get_all_rng_states, graph_safe_rng_available
     global TransformerEngineBaseModule, BasicOperation, Sequential, OperationFuser
 
@@ -130,6 +173,9 @@ def _load_optional_te() -> bool:
         from transformer_engine.common.recipe import DelayedScaling as te_DelayedScaling
         from transformer_engine.common.recipe import Recipe as te_Recipe
         from transformer_engine.pytorch.constants import dist_group_type as te_dist_group_type
+        from transformer_engine.pytorch.distributed import (
+            activation_recompute_forward as te_activation_recompute_forward,
+        )
         from transformer_engine.pytorch.distributed import (
             get_all_rng_states as te_get_all_rng_states,
         )
@@ -158,6 +204,7 @@ def _load_optional_te() -> bool:
     Recipe = te_Recipe
     dist_group_type = te_dist_group_type
     autocast = te_autocast
+    activation_recompute_forward = te_activation_recompute_forward
     FP8GlobalStateManager = te_FP8GlobalStateManager
     get_default_fp8_recipe = te_get_default_fp8_recipe
     get_all_rng_states = te_get_all_rng_states
@@ -172,15 +219,18 @@ def _load_optional_te() -> bool:
 
 
 def _prepare_runtime() -> bool:
+    """Initialize torch and load optional Transformer Engine symbols."""
     _require_torch()
     return _load_optional_te()
 
 
 def get_all_rng_states() -> Dict[Any, Any]:
+    """Return no tracked Transformer Engine RNG states by default."""
     return {}
 
 
 def graph_safe_rng_available() -> bool:
+    """Return whether torch exposes the required graph-safe RNG APIs."""
     _torch_mod = _require_torch()
     return (
         hasattr(_torch_mod.cuda.CUDAGraph, "register_generator_state")
@@ -190,31 +240,34 @@ def graph_safe_rng_available() -> bool:
     )
 
 
-def _ensure_graph_safe_rng_states() -> Dict[Any, Any]:
-    """Upgrade legacy tensor RNG states before CUDA graph registration.
+def _get_tracked_cuda_generators(require_generators: bool = True) -> Optional[Tuple[Any, ...]]:
+    """Return tracked CUDA generators supported by graph capture.
 
-    Transformer Engine's RNG tracker may retain tensor states created before
-    graph-safe RNG was enabled.  CUDA graphs require generator states, so
-    preserve each legacy state while moving it into a clone of the current
-    device generator.
+    :param require_generators: Raise for legacy tensor states when True; return
+        None so the caller can use the CUDA RNG-state fallback when False.
+    :type require_generators: bool, optional
+    :raises RuntimeError: If the installed RNG tracker exposes legacy tensor states.
+    :return: Unique tracked CUDA generators in tracker order, or None when a
+        legacy tracker requires the CUDA RNG-state fallback.
+    :rtype: Optional[Tuple[torch.Generator, ...]]
     """
-    rng_states = get_all_rng_states()
-    if not graph_safe_rng_available():
-        return rng_states
-
-    default_generator = torch.cuda.default_generators[torch.cuda.current_device()]
-    for name, state in tuple(rng_states.items()):
-        if isinstance(state, torch.Generator):
-            continue
-        if not torch.is_tensor(state):
-            raise TypeError(
-                f"Expected RNG state {name!r} to be a tensor or torch.Generator, "
-                f"but got {type(state).__name__}"
+    torch_module = _require_torch()
+    generators = []
+    seen_generator_ids = set()
+    for tracker_name, generator in get_all_rng_states().items():
+        if not isinstance(generator, torch_module.Generator):
+            if not require_generators:
+                return None
+            raise RuntimeError(
+                "CUDA graph capture requires tracked RNG values to be torch.Generator "
+                "instances, but tracker "
+                f"{tracker_name!r} returned {type(generator).__name__}. Legacy tensor "
+                "RNG tracker states are unsupported."
             )
-        generator = default_generator.clone_state()
-        generator.set_state(state)
-        rng_states[name] = generator
-    return rng_states
+        if id(generator) not in seen_generator_ids:
+            seen_generator_ids.add(id(generator))
+            generators.append(generator)
+    return tuple(generators)
 
 
 def _te_required_error(feature: str) -> RuntimeError:
@@ -223,6 +276,105 @@ def _te_required_error(feature: str) -> RuntimeError:
         f"{feature} requires transformer_engine internals compatible with {UPSTREAM_TE_VERSION}."
         f" Install te-graph-runtime[te] or disable TE-specific graph options.{detail}"
     )
+
+
+def _module_uses_delayed_wgrad(module) -> bool:
+    """Return whether a TE module requests a separate wgrad graph.
+
+    :param module: Module or operation to inspect.
+    :type module: Any
+    :return: Whether delayed wgrad is active.
+    :rtype: bool
+    """
+    for owner in (module, getattr(module, "config", None), getattr(module, "wgrad_store", None)):
+        if owner is None:
+            continue
+        for name in ("delay_wgrad_compute", "need_backward_dw"):
+            value = getattr(owner, name, False)
+            if bool(value() if callable(value) else value):
+                return True
+    return False
+
+
+def _validate_fp8_activation_recompute_support() -> None:
+    """Require the TE metadata operations needed by delayed-scaling recompute.
+
+    :raises RuntimeError: If the loaded Transformer Engine cannot preserve and
+        restore forward FP8 metadata across activation recomputation.
+    """
+    required_methods = (
+        "copy_forward_fp8_meta_tensors_for_recompute",
+        "get_old_fp8_meta_tensors_for_recompute",
+        "restore_fp8_meta_tensors",
+    )
+    missing_methods = tuple(
+        method
+        for method in required_methods
+        if not callable(getattr(FP8GlobalStateManager, method, None))
+    )
+    if missing_methods:
+        raise RuntimeError(
+            "FP8 activation recompute requires Transformer Engine metadata support; "
+            "missing FP8GlobalStateManager methods: " + ", ".join(missing_methods)
+        )
+    first_module_flags = getattr(activation_recompute_forward, "_is_first_fp8_module", None)
+    qstate = getattr(FP8GlobalStateManager, "quantization_state", None)
+    if not isinstance(first_module_flags, list) or not hasattr(
+        qstate, "fp8_tensors_recompute_buffer"
+    ):
+        raise RuntimeError(
+            "FP8 activation recompute requires Transformer Engine recompute " "queue bookkeeping"
+        )
+
+
+def _snapshot_fp8_recompute_bookkeeping(modules):
+    """Snapshot TE's Python-side activation-recompute queues.
+
+    :param modules: Root modules included in graph capture.
+    :type modules: Tuple[torch.nn.Module, ...]
+    :return: First-module flags, queued metadata, and module queue keys.
+    :rtype: Tuple[Any, Tuple[Tuple[Any, ...], ...], Tuple[Tuple[Dict, bool, Any], ...]]
+    """
+    first_module_flags = activation_recompute_forward._is_first_fp8_module
+    saved_first_module_flags = tuple(first_module_flags)
+    qstate = FP8GlobalStateManager.quantization_state
+    recompute_buffers = qstate.fp8_tensors_recompute_buffer
+    saved_recompute_buffers = tuple(tuple(queue) for queue in recompute_buffers)
+    buffer_position_key = "global_fp8_buffer_pos_fwd_recompute"
+    saved_meta_positions = []
+    seen_meta = set()
+    for root_module in modules:
+        for module in root_module.modules():
+            fp8_meta = getattr(module, "fp8_meta", None)
+            if not isinstance(fp8_meta, dict) or id(fp8_meta) in seen_meta:
+                continue
+            seen_meta.add(id(fp8_meta))
+            saved_meta_positions.append(
+                (fp8_meta, buffer_position_key in fp8_meta, fp8_meta.get(buffer_position_key))
+            )
+    return saved_first_module_flags, saved_recompute_buffers, tuple(saved_meta_positions)
+
+
+def _restore_fp8_recompute_bookkeeping(snapshot) -> None:
+    """Restore TE's Python-side activation-recompute queues after capture.
+
+    :param snapshot: State returned by ``_snapshot_fp8_recompute_bookkeeping``.
+    :type snapshot: Tuple[Any, Tuple[Tuple[Any, ...], ...], Tuple[Tuple[Dict, bool, Any], ...]]
+    """
+    saved_first_module_flags, saved_recompute_buffers, saved_meta_positions = snapshot
+    first_module_flags = activation_recompute_forward._is_first_fp8_module
+    first_module_flags[:] = saved_first_module_flags
+
+    qstate = FP8GlobalStateManager.quantization_state
+    qstate.fp8_tensors_recompute_buffer = [
+        deque(saved_queue) for saved_queue in saved_recompute_buffers
+    ]
+    buffer_position_key = "global_fp8_buffer_pos_fwd_recompute"
+    for fp8_meta, had_position, saved_position in saved_meta_positions:
+        if had_position:
+            fp8_meta[buffer_position_key] = saved_position
+        else:
+            fp8_meta.pop(buffer_position_key, None)
 
 
 def _torch_dtype_to_np_typestr(dtype):
@@ -256,13 +408,16 @@ class _WeakRefTensor:
         self.shape = tuple(int(i) for i in shape)
 
     def data_ptr(self):
+        """Return the wrapped CUDA address."""
         return self._data_ptr
 
     def numel(self):
+        """Return the number of elements in the wrapped allocation."""
         return prod(self.shape)
 
     @property
     def __cuda_array_interface__(self):
+        """Return CUDA array metadata for the wrapped allocation."""
         return {
             "shape": self.shape,
             "typestr": _torch_dtype_to_np_typestr(self.dtype),
@@ -302,6 +457,62 @@ def make_weak_ref(x):
         f"Invalid type {type(x).__name__} to make weak ref. Valid types are: "
         "torch.Tensor, tuple, list, dict, int, float, bool, and None."
     )
+
+
+def _registered_buffer_signature(module) -> Tuple[Tuple[Any, ...], ...]:
+    """Describe recursive registered-buffer slots and storage views."""
+    return tuple(
+        _registered_buffer_slot_signature(slot) for slot in _registered_buffer_slots(module)
+    )
+
+
+def _registered_buffer_slots(module) -> Tuple[Tuple[str, Any, str], ...]:
+    """Collect direct registered-buffer slots once at capture.
+
+    :param module: Root module whose recursive buffer slots are captured.
+    :type module: torch.nn.Module
+    :return: Qualified name, direct owner, and slot name tuples.
+    :rtype: Tuple[Tuple[str, torch.nn.Module, str], ...]
+    """
+    slots = []
+    for module_name, submodule in module.named_modules(remove_duplicate=False):
+        for buffer_name in submodule._buffers:
+            qualified_name = f"{module_name}.{buffer_name}" if module_name else buffer_name
+            slots.append((qualified_name, submodule, buffer_name))
+    return tuple(slots)
+
+
+def _registered_buffer_slot_signature(slot) -> Tuple[Any, ...]:
+    """Describe one precomputed direct registered-buffer slot.
+
+    :param slot: Qualified name, direct owner, and buffer name.
+    :type slot: Tuple[str, torch.nn.Module, str]
+    :return: Immutable slot metadata and storage address.
+    :rtype: Tuple[Any, ...]
+    """
+    torch_module = _require_torch()
+    qualified_name, submodule, buffer_name = slot
+    if buffer_name not in submodule._buffers:
+        return (qualified_name, "missing")
+    buffer = submodule._buffers[buffer_name]
+    if buffer is None:
+        return (qualified_name, "none")
+    if isinstance(buffer, torch_module.Tensor):
+        return (
+            qualified_name,
+            "tensor",
+            buffer.untyped_storage().data_ptr(),
+            buffer.storage_offset(),
+            tuple(buffer.shape),
+            buffer.stride(),
+            buffer.dtype,
+            buffer.layout,
+            buffer.device,
+            buffer.requires_grad,
+            buffer.is_conj(),
+            buffer.is_neg(),
+        )
+    return (qualified_name, "invalid", f"{type(buffer).__module__}.{type(buffer).__qualname__}")
 
 
 _IS_GRAPH_CAPTURING = False
@@ -391,6 +602,21 @@ def is_graph_capturing() -> bool:
     return _IS_GRAPH_CAPTURING
 
 
+@contextlib.contextmanager
+def _fp8_activation_recompute_phase(recompute_phase: Optional[bool]):
+    """Select the TE FP8 activation-recompute phase for one captured call.
+
+    :param recompute_phase: False for the initial forward, True for the
+        backward-time recompute, or None outside activation recomputation.
+    :type recompute_phase: Optional[bool]
+    """
+    token = _FP8_ACTIVATION_RECOMPUTE_PHASE.set(recompute_phase)
+    try:
+        yield
+    finally:
+        _FP8_ACTIVATION_RECOMPUTE_PHASE.reset(token)
+
+
 def graph_pool_handle():
     """
     Returns an opaque token representing the id of a graph memory pool.
@@ -409,9 +635,11 @@ def _none_grad_context_wrapper(inputs):
     for input_tensor in inputs:
         original_input_grads.append(input_tensor.grad)
         input_tensor.grad = None
-    yield
-    for input_tensor, original_grad in zip(inputs, original_input_grads):
-        input_tensor.grad = original_grad
+    try:
+        yield
+    finally:
+        for input_tensor, original_grad in zip(inputs, original_input_grads):
+            input_tensor.grad = original_grad
 
 
 @contextlib.contextmanager
@@ -481,6 +709,24 @@ def _get_compatible_main_grad_buffer(input_tensor):
     return grad_buffer
 
 
+def _parameter_allocator_signature(input_tensor):
+    """Return the allocator generation and slot bound to a parameter.
+
+    :param input_tensor: Parameter that may reference an FSDP grad buffer.
+    :type input_tensor: torch.Tensor
+    :return: Allocator identity, generation, and physical slot, or None.
+    :rtype: Optional[Tuple[int, int, int]]
+    """
+    grad_buffer = getattr(input_tensor, "_gbuf", None)
+    allocator = getattr(grad_buffer, "allocator", None)
+    if allocator is None:
+        return None
+    alloc_key = getattr(grad_buffer, "alloc_key", None)
+    slot_getter = getattr(allocator, "slot_id_for_key", None)
+    slot_id = slot_getter(alloc_key) if callable(slot_getter) else None
+    return (id(allocator), getattr(allocator, "generation", None), slot_id)
+
+
 def _get_static_grad_buffers(inputs):
     """Get static gradient buffers for captured leaves.
 
@@ -526,6 +772,110 @@ def _returned_param_grad_clone_slots(
     return tuple(clone_slots)
 
 
+def _static_dgrad_metadata(tensor):
+    """Return metadata for a safe reusable user-input gradient buffer.
+
+    :param tensor: User input or producer output tensor.
+    :type tensor: torch.Tensor
+    :return: Hashable tensor metadata, or None when reuse is unsafe.
+    :rtype: Optional[Tuple[Any, ...]]
+    """
+    torch_module = _require_torch()
+    if not isinstance(tensor, torch_module.Tensor) or tensor.layout != torch_module.strided:
+        return None
+    if not tensor.is_cuda or tensor.is_conj() or tensor.is_neg():
+        return None
+    if tensor.storage_offset() != 0 or getattr(tensor, "_base", None) is not None:
+        return None
+    overlap_check = getattr(torch_module, "_debug_has_internal_overlap", None)
+    if not callable(overlap_check) or int(overlap_check(tensor)) != 0:
+        return None
+    return (tuple(tensor.shape), tensor.stride(), tensor.dtype, tensor.device, tensor.layout)
+
+
+def _allocate_static_dgrad_reuse_buffers(
+    static_input_surfaces,
+    static_outputs,
+    input_output_aliases,
+    user_grad_indices,
+    output_requires_grad,
+):
+    """Allocate two alternating dgrad slots for safe adjacent aliases.
+
+    :param static_input_surfaces: Full input surface for every callable.
+    :type static_input_surfaces: Sequence[Tuple[torch.Tensor, ...]]
+    :param static_outputs: Static outputs for every callable.
+    :type static_outputs: Sequence[Tuple[torch.Tensor, ...]]
+    :param input_output_aliases: Consumer input to producer output mappings.
+    :type input_output_aliases: Sequence[Dict[int, Tuple[int, int]]]
+    :param user_grad_indices: User input indices that produced gradients in warmup.
+    :type user_grad_indices: Sequence[Tuple[int, ...]]
+    :param output_requires_grad: Logical output gradient flags for every callable.
+    :type output_requires_grad: Sequence[Tuple[bool, ...]]
+    :return: Reusable buffers keyed by user-input index for every callable.
+    :rtype: Tuple[Dict[int, torch.Tensor], ...]
+    """
+    torch_module = _require_torch()
+    consumers_by_output = {}
+    for consumer_idx, aliases in enumerate(input_output_aliases):
+        for input_idx, producer in aliases.items():
+            consumers_by_output.setdefault(producer, []).append((consumer_idx, input_idx))
+
+    component_by_callable = list(range(len(input_output_aliases)))
+    for consumer_idx, aliases in enumerate(input_output_aliases):
+        for producer in aliases.values():
+            producer_idx, _ = producer
+            if producer_idx + 1 == consumer_idx and len(consumers_by_output.get(producer, ())) == 1:
+                component_by_callable[consumer_idx] = component_by_callable[producer_idx]
+                break
+
+    reused_buffers = {}
+    buffers_by_callable = []
+    for consumer_idx, aliases in enumerate(input_output_aliases):
+        callable_buffers = {}
+        lanes_by_metadata = {}
+        for input_idx in sorted(user_grad_indices[consumer_idx] or ()):
+            producer = aliases.get(input_idx)
+            if producer is None:
+                continue
+            producer_idx, output_idx = producer
+            if producer_idx + 1 != consumer_idx:
+                continue
+            if len(consumers_by_output.get(producer, ())) != 1:
+                continue
+            if output_idx >= len(static_outputs[producer_idx]):
+                continue
+            producer_grad_flags = output_requires_grad[producer_idx]
+            if producer_grad_flags is None or not producer_grad_flags[output_idx]:
+                continue
+            input_tensor = static_input_surfaces[consumer_idx][input_idx]
+            output_tensor = static_outputs[producer_idx][output_idx]
+            input_metadata = _static_dgrad_metadata(input_tensor)
+            if input_metadata is None or input_metadata != _static_dgrad_metadata(output_tensor):
+                continue
+
+            lane = lanes_by_metadata.get(input_metadata, 0)
+            lanes_by_metadata[input_metadata] = lane + 1
+            buffer_key = (
+                component_by_callable[consumer_idx],
+                input_metadata,
+                consumer_idx % 2,
+                lane,
+            )
+            grad_buffer = reused_buffers.get(buffer_key)
+            if grad_buffer is None:
+                grad_buffer = torch_module.empty_strided(
+                    input_tensor.shape,
+                    input_tensor.stride(),
+                    dtype=input_tensor.dtype,
+                    device=input_tensor.device,
+                )
+                reused_buffers[buffer_key] = grad_buffer
+            callable_buffers[input_idx] = grad_buffer
+        buffers_by_callable.append(callable_buffers)
+    return tuple(buffers_by_callable)
+
+
 def _refresh_module_parameter_surface(func, user_inputs, parameter_indices=None):
     """Refresh parameters after capture-time replacement hooks.
 
@@ -561,13 +911,102 @@ def _graph_context_wrapper(*args, **kwargs):
     https://github.com/pytorch/pytorch/pull/161037.
 
     """
+    torch_module = _require_torch()
     gc_is_enabled = gc.isenabled()
     if gc_is_enabled:
         gc.disable()
-    with torch.cuda.graph(*args, **kwargs):
-        yield
-    if gc_is_enabled:
-        gc.enable()
+    try:
+        with torch_module.cuda.graph(*args, **kwargs):
+            yield
+    finally:
+        if gc_is_enabled:
+            gc.enable()
+
+
+def _activation_recompute_region_groups(
+    region_indices: Optional[Sequence[int]], callable_count: int
+) -> Tuple[Tuple[int, ...], ...]:
+    """Group contiguous callables by checkpoint region.
+
+    :param region_indices: Region index for each callable, defaults to one
+        region per callable.
+    :type region_indices: Sequence[int], optional
+    :param callable_count: Number of captured callables.
+    :type callable_count: int
+    :raises TypeError: If a region index is not an integer.
+    :raises ValueError: If region indices are missing, reordered, or non-contiguous.
+    :return: Callable indices grouped in checkpoint forward order.
+    :rtype: Tuple[Tuple[int, ...], ...]
+    """
+    if region_indices is None:
+        return tuple((idx,) for idx in range(callable_count))
+    if len(region_indices) != callable_count:
+        raise ValueError("Checkpoint regions must match the number of callables")
+
+    groups = []
+    for callable_idx, region_idx in enumerate(region_indices):
+        if not isinstance(region_idx, int):
+            raise TypeError("Checkpoint region indices must be integers")
+        if not groups or groups[-1][0] != region_idx:
+            if region_idx != len(groups):
+                raise ValueError(
+                    "Checkpoint regions must be contiguous and numbered in forward order"
+                )
+            groups.append((region_idx, []))
+        groups[-1][1].append(callable_idx)
+    return tuple(tuple(indices) for _, indices in groups)
+
+
+def _activation_recompute_forward_grad_modes(
+    forward_grad_enabled: Union[bool, Sequence[bool]], callable_count: int
+) -> Tuple[bool, ...]:
+    """Canonicalize the original-forward grad mode for each callable.
+
+    :param forward_grad_enabled: One shared mode or one mode per callable.
+    :type forward_grad_enabled: Union[bool, Sequence[bool]]
+    :param callable_count: Number of captured callables.
+    :type callable_count: int
+    :raises TypeError: If a mode is not boolean.
+    :raises ValueError: If a mode sequence has the wrong length.
+    :return: Original-forward grad modes in callable order.
+    :rtype: Tuple[bool, ...]
+    """
+    if isinstance(forward_grad_enabled, bool):
+        return (forward_grad_enabled,) * callable_count
+    if not isinstance(forward_grad_enabled, Sequence):
+        raise TypeError(
+            "_activation_recompute_forward_grad_enabled must be a bool or sequence of bool"
+        )
+    if len(forward_grad_enabled) != callable_count:
+        raise ValueError("Forward grad modes must match the number of callables")
+    if not all(isinstance(mode, bool) for mode in forward_grad_enabled):
+        raise TypeError("_activation_recompute_forward_grad_enabled must contain only bool values")
+    return tuple(forward_grad_enabled)
+
+
+def _activation_recompute_capture_schedule(
+    region_groups: Sequence[Sequence[int]],
+) -> Tuple[Tuple[str, int, bool], ...]:
+    """Build region-ordered recompute and backward capture events.
+
+    :param region_groups: Callable indices grouped in checkpoint forward order.
+    :type region_groups: Sequence[Sequence[int]]
+    :return: Phase, callable index, and keep-unsharded flag for each event.
+    :rtype: Tuple[Tuple[str, int, bool], ...]
+    """
+    schedule = []
+    for region_group in reversed(region_groups):
+        if not region_group:
+            raise ValueError("Checkpoint regions must not be empty")
+        schedule.extend(
+            ("recompute", callable_idx, callable_idx == region_group[-1])
+            for callable_idx in region_group
+        )
+        schedule.extend(
+            ("backward", callable_idx, callable_idx == region_group[-1])
+            for callable_idx in reversed(region_group)
+        )
+    return tuple(schedule)
 
 
 def _make_graphed_callables(
