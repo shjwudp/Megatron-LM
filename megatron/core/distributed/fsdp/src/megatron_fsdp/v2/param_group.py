@@ -424,7 +424,6 @@ class ParameterGroup:
                 data, param_shape, self.mesh, optimizer_dtensor_placements, post_process_uneven=True
             )
             dist_param = torch.nn.Parameter(dist_data, requires_grad=param.requires_grad)
-            dist_param = torch.nn.Parameter(dist_data, requires_grad=param.requires_grad)
             # ``torch.nn.Parameter(DTensor)`` wraps the DTensor and creates a
             # fresh local tensor object, so Python-side uneven-DTensor metadata
             # attached by ``post_process_uneven=True`` is not preserved
