@@ -144,7 +144,7 @@ class ParameterGroup:
     def _create_buffer(self, dtype: torch.dtype, role: str) -> DataParallelBuffer:
         """Create a buffer and namespace its temporary bucket by role."""
         return DataParallelBuffer(
-            params=self.params,
+            tensors=self.params,
             dtype=dtype,
             device=self.device,
             mesh=self.mesh,
@@ -259,16 +259,13 @@ class ParameterGroup:
         After unshard, parameters point to full unsharded storage. FP8
         parameters rebind their TE raw payload instead of ``param.data``.
         """
-        for weight_buffer in self.weight_buffers_for_unshard(bwd_pass=bwd_pass):
-            if self.outer_dp_sharding_strategy == "optim":
-                weight_buffer.redistribute(
-                    [Placement.REPLICATE, weight_buffer.placements[1]], stream=stream
-                )
-            weight_buffer.redistribute(
-                [weight_buffer.placements[0], Placement.REPLICATE], stream=stream
-            )
-            if bind_params:
-                self.bind_params(weight_buffer)
+        weight_buffers = self.weight_buffers_for_unshard(bwd_pass=bwd_pass)
+        full_buffers = DataParallelBuffer.redistribute_buffers(
+            weight_buffers, [Placement.REPLICATE, Placement.REPLICATE], stream=stream
+        )
+        if bind_params:
+            for weight_buffer, full_buffer in zip(weight_buffers, full_buffers):
+                self.bind_params(weight_buffer, full_buffer)
         self.post_unshard(bwd_pass=bwd_pass)
 
     def bind_params(
@@ -377,6 +374,12 @@ class ParameterGroup:
         self._full_grad_buffer_has_accumulated_grad = True
 
         grad_buffer = self.main_grad_buffer
+        partial_placements = grad_buffer.placements.copy()
+        partial_placements[1] = Placement.PARTIAL
+        if self.mesh.size(0) > 1:
+            partial_placements[0] = Placement.PARTIAL
+        DataParallelBuffer.redistribute_buffers([grad_buffer], partial_placements)
+
         storage = grad_buffer.storage_placements
         if is_last_backward or grad_buffer.inner_sharded:
             inner_target = Placement.DIRTY if self.sharding_strategy == "optim" else storage[1]

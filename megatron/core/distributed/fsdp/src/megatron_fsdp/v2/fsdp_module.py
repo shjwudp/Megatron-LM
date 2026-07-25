@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
-from torch.distributed import _coalescing_manager
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
@@ -21,54 +20,6 @@ from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
 
 logger = logging.getLogger(__name__)
-
-
-def _unshard_weight_buffers(
-    outer_dp_group,
-    inner_dp_group,
-    owned_weight_buffers: List[Tuple[ParameterGroup, DataParallelBuffer]],
-    *,
-    async_op: bool,
-    stream: torch.cuda.Stream,
-    caller_stream: torch.cuda.Stream,
-) -> None:
-    """Unshard one communication-compatible buffer run by mesh dimension."""
-    # Allocate on the caller stream before entering the communication stream.
-    full_buffers = [
-        weight_buffer.fetch_buffer([Placement.REPLICATE, Placement.REPLICATE])
-        for _, weight_buffer in owned_weight_buffers
-    ]
-    if async_op:
-        stream.wait_stream(caller_stream)
-
-    def unshard_dimension(group, unshard_dim: int) -> None:
-        cm = (
-            _coalescing_manager(group, async_ops=async_op)
-            if len(owned_weight_buffers) > 1 and torch.distributed.get_world_size(group) > 1
-            else nullcontext()
-        )
-        with cm as coalescing_event:
-            for _, weight_buffer in owned_weight_buffers:
-                target_placements = weight_buffer.placements.copy()
-                target_placements[unshard_dim] = Placement.REPLICATE
-                weight_buffer.redistribute(target_placements, stream=stream)
-        if async_op and coalescing_event is not None:
-            coalescing_event.wait()
-
-    with torch.cuda.stream(stream):
-        unshard_dimension(outer_dp_group, unshard_dim=0)
-        unshard_dimension(inner_dp_group, unshard_dim=1)
-
-    # Rebinding only updates tensor metadata and stays on the caller stream.
-    for (param_group, weight_buffer), full_buffer in zip(owned_weight_buffers, full_buffers):
-        param_group.bind_params(weight_buffer, full_buffer)
-
-
-def _select_unshard_stream(ctx, *, async_op: bool):
-    """Capture the caller stream before selecting the unshard stream."""
-    caller_stream = torch.cuda.current_stream()
-    stream = ctx.ag_stream if async_op else caller_stream
-    return caller_stream, stream
 
 
 class _FSDPState:
@@ -701,7 +652,7 @@ class FSDPModule:
         """
         torch.cuda.nvtx.range_push("MFSDP unshard")
         ctx = self._fsdp_root_context
-        caller_stream, stream = _select_unshard_stream(ctx, async_op=async_op)
+        stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
 
         # Unshard this module and optionally prefetch next modules in the forward/backward pass
         if async_op and prefetch:
@@ -717,10 +668,7 @@ class FSDPModule:
             if bwd_pass and id(module) in ctx.backward_done_modules:
                 continue  # Skip prefetch for modules whose backward is already done
 
-            # Build communication-compatible runs on the caller stream. Each run
-            # processes outer-DP before inner-DP; buffer state determines whether
-            # either dimension launches a collective.
-            buffer_runs = []
+            owned_weight_buffers = []
             for param_names, param_group in module._named_param_groups:
                 # Optional NaN checking for debugging
                 if getattr(module, "_enable_nan_checks", False):
@@ -729,36 +677,18 @@ class FSDPModule:
                             dist_param._local_tensor
                         ).any(), f"NaN detected in dist param for parameter {name}"
                 for weight_buffer in param_group.weight_buffers_for_unshard(bwd_pass=bwd_pass):
-                    outer_dp_group = param_group.outer_dp_group
-                    inner_dp_group = param_group.dp_group
-                    if (
-                        buffer_runs
-                        and buffer_runs[-1][0] is outer_dp_group
-                        and buffer_runs[-1][1] is inner_dp_group
-                        and buffer_runs[-1][2] == weight_buffer.dtype
-                        and buffer_runs[-1][3] == weight_buffer.device
-                    ):
-                        buffer_runs[-1][4].append((param_group, weight_buffer))
-                    else:
-                        buffer_runs.append(
-                            (
-                                outer_dp_group,
-                                inner_dp_group,
-                                weight_buffer.dtype,
-                                weight_buffer.device,
-                                [(param_group, weight_buffer)],
-                            )
-                        )
+                    owned_weight_buffers.append((param_group, weight_buffer))
 
-            for outer_dp_group, inner_dp_group, _, _, owned_weight_buffers in buffer_runs:
-                _unshard_weight_buffers(
-                    outer_dp_group,
-                    inner_dp_group,
-                    owned_weight_buffers,
-                    async_op=async_op,
-                    stream=stream,
-                    caller_stream=caller_stream,
-                )
+            full_buffers = DataParallelBuffer.redistribute_buffers(
+                [weight_buffer for _, weight_buffer in owned_weight_buffers],
+                [Placement.REPLICATE, Placement.REPLICATE],
+                stream=stream,
+                async_op=async_op,
+            )
+            for (param_group, weight_buffer), full_buffer in zip(
+                owned_weight_buffers, full_buffers
+            ):
+                param_group.bind_params(weight_buffer, full_buffer)
 
             # Post-processing may launch Transformer Engine kernels. Defer it
             # until this module's caller stream has waited for communication.
@@ -930,14 +860,6 @@ class FSDPModule:
                         torch._foreach_copy_(stage_tensors, stage_sources)
                 if zero_tensors:
                     torch._foreach_zero_(zero_tensors)
-
-            grad_buffer = param_group.main_grad_buffer
-            grad_buffer.redistribute([grad_buffer.placements[0], Placement.PARTIAL])
-
-            # A non-HSDP mesh has a singleton outer dimension, so only HSDP
-            # produces an outer-DP contribution that still needs reduction.
-            if param_group.mesh.size(0) > 1:
-                grad_buffer.redistribute([Placement.PARTIAL, grad_buffer.placements[1]])
 
             for param in params_with_grad:
                 if param.grad is not None:

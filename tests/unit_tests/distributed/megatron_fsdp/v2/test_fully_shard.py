@@ -444,47 +444,47 @@ class TestFullyShardBasic:
 
     def test_unshard_coalescing_keeps_mixed_dtypes_separate(self, monkeypatch):
         """Coalesced all-gathers should not group buffers with different dtypes."""
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import (
-            fsdp_module as fsdp_module_mod,
-        )
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import dp_buffer as dp_buffer_mod
 
         torch.manual_seed(42)
         model = MixedDtypeBuffers(16).to(_device())
         fully_shard(model, enable_unshard_prefetch=True, enable_async_reduce_grad=False)
 
-        captured_run_dtypes = []
-        original_unshard_weight_buffers = fsdp_module_mod._unshard_weight_buffers
+        collective_dtypes = []
+        coalesced_dtype_runs = []
+        active_dtype_runs = []
+        original_all_gather = torch.distributed.all_gather_into_tensor
+        original_coalescing_manager = dp_buffer_mod._coalescing_manager
+        original_redistribute = dp_buffer_mod.DataParallelBuffer.redistribute
 
-        def capture_unshard(
-            outer_dp_group, inner_dp_group, owned_weight_buffers, *, async_op, stream, caller_stream
-        ):
-            captured_run_dtypes.append(
-                tuple(weight_buffer.dtype for _, weight_buffer in owned_weight_buffers)
-            )
-            return original_unshard_weight_buffers(
-                outer_dp_group,
-                inner_dp_group,
-                owned_weight_buffers,
-                async_op=async_op,
-                stream=stream,
-                caller_stream=caller_stream,
-            )
+        @contextmanager
+        def capture_coalescing_manager(group, *args, **kwargs):
+            dtype_run = []
+            with original_coalescing_manager(group, *args, **kwargs) as event:
+                active_dtype_runs.append(dtype_run)
+                try:
+                    yield event
+                finally:
+                    active_dtype_runs.pop()
+                    coalesced_dtype_runs.append(tuple(dtype_run))
 
-        monkeypatch.setattr(fsdp_module_mod, "_unshard_weight_buffers", capture_unshard)
+        def capture_redistribute(buffer, *args, **kwargs):
+            if active_dtype_runs:
+                active_dtype_runs[-1].append(buffer.dtype)
+            return original_redistribute(buffer, *args, **kwargs)
+
+        def capture_all_gather(output_tensor, input_tensor, *args, **kwargs):
+            collective_dtypes.append(input_tensor.dtype)
+            return original_all_gather(output_tensor, input_tensor, *args, **kwargs)
+
+        monkeypatch.setattr(dp_buffer_mod, "_coalescing_manager", capture_coalescing_manager)
+        monkeypatch.setattr(dp_buffer_mod.DataParallelBuffer, "redistribute", capture_redistribute)
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", capture_all_gather)
 
         try:
             model.unshard(async_op=True)
-            assert captured_run_dtypes
-            assert {dtype for run_dtypes in captured_run_dtypes for dtype in run_dtypes} == {
-                torch.float32,
-                torch.uint8,
-            }
-            assert len(captured_run_dtypes) >= 2
-            for run_dtypes in captured_run_dtypes:
-                assert len(set(run_dtypes)) == 1, (
-                    "Unshard coalescing must keep mixed dtype buffers in separate runs, "
-                    f"got {run_dtypes}"
-                )
+            assert set(collective_dtypes) == {torch.float32, torch.uint8}
+            assert all(len(set(dtype_run)) == 1 for dtype_run in coalesced_dtype_runs)
         finally:
             model.reshard()
 
@@ -538,9 +538,7 @@ class TestFullyShardBasic:
     @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
     def test_weight_unshard_coalesces_outer_before_inner(self, monkeypatch, outer_strategy):
         """Outer runs should finish before inner AGs; no_shard outer is a no-op."""
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import (
-            fsdp_module as fsdp_module_mod,
-        )
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import dp_buffer as dp_buffer_mod
         from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import DataParallelBuffer
 
         torch.manual_seed(42)
@@ -556,7 +554,7 @@ class TestFullyShardBasic:
         )
 
         original_redistribute = DataParallelBuffer.redistribute
-        original_coalescing_manager = fsdp_module_mod._coalescing_manager
+        original_coalescing_manager = dp_buffer_mod._coalescing_manager
         original_all_gather = torch.distributed.all_gather_into_tensor
         manager_groups = []
         active_manager_groups = []
@@ -601,22 +599,27 @@ class TestFullyShardBasic:
             return original_all_gather(*args, **kwargs)
 
         monkeypatch.setattr(DataParallelBuffer, "redistribute", capture_redistribute)
-        monkeypatch.setattr(fsdp_module_mod, "_coalescing_manager", capture_coalescing_manager)
+        monkeypatch.setattr(dp_buffer_mod, "_coalescing_manager", capture_coalescing_manager)
         monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", capture_all_gather)
 
         try:
             model.unshard(async_op=True)
-            assert len(manager_groups) == 2
+            expected_manager_groups = (
+                [outer_dp_group, inner_dp_group] if outer_strategy == "optim" else [inner_dp_group]
+            )
+            assert len(manager_groups) == len(expected_manager_groups)
             assert all(
                 actual is expected
-                for actual, expected in zip(manager_groups, [outer_dp_group, inner_dp_group])
+                for actual, expected in zip(manager_groups, expected_manager_groups)
             )
-            expected_unshard_calls = [
-                (id(first_buffer), 0, outer_dp_group),
-                (id(second_buffer), 0, outer_dp_group),
-                (id(first_buffer), 1, inner_dp_group),
-                (id(second_buffer), 1, inner_dp_group),
-            ]
+            expected_unshard_calls = []
+            if outer_strategy == "optim":
+                expected_unshard_calls.extend(
+                    [(id(first_buffer), 0, outer_dp_group), (id(second_buffer), 0, outer_dp_group)]
+                )
+            expected_unshard_calls.extend(
+                [(id(first_buffer), 1, inner_dp_group), (id(second_buffer), 1, inner_dp_group)]
+            )
             assert len(unshard_calls) == len(expected_unshard_calls)
             assert all(
                 actual_buffer == expected_buffer

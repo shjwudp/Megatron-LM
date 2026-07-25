@@ -164,8 +164,7 @@ module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
 ### `FSDPModule.unshard(async_op, bwd_pass)`
 
 ```python
-caller_stream = torch.cuda.current_stream()  # capture before any stream switch
-stream = ctx.ag_stream if async_op else caller_stream
+stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
 
 # Build the work list: self + (optionally) next module to prefetch
 if async_op:
@@ -177,42 +176,21 @@ for module in [self] + prefetch:
     if all(pg.has_unsharded_weight_buffers(bwd_pass=bwd_pass) for pg in module._fsdp_param_groups):
         continue          # Required buffers are already unsharded — skip
 
-    # Caller stream: group consecutive buffers that have matching outer/inner
-    # process groups, dtype, and device.
-    buffer_runs = build_buffer_runs(module, bwd_pass=bwd_pass)
-    for outer_dp_group, inner_dp_group, weight_buffers in buffer_runs:
-        full_buffers = [buffer.fetch_buffer((0, 0)) for buffer in weight_buffers]
+    owned_weight_buffers = [
+        (param_group, buffer)
+        for _, param_group in module._named_param_groups
+        for buffer in param_group.weight_buffers_for_unshard(bwd_pass=bwd_pass)
+    ]
+    full_buffers = DataParallelBuffer.redistribute_buffers(
+        [buffer for _, buffer in owned_weight_buffers],
+        [Placement.REPLICATE, Placement.REPLICATE],
+        stream=stream,
+        async_op=async_op,
+    )
 
-        # The wait is inserted after allocation/preparation so all caller work
-        # needed by this run is visible to the communication stream.
-        if async_op:
-            stream.wait_stream(caller_stream)
-
-        def unshard_dimension(group, unshard_dim):
-            cm = (
-                _coalescing_manager(group, async_ops=async_op)
-                if len(weight_buffers) > 1
-                and torch.distributed.get_world_size(group) > 1
-                else nullcontext()
-            )
-            with cm as coalescing_event:
-                for buffer in weight_buffers:
-                    buffer.unshard(
-                        unshard_dim=unshard_dim,
-                        bind_params=False,
-                        stream=stream,
-                    )
-            if async_op and coalescing_event is not None:
-                coalescing_event.wait()
-
-        with torch.cuda.stream(stream):
-            # Buffer state decides whether either dimension needs a collective.
-            unshard_dimension(outer_dp_group, unshard_dim=0)
-            unshard_dimension(inner_dp_group, unshard_dim=1)
-
-        # Caller stream: rebind tensor metadata; do not run TE post-processing yet.
-        for buffer, full_buffer in zip(weight_buffers, full_buffers):
-            param_group.bind_params(buffer, full_buffer)
+    # Caller stream: rebind tensor metadata; do not run TE post-processing yet.
+    for (param_group, buffer), full_buffer in zip(owned_weight_buffers, full_buffers):
+        param_group.bind_params(buffer, full_buffer)
 
     ctx.unshard_pending_post[id(module)].add(bwd_pass)
 
@@ -248,26 +226,27 @@ free; all all-gather outputs also record `ag_stream` so the allocator cannot rec
 temporary buffer while communication is still using it.
 
 **Stream ordering barrier.** When `async_op=True`, the caller stream is captured before
-any stream switch. Each communication run allocates its output buffer and completes shard
-preparation first, then inserts `ag_stream.wait_stream(caller_stream)` immediately before
-launching the all-gather. This ensures caller-stream allocations and writes are visible to
-the collective without making `ag_stream` wait for future compute. The edge also makes
-`ag_stream` join a full-iteration CUDA graph capture before the capture stream waits on
-the recorded unshard event; otherwise CUDA reports `cudaErrorStreamCaptureIsolation` at
-the first captured async unshard.
+any stream switch inside `redistribute_buffers()`. The batch allocates final output
+buffers and completes shard preparation first, then inserts
+`ag_stream.wait_stream(caller_stream)` immediately before launching the all-gathers.
+This ensures caller-stream allocations and writes are visible to the collective without
+making `ag_stream` wait for future compute. The edge also makes `ag_stream` join a
+full-iteration CUDA graph capture before the capture stream waits on the recorded
+unshard event; otherwise CUDA reports `cudaErrorStreamCaptureIsolation` at the first
+captured async unshard.
 
 **NVTX profiling.** `unshard()`, `reshard()`, and `reduce_grad()` each push/pop a
 `torch.cuda.nvtx` range (`"MFSDP unshard"`, `"MFSDP reshard"`, `"MFSDP reduce_grad"`)
 for profiling visibility in tools like Nsight Systems.
 
-**All-gather coalescing.** `FSDPModule.unshard()` groups consecutive weight buffers
-that have the same outer-DP group, inner-DP group, dtype, and device. Each run processes
+**All-gather coalescing.** `FSDPModule.unshard()` supplies the final replicated target;
+`DataParallelBuffer.redistribute_buffers()` derives mesh-axis order and groups consecutive
+buffers with the same process group, dtype, device, and source placement. It completes
 the outer dimension before the inner dimension, and each dimension uses one grouped
-launch when it contains multiple buffers and its process group has more than one rank.
-Buffer state determines whether a given `unshard()` call actually launches a collective,
-so clean outer-optim buffers and unsharded dimensions remain fast paths. Each
-`ParameterGroup` still owns its buffers and post-processing. With `async_ops=True`,
-the coalescing manager owns the resulting `Work`; the async path calls
+launch when it contains multiple compatible buffers and its process group has more than
+one rank. Buffer state determines whether a placement needs a collective. Each
+`ParameterGroup` still owns binding and post-processing. With `async_ops=True`, the
+coalescing manager owns the resulting `Work`; the async path calls
 `coalescing_event.wait()` while `ag_stream` is current before advancing to the next
 dimension or recording the module event.
 

@@ -12,7 +12,7 @@ implementations remain valid while responsibilities move to their intended owner
 
 - a `DeviceMesh` identifies the data-parallel topology;
 - one logical placement per mesh dimension describes the current distribution;
-- a `BufferIndex` maps logical parameter ranges to local flat storage;
+- a `BufferIndex` maps logical tensor ranges to local flat storage;
 - redistribution changes placements and returns the resulting tensor view;
 - persistent and temporary storage have explicit lifetimes.
 
@@ -36,6 +36,7 @@ The buffer owns storage and distribution mechanics:
 - persistent flat storage and temporary unsharded storage;
 - allocator keys and storage release;
 - one-axis-at-a-time redistribution;
+- target-driven axis planning and coalescing for compatible buffers;
 - local item and shard views.
 
 The buffer derives a process group from `mesh.get_group(mesh_dim=changed_axis)` only
@@ -63,13 +64,14 @@ copy-versus-accumulate is gradient-accumulation state, not a storage property.
 
 The module runtime owns scheduling:
 
-- grouping compatible buffers for coalesced communication;
 - selecting communication streams;
-- ordering outer- then inner-mesh redistribution;
+- selecting the target placements for a module operation;
 - prefetch, event, and hook coordination.
 
-Every scheduled weight buffer travels with its owning `ParameterGroup`. After a
-coalesced all-gather, the module asks that owner to bind the full buffer.
+Every scheduled weight buffer travels with its owning `ParameterGroup`.
+`DataParallelBuffer.redistribute_buffers()` derives compatibility and mesh-axis
+ordering from the buffers and target placements. After redistribution, the module
+asks each owner to bind its full buffer.
 
 ### MixedPrecisionPolicy
 
@@ -101,25 +103,29 @@ storage, plus valid ranges, separately.
 
 Only one mesh placement changes per `redistribute()` call. This keeps the operation
 equivalent to applying one DTensor redistribution step and makes the selected mesh
-dimension unambiguous.
+dimension unambiguous. `redistribute_buffers()` is the batch planner: it applies that
+primitive axis by axis, coalescing only buffers with the same process group, dtype,
+device, and source placement.
 
 ## Core Operations
 
 ```text
-ParameterGroup                         DataParallelBuffer
---------------                         ------------------
-select target placement  ----------->  redistribute(target)
-                                      derive group from mesh axis
-                                      execute collective / view change
-                         <-----------  result tensor
-commit or accumulate result
-bind parameter views
+FSDPModule / ParameterGroup             DataParallelBuffer
+---------------------------             ------------------
+select final target  ---------------->  redistribute_buffers(target)
+                                        group compatible buffers
+                                        apply one-axis redistribute()
+                           <----------  result tensors
+ParameterGroup commits results
+ParameterGroup binds parameter views
 ```
 
 `redistribute()` updates the buffer placement and returns the tensor produced by that
 transition. Returning a tensor is important: communication may use a temporary dtype
 workspace whose result is not yet in persistent storage. `ParameterGroup` decides how
-to consume that result.
+to consume that result. Batch redistribution is therefore used only where intermediate
+outputs need no parameter-group decision, such as weight all-gather or marking staged
+gradients partial.
 
 ## Use Cases
 
@@ -132,23 +138,27 @@ to consume that result.
 
 ### Weight unshard and reshard
 
-1. `FSDPModule` builds runs of `(ParameterGroup, DataParallelBuffer)` pairs that share
-   mesh groups, dtype, and device.
-2. Each buffer redistributes the outer placement and then the inner placement to
-   `REPLICATE`.
+1. `FSDPModule` collects `(ParameterGroup, DataParallelBuffer)` ownership pairs and
+   requests the final `[REPLICATE, REPLICATE]` target.
+2. `DataParallelBuffer.redistribute_buffers()` groups compatible buffers and
+   redistributes the outer placement before the inner placement.
 3. The owning group binds its parameters to the resulting full buffer.
 4. Resharding returns each buffer to its persistent placements and releases temporary
    full storage.
 
 ### Gradient reduction
 
-1. `ParameterGroup` stages gradients and selects the target placement for the current
-   sharding strategy.
+1. `ParameterGroup` marks staged gradients `PARTIAL` on the active DP mesh dimensions.
 2. The gradient buffer performs all-reduce or reduce-scatter for the selected mesh
    axis.
 3. `ParameterGroup.commit_comm_output()` copies or accumulates the result according to
    microbatch state.
 4. The group exposes the resulting shards through optimizer-facing DTensors.
+
+Gradient reduction intentionally does not use a single batched final target. Inner-DP
+must reduce first, its result must be committed or accumulated, and only then may
+outer-DP consume it. Keeping those one-axis transitions in `ParameterGroup` makes that
+data dependency explicit.
 
 ### Main-weight update
 
@@ -171,6 +181,8 @@ state.
 - `len(placements) == mesh.ndim`.
 - `storage_placements` describe the persistent tensor allocation.
 - `redistribute()` changes at most one placement per call.
+- `redistribute_buffers()` completes each mesh axis across compatible buffers before
+  advancing to the next axis.
 - parameter identity and `param_idx` are owned by `ParameterGroup`.
 - only `ParameterGroup` binds storage to parameters.
 - only `ParameterGroup` decides whether a communication result overwrites or
@@ -185,7 +197,7 @@ state.
 - Store `DeviceMesh` instead of cached outer/inner process groups.
 - Move parameter binding from `DataParallelBuffer` to `ParameterGroup`.
 - Move communication-result commit from `DataParallelBuffer` to `ParameterGroup`.
-- Carry owners through coalesced unshard scheduling.
+- Move compatible-buffer grouping and mesh-axis planning out of `FSDPModule`.
 - Preserve placement transitions, collective selection, and allocation behavior.
 
 ### Phase 2: separate layout and storage

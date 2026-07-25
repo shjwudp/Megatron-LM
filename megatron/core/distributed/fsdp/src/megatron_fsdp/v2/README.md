@@ -170,6 +170,7 @@ Flat buffer managing (a shard of) parameter/gradient data:
 
 - Stores a `DeviceMesh` plus DTensor-like logical placements
 - Derives the process group for the placement axis being redistributed
+- Plans target-driven, axis-ordered redistribution for compatible buffer batches
 - Manages persistent, sharded, and temporary full-buffer tensor views
 - Uses `BufferIndex` to track parameter layout within the buffer
 

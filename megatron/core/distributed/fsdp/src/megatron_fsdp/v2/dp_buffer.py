@@ -1,9 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import enum
+from contextlib import nullcontext
+from itertools import groupby
 from typing import List, Optional
 
 import torch
+from torch.distributed import _coalescing_manager
 from torch.distributed.tensor import DeviceMesh
 
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
@@ -38,16 +41,16 @@ class Placement(enum.Enum):
 
 
 class DataParallelBuffer:
-    """Manage mesh-aware flat storage for a parameter group's tensor values.
+    """Manage mesh-aware flat storage for tensor values.
 
     The buffer owns layout, placement transitions, and storage lifecycle. It
-    does not retain parameter identities or bind storage back to parameters;
-    those operations belong to the owning ``ParameterGroup``.
+    does not retain tensor identities or bind storage to consumers; those
+    operations belong to the owning ``ParameterGroup``.
     """
 
     def __init__(
         self,
-        params: List[torch.nn.Parameter],
+        tensors: List[torch.Tensor],
         dtype: torch.dtype,
         device: torch.device,
         mesh: DeviceMesh,
@@ -95,9 +98,9 @@ class DataParallelBuffer:
 
         # Always build layout with logical shapes and shared chunk_size_factor
         # so that all buffers share the same proportional item-offset mapping.
-        _logical_shapes = [p.shape for p in params]
+        logical_shapes = [tensor.shape for tensor in tensors]
         self.buffer_index = BufferIndex(
-            param_shapes=_logical_shapes,
+            param_shapes=logical_shapes,
             mesh=mesh,
             chunk_size_factor=chunk_size_factor,
             param_group_id=param_group_id,
@@ -106,9 +109,9 @@ class DataParallelBuffer:
         # Compact NVFP4 weight buffers: scale all indices proportionally so
         # the buffer holds only the packed data without fragment-binning waste.
         if buffer_role in ("model_weight", "transpose_weight") and any(
-            mp_policy.is_nvfp4_param(p) for p in params
+            mp_policy.is_nvfp4_param(tensor) for tensor in tensors
         ):
-            compact_shapes = mp_policy.get_param_storage_shapes(params)
+            compact_shapes = mp_policy.get_param_storage_shapes(tensors)
             self.buffer_index.compact(0.5, compact_shapes)
 
         # Dirty has larger physical storage, but buffers are never initialized as Dirty.
@@ -167,7 +170,7 @@ class DataParallelBuffer:
     def set_item(
         self, item_id: int, item_data: torch.Tensor, *, placements: Optional[list[Placement]] = None
     ) -> None:
-        """Write a parameter tensor into the corresponding region of the buffer."""
+        """Write a tensor item into its corresponding region of the buffer."""
         requested_placements = placements if placements is not None else self.placements
         assert not any(
             placement is Placement.DIRTY for placement in requested_placements
@@ -184,7 +187,7 @@ class DataParallelBuffer:
     def get_item(
         self, item_id: int, *, placements: Optional[list[Placement]] = None
     ) -> torch.Tensor:
-        """Read a parameter tensor (or its shard) from the buffer."""
+        """Read a tensor item (or its shard) from the buffer."""
         requested_placements = placements if placements is not None else self.placements
         assert not any(
             placement is Placement.DIRTY for placement in requested_placements
@@ -199,6 +202,71 @@ class DataParallelBuffer:
     def is_unsharded(self) -> bool:
         """Return whether this buffer currently has a full unsharded view."""
         return all(placement is Placement.REPLICATE for placement in self.placements)
+
+    @staticmethod
+    @torch.no_grad()
+    def redistribute_buffers(
+        buffers: list["DataParallelBuffer"],
+        target_placements: list[Placement],
+        *,
+        stream: torch.cuda.Stream | None = None,
+        async_op: bool = False,
+    ) -> list[torch.Tensor]:
+        """Redistribute compatible buffers to one target placement vector.
+
+        The target defines the mesh-axis plan. Each axis is completed across
+        communication-compatible buffers before the next axis starts, preserving
+        HSDP outer-then-inner ordering and cross-buffer collective coalescing.
+        """
+        if not buffers:
+            return []
+        if any(len(target_placements) != buffer.mesh.ndim for buffer in buffers):
+            raise ValueError(
+                f"Expected {buffers[0].mesh.ndim} target placements, got {target_placements}"
+            )
+
+        caller_stream = torch.cuda.current_stream()
+        stream = stream or caller_stream
+
+        # Allocate final outputs on the caller stream before communication can
+        # run asynchronously on a separate stream.
+        outputs = [buffer.fetch_buffer(target_placements) for buffer in buffers]
+        if stream != caller_stream:
+            stream.wait_stream(caller_stream)
+
+        def compatibility_key(buffer: "DataParallelBuffer", mesh_dim: int):
+            group = buffer.mesh.get_group(mesh_dim=mesh_dim)
+            return id(group), buffer.dtype, buffer.device, buffer.placements[mesh_dim]
+
+        with torch.cuda.stream(stream):
+            for mesh_dim, target in enumerate(target_placements):
+                for _, compatible_buffers_iter in groupby(
+                    buffers, key=lambda buffer: compatibility_key(buffer, mesh_dim)
+                ):
+                    compatible_buffers = [
+                        buffer
+                        for buffer in compatible_buffers_iter
+                        if buffer.placements[mesh_dim] is not target
+                    ]
+                    if not compatible_buffers:
+                        continue
+
+                    group = compatible_buffers[0].mesh.get_group(mesh_dim=mesh_dim)
+                    context = (
+                        _coalescing_manager(group, async_ops=async_op)
+                        if len(compatible_buffers) > 1
+                        and torch.distributed.get_world_size(group) > 1
+                        else nullcontext()
+                    )
+                    with context as coalescing_event:
+                        for buffer in compatible_buffers:
+                            axis_target = buffer.placements.copy()
+                            axis_target[mesh_dim] = target
+                            buffer.redistribute(axis_target, stream=stream)
+                    if async_op and coalescing_event is not None:
+                        coalescing_event.wait()
+
+        return outputs
 
     @torch.no_grad()
     def redistribute(
