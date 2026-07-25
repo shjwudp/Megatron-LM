@@ -12,7 +12,7 @@
 | `fsdp_module.py` | `FSDPModule`, `_FSDPRootContext`, `_FSDPState`, `unshard()`, `reshard()`, `reduce_grad()` |
 | `hooks.py` | Forward/backward hook registration and final callback |
 | `param_group.py` | `ParameterGroup.unshard()`, `reduce_grad()`, `release_grad_buffer()`, `_init_buffers()` (memory optimization) |
-| `dp_buffer.py` | `DataParallelBuffer.unshard()` (all-gather + `p.data` rebind), `reduce_grad()` (reduce-scatter + shard accumulation) |
+| `dp_buffer.py` | Placement-based `DataParallelBuffer.redistribute()`, communication-output commit, and parameter binding |
 | `allocator.py` | `BucketAllocator` hierarchy: `TemporaryBucketAllocator`, `StorageFreeingBucketAllocator`, `TracePoolAllocator` — pooled memory for unsharded parameter and gradient buffers |
 | `mcore_fsdp_adapter.py` | `FullyShardedDataParallel.stop_communication()` — synchronizes ag_stream and rs_stream into main stream |
 | `utils.py` | V2-to-v1 compatibility proxy used by the existing EP-overlap schedule |
@@ -181,7 +181,8 @@ for module in [self] + prefetch:
     # process groups, dtype, and device.
     buffer_runs = build_buffer_runs(module, bwd_pass=bwd_pass)
     for outer_dp_group, inner_dp_group, weight_buffers in buffer_runs:
-        full_buffers = [buffer.fetch_buffer((0, 0)) for buffer in weight_buffers]
+        full_placements = [Placement.REPLICATE, Placement.REPLICATE]
+        full_buffers = [buffer.fetch_buffer(full_placements) for buffer in weight_buffers]
 
         # The wait is inserted after allocation/preparation so all caller work
         # needed by this run is visible to the communication stream.
@@ -197,11 +198,9 @@ for module in [self] + prefetch:
             )
             with cm as coalescing_event:
                 for buffer in weight_buffers:
-                    buffer.unshard(
-                        unshard_dim=unshard_dim,
-                        bind_params=False,
-                        stream=stream,
-                    )
+                    target_placements = buffer.placements.copy()
+                    target_placements[unshard_dim] = Placement.REPLICATE
+                    buffer.redistribute(target_placements, stream=stream)
             if async_op and coalescing_event is not None:
                 coalescing_event.wait()
 
@@ -295,9 +294,9 @@ if pending_post and unshard_event is not None:
     unshard_event.wait()  # skipped prefetch: join AG before freeing its buffer
 
 for param_names, param_group in self._named_param_groups:
-    param_group.reshard()                           # → DataParallelBuffer.reshard()
-                                                    #   frees TemporaryBucketAllocator bucket
-                                                    #   sets _unsharded_buffer = None
+    param_group.reshard()                   # → DataParallelBuffer.redistribute()
+                                            #   frees TemporaryBucketAllocator bucket
+                                            #   sets _unsharded_buffer = None
     for name, dist_param in zip(param_names, param_group.dist_params):
         _replace_module_parameter(self, name, dist_param)   # reinstall sharded DTensor
 ctx.unshard_done_events[id(self)] = None    # reset so next iteration can prefetch again
@@ -338,7 +337,7 @@ def reduce_grad(self, async_op: bool = False):
                     event.wait()
                     param_group.release_grad_buffer()
                     #   → deletes param.main_grad views (prevents TE grad-accum-fusion leak)
-                    #   → DataParallelBuffer.reshard() (frees unsharded grad bucket)
+                    #   → release_unsharded_buffer() (frees unsharded grad bucket)
             if module is self: break
 
     # --- Step 2: Stage .grad → main_grad_buffer ---
@@ -389,10 +388,8 @@ def reduce_grad(self, async_op: bool = False):
         # --- Step 3: Reduce-scatter on rs_stream ---
         if async_op:
             param_group.reduce_grad(stream=stream)
-            #   → DataParallelBuffer.reduce_grad() (synchronous within this stream):
-            #       fetch_unsharded_buffer() allocates full grad buffer
-            #       reduce_scatter_tensor(output=grad_shard, input=full_grad)
-            #       self.data[local_idx:...] += grad_shard
+            #   → DataParallelBuffer.redistribute() (synchronous within this stream)
+            #   → DataParallelBuffer.commit_comm_output() (copy or accumulate result)
             event = stream.record_event()
             ctx.reduce_grad_buckets[id(self)].append((event, param_group))
             # param_group.release_grad_buffer() is NOT called here; deferred until drain/final CB
@@ -410,7 +407,7 @@ def reduce_grad(self, async_op: bool = False):
                 setattr(dist_param, "grad", dist_grad)          # Python ref, no GPU dependency
 ```
 
-**Key design point — `DataParallelBuffer.reduce_grad()` has no `async_op` parameter.**
+**Key design point — `DataParallelBuffer.redistribute()` has no `async_op` parameter.**
 The operation is inherently synchronous *within its selected stream*. The caller passes
 `rs_stream` through `ParameterGroup.reduce_grad(stream=...)`, and the buffer implementation
 uses that stream for the collective. This avoids exposing asynchronous work handles through
@@ -539,17 +536,17 @@ optimizer-facing DTensor shards through `dist_params`.
 For ZeRO-1/2, `copy_main_weights_to_model_weights()` marks the replicated
 `DataParallelBuffer` dirty when `main_weight_buffer` is sharded and
 `model_weight_buffer` is replicated. The next normal unshard for that buffer
-calls `DataParallelBuffer.unshard()`, which refreshes any dirty replicated
+calls `DataParallelBuffer.redistribute()`, which refreshes any dirty replicated
 buffer before compute:
 
 1. Non-FP8 weights copy this rank's updated main-weight shard into the matching
    slice of the replicated model-weight buffer.
 2. FP8 weights quantize the local FP32 main-weight shard into the local FP8
    model-weight shard first; MXFP8 marks the transpose buffer dirty as well.
-3. `DataParallelBuffer.unshard(bind_params=...)` sees the dirty flag and gathers
+3. `DataParallelBuffer.redistribute()` sees the `DIRTY` placement and gathers
    the updated shards directly into the full replicated compute buffer on every
-   rank, then clears the flag. The same call can bind params to `self.data` for
-   the current compute phase.
+   rank. `bind_params()` then binds the refreshed buffer for the current compute
+   phase.
 
 The rowwise/model buffer is refreshed on forward unshard. For MXFP8, the
 transpose buffer is refreshed on backward unshard, where
@@ -736,33 +733,24 @@ final_callback:
 
 ---
 
-## `DataParallelBuffer.reduce_grad()` — Implementation Note
+## `DataParallelBuffer.redistribute()` — Gradient Reduction
 
-No `async_op` parameter is needed. The method is purely synchronous within the calling stream:
+No `async_op` parameter is needed. The method is synchronous within the selected stream and
+returns the communication result for the caller to commit:
 
 ```python
-def reduce_grad(self, *, accumulate_reduced_grad=False, reduce_scatter=True):
-    input_buffer = self.fetch_buffer(input_shard_layout)
-    output_buffer = self.fetch_buffer(output_shard_layout)
-
-    if not reduce_scatter:
-        torch.distributed.all_reduce(input_buffer, group=group)
-        return
-
-    reduced_grad = input_buffer[output_offset : output_offset + output_buffer.numel()]
-    torch.distributed.reduce_scatter_tensor(
-        output=reduced_grad, input=input_buffer, group=group
-    )
-    if output_buffer.data_ptr() != reduced_grad.data_ptr():
-        if accumulate_reduced_grad:
-            output_buffer += reduced_grad
-        else:
-            output_buffer.copy_(reduced_grad)
+comm_output = grad_buffer.redistribute(target_placements, stream=stream)
+grad_buffer.commit_comm_output(
+    comm_output,
+    changed_axis,
+    stream=stream,
+    accumulate=accumulate_reduced_grad,
+)
 ```
 
-The caller (`FSDPModule.reduce_grad`) provides the stream context; `DataParallelBuffer`
-just does the collective. This clean separation means `DataParallelBuffer` requires no
-modifications for the overlap feature.
+`redistribute()` launches all-reduce or reduce-scatter for a `PARTIAL` source placement.
+`commit_comm_output()` keeps communication and persistent-buffer accumulation separate.
+Singleton process groups use a local copy or scale instead of launching a collective.
 
 ---
 
