@@ -35,6 +35,7 @@ v2/
     ├── full_iteration_cuda_graph_design.md    # Full-iteration CUDA graph design
     ├── hsdp_design.md                         # HSDP mesh, buffer layouts, and conversions
     ├── hooks_api.md                           # Hook API contracts and Q&A
+    ├── dp_buffer_design.md                    # DP buffer and ParameterGroup ownership
     ├── lazy_grad_buffer_design.md             # Lazy main grad buffer lifecycle
     ├── mixed_precision_training_design.md     # Mixed precision training support
     └── mcore_fsdp_checkpoint_design.md        # Checkpoint save/load and conversion design
@@ -167,10 +168,14 @@ for the full per-module architecture.
 
 Flat buffer managing (a shard of) parameter/gradient data:
 
-- `unshard()` — all-gather to full tensor
-- `reshard()` — free temporary buffer
-- `reduce_grad()` — all-reduce no-shard grads or reduce-scatter ZeRO grads
+- Stores a `DeviceMesh` plus DTensor-like logical placements
+- Derives the process group for the placement axis being redistributed
+- Manages persistent, sharded, and temporary full-buffer tensor views
 - Uses `BufferIndex` to track parameter layout within the buffer
+
+Parameter binding, gradient-result accumulation, and transformation ordering belong
+to `ParameterGroup`. See
+[the data-parallel buffer design](design/dp_buffer_design.md) for the ownership model.
 
 ### ParameterGroup
 

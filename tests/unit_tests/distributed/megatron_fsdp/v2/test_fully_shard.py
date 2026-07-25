@@ -456,15 +456,15 @@ class TestFullyShardBasic:
         original_unshard_weight_buffers = fsdp_module_mod._unshard_weight_buffers
 
         def capture_unshard(
-            outer_dp_group, inner_dp_group, weight_buffers, *, async_op, stream, caller_stream
+            outer_dp_group, inner_dp_group, owned_weight_buffers, *, async_op, stream, caller_stream
         ):
             captured_run_dtypes.append(
-                tuple(weight_buffer.dtype for weight_buffer in weight_buffers)
+                tuple(weight_buffer.dtype for _, weight_buffer in owned_weight_buffers)
             )
             return original_unshard_weight_buffers(
                 outer_dp_group,
                 inner_dp_group,
-                weight_buffers,
+                owned_weight_buffers,
                 async_op=async_op,
                 stream=stream,
                 caller_stream=caller_stream,
@@ -569,12 +569,11 @@ class TestFullyShardBasic:
 
         assert len(weight_buffers) == 2
         first_buffer, second_buffer = weight_buffers
-        assert first_buffer.outer_dp_group is second_buffer.outer_dp_group
-        assert first_buffer.inner_dp_group is second_buffer.inner_dp_group
+        assert first_buffer.mesh is second_buffer.mesh
         assert first_buffer.dtype == second_buffer.dtype
         assert first_buffer.device == second_buffer.device
-        outer_dp_group = first_buffer.outer_dp_group
-        inner_dp_group = first_buffer.inner_dp_group
+        outer_dp_group = first_buffer.mesh.get_group(mesh_dim=0)
+        inner_dp_group = first_buffer.mesh.get_group(mesh_dim=1)
 
         if outer_strategy == "optim":
             for weight_buffer in weight_buffers:
@@ -694,10 +693,12 @@ class TestFullyShardBasic:
 
         outer_replicas = [
             torch.empty_like(model_buffer.data)
-            for _ in range(torch.distributed.get_world_size(model_buffer.outer_dp_group))
+            for _ in range(
+                torch.distributed.get_world_size(model_buffer.mesh.get_group(mesh_dim=0))
+            )
         ]
         torch.distributed.all_gather(
-            outer_replicas, model_buffer.data, group=model_buffer.outer_dp_group
+            outer_replicas, model_buffer.data, group=model_buffer.mesh.get_group(mesh_dim=0)
         )
         assert all(torch.equal(replica, outer_replicas[0]) for replica in outer_replicas[1:])
 
@@ -1347,7 +1348,7 @@ class TestActivationCheckpointing:
             model_buffer.buffer_index.bucket_meta.size, dtype=model_buffer.dtype, device=device
         )
         torch.distributed.all_gather_into_tensor(
-            expected_full, model_buffer.data, group=model_buffer.inner_dp_group
+            expected_full, model_buffer.data, group=model_buffer.mesh.get_group(mesh_dim=1)
         )
 
         observed_full = []

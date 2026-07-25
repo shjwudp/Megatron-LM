@@ -145,7 +145,6 @@ class ParameterGroup:
         """Create a buffer and namespace its temporary bucket by role."""
         return DataParallelBuffer(
             params=self.params,
-            param_idx=self.param_idx,
             dtype=dtype,
             device=self.device,
             mesh=self.mesh,
@@ -222,7 +221,7 @@ class ParameterGroup:
 
         for weight_buffer in (self.model_weight_buffer, self.transpose_weight_buffer):
             if weight_buffer is not None and not weight_buffer.inner_sharded:
-                weight_buffer.bind_params(weight_buffer.data)
+                self.bind_params(weight_buffer, weight_buffer.data)
 
         # Create gradient buffer
         if self.requires_grad:
@@ -269,8 +268,54 @@ class ParameterGroup:
                 [weight_buffer.placements[0], Placement.REPLICATE], stream=stream
             )
             if bind_params:
-                weight_buffer.bind_params()
+                self.bind_params(weight_buffer)
         self.post_unshard(bwd_pass=bwd_pass)
+
+    def bind_params(
+        self, weight_buffer: DataParallelBuffer, buffer: Optional[torch.Tensor] = None
+    ) -> None:
+        """Bind this group's parameters to a fully replicated weight buffer."""
+        if weight_buffer is self.model_weight_buffer:
+            buffer_role = "model_weight"
+        elif weight_buffer is self.transpose_weight_buffer:
+            buffer_role = "transpose_weight"
+        else:
+            raise ValueError("Parameters may only be bound to this group's weight buffers")
+        if buffer is None:
+            assert weight_buffer.is_unsharded(), "Cannot bind params from a sharded buffer"
+            buffer = weight_buffer.fetch_buffer(weight_buffer.placements)
+        assert buffer.numel() == weight_buffer.buffer_index.bucket_meta.size, (
+            f"Buffer size {buffer.numel()} does not match expected size "
+            f"{weight_buffer.buffer_index.bucket_meta.size}"
+        )
+        for param in self.params:
+            item_id = self.param_idx[param]
+            start, end = weight_buffer.buffer_index._get_item_global_range(item_id)
+            item_shape = weight_buffer.buffer_index.item_index_map[item_id].shape
+            param_data = buffer[start:end].view(item_shape)
+            self.mp_policy.bind_unsharded_param(param, param_data, buffer_role)
+
+    @torch.no_grad()
+    def commit_comm_output(
+        self,
+        grad_buffer: DataParallelBuffer,
+        comm_output: torch.Tensor,
+        changed_axis: int,
+        *,
+        stream: Optional[torch.cuda.Stream] = None,
+        accumulate: bool = False,
+    ) -> None:
+        """Commit a gradient redistribution result into this group's storage."""
+        if grad_buffer is not self.main_grad_buffer:
+            raise ValueError("Communication output may only target this group's grad buffer")
+        output_buffer = grad_buffer.fetch_buffer(grad_buffer.placements)
+        with torch.cuda.stream(stream or torch.cuda.current_stream()):
+            if output_buffer.data_ptr() != comm_output.data_ptr():
+                if accumulate:
+                    output_buffer.add_(comm_output)
+                else:
+                    output_buffer.copy_(comm_output)
+        grad_buffer.release_redistribution_workspace(changed_axis)
 
     def has_unsharded_weight_buffers(self, bwd_pass: bool = False) -> bool:
         """Return whether this phase can skip launching another distributed unshard."""
@@ -296,6 +341,11 @@ class ParameterGroup:
     def copy_main_weights_to_model_weights(self):
         """Install optimized main weights into model compute weights."""
         self._ensure_buffers_on_gpu()
+        if self.main_weight_buffer is not None and self.mp_policy.is_nvfp4_param(self.params[0]):
+            full_weight_buffer = self.model_weight_buffer.fetch_buffer(
+                [Placement.REPLICATE, Placement.REPLICATE]
+            )
+            self.bind_params(self.model_weight_buffer, full_weight_buffer)
         self.mp_policy.copy_main_weights_to_model_weights(
             self.params,
             self.param_idx,
@@ -334,7 +384,9 @@ class ParameterGroup:
                 [grad_buffer.placements[0], inner_target], stream=stream
             )
             accumulate = self._reduced_grad_buffer_has_accumulated_grad
-            grad_buffer.commit_comm_output(comm_output, 1, stream=stream, accumulate=accumulate)
+            self.commit_comm_output(
+                grad_buffer, comm_output, 1, stream=stream, accumulate=accumulate
+            )
             self._reduced_grad_buffer_has_accumulated_grad = True
             if inner_target is not Placement.REPLICATE:
                 self._full_grad_buffer_has_accumulated_grad = False
@@ -346,7 +398,7 @@ class ParameterGroup:
             comm_output = grad_buffer.redistribute(
                 [outer_target, grad_buffer.placements[1]], stream=stream
             )
-            grad_buffer.commit_comm_output(comm_output, 0, stream=stream)
+            self.commit_comm_output(grad_buffer, comm_output, 0, stream=stream)
 
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""

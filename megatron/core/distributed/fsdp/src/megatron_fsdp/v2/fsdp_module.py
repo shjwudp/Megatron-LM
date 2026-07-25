@@ -15,7 +15,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from .allocator import BucketAllocator, TracePoolAllocator
-from .dp_buffer import Placement
+from .dp_buffer import DataParallelBuffer, Placement
 from .mixed_precision import MixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 def _unshard_weight_buffers(
     outer_dp_group,
     inner_dp_group,
-    weight_buffers,
+    owned_weight_buffers: List[Tuple[ParameterGroup, DataParallelBuffer]],
     *,
     async_op: bool,
     stream: torch.cuda.Stream,
@@ -36,7 +36,7 @@ def _unshard_weight_buffers(
     # Allocate on the caller stream before entering the communication stream.
     full_buffers = [
         weight_buffer.fetch_buffer([Placement.REPLICATE, Placement.REPLICATE])
-        for weight_buffer in weight_buffers
+        for _, weight_buffer in owned_weight_buffers
     ]
     if async_op:
         stream.wait_stream(caller_stream)
@@ -44,11 +44,11 @@ def _unshard_weight_buffers(
     def unshard_dimension(group, unshard_dim: int) -> None:
         cm = (
             _coalescing_manager(group, async_ops=async_op)
-            if len(weight_buffers) > 1 and torch.distributed.get_world_size(group) > 1
+            if len(owned_weight_buffers) > 1 and torch.distributed.get_world_size(group) > 1
             else nullcontext()
         )
         with cm as coalescing_event:
-            for weight_buffer in weight_buffers:
+            for _, weight_buffer in owned_weight_buffers:
                 target_placements = weight_buffer.placements.copy()
                 target_placements[unshard_dim] = Placement.REPLICATE
                 weight_buffer.redistribute(target_placements, stream=stream)
@@ -60,8 +60,8 @@ def _unshard_weight_buffers(
         unshard_dimension(inner_dp_group, unshard_dim=1)
 
     # Rebinding only updates tensor metadata and stays on the caller stream.
-    for weight_buffer, full_buffer in zip(weight_buffers, full_buffers):
-        weight_buffer.bind_params(full_buffer)
+    for (param_group, weight_buffer), full_buffer in zip(owned_weight_buffers, full_buffers):
+        param_group.bind_params(weight_buffer, full_buffer)
 
 
 def _select_unshard_stream(ctx, *, async_op: bool):
@@ -729,30 +729,32 @@ class FSDPModule:
                             dist_param._local_tensor
                         ).any(), f"NaN detected in dist param for parameter {name}"
                 for weight_buffer in param_group.weight_buffers_for_unshard(bwd_pass=bwd_pass):
+                    outer_dp_group = param_group.outer_dp_group
+                    inner_dp_group = param_group.dp_group
                     if (
                         buffer_runs
-                        and buffer_runs[-1][0] is weight_buffer.outer_dp_group
-                        and buffer_runs[-1][1] is weight_buffer.inner_dp_group
+                        and buffer_runs[-1][0] is outer_dp_group
+                        and buffer_runs[-1][1] is inner_dp_group
                         and buffer_runs[-1][2] == weight_buffer.dtype
                         and buffer_runs[-1][3] == weight_buffer.device
                     ):
-                        buffer_runs[-1][4].append(weight_buffer)
+                        buffer_runs[-1][4].append((param_group, weight_buffer))
                     else:
                         buffer_runs.append(
                             (
-                                weight_buffer.outer_dp_group,
-                                weight_buffer.inner_dp_group,
+                                outer_dp_group,
+                                inner_dp_group,
                                 weight_buffer.dtype,
                                 weight_buffer.device,
-                                [weight_buffer],
+                                [(param_group, weight_buffer)],
                             )
                         )
 
-            for outer_dp_group, inner_dp_group, _, _, weight_buffers in buffer_runs:
+            for outer_dp_group, inner_dp_group, _, _, owned_weight_buffers in buffer_runs:
                 _unshard_weight_buffers(
                     outer_dp_group,
                     inner_dp_group,
-                    weight_buffers,
+                    owned_weight_buffers,
                     async_op=async_op,
                     stream=stream,
                     caller_stream=caller_stream,

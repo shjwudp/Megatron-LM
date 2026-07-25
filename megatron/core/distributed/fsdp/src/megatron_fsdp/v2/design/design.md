@@ -212,7 +212,7 @@ for module in [self] + prefetch:
 
         # Caller stream: rebind tensor metadata; do not run TE post-processing yet.
         for buffer, full_buffer in zip(weight_buffers, full_buffers):
-            buffer.bind_params(full_buffer)
+            param_group.bind_params(buffer, full_buffer)
 
     ctx.unshard_pending_post[id(module)].add(bwd_pass)
 

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import enum
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import torch
 from torch.distributed.tensor import DeviceMesh
@@ -38,17 +38,16 @@ class Placement(enum.Enum):
 
 
 class DataParallelBuffer:
-    """Manages a flat buffer that stores (a shard of) a group of parameters.
+    """Manage mesh-aware flat storage for a parameter group's tensor values.
 
-    On construction it builds its own BufferIndex describing the layout and
-    shard ownership.  External callers interact via init_data / set_item /
-    get_item only.
+    The buffer owns layout, placement transitions, and storage lifecycle. It
+    does not retain parameter identities or bind storage back to parameters;
+    those operations belong to the owning ``ParameterGroup``.
     """
 
     def __init__(
         self,
         params: List[torch.nn.Parameter],
-        param_idx: Dict[torch.nn.Parameter, int],
         dtype: torch.dtype,
         device: torch.device,
         mesh: DeviceMesh,
@@ -66,16 +65,11 @@ class DataParallelBuffer:
         from .buffer_index import BufferIndex
 
         assert mp_policy is not None, "DataParallelBuffer requires a mixed-precision policy"
-        self.params = params
-        self.param_idx = param_idx
         self.dtype = dtype
         self.device = device
-        self.outer_dp_group = mesh.get_group(mesh_dim=0)
-        self.inner_dp_group = mesh.get_group(mesh_dim=1)
+        self.mesh = mesh
         self.allocator = allocator if allocator is not None else TemporaryBucketAllocator()
-        self.buffer_role = buffer_role
         self.alloc_key = (param_group_id, buffer_role)
-        self.mp_policy = mp_policy
         self.grad_comm_dtype = mp_policy.grad_comm_dtype or dtype
         self._use_grad_comm_buffer = self.grad_comm_dtype != dtype
 
@@ -240,7 +234,7 @@ class DataParallelBuffer:
         target = target_placements[changed_axis]
         input_buffer = self.fetch_buffer(self.placements)
         output = self.fetch_buffer(target_placements)
-        group = self.outer_dp_group if changed_axis == 0 else self.inner_dp_group
+        group = self.mesh.get_group(mesh_dim=changed_axis)
 
         if source in (Placement.FLAT, Placement.DIRTY) and target is Placement.REPLICATE:
             with torch.cuda.stream(stream):
@@ -296,41 +290,10 @@ class DataParallelBuffer:
         self.placements[changed_axis] = target
         return output
 
-    @torch.no_grad()
-    def commit_comm_output(
-        self,
-        comm_output: torch.Tensor,
-        changed_axis: int,
-        *,
-        stream: Optional[torch.cuda.Stream] = None,
-        accumulate: bool = False,
-    ) -> None:
-        """Copy or accumulate a communication result into its target buffer."""
-        output_buffer = self.fetch_buffer(self.placements)
-        with torch.cuda.stream(stream or torch.cuda.current_stream()):
-            if output_buffer.data_ptr() != comm_output.data_ptr():
-                if accumulate:
-                    output_buffer.add_(comm_output)
-                else:
-                    output_buffer.copy_(comm_output)
+    def release_redistribution_workspace(self, changed_axis: int) -> None:
+        """Release temporary communication storage for one mesh-axis transition."""
         if self._use_grad_comm_buffer:
             self.allocator.free((self.alloc_key, "grad_reduce_input", changed_axis))
-
-    def bind_params(self, buffer: Optional[torch.Tensor] = None) -> None:
-        """Bind parameters to a fully replicated buffer."""
-        if buffer is None:
-            assert self.is_unsharded(), "Cannot bind params from a sharded buffer"
-            buffer = self.fetch_buffer(self.placements)
-        assert buffer.numel() == self.buffer_index.bucket_meta.size, (
-            f"Buffer size {buffer.numel()} does not match expected size "
-            f"{self.buffer_index.bucket_meta.size}"
-        )
-        for p in self.params:
-            item_id = self.param_idx[p]
-            start, end = self.buffer_index._get_item_global_range(item_id)
-            idx_shape = self.buffer_index.item_index_map[item_id].shape
-            param_data = buffer[start:end].view(idx_shape)
-            self.mp_policy.bind_unsharded_param(p, param_data, self.buffer_role)
 
     def release_unsharded_buffer(self) -> None:
         """Release the temporary full-sized buffer without changing placements."""
