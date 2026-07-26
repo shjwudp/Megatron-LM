@@ -2,9 +2,8 @@
 
 ## Status
 
-This document defines the target ownership model for Megatron FSDP v2 data-parallel
-buffers. The migration is incremental: existing placement transitions and collective
-implementations remain valid while responsibilities move to their intended owners.
+This document defines the implemented ownership and placement model for Megatron FSDP
+v2 data-parallel buffers.
 
 ## Goals
 
@@ -16,12 +15,8 @@ implementations remain valid while responsibilities move to their intended owner
 - `bind()` attaches externally allocated, placement-shaped storage;
 - redistribution requires an explicitly bound output when storage must grow.
 
-The buffer should not know which `Parameter` objects consume its storage or decide how
-communication results participate in gradient accumulation. Those are
-`ParameterGroup` responsibilities.
-
-This design does not add special singleton-group fast paths. A mesh dimension of size
-one follows the same placement transition and collective path as any other dimension.
+Parameter binding, allocation, and gradient accumulation are deliberately outside this
+abstraction. A mesh dimension of size one follows the normal placement-transition path.
 
 ## Ownership
 
@@ -56,9 +51,7 @@ The parameter group owns consumers and training semantics:
 - the ordered parameters and parameter-to-item mapping;
 - model, transpose, main-weight, and main-gradient buffer roles;
 - mixed-precision policy;
-- the shared temporary-storage allocator and allocation keys;
-- role-indexed unsharded weight leases;
-- the temporary full-gradient lease and communication-dtype workspaces;
+- the temporary-storage allocator, role keys, and active leases;
 - selecting the weight representations required by a forward or backward pass;
 - batching weight redistribution across ordered parameter groups;
 - binding unsharded buffer views to parameters;
@@ -73,11 +66,9 @@ Copy-versus-accumulate, communication dtype, gradient scaling, and workspace rel
 belong to the parameter group's reduction-stage helper because they are
 gradient-lifecycle policy, not buffer-storage properties.
 
-Logical lifetime and physical allocation lifetime are distinct. On reshard,
-`ParameterGroup` always unbinds and drops its logical lease. A storage-freeing
-allocator may retain an empty tensor shell, and `TracePoolAllocator` retains its
-planned physical slot and stable address, but neither case makes the parameter group
-logically unsharded.
+Logical and physical lifetimes are distinct. On reshard, `ParameterGroup` unbinds and
+drops its logical lease. An allocator may retain an empty tensor shell or a stable trace
+pool slot, but neither makes the group logically unsharded.
 
 ### FSDPModule
 
@@ -127,8 +118,10 @@ dimension unambiguous. `redistribute_buffers()` is the batch planner: it applies
 primitive axis by axis, coalescing only buffers with the same process group, dtype,
 device, and source placement.
 
-`redistribute()` executes on the current stream. Callers own stream ordering and tensor
-lifetime; the primitive does not wait on streams or call `record_stream()`.
+`redistribute()` executes on the current stream. It performs no stream ordering or
+tensor-lifetime management. `redistribute_buffers()` may select a communication stream
+for a batched weight redistribution and establishes one caller-to-communication-stream
+dependency before entering that stream.
 
 `redistribute()` accepts an explicit output `DataParallelBuffer`. For an in-place
 all-gather, the caller binds an externally allocated `REPLICATE` placeholder, takes
@@ -171,12 +164,11 @@ schedule groups  ---> select private weight buffers
 wait event  --------> finalize mixed-precision views
 ```
 
-`redistribute()` leaves its source object unchanged and returns the tensor produced in
-the explicitly placed output object. Returning a tensor is important: communication
-may use a temporary dtype workspace whose result is not yet in persistent storage.
-`ParameterGroup` decides how to consume that result. Batch redistribution is therefore
-used only where intermediate outputs need no parameter-group decision, such as weight
-all-gather.
+`redistribute()` leaves its source object unchanged and returns the explicitly placed
+output `DataParallelBuffer`. `ParameterGroup` decides whether that output is persistent
+storage, a shared-storage view, or a temporary workspace, and whether its value should
+replace or accumulate into persistent state. Batch redistribution is used when
+intermediate outputs need no parameter-group decision, such as weight all-gather.
 
 ## Use Cases
 
@@ -288,44 +280,8 @@ collective state.
 - weight-buffer selection and binding helpers remain private to `ParameterGroup`.
 - process groups used by a buffer are derived from its mesh and changed axis.
 
-## Migration
+## Future cleanup
 
-### Phase 1: ownership boundary
-
-- Store `DeviceMesh` instead of cached outer/inner process groups.
-- Move parameter binding from `DataParallelBuffer` to `ParameterGroup`.
-- Move gradient-redistribution finalization from `DataParallelBuffer` to
-  `ParameterGroup`.
-- Move compatible-buffer grouping and mesh-axis planning out of `FSDPModule`.
-- Preserve placement transitions, collective selection, and allocation behavior.
-
-### Phase 2: separate allocation from buffers
-
-- Add external `bind()` / `unbind()` and unbound output placeholders.
-- Move unsharded weight, full-gradient, and communication workspace leases to
-  `ParameterGroup`.
-- Require explicit outputs for storage-growing redistribution.
-- Keep Trace Pool physical slots private to the allocator while logical leases remain
-  temporary.
-
-### Phase 3: DTensor-style placement cleanup
-
-- Remove storage-state placements from the logical placement enum.
-- Represent shared-storage redistribution with explicit DP-buffer views and an
-  explicit output buffer.
-- Keep logical placements limited to replicate, shard, and partial semantics.
-- Remove the separate bound-storage placement vector; one buffer object has one exact
-  placement-shaped tensor.
-
-### Phase 4: narrow role-specific policy
-
-Move gradient communication dtype/workspace decisions and NVFP4 full-output ownership
-behind `ParameterGroup`-provided transformation inputs. `DataParallelBuffer` is then a
-reusable mesh-aware flat storage abstraction rather than an FSDP allocation-policy
-object.
-
-### Phase 5: immutable shared layout
-
-Extract `BufferIndex` and other immutable layout metadata into a reusable layout
-object. Bound placement buffers can then share layout without shallow-copying mutable
-storage fields. This cleanup is independent of allocator decoupling.
+`BufferIndex` and other immutable layout metadata may eventually move into a reusable
+layout object so placement views can share layout without copying metadata. This is
+independent of the ownership and allocation model above.

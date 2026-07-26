@@ -37,7 +37,21 @@ def _zero_tensor_storage(tensor: torch.Tensor) -> None:
 
 
 class ParameterGroup:
-    """Manage buffers and DTensor views for parameters with shared properties."""
+    """
+    Groups parameters sharing same properties for collective buffer management.
+
+    All parameters in a group have the same:
+    - device (cuda device)
+    - dtype (data type)
+    - requires_grad (whether gradients are needed)
+
+    The group manages:
+    - model_weight_buffer: stores sharded model weights
+    - main_weight_buffer: optional high-precision copy for mixed precision
+    - main_grad_buffer: accumulates gradients before reduction
+    - dist_params: DTensor views into the buffer
+    - dist_grads: DTensor gradient views
+    """
 
     def __init__(
         self,
@@ -282,7 +296,18 @@ class ParameterGroup:
         )
 
     def _init_buffers(self) -> None:
-        """Initialize persistent buffers and distributed parameter views."""
+        """
+        Initialize all buffers based on sharding strategy.
+
+        Buffer creation logic:
+        - model_weight_buffer: always created; replicated unless "optim_grads_params"
+        - main_weight_buffer: created if mp_policy.main_params_dtype is specified
+          AND it differs from the model-weight dtype or requires a different
+          sharding layout; otherwise the optimizer mutates model_weight_buffer
+        - main_grad_buffer: created if requires_grad
+        """
+        # Create model weight buffers. The policy owns dtype-sensitive storage
+        # choices and exposes the tensor view that should be packed.
         model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
         wbuf = self._create_buffer(model_weight_dtype, "model_weight")
         wbuf.bind(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
@@ -297,6 +322,15 @@ class ParameterGroup:
             )
             self.transpose_weight_buffer = tbuf
 
+        # Create main weight buffer for mixed precision. Skip the redundant
+        # copy when the optimizer dtype matches the model-weight dtype AND the
+        # buffer placements are identical — in that case the optimizer mutates
+        # ``model_weight_buffer`` directly via the dist_param views (which the
+        # code below already binds to ``model_weight_buffer`` when
+        # ``main_weight_buffer`` is None). Quantized params (FP8/NVFP4) always
+        # need a separate main buffer because their model-weight dtype (uint8)
+        # differs from the optimizer dtype (fp32), so the dtype guard below
+        # already prevents skipping them.
         main_params_dtype = self.mp_policy.main_params_dtype_for_param(self.params[0])
         if main_params_dtype is not None:
             mbuf = self._create_buffer(main_params_dtype, "main_weight")
@@ -308,7 +342,13 @@ class ParameterGroup:
                 )
                 self.main_weight_buffer = mbuf
 
+        # Free the original full parameter tensors now that their data has been
+        # copied into the weight buffers. The module holds DTensor shard views and
+        # unshard() rebinds .data to the all-gathered buffer, so the original
+        # storage is never accessed again.
         for p in self.params:
+            # Pass the replacement buffers so the policy can tell whether this
+            # parameter's original storage has been copied into FSDP-owned storage.
             for tensor in self.mp_policy.storage_tensors_to_free(
                 p, self.model_weight_buffer, self.main_weight_buffer
             ):
@@ -321,10 +361,12 @@ class ParameterGroup:
             if weight_buffer is not None and weight_buffer.placements[1] is not Placement.SHARD:
                 self._bind_params(role, weight_buffer, weight_buffer.data)
 
+        # Create gradient buffer.
         if self.requires_grad:
             main_grads_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])
             self.main_grad_buffer = self._create_buffer(main_grads_dtype, "main_grad")
 
+        # Create distributed parameter views.
         self._init_dist_params()
 
     def _weight_buffers_for_unshard(
@@ -593,8 +635,11 @@ class ParameterGroup:
         self._ensure_buffers_on_gpu()
         full_weight_buffer = None
         if self.main_weight_buffer is not None and self.mp_policy.is_nvfp4_param(self.params[0]):
-            full_output = self._acquire_weight_output(
-                "model_weight", self.model_weight_buffer, self.model_weight_buffer
+            full_output = self._acquire_temporary_buffer(
+                "model_weight",
+                self.model_weight_buffer,
+                self.model_weight_buffer,
+                [Placement.REPLICATE, Placement.REPLICATE],
             )
             full_weight_buffer = full_output.data
             self._bind_params("model_weight", self.model_weight_buffer, full_weight_buffer)
@@ -772,8 +817,14 @@ class ParameterGroup:
                 data, param_shape, self.mesh, optimizer_dtensor_placements, post_process_uneven=True
             )
             dist_param = torch.nn.Parameter(dist_data, requires_grad=param.requires_grad)
+            # ``torch.nn.Parameter(DTensor)`` wraps the DTensor and creates a
+            # fresh local tensor object, so Python-side uneven-DTensor metadata
+            # attached by ``post_process_uneven=True`` is not preserved
+            # automatically. Grad DTensor initialization later copies chunk
+            # metadata from ``dist_param``; keep that invariant explicit here.
             copy_chunk_metadata(dist_data, dist_param)
 
+            # Mark as FSDP parameter for special handling.
             setattr(param, "__fsdp_param__", True)
             setattr(dist_param, "__fsdp_param__", True)
             assert hasattr(
@@ -783,7 +834,15 @@ class ParameterGroup:
             self.dist_grads.append(None)  # placeholder, will be set in _init_dist_grads
 
     def _init_dist_grads(self) -> None:
-        """Lazily allocate gradient storage and bind optimizer-facing DTensors."""
+        """Lazily allocate ``main_grad_buffer.data`` and rebuild ``dist_grads``.
+
+        The buffer layout (``BufferIndex``, offsets, shard) was created in
+        ``_init_buffers``; only the backing tensor is deferred. Called from
+        ``reduce_grad()`` on first use. Uses ``torch.empty`` to avoid the
+        zero-init cost. ``_reduced_grad_has_value`` is ``False`` after allocation,
+        so the first reduce-scatter overwrites rather than accumulates; the
+        uninitialized data is never read. Subsequent calls are no-ops.
+        """
         gbuf = self.main_grad_buffer
         if gbuf is None or not self.requires_grad:
             return
@@ -804,6 +863,8 @@ class ParameterGroup:
             item_id = self.param_idx[p]
             grad_dtensor_placements = dist_param.placements
             grad_data = grad_view.tensor_view(item_id)
+            # Empty local shards are optimizer no-ops. Keeping them as None also
+            # avoids fused multi-tensor optimizer failures on neighboring shards.
             if not p.requires_grad or grad_data.numel() == 0:
                 self.dist_grads[index] = None
                 continue
@@ -828,7 +889,11 @@ class ParameterGroup:
             self.dist_grads[index] = dist_grad
 
     def _rebuild_dist_views(self) -> None:
-        """Rebind DTensor local tensors after persistent storage moves device."""
+        """Update ``dist_params`` and ``dist_grads`` after storage moves device.
+
+        Moving a buffer between CPU and GPU replaces its backing tensor. Rebuild
+        the local DTensor views using the optimizer-buffer ownership metadata.
+        """
         for role, source in list(self._optimizer_weight_views.items()):
             weight_buffer = (
                 self.model_weight_buffer if role == "model_weight" else self.transpose_weight_buffer
@@ -857,7 +922,7 @@ class ParameterGroup:
                 object.__setattr__(dist_grad._local_tensor, 'data', grad_data)
 
     def _ensure_buffers_on_gpu(self) -> None:
-        """Reload persistent storage to GPU and rebuild views when necessary."""
+        """Auto-reload persistent buffers to GPU and rebuild invalidated views."""
         moved = [self._move_buffer_storage_to(buffer, self.device) for buffer in self._buffers()]
         if any(moved):
             self._rebuild_dist_views()

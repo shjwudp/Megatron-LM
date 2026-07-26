@@ -12,7 +12,7 @@
 | `fsdp_module.py` | `FSDPModule`, `_FSDPRootContext`, `_FSDPState`, `unshard()`, `reshard()`, `reduce_grad()` |
 | `hooks.py` | Forward/backward hook registration and final callback |
 | `param_group.py` | `ParameterGroup.unshard()`, `reduce_grad()`, `release_grad_buffer()`, `_init_buffers()` (memory optimization) |
-| `dp_buffer.py` | `DataParallelBuffer.unshard()` (all-gather + `p.data` rebind), `reduce_grad()` (reduce-scatter + shard accumulation) |
+| `dp_buffer.py` | Placement-shaped flat-buffer views and one-axis redistribution collectives |
 | `allocator.py` | `BucketAllocator` hierarchy: `TemporaryBucketAllocator`, `StorageFreeingBucketAllocator`, `TracePoolAllocator` — pooled memory for unsharded parameter and gradient buffers |
 | `mcore_fsdp_adapter.py` | `FullyShardedDataParallel.stop_communication()` — synchronizes ag_stream and rs_stream into main stream |
 | `utils.py` | V2-to-v1 compatibility proxy used by the existing EP-overlap schedule |
@@ -213,9 +213,9 @@ caller stream, while only the all-gather collective and its `Work.wait()` execut
 `ag_stream` current. Tensor rebinding is metadata-only and returns to the caller stream.
 The caller waits for the module event before running
 `finalize_model_weight_unshard()` or installing full parameters into the module.
-Explicit stream events order consumption and free; all all-gather outputs also record
-`ag_stream` so the allocator cannot recycle a temporary buffer while communication is
-still using it.
+Explicit stream events order consumption and release. `ParameterGroup` retains each
+temporary output lease until the corresponding communication event has completed, so
+the allocator cannot recycle storage while communication is still using it.
 
 **Stream ordering barrier.** When `async_op=True`, the caller stream is captured before
 any stream switch inside `redistribute_buffers()`. The batch allocates final output
@@ -311,7 +311,7 @@ def reduce_grad(self, async_op: bool = False):
                     event.wait()
                     param_group.release_grad_buffer()
                     #   → deletes param.main_grad views (prevents TE grad-accum-fusion leak)
-                    #   → DataParallelBuffer.reshard() (frees unsharded grad bucket)
+                    #   → releases the ParameterGroup-owned full-grad lease
             if module is self: break
 
     # --- Step 2: Stage .grad → main_grad_buffer ---
@@ -336,25 +336,13 @@ def reduce_grad(self, async_op: bool = False):
                 stage_tensors.append(param.get_main_grad())
                 stage_sources.append(grad.detach())
 
-        stage_on_rs_stream = async_op and getattr(
-            self._fsdp_state, "enable_full_iteration_cuda_graph", False
-        )
-        if stage_on_rs_stream:
-            stream.wait_stream(torch.cuda.current_stream())
-            for source in stage_sources:
-                source.record_stream(stream)
-            with torch.cuda.stream(stream):
-                if stage_tensors:
-                    op = torch._foreach_add_ if accumulate_full_grad else torch._foreach_copy_
-                    op(stage_tensors, stage_sources)
-                if zero_tensors:
-                    torch._foreach_zero_(zero_tensors)
-        else:
-            if stage_tensors:
-                op = torch._foreach_add_ if accumulate_full_grad else torch._foreach_copy_
-                op(stage_tensors, stage_sources)
-            if zero_tensors:
-                torch._foreach_zero_(zero_tensors)
+        # Backward produces gradients on the caller stream, so staging remains
+        # on that stream as well.
+        if stage_tensors:
+            op = torch._foreach_add_ if accumulate_full_grad else torch._foreach_copy_
+            op(stage_tensors, stage_sources)
+        if zero_tensors:
+            torch._foreach_zero_(zero_tensors)
 
         for param in params_with_grad:
             del param.grad
@@ -382,20 +370,11 @@ def reduce_grad(self, async_op: bool = False):
                 setattr(dist_param, "grad", dist_grad)          # Python ref, no GPU dependency
 ```
 
-**Key design point — `DataParallelBuffer.reduce_grad()` has no `async_op` parameter.**
-The operation is inherently synchronous *within its selected stream*. The caller passes
-`rs_stream` through `ParameterGroup.reduce_grad(stream=...)`, and the buffer implementation
-uses that stream for the collective. This avoids exposing asynchronous work handles through
-the buffer API.
-
-For full-iteration CUDA graphs, the batched add/copy/zero staging is dispatched to
-`rs_stream` immediately before reduction. `rs_stream.wait_stream(current_stream())`
-orders the staging after backward, while `record_stream(rs_stream)` keeps detached `.grad`
-sources alive after their Python references are deleted. Replicated no-shard/optim gradients
-still add on later microbatches; sharded gradients still overwrite. This removes staging
-kernels from the captured caller stream and lets them overlap with the next module's
-backward compute. Eager, per-module CUDA graph, and synchronous-reduction paths retain
-caller-stream staging.
+**Key design point — `DataParallelBuffer.redistribute()` has no asynchronous-work
+handle.** The primitive executes synchronously within the current stream. Backward and
+gradient staging stay on the caller stream; `ParameterGroup.reduce_grad(stream=...)`
+then inserts one wait before preprocessing and redistribution on `rs_stream`. Temporary
+buffers remain owned by `ParameterGroup` until the module's reduction event completes.
 
 **`grad_added_to_main_grad` and `overwrite_main_grad` flags:**
 When TransformerEngine's `gradient_accumulation_fusion` is active, the backward kernel writes
@@ -693,13 +672,13 @@ pre-hook L[2]: event[L[2]].wait() → main stream unblocks
 
 BACKWARD PASS (enable_async_reduce_grad=True, full-iteration CUDA graph)
 ---------------------------------------------------------
-main stream:  |bwd L[2]-----------|bwd L[1]-----------|bwd L[0]-----------|
+main stream:  |bwd+stage L[2]-----|bwd+stage L[1]-----|bwd+stage L[0]-----|
 ag_stream:    |AG(L[1]) prefetch    |AG(L[0]) prefetch     |                      |
-rs_stream:    |stage+RS(L[2]) ------|stage+RS(L[1]) ------|stage+RS(L[0])---------|
+rs_stream:    |wait+RS(L[2]) -------|wait+RS(L[1]) -------|wait+RS(L[0])----------|
 
-post-bwd L[2]: reshard, rs_stream.wait(main), stage grad[2], RS(L[2]), event[2]
-post-bwd L[1]: drain event[2-2]? (i=1, no drain), stage grad[1], RS(L[1]), event[1]
-post-bwd L[0]: drain event[L[2]] (i=2, drain backward_order[0]=L[2]), stage grad[0], RS(L[0]), event[0]
+post-bwd L[2]: reshard, stage grad[2], rs_stream.wait(main), RS(L[2]), event[2]
+post-bwd L[1]: drain event[2-2]? (i=1, no drain), stage grad[1], wait, RS(L[1]), event[1]
+post-bwd L[0]: drain event[L[2]], stage grad[0], wait, RS(L[0]), event[0]
 
 final_callback:
   drain event[L[1]], event[L[0]]

@@ -786,32 +786,15 @@ class FSDPModule:
                         stage_tensors.append(main_grad)
                         stage_sources.append(grad.detach())
 
-            # Full-iteration graphs stage ordinary async gradients on the RS stream so
-            # the add/copy/zero work overlaps with the next module's backward compute.
-            stage_on_rs_stream = async_op and getattr(
-                self._fsdp_state, "enable_full_iteration_cuda_graph", False
-            )
-            if stage_on_rs_stream:
-                stream.wait_stream(torch.cuda.current_stream())
-                for source in stage_sources:
-                    if source.is_cuda:
-                        source.record_stream(stream)
-                with torch.cuda.stream(stream):
-                    if stage_tensors:
-                        if accumulate_full_grad:
-                            torch._foreach_add_(stage_tensors, stage_sources)
-                        else:
-                            torch._foreach_copy_(stage_tensors, stage_sources)
-                    if zero_tensors:
-                        torch._foreach_zero_(zero_tensors)
-            else:
-                if stage_tensors:
-                    if accumulate_full_grad:
-                        torch._foreach_add_(stage_tensors, stage_sources)
-                    else:
-                        torch._foreach_copy_(stage_tensors, stage_sources)
-                if zero_tensors:
-                    torch._foreach_zero_(zero_tensors)
+            # Gradients are produced and staged on the caller stream. reduce_grad()
+            # orders its communication stream after this work exactly once.
+            if stage_tensors:
+                if accumulate_full_grad:
+                    torch._foreach_add_(stage_tensors, stage_sources)
+                else:
+                    torch._foreach_copy_(stage_tensors, stage_sources)
+            if zero_tensors:
+                torch._foreach_zero_(zero_tensors)
 
             for param in params_with_grad:
                 if param.grad is not None:
