@@ -242,13 +242,13 @@ def test_unshard_reshard(strategy):
         shard_before = wbuf.data.view(torch.uint8).clone()
         full_placements = [Placement.REPLICATE, Placement.REPLICATE]
         pg.unshard()
-        role_output = pg._unsharded_weight_buffers.get("model_weight")
+        role_output = pg._temporary_buffers.get("model_weight")
         unsharded = wbuf.data if role_output is None else role_output.data
 
         if not w_dist:
             # ZeRO-1/2: replicated persistent storage needs no temporary lease.
             assert unsharded is wbuf.data
-            assert pg._unsharded_weight_buffers == {}
+            assert pg._temporary_buffers == {}
         else:
             # Distributed: after all-gather, every param should be fully
             # recoverable from the unsharded buffer at its global offset
@@ -259,7 +259,7 @@ def test_unshard_reshard(strategy):
 
         # Reshard: release the ParameterGroup-owned lease; persistent shard is intact.
         pg.reshard()
-        assert pg._unsharded_weight_buffers == {}
+        assert pg._temporary_buffers == {}
         # Compare the persistent storage bit-for-bit. The buffer can contain
         # uninitialized padding, including NaNs for which torch.equal is false
         # even when the before/after bit patterns are identical.
@@ -568,8 +568,8 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
         gbuf = pg.main_grad_buffer
         if gbuf is None:
             continue
-        assert not pg._full_grad_buffer_has_accumulated_grad
-        assert not pg._reduced_grad_buffer_has_accumulated_grad
+        assert not pg._full_grad_has_value
+        assert not pg._reduced_grad_has_value
 
         full_size = gbuf.buffer_index.bucket_meta.size
         full = torch.full((full_size,), float(rank + 1), dtype=gbuf.dtype, device=device)
@@ -590,8 +590,8 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
         actual = gbuf.view(pg._optimizer_placements()).data
         assert torch.equal(actual, expected)
 
-        assert pg._full_grad_buffer_has_accumulated_grad == (strategy == "no_shard")
-        assert pg._reduced_grad_buffer_has_accumulated_grad
+        assert pg._full_grad_has_value == (strategy == "no_shard")
+        assert pg._reduced_grad_has_value
 
     torch.distributed.barrier()
 
@@ -655,14 +655,14 @@ def test_hsdp_reduce_grad_multi_microbatch(strategy, outer_strategy, monkeypatch
             is_last_backward = microbatch == num_micro_batches - 1
             pg.reduce_grad(is_last_backward=is_last_backward)
             if is_last_backward:
-                assert pg._full_grad_buffer_has_accumulated_grad == (strategy == "no_shard")
-                assert pg._reduced_grad_buffer_has_accumulated_grad
+                assert pg._full_grad_has_value == (strategy == "no_shard")
+                assert pg._reduced_grad_has_value
             elif strategy == "optim_grads_params":
-                assert not pg._full_grad_buffer_has_accumulated_grad
-                assert pg._reduced_grad_buffer_has_accumulated_grad
+                assert not pg._full_grad_has_value
+                assert pg._reduced_grad_has_value
             else:
-                assert pg._full_grad_buffer_has_accumulated_grad
-                assert not pg._reduced_grad_buffer_has_accumulated_grad
+                assert pg._full_grad_has_value
+                assert not pg._reduced_grad_has_value
 
         actual_outer_calls = outer_collective_calls
         if strategy == "no_shard":
@@ -682,7 +682,7 @@ def test_hsdp_reduce_grad_multi_microbatch(strategy, outer_strategy, monkeypatch
         assert actual_outer_calls == 1
 
         pg.zero_grad()
-        assert not pg._full_grad_buffer_has_accumulated_grad
-        assert not pg._reduced_grad_buffer_has_accumulated_grad
+        assert not pg._full_grad_has_value
+        assert not pg._reduced_grad_has_value
 
     torch.distributed.barrier()

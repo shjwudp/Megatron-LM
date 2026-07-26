@@ -362,12 +362,12 @@ class TestFullyShardBasic:
                 expect_full_grad = sharding_strategy == "no_shard" or (
                     sharding_strategy == "optim" and i < len(values) - 1
                 )
-                assert param_group._full_grad_buffer_has_accumulated_grad == expect_full_grad
+                assert param_group._full_grad_has_value == expect_full_grad
                 expect_reduced_grad = (
                     sharding_strategy in ("optim_grads", "optim_grads_params")
                     or i == len(values) - 1
                 )
-                assert param_group._reduced_grad_buffer_has_accumulated_grad == expect_reduced_grad
+                assert param_group._reduced_grad_has_value == expect_reduced_grad
         model.finish_grad_sync()
 
         for param_names, param_group in model._named_param_groups:
@@ -382,8 +382,8 @@ class TestFullyShardBasic:
 
         model.zero_grad()
         for _, param_group in model._named_param_groups:
-            assert not param_group._full_grad_buffer_has_accumulated_grad
-            assert not param_group._reduced_grad_buffer_has_accumulated_grad
+            assert not param_group._full_grad_has_value
+            assert not param_group._reduced_grad_has_value
 
     @pytest.mark.skip(reason="ZeRO-1 CUDA graph microbatch accumulation is not supported yet")
     def test_cuda_graph_accumulates_with_empty_optim_shard(self):
@@ -410,8 +410,8 @@ class TestFullyShardBasic:
 
         expected = 10.0 * _world_size()
         for _, param_group in model._named_param_groups:
-            assert not param_group._full_grad_buffer_has_accumulated_grad
-            assert param_group._reduced_grad_buffer_has_accumulated_grad
+            assert not param_group._full_grad_has_value
+            assert param_group._reduced_grad_has_value
             for dist_grad in param_group.dist_grads:
                 if dist_grad is not None:
                     torch.testing.assert_close(
@@ -420,8 +420,8 @@ class TestFullyShardBasic:
 
         model.zero_grad()
         for _, param_group in model._named_param_groups:
-            assert not param_group._full_grad_buffer_has_accumulated_grad
-            assert not param_group._reduced_grad_buffer_has_accumulated_grad
+            assert not param_group._full_grad_has_value
+            assert not param_group._reduced_grad_has_value
             assert param_group.main_grad_buffer.data is None
 
     @pytest.mark.parametrize(
@@ -1403,7 +1403,7 @@ class TestActivationCheckpointing:
         observed_full = []
 
         def capture_successor_full_buffer(_module, _args):
-            full_output = param_group._unsharded_weight_buffers.get("model_weight")
+            full_output = param_group._temporary_buffers.get("model_weight")
             assert full_output is not None
             observed_full.append(full_output.data.detach().clone())
 

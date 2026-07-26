@@ -127,6 +127,9 @@ dimension unambiguous. `redistribute_buffers()` is the batch planner: it applies
 primitive axis by axis, coalescing only buffers with the same process group, dtype,
 device, and source placement.
 
+`redistribute()` executes on the current stream. Callers own stream ordering and tensor
+lifetime; the primitive does not wait on streams or call `record_stream()`.
+
 `redistribute()` accepts an explicit output `DataParallelBuffer`. For an in-place
 all-gather, the caller binds an externally allocated `REPLICATE` placeholder, takes
 its `SHARD` view, and passes the placeholder back as the output:

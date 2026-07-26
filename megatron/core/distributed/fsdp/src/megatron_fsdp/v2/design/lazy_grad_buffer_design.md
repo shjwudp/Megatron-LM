@@ -121,9 +121,9 @@ the backing buffer may change, but its established layout contract does not.
 
 Two flags track where valid gradient data currently lives:
 
-- `_full_grad_buffer_has_accumulated_grad` tracks the full `(0, 0)` staging
+- `_full_grad_has_value` tracks the full `(0, 0)` staging
   buffer used before the collective.
-- `_reduced_grad_buffer_has_accumulated_grad` tracks the collective output
+- `_reduced_grad_has_value` tracks the collective output
   consumed by the optimizer.
 
 `zero_grad()` resets both flags before trying to release storage. `reduce_grad()`

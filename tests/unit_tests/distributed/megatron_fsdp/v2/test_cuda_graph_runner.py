@@ -133,7 +133,7 @@ def test_reduce_grad_skips_aliased_main_grad_copy():
     param_group = SimpleNamespace(
         requires_grad=True,
         enable_full_iteration_cuda_graph=False,
-        _full_grad_buffer_has_accumulated_grad=False,
+        _full_grad_has_value=False,
         params=(param,),
         dist_params=(dist_param,),
         dist_grads=(None,),

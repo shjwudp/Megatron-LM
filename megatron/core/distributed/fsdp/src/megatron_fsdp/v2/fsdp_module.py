@@ -753,7 +753,7 @@ class FSDPModule:
             # the Python-side ``setattr(param, "grad_added_to_main_grad", True)`` that
             # accompanies the eager backward is captured away.  We record the per-param
             # flag during the trace micro-batch and restore it here.
-            accumulate_full_grad = param_group._full_grad_buffer_has_accumulated_grad
+            accumulate_full_grad = param_group._full_grad_has_value
             stage_tensors: List[torch.Tensor] = []
             stage_sources: List[torch.Tensor] = []
             zero_tensors: List[torch.Tensor] = []

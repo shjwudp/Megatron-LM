@@ -318,7 +318,7 @@ def reduce_grad(self, async_op: bool = False):
     for param_names, param_group in self._named_param_groups:
         if not param_group.requires_grad: continue
 
-        accumulate_full_grad = param_group._full_grad_buffer_has_accumulated_grad
+        accumulate_full_grad = param_group._full_grad_has_value
         stage_tensors = []
         stage_sources = []
         zero_tensors = []
