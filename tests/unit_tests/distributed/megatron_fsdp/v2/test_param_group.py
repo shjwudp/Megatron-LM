@@ -340,7 +340,7 @@ def test_reduce_grad(strategy):
             expected = Ref.reduce_scatter(full.clone(), dp_group)
 
         pg.reduce_grad(is_last_backward=True)
-        actual = gbuf.data
+        actual = gbuf.view(pg._optimizer_placements()).data
         assert torch.equal(actual, expected)
 
     torch.distributed.barrier()
@@ -369,9 +369,82 @@ def test_reduce_grad_owns_comm_conversion_and_scaling(grad_comm_dtype):
         expected_input = full.to(grad_comm_dtype or full.dtype).mul_(0.25)
         expected = Ref.reduce_scatter(expected_input, dp_group).to(gbuf.dtype)
 
+        allocation_keys = []
+        original_allocate = pg.allocator.allocate
+
+        def capture_allocate(*args, **kwargs):
+            allocation_keys.append(kwargs.get("key", args[0] if args else None))
+            return original_allocate(*args, **kwargs)
+
+        pg.allocator.allocate = capture_allocate
         pg.reduce_grad(is_last_backward=True)
 
-        assert torch.equal(gbuf.data, expected)
+        actual = gbuf.view(pg._optimizer_placements()).data
+        assert torch.equal(actual, expected)
+        grad_comm_keys = [
+            key for key in allocation_keys if isinstance(key, tuple) and "grad_comm" in key
+        ]
+        assert len(grad_comm_keys) == (1 if grad_comm_dtype is not None else 0)
+
+    torch.distributed.barrier()
+
+
+def test_hsdp_reuses_one_grad_comm_workspace_across_axes():
+    """One communication-dtype owner feeds both HSDP redistribution axes."""
+    device = torch.device(f"cuda:{torch.distributed.get_rank() % torch.cuda.device_count()}")
+    mesh = _build_hsdp_mesh(device)
+    mp_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32, grad_comm_dtype=torch.float32)
+    groups, _, _, rank, _, _ = _build_groups(
+        "optim_grads_params",
+        mesh=mesh,
+        mp_policy=mp_policy,
+        outer_dp_sharding_strategy="optim",
+        gradient_scaling_factor=0.25,
+    )
+
+    for pg in groups:
+        pg._init_dist_grads()
+        gbuf = pg.main_grad_buffer
+        if gbuf is None:
+            continue
+
+        full = torch.full(
+            (gbuf.buffer_index.bucket_meta.size,), float(rank + 1), dtype=gbuf.dtype, device=device
+        )
+        pg._acquire_full_grad_buffer().data.copy_(full)
+
+        allocation_keys = []
+        redistribution_dtypes = []
+        original_allocate = pg.allocator.allocate
+        original_reduce_axis = pg._reduce_gradient_axis
+
+        def capture_allocate(*args, **kwargs):
+            allocation_keys.append(kwargs.get("key", args[0] if args else None))
+            return original_allocate(*args, **kwargs)
+
+        def capture_reduce_axis(input_buffer, output_buffer, changed_axis, **kwargs):
+            redistribution_dtypes.append((input_buffer.dtype, output_buffer.dtype))
+            return original_reduce_axis(input_buffer, output_buffer, changed_axis, **kwargs)
+
+        pg.allocator.allocate = capture_allocate
+        pg._reduce_gradient_axis = capture_reduce_axis
+
+        expected = full.float().mul_(0.25)
+        expected = Ref.reduce_scatter(expected, pg.dp_group)
+        expected = Ref.reduce_scatter(expected, pg.outer_dp_group).to(gbuf.dtype)
+
+        pg.reduce_grad(is_last_backward=True)
+
+        grad_comm_keys = [
+            key for key in allocation_keys if isinstance(key, tuple) and "grad_comm" in key
+        ]
+        assert len(grad_comm_keys) == 1
+        assert redistribution_dtypes == [
+            (torch.float32, torch.float32),
+            (torch.float32, torch.float32),
+        ]
+        actual = gbuf.view(pg._optimizer_placements()).data
+        assert torch.equal(actual, expected)
 
     torch.distributed.barrier()
 
@@ -510,7 +583,7 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
                 Ref.all_reduce(expected, pg.outer_dp_group)
 
         pg.reduce_grad(is_last_backward=True)
-        actual = gbuf.data
+        actual = gbuf.view(pg._optimizer_placements()).data
         assert torch.equal(actual, expected)
 
         assert pg._full_grad_buffer_has_accumulated_grad == (strategy == "no_shard")
@@ -521,15 +594,40 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
 
 @pytest.mark.parametrize(
     ("strategy", "outer_strategy"),
-    [("no_shard", "no_shard"), ("optim", "no_shard"), ("optim_grads_params", "optim")],
+    [
+        ("no_shard", "no_shard"),
+        ("optim", "no_shard"),
+        ("optim_grads_params", "no_shard"),
+        ("optim_grads_params", "optim"),
+    ],
 )
-def test_hsdp_reduce_grad_multi_microbatch(strategy, outer_strategy):
+def test_hsdp_reduce_grad_multi_microbatch(strategy, outer_strategy, monkeypatch):
     rank = torch.distributed.get_rank()
     device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
     mesh = _build_hsdp_mesh(device)
     groups, _, _, rank, _, _ = _build_groups(
         strategy, mesh=mesh, outer_dp_sharding_strategy=outer_strategy
     )
+    outer_collective_calls = 0
+    original_reduce_scatter = torch.distributed.reduce_scatter_tensor
+    original_all_reduce = torch.distributed.all_reduce
+
+    def capture_reduce_scatter(*args, **kwargs):
+        nonlocal outer_collective_calls
+        group = kwargs.get("group")
+        if groups and group is groups[0].outer_dp_group:
+            outer_collective_calls += 1
+        return original_reduce_scatter(*args, **kwargs)
+
+    def capture_all_reduce(*args, **kwargs):
+        nonlocal outer_collective_calls
+        group = kwargs.get("group")
+        if groups and group is groups[0].outer_dp_group:
+            outer_collective_calls += 1
+        return original_all_reduce(*args, **kwargs)
+
+    monkeypatch.setattr(torch.distributed, "reduce_scatter_tensor", capture_reduce_scatter)
+    monkeypatch.setattr(torch.distributed, "all_reduce", capture_all_reduce)
 
     num_micro_batches = 3
     for pg in groups:
@@ -555,26 +653,29 @@ def test_hsdp_reduce_grad_multi_microbatch(strategy, outer_strategy):
             if is_last_backward:
                 assert pg._full_grad_buffer_has_accumulated_grad == (strategy == "no_shard")
                 assert pg._reduced_grad_buffer_has_accumulated_grad
-            elif outer_strategy == "optim":
+            elif strategy == "optim_grads_params":
                 assert not pg._full_grad_buffer_has_accumulated_grad
                 assert pg._reduced_grad_buffer_has_accumulated_grad
             else:
                 assert pg._full_grad_buffer_has_accumulated_grad
                 assert not pg._reduced_grad_buffer_has_accumulated_grad
 
+        actual_outer_calls = outer_collective_calls
         if strategy == "no_shard":
             ref = full_batch_grad
             Ref.all_reduce(ref, pg.dp_group)
             Ref.all_reduce(ref, pg.outer_dp_group)
-            assert torch.equal(gbuf.data, ref)
+            actual = gbuf.view(pg._optimizer_placements()).data
+            assert torch.equal(actual, ref)
         else:
             ref_shard = Ref.reduce_scatter(full_batch_grad, pg.dp_group)
             if outer_strategy == "optim":
                 ref_shard = Ref.reduce_scatter(ref_shard, pg.outer_dp_group)
             else:
                 Ref.all_reduce(ref_shard, pg.outer_dp_group)
-            actual = gbuf.data
+            actual = gbuf.view(pg._optimizer_placements()).data
             assert torch.equal(actual, ref_shard)
+        assert actual_outer_calls == 1
 
         pg.zero_grad()
         assert not pg._full_grad_buffer_has_accumulated_grad

@@ -218,16 +218,20 @@ lease from asynchronous all-gather launch through the final consumer.
 1. `ParameterGroup` acquires a full-gradient lease only when persistent gradient
    storage cannot contain the replicated backward output.
 2. It aliases the staged full buffer as `PARTIAL` on active DP mesh dimensions.
-3. `ParameterGroup` determines an ordered list of target placements. Inner-DP runs at
-   the step boundary or whenever persistent gradients are inner-sharded. Outer-DP
-   runs at the step boundary or whenever optimizer state is outer-sharded.
-4. When dtype conversion, scaling, or accumulation requires temporary storage, the
-   group creates an externally allocated DP-buffer owner and derives input and output
-   placement views from it.
+3. `ParameterGroup` determines an ordered list of one-axis target placements.
+   Inner-DP runs at the step boundary or whenever persistent gradients are
+   inner-sharded. Outer-DP runs only at the step boundary.
+4. When the communication dtype differs from the full-gradient dtype, the group
+   allocates one communication owner before entering the target loop. Otherwise the
+   full-gradient owner is reused. Scaling is applied once during this preprocessing
+   and does not cause allocation.
 5. `DataParallelBuffer.redistribute()` performs one all-reduce or reduce-scatter and
-   returns its destination DP buffer. The group stage helper copies or accumulates
-   that result into persistent storage and releases any workspace.
-6. The group exposes the resulting shards through optimizer-facing DTensors and
+   returns its destination DP buffer. Every target output is a placement view of the
+   same communication owner.
+6. Non-final inner results are copied or accumulated into the persistent `[P, S]`
+   gradient view. On the final backward, prior accumulation is merged into the new
+   inner result before the target loop advances to the outer redistribution.
+7. The group exposes the resulting shards through optimizer-facing DTensors and
    releases the full-gradient lease after asynchronous communication completes.
 
 Gradient reduction intentionally does not use a single batched final target. Inner-DP

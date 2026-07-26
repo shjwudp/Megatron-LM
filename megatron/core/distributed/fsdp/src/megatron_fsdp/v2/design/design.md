@@ -713,14 +713,14 @@ final_callback:
 
 No `async_op` parameter is needed. The method is purely synchronous within the calling stream:
 
-`ParameterGroup.reduce_grad()` acquires any full-gradient and communication-dtype
-leases, binds explicit destination buffers, and calls
-`DataParallelBuffer.redistribute()`. The buffer performs only the placement-selected
-collective and returns the destination `DataParallelBuffer`. It does not accept raw
-communication tensors or gradient-scaling policy. `ParameterGroup` stages dtype
-conversion and scaling in its own temporary DP buffer, then one reduction-stage
-helper decides whether the result overwrites or accumulates persistent gradient
-storage and releases the workspace.
+`ParameterGroup.reduce_grad()` acquires the full-gradient lease and allocates one
+communication owner only when the communication dtype differs. It converts and
+scales once before iterating over ordered one-axis targets. Each
+`_reduce_gradient_axis()` call only invokes `DataParallelBuffer.redistribute()` between
+explicit placement views of that owner. The buffer does not accept raw communication
+tensors, scaling policy, or accumulation policy. `ParameterGroup` commits non-final
+inner results to persistent accumulation storage and merges that accumulation before
+the final outer target.
 
 The caller (`FSDPModule.reduce_grad`) provides the stream context. Allocation remains
 on the caller stream before side-stream communication starts, preserving overlap and

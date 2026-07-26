@@ -544,151 +544,137 @@ class ParameterGroup:
         """Materialize the full gradient lease before CUDA graph trace or capture."""
         self._acquire_full_grad_buffer()
 
-    def _gradient_output_buffer(self, target_placements: list[Placement]) -> DataParallelBuffer:
-        """Return externally owned storage for one gradient redistribution output."""
+    @staticmethod
+    def _placement_view(
+        owner: DataParallelBuffer, placements: list[Placement]
+    ) -> DataParallelBuffer:
+        """Return a logical placement view backed by a containing buffer owner."""
+        physical_placements = [
+            Placement.REPLICATE if placement is Placement.PARTIAL else placement
+            for placement in placements
+        ]
+        output = owner.view(physical_placements)
+        return output if physical_placements == placements else output.reinterpret(placements)
+
+    def _gradient_storage_view(self, placements: list[Placement]) -> DataParallelBuffer:
+        """Return a logical gradient view backed by persistent gradient storage."""
         grad_buffer = self.main_grad_buffer
         if grad_buffer is None:
             raise RuntimeError("Parameter group has no gradient buffer")
-        physical_placements = [
-            Placement.REPLICATE if placement is Placement.PARTIAL else placement
-            for placement in target_placements
-        ]
-        # With outer optimizer sharding, inner reduction produces an
-        # outer-PARTIAL intermediate. Keep it in the full temporary lease so
-        # it cannot overwrite the persistent outer shard accumulated by an
-        # earlier microbatch.
-        if self.outer_dp_sharding_strategy == "optim" and target_placements[0] is Placement.PARTIAL:
-            owners = (self._full_grad_buffer, grad_buffer)
-        else:
-            owners = (grad_buffer, self._full_grad_buffer)
-        for owner in owners:
-            if owner is None:
-                continue
-            try:
-                return owner.view(physical_placements).reinterpret(target_placements)
-            except ValueError:
-                continue
-        raise RuntimeError(
-            f"No bound gradient storage contains output placements {target_placements}"
-        )
+        return self._placement_view(grad_buffer, placements)
 
     def _gradient_reduction_targets(
-        self, current_placements: list[Placement], is_last_backward: bool
+        self, input_placements: list[Placement], is_last_backward: bool
     ) -> list[tuple[int, list[Placement]]]:
-        """Plan the ordered placement targets for one gradient contribution.
-
-        Inner-DP reduction runs at the step boundary, or on every microbatch
-        when gradients are persistently inner-sharded. Outer-DP reduction runs
-        at the step boundary, or on every microbatch when optimizer state is
-        outer-sharded. Inner must precede outer because its output is the
-        outer collective's input.
-        """
+        """Return ordered one-axis gradient redistribution targets."""
         grad_buffer = self.main_grad_buffer
         if grad_buffer is None:
             return []
 
-        storage_placements = grad_buffer.placements
+        should_reduce_axis = [
+            self.mesh.size(0) > 1 and is_last_backward,
+            is_last_backward or grad_buffer.placements[1] is Placement.SHARD,
+        ]
+        final_placements = self._optimizer_placements()
+        current_placements = input_placements.copy()
         targets = []
-        current = current_placements.copy()
-
-        reduce_inner = is_last_backward or storage_placements[1] is Placement.SHARD
-        if reduce_inner:
-            current[1] = (
-                Placement.SHARD if self.sharding_strategy == "optim" else storage_placements[1]
-            )
-            targets.append((1, current.copy()))
-
-        reduce_outer = self.mesh.size(0) > 1 and (
-            is_last_backward or self.outer_dp_sharding_strategy == "optim"
-        )
-        if reduce_outer:
-            current[0] = (
-                Placement.SHARD
-                if self.outer_dp_sharding_strategy == "optim"
-                else storage_placements[0]
-            )
-            targets.append((0, current.copy()))
-
+        for changed_axis in reversed(range(self.mesh.ndim)):
+            if not should_reduce_axis[changed_axis]:
+                continue
+            current_placements[changed_axis] = final_placements[changed_axis]
+            targets.append((changed_axis, current_placements.copy()))
         return targets
+
+    def _prepare_gradient_communication(
+        self,
+        full_grad_buffer: DataParallelBuffer,
+        input_placements: list[Placement],
+        *,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> tuple[DataParallelBuffer, DataParallelBuffer, tuple | None]:
+        """Prepare one communication owner before all gradient redistributions."""
+        comm_dtype = self.grad_comm_dtype or full_grad_buffer.dtype
+        workspace_key = None
+        communication_owner = full_grad_buffer
+        if comm_dtype != full_grad_buffer.dtype:
+            workspace_key = (self.param_group_id, "main_grad", "grad_comm")
+            communication_owner = DataParallelBuffer(
+                full_grad_buffer.buffer_index,
+                comm_dtype,
+                full_grad_buffer.device,
+                full_grad_buffer.mesh,
+                full_grad_buffer.placements,
+            )
+            communication_owner.bind(
+                self.allocator.allocate(
+                    key=workspace_key,
+                    size=communication_owner.data_size,
+                    dtype=communication_owner.dtype,
+                    device=communication_owner.device,
+                ).data
+            )
+
+        needs_scaling = self.gradient_scaling_factor not in (None, 1.0)
+        if communication_owner is not full_grad_buffer or needs_scaling:
+            current_stream = torch.cuda.current_stream()
+            stream = stream or current_stream
+            if stream != current_stream:
+                stream.wait_stream(current_stream)
+            full_grad_buffer.data.record_stream(stream)
+            communication_owner.data.record_stream(stream)
+            with torch.cuda.stream(stream):
+                if communication_owner is not full_grad_buffer:
+                    communication_owner.data.copy_(full_grad_buffer.data)
+                if needs_scaling:
+                    communication_owner.data.mul_(self.gradient_scaling_factor)
+
+        communication_input = self._placement_view(communication_owner, input_placements)
+        return communication_owner, communication_input, workspace_key
 
     def _reduce_gradient_axis(
         self,
         input_buffer: DataParallelBuffer,
-        target_placements: list[Placement],
+        output_buffer: DataParallelBuffer,
         changed_axis: int,
         *,
         stream: Optional[torch.cuda.Stream] = None,
     ) -> DataParallelBuffer:
-        """Run one planned gradient redistribution and commit its result."""
-        output_buffer = self._gradient_output_buffer(target_placements)
-        accumulate = self._reduced_grad_buffer_has_accumulated_grad and (
-            (changed_axis == 1 and self.outer_dp_sharding_strategy != "optim")
-            or (changed_axis == 0 and self.outer_dp_sharding_strategy == "optim")
+        """Redistribute one gradient axis between explicit DP buffers."""
+        expected_placements = input_buffer.placements.copy()
+        expected_placements[changed_axis] = output_buffer.placements[changed_axis]
+        if expected_placements != output_buffer.placements:
+            raise ValueError(
+                f"Axis {changed_axis} does not describe gradient redistribution "
+                f"{input_buffer.placements} -> {output_buffer.placements}"
+            )
+        return input_buffer.redistribute(
+            output_buffer.placements, output_buffer=output_buffer, stream=stream
         )
-        scaling_factor = self.gradient_scaling_factor if changed_axis == 1 else None
-        needs_scaling = scaling_factor not in (None, 1.0)
-        comm_dtype = self.grad_comm_dtype or input_buffer.dtype
-        needs_workspace = accumulate or needs_scaling or comm_dtype != input_buffer.dtype
 
-        redistribution_input = input_buffer
-        redistribution_output = output_buffer
-        workspace_key = None
+    @staticmethod
+    def _commit_gradient(
+        destination: DataParallelBuffer,
+        source: DataParallelBuffer,
+        *,
+        accumulate: bool,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Copy or accumulate one logical gradient value into persistent storage."""
+        if destination.data.data_ptr() == source.data.data_ptr():
+            if accumulate:
+                raise RuntimeError("Cannot accumulate a gradient buffer into itself")
+            return
         current_stream = torch.cuda.current_stream()
         stream = stream or current_stream
-
-        if needs_workspace:
-            workspace_key = (self.param_group_id, "main_grad", "grad_redistribute", changed_axis)
-            physical_input_placements = [
-                Placement.REPLICATE if placement is Placement.PARTIAL else placement
-                for placement in input_buffer.placements
-            ]
-            workspace = DataParallelBuffer(
-                input_buffer.buffer_index,
-                comm_dtype,
-                input_buffer.device,
-                input_buffer.mesh,
-                physical_input_placements,
-            )
-            workspace.bind(
-                self.allocator.allocate(
-                    key=workspace_key,
-                    size=workspace.data_size,
-                    dtype=workspace.dtype,
-                    device=workspace.device,
-                ).data
-            )
-            redistribution_input = workspace.reinterpret(input_buffer.placements)
-            physical_output_placements = [
-                Placement.REPLICATE if placement is Placement.PARTIAL else placement
-                for placement in target_placements
-            ]
-            redistribution_output = workspace.view(physical_output_placements)
-            if physical_output_placements != target_placements:
-                redistribution_output = redistribution_output.reinterpret(target_placements)
-
-            if stream != current_stream:
-                stream.wait_stream(current_stream)
-            input_buffer.data.record_stream(stream)
-            workspace.data.record_stream(stream)
-            with torch.cuda.stream(stream):
-                workspace.data.copy_(input_buffer.data)
-                if needs_scaling:
-                    workspace.data.mul_(scaling_factor)
-
-        result_buffer = redistribution_input.redistribute(
-            target_placements, output_buffer=redistribution_output, stream=stream
-        )
-        if result_buffer is not output_buffer:
-            result_buffer.data.record_stream(stream)
-            output_buffer.data.record_stream(stream)
-            with torch.cuda.stream(stream):
-                if accumulate:
-                    output_buffer.data.add_(result_buffer.data)
-                else:
-                    output_buffer.data.copy_(result_buffer.data)
-        if workspace_key is not None:
-            self.allocator.free(workspace_key)
-        return output_buffer
+        if stream != current_stream:
+            stream.wait_stream(current_stream)
+        destination.data.record_stream(stream)
+        source.data.record_stream(stream)
+        with torch.cuda.stream(stream):
+            if accumulate:
+                destination.data.add_(source.data)
+            else:
+                destination.data.copy_(source.data)
 
     def model_weights_are_unsharded(self, bwd_pass: bool = False) -> bool:
         """Return whether the model weights required by this pass are unsharded."""
@@ -770,19 +756,63 @@ class ParameterGroup:
         partial_placements[1] = Placement.PARTIAL
         if self.mesh.size(0) > 1:
             partial_placements[0] = Placement.PARTIAL
-        current_buffer = full_grad_buffer.reinterpret(partial_placements)
-        targets = self._gradient_reduction_targets(current_buffer.placements, is_last_backward)
-        for changed_axis, target_placements in targets:
-            current_buffer = self._reduce_gradient_axis(
-                current_buffer, target_placements, changed_axis, stream=stream
-            )
-            if changed_axis == 1:
-                if self.outer_dp_sharding_strategy != "optim":
-                    self._reduced_grad_buffer_has_accumulated_grad = True
-                if target_placements[1] is not Placement.REPLICATE:
+
+        targets = self._gradient_reduction_targets(partial_placements, is_last_backward)
+        if not targets:
+            return
+
+        communication_owner, current_buffer, workspace_key = self._prepare_gradient_communication(
+            full_grad_buffer, partial_placements, stream=stream
+        )
+        optimizer_placements = self._optimizer_placements()
+        accumulation_placements = optimizer_placements.copy()
+        if self.mesh.size(0) > 1:
+            accumulation_placements[0] = Placement.PARTIAL
+        merged_previous_accumulation = False
+        try:
+            for changed_axis, target_placements in targets:
+                output_buffer = self._placement_view(communication_owner, target_placements)
+                current_buffer = self._reduce_gradient_axis(
+                    current_buffer, output_buffer, changed_axis, stream=stream
+                )
+                if current_buffer.placements[1] is Placement.SHARD:
                     self._full_grad_buffer_has_accumulated_grad = False
-            else:
+
+                if (
+                    is_last_backward
+                    and not merged_previous_accumulation
+                    and self._reduced_grad_buffer_has_accumulated_grad
+                    and current_buffer.placements == accumulation_placements
+                ):
+                    accumulated_buffer = self._gradient_storage_view(accumulation_placements)
+                    self._commit_gradient(
+                        current_buffer, accumulated_buffer, accumulate=True, stream=stream
+                    )
+                    merged_previous_accumulation = True
+
+            if not is_last_backward:
+                accumulated_buffer = self._gradient_storage_view(current_buffer.placements)
+                self._commit_gradient(
+                    accumulated_buffer,
+                    current_buffer,
+                    accumulate=self._reduced_grad_buffer_has_accumulated_grad,
+                    stream=stream,
+                )
                 self._reduced_grad_buffer_has_accumulated_grad = True
+                return
+
+            if self._reduced_grad_buffer_has_accumulated_grad and not merged_previous_accumulation:
+                raise RuntimeError(
+                    "Gradient reduction did not reach the persistent "
+                    f"accumulation placement {accumulation_placements}"
+                )
+
+            optimizer_grad = self._gradient_storage_view(optimizer_placements)
+            self._commit_gradient(optimizer_grad, current_buffer, accumulate=False, stream=stream)
+            self._reduced_grad_buffer_has_accumulated_grad = True
+        finally:
+            if workspace_key is not None:
+                self.allocator.free(workspace_key)
 
     def release_grad_buffer(self):
         """Release this group's temporary full-gradient lease."""

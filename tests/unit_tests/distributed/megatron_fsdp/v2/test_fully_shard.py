@@ -714,7 +714,11 @@ class TestFullyShardBasic:
         model.set_is_last_backward(True)
         model(x).float().sum().backward()
         model.finish_grad_sync()
-        assert param_group.main_grad_buffer.placements == [Placement.SHARD, Placement.SHARD]
+        assert param_group.main_grad_buffer.placements == [Placement.REPLICATE, Placement.SHARD]
+        optimizer_grad_view = param_group.main_grad_buffer.view([Placement.SHARD, Placement.SHARD])
+        assert optimizer_grad_view.data.numel() * _world_size() == (
+            param_group.main_grad_buffer.buffer_index.bucket_meta.size
+        )
 
         ctx = model._fsdp_root_context
         assert ctx.model_weight_refresh_pending
