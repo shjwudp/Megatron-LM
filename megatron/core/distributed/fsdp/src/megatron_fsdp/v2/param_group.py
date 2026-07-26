@@ -630,25 +630,6 @@ class ParameterGroup:
 
         return self._placement_view(communication_owner, input_placements), workspace_key
 
-    def _merge_reduced_gradient(
-        self,
-        input_buffer: DataParallelBuffer,
-        changed_axis: int,
-        *,
-        stream: Optional[torch.cuda.Stream] = None,
-    ) -> None:
-        """Merge persistent inner-DP accumulation before reducing the outer axis."""
-        if not self._reduced_grad_buffer_has_accumulated_grad or changed_axis != 0:
-            return
-        accumulation_placements = self._optimizer_placements()
-        if self.mesh.size(0) > 1:
-            accumulation_placements[0] = Placement.PARTIAL
-        if input_buffer.placements != accumulation_placements:
-            return
-        accumulated_buffer = self._gradient_storage_view(accumulation_placements)
-        self._commit_gradient(input_buffer, accumulated_buffer, accumulate=True, stream=stream)
-        self._reduced_grad_buffer_has_accumulated_grad = False
-
     def _reduce_gradient_axis(
         self,
         input_buffer: DataParallelBuffer,
@@ -657,8 +638,7 @@ class ParameterGroup:
         *,
         stream: Optional[torch.cuda.Stream] = None,
     ) -> DataParallelBuffer:
-        """Merge any pending input and redistribute one gradient axis."""
-        self._merge_reduced_gradient(input_buffer, changed_axis, stream=stream)
+        """Redistribute one gradient axis."""
         storage_owner = input_buffer._storage_owner or input_buffer
         output_buffer = self._placement_view(storage_owner, target_placements)
         expected_placements = input_buffer.placements.copy()
@@ -696,6 +676,32 @@ class ParameterGroup:
                 destination.data.add_(source.data)
             else:
                 destination.data.copy_(source.data)
+
+    def _accumulate_or_assign_gradient(
+        self,
+        input_buffer: DataParallelBuffer,
+        *,
+        persist: bool,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> DataParallelBuffer:
+        """Merge an intermediate or commit the final gradient stage."""
+        accumulated_buffer = self._gradient_storage_view(input_buffer.placements)
+        if not persist:
+            if self._reduced_grad_buffer_has_accumulated_grad:
+                self._commit_gradient(
+                    input_buffer, accumulated_buffer, accumulate=True, stream=stream
+                )
+                self._reduced_grad_buffer_has_accumulated_grad = False
+            return input_buffer
+
+        self._commit_gradient(
+            accumulated_buffer,
+            input_buffer,
+            accumulate=self._reduced_grad_buffer_has_accumulated_grad,
+            stream=stream,
+        )
+        self._reduced_grad_buffer_has_accumulated_grad = True
+        return accumulated_buffer
 
     def model_weights_are_unsharded(self, bwd_pass: bool = False) -> bool:
         """Return whether the model weights required by this pass are unsharded."""
@@ -787,22 +793,15 @@ class ParameterGroup:
         try:
             # Full gradient buffer to reduced buffer.
             current_buffer = grad_input_buffer
-            for changed_axis, target_placements in targets:
+            for target_index, (changed_axis, target_placements) in enumerate(targets):
                 current_buffer = self._reduce_gradient_axis(
                     current_buffer, target_placements, changed_axis, stream=stream
                 )
+                current_buffer = self._accumulate_or_assign_gradient(
+                    current_buffer, persist=target_index == len(targets) - 1, stream=stream
+                )
             if current_buffer.placements[1] is Placement.SHARD:
                 self._full_grad_buffer_has_accumulated_grad = False
-
-            # Commit the reduced buffer to persistent gradient storage.
-            accumulated_buffer = self._gradient_storage_view(current_buffer.placements)
-            self._commit_gradient(
-                accumulated_buffer,
-                current_buffer,
-                accumulate=self._reduced_grad_buffer_has_accumulated_grad,
-                stream=stream,
-            )
-            self._reduced_grad_buffer_has_accumulated_grad = True
         finally:
             if workspace_key is not None:
                 self.allocator.free(workspace_key)

@@ -228,9 +228,9 @@ lease from asynchronous all-gather launch through the final consumer.
 5. `DataParallelBuffer.redistribute()` performs one all-reduce or reduce-scatter and
    returns its destination DP buffer. Each target output is a contained placement view
    of the current communication buffer.
-6. Before an outer-axis transition, the parameter group merges any persistent
-   `[P, S]` inner-DP accumulation into the transition input. After the target loop, it
-   copies or accumulates the result once into the matching persistent gradient view.
+6. After each stage, the parameter group either merges persistent `[P, S]`
+   accumulation into an intermediate that feeds the next stage, or assigns/accumulates
+   the final result into the matching persistent gradient view.
 7. The group exposes the resulting shards through optimizer-facing DTensors and
    releases the full-gradient lease after asynchronous communication completes.
 

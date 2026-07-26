@@ -716,11 +716,12 @@ No `async_op` parameter is needed. The method is purely synchronous within the c
 `ParameterGroup.reduce_grad()` acquires the full-gradient lease and allocates one
 communication owner only when the communication dtype differs. It converts and
 scales once before iterating over ordered one-axis targets. Each
-`_reduce_gradient_axis()` call resolves the target placement view and invokes
-`DataParallelBuffer.redistribute()`. Before the final outer-axis transition, it merges
-any persistent inner-DP accumulation into that transition's input. The buffer does not
-accept raw communication tensors, scaling policy, or accumulation policy. After the
-ordered loop, `ParameterGroup` commits the result once to persistent gradient storage.
+`_reduce_gradient_axis()` call only resolves the target placement view and invokes
+`DataParallelBuffer.redistribute()`. Between HSDP stages, `ParameterGroup` merges any
+persistent inner-DP accumulation into the communication-dtype intermediate. At the
+final stage, it assigns or accumulates the result into persistent gradient storage.
+The buffer does not accept raw communication tensors, scaling policy, or accumulation
+policy.
 
 The caller (`FSDPModule.reduce_grad`) provides the stream context. Allocation remains
 on the caller stream before side-stream communication starts, preserving overlap and
