@@ -327,7 +327,7 @@ class ParameterGroupV2:
         grad_input, workspace_key = self._preprocess_gradient(self.state.full_grad)
         accumulation = self._placement_view(self.grad_buffer, self.layout.grad_accumulation)
         has_accumulation = self.state.grad_valid == self.layout.grad_accumulation
-        if has_accumulation or grad_input.dtype != accumulation.dtype:
+        if is_last_backward or has_accumulation or grad_input.dtype != accumulation.dtype:
             owner = grad_input._storage_owner or grad_input
             output = self._placement_view(owner, self.layout.grad_accumulation)
         else:
@@ -337,15 +337,22 @@ class ParameterGroupV2:
             grad_input.redistribute(list(self.layout.grad_accumulation), output_buffer=output)
             if output.data.data_ptr() != accumulation.data.data_ptr():
                 if has_accumulation:
-                    accumulation.data.add_(output.data)
-                else:
+                    output.data.add_(accumulation.data)
+                if not is_last_backward:
                     accumulation.data.copy_(output.data)
             self.state.grad_valid = self.layout.grad_accumulation
             self.state.grad_ready = False
 
             if is_last_backward:
                 final = self._placement_view(self.grad_buffer, self.layout.main_weight)
-                accumulation.redistribute(list(self.layout.main_weight), output_buffer=final)
+                communication_owner = output._storage_owner or output
+                communication_final = self._placement_view(
+                    communication_owner, self.layout.main_weight
+                )
+                output.redistribute(
+                    list(self.layout.main_weight), output_buffer=communication_final
+                )
+                final.data.copy_(communication_final.data)
                 self.state.grad_valid = self.layout.main_weight
                 self.state.grad_ready = True
         finally:
