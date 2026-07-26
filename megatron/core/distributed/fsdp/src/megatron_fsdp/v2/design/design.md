@@ -336,13 +336,25 @@ def reduce_grad(self, async_op: bool = False):
                 stage_tensors.append(param.get_main_grad())
                 stage_sources.append(grad.detach())
 
-        # Backward produces gradients on the caller stream, so staging remains
-        # on that stream as well.
-        if stage_tensors:
-            op = torch._foreach_add_ if accumulate_full_grad else torch._foreach_copy_
-            op(stage_tensors, stage_sources)
-        if zero_tensors:
-            torch._foreach_zero_(zero_tensors)
+        stage_on_rs_stream = async_op and getattr(
+            self._fsdp_state, "enable_full_iteration_cuda_graph", False
+        )
+        if stage_on_rs_stream:
+            stream.wait_stream(torch.cuda.current_stream())
+            for source in stage_sources:
+                source.record_stream(stream)
+            with torch.cuda.stream(stream):
+                if stage_tensors:
+                    op = torch._foreach_add_ if accumulate_full_grad else torch._foreach_copy_
+                    op(stage_tensors, stage_sources)
+                if zero_tensors:
+                    torch._foreach_zero_(zero_tensors)
+        else:
+            if stage_tensors:
+                op = torch._foreach_add_ if accumulate_full_grad else torch._foreach_copy_
+                op(stage_tensors, stage_sources)
+            if zero_tensors:
+                torch._foreach_zero_(zero_tensors)
 
         for param in params_with_grad:
             del param.grad
@@ -371,10 +383,18 @@ def reduce_grad(self, async_op: bool = False):
 ```
 
 **Key design point — `DataParallelBuffer.redistribute()` has no asynchronous-work
-handle.** The primitive executes synchronously within the current stream. Backward and
-gradient staging stay on the caller stream; `ParameterGroup.reduce_grad(stream=...)`
-then inserts one wait before preprocessing and redistribution on `rs_stream`. Temporary
-buffers remain owned by `ParameterGroup` until the module's reduction event completes.
+handle.** The primitive executes synchronously within the current stream, while its
+caller owns stream ordering and tensor lifetime. Eager, per-module CUDA graph, and
+synchronous-reduction paths stage gradients on the caller stream; then
+`ParameterGroup.reduce_grad(stream=...)` inserts one wait before preprocessing and
+redistribution on `rs_stream`.
+
+Full-iteration CUDA graphs instead dispatch ordinary async gradient add/copy/zero
+staging to `rs_stream` immediately before reduction. The stream first waits for
+backward, and detached `.grad` sources record `rs_stream` so their storage remains live
+after Python references are deleted. This preserves overlap with the next module's
+backward compute. Temporary buffers remain owned by `ParameterGroup` until the module's
+reduction event completes.
 
 **`grad_added_to_main_grad` and `overwrite_main_grad` flags:**
 When TransformerEngine's `gradient_accumulation_fusion` is active, the backward kernel writes
@@ -672,13 +692,13 @@ pre-hook L[2]: event[L[2]].wait() → main stream unblocks
 
 BACKWARD PASS (enable_async_reduce_grad=True, full-iteration CUDA graph)
 ---------------------------------------------------------
-main stream:  |bwd+stage L[2]-----|bwd+stage L[1]-----|bwd+stage L[0]-----|
+main stream:  |bwd L[2]-----------|bwd L[1]-----------|bwd L[0]-----------|
 ag_stream:    |AG(L[1]) prefetch    |AG(L[0]) prefetch     |                      |
-rs_stream:    |wait+RS(L[2]) -------|wait+RS(L[1]) -------|wait+RS(L[0])----------|
+rs_stream:    |stage+RS(L[2]) ------|stage+RS(L[1]) ------|stage+RS(L[0])---------|
 
-post-bwd L[2]: reshard, stage grad[2], rs_stream.wait(main), RS(L[2]), event[2]
-post-bwd L[1]: drain event[2-2]? (i=1, no drain), stage grad[1], wait, RS(L[1]), event[1]
-post-bwd L[0]: drain event[L[2]], stage grad[0], wait, RS(L[0]), event[0]
+post-bwd L[2]: reshard, rs_stream.wait(main), stage grad[2], RS(L[2]), event[2]
+post-bwd L[1]: drain event[2-2]? (i=1, no drain), stage grad[1], RS(L[1]), event[1]
+post-bwd L[0]: drain event[L[2]], stage grad[0], RS(L[0]), event[0]
 
 final_callback:
   drain event[L[1]], event[L[0]]

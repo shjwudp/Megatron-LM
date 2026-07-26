@@ -351,10 +351,12 @@ torchrun --nproc_per_node=2 \
 - **Temporary communication bucket lifecycle.** Temporary all-gather /
   reduce-scatter buckets are allocated on the caller CUDA stream. Parameter
   all-gathers run on `ag_stream`; gradient collectives run on `rs_stream`,
-  after one wait on caller-stream preparation. Gradient add/copy/zero staging
-  remains on the caller stream. CUDA events order communication, consumption,
-  and release, and `ParameterGroup` retains each temporary lease until its event
-  completes.
+  after one wait on gradient preparation. Eager and per-module CUDA graph paths
+  stage gradients on the caller stream. Full-iteration CUDA graphs instead stage
+  ordinary async gradients on `rs_stream` and record detached source tensors on
+  that stream so their storage remains live. CUDA events order communication,
+  consumption, and release, and `ParameterGroup` retains each temporary lease
+  until its event completes.
 
 ## Unit Tests
 
