@@ -5,14 +5,13 @@ from __future__ import annotations
 from contextlib import nullcontext
 from copy import copy
 from itertools import groupby
-from typing import Iterable, List, Optional
+from typing import Iterable, Optional
 
 import torch
 from torch.distributed import _coalescing_manager
 from torch.distributed.tensor import DeviceMesh
 
 from .buffer_index import BufferIndex, Placement
-from .utils import ParamGroupIdx
 
 
 class DataParallelBuffer:
@@ -25,61 +24,20 @@ class DataParallelBuffer:
 
     def __init__(
         self,
-        tensors: List[torch.Tensor],
+        buffer_index: BufferIndex,
         dtype: torch.dtype,
         device: torch.device,
         mesh: DeviceMesh,
-        param_group_id: ParamGroupIdx,
-        mp_policy,
-        *,
-        buffer_role: str = "model_weight",
-        chunk_size_factor: int = 1,
-        sharding_strategy: str = "no_shard",
-        outer_dp_sharding_strategy: str = "no_shard",
+        placements: list[Placement],
     ):
-        assert mp_policy is not None, "DataParallelBuffer requires a mixed-precision policy"
+        if len(placements) != mesh.ndim:
+            raise ValueError(f"Expected {mesh.ndim} placements, got {placements}")
+        self.buffer_index = buffer_index
         self.dtype = dtype
         self.device = device
         self.mesh = mesh
-
-        def is_sharded_from_strategy(strategy: str) -> bool:
-            if buffer_role in ("model_weight", "transpose_weight"):
-                return strategy == "optim_grads_params"
-            if buffer_role == "main_weight":
-                return strategy != "no_shard"
-            if buffer_role == "main_grad":
-                return strategy in ("optim_grads", "optim_grads_params")
-            raise ValueError(f"Unsupported data-parallel buffer role: {buffer_role}")
-
-        self.outer_sharded = is_sharded_from_strategy(outer_dp_sharding_strategy)
-        self.inner_sharded = is_sharded_from_strategy(sharding_strategy)
-        self.storage_placements: list[Placement] = [
-            Placement.SHARD if sharded else Placement.REPLICATE
-            for sharded in (self.outer_sharded, self.inner_sharded)
-        ]
-        self.placements: list[Placement] = self.storage_placements.copy()
-        self.sharding_strategy = sharding_strategy
-        self.outer_dp_sharding_strategy = outer_dp_sharding_strategy
-
-        # Always build layout with logical shapes and shared chunk_size_factor
-        # so that all buffers share the same proportional item-offset mapping.
-        logical_shapes = [tensor.shape for tensor in tensors]
-        self.buffer_index = BufferIndex(
-            param_shapes=logical_shapes,
-            mesh=mesh,
-            chunk_size_factor=chunk_size_factor,
-            param_group_id=param_group_id,
-        )
-
-        # Compact NVFP4 weight buffers: scale all indices proportionally so
-        # the buffer holds only the packed data without fragment-binning waste.
-        if buffer_role in ("model_weight", "transpose_weight") and any(
-            mp_policy.is_nvfp4_param(tensor) for tensor in tensors
-        ):
-            compact_shapes = mp_policy.get_param_storage_shapes(tensors)
-            self.buffer_index.compact(0.5, compact_shapes)
-
-        self.data_size = self.buffer_index._get_shard_meta(self.storage_placements).size
+        self.placements = placements.copy()
+        self.data_size = self.buffer_index._get_shard_meta(self.placements).size
 
         self.data: Optional[torch.Tensor] = None
         self._storage_owner: Optional["DataParallelBuffer"] = None
@@ -106,21 +64,16 @@ class DataParallelBuffer:
         placeholder = copy(self)
         placeholder.data_size = self.buffer_index._get_shard_meta(placements).size
         placeholder.data = None
-        placeholder.storage_placements = placements.copy()
         placeholder.placements = placements.copy()
         placeholder._storage_owner = None
         return placeholder
 
     @torch.no_grad()
-    def copy_tensors_(
-        self, tensors: Iterable[torch.Tensor], *, placements: Optional[list[Placement]] = None
-    ) -> None:
+    def copy_tensors_(self, tensors: Iterable[torch.Tensor]) -> None:
         """Copy an ordered tensor sequence into this buffer in place.
 
         Args:
             tensors: One tensor per layout entry, in constructor order.
-            placements: Logical source placements. Defaults to this buffer's
-                current placements.
 
         Raises:
             RuntimeError: If no storage is bound.
@@ -128,7 +81,6 @@ class DataParallelBuffer:
         """
         if self.data is None:
             raise RuntimeError("DataParallelBuffer has no bound storage")
-        requested_placements = placements if placements is not None else self.placements
         expected_count = len(self.buffer_index.item_index_map)
         copied_count = 0
         for tensor_id, tensor in enumerate(tensors):
@@ -136,8 +88,8 @@ class DataParallelBuffer:
                 raise ValueError(f"Expected {expected_count} tensors, got more")
             source_slice, local_slice = self.buffer_index.local_slice_for(
                 self.buffer_index._get_item_global_range(tensor_id),
-                requested_placements,
-                self.storage_placements,
+                self.placements,
+                self.placements,
             )
             if source_slice is not None and local_slice is not None:
                 self.data[local_slice].copy_(tensor.flatten()[source_slice])
@@ -145,26 +97,19 @@ class DataParallelBuffer:
         if copied_count != expected_count:
             raise ValueError(f"Expected {expected_count} tensors, got {copied_count}")
 
-    def tensor_view(
-        self, tensor_id: int, *, placements: Optional[list[Placement]] = None
-    ) -> torch.Tensor:
-        """Return a local view of one tensor under the requested placements.
+    def tensor_view(self, tensor_id: int) -> torch.Tensor:
+        """Return this rank's local view of one tensor.
 
         Args:
             tensor_id: Tensor index in constructor order.
-            placements: Logical placements for the requested view. Defaults to
-                this buffer's current placements.
 
         Returns:
             A local ``torch.Tensor`` view, which may be empty on this rank.
         """
         if self.data is None:
             raise RuntimeError("DataParallelBuffer has no bound storage")
-        requested_placements = placements if placements is not None else self.placements
         _, local_slice = self.buffer_index.local_slice_for(
-            self.buffer_index._get_item_global_range(tensor_id),
-            requested_placements,
-            self.storage_placements,
+            self.buffer_index._get_item_global_range(tensor_id), self.placements, self.placements
         )
         return self.data[:0] if local_slice is None else self.data[local_slice]
 
@@ -262,11 +207,18 @@ class DataParallelBuffer:
                         continue
                     axis_target = buffer.placements.copy()
                     axis_target[mesh_dim] = target
-                    axis_output = (
-                        final_output
-                        if axis_target == target_placements
-                        else final_output.view(axis_target)
-                    )
+                    if axis_target == target_placements:
+                        axis_output = final_output
+                    elif (
+                        buffer._storage_owner is not None
+                        and buffer._storage_owner.placements == axis_target
+                    ):
+                        # Prefer the containing placement view when one exists.
+                        # For [S, S] -> [R, S] -> [R, R], this refreshes the
+                        # persistent [R, S] owner before the final all-gather.
+                        axis_output = buffer._storage_owner
+                    else:
+                        axis_output = final_output.view(axis_target)
                     axis_transitions.append((buffer, axis_output))
                     next_buffers.append(axis_output)
 
@@ -289,14 +241,18 @@ class DataParallelBuffer:
                         coalescing_event.wait()
                 current_buffers = next_buffers
 
-        for buffer in buffers:
-            buffer.placements = target_placements.copy()
+            for current, final_output in zip(current_buffers, output_buffers):
+                if current is not final_output:
+                    current.redistribute(
+                        target_placements, output_buffer=final_output, stream=stream
+                    )
+
         return output_buffers
 
     @torch.no_grad()
     def redistribute(
         self,
-        target_placements: Optional[list[Placement]] = None,
+        target_placements: list[Placement],
         *,
         output_buffer: "DataParallelBuffer" | None = None,
         comm_input: torch.Tensor | None = None,
@@ -309,8 +265,6 @@ class DataParallelBuffer:
         in-place all-gather whose ``REPLICATE`` output owns full storage while
         this ``SHARD`` input is a slice sharing that same storage.
         """
-        if target_placements is None:
-            target_placements = self.storage_placements
         assert len(target_placements) == 2
 
         changed_axis = None
@@ -325,8 +279,10 @@ class DataParallelBuffer:
             changed_axis = axis
         if changed_axis is None:
             if output_buffer is None:
-                return self._bound_view(target_placements)
+                return self.data
             self._validate_output_buffer(output_buffer, target_placements)
+            if output_buffer.data.data_ptr() != self.data.data_ptr():
+                output_buffer.data.copy_(self.data)
             return output_buffer.data
 
         current_stream = torch.cuda.current_stream()
@@ -401,7 +357,6 @@ class DataParallelBuffer:
         else:
             raise NotImplementedError(f"Unsupported placement transition: {source!r} -> {target!r}")
 
-        self.placements[changed_axis] = target
         return output
 
     def _validate_output_buffer(
@@ -426,30 +381,24 @@ class DataParallelBuffer:
                 f"got {None if output_buffer.data is None else output_buffer.data.numel()}"
             )
 
-    def get_shard_view(self, placements: Optional[list[Placement]] = None) -> torch.Tensor:
-        """Return a placement view inside the persistent data buffer."""
-        assert self.data is not None, "DataParallelBuffer data not initialized"
-        requested_placements = placements if placements is not None else self.placements
-        _, local_slice = self.buffer_index.local_slice_for(
-            (0, self.buffer_index.bucket_meta.size), requested_placements, self.storage_placements
-        )
-        return self.data[:0] if local_slice is None else self.data[local_slice]
-
     def _bound_view(self, placements: list[Placement]) -> torch.Tensor:
         """Return a placement-shaped view when the bound storage contains it."""
         if self.data is None:
             raise RuntimeError("DataParallelBuffer has no bound storage")
-        if placements == self.storage_placements:
+        if placements == self.placements:
             return self.data
 
         data_contains_requested = all(
             storage_placement is requested_placement
             or (storage_placement is Placement.REPLICATE and requested_placement is Placement.SHARD)
-            for storage_placement, requested_placement in zip(self.storage_placements, placements)
+            for storage_placement, requested_placement in zip(self.placements, placements)
         )
         if data_contains_requested:
-            return self.get_shard_view(placements)
+            _, local_slice = self.buffer_index.local_slice_for(
+                (0, self.buffer_index.bucket_meta.size), placements, self.placements
+            )
+            return self.data[:0] if local_slice is None else self.data[local_slice]
         raise ValueError(
-            f"Bound storage placements {self.storage_placements} do not contain {placements}; "
+            f"Buffer placements {self.placements} do not contain {placements}; "
             "bind an externally allocated output buffer"
         )

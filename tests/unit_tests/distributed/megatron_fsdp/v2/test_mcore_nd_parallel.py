@@ -10,6 +10,7 @@ import megatron.core.parallel_state as mpu
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import _init_dp_mesh
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
     HAVE_TE_NVFP4,
@@ -112,7 +113,7 @@ class TestMegatronFSDPE2E:
             grad_buffer = param_group.main_grad_buffer
             assert grad_buffer is not None
             assert grad_buffer.mesh.get_group(mesh_dim=1).size() == 1
-            assert grad_buffer.inner_sharded
+            assert grad_buffer.placements[1] is Placement.SHARD
             param_group._init_dist_grads()
 
             param = param_group.params[0]
@@ -222,7 +223,7 @@ class TestMegatronFSDPE2E:
                 for param_group in module._fsdp_param_groups:
                     if (
                         param_group.model_weight_buffer is None
-                        or param_group.model_weight_buffer.inner_sharded
+                        or param_group.model_weight_buffer.placements[1] is Placement.SHARD
                     ):
                         continue
                     param_group.unshard(bwd_pass=False)
@@ -233,7 +234,7 @@ class TestMegatronFSDPE2E:
                         ("model_weight_buffer", param_group.model_weight_buffer),
                         ("transpose_weight_buffer", param_group.transpose_weight_buffer),
                     ):
-                        if buffer is None or buffer.inner_sharded:
+                        if buffer is None or buffer.placements[1] is Placement.SHARD:
                             continue
                         gathered = [
                             torch.empty_like(buffer.data)

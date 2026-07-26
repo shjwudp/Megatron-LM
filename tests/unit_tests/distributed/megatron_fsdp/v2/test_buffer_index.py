@@ -147,25 +147,25 @@ class TestBufferIndex:
         assert index._get_item_self_range(item_id, placements=placements) == expected_self
         assert index._get_item_local_range(item_id, placements=placements) == expected_local
 
-    def _expected_local_slices(self, global_range, requested_placements, storage_placements):
+    def _expected_local_slices(self, global_range, requested_placements, bound_placements):
         global_start, global_end = global_range
         requested_start, _, _, requested_size = self.ref_shard_metas[tuple(requested_placements)]
-        storage_start, storage_local_start, _, storage_size = self.ref_shard_metas[
-            tuple(storage_placements)
+        bound_start, bound_local_start, _, bound_size = self.ref_shard_metas[
+            tuple(bound_placements)
         ]
-        start = max(global_start, requested_start, storage_start)
-        end = min(global_end, requested_start + requested_size, storage_start + storage_size)
+        start = max(global_start, requested_start, bound_start)
+        end = min(global_end, requested_start + requested_size, bound_start + bound_size)
         if start >= end:
             return None, None
 
         source_slice = slice(start - global_start, end - global_start)
-        local_start = storage_local_start + start - storage_start
+        local_start = bound_local_start + start - bound_start
         return source_slice, slice(local_start, local_start + end - start)
 
     @pytest.mark.parametrize("item_id", [0, 1, 2])
     @pytest.mark.parametrize("requested_placements", CANONICAL_PLACEMENTS)
-    @pytest.mark.parametrize("storage_placements", CANONICAL_PLACEMENTS)
-    def test_local_slice_for_item(self, item_id, requested_placements, storage_placements):
+    @pytest.mark.parametrize("bound_placements", CANONICAL_PLACEMENTS)
+    def test_local_slice_for_item(self, item_id, requested_placements, bound_placements):
         index = BufferIndex(
             param_shapes=self.param_shapes,
             mesh=self.mesh,
@@ -175,12 +175,12 @@ class TestBufferIndex:
         global_range = self.ref_item_ranges[item_id]
 
         assert index.local_slice_for(
-            global_range, requested_placements, storage_placements
-        ) == self._expected_local_slices(global_range, requested_placements, storage_placements)
+            global_range, requested_placements, bound_placements
+        ) == self._expected_local_slices(global_range, requested_placements, bound_placements)
 
     @pytest.mark.parametrize("requested_placements", CANONICAL_PLACEMENTS)
-    @pytest.mark.parametrize("storage_placements", CANONICAL_PLACEMENTS)
-    def test_local_slice_for_whole_bucket(self, requested_placements, storage_placements):
+    @pytest.mark.parametrize("bound_placements", CANONICAL_PLACEMENTS)
+    def test_local_slice_for_whole_bucket(self, requested_placements, bound_placements):
         index = BufferIndex(
             param_shapes=self.param_shapes,
             mesh=self.mesh,
@@ -190,5 +190,5 @@ class TestBufferIndex:
         global_range = (0, self.ref_bucket_size)
 
         assert index.local_slice_for(
-            global_range, requested_placements, storage_placements
-        ) == self._expected_local_slices(global_range, requested_placements, storage_placements)
+            global_range, requested_placements, bound_placements
+        ) == self._expected_local_slices(global_range, requested_placements, bound_placements)

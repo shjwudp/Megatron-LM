@@ -188,19 +188,15 @@ def test_init_buffers(strategy):
             assert not hasattr(wbuf, "allocator")
             assert not hasattr(wbuf, "_move_data_to")
             assert not hasattr(wbuf, "_ensure_data_on_gpu")
-            assert wbuf.storage_placements[1] is (
-                Placement.SHARD if w_dist else Placement.REPLICATE
-            )
+            assert wbuf.placements[1] is (Placement.SHARD if w_dist else Placement.REPLICATE)
 
             # Per-param check: tensor_view should return this rank's portion of
             # the original param. A param may span shard boundaries, so the
             # returned slice can be shorter than the full param or even empty.
             for i, p in enumerate(orig):
-                item = wbuf.tensor_view(i, placements=wbuf.storage_placements)
+                item = wbuf.tensor_view(i)
                 if w_dist:
-                    s, e = wbuf.buffer_index._get_item_self_range(
-                        i, placements=wbuf.storage_placements
-                    )
+                    s, e = wbuf.buffer_index._get_item_self_range(i, placements=wbuf.placements)
                     expected = p.flatten()[s:e]
                 else:
                     expected = p.flatten()
@@ -208,7 +204,7 @@ def test_init_buffers(strategy):
         # -- main_grad_buffer --
         if pg.requires_grad:
             assert pg.main_grad_buffer is not None
-            assert pg.main_grad_buffer.storage_placements[1] is (
+            assert pg.main_grad_buffer.placements[1] is (
                 Placement.SHARD if g_dist else Placement.REPLICATE
             )
             assert pg.main_grad_buffer.data is None  # lazy init
@@ -280,8 +276,11 @@ def test_redistribute_into_shared_replicate_output():
         input_buffer = output_buffer.view(shard_placements)
 
         assert input_buffer is not output_buffer
-        assert input_buffer.storage_placements == shard_placements
-        assert output_buffer.storage_placements == full_placements
+        assert input_buffer.placements == shard_placements
+        assert output_buffer.placements == full_placements
+        assert not hasattr(input_buffer, "storage_placements")
+        assert not hasattr(input_buffer, "buffer_role")
+        assert not hasattr(input_buffer, "sharding_strategy")
         assert (
             input_buffer.data.untyped_storage().data_ptr()
             == output_buffer.data.untyped_storage().data_ptr()
@@ -325,7 +324,7 @@ def test_reduce_grad(strategy):
             expected = Ref.reduce_scatter(full.clone(), dp_group)
 
         pg.reduce_grad(is_last_backward=True)
-        actual = gbuf.get_shard_view(gbuf.placements)
+        actual = gbuf.data
         assert torch.equal(actual, expected)
 
     torch.distributed.barrier()
@@ -465,7 +464,7 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
                 Ref.all_reduce(expected, pg.outer_dp_group)
 
         pg.reduce_grad(is_last_backward=True)
-        actual = gbuf.get_shard_view(gbuf.placements)
+        actual = gbuf.data
         assert torch.equal(actual, expected)
 
         assert pg._full_grad_buffer_has_accumulated_grad == (strategy == "no_shard")
@@ -528,7 +527,7 @@ def test_hsdp_reduce_grad_multi_microbatch(strategy, outer_strategy):
                 ref_shard = Ref.reduce_scatter(ref_shard, pg.outer_dp_group)
             else:
                 Ref.all_reduce(ref_shard, pg.outer_dp_group)
-            actual = gbuf.get_shard_view(gbuf.placements)
+            actual = gbuf.data
             assert torch.equal(actual, ref_shard)
 
         pg.zero_grad()

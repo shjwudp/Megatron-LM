@@ -325,28 +325,29 @@ class BufferIndex:
         self,
         global_range: Tuple[int, int],
         requested_placements: list[Placement],
-        storage_placements: list[Placement],
+        bound_placements: list[Placement],
     ) -> Tuple[Optional[slice], Optional[slice]]:
-        """Clip global_range to requested and storage placements.
+        """Clip ``global_range`` to requested and bound-buffer placements.
 
         The source slice indexes the object described by global_range relative
-        to global_range[0]. The local slice indexes storage physically laid out
-        as storage_placements. Returns (None, None) when the intersection is empty.
+        to global_range[0]. The local slice indexes the tensor bound to a buffer
+        with ``bound_placements``. Returns (None, None) when the intersection is
+        empty.
         """
         global_start, global_end = global_range
         requested_meta = self._get_shard_meta(requested_placements)
-        storage_meta = self._get_shard_meta(storage_placements)
-        start = max(global_start, requested_meta.global_data_index, storage_meta.global_data_index)
+        bound_meta = self._get_shard_meta(bound_placements)
+        start = max(global_start, requested_meta.global_data_index, bound_meta.global_data_index)
         end = min(
             global_end,
             requested_meta.global_data_index + requested_meta.size,
-            storage_meta.global_data_index + storage_meta.size,
+            bound_meta.global_data_index + bound_meta.size,
         )
         if start >= end:
             return None, None
 
         source_slice = slice(start - global_start, end - global_start)
-        local_start = storage_meta.local_data_index + start - storage_meta.global_data_index
+        local_start = bound_meta.local_data_index + start - bound_meta.global_data_index
         local_slice = slice(local_start, local_start + end - start)
         return source_slice, local_slice
 

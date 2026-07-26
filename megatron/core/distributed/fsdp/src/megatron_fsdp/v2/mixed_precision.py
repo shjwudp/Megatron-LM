@@ -553,29 +553,18 @@ class MixedPrecisionPolicy:
         main_weight_buffer,
         transpose_weight_buffer=None,
         *,
+        optimizer_placements,
         full_weight_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         """Install optimized main weights into model compute weights."""
         assert model_weight_buffer is not None, "FSDP parameters require a model-weight buffer"
-        optimizer_weight_buffer = main_weight_buffer or model_weight_buffer
-        outer_optim = optimizer_weight_buffer.outer_dp_sharding_strategy == "optim"
 
         # With no distinct main-weight buffer, the optimizer updated shard views
-        # of model_weight_buffer directly. There is no data to copy, but the buffer
-        # now represents that SHARD view so the next unshard refreshes its replica.
+        # of model_weight_buffer directly. There is no data to copy; ParameterGroup
+        # records the optimizer-placement source for the next unshard.
         if main_weight_buffer is None:
-            for buffer in (model_weight_buffer, transpose_weight_buffer):
-                if buffer is None:
-                    continue
-                target_placements = buffer.storage_placements.copy()
-                if buffer.sharding_strategy != "no_shard" and not buffer.inner_sharded:
-                    target_placements[1] = Placement.SHARD
-                if outer_optim:
-                    target_placements[0] = Placement.SHARD
-                buffer.redistribute(target_placements)
             return
 
-        optimizer_placements = main_weight_buffer.storage_placements
         inner_dp_group = mesh.get_group(mesh_dim=1)
 
         if self.is_nvfp4_param(params[0]):
@@ -592,22 +581,27 @@ class MixedPrecisionPolicy:
                 full_weight_buffer=full_weight_buffer,
             )
         elif not self.is_fp8_param(params[0]):
-            if model_weight_buffer.storage_placements == optimizer_placements:
+            if model_weight_buffer.placements == optimizer_placements:
                 model_weight_buffer.data.copy_(main_weight_buffer.data)
             else:
-                model_weight_buffer.get_shard_view(optimizer_placements).copy_(
-                    main_weight_buffer.get_shard_view(optimizer_placements)
+                model_weight_buffer.view(optimizer_placements).data.copy_(
+                    main_weight_buffer.view(optimizer_placements).data
                 )
         else:
+            model_weight_view = model_weight_buffer.view(optimizer_placements)
+            main_weight_view = main_weight_buffer.view(optimizer_placements)
+            transpose_weight_view = (
+                None
+                if transpose_weight_buffer is None
+                else transpose_weight_buffer.view(optimizer_placements)
+            )
             fp8_params = []
             main_params = []
             start_offsets = []
             model_param_shards = []
             for param in params:
                 item_id = param_idx[param]
-                model_shard = model_weight_buffer.tensor_view(
-                    item_id, placements=optimizer_placements
-                )
+                model_shard = model_weight_view.tensor_view(item_id)
                 if model_shard.numel() == 0:
                     fp8_params.append(param)
                     main_params.append(None)
@@ -616,13 +610,9 @@ class MixedPrecisionPolicy:
                     continue
 
                 transpose_shard = None
-                if transpose_weight_buffer is not None:
-                    transpose_shard = transpose_weight_buffer.tensor_view(
-                        item_id, placements=optimizer_placements
-                    )
-                main_weight = main_weight_buffer.tensor_view(
-                    item_id, placements=optimizer_placements
-                )
+                if transpose_weight_view is not None:
+                    transpose_shard = transpose_weight_view.tensor_view(item_id)
+                main_weight = main_weight_view.tensor_view(item_id)
                 start_offset, _ = model_weight_buffer.buffer_index._get_item_self_range(
                     item_id, placements=optimizer_placements
                 )
@@ -637,21 +627,6 @@ class MixedPrecisionPolicy:
             quantize_main_weights_to_fp8(
                 fp8_params, main_params, start_offsets, amax_reduce_group, model_param_shards
             )
-
-        # Refresh updated local shards before the next compute unshard.
-        for buffer in (model_weight_buffer, transpose_weight_buffer):
-            if buffer is None:
-                continue
-            target_placements = buffer.storage_placements.copy()
-            for comm_dim, (storage_placement, optimizer_placement) in enumerate(
-                zip(buffer.storage_placements, optimizer_placements)
-            ):
-                if (
-                    storage_placement is Placement.REPLICATE
-                    and optimizer_placement is Placement.SHARD
-                ):
-                    target_placements[comm_dim] = Placement.SHARD
-            buffer.redistribute(target_placements)
 
 
 def is_fp8_param(tensor: torch.Tensor) -> bool:
@@ -789,8 +764,9 @@ def quantize_main_weights_to_nvfp4(
     te_start_offsets = []
 
     wbuf = model_weight_buffer
-    sharded_placements = main_weight_buffer.storage_placements
-    if wbuf.storage_placements[1] is not Placement.SHARD:
+    sharded_placements = main_weight_buffer.placements
+    main_weight_view = main_weight_buffer.view(sharded_placements)
+    if wbuf.placements[1] is not Placement.SHARD:
         raise RuntimeError("FIXME: implement non-distributed NVFP4 quantization path")
 
     if full_weight_buffer is None:
@@ -798,7 +774,7 @@ def quantize_main_weights_to_nvfp4(
 
     for param in model_params:
         item_id = param_idx[param]
-        main_weight_shard = main_weight_buffer.tensor_view(item_id, placements=sharded_placements)
+        main_weight_shard = main_weight_view.tensor_view(item_id)
         if main_weight_shard.numel() == 0:
             main_weight_shard = None
 

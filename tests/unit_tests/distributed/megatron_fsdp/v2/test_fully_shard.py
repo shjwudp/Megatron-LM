@@ -301,9 +301,9 @@ class TestFullyShardBasic:
 
         for param_group in model._fsdp_param_groups:
             assert param_group.model_weight_buffer is not None
-            assert not param_group.model_weight_buffer.inner_sharded
+            assert param_group.model_weight_buffer.placements[1] is Placement.REPLICATE
             assert param_group.main_grad_buffer is not None
-            assert not param_group.main_grad_buffer.inner_sharded
+            assert param_group.main_grad_buffer.placements[1] is Placement.REPLICATE
             for dist_grad in param_group.dist_grads:
                 if dist_grad is None:
                     continue
@@ -589,23 +589,25 @@ class TestFullyShardBasic:
         active_manager_groups = []
         unshard_calls = []
         collective_groups = []
-        weight_buffers = []
+        if outer_strategy == "optim":
+            for param_group in model._fsdp_param_groups:
+                for role, weight_buffer, _ in param_group._weight_buffers_for_unshard():
+                    placements = weight_buffer.placements.copy()
+                    placements[0] = Placement.SHARD
+                    param_group._optimizer_weight_views[role] = weight_buffer.view(placements)
 
-        for param_group in model._fsdp_param_groups:
-            weight_buffers.extend(param_group._weight_buffers_for_unshard())
-
-        assert len(weight_buffers) == 2
-        first_buffer, second_buffer = weight_buffers
+        owned_weight_buffers = [
+            entry
+            for param_group in model._fsdp_param_groups
+            for entry in param_group._weight_buffers_for_unshard()
+        ]
+        assert len(owned_weight_buffers) == 2
+        first_buffer, second_buffer = [source for _, _, source in owned_weight_buffers]
         assert first_buffer.mesh is second_buffer.mesh
         assert first_buffer.dtype == second_buffer.dtype
         assert first_buffer.device == second_buffer.device
         outer_dp_group = first_buffer.mesh.get_group(mesh_dim=0)
         inner_dp_group = first_buffer.mesh.get_group(mesh_dim=1)
-
-        if outer_strategy == "optim":
-            for weight_buffer in weight_buffers:
-                # Force the post-optimizer/checkpoint state so dim 0 launches AG.
-                weight_buffer.placements[0] = Placement.SHARD
 
         @contextmanager
         def capture_coalescing_manager(group, *args, **kwargs):
@@ -695,8 +697,7 @@ class TestFullyShardBasic:
         param_group = model._fsdp_param_groups[0]
         model_buffer = param_group.model_weight_buffer
         assert param_group.main_weight_buffer is None
-        assert model_buffer.storage_placements == [Placement.REPLICATE, Placement.SHARD]
-        assert model_buffer.placements == model_buffer.storage_placements
+        assert model_buffer.placements == [Placement.REPLICATE, Placement.SHARD]
         from torch.distributed.tensor.placement_types import Shard
 
         assert all(
@@ -721,13 +722,19 @@ class TestFullyShardBasic:
         optimizer.step()
         # No optimizer integration performed an explicit model-weight copy.
         assert ctx.model_weight_refresh_pending
-        assert model_buffer.placements == model_buffer.storage_placements
+        optimizer_weight_view = param_group._optimizer_weight_views["model_weight"]
+        assert optimizer_weight_view.placements == [Placement.SHARD, Placement.SHARD]
+        assert (
+            optimizer_weight_view.data.untyped_storage().data_ptr()
+            == model_buffer.data.untyped_storage().data_ptr()
+        )
+        assert model_buffer.placements == [Placement.REPLICATE, Placement.SHARD]
 
         # The normal pre-forward hook selects the direct model-weight SHARD view
         # before unshard, which refreshes the outer replicas exactly once.
         model(torch.zeros_like(x))
         assert not ctx.model_weight_refresh_pending
-        assert model_buffer.placements == model_buffer.storage_placements
+        assert "model_weight" not in param_group._optimizer_weight_views
 
         outer_replicas = [
             torch.empty_like(model_buffer.data)
@@ -1365,9 +1372,9 @@ class TestActivationCheckpointing:
         model_buffer = param_group.model_weight_buffer
         main_buffer = param_group.main_weight_buffer
         assert main_buffer is not None
-        expected_storage_placements = [Placement.REPLICATE, Placement.SHARD]
-        assert model_buffer.storage_placements == expected_storage_placements
-        assert main_buffer.storage_placements == expected_storage_placements
+        expected_placements = [Placement.REPLICATE, Placement.SHARD]
+        assert model_buffer.placements == expected_placements
+        assert main_buffer.placements == expected_placements
 
         model.set_is_last_backward(True)
         x = torch.randn(4, 32, device=device, dtype=torch.bfloat16, requires_grad=True)

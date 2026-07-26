@@ -30,7 +30,7 @@ one follows the same placement transition and collective path as any other dimen
 The buffer owns bound-storage validation and distribution mechanics:
 
 - `DeviceMesh`;
-- logical and bound-storage placements;
+- one placement vector describing the buffer object's exact local tensor view;
 - dtype and device;
 - `BufferIndex`;
 - binding and unbinding externally allocated tensors without freeing them;
@@ -113,10 +113,12 @@ dimension. Their DTensor analogues are:
 | `SHARD` | `Shard(0)` | The rank owns one flat shard. |
 | `PARTIAL` | `Partial()` | The rank holds a contribution awaiting reduction. |
 
-Placement describes validity, not allocation shape. A `SHARD` buffer can own compact
-storage or be a slice of a `REPLICATE` buffer. The latter representation uses two
-explicit objects—a replicated output placeholder and its shared-storage shard input
-view—instead of encoding storage validity as a placement.
+Placement describes both the value distribution and the exact shape of the tensor
+bound to that buffer object. A `SHARD` buffer therefore always exposes a shard-shaped
+`data` tensor. That tensor may own a compact allocation or be a slice of storage owned
+by a `REPLICATE` buffer. The latter representation uses two explicit objects—a
+replicated output placeholder and its shared-storage shard input view—without a second
+``storage_placements`` state.
 
 Only one mesh placement changes per `redistribute()` call. This keeps the operation
 equivalent to applying one DTensor redistribution step and makes the selected mesh
@@ -144,6 +146,12 @@ shard.redistribute(replicated.placements, output_buffer=replicated)
 The two DP-buffer objects have different placements and exact placement-shaped data,
 while their tensors share one allocation.
 
+For a multi-axis transition, the batch planner prefers a source view's containing
+storage owner when that owner's placement is the next intermediate target. Thus
+`[SHARD, SHARD] -> [REPLICATE, SHARD] -> [REPLICATE, REPLICATE]` refreshes an existing
+`[REPLICATE, SHARD]` persistent owner directly before writing the final full output.
+No role or sharding-strategy knowledge is needed for that choice.
+
 ## Core Operations
 
 ```text
@@ -159,18 +167,20 @@ schedule groups  ---> select private weight buffers
 wait event  --------> finalize mixed-precision views
 ```
 
-`redistribute()` updates the buffer placement and returns the tensor produced by that
-transition. Returning a tensor is important: communication may use a temporary dtype
-workspace whose result is not yet in persistent storage. `ParameterGroup` decides how
-to consume that result. Batch redistribution is therefore used only where intermediate
-outputs need no parameter-group decision, such as weight all-gather or marking staged
-gradients partial.
+`redistribute()` leaves its source object unchanged and returns the tensor produced in
+the explicitly placed output object. Returning a tensor is important: communication
+may use a temporary dtype workspace whose result is not yet in persistent storage.
+`ParameterGroup` decides how to consume that result. Batch redistribution is therefore
+used only where intermediate outputs need no parameter-group decision, such as weight
+all-gather.
 
 ## Use Cases
 
 ### Initial packing
 
 1. `ParameterGroup` creates buffers with a shared mesh and layout inputs.
+   It derives each role's placement from the group's sharding strategy; the buffer
+   never sees either concept.
 2. It streams each policy-provided parameter representation through
    `copy_tensors_()`.
 3. For replicated compute weights, it calls `_bind_params()` immediately.
@@ -185,8 +195,10 @@ buffer preserves the boundary between flat storage/layout and parameter semantic
 
 1. `FSDPModule` schedules an ordered parameter-group sequence on the selected stream.
 2. `ParameterGroup.unshard_model_weights()` privately selects the required weight
-   buffers. Replicated persistent weights are used directly; sharded weights acquire
-   a role-keyed `[REPLICATE, REPLICATE]` output lease.
+   buffers. After an optimizer update, a shard view of replicated persistent storage
+   is retained in `_optimizer_weight_views` as the explicit redistribution source.
+   Replicated persistent weights provide the full output; compact sharded weights
+   acquire a role-keyed `[REPLICATE, REPLICATE]` output lease.
 3. `DataParallelBuffer.redistribute_buffers()` groups compatible buffers and
    redistributes the outer placement before the inner placement into those explicit
    outputs.
@@ -238,8 +250,11 @@ collective state.
 ## Invariants
 
 - `len(placements) == mesh.ndim`.
-- `storage_placements` describe the tensor currently bound to that buffer object.
+- `placements` describe both the distribution and exact local shape of `data`.
 - logical placements are limited to `REPLICATE`, `SHARD`, and `PARTIAL`.
+- shared storage with different placements is represented by separate buffer objects.
+- redistribution never changes the source buffer's placements.
+- buffer roles and sharding strategies are owned and interpreted by `ParameterGroup`.
 - `DataParallelBuffer` has no allocator, allocation key, or temporary-buffer cache.
 - `DataParallelBuffer` does not move, allocate, resize, or free storage.
 - `bind()` and `unbind()` never allocate or free storage.
@@ -287,6 +302,8 @@ collective state.
 - Represent shared-storage redistribution with explicit DP-buffer views and an
   explicit output buffer.
 - Keep logical placements limited to replicate, shard, and partial semantics.
+- Remove the separate bound-storage placement vector; one buffer object has one exact
+  placement-shaped tensor.
 
 ### Phase 4: narrow role-specific policy
 

@@ -22,7 +22,7 @@ from ..uneven_dtensor import (
     rebind_uneven_dtensor_local_tensor,
 )
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
-from .buffer_index import Placement
+from .buffer_index import BufferIndex, Placement
 from .dp_buffer import DataParallelBuffer
 from .mixed_precision import MixedPrecisionPolicy
 from .utils import ParamGroupIdx, _prepare_fsdp_mesh
@@ -118,6 +118,7 @@ class ParameterGroup:
         self._full_grad_buffer_has_accumulated_grad = False
         self._reduced_grad_buffer_has_accumulated_grad = False
         self._unsharded_weight_buffers: Dict[str, DataParallelBuffer] = {}
+        self._optimizer_weight_views: Dict[str, DataParallelBuffer] = {}
         self._full_grad_buffer: Optional[DataParallelBuffer] = None
 
         # Buffer references (initialized in _init_buffers)
@@ -229,8 +230,8 @@ class ParameterGroup:
                         buffer.dtype,
                         buffer.data_size,
                         buffer.buffer_index.bucket_meta.size,
-                        buffer.outer_sharded,
-                        buffer.inner_sharded,
+                        buffer.placements[0] is Placement.SHARD,
+                        buffer.placements[1] is Placement.SHARD,
                     )
                 )
 
@@ -246,25 +247,55 @@ class ParameterGroup:
 
     def assert_model_weights_not_nan(self) -> None:
         """Assert that every fully replicated model-weight item contains no NaNs."""
+        model_weights = self._unsharded_weight_buffers.get("model_weight", self.model_weight_buffer)
+        if not model_weights.is_unsharded():
+            raise RuntimeError("Model weights must be unsharded before checking for NaNs")
         for param in self.params:
-            param_data = self.model_weight_buffer.tensor_view(
-                self.param_idx[param], placements=[Placement.REPLICATE, Placement.REPLICATE]
-            )
+            param_data = model_weights.tensor_view(self.param_idx[param])
             assert not torch.isnan(param_data).any(), "NaN detected in model weight buffer"
+
+    def _buffer_placements(self, role: str) -> list[Placement]:
+        """Derive one persistent buffer role's placements from group strategy."""
+
+        def is_sharded(strategy: str) -> bool:
+            if role in ("model_weight", "transpose_weight"):
+                return strategy == "optim_grads_params"
+            if role == "main_weight":
+                return strategy != "no_shard"
+            if role == "main_grad":
+                return strategy in ("optim_grads", "optim_grads_params")
+            raise ValueError(f"Unsupported data-parallel buffer role: {role}")
+
+        return [
+            Placement.SHARD if is_sharded(strategy) else Placement.REPLICATE
+            for strategy in (self.outer_dp_sharding_strategy, self.sharding_strategy)
+        ]
+
+    def _optimizer_placements(self) -> list[Placement]:
+        """Return optimizer-facing placements derived from group strategy."""
+        return [
+            Placement.SHARD if self.outer_dp_sharding_strategy == "optim" else Placement.REPLICATE,
+            Placement.SHARD if self.sharding_strategy != "no_shard" else Placement.REPLICATE,
+        ]
 
     def _create_buffer(self, dtype: torch.dtype, role: str) -> DataParallelBuffer:
         """Create an unbound persistent buffer layout for one storage role."""
+        buffer_index = BufferIndex(
+            param_shapes=[param.shape for param in self.params],
+            mesh=self.mesh,
+            chunk_size_factor=self.chunk_size_factor,
+            param_group_id=self.param_group_id,
+        )
+        if role in ("model_weight", "transpose_weight") and any(
+            self.mp_policy.is_nvfp4_param(param) for param in self.params
+        ):
+            buffer_index.compact(0.5, self.mp_policy.get_param_storage_shapes(self.params))
         return DataParallelBuffer(
-            tensors=self.params,
+            buffer_index=buffer_index,
             dtype=dtype,
             device=self.device,
             mesh=self.mesh,
-            buffer_role=role,
-            param_group_id=self.param_group_id,
-            chunk_size_factor=self.chunk_size_factor,
-            sharding_strategy=self.sharding_strategy,
-            outer_dp_sharding_strategy=self.outer_dp_sharding_strategy,
-            mp_policy=self.mp_policy,
+            placements=self._buffer_placements(role),
         )
 
     def _init_buffers(self) -> None:
@@ -296,7 +327,7 @@ class ParameterGroup:
 
         # Create main weight buffer for mixed precision. Skip the redundant
         # copy when the optimizer dtype matches the model-weight dtype AND the
-        # storage placements are identical — in that case the optimizer mutates
+        # buffer placements are identical — in that case the optimizer mutates
         # ``model_weight_buffer`` directly via the dist_param views (which the
         # code below already binds to ``model_weight_buffer`` when
         # ``main_weight_buffer`` is None). Quantized params (FP8/NVFP4) always
@@ -306,10 +337,7 @@ class ParameterGroup:
         main_params_dtype = self.mp_policy.main_params_dtype_for_param(self.params[0])
         if main_params_dtype is not None:
             mbuf = self._create_buffer(main_params_dtype, "main_weight")
-            if (
-                main_params_dtype != model_weight_dtype
-                or mbuf.storage_placements != wbuf.storage_placements
-            ):
+            if main_params_dtype != model_weight_dtype or mbuf.placements != wbuf.placements:
                 mbuf.bind(torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device))
                 mbuf.copy_tensors_(
                     self.mp_policy.get_high_precision_value(param).detach().to(main_params_dtype)
@@ -330,7 +358,7 @@ class ParameterGroup:
                 _free_storage(tensor)
 
         for weight_buffer in (self.model_weight_buffer, self.transpose_weight_buffer):
-            if weight_buffer is not None and not weight_buffer.inner_sharded:
+            if weight_buffer is not None and weight_buffer.placements[1] is not Placement.SHARD:
                 self._bind_params(weight_buffer, weight_buffer.data)
 
         # Create gradient buffer
@@ -342,16 +370,22 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
-    def _weight_buffers_for_unshard(self, bwd_pass: bool = False) -> List[DataParallelBuffer]:
-        """Return this group's internal weight buffers required by one compute pass."""
+    def _weight_buffers_for_unshard(
+        self, bwd_pass: bool = False
+    ) -> List[tuple[str, DataParallelBuffer, DataParallelBuffer]]:
+        """Return ``(role, persistent, source)`` weights required by one compute pass."""
         self._ensure_buffers_on_gpu()
-        return [
-            weight_buffer
-            for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
-                self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
+        buffers = []
+        for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
+            self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
+        ):
+            if weight_buffer is None:
+                continue
+            role = self._weight_buffer_role(weight_buffer)
+            buffers.append(
+                (role, weight_buffer, self._optimizer_weight_views.get(role, weight_buffer))
             )
-            if weight_buffer is not None
-        ]
+        return buffers
 
     def _weight_buffer_role(self, weight_buffer: DataParallelBuffer) -> str:
         """Return the allocator role for one of this group's weight buffers."""
@@ -361,15 +395,18 @@ class ParameterGroup:
             return "transpose_weight"
         raise ValueError("Weight buffer does not belong to this parameter group")
 
-    def _acquire_weight_output(self, weight_buffer: DataParallelBuffer) -> DataParallelBuffer:
+    def _acquire_weight_output(
+        self, role: str, weight_buffer: DataParallelBuffer, source: DataParallelBuffer
+    ) -> DataParallelBuffer:
         """Return a bound replicated destination for a weight redistribution."""
         full_placements = [Placement.REPLICATE, Placement.REPLICATE]
-        role = self._weight_buffer_role(weight_buffer)
         if role in self._unsharded_weight_buffers:
             return self._unsharded_weight_buffers[role]
 
+        if weight_buffer.placements == full_placements:
+            return weight_buffer
         try:
-            return weight_buffer.view(full_placements)
+            return source.view(full_placements)
         except ValueError:
             output = weight_buffer.placeholder(full_placements)
             bucket = self.allocator.allocate(
@@ -409,23 +446,28 @@ class ParameterGroup:
         still share coalesced collectives.
         """
         owned_weight_buffers = [
-            (param_group, weight_buffer)
+            (param_group, role, weight_buffer, source)
             for param_group in param_groups
-            for weight_buffer in param_group._weight_buffers_for_unshard(bwd_pass=bwd_pass)
+            for role, weight_buffer, source in param_group._weight_buffers_for_unshard(
+                bwd_pass=bwd_pass
+            )
         ]
         output_buffers = [
-            param_group._acquire_weight_output(weight_buffer)
-            for param_group, weight_buffer in owned_weight_buffers
+            param_group._acquire_weight_output(role, weight_buffer, source)
+            for param_group, role, weight_buffer, source in owned_weight_buffers
         ]
         full_buffers = DataParallelBuffer.redistribute_buffers(
-            [weight_buffer for _, weight_buffer in owned_weight_buffers],
+            [source for _, _, _, source in owned_weight_buffers],
             [Placement.REPLICATE, Placement.REPLICATE],
             output_buffers=output_buffers,
             stream=stream,
             async_op=async_op,
         )
-        for (param_group, weight_buffer), full_buffer in zip(owned_weight_buffers, full_buffers):
+        for (param_group, role, weight_buffer, _), full_buffer in zip(
+            owned_weight_buffers, full_buffers
+        ):
             param_group._bind_params(weight_buffer, full_buffer.data)
+            param_group._optimizer_weight_views.pop(role, None)
 
     def unshard(self, bwd_pass: bool = False, stream: Optional[torch.cuda.Stream] = None) -> None:
         """
@@ -576,15 +618,13 @@ class ParameterGroup:
             if weight_buffer is None:
                 continue
             role = self._weight_buffer_role(weight_buffer)
-            if not weight_buffer.is_unsharded() and role not in self._unsharded_weight_buffers:
+            source = self._optimizer_weight_views.get(role, weight_buffer)
+            if not source.is_unsharded() and role not in self._unsharded_weight_buffers:
                 return False
         return True
 
     def reshard(self):
         """Detach parameter views and release temporary replicated weight leases."""
-        for weight_buffer in (self.model_weight_buffer, self.transpose_weight_buffer):
-            if weight_buffer is not None:
-                weight_buffer.placements = weight_buffer.storage_placements.copy()
         self.mp_policy.post_reshard(self.params)
         self._release_weight_outputs()
 
@@ -594,9 +634,12 @@ class ParameterGroup:
         self._ensure_buffers_on_gpu()
         full_weight_buffer = None
         if self.main_weight_buffer is not None and self.mp_policy.is_nvfp4_param(self.params[0]):
-            full_output = self._acquire_weight_output(self.model_weight_buffer)
+            full_output = self._acquire_weight_output(
+                "model_weight", self.model_weight_buffer, self.model_weight_buffer
+            )
             full_weight_buffer = full_output.data
             self._bind_params(self.model_weight_buffer, full_weight_buffer)
+        optimizer_placements = self._optimizer_placements()
         try:
             self.mp_policy.copy_main_weights_to_model_weights(
                 self.params,
@@ -605,8 +648,17 @@ class ParameterGroup:
                 self.model_weight_buffer,
                 self.main_weight_buffer,
                 self.transpose_weight_buffer,
+                optimizer_placements=optimizer_placements,
                 full_weight_buffer=full_weight_buffer,
             )
+            for role, buffer in (
+                ("model_weight", self.model_weight_buffer),
+                ("transpose_weight", self.transpose_weight_buffer),
+            ):
+                if buffer is None or buffer.placements == optimizer_placements:
+                    self._optimizer_weight_views.pop(role, None)
+                else:
+                    self._optimizer_weight_views[role] = buffer.view(optimizer_placements)
         finally:
             if full_weight_buffer is not None:
                 self._release_weight_outputs()
@@ -639,10 +691,8 @@ class ParameterGroup:
         if self.mesh.size(0) > 1:
             partial_placements[0] = Placement.PARTIAL
         current_buffer = full_grad_buffer.reinterpret(partial_placements)
-        grad_buffer.placements = partial_placements.copy()
-
-        storage = grad_buffer.storage_placements
-        if is_last_backward or grad_buffer.inner_sharded:
+        storage = grad_buffer.placements
+        if is_last_backward or storage[1] is Placement.SHARD:
             inner_target = Placement.SHARD if self.sharding_strategy == "optim" else storage[1]
             inner_placements = [current_buffer.placements[0], inner_target]
             output_buffer = self._gradient_output_buffer(inner_placements)
@@ -667,7 +717,6 @@ class ParameterGroup:
                 release_workspace=comm_input is not None,
             )
             current_buffer = output_buffer
-            grad_buffer.placements = inner_placements
             if self.outer_dp_sharding_strategy != "optim":
                 self._reduced_grad_buffer_has_accumulated_grad = True
             if inner_target is not Placement.REPLICATE:
@@ -701,7 +750,6 @@ class ParameterGroup:
                 accumulate=accumulate,
                 release_workspace=comm_input is not None,
             )
-            grad_buffer.placements = outer_placements
             self._reduced_grad_buffer_has_accumulated_grad = True
 
     def release_grad_buffer(self):
@@ -759,10 +807,8 @@ class ParameterGroup:
         self.dist_params = []
         self.dist_grads = []  # placeholder, populated in _init_dist_grads
         optimizer_buffer = self.main_weight_buffer or self.model_weight_buffer
-        buffer_placements = [
-            Placement.SHARD if self.outer_dp_sharding_strategy == "optim" else Placement.REPLICATE,
-            Placement.SHARD if self.sharding_strategy != "no_shard" else Placement.REPLICATE,
-        ]
+        buffer_placements = self._optimizer_placements()
+        optimizer_view = optimizer_buffer.view(buffer_placements)
         optimizer_dtensor_placements = [
             Shard(dim=0) if placement is Placement.SHARD else Replicate()
             for placement in buffer_placements
@@ -772,7 +818,7 @@ class ParameterGroup:
 
         for param in self.params:
             item_id = self.param_idx[param]
-            data = optimizer_buffer.tensor_view(item_id, placements=buffer_placements)
+            data = optimizer_view.tensor_view(item_id)
             param_shape = (
                 param.shape
                 if self.main_weight_buffer is not None
@@ -818,20 +864,20 @@ class ParameterGroup:
         if gbuf.data is not None:
             return  # already initialised
 
-        gbuf.placements = gbuf.storage_placements.copy()
         gbuf.bind(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
 
         buffer_placements = [
             Placement.SHARD if isinstance(placement, Shard) else Placement.REPLICATE
             for placement in self.dist_params[0].placements
         ]
+        grad_view = gbuf.view(buffer_placements)
 
         for index, (p, dist_param, dist_grad) in enumerate(
             zip(self.params, self.dist_params, self._dist_grad_cache)
         ):
             item_id = self.param_idx[p]
             grad_dtensor_placements = dist_param.placements
-            grad_data = gbuf.tensor_view(item_id, placements=buffer_placements)
+            grad_data = grad_view.tensor_view(item_id)
             # Empty local shards are optimizer no-ops. Keeping them as None also
             # avoids fused multi-tensor optimizer failures on neighboring shards.
             if not p.requires_grad or grad_data.numel() == 0:
@@ -863,22 +909,31 @@ class ParameterGroup:
         Called after any buffer's ``self.data`` changes device (offload_to_cpu /
         auto-reload). Updates local tensor views using optimizer-buffer ownership.
         """
+        for role, source in list(self._optimizer_weight_views.items()):
+            weight_buffer = (
+                self.model_weight_buffer if role == "model_weight" else self.transpose_weight_buffer
+            )
+            if weight_buffer is None:
+                self._optimizer_weight_views.pop(role)
+            else:
+                self._optimizer_weight_views[role] = weight_buffer.view(source.placements)
+
         optimizer_buffer = self.main_weight_buffer or self.model_weight_buffer
         buffer_placements = [
             Placement.SHARD if isinstance(placement, Shard) else Placement.REPLICATE
             for placement in self.dist_params[0].placements
         ]
+        optimizer_view = optimizer_buffer.view(buffer_placements)
         for param, dist_param in zip(self.params, self.dist_params):
-            data = optimizer_buffer.tensor_view(self.param_idx[param], placements=buffer_placements)
+            data = optimizer_view.tensor_view(self.param_idx[param])
             object.__setattr__(dist_param._local_tensor, 'data', data)
 
         if self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
+            grad_view = self.main_grad_buffer.view(buffer_placements)
             for param, dist_grad in zip(self.params, self.dist_grads):
                 if dist_grad is None:
                     continue
-                grad_data = self.main_grad_buffer.tensor_view(
-                    self.param_idx[param], placements=buffer_placements
-                )
+                grad_data = grad_view.tensor_view(self.param_idx[param])
                 object.__setattr__(dist_grad._local_tensor, 'data', grad_data)
 
     def _ensure_buffers_on_gpu(self) -> bool:
