@@ -45,7 +45,18 @@ full = (Placement.REPLICATE,) * mesh.ndim
 contribution = (Placement.PARTIAL,) * mesh.ndim
 ```
 
-The optimizer gradient has the same placements as `main_weight`.
+The optimizer gradient has the same placements as `main_weight`. The
+microbatch accumulation placement separates reductions performed every
+backward from reductions delayed until the last backward:
+
+| Strategy | Weight | Main weight | Gradient storage | Microbatch accumulation | Final gradient |
+| --- | --- | --- | --- | --- | --- |
+| DDP (`no_shard`) | `[R]` | `[R]` | `[R]` | `[P]` | `[R]` |
+| ZeRO-1 (`optim`) | `[R]` | `[S]` | `[R]` | `[P]` | `[S]` |
+| ZeRO-2 (`optim_grads`) | `[R]` | `[S]` | `[S]` | `[S]` | `[S]` |
+| FSDP (`optim_grads_params`) | `[S]` | `[S]` | `[S]` | `[S]` | `[S]` |
+| HSDP, outer replicated | `[R,S]` | `[R,S]` | `[R,S]` | `[P,S]` | `[R,S]` |
+| HSDP, outer sharded | `[R,S]` | `[S,S]` | `[R,S]` | `[P,S]` | `[S,S]` |
 
 For normal FSDP, the caller's 1D mesh remains 1D; it is not expanded into a
 synthetic `(1, N)` HSDP mesh:
@@ -98,19 +109,31 @@ state or behavior to `DataParallelBuffer`.
 ## Concise runtime state
 
 ```python
+class GradientPhase(Enum):
+    EMPTY = auto()
+    ACCUMULATING = auto()
+    READY = auto()
+
+
 @dataclass
 class ParameterGroupState:
     weight_valid: tuple[Placement, ...]
-    grad_valid: tuple[Placement, ...] | None = None
-    grad_ready: bool = False
+    grad_phase: GradientPhase = GradientPhase.EMPTY
     full_weight: DataParallelBuffer | None = None
     full_grad: DataParallelBuffer | None = None
 ```
 
 `weight_valid` identifies the current placement view of persistent model-weight
-storage. `grad_valid` identifies the current value in persistent gradient storage.
-`grad_ready` distinguishes a microbatch accumulation from an optimizer-ready
-gradient when those values happen to have the same placements.
+storage. Gradient placement is derived from `grad_phase`:
+
+| Phase | Valid gradient placement |
+| --- | --- |
+| `EMPTY` | none |
+| `ACCUMULATING` | `layout.grad_accumulation` |
+| `READY` | `layout.main_weight` |
+
+Value existence must not be inferred from placement equality. ZeRO-2 and FSDP
+use `[S]` for both accumulation and the optimizer-ready gradient.
 
 The two buffer fields are optional scratch leases:
 
@@ -137,8 +160,7 @@ The initial state is:
 
 ```python
 state.weight_valid = weight_buffer.placements
-state.grad_valid = None
-state.grad_ready = False
+state.grad_phase = GradientPhase.EMPTY
 state.full_weight = None
 state.full_grad = None
 ```
@@ -186,16 +208,20 @@ compute weights.
 At backward start, the group acquires and zeroes `full_grad`. Autograd writes one
 full local contribution, interpreted logically as all-partial placements.
 
-For normal FSDP, every microbatch performs the complete data-parallel
-reduce-scatter and accumulates into persistent optimizer placement:
+Every strategy follows the same two-target process:
 
 ```text
-[P] -- per-microbatch redistribution --> [S]
-                                      accumulate into grad_buffer
+local contribution
+    -> layout.grad_accumulation on every microbatch
+    -> layout.main_weight on the last backward
 ```
 
-There is no separate final placement transition. `is_last_backward` only marks
-the accumulated `[S]` value optimizer-ready.
+For DDP and ZeRO-1, the first transition performs no collective: full local
+gradients accumulate as `[P]`. The last backward performs `[P] -> [R]`
+all-reduce for DDP or `[P] -> [S]` reduce-scatter for ZeRO-1.
+
+For ZeRO-2 and FSDP, every microbatch reduce-scatters `[P] -> [S]`; the final
+placement is already reached, so the last transition is a no-op.
 
 For HSDP, every microbatch performs:
 
@@ -216,11 +242,11 @@ For outer replication, the final transition is `[P, S] -> [R, S]`.
 Gradient scaling and conversion to communication dtype happen once before the
 per-microbatch redistribution. Communication workspaces are call-local and are
 not persistent parameter-group state. After every microbatch, `full_grad` is
-released. On the last backward, `grad_valid` becomes `layout.main_weight` and
-`grad_ready` becomes true.
+released. Non-final backward sets the phase to `ACCUMULATING`; the last backward
+sets it to `READY`.
 
-`zero_grad()` resets `grad_valid` and `grad_ready` and releases any active
-`full_grad` lease.
+`zero_grad()` resets the phase to `EMPTY` and releases any active `full_grad`
+lease.
 
 ## Ownership boundaries
 

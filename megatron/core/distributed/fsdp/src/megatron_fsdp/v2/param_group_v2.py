@@ -1,14 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Placement-first ParameterGroup prototype for Megatron FSDP v2.
+"""Placement-first data-parallel ParameterGroup prototype for Megatron FSDP v2.
 
 This module is intentionally not wired into ``fully_shard`` yet. It provides a
-small, reviewable implementation of the target FSDP/HSDP ownership and state
-model without inheriting the lifecycle structure of ``param_group.py``.
+small, reviewable implementation of the target DDP, ZeRO, FSDP, and HSDP
+ownership model without inheriting the lifecycle structure of ``param_group.py``.
 """
 
 from __future__ import annotations
 
+import enum
 import math
 from dataclasses import dataclass
 
@@ -28,7 +29,7 @@ Placements = tuple[Placement, ...]
 
 @dataclass(frozen=True)
 class ParameterGroupLayoutV2:
-    """Persistent FSDP or HSDP placements used by :class:`ParameterGroupV2`."""
+    """Persistent data-parallel placements used by :class:`ParameterGroupV2`."""
 
     weight: Placements
     main_weight: Placements
@@ -36,28 +37,88 @@ class ParameterGroupLayoutV2:
     grad_accumulation: Placements
 
     @classmethod
+    def from_strategies(
+        cls,
+        sharding_strategy: str,
+        outer_dp_sharding_strategy: str | None = None,
+    ) -> "ParameterGroupLayoutV2":
+        """Resolve public sharding strategies into a placement-only layout."""
+        valid_inner = ("no_shard", "optim", "optim_grads", "optim_grads_params")
+        if sharding_strategy not in valid_inner:
+            raise ValueError(f"Unsupported sharding strategy: {sharding_strategy}")
+
+        weight = (
+            Placement.SHARD
+            if sharding_strategy == "optim_grads_params"
+            else Placement.REPLICATE
+        )
+        optimizer = (
+            Placement.REPLICATE
+            if sharding_strategy == "no_shard"
+            else Placement.SHARD
+        )
+        reduce_each_microbatch = sharding_strategy in (
+            "optim_grads",
+            "optim_grads_params",
+        )
+        grad_accumulation = (
+            Placement.SHARD if reduce_each_microbatch else Placement.PARTIAL
+        )
+        grad_storage = (
+            Placement.SHARD if reduce_each_microbatch else Placement.REPLICATE
+        )
+        inner_layout = cls(
+            weight=(weight,),
+            main_weight=(optimizer,),
+            grad_storage=(grad_storage,),
+            grad_accumulation=(grad_accumulation,),
+        )
+        if outer_dp_sharding_strategy is None:
+            return inner_layout
+
+        if outer_dp_sharding_strategy not in ("no_shard", "optim"):
+            raise ValueError(
+                f"Unsupported outer DP sharding strategy: {outer_dp_sharding_strategy}"
+            )
+        if outer_dp_sharding_strategy == "optim" and sharding_strategy != "optim_grads_params":
+            raise NotImplementedError(
+                "Outer-DP optimizer sharding requires inner optim_grads_params, "
+                f"got {sharding_strategy}"
+            )
+        outer_optimizer = (
+            Placement.SHARD
+            if outer_dp_sharding_strategy == "optim"
+            else Placement.REPLICATE
+        )
+        return cls(
+            weight=(Placement.REPLICATE, inner_layout.weight[0]),
+            main_weight=(outer_optimizer, inner_layout.main_weight[0]),
+            grad_storage=(Placement.REPLICATE, inner_layout.grad_storage[0]),
+            grad_accumulation=(Placement.PARTIAL, inner_layout.grad_accumulation[0]),
+        )
+
+    @classmethod
     def fsdp(cls) -> "ParameterGroupLayoutV2":
         """Build a one-dimensional fully sharded layout."""
-        sharded = (Placement.SHARD,)
-        return cls(
-            weight=sharded,
-            main_weight=sharded,
-            grad_storage=sharded,
-            grad_accumulation=sharded,
-        )
+        return cls.from_strategies("optim_grads_params")
 
     @classmethod
     def hsdp(cls, *, shard_optimizer_across_outer_dp: bool) -> "ParameterGroupLayoutV2":
         """Build the two-dimensional HSDP layout discussed in the design document."""
-        outer_optimizer = (
-            Placement.SHARD if shard_optimizer_across_outer_dp else Placement.REPLICATE
+        return cls.from_strategies(
+            "optim_grads_params",
+            outer_dp_sharding_strategy=(
+                "optim" if shard_optimizer_across_outer_dp else "no_shard"
+            ),
         )
-        return cls(
-            weight=(Placement.REPLICATE, Placement.SHARD),
-            main_weight=(outer_optimizer, Placement.SHARD),
-            grad_storage=(Placement.REPLICATE, Placement.SHARD),
-            grad_accumulation=(Placement.PARTIAL, Placement.SHARD),
-        )
+
+
+class GradientPhaseV2(enum.Enum):
+    """Lifecycle phase of the value stored in the persistent gradient buffer."""
+
+    EMPTY = enum.auto()
+    ACCUMULATING = enum.auto()
+    READY = enum.auto()
 
 
 @dataclass
@@ -65,14 +126,13 @@ class ParameterGroupStateV2:
     """Minimal value-validity and scratch-lease state."""
 
     weight_valid: Placements
-    grad_valid: Placements | None = None
-    grad_ready: bool = False
+    grad_phase: GradientPhaseV2 = GradientPhaseV2.EMPTY
     full_weight: DataParallelBuffer | None = None
     full_grad: DataParallelBuffer | None = None
 
 
 class ParameterGroupV2:
-    """Own persistent FSDP/HSDP values and their placement transitions.
+    """Own persistent data-parallel values and their placement transitions.
 
     This prototype focuses on the three semantic distributed values:
 
@@ -99,7 +159,7 @@ class ParameterGroupV2:
             raise ValueError("ParameterGroupV2 requires at least one parameter")
         if mesh.ndim not in (1, 2):
             raise ValueError(
-                f"ParameterGroupV2 expects a 1D FSDP or 2D HSDP mesh, got {mesh.ndim}D"
+                f"ParameterGroupV2 expects a 1D DP or 2D hybrid-DP mesh, got {mesh.ndim}D"
             )
         for placements in (
             layout.weight,
@@ -418,16 +478,54 @@ class ParameterGroupV2:
 
         return self._placement_view(owner, self.contribution_placements), workspace_key
 
+    def _finalize_gradient_placement(
+        self, current: DataParallelBuffer
+    ) -> DataParallelBuffer:
+        """Redistribute delayed mesh axes into the persistent optimizer gradient."""
+        target = self.layout.main_weight
+        final = self._placement_view(self.grad_buffer, target)
+        communication_owner = current._storage_owner or current
+        changed_axes = [
+            axis
+            for axis, (source, destination) in enumerate(zip(current.placements, target))
+            if source is not destination
+        ]
+        for axis in reversed(changed_axes):
+            next_placements = current.placements.copy()
+            next_placements[axis] = target[axis]
+            if tuple(next_placements) == target and current.dtype == final.dtype:
+                output = final
+            else:
+                output = self._placement_view(
+                    communication_owner, tuple(next_placements)
+                )
+            current.redistribute(next_placements, output_buffer=output)
+            current = output
+
+        if current.data.data_ptr() != final.data.data_ptr():
+            final.data.copy_(current.data)
+        return final
+
     @torch.no_grad()
     def reduce_grad(self, *, is_last_backward: bool) -> None:
-        """Reduce one HSDP microbatch and finalize outer DP on the last backward."""
+        """Reduce one microbatch and finalize delayed DP axes on the last backward."""
         if self.state.full_grad is None:
             raise RuntimeError("begin_backward() must run before reduce_grad()")
+        if self.state.grad_phase is GradientPhaseV2.READY:
+            raise RuntimeError("zero_grad() must run before starting another gradient")
 
         grad_input, workspace_key = self._preprocess_gradient(self.state.full_grad)
         accumulation = self._placement_view(self.grad_buffer, self.layout.grad_accumulation)
-        has_accumulation = self.state.grad_valid == self.layout.grad_accumulation
-        if is_last_backward or has_accumulation or grad_input.dtype != accumulation.dtype:
+        # A pending accumulation contains reduced gradients from earlier
+        # microbatches but is not yet optimizer-ready. Placement alone cannot
+        # express this: ZeRO-2/FSDP use the same placement for both phases.
+        has_accumulation = self.state.grad_phase is GradientPhaseV2.ACCUMULATING
+        needs_final_redistribution = self.layout.grad_accumulation != self.layout.main_weight
+        if (
+            has_accumulation
+            or grad_input.dtype != accumulation.dtype
+            or (is_last_backward and needs_final_redistribution)
+        ):
             owner = grad_input._storage_owner or grad_input
             output = self._placement_view(owner, self.layout.grad_accumulation)
         else:
@@ -437,30 +535,24 @@ class ParameterGroupV2:
             grad_input.redistribute(list(self.layout.grad_accumulation), output_buffer=output)
             if output.data.data_ptr() != accumulation.data.data_ptr():
                 if has_accumulation:
-                    output.data.add_(accumulation.data)
-                if (
-                    not is_last_backward
-                    or self.layout.grad_accumulation == self.layout.main_weight
-                ):
+                    if is_last_backward and needs_final_redistribution:
+                        # Keep the combined value in communication dtype; it is
+                        # the input to the delayed DDP, ZeRO-1, or HSDP reduction.
+                        output.data.add_(accumulation.data)
+                    else:
+                        accumulation.data.add_(output.data)
+                        output = accumulation
+                elif not is_last_backward or not needs_final_redistribution:
                     accumulation.data.copy_(output.data)
                     output = accumulation
-            self.state.grad_valid = self.layout.grad_accumulation
-            self.state.grad_ready = False
 
             if is_last_backward:
-                if self.layout.grad_accumulation != self.layout.main_weight:
-                    final = self._placement_view(self.grad_buffer, self.layout.main_weight)
-                    communication_owner = output._storage_owner or output
-                    communication_final = self._placement_view(
-                        communication_owner, self.layout.main_weight
-                    )
-                    output.redistribute(
-                        list(self.layout.main_weight), output_buffer=communication_final
-                    )
-                    final.data.copy_(communication_final.data)
-                self.state.grad_valid = self.layout.main_weight
-                self.state.grad_ready = True
+                if needs_final_redistribution:
+                    self._finalize_gradient_placement(output)
+                self.state.grad_phase = GradientPhaseV2.READY
                 self._install_optimizer_grads()
+            else:
+                self.state.grad_phase = GradientPhaseV2.ACCUMULATING
         finally:
             if workspace_key is not None:
                 self.allocator.free(workspace_key)
@@ -472,8 +564,8 @@ class ParameterGroupV2:
         return self.main_weight_buffer
 
     def optimizer_grad(self) -> DataParallelBuffer:
-        """Return the optimizer gradient after final HSDP reduction."""
-        if not self.state.grad_ready or self.state.grad_valid != self.layout.main_weight:
+        """Return the optimizer gradient after final data-parallel reduction."""
+        if self.state.grad_phase is not GradientPhaseV2.READY:
             raise RuntimeError("Gradient is not ready for the optimizer")
         return self.grad_buffer.view(list(self.layout.main_weight))
 
@@ -481,8 +573,7 @@ class ParameterGroupV2:
         """Reset logical gradient state and optimizer-facing gradients."""
         self._release_scratch("full_grad", self.state.full_grad)
         self.state.full_grad = None
-        self.state.grad_valid = None
-        self.state.grad_ready = False
+        self.state.grad_phase = GradientPhaseV2.EMPTY
         self.grad_buffer.data.zero_()
         if set_to_none:
             for optimizer_param in self._optimizer_params:
