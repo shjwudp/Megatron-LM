@@ -44,7 +44,7 @@ Megatron FSDP v2 handles this by:
   them;
 - preserving optimizer-facing `grad` or `decoupled_grad` DTensor objects;
 - zeroing kept gradient storage in place during `zero_grad()`;
-- disabling lazy release of optimizer-facing `main_grad_buffer.data` while
+- disabling lazy release of optimizer-facing `grad_buffer.data` while
   `enable_full_iteration_cuda_graph=True`;
 - bypassing the eager root-wide unused-gradient sweep, including its
   parameter-group `zero_grad()` calls;
@@ -52,9 +52,9 @@ Megatron FSDP v2 handles this by:
   object contract.
 
 Both parameter-group implementations expose this through
-`prepare_gradient_storage()`. The placement-first `ParameterGroupV2` keeps its
+`prepare_gradient_storage()`. The placement-first `ParameterGroup` keeps its
 `grad_buffer` allocation and optimizer-gradient DTensor identities stable while
-resetting `GradientPhaseV2` to `EMPTY` at the optimizer boundary. Its transient
+resetting `GradientPhase` to `EMPTY` at the optimizer boundary. Its transient
 full-gradient lease is still released after the reduction stream completes.
 
 ## Buffer ownership
@@ -90,6 +90,6 @@ execution pattern.
 | --- | --- |
 | `mcore_fsdp_adapter.py` | Passes `enable_full_iteration_cuda_graph` into `fully_shard()`. |
 | `fully_shard.py` | Stores full-iteration graph mode in FSDP state. |
-| `param_group.py` / `param_group_v2.py` | Preserve optimizer-facing gradient storage and zero it in place. |
+| `param_group.py` | Preserves optimizer-facing gradient storage and zeros it in place. |
 | `fsdp_module.py` | Releases transient buffers while keeping graph-visible gradient objects stable. |
 | `training.py` | Wraps the forward/backward function with `FullCudaGraphWrapper`. |

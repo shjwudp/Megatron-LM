@@ -134,11 +134,11 @@ on each `TransformerLayerSchedulePlan` to wire:
 
 - **Post-forward**: attached to the **last forward node**
   (`moe_combine` for MoE, `mlp` otherwise).  Calls `mfsdp_post_forward_hook(layer)`,
-  which reshard parameters (release all-gathered buffer, install DTensor dist_params).
+  which reshard parameters (release all-gathered buffer, install DTensor optimizer_params).
 
 - **Post-backward**: attached to the **last backward node** (`attn`).
   Calls `mfsdp_post_backward_hook(layer)`, which does **both**:
-  1. Reshard parameters (release all-gathered buffer, install DTensor dist_params).
+  1. Reshard parameters (release all-gathered buffer, install DTensor optimizer_params).
   2. Reduce gradients: copy `.grad` → main grad buffer → reduce-scatter →
      install `dist_param.grad = dist_grad` (DTensor).
 

@@ -1,7 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import copy
 import time
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,17 +8,10 @@ from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-    _can_use_parameter_group_v2,
-    _init_dp_mesh,
-)
-from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import _init_dp_mesh
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-    HAVE_TE_NVFP4,
-    HAVE_TE_NVFP4_RECIPE,
-)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import GradientPhase
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -51,46 +43,6 @@ class TestMegatronFSDPE2E:
     def teardown_method(self):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
-
-    def test_parameter_group_v2_adapter_selection(self):
-        config = SimpleNamespace(
-            delay_wgrad_compute=False,
-            overlap_moe_expert_parallel_comm=False,
-        )
-        ddp_config = DistributedDataParallelConfig(
-            data_parallel_sharding_strategy="optim_grads_params"
-        )
-        assert _can_use_parameter_group_v2(config, ddp_config)
-        assert not _can_use_parameter_group_v2(
-            config, ddp_config, torch.nn.Linear(2, 2, dtype=torch.float64)
-        )
-
-        for field_name, value in (
-            ("fp8_param_gather", True),
-            ("fp4_param_gather", True),
-            ("fsdp_double_buffer", True),
-            ("fsdp_trace_pool", True),
-            ("mfsdp_cuda_graph_modules", ["transformer"]),
-            ("data_parallel_sharding_strategy", "optim_grads"),
-        ):
-            unsupported = copy.deepcopy(ddp_config)
-            setattr(unsupported, field_name, value)
-            assert not _can_use_parameter_group_v2(config, unsupported)
-
-        assert not _can_use_parameter_group_v2(
-            SimpleNamespace(
-                delay_wgrad_compute=True,
-                overlap_moe_expert_parallel_comm=False,
-            ),
-            ddp_config,
-        )
-        assert not _can_use_parameter_group_v2(
-            SimpleNamespace(
-                delay_wgrad_compute=False,
-                overlap_moe_expert_parallel_comm=True,
-            ),
-            ddp_config,
-        )
 
     @pytest.mark.parametrize("outer_dp_size", [1, 2])
     def test_dp_mesh_flatten_groups_reuse_full_dp_groups(self, outer_dp_size):
@@ -154,11 +106,11 @@ class TestMegatronFSDPE2E:
             )
 
             param_group = model._fsdp_param_groups[0]
-            grad_buffer = param_group.main_grad_buffer
+            grad_buffer = param_group.grad_buffer
             assert grad_buffer is not None
             assert grad_buffer.mesh.get_group(mesh_dim=1).size() == 1
             assert grad_buffer.placements[1] is Placement.SHARD
-            param_group._init_dist_grads()
+            param_group.prepare_gradient_storage()
 
             param = param_group.params[0]
             item_id = param_group.param_idx[param]
@@ -185,18 +137,16 @@ class TestMegatronFSDPE2E:
                 param.grad_added_to_main_grad = True
                 param._mfsdp_recorded_te_wgrad = False
                 assert param.grad is None
-                assert not param_group._full_grad_has_value
-                assert not param_group._reduced_grad_has_value
+                assert param_group.state.grad_phase is GradientPhase.EMPTY
 
                 reduce_and_wait()
-                optimizer_grad = param_group.dist_params[item_id].grad
+                optimizer_grad = param_group.optimizer_params[item_id].grad
                 assert optimizer_grad is not None
                 torch.testing.assert_close(
                     optimizer_grad._local_tensor, torch.full_like(optimizer_grad._local_tensor, 2.0)
                 )
                 assert param.grad_added_to_main_grad is False
-                assert not param_group._full_grad_has_value
-                assert param_group._reduced_grad_has_value
+                assert param_group.state.grad_phase is GradientPhase.ACCUMULATING
                 drain_pending()
                 assert not hasattr(param, "main_grad")
 
@@ -209,9 +159,8 @@ class TestMegatronFSDPE2E:
 
                 reduce_and_wait()
                 assert torch.count_nonzero(stale_main_grad) == 0
-                assert not param_group._full_grad_has_value
-                assert param_group._reduced_grad_has_value
-                optimizer_grad = param_group.dist_params[item_id].grad
+                assert param_group.state.grad_phase is GradientPhase.ACCUMULATING
+                optimizer_grad = param_group.optimizer_params[item_id].grad
                 assert optimizer_grad is not None
                 torch.testing.assert_close(
                     optimizer_grad._local_tensor, torch.full_like(optimizer_grad._local_tensor, 2.0)
@@ -265,33 +214,21 @@ class TestMegatronFSDPE2E:
                 if not isinstance(module, FSDPModule):
                     continue
                 for param_group in module._fsdp_param_groups:
-                    if (
-                        param_group.model_weight_buffer is None
-                        or param_group.model_weight_buffer.placements[1] is Placement.SHARD
-                    ):
+                    buffer = param_group.weight_buffer
+                    if buffer.placements[-1] is Placement.SHARD:
                         continue
-                    param_group.unshard(bwd_pass=False)
-                    if param_group.transpose_weight_buffer is not None:
-                        param_group.unshard(bwd_pass=True)
-
-                    for buffer_name, buffer in (
-                        ("model_weight_buffer", param_group.model_weight_buffer),
-                        ("transpose_weight_buffer", param_group.transpose_weight_buffer),
-                    ):
-                        if buffer is None or buffer.placements[1] is Placement.SHARD:
-                            continue
-                        inner_group = param_group.mesh.get_group(mesh_dim=1)
-                        gathered = [
-                            torch.empty_like(buffer.data)
-                            for _ in range(torch.distributed.get_world_size(inner_group))
-                        ]
-                        torch.distributed.all_gather(gathered, buffer.data, group=inner_group)
-                        for group_rank, replica in enumerate(gathered):
-                            assert torch.equal(buffer.data, replica), (
-                                f"Replicated {buffer_name} mismatch for "
-                                f"param_group={param_group.param_group_id}, "
-                                f"group_rank={group_rank}"
-                            )
+                    inner_group = param_group.mesh.get_group(mesh_dim=param_group.mesh.ndim - 1)
+                    gathered = [
+                        torch.empty_like(buffer.data)
+                        for _ in range(torch.distributed.get_world_size(inner_group))
+                    ]
+                    torch.distributed.all_gather(gathered, buffer.data, group=inner_group)
+                    for group_rank, replica in enumerate(gathered):
+                        assert torch.equal(buffer.data, replica), (
+                            f"Replicated weight buffer mismatch for "
+                            f"param_group={param_group.param_group_id}, "
+                            f"group_rank={group_rank}"
+                        )
 
     @staticmethod
     def _training_loop(seed=42, **kwargs):
@@ -451,96 +388,11 @@ class TestMegatronFSDPE2E:
                     overlap_grad_reduce=True,
                     use_megatron_fsdp_v2=True,
                 ),
-                id="optim_grads_params_parameter_group_v2",
-            ),
-            pytest.param(
-                dict(
-                    data_parallel_sharding_strategy="optim_grads_params",
-                    recompute_granularity="full",
-                    recompute_method="uniform",
-                    recompute_num_layers=1,
-                    overlap_param_gather=True,
-                    overlap_grad_reduce=True,
-                    use_megatron_fsdp_v2=True,
-                    gradient_accumulation_fusion=True,
-                    fsdp_trace_pool=True,
-                ),
-                id="optim_grads_params_double_buffer",
-            ),
-            pytest.param(
-                dict(
-                    bf16=True,
-                    data_parallel_sharding_strategy="optim_grads_params",
-                    fp8="e4m3",
-                    fp8_param_gather=True,
-                    fp8_recipe="mxfp8",
-                    moe_grouped_gemm=True,
-                    overlap_param_gather=True,
-                    overlap_grad_reduce=True,
-                    use_megatron_fsdp_v2=True,
-                ),
-                id="optim_grads_params_mxfp8_param_gather",
-            ),
-            pytest.param(
-                dict(
-                    bf16=True,
-                    data_parallel_sharding_strategy="optim_grads_params",
-                    fp4="e2m1",
-                    fp4_recipe="nvfp4",
-                    fp4_param_gather=True,
-                    main_grads_dtype="fp32",
-                    main_params_dtype="fp32",
-                    overlap_param_gather=True,
-                    overlap_grad_reduce=True,
-                    use_megatron_fsdp_v2=True,
-                ),
-                id="optim_grads_params_nvfp4_param_gather",
-            ),
-            pytest.param(
-                dict(
-                    bf16=True,
-                    data_parallel_sharding_strategy="optim_grads_params",
-                    fp8="e4m3",
-                    fp8_param_gather=True,
-                    fp8_recipe="mxfp8",
-                    moe_grouped_gemm=True,
-                    use_megatron_fsdp_v2=True,
-                    moe_token_dispatcher_type="alltoall",
-                    overlap_moe_expert_parallel_comm=True,
-                    delay_wgrad_compute=True,
-                ),
-                id="ep_overlap-optim_grads_params",
+                id="optim_grads_params_parameter_group",
             ),
         ],
     )
     def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, spec_configs):
-        if spec_configs.get("fp8_recipe") == "mxfp8" and (
-            not torch.cuda.is_available()
-            or torch.cuda.get_device_capability()[0] < 10
-            or not HAVE_TE_MXFP8TENSOR
-        ):
-            pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
-
-        if spec_configs.get("fp4_param_gather"):
-            if not torch.cuda.is_available():
-                pytest.skip("CUDA is required for NVFP4")
-            if not (HAVE_TE_NVFP4 and HAVE_TE_NVFP4_RECIPE):
-                pytest.skip("NVFP4 requires Transformer Engine >= 2.7.0.dev0")
-            try:
-                from transformer_engine.pytorch.fp8 import check_nvfp4_support
-
-                is_nvfp4_available, reason = check_nvfp4_support()
-                if not is_nvfp4_available:
-                    pytest.skip("NVFP4 not available: " + reason)
-            except ImportError:
-                pytest.skip("NVFP4 support check requires Transformer Engine >= 2.7.0.dev0")
-
-        if spec_configs.get("overlap_moe_expert_parallel_comm"):
-            from megatron.core.utils import is_te_min_version
-
-            if not is_te_min_version("2.3.0"):
-                pytest.skip("EP overlap requires Transformer Engine >= 2.3.0")
-
         reference_kind = "distopt"
         ref_cache_key = (
             reference_kind,
@@ -617,37 +469,11 @@ class TestMegatronFSDPE2E:
                 ),
                 id="bf16-optim_grads_params",
             ),
-            pytest.param(
-                dict(
-                    strategy="optim_grads_params",
-                    precision_configs=dict(
-                        bf16=True,
-                        fp8="e4m3",
-                        fp8_param_gather=True,
-                        fp8_recipe="mxfp8",
-                        main_grads_dtype="fp32",
-                        main_params_dtype="fp32",
-                        exp_avg_dtype="bf16",
-                        exp_avg_sq_dtype="bf16",
-                        moe_grouped_gemm=True,
-                        use_precision_aware_optimizer=True,
-                    ),
-                    reference_kind="fsdp_v1",
-                    capture_param_snapshots=False,
-                ),
-                id="mxfp8_param_gather-optim_grads_params",
-            ),
         ],
     )
     def test_strict_iter_equivalence_zero_strategies(self, ref_cache, case):
         strategy = case["strategy"]
         precision_configs = case["precision_configs"]
-        if precision_configs.get("fp8_recipe") == "mxfp8" and (
-            not torch.cuda.is_available()
-            or torch.cuda.get_device_capability()[0] < 10
-            or not HAVE_TE_MXFP8TENSOR
-        ):
-            pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
         if Utils.world_size < 2:
             pytest.skip("Requires at least 2 distributed ranks for ZeRO sharding")
 
@@ -750,75 +576,6 @@ class TestMegatronFSDPE2E:
                         f"reference_shape={tuple(ref_params[name].shape)}"
                     ),
                 )
-
-    @pytest.mark.skipif(
-        not is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
-    )
-    @pytest.mark.parametrize(
-        "strategy,precision_configs",
-        [
-            pytest.param(
-                strategy,
-                dict(
-                    bf16=True,
-                    fp8="e4m3",
-                    fp8_param_gather=True,
-                    fp8_recipe="mxfp8",
-                    main_grads_dtype="fp32",
-                    main_params_dtype="fp32",
-                    exp_avg_dtype="bf16",
-                    exp_avg_sq_dtype="bf16",
-                    moe_grouped_gemm=True,
-                    use_precision_aware_optimizer=True,
-                ),
-                id=f"mxfp8_param_gather-{strategy}",
-            )
-            for strategy in ("optim", "optim_grads")
-        ],
-    )
-    def test_zero_strategy_non_equivalent_precision_paths_run(self, strategy, precision_configs):
-        """Exercise valid ZeRO paths that intentionally lack a strict reference.
-
-        MXFP8 ZeRO-1/2 refreshes replicated quantized compute buffers after
-        sharded optimizer updates; v1 and v2 do not provide a strict multi-step
-        golden comparison for that replicated-weight quantization path.
-        """
-        if precision_configs.get("fp8_recipe") == "mxfp8" and (
-            not torch.cuda.is_available()
-            or torch.cuda.get_device_capability()[0] < 10
-            or not HAVE_TE_MXFP8TENSOR
-        ):
-            pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
-        if Utils.world_size < 2:
-            pytest.skip("Requires at least 2 distributed ranks for ZeRO sharding")
-
-        outputs = TestMegatronFSDPE2E._training_loop(
-            use_megatron_fsdp=True,
-            use_megatron_fsdp_v2=True,
-            ckpt_format="fsdp_dtensor",
-            data_parallel_sharding_strategy=strategy,
-            train_iters=3,
-            seq_length=64,
-            micro_batch_size=1,
-            global_batch_size=8,
-            init_model_with_meta_device=False,
-            gradient_accumulation_fusion=False,
-            overlap_param_gather=False,
-            overlap_grad_reduce=False,
-            **precision_configs,
-        )
-
-        if torch.distributed.get_rank() != 0:
-            return
-
-        assert len(outputs) == 3
-        for step, output in enumerate(outputs):
-            loss = output["lm loss"]
-            assert torch.isfinite(loss), (
-                f"Non-finite loss at step {step}, strategy={strategy}, "
-                f"precision={precision_configs}"
-            )
-
 
 def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
     """

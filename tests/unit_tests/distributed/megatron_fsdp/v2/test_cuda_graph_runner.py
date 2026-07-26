@@ -138,7 +138,7 @@ def test_reduce_grad_skips_aliased_main_grad_copy():
         optimizer_params=(dist_param,),
         optimizer_grads=(None,),
         mp_policy=SimpleNamespace(use_decoupled_grad=False),
-        _init_dist_grads=lambda: None,
+        prepare_gradient_storage=lambda: None,
         reduce_grad=lambda **_: reduce_calls.append(True),
         release_grad_buffer=lambda: release_calls.append(True),
     )
@@ -298,14 +298,14 @@ def test_capture_backward_pre_hook_prefetches_only_te_fused_wgrad():
     fused_group = SimpleNamespace(
         params=(fused_param,),
         grad_buffer=SimpleNamespace(),
-        ensure_full_grad_buffer=lambda: fused_fetch_calls.append(True),
-        _init_dist_grads=lambda: fused_init_calls.append(True),
+        begin_backward=lambda: fused_fetch_calls.append(True),
+        prepare_gradient_storage=lambda: fused_init_calls.append(True),
     )
     regular_group = SimpleNamespace(
         params=(regular_param,),
         grad_buffer=SimpleNamespace(),
-        ensure_full_grad_buffer=lambda: regular_fetch_calls.append(True),
-        _init_dist_grads=lambda: regular_init_calls.append(True),
+        begin_backward=lambda: regular_fetch_calls.append(True),
+        prepare_gradient_storage=lambda: regular_init_calls.append(True),
     )
     unshard_calls = []
     module = SimpleNamespace(
@@ -335,8 +335,8 @@ def test_trace_prefetches_static_main_grad_before_backward():
         grad_buffer=SimpleNamespace(dtype=param.dtype),
         overwrites_full_grad=True,
         supports_fused_grad_capture=True,
-        ensure_full_grad_buffer=lambda: fetch_calls.append(True),
-        _init_dist_grads=lambda: init_calls.append(True),
+        begin_backward=lambda: fetch_calls.append(True),
+        prepare_gradient_storage=lambda: init_calls.append(True),
     )
     module = SimpleNamespace(
         _fsdp_root_context=SimpleNamespace(cuda_graph_active=False, enable_unshard_prefetch=False),

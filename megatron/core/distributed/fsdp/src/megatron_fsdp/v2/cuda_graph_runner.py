@@ -464,7 +464,7 @@ def _make_bwd_pre_hook(module):
             )
             if has_fused_wgrad and param_group.grad_buffer is not None:
                 param_group.prepare_gradient_storage()
-                param_group.ensure_full_grad_buffer()
+                param_group.begin_backward()
 
     return hook
 

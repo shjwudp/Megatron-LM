@@ -15,7 +15,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Shard
 
-from .allocator import StorageFreeingBucketAllocator, TracePoolAllocator
+from .allocator import StorageFreeingBucketAllocator
 from .fsdp_module import FSDPModule
 from .hooks import (
     _register_backward_hook,
@@ -24,7 +24,7 @@ from .hooks import (
     _register_forward_pre_hook,
 )
 from .mixed_precision import MixedPrecisionPolicy
-from .utils import _init_default_fully_shard_mesh, _prepare_fsdp_mesh
+from .utils import _init_default_fully_shard_mesh
 
 __all__ = ["FSDPModule", "fully_shard"]
 _fsdp_class_cache = {}  # module-level cache
@@ -55,7 +55,6 @@ def fully_shard(
     fine_grained_hooks: bool = False,
     skip_backward_callback: bool = False,  # Skip autograd RegisterFSDPBackwardFunction.
     skip_final_backward_callback: bool = False,
-    use_parameter_group_v2: bool = False,
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -88,11 +87,6 @@ def fully_shard(
             ``_register_post_backward_final_callback`` during the backward
             pre-hook.  The caller must invoke the final callback manually
             (used by the 1F1B EP overlap schedule).
-        use_parameter_group_v2: Use the placement-first parameter-group
-            implementation. This experimental path supports eager and
-            full-iteration CUDA-graph FP32/BF16 training. Per-module CUDA
-            graphs, trace-pool allocation, CPU offload, and quantized weights
-            remain on the existing parameter-group path.
     """
     unsupported_args = {
         "reshard_after_forward": reshard_after_forward,
@@ -110,37 +104,38 @@ def fully_shard(
         )
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy()
+    for param in module.parameters():
+        if ignored_params is not None and param in ignored_params:
+            continue
+        if param.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+            raise NotImplementedError(
+                "ParameterGroup supports FP32/BF16/FP16 parameters, "
+                f"got {param.dtype}"
+            )
 
     if mesh is None:
         mesh = _init_default_fully_shard_mesh()
-        if use_parameter_group_v2:
-            mesh = mesh[mesh.mesh_dim_names[-1]]
-    if use_parameter_group_v2:
-        unsupported_v2_options = {
-            "enable_trace_pool": enable_trace_pool,
-            "enable_cuda_graph": enable_cuda_graph,
-            "skip_backward_callback": skip_backward_callback,
-            "skip_final_backward_callback": skip_final_backward_callback,
-        }
-        enabled = [name for name, value in unsupported_v2_options.items() if value]
-        if enabled:
+        mesh = mesh[mesh.mesh_dim_names[-1]]
+
+    unsupported_options = {
+        "enable_trace_pool": enable_trace_pool,
+        "enable_cuda_graph": enable_cuda_graph,
+        "skip_backward_callback": skip_backward_callback,
+        "skip_final_backward_callback": skip_final_backward_callback,
+    }
+    enabled = [name for name, value in unsupported_options.items() if value]
+    if enabled:
+        raise NotImplementedError("ParameterGroup does not support: " + ", ".join(enabled))
+    if mp_policy.fp8.enabled or mp_policy.nvfp4.enabled:
+        raise NotImplementedError("ParameterGroup does not support quantized weights yet")
+    if mesh.ndim == 2 and sharding_strategy != "optim_grads_params":
+        if mesh.size(0) != 1:
             raise NotImplementedError(
-                "ParameterGroupV2 integration does not support: " + ", ".join(enabled)
+                "ParameterGroup requires optim_grads_params on a 2D HSDP mesh"
             )
-        if mp_policy.fp8.enabled or mp_policy.nvfp4.enabled:
-            raise NotImplementedError("ParameterGroupV2 does not support quantized weights yet")
-        if mesh.ndim == 2 and sharding_strategy != "optim_grads_params":
-            raise NotImplementedError(
-                "ParameterGroupV2 currently requires optim_grads_params on a 2D HSDP mesh"
-            )
-        if mesh.ndim == 1 and outer_dp_sharding_strategy == "optim":
-            raise ValueError("Outer-DP optimizer sharding requires a 2D DeviceMesh")
-    elif all_gather_streams is not None or reduce_scatter_streams is not None:
-        raise NotImplementedError(
-            "Axis-indexed communication streams require use_parameter_group_v2=True"
-        )
-    else:
-        mesh = _prepare_fsdp_mesh(mesh)
+        mesh = mesh[mesh.mesh_dim_names[-1]]
+    if mesh.ndim == 1 and outer_dp_sharding_strategy == "optim":
+        raise ValueError("Outer-DP optimizer sharding requires a 2D DeviceMesh")
 
     for name, streams in (
         ("all_gather_streams", all_gather_streams),
@@ -155,16 +150,7 @@ def fully_shard(
     new_cls = _fsdp_class_cache[cls]
     module.__class__ = new_cls
 
-    use_trace_pool = (
-        enable_trace_pool
-        or enable_cuda_graph
-        or any(
-            getattr(m._fsdp_state, "enable_cuda_graph", False)
-            for m in module.modules()
-            if isinstance(m, FSDPModule) and m is not module
-        )
-    ) and sharding_strategy in ("no_shard", "optim", "optim_grads", "optim_grads_params")
-    bucket_allocator = TracePoolAllocator() if use_trace_pool else StorageFreeingBucketAllocator()
+    bucket_allocator = StorageFreeingBucketAllocator()
 
     module._init_named_param_groups(
         mesh,
@@ -173,7 +159,6 @@ def fully_shard(
         gradient_scaling_factor=gradient_scaling_factor,
         sharding_strategy=sharding_strategy,
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,
-        use_parameter_group_v2=use_parameter_group_v2,
     )
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,

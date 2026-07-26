@@ -51,10 +51,6 @@ class _FSDPRootContext:
     # module_id -> Event: signals when that module's all-gather is complete.
     # None means "not yet launched" or "resharded"; the event persists after waits.
 
-    unshard_pending_post: Dict[int, Set[bool]]
-    # module_id -> {bwd_pass}: communication has been launched for this
-    # forward/backward phase, but caller-stream post-processing is pending.
-
     # --- Reduce-scatter grad overlap tracking ---
     reduce_grad_buckets: Dict[int, List[Tuple[torch.cuda.Event, ParameterGroup]]]
     # module_id -> [(event, param_group), ...]
@@ -93,18 +89,17 @@ class _FSDPRootContext:
 ### Initialization in `_init_fsdp_state()`
 
 ```python
-bucket_allocator = TracePoolAllocator() if enable_trace_pool else StorageFreeingBucketAllocator()
-module._init_named_param_groups(..., bucket_allocator=bucket_allocator)
+bucket_allocator = StorageFreeingBucketAllocator()
+module._init_named_param_groups(...)
 
 forward_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
 root_context = _FSDPRootContext(
-    ag_stream=torch.cuda.Stream() if enable_unshard_prefetch else torch.cuda.current_stream(),
-    rs_stream=torch.cuda.Stream() if enable_async_reduce_grad else torch.cuda.current_stream(),
+    ag_streams=resolve_axis_streams(all_gather_streams, enable_unshard_prefetch),
+    rs_streams=resolve_axis_streams(reduce_scatter_streams, enable_async_reduce_grad),
     bucket_allocator=bucket_allocator,
     forward_order=forward_order,
     reduce_grad_buckets={id(m): [] for m in forward_order},
     unshard_done_events={id(m): None for m in forward_order},
-    unshard_pending_post={id(m): set() for m in forward_order},
     enable_unshard_prefetch=enable_unshard_prefetch,
     enable_async_reduce_grad=enable_async_reduce_grad,
 )
@@ -164,58 +159,35 @@ module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
 ### `FSDPModule.unshard(async_op, bwd_pass)`
 
 ```python
-stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
-
-# Build the work list: self + (optionally) next module to prefetch
-if async_op:
-    prefetch = _get_prefetch_next_modules(bwd_pass)   # returns [next_module] or []
-else:
-    prefetch = []
-
+caller_stream = torch.cuda.current_stream()
+prefetch = _get_prefetch_next_modules(bwd_pass) if async_op else []
 for module in [self] + prefetch:
-    if all(pg.model_weights_are_unsharded(bwd_pass=bwd_pass) for pg in module._fsdp_param_groups):
-        continue          # Required buffers are already unsharded — skip
-
-    ParameterGroup.unshard_model_weights(
-        module._fsdp_param_groups,
-        bwd_pass=bwd_pass,
-        stream=stream,
-        async_op=async_op,
+    if all(pg.weights_are_unsharded() for pg in module._fsdp_param_groups):
+        continue
+    streams = (
+        ctx.ag_streams
+        if async_op
+        else (caller_stream,) * module._fsdp_param_groups[0].mesh.ndim
     )
-
-    ctx.unshard_pending_post[id(module)].add(bwd_pass)
-
+    ParameterGroup.unshard_weights(
+        module._fsdp_param_groups, streams=streams, async_op=async_op
+    )
     if async_op:
-        event = stream.record_event()
-        ctx.unshard_done_events[id(module)] = event   # store completion signal
+        ctx.unshard_done_events[id(module)] = ctx.ag_streams[-1].record_event()
 
-# Synchronize self: block main stream until this module's AG is done.
-# The event is NOT cleared here; it is only cleared by reshard(). Buffer
-# readiness, not event presence, determines whether a later unshard can skip.
 if ctx.unshard_done_events[id(self)] is not None:
-    ctx.unshard_done_events[id(self)].wait()          # main stream waits on ag_stream event
+    ctx.unshard_done_events[id(self)].wait()
 
-# TE post-processing may launch kernels, so run it on the caller only after
-# this module's communication event has joined the caller stream.
-if bwd_pass in ctx.unshard_pending_post[id(self)]:
-    for _, param_group in self._named_param_groups:
-        param_group.finalize_model_weight_unshard(bwd_pass=bwd_pass)
-    ctx.unshard_pending_post[id(self)].remove(bwd_pass)
-
-# Install full parameter tensors into the nn.Module (safe after event.wait)
 for param_names, param_group in self._named_param_groups:
     for name, param in zip(param_names, param_group.params):
-        _replace_module_parameter(self, name, param)  # swaps nn.Parameter object
+        _replace_module_parameter(self, name, param)
 ```
 
-**Stream ownership and buffer lifetime.** Temporary full buffers are allocated on the
-caller stream, while only the all-gather collective and its `Work.wait()` execute with
-`ag_stream` current. Tensor rebinding is metadata-only and returns to the caller stream.
-The caller waits for the module event before running
-`finalize_model_weight_unshard()` or installing full parameters into the module.
-Explicit stream events order consumption and release. `ParameterGroup` retains each
-temporary output lease until the corresponding communication event has completed, so
-the allocator cannot recycle storage while communication is still using it.
+**Stream ownership and buffer lifetime.** Each mesh-axis redistribution runs on its
+configured stream. `ParameterGroup.unshard_weights()` binds the output and runs
+mixed-precision post-processing on the terminal axis stream. The caller waits for the
+module event before installing full parameters. A skipped prefetched module waits for
+that event in `reshard()` before releasing its temporary full-weight lease.
 
 **Stream ordering barrier.** When `async_op=True`, the caller stream is captured before
 any stream switch inside `redistribute_buffers()`. The batch allocates final output
@@ -232,10 +204,9 @@ captured async unshard.
 for profiling visibility in tools like Nsight Systems.
 
 **All-gather coalescing.** `FSDPModule.unshard()` delegates the module's ordered
-parameter groups to `ParameterGroup.unshard_model_weights()`. The parameter-group
-operation privately selects the required weight representations and supplies their final
-replicated target to `DataParallelBuffer.redistribute_buffers()`. The buffer planner
-derives mesh-axis order and groups consecutive buffers with the same process group,
+parameter groups to `ParameterGroup.unshard_weights()`. The parameter-group operation
+supplies their full replicated target to `DataParallelBuffer.redistribute_buffers()`.
+The buffer planner derives mesh-axis order and groups buffers with the same process group,
 dtype, device, and source placement. It completes the outer dimension before the inner
 dimension, and each dimension uses one grouped launch when it contains multiple
 compatible buffers and its process group has more than one rank. Buffer state determines
@@ -243,11 +214,6 @@ whether a placement needs a collective. With `async_ops=True`, the coalescing ma
 owns the resulting `Work`; the async path calls
 `coalescing_event.wait()` while `ag_stream` is current before advancing to the next
 dimension or recording the module event.
-
-Prefetched modules keep their `bwd_pass` value in `unshard_pending_post`. When their own
-pre-hook later arrives, it skips the already-launched all-gather, waits for its event, and
-runs `finalize_model_weight_unshard()` on the caller stream. Removing the phase from the
-pending set makes re-entry and activation recompute idempotent.
 
 ### `_get_prefetch_next_modules(bwd_pass)`
 
@@ -262,16 +228,13 @@ Exactly one module is prefetched per step. Multi-module lookahead is a future ex
 ### `FSDPModule.reshard()`
 
 ```python
-pending_post = ctx.unshard_pending_post[id(self)]
 unshard_event = ctx.unshard_done_events[id(self)]
-if pending_post and unshard_event is not None:
+if unshard_event is not None:
     unshard_event.wait()  # skipped prefetch: join AG before freeing its buffer
 
 for param_names, param_group in self._named_param_groups:
-    param_group.reshard()                           # detaches unsharded parameter views
-                                                    # unbinds group-owned weight outputs
-                                                    # releases their allocator keys
-    for name, dist_param in zip(param_names, param_group.dist_params):
+    param_group.reshard_weight()                    # unbinds and releases full weights
+    for name, dist_param in zip(param_names, param_group.optimizer_params):
         _replace_module_parameter(self, name, dist_param)   # reinstall sharded DTensor
 ctx.unshard_done_events[id(self)] = None    # reset so next iteration can prefetch again
 pending_post.clear()                         # discard any unused prefetched post phase
@@ -374,7 +337,7 @@ def reduce_grad(self, async_op: bool = False):
 
         # --- Step 4: Install dist_grad on dist_param (runs in stream context) ---
         for name, param, dist_param, dist_grad in zip(
-            param_names, param_group.params, param_group.dist_params, param_group.dist_grads
+            param_names, param_group.params, param_group.optimizer_params, param_group.optimizer_grads
         ):
             if param.requires_grad and dist_grad is not None:
                 with torch.cuda.stream(stream):
@@ -473,7 +436,7 @@ def _post_backward_final_callback(root_state, root_module):
    `no_shard` grad buffer. The optimizer consumes replicated DTensor grads.
 
 `optim` and `optim_grads` keep compute weights replicated but still expose
-optimizer-facing DTensor shards through `dist_params`.
+optimizer-facing DTensor shards through `optimizer_params`.
 
 ### ZeRO-1 (`optim`)
 
@@ -484,7 +447,7 @@ optimizer-facing DTensor shards through `dist_params`.
    replicas across local gradient accumulation.
 3. `finish_grad_sync()` performs one delayed reduce-scatter for each `optim`
    grad buffer. The reduce-scatter output is written into this rank's virtual
-   shard, which is what the optimizer consumes through `dist_grads`.
+   shard, which is what the optimizer consumes through `optimizer_grads`.
 4. The optimizer updates this rank's sharded `main_weight_buffer` view. After
    `copy_main_weights_to_model_weights()`, the next forward refreshes the
    replicated compute weights from those updated shards.
@@ -511,14 +474,14 @@ optimizer-facing DTensor shards through `dist_params`.
 For ZeRO-1/2, `copy_main_weights_to_model_weights()` marks the replicated
 `DataParallelBuffer` in a shard view when `main_weight_buffer` is sharded and
 `model_weight_buffer` is replicated. The next normal unshard for that buffer
-asks `ParameterGroup.unshard_model_weights()` to refresh any replicated
+asks `ParameterGroup.unshard_weights()` to refresh any replicated
 buffer before compute:
 
 1. Non-FP8 weights copy this rank's updated main-weight shard into the matching
    slice of the replicated model-weight buffer.
 2. FP8 weights quantize the local FP32 main-weight shard into the local FP8
    model-weight shard first; MXFP8 selects the transpose-buffer shard view as well.
-3. `ParameterGroup.unshard_model_weights()` privately selects the shard buffer,
+3. `ParameterGroup.unshard_weights()` privately selects the shard buffer,
    asks `DataParallelBuffer.redistribute_buffers()` to gather the updated shards
    into the full replicated compute buffer on every rank, and binds the result
    for the current compute phase.
@@ -678,16 +641,16 @@ ag_stream:    |AG(L[0])  AG(L[1])|        AG(L[2])|                |
 
 pre-hook L[0]: async unshard L[0] + prefetch L[1] on ag_stream
                event[L[0]].wait() → main stream unblocks
-               finalize_model_weight_unshard(L[0]) on main stream
+               post_unshard(L[0]) on terminal AG stream
                _replace_module_parameter(L[0])
 
 pre-hook L[1]: event[L[1]] already set → wait (likely done)
-               finalize_model_weight_unshard(L[1]) on main stream
+               post_unshard(L[1]) on terminal AG stream
                _replace_module_parameter(L[1])
                async prefetch L[2] on ag_stream
 
 pre-hook L[2]: event[L[2]].wait() → main stream unblocks
-               finalize_model_weight_unshard(L[2]) on main stream
+               post_unshard(L[2]) on terminal AG stream
                _replace_module_parameter(L[2])
 
 BACKWARD PASS (enable_async_reduce_grad=True, full-iteration CUDA graph)
@@ -752,9 +715,9 @@ making this extremely difficult to attribute and debug.
 ```python
 # DO NOT REMOVE THIS CHECK:
 if p.requires_grad and grad_data.numel() > 0:
-    self.dist_grads.append(make_uneven_dtensor(...))
+    self.optimizer_grads.append(make_uneven_dtensor(...))
 else:
-    self.dist_grads.append(None)  # zero-numel shard → no DTensor grad
+    self.optimizer_grads.append(None)  # zero-numel shard → no DTensor grad
 ```
 
 By recording `None` for zero-numel shards instead of a DTensor with an empty local tensor,
@@ -764,7 +727,7 @@ simply skipped during the fused update).
 
 **Additional safeguard in `_scale_gradients`:**
 ```python
-for dist_grad in param_group.dist_grads:
+for dist_grad in param_group.optimizer_grads:
     if dist_grad is None:
         continue   # skip zero-numel shards
     dist_grad._local_tensor.mul_(scaling_factor)
@@ -774,14 +737,14 @@ for dist_grad in param_group.dist_grads:
 
 ## Pitfall: Attribute Propagation from Original Params to DTensor Dist Params
 
-**Problem.**  `_init_buffers()` in `ParameterGroup` creates DTensor views (`dist_params`) into
+**Problem.**  `_init_buffers()` in `ParameterGroup` creates DTensor views (`optimizer_params`) into
 sharded buffers and `_replace_module_parameter` registers these DTensors on the module.
 However, critical metadata set on the **original** `nn.Parameter` objects by upstream layers
 (e.g. TE linear layers from `transformer_engine.py`) is **not** automatically transferred to
 the new DTensor wrappers.
 
 The adapter (`mcore_fsdp_adapter.py:310-330`) copies a fixed list of attributes from original
-params to dist_params.  If an attribute is missing from this list, downstream consumers that
+params to optimizer_params.  If an attribute is missing from this list, downstream consumers that
 inspect the registered module parameters will see the wrong metadata.
 
 **Affected attributes and their consumers:**
@@ -798,7 +761,7 @@ inspect the registered module parameters will see the wrong metadata.
 **Fix.**  When adding a new metadata attribute to TE layers or custom modules that are
 consumed by downstream code (optimizer, checkpointing, mixed precision), add its name to
 the `attr_name` list in `mcore_fsdp_adapter.py` to ensure it propagates to the DTensor
-dist_params.
+optimizer_params.
 
 **Debugging.**  Misattributed params can be detected by dumping
 `model._log_parameter_groups()` output and verifying that expert params appear in the

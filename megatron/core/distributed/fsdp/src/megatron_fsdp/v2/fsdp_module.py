@@ -6,17 +6,16 @@ import logging
 import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from .allocator import BucketAllocator, TracePoolAllocator
+from .allocator import BucketAllocator
 from .mixed_precision import MixedPrecisionPolicy
-from .param_group import ParameterGroup
-from .param_group_v2 import ParameterGroupLayoutV2, ParameterGroupV2
+from .param_group import ParameterGroup, ParameterGroupLayout
 from .utils import ParamGroupIdx, _replace_module_parameter
 
 logger = logging.getLogger(__name__)
@@ -53,11 +52,6 @@ class _FSDPRootContext:
     # ------------------------------------------------------------------
     ag_streams: Tuple[torch.cuda.Stream, ...]  # one all-gather stream per mesh axis
     rs_streams: Tuple[torch.cuda.Stream, ...]  # one reduce-scatter stream per mesh axis
-
-    @property
-    def ag_stream(self) -> torch.cuda.Stream:
-        """Return the compatibility all-gather stream for the existing parameter group."""
-        return self.ag_streams[-1]
 
     @property
     def rs_stream(self) -> torch.cuda.Stream:
@@ -97,9 +91,6 @@ class _FSDPRootContext:
 
     Used to enforce correct dependency between all-gather and compute.
     """
-
-    unshard_pending_post: Dict[int, Set[bool]] = field(default_factory=dict)
-    """Maps module_id -> forward/backward post-unshard phases awaiting completion."""
 
     enable_unshard_prefetch: bool = True
     """Whether to prefetch (pipeline) parameter unshard for upcoming modules."""
@@ -311,62 +302,14 @@ class FSDPModule:
     def offload_to_cpu(
         self, recursive: bool = True, pin_memory: bool = False, max_cpu_bytes: Optional[int] = None
     ) -> Dict[str, int]:
-        """Offload FSDP-held GPU memory to CPU within an optional budget.
-
-        Moves every DataParallelBuffer.data to CPU and releases
-        TracePoolAllocator slot tensors.  All buffers auto-reload on
-        next access — no explicit reload call needed.
-
-        Buffers are offloaded in descending size order so the largest
-        buffers (most GPU savings) are prioritized when the budget is
-        tight.
-
-        Args:
-            recursive: If True (default), also offloads child FSDPModules.
-            pin_memory: If True, allocate pinned CPU memory for faster
-                CPU↔GPU transfers (~12 GB/s via DMA vs ~3-6 GB/s pageable).
-            max_cpu_bytes: Maximum CPU memory (in bytes) to consume.
-                Buffers beyond this limit are left on GPU.  ``None``
-                means no limit (offload everything).  The allocator
-                slots are always released and do not count against
-                this budget.
-
-        Returns:
-            Dict with ``"offloaded_bytes"`` and ``"skipped_bytes"``.
-        """
-        ctx = self._fsdp_root_context
-
-        param_groups = [
-            param_group
-            for module in self._get_fsdp_modules(recursive)
-            for param_group in module._fsdp_param_groups
-        ]
-        if any(isinstance(param_group, ParameterGroupV2) for param_group in param_groups):
-            raise NotImplementedError("ParameterGroupV2 CPU offload is not implemented yet")
-        result = ParameterGroup.offload_storage_to_cpu(
-            param_groups, pin_memory=pin_memory, max_cpu_bytes=max_cpu_bytes
-        )
-
-        # Release allocator slots (always — no CPU cost)
-        if isinstance(ctx.bucket_allocator, TracePoolAllocator):
-            ctx.bucket_allocator.release()
-
-        return result
+        """Raise because CPU offload is not supported."""
+        _ = recursive, pin_memory, max_cpu_bytes
+        raise NotImplementedError("ParameterGroup CPU offload is not implemented yet")
 
     def reload_to_gpu(self, recursive: bool = True) -> None:
-        """Explicitly move all buffers back to GPU and rebuild views.
-
-        Normally not needed — every access path auto-reloads.
-        Useful to hide first-touch CPU→GPU copy latency.
-        """
-        param_groups = [
-            param_group
-            for module in self._get_fsdp_modules(recursive)
-            for param_group in module._fsdp_param_groups
-        ]
-        if any(isinstance(param_group, ParameterGroupV2) for param_group in param_groups):
-            raise NotImplementedError("ParameterGroupV2 CPU reload is not implemented yet")
-        ParameterGroup.reload_storage_to_gpu(param_groups)
+        """Raise because CPU reload is not supported."""
+        _ = recursive
+        raise NotImplementedError("ParameterGroup CPU reload is not implemented yet")
 
     def _init_named_param_groups(
         self,
@@ -376,7 +319,6 @@ class FSDPModule:
         gradient_scaling_factor: Optional[float] = None,
         sharding_strategy: str = "optim_grads_params",
         outer_dp_sharding_strategy: str = "no_shard",
-        use_parameter_group_v2: bool = False,
     ):
         """
         Initialize parameter groups and build param name mapping.
@@ -409,7 +351,6 @@ class FSDPModule:
             gradient_scaling_factor=gradient_scaling_factor,
             sharding_strategy=sharding_strategy,
             outer_dp_sharding_strategy=outer_dp_sharding_strategy,
-            use_parameter_group_v2=use_parameter_group_v2,
         )
         setattr(self, "_fsdp_param_groups", fsdp_param_groups)
 
@@ -579,7 +520,6 @@ class FSDPModule:
             forward_order=forward_order,
             reduce_grad_buckets={id(module): [] for module in forward_order},
             unshard_done_events={id(module): None for module in forward_order},
-            unshard_pending_post={id(module): set() for module in forward_order},
             enable_unshard_prefetch=enable_unshard_prefetch,
             enable_async_reduce_grad=enable_async_reduce_grad,
             _reversed_order=list(reversed(forward_order)),
@@ -644,8 +584,6 @@ class FSDPModule:
         torch.cuda.nvtx.range_push("MFSDP unshard")
         ctx = self._fsdp_root_context
         caller_stream = torch.cuda.current_stream()
-        stream = ctx.ag_stream if async_op else caller_stream
-
         # Unshard this module and optionally prefetch next modules in the forward/backward pass
         if async_op and prefetch:
             prefetch_modules = ctx.get_prefetch_next_modules(self, bwd_pass=bwd_pass)
@@ -668,25 +606,14 @@ class FSDPModule:
                             dist_param._local_tensor
                         ).any(), f"NaN detected in dist param for parameter {name}"
 
-            uses_v2 = bool(module._fsdp_param_groups) and isinstance(
-                module._fsdp_param_groups[0], ParameterGroupV2
+            streams = (
+                ctx.ag_streams
+                if async_op
+                else (caller_stream,) * module._fsdp_param_groups[0].mesh.ndim
             )
-            if uses_v2:
-                streams = (
-                    ctx.ag_streams
-                    if async_op
-                    else (caller_stream,) * module._fsdp_param_groups[0].mesh.ndim
-                )
-                ParameterGroupV2.unshard_weights(
-                    module._fsdp_param_groups, streams=streams, async_op=async_op
-                )
-            else:
-                ParameterGroup.unshard_model_weights(
-                    module._fsdp_param_groups, bwd_pass=bwd_pass, stream=stream, async_op=async_op
-                )
-                # Post-processing may launch Transformer Engine kernels. Defer it
-                # until this module's caller stream has waited for communication.
-                ctx.unshard_pending_post[id(module)].add(bwd_pass)
+            ParameterGroup.unshard_weights(
+                module._fsdp_param_groups, streams=streams, async_op=async_op
+            )
 
             # Record event to track when unshard is done for this module
             if async_op:
@@ -699,12 +626,6 @@ class FSDPModule:
         # all-gathers during activation recompute and prefetch re-entry.
         if ctx.unshard_done_events[id(self)] is not None:
             ctx.unshard_done_events[id(self)].wait()
-
-        pending_post = ctx.unshard_pending_post[id(self)]
-        if bwd_pass in pending_post:
-            for _, param_group in self._named_param_groups:
-                param_group.finalize_model_weight_unshard(bwd_pass=bwd_pass)
-            pending_post.remove(bwd_pass)
 
         # Replace module parameters with unsharded versions
         for param_names, param_group in self._named_param_groups:
@@ -722,9 +643,8 @@ class FSDPModule:
         """Reshard parameters by replacing with sharded DTensors."""
         torch.cuda.nvtx.range_push("MFSDP reshard")
         ctx = self._fsdp_root_context
-        pending_post = ctx.unshard_pending_post[id(self)]
         unshard_event = ctx.unshard_done_events[id(self)]
-        if pending_post and unshard_event is not None:
+        if unshard_event is not None:
             # A prefetched module may be skipped by control flow. Join its
             # communication before releasing caller-owned temporary buffers.
             unshard_event.wait()
@@ -733,7 +653,6 @@ class FSDPModule:
             for name, dist_param in zip(param_names, param_group.optimizer_params):
                 _replace_module_parameter(self, name, dist_param)
         ctx.unshard_done_events[id(self)] = None  # Clear unshard event for this module
-        pending_post.clear()
         torch.cuda.nvtx.range_pop()
 
     def _wait_for_previous_async_reduce_grad(self):
@@ -874,13 +793,9 @@ class FSDPModule:
             if async_op:
                 # ---- Overlapped path ----
                 # Switch to rs_stream for the reduce-scatter kernel
-                if isinstance(param_group, ParameterGroupV2):
-                    completion_stream = param_group.reduce_grad(
-                        is_last_backward=ctx.is_last_backward, streams=ctx.rs_streams, async_op=True
-                    )
-                else:
-                    param_group.reduce_grad(is_last_backward=ctx.is_last_backward, stream=stream)
-                    completion_stream = stream
+                completion_stream = param_group.reduce_grad(
+                    is_last_backward=ctx.is_last_backward, streams=ctx.rs_streams, async_op=True
+                )
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
@@ -1172,8 +1087,7 @@ def _get_module_fsdp_param_groups(
     gradient_scaling_factor: Optional[float] = None,
     sharding_strategy: str = "optim_grads_params",
     outer_dp_sharding_strategy: str = "no_shard",
-    use_parameter_group_v2: bool = False,
-) -> List[ParameterGroup | ParameterGroupV2]:
+) -> List[ParameterGroup]:
     """
     Group module parameters by (device, dtype, requires_grad) and create ParameterGroups.
 
@@ -1185,18 +1099,8 @@ def _get_module_fsdp_param_groups(
     for param in module.parameters():
         if ignored_params is not None and param in ignored_params:
             continue
-        if use_parameter_group_v2 and param.dtype not in (
-            torch.float32,
-            torch.bfloat16,
-            torch.float16,
-        ):
-            raise NotImplementedError(
-                "ParameterGroupV2 eager integration supports FP32/BF16/FP16 parameters, "
-                f"got {param.dtype}"
-            )
 
-        # The policy owns dtype-sensitive grouping, including FP8/MXFP8 tensors
-        # whose logical dtype may differ from their communication payload.
+        # The policy owns dtype-sensitive grouping.
         param_dtype = mp_policy.group_key_dtype(param)
         param_attrs = (param.device, param_dtype, param.requires_grad)
         if param_attrs not in param_groups:
@@ -1206,30 +1110,19 @@ def _get_module_fsdp_param_groups(
     # Create ParameterGroup for each group
     fsdp_param_groups = []
     for i, params in enumerate(param_groups.values()):
-        if use_parameter_group_v2:
-            if mesh is None:
-                raise ValueError("ParameterGroupV2 requires an explicit DeviceMesh")
-            layout = ParameterGroupLayoutV2.from_strategies(
-                sharding_strategy, outer_dp_sharding_strategy if mesh.ndim == 2 else None
-            )
-            param_group = ParameterGroupV2(
-                params,
-                mesh=mesh,
-                param_group_id=ParamGroupIdx(id(module), i),
-                layout=layout,
-                mp_policy=mp_policy,
-                gradient_scaling_factor=gradient_scaling_factor,
-            )
-        else:
-            param_group = ParameterGroup(
-                params,
-                mesh=mesh,
-                param_group_id=ParamGroupIdx(id(module), i),
-                mp_policy=mp_policy,
-                gradient_scaling_factor=gradient_scaling_factor,
-                sharding_strategy=sharding_strategy,
-                outer_dp_sharding_strategy=outer_dp_sharding_strategy,
-            )
+        if mesh is None:
+            raise ValueError("ParameterGroup requires an explicit DeviceMesh")
+        layout = ParameterGroupLayout.from_strategies(
+            sharding_strategy, outer_dp_sharding_strategy if mesh.ndim == 2 else None
+        )
+        param_group = ParameterGroup(
+            params,
+            mesh=mesh,
+            param_group_id=ParamGroupIdx(id(module), i),
+            layout=layout,
+            mp_policy=mp_policy,
+            gradient_scaling_factor=gradient_scaling_factor,
+        )
         fsdp_param_groups.append(param_group)
 
     return fsdp_param_groups

@@ -20,8 +20,7 @@ v2/
 ├── fully_shard.py               # Public fully_shard() API entry point
 ├── fsdp_module.py               # FSDPModule runtime state (unshard/reshard/reduce_grad)
 ├── hooks.py                     # Forward/backward hook registration
-├── param_group.py               # Legacy ParameterGroup for compatibility-only features
-├── param_group_v2.py            # Placement-first ParameterGroup replacement
+├── param_group.py               # Placement-first ParameterGroup
 ├── dp_buffer.py                 # DataParallelBuffer — flat buffer management
 ├── buffer_index.py              # Flat-buffer item indexing and shard metadata
 ├── allocator.py                 # BucketAllocator (Temporary, StorageFreeing, TracePool)
@@ -64,23 +63,13 @@ Controls parameter/gradient dtypes and communication precision.
 
 | Field | Default | Purpose |
 |-------|---------|---------|
-| `main_params_dtype` | ``None`` | Dtype for optimizer main-weight buffer. ``None`` = no separate buffer, optimizer mutates model weights directly. Set to ``torch.float32`` for quantized models (FP8/NVFP4) so the optimizer works on high-precision copies. When this equals the model-weight dtype and the sharding layout matches, the separate buffer is skipped automatically to avoid a redundant copy. |
+| `main_params_dtype` | ``None`` | Dtype for optimizer main-weight buffer. ``None`` = no separate buffer, optimizer mutates model weights directly. When this equals the model-weight dtype and the sharding layout matches, the separate buffer is skipped automatically to avoid a redundant copy. |
 | `main_grads_dtype` | ``None`` | Dtype for optimizer main-grad buffer. When ``None`` and ``use_decoupled_grad=False``, aligns with ``main_params_dtype``. Otherwise falls back to ``param.dtype``. |
 | `grad_comm_dtype` | ``None`` | Dtype for gradient reduce-scatter communication. ``None`` = use ``main_grads_dtype``. |
 | `use_decoupled_grad` | ``False`` | When ``False``, ``main_grads_dtype`` is inferred from ``main_params_dtype`` so the optimizer operates in a consistent precision context. |
 
-**FP8 & NVFP4 recipes**
-
-`FullyShardFP8Policy` and `FullyShardNVFP4Policy` are recipe dataclasses
-that configure quantized mixed-precision behavior within `MixedPrecisionPolicy`,
-passed via the ``fp8`` and ``nvfp4`` fields respectively.  They are not
-standalone policies.
-
 ```python
-from megatron_fsdp.v2 import (
-    fully_shard, MixedPrecisionPolicy,
-    FullyShardFP8Policy, FullyShardNVFP4Policy,
-)
+from megatron_fsdp.v2 import fully_shard, MixedPrecisionPolicy
 
 # No separate main buffer — optimizer mutates model params directly
 mp_policy = MixedPrecisionPolicy()
@@ -88,20 +77,6 @@ fully_shard(model, mp_policy=mp_policy)
 
 # fp32 optimizer precision for bf16 model
 mp_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
-fully_shard(model, mp_policy=mp_policy)
-
-# FP8 mixed precision — fp32 main weights + MXFP8 rowwise/colwise quantized compute
-mp_policy = MixedPrecisionPolicy(
-    main_params_dtype=torch.float32,
-    fp8=FullyShardFP8Policy(enabled=True),
-)
-fully_shard(model, mp_policy=mp_policy)
-
-# NVFP4 mixed precision — fp32 main weights + NVFP4 primary compute weights
-mp_policy = MixedPrecisionPolicy(
-    main_params_dtype=torch.float32,
-    nvfp4=FullyShardNVFP4Policy(enabled=True),
-)
 fully_shard(model, mp_policy=mp_policy)
 ```
 
@@ -114,56 +89,6 @@ Mixin class added to wrapped modules. Methods:
 | `unshard()` | Pre-forward | All-gather params from sharded buffer |
 | `reshard()` | Post-forward, post-backward | Release unsharded buffer |
 | `reduce_grad()` | Post-backward / grad sync | All-reduce no-shard grads or reduce-scatter ZeRO grads |
-
-### CUDA Graph Capture
-
-> **Experimental** — CUDA graph support in Megatron FSDP v2 is an experimental
-> feature.  The API and behaviour may change in future releases without notice.
-
-**Why MFSDP v2 can support CUDA graphs.**  The [`TracePoolAllocator`](allocator.py)
-traces one micro-batch, assigns each FSDP temporary buffer key to a stable slot,
-and returns the same cached tensor view on later micro-batches.  Those stable
-addresses are the memory foundation that CUDA graph capture requires.
-
-When using the standalone API, enable per-module capture with
-``enable_cuda_graph=True``:
-
-```python
-for layer in model.layers:
-    fully_shard(layer, enable_cuda_graph=True)
-fully_shard(model)  # root without CUDA graph
-```
-
-**How it works:**
-
-1. The first optimized forward pass records sample arguments for each
-   eligible module.
-2. After the first backward completes, a single batch call to
-   `te-graph-runtime`'s `make_graphed_callables` captures forward + backward
-   graphs for all modules in correct order (fwds in forward-module order,
-   bwds in reverse) using the shared trace pool.
-3. FSDP unshard/reshard hooks run **outside** the CUDA graph capture via
-   `capture_time_hooks` — they are never graphed.  During replay they
-   fire normally around the graphed forward/backward.
-4. Replay runs entirely through the captured graphs — no Python hooks fire
-   inside the graphed region.
-
-**Limitation — nesting:** A parent FSDP module that contains other FSDP
-modules as children **cannot** use ``enable_cuda_graph=True``.  Only leaf
-FSDP modules (those without FSDP children) are eligible.  Attempting to
-enable CUDA graph on a module with FSDP children raises a ``RuntimeError``.
-
-```python
-# OK — layers are leaf FSDP modules
-for layer in model.layers:
-    fully_shard(layer, enable_cuda_graph=True)
-
-# NOT OK — model contains FSDP layers as children
-fully_shard(model, enable_cuda_graph=True)   # raises RuntimeError
-```
-
-See [`design/mfsdp_v2_builtin_cuda_graph_design.md`](design/mfsdp_v2_builtin_cuda_graph_design.md)
-for the full per-module architecture.
 
 ### DataParallelBuffer
 
@@ -215,14 +140,12 @@ strategy controls which buffers and communication collectives are used.
 
 ## Known Limitations
 
-### Parameter-group migration
+### Parameter-group features
 
-The MCore adapter automatically selects the placement-first parameter group for
-non-quantized `optim_grads_params` training, including full-iteration CUDA
-graphs. It retains the legacy parameter group for FP8/NVFP4 parameter gather,
-trace-pool or per-module CUDA graphs, delayed weight-gradient/MoE callbacks, and
-other sharding strategies. Standalone callers may select the placement-first
-path with `use_parameter_group_v2=True` while this compatibility phase is active.
+The placement-first parameter group supports DDP, ZeRO-1/2/3, HSDP, and
+full-iteration CUDA graphs. FP8/NVFP4 parameter gather, trace-pool or per-module
+CUDA graphs, delayed weight-gradient/MoE callbacks, and CPU offload are not
+supported.
 
 ### Parallelism
 
@@ -244,17 +167,11 @@ overlap (prefetch/unshard pipelining) is not applicable.
 
 ### CUDA Graph
 
-- **Experimental.** Enable via ``enable_cuda_graph=True`` on leaf FSDP modules.
-  In Megatron-LM training, use ``--mfsdp-cuda-graph`` with one or more module
-  selectors (`transformer`, `mamba`, `attn`, `mlp`, `moe`, `moe_router`).
-  Built on vendored [te-graph-runtime](https://github.com/buptzyb/te-graph-runtime)
-  with local modifications. See
-  [`design/mfsdp_v2_builtin_cuda_graph_design.md`](design/mfsdp_v2_builtin_cuda_graph_design.md).
-- **Requires `TracePoolAllocator`.** CUDA graph capture depends on the
-  deterministic buffer addresses provided by the trace pool. It is selected
-  automatically when ``enable_cuda_graph=True``.
-- **Nesting not supported.** Only leaf FSDP modules (those without FSDP children)
-  are eligible for capture.
+Full-iteration CUDA graphs are supported through
+`enable_full_iteration_cuda_graph=True`. Per-module capture through
+`enable_cuda_graph=True` is not supported by the placement-first parameter
+group. See
+[`design/full_iteration_cuda_graph_design.md`](design/full_iteration_cuda_graph_design.md).
 
 ### `fully_shard()` API Parameters
 
@@ -269,9 +186,7 @@ signature but are **not supported yet**. Passing any of them raises
 ### Hardware & Platform
 
 - **GPU only.** CUDA devices only. CPU, XPU, and ROCm are not tested or supported.
-- **NVFP4** (`mixed_precision.py`): The non-distributed quantization path is
-  not implemented. Distributed NVFP4 quantization is implemented for sharded
-  model-weight buffers.
+- **Quantized weights:** FP8/NVFP4 parameter gather is not supported.
 
 ### Checkpointing
 

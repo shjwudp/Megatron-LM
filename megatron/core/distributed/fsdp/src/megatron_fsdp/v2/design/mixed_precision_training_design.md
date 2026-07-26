@@ -3,6 +3,10 @@
 Megatron FSDP v2 uses `MixedPrecisionPolicy` to describe how parameters,
 optimizer weights, and gradients are stored in the `fully_shard()` path.
 
+The canonical placement-first `ParameterGroup` currently supports FP32, FP16,
+and BF16 parameters. The FP8/NVFP4 sections below describe policy machinery
+that remains in the tree but is not accepted by `fully_shard()`.
+
 The policy keeps the FSDP runtime independent of specific tensor formats. FSDP
 owns buffer allocation, sharding, unshard/reshard, and gradient reduction;
 `MixedPrecisionPolicy` owns dtype- and tensor-format-specific decisions.

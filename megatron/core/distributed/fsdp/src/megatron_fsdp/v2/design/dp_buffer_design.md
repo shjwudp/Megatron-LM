@@ -60,7 +60,7 @@ The parameter group owns consumers and training semantics:
 - the sequence of weight, gradient, and mixed-precision transformations.
 
 `_bind_params()` is private because it combines internal buffer identity, parameter
-indexing, and mixed-precision representation rules. `unshard_model_weights()` is the
+indexing, and mixed-precision representation rules. `unshard_weights()` is the
 semantic entry point used by the module scheduler.
 Copy-versus-accumulate, communication dtype, gradient scaling, and workspace release
 belong to the parameter group's reduction-stage helper because they are
@@ -78,7 +78,7 @@ The module runtime owns scheduling:
 - prefetch, event, and hook coordination.
 
 The module passes an ordered parameter-group sequence and lifecycle context to
-`ParameterGroup.unshard_model_weights()`. It does not inspect weight-buffer roles,
+`ParameterGroup.unshard_weights()`. It does not inspect weight-buffer roles,
 choose placements, call buffer redistribution, or bind storage. Mixed-precision
 finalization remains a separate semantic operation because prefetched communication
 must join the caller stream before Transformer Engine kernels may launch.

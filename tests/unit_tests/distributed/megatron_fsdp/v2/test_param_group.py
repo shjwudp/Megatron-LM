@@ -1,708 +1,465 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Multi-process integration tests for ParameterGroup.
-
-Builds a layer with mixed-dtype params (bf16 + uint8), splits them into
-two ParameterGroups, and validates shard / unshard / reshard / reduce_grad
-across all four sharding strategies.
-
-Run with:
-    torchrun --nproc_per_node=4 -m pytest megatron.core.distributed.fsdp.src.megatron_fsdp.tests.test_param_group -v
-"""
-
-import sys
-from pathlib import Path
+"""Distributed tests for the placement-first ParameterGroup."""
 
 import pytest
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import DeviceMesh
+from torch.distributed.tensor import DeviceMesh, DTensor
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
-sys.path.insert(0, str(Path(__file__).parents[2]))
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.allocator import TemporaryBucketAllocator
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import DataParallelBuffer
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-    MixedPrecisionPolicy,
-    WeightBufferRole,
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import (
+    GradientPhase,
+    ParameterGroup,
+    ParameterGroupLayout,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
-
-# ------------------------------------------------------------------ #
-#  Process group — init once per pytest session, shared by all tests
-# ------------------------------------------------------------------ #
 
 
 @pytest.fixture(scope="session", autouse=True)
 def dist_env():
-    """Initialize NCCL process group once and tear down at session end."""
     if not torch.distributed.is_initialized():
         torch.distributed.init_process_group(backend="nccl")
     rank = torch.distributed.get_rank()
-    device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
-    torch.cuda.set_device(device)
+    torch.cuda.set_device(rank % torch.cuda.device_count())
     yield
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 
 
-# ------------------------------------------------------------------ #
-#  Test model — contains bf16 and uint8 (simulated fp8) params
-# ------------------------------------------------------------------ #
+def _device() -> torch.device:
+    return torch.device(f"cuda:{torch.cuda.current_device()}")
 
 
-class MixedDtypeLayer(nn.Module):
-    """A toy layer with large matrices, small biases, and quantized projections."""
-
-    def __init__(self):
-        super().__init__()
-        self.linear1 = nn.Linear(16, 32, bias=False)  # bf16, shape [16, 32]
-        self.linear2 = nn.Linear(32, 16, bias=True)  # bf16, shape [32, 16] + bias [16]
-        self.norm = nn.LayerNorm(16)  # bf16, weight [16] + bias [16]
-        self.quant_proj = nn.Linear(16, 8, bias=False)  # uint8, shape [16, 8]
-        self.quant_gate = nn.Linear(16, 4, bias=False)  # uint8, shape [16, 4]
-
-
-# ------------------------------------------------------------------ #
-#  Helpers
-# ------------------------------------------------------------------ #
-
-
-def _build_groups(
-    strategy,
-    mesh=None,
-    mp_policy=None,
-    outer_dp_sharding_strategy="no_shard",
-    gradient_scaling_factor=None,
-):
-    """Create two ParameterGroups (bf16 + uint8) and call init_buffers.
-
-    Returns (groups, originals, dp_group, rank, world_size, device) where
-    `originals[i]` is a list of cloned param tensors before any sharding.
-    """
-    rank = torch.distributed.get_rank()
-    device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
-    dp_group = torch.distributed.group.WORLD if mesh is None else mesh.get_group(mesh_dim=1)
-
-    # Fixed seed so all ranks start with identical weights
-    torch.manual_seed(42)
-    layer = MixedDtypeLayer()
-
-    # Split params by dtype
-    bf16_params, uint8_params = [], []
-    for name, p in layer.named_parameters():
-        if "quant" in name:
-            uint8_params.append(
-                nn.Parameter(p.data.to(torch.uint8).to(device), requires_grad=False)
-            )
-        else:
-            bf16_params.append(nn.Parameter(p.data.to(torch.bfloat16).to(device)))
-
-    # Build one ParameterGroup per dtype, each with its own param_group_id
-    mp_policy = mp_policy or MixedPrecisionPolicy(main_params_dtype=torch.float32)
-    groups, originals = [], []
-    for gid, params in enumerate([bf16_params, uint8_params]):
-        if not params:
-            continue
-        originals.append([p.detach().clone() for p in params])
-        pg = ParameterGroup(
-            params=params,
-            param_group_id=ParamGroupIdx(0, gid),
-            mp_policy=mp_policy,
-            mesh=mesh,
-            sharding_strategy=strategy,
-            outer_dp_sharding_strategy=outer_dp_sharding_strategy,
-            gradient_scaling_factor=gradient_scaling_factor,
-        )
-        groups.append(pg)
-    return groups, originals, dp_group, rank, torch.distributed.get_world_size(), device
-
-
-def _build_hsdp_mesh(device):
+def _hsdp_mesh() -> DeviceMesh:
     world_size = torch.distributed.get_world_size()
-    if world_size < 4 or world_size % 2 != 0:
-        pytest.skip("HSDP mesh coverage requires an even world size >= 4")
-    mesh = torch.arange(world_size, dtype=torch.int).reshape(2, world_size // 2)
-    return DeviceMesh(device.type, mesh, mesh_dim_names=("dp_outer", "dp"))
+    if world_size < 4 or world_size % 2:
+        pytest.skip("ParameterGroup HSDP tests require an even world size >= 4")
+    ranks = torch.arange(world_size, dtype=torch.int).reshape(2, world_size // 2)
+    return DeviceMesh(_device().type, ranks, mesh_dim_names=("dp_outer", "dp"))
 
 
-def _outer_group(param_group):
-    return param_group.mesh.get_group(mesh_dim=0)
+def _dp_mesh() -> DeviceMesh:
+    ranks = torch.arange(torch.distributed.get_world_size(), dtype=torch.int)
+    return DeviceMesh(_device().type, ranks, mesh_dim_names=("dp",))
 
 
-def _inner_group(param_group):
-    return param_group.mesh.get_group(mesh_dim=1)
-
-
-def _flags(s):
-    """Return (has_model_weight_buf, has_grad_buf, weight_distributed, grad_distributed).
-
-    - has_model_weight_buf: model_weight_buffer is created for all supported strategies
-    - has_grad_buf: always True when requires_grad, across all strategies
-    - weight_distributed: only True for optim_grads_params (full FSDP)
-    - grad_distributed: True for optim_grads and optim_grads_params
-    """
-    return {
-        "no_shard": (True, True, False, False),
-        "optim": (True, True, False, False),
-        "optim_grads": (True, True, False, True),
-        "optim_grads_params": (True, True, True, True),
-    }[s]
-
-
-# ------------------------------------------------------------------ #
-#  PyTorch reference — thin wrappers around torch.distributed
-# ------------------------------------------------------------------ #
-
-
-class Ref:
-    @staticmethod
-    def all_gather(shard, group):
-        ws = torch.distributed.get_world_size(group)
-        out = torch.empty(shard.numel() * ws, dtype=shard.dtype, device=shard.device)
-        torch.distributed.all_gather_into_tensor(out, shard, group=group)
-        return out
-
-    @staticmethod
-    def reduce_scatter(full, group):
-        ws = torch.distributed.get_world_size(group)
-        ss = full.numel() // ws
-        out = torch.empty(ss, dtype=full.dtype, device=full.device)
-        torch.distributed.reduce_scatter_tensor(out, full, group=group)
-        return out
-
-    @staticmethod
-    def all_reduce(t, group):
-        torch.distributed.all_reduce(t, group=group)
-        return t
-
-
-# ------------------------------------------------------------------ #
-#  Part 1: init_buffers — verify buffer creation and shard correctness
-# ------------------------------------------------------------------ #
-
-
-@pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
-def test_init_buffers(strategy):
-    groups, originals, dp_group, rank, ws, device = _build_groups(strategy)
-    has_wbuf, _, w_dist, g_dist = _flags(strategy)
-
-    for pg, orig in zip(groups, originals):
-        assert pg.optimizer_params is pg.dist_params
-        assert pg.optimizer_grads is pg.dist_grads
-        assert pg.weight_buffer is pg.model_weight_buffer
-        assert pg.grad_buffer is pg.main_grad_buffer
-        assert pg.full_grad_has_value == pg._full_grad_has_value
-        # -- model_weight_buffer --
-        if has_wbuf:
-            assert pg.model_weight_buffer is not None
-            wbuf = pg.model_weight_buffer
-            assert not hasattr(wbuf, "allocator")
-            assert not hasattr(wbuf, "_move_data_to")
-            assert not hasattr(wbuf, "_ensure_data_on_gpu")
-            assert wbuf.placements[1] is (Placement.SHARD if w_dist else Placement.REPLICATE)
-
-            # Per-param check: tensor_view should return this rank's portion of
-            # the original param. A param may span shard boundaries, so the
-            # returned slice can be shorter than the full param or even empty.
-            for i, p in enumerate(orig):
-                item = wbuf.tensor_view(i)
-                if w_dist:
-                    s, e = wbuf.buffer_index._get_item_self_range(i, placements=wbuf.placements)
-                    expected = p.flatten()[s:e]
-                else:
-                    expected = p.flatten()
-                assert torch.equal(item, expected)
-        # -- main_grad_buffer --
-        if pg.requires_grad:
-            assert pg.main_grad_buffer is not None
-            assert pg.main_grad_buffer.placements[1] is (
-                Placement.SHARD if g_dist else Placement.REPLICATE
-            )
-            assert pg.main_grad_buffer.data is None  # lazy init
-
-    torch.distributed.barrier()
-
-
-# ------------------------------------------------------------------ #
-#  Part 2: unshard + reshard — verify all-gather and cleanup
-# ------------------------------------------------------------------ #
-
-
-@pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
-def test_unshard_reshard(strategy):
-    if strategy not in ("no_shard", "optim_grads_params"):
-        pytest.skip(
-            "This test currently covers no_shard and optim_grads_params, " f"skipping {strategy}."
-        )
-
-    groups, originals, dp_group, rank, ws, device = _build_groups(strategy)
-    _, _, w_dist, _ = _flags(strategy)
-
-    for pg, orig in zip(groups, originals):
-        wbuf = pg.model_weight_buffer
-        assert wbuf is not None
-
-        shard_before = wbuf.data.view(torch.uint8).clone()
-        pg.unshard()
-        state = pg._weight_buffer_states[WeightBufferRole.MODEL]
-        compute_buffer = state.compute_buffer(pg._full_placements())
-        assert compute_buffer is not None
-        unsharded = compute_buffer.data
-
-        if not w_dist:
-            # ZeRO-1/2: replicated persistent storage needs no temporary lease.
-            assert unsharded is wbuf.data
-            assert state.full_buffer is None
-        else:
-            assert state.full_buffer is compute_buffer
-            # Distributed: after all-gather, every param should be fully
-            # recoverable from the unsharded buffer at its global offset
-            for i, p in enumerate(orig):
-                start, end = wbuf.buffer_index._get_item_global_range(i)
-                recovered = unsharded[start:end]
-                assert torch.equal(recovered, p.flatten())
-
-        # Reshard: release the ParameterGroup-owned lease; persistent shard is intact.
-        pg.reshard()
-        assert state.full_buffer is None
-        expected_compute = wbuf if wbuf.is_unsharded() else None
-        assert state.compute_buffer(pg._full_placements()) is expected_compute
-        # Compare the persistent storage bit-for-bit. The buffer can contain
-        # uninitialized padding, including NaNs for which torch.equal is false
-        # even when the before/after bit patterns are identical.
-        assert torch.equal(wbuf.data.view(torch.uint8), shard_before)
-
-    torch.distributed.barrier()
-
-
-def test_redistribute_into_shared_replicate_output():
-    """A SHARD input view may all-gather into its aliased REPLICATE owner."""
-    groups, _, dp_group, rank, ws, _ = _build_groups("optim")
-    full_placements = [Placement.REPLICATE, Placement.REPLICATE]
-    shard_placements = [Placement.REPLICATE, Placement.SHARD]
-
-    for pg in groups:
-        output_buffer = pg.model_weight_buffer.placeholder(full_placements)
-        output_buffer.bind(
-            torch.empty(
-                output_buffer.data_size, dtype=output_buffer.dtype, device=output_buffer.device
-            )
-        )
-        input_buffer = output_buffer.view(shard_placements)
-
-        assert input_buffer is not output_buffer
-        assert input_buffer.placements == shard_placements
-        assert output_buffer.placements == full_placements
-        assert not hasattr(input_buffer, "storage_placements")
-        assert not hasattr(input_buffer, "buffer_role")
-        assert not hasattr(input_buffer, "sharding_strategy")
-        assert (
-            input_buffer.data.untyped_storage().data_ptr()
-            == output_buffer.data.untyped_storage().data_ptr()
-        )
-
-        input_buffer.data.fill_(rank + 1)
-        result = input_buffer.redistribute(full_placements, output_buffer=output_buffer)
-
-        expected = torch.cat(
-            [torch.full_like(input_buffer.data, peer_rank + 1) for peer_rank in range(ws)]
-        )
-        assert result is output_buffer
-        assert torch.equal(output_buffer.data, expected)
-
-        # A local REPLICATE -> SHARD transition must also populate a separate
-        # destination rather than only validate its placement.
-        shard_output = output_buffer.placeholder(shard_placements)
-        shard_output.bind(torch.empty_like(input_buffer.data))
-        expected_shard = output_buffer.view(shard_placements).data.clone()
-        result = output_buffer.redistribute(shard_placements, output_buffer=shard_output)
-        assert result is shard_output
-        assert torch.equal(shard_output.data, expected_shard)
-
-    torch.distributed.barrier(group=dp_group)
-
-
-# ------------------------------------------------------------------ #
-#  Part 3: reduce_grad — verify all-reduce / reduce-scatter
-# ------------------------------------------------------------------ #
-
-
-@pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
-def test_reduce_grad(strategy):
-    groups, _, dp_group, rank, ws, device = _build_groups(strategy)
-
-    for pg in groups:
-        pg._init_dist_grads()
-        gbuf = pg.main_grad_buffer
-        if gbuf is None:
-            continue
-
-        full_size = gbuf.buffer_index.bucket_meta.size
-        full = torch.full((full_size,), float(rank + 1), dtype=gbuf.dtype, device=device)
-        pg._acquire_full_grad_buffer().data.copy_(full)
-
-        if strategy == "no_shard":
-            expected = full.clone()
-            Ref.all_reduce(expected, dp_group)
-        else:
-            expected = Ref.reduce_scatter(full.clone(), dp_group)
-
-        pg.reduce_grad(is_last_backward=True)
-        actual = gbuf.view(pg._optimizer_placements()).data
-        assert torch.equal(actual, expected)
-
-    torch.distributed.barrier()
-
-
-@pytest.mark.parametrize("grad_comm_dtype", [None, torch.float32])
-def test_reduce_grad_owns_comm_conversion_and_scaling(grad_comm_dtype):
-    """Communication dtype and scaling are ParameterGroup workspace policy."""
-    mp_policy = MixedPrecisionPolicy(
-        main_params_dtype=torch.float32, grad_comm_dtype=grad_comm_dtype
+def _build_2d_group(
+    *,
+    shard_optimizer_across_outer_dp: bool,
+    sharding_strategy: str = "optim_grads_params",
+    grad_comm_dtype: torch.dtype | None = None,
+    gradient_scaling_factor: float | None = None,
+    use_decoupled_grad: bool = False,
+) -> tuple[ParameterGroup, torch.Tensor, TemporaryBucketAllocator]:
+    values = torch.arange(128, dtype=torch.float32, device=_device())
+    param = nn.Parameter(values.clone())
+    allocator = TemporaryBucketAllocator()
+    group = ParameterGroup(
+        [param],
+        ParamGroupIdx(0, 0),
+        mesh=_hsdp_mesh(),
+        layout=ParameterGroupLayout.from_strategies(
+            sharding_strategy,
+            outer_dp_sharding_strategy=(
+                "optim" if shard_optimizer_across_outer_dp else "no_shard"
+            ),
+        ),
+        mp_policy=MixedPrecisionPolicy(
+            main_grads_dtype=torch.float32,
+            grad_comm_dtype=grad_comm_dtype,
+            use_decoupled_grad=use_decoupled_grad,
+        ),
+        allocator=allocator,
+        gradient_scaling_factor=gradient_scaling_factor,
     )
-    groups, _, dp_group, rank, _, device = _build_groups(
-        "optim_grads_params", mp_policy=mp_policy, gradient_scaling_factor=0.25
+    return group, values, allocator
+
+
+def _build_1d_group(
+    sharding_strategy: str,
+) -> tuple[ParameterGroup, torch.Tensor, TemporaryBucketAllocator]:
+    values = torch.arange(128, dtype=torch.float32, device=_device())
+    param = nn.Parameter(values.clone())
+    allocator = TemporaryBucketAllocator()
+    group = ParameterGroup(
+        [param],
+        ParamGroupIdx(0, 0),
+        mesh=_dp_mesh(),
+        layout=ParameterGroupLayout.from_strategies(sharding_strategy),
+        mp_policy=MixedPrecisionPolicy(main_grads_dtype=torch.float32),
+        allocator=allocator,
     )
-
-    for pg in groups:
-        pg._init_dist_grads()
-        gbuf = pg.main_grad_buffer
-        if gbuf is None:
-            continue
-
-        full = torch.full(
-            (gbuf.buffer_index.bucket_meta.size,), float(rank + 1), dtype=gbuf.dtype, device=device
-        )
-        pg._acquire_full_grad_buffer().data.copy_(full)
-        expected_input = full.to(grad_comm_dtype or full.dtype).mul_(0.25)
-        expected = Ref.reduce_scatter(expected_input, dp_group).to(gbuf.dtype)
-
-        allocation_keys = []
-        original_allocate = pg.allocator.allocate
-
-        def capture_allocate(*args, **kwargs):
-            allocation_keys.append(kwargs.get("key", args[0] if args else None))
-            return original_allocate(*args, **kwargs)
-
-        pg.allocator.allocate = capture_allocate
-        pg.reduce_grad(is_last_backward=True)
-
-        actual = gbuf.view(pg._optimizer_placements()).data
-        assert torch.equal(actual, expected)
-        grad_comm_keys = [
-            key for key in allocation_keys if isinstance(key, tuple) and "grad_comm" in key
-        ]
-        assert len(grad_comm_keys) == (1 if grad_comm_dtype is not None else 0)
-
-    torch.distributed.barrier()
-
-
-def test_hsdp_reuses_one_grad_comm_workspace_across_axes(monkeypatch):
-    """One communication-dtype owner feeds both HSDP redistribution axes."""
-    device = torch.device(f"cuda:{torch.distributed.get_rank() % torch.cuda.device_count()}")
-    mesh = _build_hsdp_mesh(device)
-    redistribution_dtypes = []
-    original_redistribute = DataParallelBuffer.redistribute
-
-    def capture_redistribute(input_buffer, target_placements, **kwargs):
-        result = original_redistribute(input_buffer, target_placements, **kwargs)
-        redistribution_dtypes.append((input_buffer.dtype, result.dtype))
-        return result
-
-    monkeypatch.setattr(DataParallelBuffer, "redistribute", capture_redistribute)
-    mp_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32, grad_comm_dtype=torch.float32)
-    groups, _, _, rank, _, _ = _build_groups(
-        "optim_grads_params",
-        mesh=mesh,
-        mp_policy=mp_policy,
-        outer_dp_sharding_strategy="optim",
-        gradient_scaling_factor=0.25,
-    )
-
-    for pg in groups:
-        pg._init_dist_grads()
-        gbuf = pg.main_grad_buffer
-        if gbuf is None:
-            continue
-
-        full = torch.full(
-            (gbuf.buffer_index.bucket_meta.size,), float(rank + 1), dtype=gbuf.dtype, device=device
-        )
-        pg._acquire_full_grad_buffer().data.copy_(full)
-
-        allocation_keys = []
-        redistribution_dtypes.clear()
-        original_allocate = pg.allocator.allocate
-
-        def capture_allocate(*args, **kwargs):
-            allocation_keys.append(kwargs.get("key", args[0] if args else None))
-            return original_allocate(*args, **kwargs)
-
-        pg.allocator.allocate = capture_allocate
-
-        expected = full.float().mul_(0.25)
-        expected = Ref.reduce_scatter(expected, _inner_group(pg))
-        expected = Ref.reduce_scatter(expected, _outer_group(pg)).to(gbuf.dtype)
-
-        pg.reduce_grad(is_last_backward=True)
-
-        grad_comm_keys = [
-            key for key in allocation_keys if isinstance(key, tuple) and "grad_comm" in key
-        ]
-        assert len(grad_comm_keys) == 1
-        assert redistribution_dtypes == [
-            (torch.float32, torch.float32),
-            (torch.float32, torch.float32),
-        ]
-        actual = gbuf.view(pg._optimizer_placements()).data
-        assert torch.equal(actual, expected)
-
-    torch.distributed.barrier()
-
-
-@pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
-def test_zero_grad_set_to_none_false_reuses_dist_grads(strategy):
-    groups, _, _, _, _, _ = _build_groups(strategy)
-
-    for pg in groups:
-        gbuf = pg.main_grad_buffer
-        if gbuf is None:
-            continue
-
-        gbuf.bind(torch.ones(gbuf.data_size, dtype=gbuf.dtype, device=pg.device))
-        original_data = gbuf.data
-        original_data_ptr = original_data.data_ptr()
-        original_dist_grads = [object() for _ in pg.params]
-        pg.dist_grads = list(original_dist_grads)
-
-        pg.zero_grad(set_to_none=False)
-
-        assert gbuf.data is original_data
-        assert gbuf.data.data_ptr() == original_data_ptr
-        assert torch.count_nonzero(gbuf.data).item() == 0
-        assert all(dist_param.grad is None for dist_param in pg.dist_params)
-        for before, after in zip(original_dist_grads, pg.dist_grads):
-            assert after is before
-
-    torch.distributed.barrier()
+    return group, values, allocator
 
 
 @pytest.mark.parametrize(
-    ("strategy", "outer_strategy"),
+    ("sharding_strategy", "weight", "main_weight", "grad_storage", "grad_accumulation"),
     [
-        ("no_shard", "no_shard"),
-        ("optim", "no_shard"),
-        ("optim_grads", "no_shard"),
-        ("optim_grads_params", "no_shard"),
-        ("optim_grads_params", "optim"),
+        (
+            "no_shard",
+            Placement.REPLICATE,
+            Placement.REPLICATE,
+            Placement.REPLICATE,
+            Placement.PARTIAL,
+        ),
+        (
+            "optim",
+            Placement.REPLICATE,
+            Placement.SHARD,
+            Placement.REPLICATE,
+            Placement.PARTIAL,
+        ),
+        (
+            "optim_grads",
+            Placement.REPLICATE,
+            Placement.SHARD,
+            Placement.SHARD,
+            Placement.SHARD,
+        ),
+        (
+            "optim_grads_params",
+            Placement.SHARD,
+            Placement.SHARD,
+            Placement.SHARD,
+            Placement.SHARD,
+        ),
     ],
 )
-@pytest.mark.parametrize("main_grad_dtype", [None, torch.float32])
-def test_zero_grad_set_to_none_reuses_dist_grad_wrappers(strategy, outer_strategy, main_grad_dtype):
-    device = torch.device(f"cuda:{torch.distributed.get_rank() % torch.cuda.device_count()}")
-    mesh = _build_hsdp_mesh(device) if outer_strategy == "optim" else None
-    groups, _, _, _, _, _ = _build_groups(
-        strategy,
-        mesh=mesh,
-        mp_policy=MixedPrecisionPolicy(main_grads_dtype=main_grad_dtype),
-        outer_dp_sharding_strategy=outer_strategy,
-    )
+def test_1d_strategy_layout(
+    sharding_strategy, weight, main_weight, grad_storage, grad_accumulation
+):
+    layout = ParameterGroupLayout.from_strategies(sharding_strategy)
 
-    for pg in groups:
-        pg._init_dist_grads()
-        gbuf = pg.main_grad_buffer
-        if gbuf is None:
-            continue
-
-        original_dist_grads = list(pg.dist_grads)
-        live_dist_grads = pg.dist_grads
-        original_local_shapes = [
-            None if dist_grad is None else dist_grad._local_tensor.shape
-            for dist_grad in original_dist_grads
-        ]
-        dist_grad_count = torch.tensor(
-            sum(dist_grad is not None for dist_grad in original_dist_grads), device=device
-        )
-        torch.distributed.all_reduce(dist_grad_count)
-        assert dist_grad_count.item() > 0
-
-        pg.zero_grad(set_to_none=True)
-
-        assert gbuf.data is None
-        assert pg.dist_grads is live_dist_grads
-        assert all(dist_grad is None for dist_grad in pg.dist_grads)
-        for before, cached in zip(original_dist_grads, pg._dist_grad_cache):
-            assert cached is before
-            if cached is not None:
-                assert cached._local_tensor is None
-
-        pg._init_dist_grads()
-
-        assert gbuf.data is not None
-        assert pg.dist_grads is live_dist_grads
-        for before, after, local_shape in zip(
-            original_dist_grads, pg.dist_grads, original_local_shapes
-        ):
-            assert after is before
-            if after is not None:
-                assert after._local_tensor is not None
-                assert after._local_tensor.shape == local_shape
-                assert hasattr(after._local_tensor, "__create_chunk_list__")
-        assert all(
-            validated
-            for cached, validated in zip(pg._dist_grad_cache, pg._dist_grad_cache_validated)
-            if cached is not None
-        )
-
-    torch.distributed.barrier()
-
-
-@pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
-@pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
-def test_hsdp_reduce_grad(strategy, outer_strategy):
-    if outer_strategy == "optim" and strategy != "optim_grads_params":
-        pytest.skip("Outer-DP optimizer sharding currently requires inner optim_grads_params.")
-
-    rank = torch.distributed.get_rank()
-    device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
-    mesh = _build_hsdp_mesh(device)
-    groups, _, _, rank, _, device = _build_groups(
-        strategy, mesh=mesh, outer_dp_sharding_strategy=outer_strategy
-    )
-
-    for pg in groups:
-        pg._init_dist_grads()
-        gbuf = pg.main_grad_buffer
-        if gbuf is None:
-            continue
-        assert not pg._full_grad_has_value
-        assert not pg._reduced_grad_has_value
-
-        full_size = gbuf.buffer_index.bucket_meta.size
-        full = torch.full((full_size,), float(rank + 1), dtype=gbuf.dtype, device=device)
-        pg._acquire_full_grad_buffer().data.copy_(full)
-
-        if strategy == "no_shard":
-            expected = full.clone()
-            Ref.all_reduce(expected, _inner_group(pg))
-            Ref.all_reduce(expected, _outer_group(pg))
-        else:
-            expected = Ref.reduce_scatter(full.clone(), _inner_group(pg))
-            if outer_strategy == "optim":
-                expected = Ref.reduce_scatter(expected, _outer_group(pg))
-            else:
-                Ref.all_reduce(expected, _outer_group(pg))
-
-        pg.reduce_grad(is_last_backward=True)
-        actual = gbuf.view(pg._optimizer_placements()).data
-        assert torch.equal(actual, expected)
-
-        assert pg._full_grad_has_value == (strategy == "no_shard")
-        assert pg._reduced_grad_has_value
-
-    torch.distributed.barrier()
+    assert layout.weight == (weight,)
+    assert layout.main_weight == (main_weight,)
+    assert layout.grad_storage == (grad_storage,)
+    assert layout.grad_accumulation == (grad_accumulation,)
 
 
 @pytest.mark.parametrize(
-    ("strategy", "outer_strategy"),
-    [
-        ("no_shard", "no_shard"),
-        ("optim", "no_shard"),
-        ("optim_grads_params", "no_shard"),
-        ("optim_grads_params", "optim"),
-    ],
+    "sharding_strategy",
+    ["no_shard", "optim", "optim_grads", "optim_grads_params"],
 )
-def test_hsdp_reduce_grad_multi_microbatch(strategy, outer_strategy, monkeypatch):
-    rank = torch.distributed.get_rank()
-    device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
-    mesh = _build_hsdp_mesh(device)
-    groups, _, _, rank, _, _ = _build_groups(
-        strategy, mesh=mesh, outer_dp_sharding_strategy=outer_strategy
+def test_1d_strategy_weight_and_gradient_lifecycle(sharding_strategy):
+    group, values, allocator = _build_1d_group(sharding_strategy)
+
+    assert group.mesh.ndim == 1
+    assert group.state.weight_valid == group.layout.weight
+    expected_optimizer_placement = (
+        Replicate() if sharding_strategy == "no_shard" else Shard(0)
     )
-    outer_collective_calls = 0
-    original_reduce_scatter = torch.distributed.reduce_scatter_tensor
-    original_all_reduce = torch.distributed.all_reduce
+    assert group.optimizer_params[0].placements == (expected_optimizer_placement,)
 
-    def capture_reduce_scatter(*args, **kwargs):
-        nonlocal outer_collective_calls
-        group = kwargs.get("group")
-        if groups and group is _outer_group(groups[0]):
-            outer_collective_calls += 1
-        return original_reduce_scatter(*args, **kwargs)
+    group.unshard_weight()
+    torch.testing.assert_close(group.params[0], values)
+    group.reshard_weight()
 
-    def capture_all_reduce(*args, **kwargs):
-        nonlocal outer_collective_calls
-        group = kwargs.get("group")
-        if groups and group is _outer_group(groups[0]):
-            outer_collective_calls += 1
-        return original_all_reduce(*args, **kwargs)
+    rank = torch.distributed.get_rank()
+    group.begin_backward().data.fill_(rank + 1)
+    group.reduce_grad(is_last_backward=False)
+    assert group.state.grad_phase is GradientPhase.ACCUMULATING
+    if sharding_strategy in ("no_shard", "optim"):
+        first_microbatch = rank + 1
+    else:
+        world_size = torch.distributed.get_world_size()
+        first_microbatch = world_size * (world_size + 1) / 2
+    torch.testing.assert_close(
+        group.grad_buffer.data,
+        torch.full_like(group.grad_buffer.data, first_microbatch),
+        rtol=0,
+        atol=0,
+    )
 
-    monkeypatch.setattr(torch.distributed, "reduce_scatter_tensor", capture_reduce_scatter)
-    monkeypatch.setattr(torch.distributed, "all_reduce", capture_all_reduce)
+    group.begin_backward().data.fill_(rank + 2)
+    group.reduce_grad(is_last_backward=True)
+    world_size = torch.distributed.get_world_size()
+    expected = world_size * (world_size + 2)
+    torch.testing.assert_close(
+        group.optimizer_grad().data,
+        torch.full_like(group.optimizer_grad().data, expected),
+        rtol=0,
+        atol=0,
+    )
+    assert group.state.grad_phase is GradientPhase.READY
+    assert group.optimizer_params[0].grad is group.optimizer_grads[0]
+    assert allocator.buckets == {}
 
-    num_micro_batches = 3
-    for pg in groups:
-        pg._init_dist_grads()
-        gbuf = pg.main_grad_buffer
-        if gbuf is None:
-            continue
+    group.zero_grad()
+    assert group.state.grad_phase is GradientPhase.EMPTY
 
-        full_grad_buffer = pg._acquire_full_grad_buffer().data
-        full_grad_buffer.zero_()
-        full_batch_grad = torch.zeros_like(full_grad_buffer)
-        for microbatch in range(num_micro_batches):
-            micro_grad = torch.full_like(full_grad_buffer, float((microbatch + 1) * (rank + 1)))
-            if strategy == "optim_grads_params":
-                # ZeRO-3 consumes full-gradient scratch on every microbatch;
-                # production staging overwrites it before the next reduction.
-                full_grad_buffer.copy_(micro_grad)
-            else:
-                full_grad_buffer.add_(micro_grad)
-            full_batch_grad.add_(micro_grad)
-            is_last_backward = microbatch == num_micro_batches - 1
-            pg.reduce_grad(is_last_backward=is_last_backward)
-            if is_last_backward:
-                assert pg._full_grad_has_value == (strategy == "no_shard")
-                assert pg._reduced_grad_has_value
-            elif strategy == "optim_grads_params":
-                assert not pg._full_grad_has_value
-                assert pg._reduced_grad_has_value
-            else:
-                assert pg._full_grad_has_value
-                assert not pg._reduced_grad_has_value
 
-        actual_outer_calls = outer_collective_calls
-        if strategy == "no_shard":
-            ref = full_batch_grad
-            Ref.all_reduce(ref, _inner_group(pg))
-            Ref.all_reduce(ref, _outer_group(pg))
-            actual = gbuf.view(pg._optimizer_placements()).data
-            assert torch.equal(actual, ref)
-        else:
-            ref_shard = Ref.reduce_scatter(full_batch_grad, _inner_group(pg))
-            if outer_strategy == "optim":
-                ref_shard = Ref.reduce_scatter(ref_shard, _outer_group(pg))
-            else:
-                Ref.all_reduce(ref_shard, _outer_group(pg))
-            actual = gbuf.view(pg._optimizer_placements()).data
-            assert torch.equal(actual, ref_shard)
-        assert actual_outer_calls == 1
+@pytest.mark.parametrize(
+    "sharding_strategy",
+    ["no_shard", "optim", "optim_grads", "optim_grads_params"],
+)
+def test_2d_strategy_gradient_lifecycle(sharding_strategy):
+    group, _, allocator = _build_2d_group(
+        sharding_strategy=sharding_strategy,
+        shard_optimizer_across_outer_dp=False,
+    )
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    inner_size = world_size // 2
 
-        pg.zero_grad()
-        assert not pg._full_grad_has_value
-        assert not pg._reduced_grad_has_value
+    group.begin_backward().data.fill_(rank + 1)
+    group.reduce_grad(is_last_backward=False)
+    assert group.state.grad_phase is GradientPhase.ACCUMULATING
+    if sharding_strategy in ("no_shard", "optim"):
+        first_microbatch = rank + 1
+    else:
+        outer_rank = rank // inner_size
+        first_rank = outer_rank * inner_size
+        first_microbatch = sum(
+            inner_rank + 1 for inner_rank in range(first_rank, first_rank + inner_size)
+        )
+    torch.testing.assert_close(
+        group.grad_buffer.data,
+        torch.full_like(group.grad_buffer.data, first_microbatch),
+        rtol=0,
+        atol=0,
+    )
 
-    torch.distributed.barrier()
+    group.begin_backward().data.fill_(rank + 2)
+    group.reduce_grad(is_last_backward=True)
+    expected = world_size * (world_size + 2)
+    torch.testing.assert_close(
+        group.optimizer_grad().data,
+        torch.full_like(group.optimizer_grad().data, expected),
+        rtol=0,
+        atol=0,
+    )
+    assert group.state.grad_phase is GradientPhase.READY
+    assert allocator.buckets == {}
+
+
+@pytest.mark.parametrize("shard_optimizer_across_outer_dp", [False, True])
+def test_optimizer_params_own_main_weight_views(shard_optimizer_across_outer_dp):
+    group, _, _ = _build_2d_group(
+        shard_optimizer_across_outer_dp=shard_optimizer_across_outer_dp
+    )
+
+    assert len(group.optimizer_params) == 1
+    optimizer_param = group.optimizer_params[0]
+    assert isinstance(optimizer_param, DTensor)
+    expected_placements = (
+        (Shard(0), Shard(0))
+        if shard_optimizer_across_outer_dp
+        else (Replicate(), Shard(0))
+    )
+    assert optimizer_param.placements == expected_placements
+    assert optimizer_param._local_tensor.data_ptr() == group.main_weight_buffer.view(
+        list(group.layout.main_weight)
+    ).tensor_view(0).data_ptr()
+    assert hasattr(optimizer_param._local_tensor, "__create_chunk_list__")
+    assert getattr(optimizer_param, "__fsdp_param__")
+    assert getattr(group.params[0], "__fsdp_param__")
+    assert group.optimizer_grads == [None]
+    assert group.dtype == group.params[0].dtype
+    assert group.requires_grad
+    assert not group.full_grad_has_value
+    assert group.overwrites_full_grad
+    assert group.supports_fused_grad_capture
+
+
+def test_weight_validity_and_scratch_lifecycle():
+    group, original, allocator = _build_2d_group(
+        shard_optimizer_across_outer_dp=True
+    )
+
+    assert group.state.weight_valid == (Placement.REPLICATE, Placement.SHARD)
+    assert group.compute_weight() is None
+
+    compute_weight = group.unshard_weight()
+    assert compute_weight.placements == [Placement.REPLICATE, Placement.REPLICATE]
+    torch.testing.assert_close(group.params[0], original)
+    assert group.state.full_weight is compute_weight
+
+    group.reshard_weight()
+    assert group.state.full_weight is None
+    assert allocator.buckets == {}
+
+    group.main_weight_buffer.data.add_(torch.distributed.get_rank() + 1)
+    group.refresh_model_weight()
+    assert group.state.weight_valid == (Placement.SHARD, Placement.SHARD)
+
+    refreshed = group.unshard_weight()
+    replicas = [torch.empty_like(refreshed.data) for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather(replicas, refreshed.data)
+    assert all(torch.equal(replicas[0], replica) for replica in replicas[1:])
+    assert not torch.equal(refreshed.data, original)
+
+    group.reshard_weight()
+    assert allocator.buckets == {}
+
+
+def test_outer_sharded_hsdp_collective_order(monkeypatch):
+    group, _, _ = _build_2d_group(shard_optimizer_across_outer_dp=True)
+    transitions = []
+    redistribute = DataParallelBuffer.redistribute
+
+    def record_redistribution(self, target_placements, *, output_buffer=None):
+        transitions.append(
+            (tuple(self.placements), tuple(target_placements), torch.cuda.current_stream())
+        )
+        return redistribute(self, target_placements, output_buffer=output_buffer)
+
+    monkeypatch.setattr(DataParallelBuffer, "redistribute", record_redistribution)
+
+    outer_ag_stream = torch.cuda.Stream()
+    inner_ag_stream = torch.cuda.Stream()
+    group.refresh_model_weight()
+    transitions.clear()
+    group.unshard_weight(streams=(outer_ag_stream, inner_ag_stream), async_op=True)
+    inner_ag_stream.synchronize()
+    assert transitions == [
+        (
+            (Placement.SHARD, Placement.SHARD),
+            (Placement.REPLICATE, Placement.SHARD),
+            outer_ag_stream,
+        ),
+        (
+            (Placement.REPLICATE, Placement.SHARD),
+            (Placement.REPLICATE, Placement.REPLICATE),
+            inner_ag_stream,
+        ),
+    ]
+
+    group.reshard_weight()
+    transitions.clear()
+    group.begin_backward().data.fill_(torch.distributed.get_rank() + 1)
+    outer_rs_stream = torch.cuda.Stream()
+    inner_rs_stream = torch.cuda.Stream()
+    completion_stream = group.reduce_grad(
+        is_last_backward=True, streams=(outer_rs_stream, inner_rs_stream), async_op=True
+    )
+    assert transitions == [
+        (
+            (Placement.PARTIAL, Placement.PARTIAL),
+            (Placement.PARTIAL, Placement.SHARD),
+            inner_rs_stream,
+        ),
+        (
+            (Placement.PARTIAL, Placement.SHARD),
+            (Placement.SHARD, Placement.SHARD),
+            outer_rs_stream,
+        ),
+    ]
+    assert completion_stream == outer_rs_stream
+    completion_stream.synchronize()
+    group.release_grad_buffer()
+
+
+def test_hsdp_layout_rejects_reversed_mesh_axes():
+    layout = ParameterGroupLayout(
+        weight=(Placement.SHARD, Placement.REPLICATE),
+        main_weight=(Placement.SHARD, Placement.SHARD),
+        grad_storage=(Placement.SHARD, Placement.REPLICATE),
+        grad_accumulation=(Placement.SHARD, Placement.PARTIAL),
+    )
+    with pytest.raises(ValueError, match="outer DP, inner DP"):
+        layout.validate(2)
+
+
+def test_gradient_storage_zeroing_is_lazy(monkeypatch):
+    group, _, _ = _build_1d_group("optim_grads_params")
+    assert group.grad_buffer.data is None
+    allocate_scratch = group._allocate_scratch
+
+    def allocate_with_sentinel(role, prototype, placements):
+        buffer = allocate_scratch(role, prototype, placements)
+        buffer.data.fill_(13)
+        return buffer
+
+    monkeypatch.setattr(group, "_allocate_scratch", allocate_with_sentinel)
+    assert torch.count_nonzero(group.begin_backward().data != 13) == 0
+
+    group.grad_buffer.data.fill_(11)
+    group.zero_grad()
+    assert group.state.grad_phase is GradientPhase.EMPTY
+    assert group.grad_buffer.data is None
+
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    group.begin_backward().data.fill_(rank + 1)
+    group.reduce_grad(is_last_backward=True)
+    expected = world_size * (world_size + 1) / 2
+    torch.testing.assert_close(
+        group.optimizer_grad().data,
+        torch.full_like(group.optimizer_grad().data, expected),
+        rtol=0,
+        atol=0,
+    )
+    optimizer_grad = group.optimizer_grads[0]
+    assert optimizer_grad is not None
+
+    group.zero_grad()
+    assert group.grad_buffer.data is None
+    assert optimizer_grad._local_tensor is None
+
+    group.begin_backward().data.fill_(rank + 2)
+    group.reduce_grad(is_last_backward=True)
+    assert group.optimizer_grads[0] is optimizer_grad
+    assert optimizer_grad._local_tensor.data_ptr() == group.optimizer_grad().tensor_view(
+        0
+    ).data_ptr()
+
+    group.zero_grad(set_to_none=False)
+    assert group.grad_buffer.data is not None
+    assert torch.count_nonzero(group.grad_buffer.data) == 0
+
+
+@pytest.mark.parametrize("shard_optimizer_across_outer_dp", [False, True])
+@pytest.mark.parametrize("grad_comm_dtype", [None, torch.bfloat16])
+@pytest.mark.parametrize("use_decoupled_grad", [False, True])
+def test_two_microbatch_hsdp_gradient(
+    shard_optimizer_across_outer_dp, grad_comm_dtype, use_decoupled_grad
+):
+    group, _, allocator = _build_2d_group(
+        shard_optimizer_across_outer_dp=shard_optimizer_across_outer_dp,
+        grad_comm_dtype=grad_comm_dtype,
+        gradient_scaling_factor=0.5,
+        use_decoupled_grad=use_decoupled_grad,
+    )
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+
+    group.begin_backward().data.fill_(rank + 1)
+    group.reduce_grad(is_last_backward=False)
+    assert group.state.grad_phase is GradientPhase.ACCUMULATING
+    assert group.state.full_grad is None
+    assert allocator.buckets == {}
+
+    group.begin_backward().data.fill_(rank + 2)
+    group.reduce_grad(is_last_backward=True)
+
+    expected = 0.5 * world_size * (world_size + 2)
+    optimizer_grad = group.optimizer_grad()
+    torch.testing.assert_close(
+        optimizer_grad.data, torch.full_like(optimizer_grad.data, expected), rtol=0, atol=0
+    )
+    assert group.state.grad_phase is GradientPhase.READY
+    assert group.state.full_grad is None
+    assert allocator.buckets == {}
+
+    optimizer_param = group.optimizer_params[0]
+    optimizer_grad_dtensor = group.optimizer_grads[0]
+    assert optimizer_grad_dtensor is not None
+    assert optimizer_grad_dtensor._local_tensor.data_ptr() == optimizer_grad.tensor_view(
+        0
+    ).data_ptr()
+    if use_decoupled_grad:
+        assert optimizer_param.grad is None
+        assert optimizer_param.decoupled_grad is optimizer_grad_dtensor
+    else:
+        assert optimizer_param.grad is optimizer_grad_dtensor
+        assert getattr(optimizer_param, "decoupled_grad", None) is None
+
+    group.zero_grad()
+    assert group.state.grad_phase is GradientPhase.EMPTY
+    assert optimizer_param.grad is None
+    assert getattr(optimizer_param, "decoupled_grad", None) is None

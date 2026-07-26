@@ -3,17 +3,11 @@
 ## Status
 
 This document defines the target ownership and state model for Megatron FSDP v2
-`ParameterGroup`. `ParameterGroupV2` implements this model and is wired to
-`fully_shard(..., use_parameter_group_v2=True)` for eager and full-iteration
-CUDA-graph FP32/BF16 validation. Communication overlap is supported on this
-path. Per-module CUDA graphs, trace-pool allocation, CPU offload, and quantized
-weights remain on the existing `ParameterGroup` path while the migration
-proceeds. Each intermediate step must preserve the HSDP lifecycle in
-[`hsdp_design.md`](hsdp_design.md).
-
-`ParameterGroupV2` is a migration name, not a long-term public type. After the
-remaining features move to this ownership model, the old `param_group.py` will
-be removed and `param_group_v2.py` will become `param_group.py`.
+`ParameterGroup`. It is the sole parameter-group implementation used by
+`fully_shard()` for eager and full-iteration CUDA-graph FP32/BF16 validation.
+Communication overlap is supported on this path. Per-module CUDA graphs,
+trace-pool allocation, CPU offload, and quantized weights are not supported.
+The HSDP lifecycle is defined in [`hsdp_design.md`](hsdp_design.md).
 
 ## Design principles
 
