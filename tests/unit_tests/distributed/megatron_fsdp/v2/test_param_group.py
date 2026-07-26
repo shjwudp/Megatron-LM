@@ -200,6 +200,11 @@ def test_init_buffers(strategy):
     has_wbuf, _, w_dist, g_dist = _flags(strategy)
 
     for pg, orig in zip(groups, originals):
+        assert pg.optimizer_params is pg.dist_params
+        assert pg.optimizer_grads is pg.dist_grads
+        assert pg.weight_buffer is pg.model_weight_buffer
+        assert pg.grad_buffer is pg.main_grad_buffer
+        assert pg.full_grad_has_value == pg._full_grad_has_value
         # -- model_weight_buffer --
         if has_wbuf:
             assert pg.model_weight_buffer is not None

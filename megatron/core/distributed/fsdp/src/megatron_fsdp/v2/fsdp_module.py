@@ -424,7 +424,7 @@ class FSDPModule:
         for param_group in self._fsdp_param_groups:
             for param in param_group.params:
                 setattr(param, "_fsdp_param_group", param_group)
-                setattr(param, "_gbuf", param_group.main_grad_buffer)
+                setattr(param, "_gbuf", param_group.grad_buffer)
                 setattr(param, "_item_id", param_group.param_idx[param])
                 param.get_main_grad = main_grad_getter.__get__(param)
 
@@ -633,7 +633,7 @@ class FSDPModule:
             for param_names, param_group in module._named_param_groups:
                 # Optional NaN checking for debugging
                 if getattr(module, "_enable_nan_checks", False):
-                    for name, dist_param in zip(param_names, param_group.dist_params):
+                    for name, dist_param in zip(param_names, param_group.optimizer_params):
                         assert not torch.isnan(
                             dist_param._local_tensor
                         ).any(), f"NaN detected in dist param for parameter {name}"
@@ -688,7 +688,7 @@ class FSDPModule:
             unshard_event.wait()
         for param_names, param_group in self._named_param_groups:
             param_group.reshard()
-            for name, dist_param in zip(param_names, param_group.dist_params):
+            for name, dist_param in zip(param_names, param_group.optimizer_params):
                 _replace_module_parameter(self, name, dist_param)
         ctx.unshard_done_events[id(self)] = None  # Clear unshard event for this module
         pending_post.clear()
@@ -753,7 +753,7 @@ class FSDPModule:
             # the Python-side ``setattr(param, "grad_added_to_main_grad", True)`` that
             # accompanies the eager backward is captured away.  We record the per-param
             # flag during the trace micro-batch and restore it here.
-            accumulate_full_grad = param_group._full_grad_has_value
+            accumulate_full_grad = param_group.full_grad_has_value
             stage_tensors: List[torch.Tensor] = []
             stage_sources: List[torch.Tensor] = []
             zero_tensors: List[torch.Tensor] = []
@@ -840,7 +840,10 @@ class FSDPModule:
 
             # Install reduced gradients to distributed parameters
             for name, param, dist_param, dist_grad in zip(
-                param_names, param_group.params, param_group.dist_params, param_group.dist_grads
+                param_names,
+                param_group.params,
+                param_group.optimizer_params,
+                param_group.optimizer_grads,
             ):
                 if not param.requires_grad:
                     continue
@@ -867,7 +870,7 @@ class FSDPModule:
 
             # NaN check after reduction
             if getattr(self, "_enable_nan_checks", False):
-                for name, dist_grad in zip(param_names, param_group.dist_grads):
+                for name, dist_grad in zip(param_names, param_group.optimizer_grads):
                     if dist_grad is not None:
                         assert not torch.isnan(
                             dist_grad._local_tensor
@@ -890,7 +893,7 @@ class FSDPModule:
             if not isinstance(child, FSDPModule):
                 continue
             for param_group in child._fsdp_param_groups:
-                for dist_param in param_group.dist_params:
+                for dist_param in param_group.optimizer_params:
                     grad = getattr(dist_param, "decoupled_grad", None)
                     if grad is None:
                         grad = dist_param.grad
@@ -939,7 +942,7 @@ class FSDPModule:
             getattr(dist_param, "grad", None) is not None
             or getattr(dist_param, "decoupled_grad", None) is not None
             for param_group in param_groups
-            for dist_param in param_group.dist_params
+            for dist_param in param_group.optimizer_params
         ):
             return
 
@@ -1002,7 +1005,7 @@ class FSDPModule:
                 param_shapes = [p.shape for p in param_group.params]
                 numel = sum(s.numel() for s in param_shapes)
                 total_model_elems += numel
-                dp_size = param_group.mesh.size(1)
+                dp_size = param_group.mesh.size(-1)
 
                 buffer_entries = []
                 group_pad = 0

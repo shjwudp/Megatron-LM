@@ -210,6 +210,8 @@ class ParameterGroupV2:
         self.allocator = allocator or TemporaryBucketAllocator()
         self.gradient_scaling_factor = gradient_scaling_factor
         self.device = params[0].device
+        self.dtype = params[0].dtype
+        self.requires_grad = params[0].requires_grad
         row_sizes = [param.shape[1:].numel() for param in params if param.ndim > 1]
         self.chunk_size_factor = max(1, math.lcm(*row_sizes)) if row_sizes else 1
 
@@ -245,6 +247,29 @@ class ParameterGroupV2:
     def optimizer_grads(self) -> list[DTensor | None]:
         """Return gradient DTensor views matching :attr:`optimizer_params`."""
         return self._optimizer_grads
+
+    @property
+    def full_grad_has_value(self) -> bool:
+        """Return whether full-gradient storage contains prior accumulation."""
+        return False
+
+    @property
+    def overwrites_full_grad(self) -> bool:
+        """Return whether every backward writes a fresh inner-DP gradient shard."""
+        return self.layout.grad_storage[-1] is Placement.SHARD
+
+    @property
+    def supports_fused_grad_capture(self) -> bool:
+        """Return whether fused wgrad can target this group's full-gradient storage."""
+        return (
+            self.requires_grad
+            and self.overwrites_full_grad
+            and self.grad_buffer.dtype == self.params[0].dtype
+        )
+
+    def set_allocator(self, allocator: BucketAllocator) -> None:
+        """Replace the allocator used for temporary buffer leases."""
+        self.allocator = allocator
 
     def _new_index(self, *, compact_weight: bool = False) -> BufferIndex:
         index = BufferIndex(

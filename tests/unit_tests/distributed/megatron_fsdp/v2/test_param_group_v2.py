@@ -259,6 +259,11 @@ def test_optimizer_params_own_main_weight_views(shard_optimizer_across_outer_dp)
     assert getattr(optimizer_param, "__fsdp_param__")
     assert getattr(group.params[0], "__fsdp_param__")
     assert group.optimizer_grads == [None]
+    assert group.dtype == group.params[0].dtype
+    assert group.requires_grad
+    assert not group.full_grad_has_value
+    assert group.overwrites_full_grad
+    assert group.supports_fused_grad_capture
 
 
 def test_weight_validity_and_scratch_lifecycle():

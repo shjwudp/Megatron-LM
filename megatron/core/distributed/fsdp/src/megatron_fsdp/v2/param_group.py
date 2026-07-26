@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import torch
-from torch.distributed.tensor import DeviceMesh
+from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from ..uneven_dtensor import (
@@ -199,6 +199,46 @@ class ParameterGroup:
         # through dist_grads until _init_dist_grads rebinds them.
         self._dist_grad_cache = list(self.dist_grads)
         self._dist_grad_cache_validated = [False for _ in self.dist_grads]
+
+    @property
+    def optimizer_params(self) -> List[torch.nn.Parameter]:
+        """Return optimizer-facing distributed parameters."""
+        return self.dist_params
+
+    @property
+    def optimizer_grads(self) -> List[Optional[DTensor]]:
+        """Return optimizer-facing distributed gradients."""
+        return self.dist_grads
+
+    @property
+    def weight_buffer(self) -> Optional[DataParallelBuffer]:
+        """Return the canonical model-weight buffer."""
+        return self.model_weight_buffer
+
+    @property
+    def grad_buffer(self) -> Optional[DataParallelBuffer]:
+        """Return the canonical optimizer-gradient buffer."""
+        return self.main_grad_buffer
+
+    @property
+    def full_grad_has_value(self) -> bool:
+        """Return whether the full-gradient buffer contains prior accumulation."""
+        return self._full_grad_has_value
+
+    @property
+    def overwrites_full_grad(self) -> bool:
+        """Return whether every backward writes a fresh inner-DP gradient shard."""
+        return self.layout.grad_storage[-1] is Placement.SHARD
+
+    @property
+    def supports_fused_grad_capture(self) -> bool:
+        """Return whether fused wgrad can target this group's full-gradient storage."""
+        return (
+            self.requires_grad
+            and self.overwrites_full_grad
+            and self.grad_buffer is not None
+            and self.grad_buffer.dtype == self.params[0].dtype
+        )
 
     def set_allocator(self, allocator: BucketAllocator) -> None:
         """Replace the allocator used for this group's temporary buffer leases."""
