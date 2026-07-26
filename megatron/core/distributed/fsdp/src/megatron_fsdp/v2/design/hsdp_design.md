@@ -3,6 +3,9 @@
 FSDP v2 implements HSDP as layout transitions over a two-dimensional
 data-parallel mesh.
 
+The target `ParameterGroup` ownership and runtime-state model is defined in
+[`parameter_group_design.md`](parameter_group_design.md).
+
 ## Established lifecycle facts
 
 This section is the normative starting point for the refactor. It describes outer
