@@ -487,7 +487,7 @@ class ParameterGroup:
 
         storage = grad_buffer.storage_placements
         if is_last_backward or grad_buffer.inner_sharded:
-            inner_target = Placement.DIRTY if self.sharding_strategy == "optim" else storage[1]
+            inner_target = Placement.SHARD if self.sharding_strategy == "optim" else storage[1]
             comm_output = grad_buffer.redistribute(
                 [grad_buffer.placements[0], inner_target], stream=stream
             )
@@ -501,7 +501,7 @@ class ParameterGroup:
 
         if is_last_backward and self.mesh.size(0) > 1:
             outer_target = (
-                Placement.DIRTY if self.outer_dp_sharding_strategy == "optim" else storage[0]
+                Placement.SHARD if self.outer_dp_sharding_strategy == "optim" else storage[0]
             )
             comm_output = grad_buffer.redistribute(
                 [outer_target, grad_buffer.placements[1]], stream=stream
@@ -561,14 +561,14 @@ class ParameterGroup:
         self.dist_grads = []  # placeholder, populated in _init_dist_grads
         optimizer_buffer = self.main_weight_buffer or self.model_weight_buffer
         buffer_placements = [
-            Placement.FLAT if self.outer_dp_sharding_strategy == "optim" else Placement.REPLICATE,
-            Placement.FLAT if self.sharding_strategy != "no_shard" else Placement.REPLICATE,
+            Placement.SHARD if self.outer_dp_sharding_strategy == "optim" else Placement.REPLICATE,
+            Placement.SHARD if self.sharding_strategy != "no_shard" else Placement.REPLICATE,
         ]
         optimizer_dtensor_placements = [
-            Shard(dim=0) if placement is Placement.FLAT else Replicate()
+            Shard(dim=0) if placement is Placement.SHARD else Replicate()
             for placement in buffer_placements
         ]
-        if buffer_placements[0] is Placement.FLAT:
+        if buffer_placements[0] is Placement.SHARD:
             setattr(self.mesh, "_shard_order", [1, 0])
 
         for param in self.params:
@@ -623,7 +623,7 @@ class ParameterGroup:
         gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
 
         buffer_placements = [
-            Placement.FLAT if isinstance(placement, Shard) else Placement.REPLICATE
+            Placement.SHARD if isinstance(placement, Shard) else Placement.REPLICATE
             for placement in self.dist_params[0].placements
         ]
 
@@ -666,7 +666,7 @@ class ParameterGroup:
         """
         optimizer_buffer = self.main_weight_buffer or self.model_weight_buffer
         buffer_placements = [
-            Placement.FLAT if isinstance(placement, Shard) else Placement.REPLICATE
+            Placement.SHARD if isinstance(placement, Shard) else Placement.REPLICATE
             for placement in self.dist_params[0].placements
         ]
         for param, dist_param in zip(self.params, self.dist_params):

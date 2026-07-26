@@ -28,7 +28,7 @@ class BufferIndex:
     and per-rank shard information.
 
     The index always builds coordinate metadata for a 2D (outer, inner) mesh.
-    Query APIs accept one placement per mesh dimension. FLAT and DIRTY select the
+    Query APIs accept one placement per mesh dimension. SHARD selects the
     rank-owned range; REPLICATE and PARTIAL select the full range.
 
     Each DataParallelBuffer owns its own independent BufferIndex instance.
@@ -300,13 +300,13 @@ class BufferIndex:
     # ------------------------------------------------------------------ #
 
     def _get_shard_meta(self, placements: list[Placement]):
-        """Return logical metadata, treating FLAT and DIRTY as sharded."""
+        """Return logical metadata for the requested placements."""
         if len(placements) != 2:
             raise ValueError(f"Expected two placements, got {len(placements)}")
         if not all(isinstance(placement, Placement) for placement in placements):
             raise TypeError(f"Unsupported placements: {placements}")
 
-        key = tuple(int(placement in (Placement.FLAT, Placement.DIRTY)) for placement in placements)
+        key = tuple(int(placement is Placement.SHARD) for placement in placements)
         return self.outer_shard_metas[key]
 
     def local_slice_for(
@@ -351,7 +351,7 @@ class BufferIndex:
         Placements select the valid range on each mesh dimension.
         """
         if placements is None:
-            placements = [Placement.REPLICATE, Placement.FLAT]
+            placements = [Placement.REPLICATE, Placement.SHARD]
         idx = self.item_index_map[item_id]
         item_start = idx.global_data_index
         item_end = item_start + idx.size

@@ -559,17 +559,17 @@ class MixedPrecisionPolicy:
         outer_optim = optimizer_weight_buffer.outer_dp_sharding_strategy == "optim"
 
         # With no distinct main-weight buffer, the optimizer updated shard views
-        # of model_weight_buffer directly. There is no data to copy, but replicated
-        # storage still has to be marked dirty so the next unshard refreshes it.
+        # of model_weight_buffer directly. There is no data to copy, but the buffer
+        # now represents that SHARD view so the next unshard refreshes its replica.
         if main_weight_buffer is None:
             for buffer in (model_weight_buffer, transpose_weight_buffer):
                 if buffer is None:
                     continue
                 target_placements = buffer.storage_placements.copy()
                 if buffer.sharding_strategy != "no_shard" and not buffer.inner_sharded:
-                    target_placements[1] = Placement.DIRTY
+                    target_placements[1] = Placement.SHARD
                 if outer_optim:
-                    target_placements[0] = Placement.DIRTY
+                    target_placements[0] = Placement.SHARD
                 buffer.redistribute(target_placements)
             return
 
@@ -577,7 +577,7 @@ class MixedPrecisionPolicy:
         inner_dp_group = mesh.get_group(mesh_dim=1)
 
         if self.is_nvfp4_param(params[0]):
-            if optimizer_placements[0] is Placement.FLAT:
+            if optimizer_placements[0] is Placement.SHARD:
                 raise NotImplementedError(
                     "HSDP outer optimizer sharding is not supported for NVFP4."
                 )
@@ -621,7 +621,7 @@ class MixedPrecisionPolicy:
                 model_param_shards.append((model_shard, transpose_shard))
 
             amax_reduce_group = inner_dp_group
-            if optimizer_placements[0] is Placement.FLAT:
+            if optimizer_placements[0] is Placement.SHARD:
                 amax_reduce_group = mesh._flatten("_".join(mesh.mesh_dim_names)).get_group()
             quantize_main_weights_to_fp8(
                 fp8_params, main_params, start_offsets, amax_reduce_group, model_param_shards
@@ -637,9 +637,9 @@ class MixedPrecisionPolicy:
             ):
                 if (
                     storage_placement is Placement.REPLICATE
-                    and optimizer_placement is Placement.FLAT
+                    and optimizer_placement is Placement.SHARD
                 ):
-                    target_placements[comm_dim] = Placement.DIRTY
+                    target_placements[comm_dim] = Placement.SHARD
             buffer.redistribute(target_placements)
 
 
@@ -777,7 +777,7 @@ def quantize_main_weights_to_nvfp4(
 
     wbuf = model_weight_buffer
     sharded_placements = main_weight_buffer.storage_placements
-    if wbuf.storage_placements[1] is not Placement.FLAT:
+    if wbuf.storage_placements[1] is not Placement.SHARD:
         raise RuntimeError("FIXME: implement non-distributed NVFP4 quantization path")
 
     full_weight_buffer = wbuf.fetch_buffer([Placement.REPLICATE, Placement.REPLICATE])

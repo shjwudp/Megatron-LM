@@ -38,10 +38,10 @@ When a separate `main_weight_buffer` would be redundant (same dtype and same
 sharding layout as `model_weight_buffer`), `ParameterGroup._init_buffers()`
 skips it and lets the optimizer mutate model-weight storage directly.
 `copy_main_weights_to_model_weights()` still marks replicated HSDP storage
-dirty in this case, because an outer optimizer shard was updated even though
-there is no separate tensor payload to copy. The next unshard then refreshes
-the outer replicas. Quantized parameters require a separate high-precision
-main-weight buffer.
+represented by a shard view in this case, because an outer optimizer shard was
+updated even though there is no separate tensor payload to copy. The next
+unshard then refreshes the outer replicas. Quantized parameters require a
+separate high-precision main-weight buffer.
 
 ## Parameter grouping
 

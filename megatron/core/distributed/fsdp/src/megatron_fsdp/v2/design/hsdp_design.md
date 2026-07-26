@@ -238,4 +238,4 @@ after the copy only its local `(1, 1)` slice is current. While
 `_outer_dirty=True`, outer unshard treats that storage as a `(1, 1)` source.
 The outer all-gather restores the complete `(0, 1)` inner shard and clears
 `_outer_dirty`. Inner unshard and reshard leave it clear; the next
-optimizer-to-model copy starts the next dirty cycle.
+optimizer-to-model copy starts the next shard-refresh cycle.

@@ -95,20 +95,32 @@ dimension. Their DTensor analogues are:
 | Buffer placement | DTensor analogue | Meaning |
 | --- | --- | --- |
 | `REPLICATE` | `Replicate()` | Every rank has a valid full logical value. |
-| `FLAT` | `Shard(0)` | The rank owns a compact flat shard. |
+| `SHARD` | `Shard(0)` | The rank owns one flat shard. |
 | `PARTIAL` | `Partial()` | The rank holds a contribution awaiting reduction. |
-| `DIRTY` | none | The rank-owned shard is valid inside full-sized storage. |
 
-`DIRTY` mixes logical distribution with physical storage validity. It is retained
-during the ownership migration so collective behavior does not change. The target
-model represents logical sharding as `FLAT` and tracks compact-versus-full-sized
-storage, plus valid ranges, separately.
+Placement describes validity, not allocation shape. A `SHARD` buffer can own compact
+storage or be a slice of a `REPLICATE` buffer. The latter representation uses two
+explicit objects—a replicated output placeholder and its shared-storage shard input
+view—instead of encoding storage validity as a placement.
 
 Only one mesh placement changes per `redistribute()` call. This keeps the operation
 equivalent to applying one DTensor redistribution step and makes the selected mesh
 dimension unambiguous. `redistribute_buffers()` is the batch planner: it applies that
 primitive axis by axis, coalescing only buffers with the same process group, dtype,
 device, and source placement.
+
+`redistribute()` accepts an optional output `DataParallelBuffer`. For an in-place
+all-gather, the caller can take a `SHARD` view of a `REPLICATE` placeholder and pass
+the placeholder back as the output:
+
+```python
+replicated = buffer.view([Placement.REPLICATE, Placement.REPLICATE])
+shard = replicated.view([Placement.REPLICATE, Placement.SHARD])
+shard.redistribute(replicated.placements, output_buffer=replicated)
+```
+
+The two DP-buffer objects have different placements and exact placement-shaped data,
+while their tensors share one allocation.
 
 ## Core Operations
 
@@ -187,6 +199,11 @@ state.
 
 - `len(placements) == mesh.ndim`.
 - `storage_placements` describe the persistent tensor allocation.
+- logical placements are limited to `REPLICATE`, `SHARD`, and `PARTIAL`.
+- a buffer returned by `view()` has exact placement-shaped data and retains its
+  storage owner.
+- an explicit redistribution output shares layout, mesh, dtype, and device with its
+  input and exactly matches the target placements.
 - `redistribute()` changes at most one placement per call.
 - `redistribute_buffers()` completes each mesh axis across compatible buffers before
   advancing to the next axis.
@@ -216,9 +233,10 @@ logical shapes permit it without sharing lifecycle state.
 
 ### Phase 3: DTensor-style placement cleanup
 
-Replace `DIRTY` with explicit storage form and validity metadata. Keep logical
-placements limited to replicate, shard, and partial semantics, and make transition
-planning independent from storage allocation.
+- Remove storage-state placements from the logical placement enum.
+- Represent shared-storage redistribution with explicit DP-buffer views and an
+  optional output buffer.
+- Keep logical placements limited to replicate, shard, and partial semantics.
 
 ### Phase 4: narrow role-specific policy
 

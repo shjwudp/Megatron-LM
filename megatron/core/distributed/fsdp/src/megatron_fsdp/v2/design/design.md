@@ -510,16 +510,16 @@ optimizer-facing DTensor shards through `dist_params`.
 ### Replicated Weight Refresh
 
 For ZeRO-1/2, `copy_main_weights_to_model_weights()` marks the replicated
-`DataParallelBuffer` dirty when `main_weight_buffer` is sharded and
+`DataParallelBuffer` in a shard view when `main_weight_buffer` is sharded and
 `model_weight_buffer` is replicated. The next normal unshard for that buffer
-asks `ParameterGroup.unshard_model_weights()` to refresh any dirty replicated
+asks `ParameterGroup.unshard_model_weights()` to refresh any replicated
 buffer before compute:
 
 1. Non-FP8 weights copy this rank's updated main-weight shard into the matching
    slice of the replicated model-weight buffer.
 2. FP8 weights quantize the local FP32 main-weight shard into the local FP8
-   model-weight shard first; MXFP8 marks the transpose buffer dirty as well.
-3. `ParameterGroup.unshard_model_weights()` privately selects the dirty buffer,
+   model-weight shard first; MXFP8 selects the transpose-buffer shard view as well.
+3. `ParameterGroup.unshard_model_weights()` privately selects the shard buffer,
    asks `DataParallelBuffer.redistribute_buffers()` to gather the updated shards
    into the full replicated compute buffer on every rank, and binds the result
    for the current compute phase.

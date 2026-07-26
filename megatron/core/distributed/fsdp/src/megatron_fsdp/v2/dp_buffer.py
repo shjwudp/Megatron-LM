@@ -1,7 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from __future__ import annotations
+
 import enum
 from contextlib import nullcontext
+from copy import copy
 from itertools import groupby
 from typing import List, Optional
 
@@ -18,26 +21,20 @@ class Placement(enum.Enum):
 
     A buffer stores two enum members ordered as ``[outer-DP, inner-DP]``.
 
-    ``FLAT`` and ``DIRTY`` contain the same valid rank-owned shard. ``FLAT``
-    has compact shard storage, while ``DIRTY`` keeps full-sized storage whose
-    non-owned regions are invalid. ``PARTIAL`` is a local contribution pending
-    reduction; it is not another form of ``DIRTY``.
-
     Supported data transitions are:
 
-    - ``FLAT``/``DIRTY`` -> ``REPLICATE``: all-gather
+    - ``SHARD`` -> ``REPLICATE``: all-gather
     - ``PARTIAL`` -> ``REPLICATE``: all-reduce
-    - ``PARTIAL`` -> ``FLAT``/``DIRTY``: reduce-scatter
-    - ``REPLICATE`` -> ``FLAT``: retain the rank-owned shard
-    - ``REPLICATE`` -> ``DIRTY``: update only the rank-owned shard
-    - ``FLAT`` -> ``DIRTY``: place the shard into full-sized storage
-    - ``DIRTY`` -> ``FLAT``: discard invalid full-sized storage
+    - ``PARTIAL`` -> ``SHARD``: reduce-scatter
+    - ``REPLICATE`` -> ``SHARD``: retain the rank-owned shard
+
+    Allocation shape is intentionally not encoded here. A ``SHARD`` buffer
+    may be a compact allocation or a slice of a ``REPLICATE`` output buffer.
     """
 
-    FLAT = "flat"
+    SHARD = "shard"
     REPLICATE = "replicate"
     PARTIAL = "partial"
-    DIRTY = "dirty"
 
 
 class DataParallelBuffer:
@@ -88,7 +85,7 @@ class DataParallelBuffer:
         self.outer_sharded = is_sharded_from_strategy(outer_dp_sharding_strategy)
         self.inner_sharded = is_sharded_from_strategy(sharding_strategy)
         self.storage_placements: list[Placement] = [
-            Placement.FLAT if sharded else Placement.REPLICATE
+            Placement.SHARD if sharded else Placement.REPLICATE
             for sharded in (self.outer_sharded, self.inner_sharded)
         ]
         self.placements: list[Placement] = self.storage_placements.copy()
@@ -114,11 +111,11 @@ class DataParallelBuffer:
             compact_shapes = mp_policy.get_param_storage_shapes(tensors)
             self.buffer_index.compact(0.5, compact_shapes)
 
-        # Dirty has larger physical storage, but buffers are never initialized as Dirty.
         self.data_size = self.buffer_index._get_shard_meta(self.storage_placements).size
 
         self.data: Optional[torch.Tensor] = None
         self._unsharded_buffer: Optional[torch.Tensor] = None
+        self._storage_owner: Optional["DataParallelBuffer"] = None
 
     # ------------------------------------------------------------------ #
     #  Public API
@@ -172,9 +169,6 @@ class DataParallelBuffer:
     ) -> None:
         """Write a tensor item into its corresponding region of the buffer."""
         requested_placements = placements if placements is not None else self.placements
-        assert not any(
-            placement is Placement.DIRTY for placement in requested_placements
-        ), "set_item does not support Dirty placements"
         source_slice, local_slice = self.buffer_index.local_slice_for(
             self.buffer_index._get_item_global_range(item_id),
             requested_placements,
@@ -189,9 +183,6 @@ class DataParallelBuffer:
     ) -> torch.Tensor:
         """Read a tensor item (or its shard) from the buffer."""
         requested_placements = placements if placements is not None else self.placements
-        assert not any(
-            placement is Placement.DIRTY for placement in requested_placements
-        ), "get_item does not support Dirty placements"
         _, local_slice = self.buffer_index.local_slice_for(
             self.buffer_index._get_item_global_range(item_id),
             requested_placements,
@@ -203,12 +194,37 @@ class DataParallelBuffer:
         """Return whether this buffer currently has a full unsharded view."""
         return all(placement is Placement.REPLICATE for placement in self.placements)
 
+    def view(self, placements: list[Placement]) -> "DataParallelBuffer":
+        """Return a non-owning DP-buffer view with explicit placements.
+
+        The returned buffer has exact placement-shaped ``data``. For example,
+        taking a ``SHARD`` view of a ``REPLICATE`` placeholder returns the
+        rank-owned slice while retaining the placeholder as its storage owner.
+
+        Args:
+            placements: Logical placement for each mesh dimension.
+
+        Returns:
+            A DP buffer whose data is the requested view of this buffer's storage.
+        """
+        if len(placements) != self.mesh.ndim:
+            raise ValueError(f"Expected {self.mesh.ndim} placements, got {placements}")
+        view = copy(self)
+        view.data = self.fetch_buffer(placements)
+        view.data_size = view.data.numel()
+        view.storage_placements = placements.copy()
+        view.placements = placements.copy()
+        view._unsharded_buffer = None
+        view._storage_owner = self
+        return view
+
     @staticmethod
     @torch.no_grad()
     def redistribute_buffers(
         buffers: list["DataParallelBuffer"],
         target_placements: list[Placement],
         *,
+        output_buffers: list["DataParallelBuffer"] | None = None,
         stream: torch.cuda.Stream | None = None,
         async_op: bool = False,
     ) -> list[torch.Tensor]:
@@ -224,13 +240,23 @@ class DataParallelBuffer:
             raise ValueError(
                 f"Expected {buffers[0].mesh.ndim} target placements, got {target_placements}"
             )
+        if output_buffers is not None and len(output_buffers) != len(buffers):
+            raise ValueError(f"Expected {len(buffers)} output buffers, got {len(output_buffers)}")
 
         caller_stream = torch.cuda.current_stream()
         stream = stream or caller_stream
 
         # Allocate final outputs on the caller stream before communication can
         # run asynchronously on a separate stream.
-        outputs = [buffer.fetch_buffer(target_placements) for buffer in buffers]
+        if output_buffers is None:
+            output_buffers = [buffer.view(target_placements) for buffer in buffers]
+        else:
+            for buffer, output_buffer in zip(buffers, output_buffers):
+                buffer._validate_output_buffer(output_buffer, target_placements)
+        outputs = [output_buffer.data for output_buffer in output_buffers]
+        output_by_buffer_id = {
+            id(buffer): output_buffer for buffer, output_buffer in zip(buffers, output_buffers)
+        }
         if stream != caller_stream:
             stream.wait_stream(caller_stream)
 
@@ -262,7 +288,11 @@ class DataParallelBuffer:
                         for buffer in compatible_buffers:
                             axis_target = buffer.placements.copy()
                             axis_target[mesh_dim] = target
-                            buffer.redistribute(axis_target, stream=stream)
+                            final_output = output_by_buffer_id[id(buffer)]
+                            axis_output = final_output if axis_target == target_placements else None
+                            buffer.redistribute(
+                                axis_target, output_buffer=axis_output, stream=stream
+                            )
                     if async_op and coalescing_event is not None:
                         coalescing_event.wait()
 
@@ -273,9 +303,15 @@ class DataParallelBuffer:
         self,
         target_placements: Optional[list[Placement]] = None,
         *,
+        output_buffer: "DataParallelBuffer" | None = None,
         stream: Optional[torch.cuda.Stream] = None,
     ) -> torch.Tensor:
-        """Redistribute one mesh axis and return the branch output."""
+        """Redistribute one mesh axis and return the destination tensor.
+
+        ``output_buffer`` may name an explicit destination. This permits an
+        in-place all-gather whose ``REPLICATE`` output owns full storage while
+        this ``SHARD`` input is a slice sharing that same storage.
+        """
         if target_placements is None:
             target_placements = self.storage_placements
         assert len(target_placements) == 2
@@ -291,7 +327,10 @@ class DataParallelBuffer:
                 )
             changed_axis = axis
         if changed_axis is None:
-            return self.fetch_buffer(target_placements)
+            if output_buffer is None:
+                return self.fetch_buffer(target_placements)
+            self._validate_output_buffer(output_buffer, target_placements)
+            return output_buffer.data
 
         current_stream = torch.cuda.current_stream()
         stream = stream or current_stream
@@ -300,11 +339,16 @@ class DataParallelBuffer:
 
         source = self.placements[changed_axis]
         target = target_placements[changed_axis]
-        input_buffer = self.fetch_buffer(self.placements)
-        output = self.fetch_buffer(target_placements)
+        input_buffer = self.view(self.placements).data
+        explicit_output = output_buffer is not None
+        if output_buffer is None:
+            output_buffer = self.view(target_placements)
+        else:
+            self._validate_output_buffer(output_buffer, target_placements)
+        output = output_buffer.data
         group = self.mesh.get_group(mesh_dim=changed_axis)
 
-        if source in (Placement.FLAT, Placement.DIRTY) and target is Placement.REPLICATE:
+        if source is Placement.SHARD and target is Placement.REPLICATE:
             with torch.cuda.stream(stream):
                 torch.distributed.all_gather_into_tensor(output, input_buffer, group=group)
         elif source is Placement.PARTIAL:
@@ -340,16 +384,17 @@ class DataParallelBuffer:
                     torch.distributed.all_reduce(comm_input, group=group, op=op)
                     output = comm_input
                 else:
-                    input_meta = self.buffer_index._get_shard_meta(self.placements)
-                    output_meta = self.buffer_index._get_shard_meta(target_placements)
-                    output_offset = output_meta.global_data_index - input_meta.global_data_index
-                    output = comm_input[output_offset : output_offset + output_meta.size]
+                    if not explicit_output or comm_input is not input_buffer:
+                        input_meta = self.buffer_index._get_shard_meta(self.placements)
+                        output_meta = self.buffer_index._get_shard_meta(target_placements)
+                        output_offset = output_meta.global_data_index - input_meta.global_data_index
+                        output = comm_input[output_offset : output_offset + output_meta.size]
                     torch.distributed.reduce_scatter_tensor(
                         output=output, input=comm_input, group=group, op=op
                     )
-        elif target in (Placement.DIRTY, Placement.PARTIAL):
+        elif target is Placement.PARTIAL:
             pass
-        elif target is Placement.FLAT:
+        elif target is Placement.SHARD:
             if source is Placement.REPLICATE:
                 self.release_unsharded_buffer()
         else:
@@ -358,6 +403,28 @@ class DataParallelBuffer:
         self.placements[changed_axis] = target
         return output
 
+    def _validate_output_buffer(
+        self, output_buffer: "DataParallelBuffer", target_placements: list[Placement]
+    ) -> None:
+        """Validate an explicit redistribution destination."""
+        if output_buffer.buffer_index is not self.buffer_index:
+            raise ValueError("Redistribution output must share the input buffer layout")
+        if output_buffer.mesh is not self.mesh:
+            raise ValueError("Redistribution output must share the input buffer mesh")
+        if output_buffer.dtype != self.dtype or output_buffer.device != self.device:
+            raise ValueError("Redistribution output must share the input dtype and device")
+        if output_buffer.placements != target_placements:
+            raise ValueError(
+                f"Output placements {output_buffer.placements} do not match target "
+                f"{target_placements}"
+            )
+        expected_size = self.buffer_index._get_shard_meta(target_placements).size
+        if output_buffer.data is None or output_buffer.data.numel() != expected_size:
+            raise ValueError(
+                f"Output buffer size does not match target: expected {expected_size}, "
+                f"got {None if output_buffer.data is None else output_buffer.data.numel()}"
+            )
+
     def release_redistribution_workspace(self, changed_axis: int) -> None:
         """Release temporary communication storage for one mesh-axis transition."""
         if self._use_grad_comm_buffer:
@@ -365,8 +432,9 @@ class DataParallelBuffer:
 
     def release_unsharded_buffer(self) -> None:
         """Release the temporary full-sized buffer without changing placements."""
-        self.allocator.free(self.alloc_key)
-        self._unsharded_buffer = None
+        if self._unsharded_buffer is not None:
+            self.allocator.free(self.alloc_key)
+            self._unsharded_buffer = None
 
     def get_shard_view(self, placements: Optional[list[Placement]] = None) -> torch.Tensor:
         """Return a placement view inside the persistent data buffer."""
@@ -395,7 +463,7 @@ class DataParallelBuffer:
             return self.data
 
         data_contains_requested = all(
-            storage_placement is not Placement.FLAT or requested_placement is Placement.FLAT
+            storage_placement is not Placement.SHARD or requested_placement is Placement.SHARD
             for storage_placement, requested_placement in zip(self.storage_placements, placements)
         )
         if data_contains_requested:

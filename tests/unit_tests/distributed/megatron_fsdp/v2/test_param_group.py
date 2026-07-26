@@ -185,7 +185,9 @@ def test_init_buffers(strategy):
         if has_wbuf:
             assert pg.model_weight_buffer is not None
             wbuf = pg.model_weight_buffer
-            assert wbuf.storage_placements[1] is (Placement.FLAT if w_dist else Placement.REPLICATE)
+            assert wbuf.storage_placements[1] is (
+                Placement.SHARD if w_dist else Placement.REPLICATE
+            )
 
             # Per-param check: get_item should return this rank's portion of
             # the original param. A param may span shard boundaries, so the
@@ -204,7 +206,7 @@ def test_init_buffers(strategy):
         if pg.requires_grad:
             assert pg.main_grad_buffer is not None
             assert pg.main_grad_buffer.storage_placements[1] is (
-                Placement.FLAT if g_dist else Placement.REPLICATE
+                Placement.SHARD if g_dist else Placement.REPLICATE
             )
             assert pg.main_grad_buffer.data is None  # lazy init
 
@@ -256,6 +258,36 @@ def test_unshard_reshard(strategy):
         assert torch.equal(wbuf.data.view(torch.uint8), shard_before)
 
     torch.distributed.barrier()
+
+
+def test_redistribute_into_shared_replicate_output():
+    """A SHARD input view may all-gather into its aliased REPLICATE owner."""
+    groups, _, dp_group, rank, ws, _ = _build_groups("optim")
+    full_placements = [Placement.REPLICATE, Placement.REPLICATE]
+    shard_placements = [Placement.REPLICATE, Placement.SHARD]
+
+    for pg in groups:
+        output_buffer = pg.model_weight_buffer.view(full_placements)
+        input_buffer = output_buffer.view(shard_placements)
+
+        assert input_buffer is not output_buffer
+        assert input_buffer.storage_placements == shard_placements
+        assert output_buffer.storage_placements == full_placements
+        assert (
+            input_buffer.data.untyped_storage().data_ptr()
+            == output_buffer.data.untyped_storage().data_ptr()
+        )
+
+        input_buffer.data.fill_(rank + 1)
+        result = input_buffer.redistribute(full_placements, output_buffer=output_buffer)
+
+        expected = torch.cat(
+            [torch.full_like(input_buffer.data, peer_rank + 1) for peer_rank in range(ws)]
+        )
+        assert result is output_buffer.data
+        assert torch.equal(output_buffer.data, expected)
+
+    torch.distributed.barrier(group=dp_group)
 
 
 # ------------------------------------------------------------------ #

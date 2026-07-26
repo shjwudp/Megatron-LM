@@ -26,9 +26,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroup
 
 CANONICAL_PLACEMENTS = (
     [Placement.REPLICATE, Placement.REPLICATE],
-    [Placement.REPLICATE, Placement.FLAT],
-    [Placement.FLAT, Placement.REPLICATE],
-    [Placement.FLAT, Placement.FLAT],
+    [Placement.REPLICATE, Placement.SHARD],
+    [Placement.SHARD, Placement.REPLICATE],
+    [Placement.SHARD, Placement.SHARD],
 )
 
 
@@ -85,9 +85,9 @@ class TestBufferIndex:
         )
         self.ref_shard_metas = {
             (Placement.REPLICATE, Placement.REPLICATE): full_meta,
-            (Placement.FLAT, Placement.REPLICATE): outer_meta,
-            (Placement.REPLICATE, Placement.FLAT): inner_meta,
-            (Placement.FLAT, Placement.FLAT): outer_inner_meta,
+            (Placement.SHARD, Placement.REPLICATE): outer_meta,
+            (Placement.REPLICATE, Placement.SHARD): inner_meta,
+            (Placement.SHARD, Placement.SHARD): outer_inner_meta,
         }
 
     @pytest.mark.parametrize("placements", CANONICAL_PLACEMENTS)
@@ -106,8 +106,8 @@ class TestBufferIndex:
             meta.size,
         ) == self.ref_shard_metas[tuple(placements)]
 
-        assert index.shard_meta == index._get_shard_meta([Placement.REPLICATE, Placement.FLAT])
-        assert index.outer_shard_meta == index._get_shard_meta([Placement.FLAT, Placement.FLAT])
+        assert index.shard_meta == index._get_shard_meta([Placement.REPLICATE, Placement.SHARD])
+        assert index.outer_shard_meta == index._get_shard_meta([Placement.SHARD, Placement.SHARD])
 
     @pytest.mark.parametrize("item_id", [0, 1, 2])
     @pytest.mark.parametrize("placements", CANONICAL_PLACEMENTS)

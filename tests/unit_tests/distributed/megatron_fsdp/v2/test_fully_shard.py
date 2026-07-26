@@ -605,7 +605,7 @@ class TestFullyShardBasic:
         if outer_strategy == "optim":
             for weight_buffer in weight_buffers:
                 # Force the post-optimizer/checkpoint state so dim 0 launches AG.
-                weight_buffer.placements[0] = Placement.DIRTY
+                weight_buffer.placements[0] = Placement.SHARD
 
         @contextmanager
         def capture_coalescing_manager(group, *args, **kwargs):
@@ -689,7 +689,7 @@ class TestFullyShardBasic:
         param_group = model._fsdp_param_groups[0]
         model_buffer = param_group.model_weight_buffer
         assert param_group.main_weight_buffer is None
-        assert model_buffer.storage_placements == [Placement.REPLICATE, Placement.FLAT]
+        assert model_buffer.storage_placements == [Placement.REPLICATE, Placement.SHARD]
         assert model_buffer.placements == model_buffer.storage_placements
         from torch.distributed.tensor.placement_types import Shard
 
@@ -707,7 +707,7 @@ class TestFullyShardBasic:
         model.set_is_last_backward(True)
         model(x).float().sum().backward()
         model.finish_grad_sync()
-        assert param_group.main_grad_buffer.placements == [Placement.DIRTY, Placement.FLAT]
+        assert param_group.main_grad_buffer.placements == [Placement.SHARD, Placement.SHARD]
 
         ctx = model._fsdp_root_context
         assert ctx.model_weight_refresh_pending
@@ -717,8 +717,8 @@ class TestFullyShardBasic:
         assert ctx.model_weight_refresh_pending
         assert model_buffer.placements == model_buffer.storage_placements
 
-        # The normal pre-forward hook marks the direct model-weight storage
-        # dirty before unshard, which refreshes the outer replicas exactly once.
+        # The normal pre-forward hook selects the direct model-weight SHARD view
+        # before unshard, which refreshes the outer replicas exactly once.
         model(torch.zeros_like(x))
         assert not ctx.model_weight_refresh_pending
         assert model_buffer.placements == model_buffer.storage_placements
@@ -1359,7 +1359,7 @@ class TestActivationCheckpointing:
         model_buffer = param_group.model_weight_buffer
         main_buffer = param_group.main_weight_buffer
         assert main_buffer is not None
-        expected_storage_placements = [Placement.REPLICATE, Placement.FLAT]
+        expected_storage_placements = [Placement.REPLICATE, Placement.SHARD]
         assert model_buffer.storage_placements == expected_storage_placements
         assert main_buffer.storage_placements == expected_storage_placements
 
