@@ -440,7 +440,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         def synchronize_param_gather():
             ctx = self.module._fsdp_root_context
-            torch.cuda.current_stream().wait_stream(ctx.ag_stream)
+            caller_stream = torch.cuda.current_stream()
+            for stream in ctx.ag_streams:
+                caller_stream.wait_stream(stream)
 
         self.finish_grad_sync = self.module.finish_grad_sync
         self.scale_gradients = self.module._scale_gradients
@@ -714,8 +716,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
         """
         if self.ddp_config.use_megatron_fsdp_v2:
             ctx = self.module._fsdp_root_context
-            torch.cuda.current_stream().wait_stream(ctx.ag_stream)
-            torch.cuda.current_stream().wait_stream(ctx.rs_stream)
+            caller_stream = torch.cuda.current_stream()
+            for stream in (*ctx.ag_streams, *ctx.rs_streams):
+                caller_stream.wait_stream(stream)
             return
 
         self.module.synchronize_gradient_reduce()

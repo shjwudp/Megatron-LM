@@ -6,7 +6,7 @@ import logging
 import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -51,8 +51,18 @@ class _FSDPRootContext:
     # ------------------------------------------------------------------
     # CUDA streams (communication overlap)
     # ------------------------------------------------------------------
-    ag_stream: torch.cuda.Stream  # all-gather / unshard stream
-    rs_stream: torch.cuda.Stream  # reduce-scatter stream
+    ag_streams: Tuple[torch.cuda.Stream, ...]  # one all-gather stream per mesh axis
+    rs_streams: Tuple[torch.cuda.Stream, ...]  # one reduce-scatter stream per mesh axis
+
+    @property
+    def ag_stream(self) -> torch.cuda.Stream:
+        """Return the compatibility all-gather stream for the existing parameter group."""
+        return self.ag_streams[-1]
+
+    @property
+    def rs_stream(self) -> torch.cuda.Stream:
+        """Return the first HSDP reduction stream for shared-stream call sites."""
+        return self.rs_streams[-1]
 
     # ------------------------------------------------------------------
     # Bucket allocator
@@ -505,6 +515,9 @@ class FSDPModule:
         self,
         enable_unshard_prefetch,
         enable_async_reduce_grad,
+        mesh_ndim: int,
+        all_gather_streams: Sequence[torch.cuda.Stream | None] | None,
+        reduce_scatter_streams: Sequence[torch.cuda.Stream | None] | None,
         bucket_allocator: BucketAllocator,
         enable_cuda_graph: bool = False,
         enable_full_iteration_cuda_graph: bool = False,
@@ -547,13 +560,22 @@ class FSDPModule:
                     "completed gradient reduction before re-initializing FSDP state."
                 )
 
+        def resolve_axis_streams(
+            configured: Sequence[torch.cuda.Stream | None] | None, overlap: bool
+        ) -> Tuple[torch.cuda.Stream, ...]:
+            caller_stream = torch.cuda.current_stream()
+            if configured is not None:
+                if len(configured) != mesh_ndim:
+                    raise ValueError(f"Expected {mesh_ndim} streams, got {len(configured)}")
+                return tuple(stream or caller_stream for stream in configured)
+            shared_stream = torch.cuda.Stream() if overlap else caller_stream
+            return (shared_stream,) * mesh_ndim
+
+        ag_streams = resolve_axis_streams(all_gather_streams, enable_unshard_prefetch)
+        rs_streams = resolve_axis_streams(reduce_scatter_streams, enable_async_reduce_grad)
         root_context = _FSDPRootContext(
-            ag_stream=(
-                torch.cuda.Stream() if enable_unshard_prefetch else torch.cuda.current_stream()
-            ),
-            rs_stream=(
-                torch.cuda.Stream() if enable_async_reduce_grad else torch.cuda.current_stream()
-            ),
+            ag_streams=ag_streams,
+            rs_streams=rs_streams,
             forward_order=forward_order,
             reduce_grad_buckets={id(module): [] for module in forward_order},
             unshard_done_events={id(module): None for module in forward_order},
@@ -621,7 +643,8 @@ class FSDPModule:
         """
         torch.cuda.nvtx.range_push("MFSDP unshard")
         ctx = self._fsdp_root_context
-        stream = ctx.ag_stream if async_op else torch.cuda.current_stream()
+        caller_stream = torch.cuda.current_stream()
+        stream = ctx.ag_stream if async_op else caller_stream
 
         # Unshard this module and optionally prefetch next modules in the forward/backward pass
         if async_op and prefetch:
@@ -649,8 +672,13 @@ class FSDPModule:
                 module._fsdp_param_groups[0], ParameterGroupV2
             )
             if uses_v2:
+                streams = (
+                    ctx.ag_streams
+                    if async_op
+                    else (caller_stream,) * module._fsdp_param_groups[0].mesh.ndim
+                )
                 for param_group in module._fsdp_param_groups:
-                    param_group.unshard_weight(stream=stream)
+                    param_group.unshard_weight(streams=streams, async_op=async_op)
             else:
                 ParameterGroup.unshard_model_weights(
                     module._fsdp_param_groups, bwd_pass=bwd_pass, stream=stream, async_op=async_op
@@ -661,7 +689,7 @@ class FSDPModule:
 
             # Record event to track when unshard is done for this module
             if async_op:
-                event = stream.record_event()
+                event = ctx.ag_streams[-1].record_event()
                 ctx.unshard_done_events[id(module)] = event
 
         # Ensure unshard is complete before forward.
@@ -735,7 +763,8 @@ class FSDPModule:
         """
         torch.cuda.nvtx.range_push("MFSDP reduce_grad")
         ctx = self._fsdp_root_context
-        stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
+        caller_stream = torch.cuda.current_stream()
+        stream = ctx.rs_stream if async_op else caller_stream
 
         # Handle pending reduce events before this module to release buffers promptly.
         self._wait_for_previous_async_reduce_grad()
@@ -844,11 +873,17 @@ class FSDPModule:
             if async_op:
                 # ---- Overlapped path ----
                 # Switch to rs_stream for the reduce-scatter kernel
-                param_group.reduce_grad(is_last_backward=ctx.is_last_backward, stream=stream)
+                if isinstance(param_group, ParameterGroupV2):
+                    completion_stream = param_group.reduce_grad(
+                        is_last_backward=ctx.is_last_backward, streams=ctx.rs_streams, async_op=True
+                    )
+                else:
+                    param_group.reduce_grad(is_last_backward=ctx.is_last_backward, stream=stream)
+                    completion_stream = stream
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
-                param_group.reduce_grad(is_last_backward=ctx.is_last_backward)
+                completion_stream = param_group.reduce_grad(is_last_backward=ctx.is_last_backward)
                 param_group.release_grad_buffer()
 
             # Install reduced gradients to distributed parameters
@@ -878,7 +913,7 @@ class FSDPModule:
                         dist_param.decoupled_grad = None
 
             if async_op:
-                event = stream.record_event()
+                event = completion_stream.record_event()
                 ctx.reduce_grad_buckets[id(self)].append((event, param_group))
 
             # NaN check after reduction
@@ -895,13 +930,17 @@ class FSDPModule:
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """Finish optimizer-facing gradient synchronization for this iteration."""
         assert not force_all_reduce, "FSDP v2 does not support force_all_reduce."
-        torch.cuda.current_stream().wait_stream(self._fsdp_root_context.rs_stream)
+        caller_stream = torch.cuda.current_stream()
+        for stream in self._fsdp_root_context.rs_streams:
+            caller_stream.wait_stream(stream)
 
     @torch.no_grad()
     def _scale_gradients(self, scaling_factor: float):
         """Scale optimizer-facing gradients by a factor."""
         ctx = self._fsdp_root_context
-        torch.cuda.current_stream().wait_stream(ctx.rs_stream)
+        caller_stream = torch.cuda.current_stream()
+        for stream in ctx.rs_streams:
+            caller_stream.wait_stream(stream)
         for _, child in self.named_modules():
             if not isinstance(child, FSDPModule):
                 continue

@@ -12,6 +12,7 @@ from __future__ import annotations
 import enum
 import math
 from dataclasses import dataclass
+from typing import Sequence
 
 import torch
 from torch.distributed.tensor import DeviceMesh, DTensor
@@ -30,6 +31,7 @@ from .mixed_precision import MixedPrecisionPolicy
 from .utils import ParamGroupIdx
 
 Placements = tuple[Placement, ...]
+AxisStreams = Sequence[torch.cuda.Stream | None]
 
 
 @dataclass(frozen=True)
@@ -147,6 +149,7 @@ class ParameterGroupStateV2:
     grad_phase: GradientPhaseV2 = GradientPhaseV2.EMPTY
     full_weight: DataParallelBuffer | None = None
     full_grad: DataParallelBuffer | None = None
+    grad_comm: DataParallelBuffer | None = None
 
 
 class ParameterGroupV2:
@@ -447,43 +450,68 @@ class ParameterGroupV2:
         _ = bwd_pass
         return self.compute_weight() is not None
 
-    @torch.no_grad()
-    def unshard_weight(self, stream: torch.cuda.Stream | None = None) -> DataParallelBuffer:
-        """Restore persistent weight validity, materialize full weights, and bind params."""
+    def _axis_streams(
+        self, *, stream: torch.cuda.Stream | None = None, streams: AxisStreams | None = None
+    ) -> tuple[torch.cuda.Stream, ...]:
+        """Resolve a legacy shared stream or one stream per mesh axis."""
+        if stream is not None and streams is not None:
+            raise ValueError("Specify either stream or streams, not both")
         caller_stream = torch.cuda.current_stream()
-        stream = stream or caller_stream
-        if stream != caller_stream:
-            stream.wait_stream(caller_stream)
+        if streams is None:
+            return (stream or caller_stream,) * self.mesh.ndim
+        if len(streams) != self.mesh.ndim:
+            raise ValueError(f"Expected {self.mesh.ndim} streams, got {len(streams)}")
+        return tuple(axis_stream or caller_stream for axis_stream in streams)
 
-        with torch.cuda.stream(stream):
-            compute_weight = self.compute_weight()
-            if compute_weight is not None:
-                self._bind_weight(compute_weight)
-                self.mp_policy.post_unshard(self.params)
-                return compute_weight
+    @staticmethod
+    def _last_changed_axis(source: Placements, target: Placements) -> int | None:
+        """Return the last changed axis in forward mesh order."""
+        changed = [axis for axis, pair in enumerate(zip(source, target)) if pair[0] is not pair[1]]
+        return changed[-1] if changed else None
 
-            current = self.weight_buffer.view(list(self.state.weight_valid))
-            persistent_placements = tuple(self.weight_buffer.placements)
-            if self.state.weight_valid != persistent_placements:
-                # For outer-optimizer-sharded HSDP this is [S,S] -> [R,S]:
-                # restore the outer replica before unsharding the inner DP axis.
-                current.redistribute(list(persistent_placements), output_buffer=self.weight_buffer)
-                self.state.weight_valid = persistent_placements
-                current = self.weight_buffer
-
-            if persistent_placements != self.full_placements:
-                # The remaining HSDP transition is [R,S] -> [R,R].
-                self.state.full_weight = self._allocate_scratch(
-                    "full_weight", self.weight_buffer, self.full_placements
-                )
-                current.redistribute(
-                    list(self.full_placements), output_buffer=self.state.full_weight
-                )
-                current = self.state.full_weight
-
-            self._bind_weight(current)
+    @torch.no_grad()
+    def unshard_weight(
+        self,
+        stream: torch.cuda.Stream | None = None,
+        *,
+        streams: AxisStreams | None = None,
+        async_op: bool = False,
+    ) -> DataParallelBuffer:
+        """Restore persistent weight validity, materialize full weights, and bind params."""
+        compute_weight = self.compute_weight()
+        if compute_weight is not None:
+            self._bind_weight(compute_weight)
             self.mp_policy.post_unshard(self.params)
-            return current
+            return compute_weight
+
+        source_placements = self.state.weight_valid
+        current = self.weight_buffer.view(list(source_placements))
+        persistent_placements = tuple(self.weight_buffer.placements)
+        if persistent_placements == self.full_placements:
+            output = self.weight_buffer
+        else:
+            self.state.full_weight = self._allocate_scratch(
+                "full_weight", self.weight_buffer, self.full_placements
+            )
+            output = self.state.full_weight
+
+        axis_streams = self._axis_streams(stream=stream, streams=streams)
+        DataParallelBuffer.redistribute_buffers(
+            [current],
+            list(self.full_placements),
+            output_buffers=[output],
+            streams=axis_streams,
+            async_op=async_op,
+        )
+        self.state.weight_valid = persistent_placements
+        terminal_axis = self._last_changed_axis(source_placements, self.full_placements)
+        terminal_stream = (
+            torch.cuda.current_stream() if terminal_axis is None else axis_streams[terminal_axis]
+        )
+        with torch.cuda.stream(terminal_stream):
+            self._bind_weight(output)
+            self.mp_policy.post_unshard(self.params)
+        return output
 
     def reshard_weight(self) -> None:
         """Release only the full compute-weight lease."""
@@ -498,6 +526,8 @@ class ParameterGroupV2:
                 del param.main_grad
         self._release_scratch("full_grad", self.state.full_grad)
         self.state.full_grad = None
+        self._release_scratch("grad_comm", self.state.grad_comm)
+        self.state.grad_comm = None
 
     def release_grad_storage_if_unused(self) -> None:
         """Release gradient storage after optimizer-facing gradients are cleared."""
@@ -546,14 +576,10 @@ class ParameterGroupV2:
         shape = full_grad.buffer_index.item_index_map[item_id].shape
         return full_grad.data[start:end].view(shape)
 
-    def _preprocess_gradient(
-        self, full_grad: DataParallelBuffer
-    ) -> tuple[DataParallelBuffer, tuple | None]:
+    def _preprocess_gradient(self, full_grad: DataParallelBuffer) -> DataParallelBuffer:
         comm_dtype = self.mp_policy.grad_comm_dtype or full_grad.dtype
-        workspace_key = None
         owner = full_grad
         if comm_dtype != full_grad.dtype:
-            workspace_key = (self.param_group_id, "grad_comm")
             owner = DataParallelBuffer(
                 buffer_index=full_grad.buffer_index,
                 dtype=comm_dtype,
@@ -563,21 +589,28 @@ class ParameterGroupV2:
             )
             owner.bind(
                 self.allocator.allocate(
-                    key=workspace_key, size=owner.data_size, dtype=owner.dtype, device=owner.device
+                    key=(self.param_group_id, "grad_comm"),
+                    size=owner.data_size,
+                    dtype=owner.dtype,
+                    device=owner.device,
                 ).data
             )
             owner.data.copy_(full_grad.data)
+            self.state.grad_comm = owner
 
         if self.gradient_scaling_factor not in (None, 1.0):
             owner.data.mul_(self.gradient_scaling_factor)
 
-        return self._placement_view(owner, self.contribution_placements), workspace_key
+        return self._placement_view(owner, self.contribution_placements)
 
-    def _finalize_gradient_placement(self, current: DataParallelBuffer) -> DataParallelBuffer:
+    def _finalize_gradient_placement(
+        self, current: DataParallelBuffer, *, streams: tuple[torch.cuda.Stream, ...], async_op: bool
+    ) -> tuple[DataParallelBuffer, torch.cuda.Stream]:
         """Redistribute delayed mesh axes into the persistent optimizer gradient."""
         target = self.layout.main_weight
         final = self._placement_view(self.grad_buffer, target)
         communication_owner = current._storage_owner or current
+        terminal_stream = torch.cuda.current_stream()
         # Reduce in reverse mesh-axis order. On the supported 2D HSDP mesh
         # (outer DP, inner DP), this means inner reduce-scatter precedes outer
         # reduce-scatter. Weight unshard uses the inverse order.
@@ -590,21 +623,32 @@ class ParameterGroupV2:
                 output = final
             else:
                 output = self._placement_view(communication_owner, tuple(next_placements))
-            current.redistribute(next_placements, output_buffer=output)
+            with torch.cuda.stream(terminal_stream):
+                DataParallelBuffer.redistribute_buffers(
+                    [current],
+                    next_placements,
+                    output_buffers=[output],
+                    streams=streams,
+                    async_op=async_op,
+                )
+            terminal_stream = streams[axis]
             current = output
 
-        if current.data.data_ptr() != final.data.data_ptr():
-            final.data.copy_(current.data)
-        return final
+        with torch.cuda.stream(terminal_stream):
+            if current.data.data_ptr() != final.data.data_ptr():
+                final.data.copy_(current.data)
+        return final, terminal_stream
 
-    def _reduce_grad(self, *, is_last_backward: bool) -> None:
-        """Run one gradient reduction on the current CUDA stream."""
+    def _reduce_grad(
+        self, *, is_last_backward: bool, streams: tuple[torch.cuda.Stream, ...], async_op: bool
+    ) -> torch.cuda.Stream:
+        """Reduce one gradient contribution and return its completion stream."""
         if self.state.full_grad is None:
             raise RuntimeError("begin_backward() must run before reduce_grad()")
         if self.state.grad_phase is GradientPhaseV2.READY:
             raise RuntimeError("zero_grad() must run before starting another gradient")
 
-        grad_input, workspace_key = self._preprocess_gradient(self.state.full_grad)
+        grad_input = self._preprocess_gradient(self.state.full_grad)
         accumulation = self._placement_view(self.grad_buffer, self.layout.grad_accumulation)
         # A pending accumulation contains reduced gradients from earlier
         # microbatches but is not yet optimizer-ready. Placement alone cannot
@@ -621,8 +665,21 @@ class ParameterGroupV2:
         else:
             output = accumulation
 
-        try:
-            grad_input.redistribute(list(self.layout.grad_accumulation), output_buffer=output)
+        terminal_stream = torch.cuda.current_stream()
+        DataParallelBuffer.redistribute_buffers(
+            [grad_input],
+            list(self.layout.grad_accumulation),
+            output_buffers=[output],
+            streams=streams,
+            async_op=async_op,
+        )
+        first_axis = self._last_changed_axis(
+            tuple(grad_input.placements), self.layout.grad_accumulation
+        )
+        if first_axis is not None:
+            terminal_stream = streams[first_axis]
+
+        with torch.cuda.stream(terminal_stream):
             if output.data.data_ptr() != accumulation.data.data_ptr():
                 if has_accumulation:
                     if is_last_backward and needs_final_redistribution:
@@ -638,37 +695,42 @@ class ParameterGroupV2:
 
             if is_last_backward:
                 if needs_final_redistribution:
-                    self._finalize_gradient_placement(output)
+                    _, terminal_stream = self._finalize_gradient_placement(
+                        output, streams=streams, async_op=async_op
+                    )
                 self.state.grad_phase = GradientPhaseV2.READY
                 self._install_optimizer_grads()
             else:
                 self.state.grad_phase = GradientPhaseV2.ACCUMULATING
-        finally:
-            if workspace_key is not None:
-                self.allocator.free(workspace_key)
+        return terminal_stream
 
     @torch.no_grad()
     def reduce_grad(
-        self, *, is_last_backward: bool, stream: torch.cuda.Stream | None = None
-    ) -> None:
+        self,
+        *,
+        is_last_backward: bool,
+        stream: torch.cuda.Stream | None = None,
+        streams: AxisStreams | None = None,
+        async_op: bool = False,
+    ) -> torch.cuda.Stream:
         """Reduce one microbatch and finalize delayed DP axes on the last backward.
 
-        A caller-supplied stream enables overlap. In that case the caller owns
-        completion tracking and releases the full-gradient lease after waiting
-        for its recorded event.
+        Axis-indexed streams allow HSDP inner and outer reduce-scatter stages
+        to run on distinct streams. The returned stream owns the terminal
+        operation; an asynchronous caller records its completion event there.
         """
         caller_stream = torch.cuda.current_stream()
-        stream = stream or caller_stream
-        if stream != caller_stream:
-            stream.wait_stream(caller_stream)
+        axis_streams = self._axis_streams(stream=stream, streams=streams)
         try:
-            with torch.cuda.stream(stream):
-                self._reduce_grad(is_last_backward=is_last_backward)
+            terminal_stream = self._reduce_grad(
+                is_last_backward=is_last_backward, streams=axis_streams, async_op=async_op
+            )
         except Exception:
             self.release_grad_buffer()
             raise
-        if stream == caller_stream:
+        if terminal_stream == caller_stream:
             self.release_grad_buffer()
+        return terminal_stream
 
     def optimizer_weight(self) -> DataParallelBuffer:
         """Return the persistent optimizer-weight representation."""

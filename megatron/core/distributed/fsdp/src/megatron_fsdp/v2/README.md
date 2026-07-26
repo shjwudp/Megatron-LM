@@ -350,13 +350,14 @@ torchrun --nproc_per_node=2 \
 - **Zero-numel gradient shards and fused optimizers.** When a parameter's local shard is empty on some DP ranks (e.g., small biases on high DP counts), creating a `DTensor` gradient with `numel() == 0` and passing it to fused multi-tensor optimizers (TE `FusedAdam`) can silently corrupt updates for neighboring non-empty parameters. This manifests only as convergence divergence with no error — see [design.md § Pitfall](design/design.md) for details and the fix in `param_group.py`.
 - **Temporary communication bucket lifecycle.** Temporary all-gather /
   reduce-scatter buckets are allocated on the caller CUDA stream. Parameter
-  all-gathers run on `ag_stream`; gradient collectives run on `rs_stream`,
-  after one wait on gradient preparation. Eager and per-module CUDA graph paths
-  stage gradients on the caller stream. Full-iteration CUDA graphs instead stage
-  ordinary async gradients on `rs_stream` and record detached source tensors on
-  that stream so their storage remains live. CUDA events order communication,
-  consumption, and release, and `ParameterGroup` retains each temporary lease
-  until its event completes.
+  all-gathers and gradient collectives may use one stream per device-mesh axis.
+  HSDP all-gather runs outer then inner; reduction runs inner then outer, with
+  explicit stream dependencies between stages. Eager and per-module CUDA graph
+  paths stage gradients on the caller stream. Full-iteration CUDA graphs instead
+  stage ordinary async gradients on the inner reduction stream and record detached
+  source tensors on that stream so their storage remains live. CUDA events order
+  communication, consumption, and release, and `ParameterGroup` retains each
+  temporary lease until its event completes.
 
 ## Unit Tests
 

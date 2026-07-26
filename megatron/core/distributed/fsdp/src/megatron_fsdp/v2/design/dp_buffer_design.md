@@ -119,9 +119,10 @@ primitive axis by axis, coalescing only buffers with the same process group, dty
 device, and source placement.
 
 `redistribute()` executes on the current stream. It performs no stream ordering or
-tensor-lifetime management. `redistribute_buffers()` may select a communication stream
-for a batched weight redistribution and establishes one caller-to-communication-stream
-dependency before entering that stream.
+tensor-lifetime management. `redistribute_buffers()` accepts an optional stream per
+mesh axis. The first active axis waits for the caller stream, and each later active
+axis waits for the preceding active axis. A single `stream` remains a shorthand for
+using the same stream on every axis.
 
 `redistribute()` accepts an explicit output `DataParallelBuffer`. For an in-place
 all-gather, the caller binds an externally allocated `REPLICATE` placeholder, takes
@@ -189,7 +190,7 @@ buffer preserves the boundary between flat storage/layout and parameter semantic
 
 ### Weight unshard and reshard
 
-1. `FSDPModule` schedules an ordered parameter-group sequence on the selected stream.
+1. `FSDPModule` supplies one optional all-gather stream per mesh axis.
 2. The mixed-precision policy selects semantic weight roles for the compute pass.
    `ParameterGroup` maps each role to a persistent buffer, its currently valid
    placements, and an optional full output. After an optimizer update, the valid
@@ -199,7 +200,8 @@ buffer preserves the boundary between flat storage/layout and parameter semantic
    weights acquire a role-keyed `[REPLICATE, REPLICATE]` output lease.
 3. `DataParallelBuffer.redistribute_buffers()` groups compatible buffers and
    redistributes the outer placement before the inner placement into those explicit
-   outputs.
+   outputs. Each axis runs on its configured stream, with an explicit dependency on
+   the preceding axis.
 4. Each owning group binds its parameters to the resulting full buffer.
 5. After async communication joins the caller stream, each group finalizes its
    mixed-precision representation.
@@ -222,9 +224,9 @@ lease from asynchronous all-gather launch through the final consumer.
    allocates one communication owner before entering the stages. Otherwise the
    full-gradient owner is reused. Scaling is applied once during this preprocessing
    and does not cause allocation.
-5. `DataParallelBuffer.redistribute()` performs one all-reduce or reduce-scatter and
-   returns its destination DP buffer. An empty, dtype-compatible persistent buffer can
-   be the direct output; otherwise the stage uses a contained temporary view.
+5. `DataParallelBuffer.redistribute_buffers()` schedules each stage on the stream for
+   its changed mesh axis. An empty, dtype-compatible persistent buffer can be the
+   direct output; otherwise the stage uses a contained temporary view.
 6. After each stage, the parameter group assigns or accumulates the result. When an
    outer stage follows, the logical inner result remains in communication dtype and
    becomes that stage's input.
@@ -272,7 +274,7 @@ collective state.
   input and exactly matches the target placements.
 - `redistribute()` changes at most one placement per call.
 - `redistribute_buffers()` completes each mesh axis across compatible buffers before
-  advancing to the next axis.
+  advancing to the next axis; distinct axis streams are linked by explicit waits.
 - parameter identity and `param_idx` are owned by `ParameterGroup`.
 - only `ParameterGroup` binds storage to parameters.
 - only `ParameterGroup` acquires and releases temporary storage.

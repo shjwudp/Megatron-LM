@@ -303,39 +303,55 @@ def test_outer_sharded_hsdp_collective_order(monkeypatch):
     redistribute = DataParallelBuffer.redistribute
 
     def record_redistribution(self, target_placements, *, output_buffer=None):
-        transitions.append((tuple(self.placements), tuple(target_placements)))
+        transitions.append(
+            (tuple(self.placements), tuple(target_placements), torch.cuda.current_stream())
+        )
         return redistribute(self, target_placements, output_buffer=output_buffer)
 
     monkeypatch.setattr(DataParallelBuffer, "redistribute", record_redistribution)
 
+    outer_ag_stream = torch.cuda.Stream()
+    inner_ag_stream = torch.cuda.Stream()
     group.refresh_model_weight()
     transitions.clear()
-    group.unshard_weight()
+    group.unshard_weight(streams=(outer_ag_stream, inner_ag_stream), async_op=True)
+    inner_ag_stream.synchronize()
     assert transitions == [
         (
             (Placement.SHARD, Placement.SHARD),
             (Placement.REPLICATE, Placement.SHARD),
+            outer_ag_stream,
         ),
         (
             (Placement.REPLICATE, Placement.SHARD),
             (Placement.REPLICATE, Placement.REPLICATE),
+            inner_ag_stream,
         ),
     ]
 
     group.reshard_weight()
     transitions.clear()
     group.begin_backward().data.fill_(torch.distributed.get_rank() + 1)
-    group.reduce_grad(is_last_backward=True)
+    outer_rs_stream = torch.cuda.Stream()
+    inner_rs_stream = torch.cuda.Stream()
+    completion_stream = group.reduce_grad(
+        is_last_backward=True, streams=(outer_rs_stream, inner_rs_stream), async_op=True
+    )
     assert transitions == [
         (
             (Placement.PARTIAL, Placement.PARTIAL),
             (Placement.PARTIAL, Placement.SHARD),
+            inner_rs_stream,
         ),
         (
             (Placement.PARTIAL, Placement.SHARD),
             (Placement.SHARD, Placement.SHARD),
+            outer_rs_stream,
         ),
     ]
+    assert completion_stream == outer_rs_stream
+    completion_stream.synchronize()
+    group.release_grad_buffer()
 
 
 def test_hsdp_layout_rejects_reversed_mesh_axes():

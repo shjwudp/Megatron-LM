@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from copy import copy
 from itertools import groupby
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 import torch
 from torch.distributed import _coalescing_manager
@@ -164,6 +164,7 @@ class DataParallelBuffer:
         *,
         output_buffers: list["DataParallelBuffer"],
         stream: torch.cuda.Stream | None = None,
+        streams: Sequence[torch.cuda.Stream | None] | None = None,
         async_op: bool = False,
     ) -> list["DataParallelBuffer"]:
         """Redistribute compatible buffers to one target placement vector.
@@ -171,6 +172,11 @@ class DataParallelBuffer:
         The target defines the mesh-axis plan. Each axis is completed across
         communication-compatible buffers before the next axis starts, preserving
         HSDP outer-then-inner ordering and cross-buffer collective coalescing.
+
+        ``streams[mesh_dim]`` selects the stream for one mesh-axis transition.
+        The first active axis waits for the caller stream, and each later active
+        axis waits for the preceding active axis. ``stream`` is a compatibility
+        shorthand that selects one stream for every mesh axis.
         """
         if not buffers:
             return []
@@ -180,14 +186,21 @@ class DataParallelBuffer:
             )
         if len(output_buffers) != len(buffers):
             raise ValueError(f"Expected {len(buffers)} output buffers, got {len(output_buffers)}")
+        if stream is not None and streams is not None:
+            raise ValueError("Specify either stream or streams, not both")
 
         caller_stream = torch.cuda.current_stream()
-        stream = stream or caller_stream
+        if streams is None:
+            axis_streams = [stream or caller_stream] * buffers[0].mesh.ndim
+        else:
+            if len(streams) != buffers[0].mesh.ndim:
+                raise ValueError(f"Expected {buffers[0].mesh.ndim} streams, got {len(streams)}")
+            axis_streams = [
+                axis_stream if axis_stream is not None else caller_stream for axis_stream in streams
+            ]
 
         for buffer, output_buffer in zip(buffers, output_buffers):
             buffer._validate_output_buffer(output_buffer, target_placements)
-        if stream != caller_stream:
-            stream.wait_stream(caller_stream)
 
         def compatibility_key(
             item: tuple["DataParallelBuffer", "DataParallelBuffer"], mesh_dim: int
@@ -197,48 +210,58 @@ class DataParallelBuffer:
             return id(group), buffer.dtype, buffer.device, buffer.placements[mesh_dim]
 
         current_buffers = list(buffers)
-        with torch.cuda.stream(stream):
-            for mesh_dim, target in enumerate(target_placements):
-                axis_transitions = []
-                next_buffers = []
-                for buffer, final_output in zip(current_buffers, output_buffers):
-                    if buffer.placements[mesh_dim] is target:
-                        next_buffers.append(buffer)
-                        continue
-                    axis_target = buffer.placements.copy()
-                    axis_target[mesh_dim] = target
-                    if axis_target == target_placements:
-                        axis_output = final_output
-                    elif (
-                        buffer._storage_owner is not None
-                        and buffer._storage_owner.placements == axis_target
-                    ):
-                        # Prefer the containing placement view when one exists.
-                        # For [S, S] -> [R, S] -> [R, R], this refreshes the
-                        # persistent [R, S] owner before the final all-gather.
-                        axis_output = buffer._storage_owner
-                    else:
-                        axis_output = final_output.view(axis_target)
-                    axis_transitions.append((buffer, axis_output))
-                    next_buffers.append(axis_output)
-
-                for _, compatible_items_iter in groupby(
-                    axis_transitions, key=lambda item: compatibility_key(item, mesh_dim)
+        previous_stream = caller_stream
+        for mesh_dim, target in enumerate(target_placements):
+            axis_transitions = []
+            next_buffers = []
+            for buffer, final_output in zip(current_buffers, output_buffers):
+                if buffer.placements[mesh_dim] is target:
+                    next_buffers.append(buffer)
+                    continue
+                axis_target = buffer.placements.copy()
+                axis_target[mesh_dim] = target
+                if axis_target == target_placements:
+                    axis_output = final_output
+                elif (
+                    buffer._storage_owner is not None
+                    and buffer._storage_owner.placements == axis_target
                 ):
-                    compatible_items = list(compatible_items_iter)
-                    group = compatible_items[0][0].mesh.get_group(mesh_dim=mesh_dim)
-                    context = (
-                        _coalescing_manager(group, async_ops=async_op)
-                        if len(compatible_items) > 1 and torch.distributed.get_world_size(group) > 1
-                        else nullcontext()
-                    )
-                    with context as coalescing_event:
-                        for buffer, axis_output in compatible_items:
-                            buffer.redistribute(axis_output.placements, output_buffer=axis_output)
-                    if async_op and coalescing_event is not None:
-                        coalescing_event.wait()
-                current_buffers = next_buffers
+                    # Prefer the containing placement view when one exists.
+                    # For [S, S] -> [R, S] -> [R, R], this refreshes the
+                    # persistent [R, S] owner before the final all-gather.
+                    axis_output = buffer._storage_owner
+                else:
+                    axis_output = final_output.view(axis_target)
+                axis_transitions.append((buffer, axis_output))
+                next_buffers.append(axis_output)
 
+            if axis_transitions:
+                axis_stream = axis_streams[mesh_dim]
+                if axis_stream != previous_stream:
+                    axis_stream.wait_stream(previous_stream)
+                with torch.cuda.stream(axis_stream):
+                    for _, compatible_items_iter in groupby(
+                        axis_transitions, key=lambda item: compatibility_key(item, mesh_dim)
+                    ):
+                        compatible_items = list(compatible_items_iter)
+                        group = compatible_items[0][0].mesh.get_group(mesh_dim=mesh_dim)
+                        context = (
+                            _coalescing_manager(group, async_ops=async_op)
+                            if len(compatible_items) > 1
+                            and torch.distributed.get_world_size(group) > 1
+                            else nullcontext()
+                        )
+                        with context as coalescing_event:
+                            for buffer, axis_output in compatible_items:
+                                buffer.redistribute(
+                                    axis_output.placements, output_buffer=axis_output
+                                )
+                        if async_op and coalescing_event is not None:
+                            coalescing_event.wait()
+                previous_stream = axis_stream
+            current_buffers = next_buffers
+
+        with torch.cuda.stream(previous_stream):
             for current, final_output in zip(current_buffers, output_buffers):
                 if current is not final_output:
                     current.redistribute(target_placements, output_buffer=final_output)

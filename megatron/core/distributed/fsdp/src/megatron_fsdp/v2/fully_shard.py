@@ -8,8 +8,9 @@ The implementation is split across:
 - hooks.py: forward/backward hook registration
 """
 
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
+import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Shard
@@ -43,6 +44,8 @@ def fully_shard(
     # --- Megatron-FSDP specific options ---
     enable_unshard_prefetch: bool = True,
     enable_async_reduce_grad: bool = True,
+    all_gather_streams: Sequence[torch.cuda.Stream | None] | None = None,
+    reduce_scatter_streams: Sequence[torch.cuda.Stream | None] | None = None,
     gradient_scaling_factor: Optional[float] = None,
     enable_trace_pool: bool = False,
     sharding_strategy: str = "optim_grads_params",
@@ -67,6 +70,11 @@ def fully_shard(
     Args:
         enable_full_iteration_cuda_graph: If ``True``, keep graph-visible FSDP
             optimizer gradient objects stable across full-iteration graph replay.
+        all_gather_streams: Optional stream for each device-mesh axis. HSDP
+            all-gathers execute in mesh order (outer DP, then inner DP).
+        reduce_scatter_streams: Optional stream for each device-mesh axis. HSDP
+            gradient reduction executes in reverse mesh order (inner DP, then
+            outer DP on the last backward).
         fine_grained_hooks: If ``True``, register pre-forward/backward hooks
             on every sub-module (for EP-overlap / 1F1B schedules).
         skip_backward_callback: If ``True``, skip the autograd post-backward
@@ -124,8 +132,19 @@ def fully_shard(
             )
         if mesh.ndim == 1 and outer_dp_sharding_strategy == "optim":
             raise ValueError("Outer-DP optimizer sharding requires a 2D DeviceMesh")
+    elif all_gather_streams is not None or reduce_scatter_streams is not None:
+        raise NotImplementedError(
+            "Axis-indexed communication streams require use_parameter_group_v2=True"
+        )
     else:
         mesh = _prepare_fsdp_mesh(mesh)
+
+    for name, streams in (
+        ("all_gather_streams", all_gather_streams),
+        ("reduce_scatter_streams", reduce_scatter_streams),
+    ):
+        if streams is not None and len(streams) != mesh.ndim:
+            raise ValueError(f"Expected {mesh.ndim} {name}, got {len(streams)}")
 
     cls = module.__class__
     if cls not in _fsdp_class_cache:
@@ -156,6 +175,9 @@ def fully_shard(
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,
         enable_async_reduce_grad=enable_async_reduce_grad,
+        mesh_ndim=mesh.ndim,
+        all_gather_streams=all_gather_streams,
+        reduce_scatter_streams=reduce_scatter_streams,
         bucket_allocator=bucket_allocator,
         enable_cuda_graph=enable_cuda_graph,
         enable_full_iteration_cuda_graph=enable_full_iteration_cuda_graph,

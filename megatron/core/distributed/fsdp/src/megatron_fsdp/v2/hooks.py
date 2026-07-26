@@ -281,13 +281,14 @@ def mfsdp_post_backward_final_callback(root_module: nn.Module):
         module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
 
     # ---- drain pending async reduce-grad events -----------------------
-    stream = ctx.rs_stream
     for buckets in ctx.reduce_grad_buckets.values():
         while len(buckets) > 0:
             event, param_group = buckets.pop()
             event.wait()
             param_group.release_grad_buffer()
-    torch.cuda.current_stream().wait_stream(stream)
+    caller_stream = torch.cuda.current_stream()
+    for stream in ctx.rs_streams:
+        caller_stream.wait_stream(stream)
 
     # ``is_last_backward`` is the optimizer-step boundary. The optimizer may
     # install model weights explicitly; otherwise the next normal pre-forward

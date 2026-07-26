@@ -370,6 +370,39 @@ class TestFullyShardBasic:
             assert param_group.layout.main_weight == (expected_outer, Placement.SHARD)
             assert param_group.state.grad_phase is GradientPhaseV2.READY
 
+    def test_parameter_group_v2_hsdp_axis_streams(self):
+        """HSDP accepts independent outer/inner all-gather and reduction streams."""
+        torch.manual_seed(42)
+        model = SimpleMLP(16).to(_device())
+        outer_ag_stream = torch.cuda.Stream()
+        inner_ag_stream = torch.cuda.Stream()
+        outer_rs_stream = torch.cuda.Stream()
+        inner_rs_stream = torch.cuda.Stream()
+        fully_shard(
+            model,
+            mesh=_build_hsdp_mesh(),
+            sharding_strategy="optim_grads_params",
+            outer_dp_sharding_strategy="optim",
+            enable_unshard_prefetch=True,
+            enable_async_reduce_grad=True,
+            all_gather_streams=(outer_ag_stream, inner_ag_stream),
+            reduce_scatter_streams=(outer_rs_stream, inner_rs_stream),
+            use_parameter_group_v2=True,
+        )
+
+        ctx = model._fsdp_root_context
+        assert ctx.ag_streams == (outer_ag_stream, inner_ag_stream)
+        assert ctx.rs_streams == (outer_rs_stream, inner_rs_stream)
+
+        model.set_is_last_backward(True)
+        loss = _forward_backward(model, torch.randn(2, 16, device=_device()))
+        model.finish_grad_sync()
+        assert torch.isfinite(torch.tensor(loss))
+        assert all(
+            param_group.state.grad_phase is GradientPhaseV2.READY
+            for param_group in model._fsdp_param_groups
+        )
+
     @pytest.mark.parametrize("sharding_strategy", ["no_shard", "optim_grads_params"])
     @pytest.mark.parametrize("use_decoupled_grad", [False, True])
     def test_parameter_group_v2_full_iteration_gradients_are_stable(
