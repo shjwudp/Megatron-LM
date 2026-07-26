@@ -132,14 +132,101 @@ class ParameterGroup:
     def set_allocator(self, allocator: BucketAllocator) -> None:
         """Replace the allocator used by every buffer in this parameter group."""
         self.allocator = allocator
-        for buffer in (
-            self.model_weight_buffer,
-            self.transpose_weight_buffer,
-            self.main_weight_buffer,
-            self.main_grad_buffer,
+        for buffer in self._buffers():
+            buffer.allocator = allocator
+
+    def _buffers(self) -> List[DataParallelBuffer]:
+        """Return all internal buffers owned by this parameter group."""
+        return [
+            buffer
+            for buffer in (
+                self.model_weight_buffer,
+                self.transpose_weight_buffer,
+                self.main_weight_buffer,
+                self.main_grad_buffer,
+            )
+            if buffer is not None
+        ]
+
+    @staticmethod
+    def offload_storage_to_cpu(
+        param_groups: List["ParameterGroup"],
+        *,
+        pin_memory: bool = False,
+        max_cpu_bytes: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Offload persistent group storage under one cross-group CPU-memory budget."""
+        entries = [
+            (buffer, buffer.data.nbytes)
+            for param_group in param_groups
+            for buffer in param_group._buffers()
+            if buffer.data is not None and not buffer._is_on_cpu()
+        ]
+        entries.sort(key=lambda entry: entry[1], reverse=True)
+
+        offloaded_bytes = 0
+        skipped_bytes = 0
+        for buffer, nbytes in entries:
+            if max_cpu_bytes is not None and offloaded_bytes + nbytes > max_cpu_bytes:
+                skipped_bytes += nbytes
+                continue
+            buffer._move_data_to(torch.device("cpu"), pin_memory=pin_memory)
+            offloaded_bytes += nbytes
+
+        for param_group in param_groups:
+            param_group._rebuild_dist_views()
+        return {"offloaded_bytes": offloaded_bytes, "skipped_bytes": skipped_bytes}
+
+    @staticmethod
+    def reload_storage_to_gpu(param_groups: List["ParameterGroup"]) -> None:
+        """Move persistent group storage to the current CUDA device and rebuild views."""
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        for param_group in param_groups:
+            for buffer in param_group._buffers():
+                buffer._move_data_to(device)
+            param_group._rebuild_dist_views()
+
+    def buffer_diagnostics(
+        self,
+    ) -> tuple[
+        List[tuple[str, torch.dtype, int, int, bool, bool]], List[Optional[tuple[int, int]]]
+    ]:
+        """Return read-only buffer metadata and model-weight item ranges."""
+        buffer_metadata = []
+        for label, buffer in (
+            ("W", self.model_weight_buffer),
+            ("MW", self.main_weight_buffer),
+            ("G", self.main_grad_buffer),
         ):
             if buffer is not None:
-                buffer.allocator = allocator
+                buffer_metadata.append(
+                    (
+                        label,
+                        buffer.dtype,
+                        buffer.data_size,
+                        buffer.buffer_index.bucket_meta.size,
+                        buffer.outer_sharded,
+                        buffer.inner_sharded,
+                    )
+                )
+
+        model_weight_ranges = []
+        for param in self.params:
+            item_index = self.model_weight_buffer.buffer_index.item_index_map.get(
+                self.param_idx[param]
+            )
+            model_weight_ranges.append(
+                None if item_index is None else (item_index.global_data_index, item_index.size)
+            )
+        return buffer_metadata, model_weight_ranges
+
+    def assert_model_weights_not_nan(self) -> None:
+        """Assert that every fully replicated model-weight item contains no NaNs."""
+        for param in self.params:
+            param_data = self.model_weight_buffer.get_item(
+                self.param_idx[param], placements=[Placement.REPLICATE, Placement.REPLICATE]
+            )
+            assert not torch.isnan(param_data).any(), "NaN detected in model weight buffer"
 
     def _create_buffer(self, dtype: torch.dtype, role: str) -> DataParallelBuffer:
         """Create a buffer and namespace its temporary bucket by role."""
@@ -221,7 +308,7 @@ class ParameterGroup:
 
         for weight_buffer in (self.model_weight_buffer, self.transpose_weight_buffer):
             if weight_buffer is not None and not weight_buffer.inner_sharded:
-                self.bind_params(weight_buffer, weight_buffer.data)
+                self._bind_params(weight_buffer, weight_buffer.data)
 
         # Create gradient buffer
         if self.requires_grad:
@@ -232,8 +319,8 @@ class ParameterGroup:
         # Create distributed parameter views
         self._init_dist_params()
 
-    def weight_buffers_for_unshard(self, bwd_pass: bool = False):
-        """Return weight buffers that must be unsharded for this pass."""
+    def _weight_buffers_for_unshard(self, bwd_pass: bool = False) -> List[DataParallelBuffer]:
+        """Return this group's internal weight buffers required by one compute pass."""
         self._ensure_buffers_on_gpu()
         return [
             weight_buffer
@@ -243,32 +330,50 @@ class ParameterGroup:
             if weight_buffer is not None
         ]
 
-    def post_unshard(self, bwd_pass: bool = False):
-        """Run post-unshard processing after required buffers have been gathered."""
+    def finalize_model_weight_unshard(self, bwd_pass: bool = False) -> None:
+        """Finalize model weights after the caller has waited for async communication."""
         self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
 
-    def unshard(
-        self,
+    @staticmethod
+    def unshard_model_weights(
+        param_groups: List["ParameterGroup"],
+        *,
         bwd_pass: bool = False,
-        bind_params: bool = True,
         stream: Optional[torch.cuda.Stream] = None,
+        async_op: bool = False,
     ) -> None:
+        """Unshard and bind model weights for a communication-compatible group sequence.
+
+        Buffer roles, placement targets, and parameter binding remain private to
+        ``ParameterGroup``. The caller supplies only lifecycle context and the
+        communication stream so buffers from consecutive parameter groups can
+        still share coalesced collectives.
+        """
+        owned_weight_buffers = [
+            (param_group, weight_buffer)
+            for param_group in param_groups
+            for weight_buffer in param_group._weight_buffers_for_unshard(bwd_pass=bwd_pass)
+        ]
+        full_buffers = DataParallelBuffer.redistribute_buffers(
+            [weight_buffer for _, weight_buffer in owned_weight_buffers],
+            [Placement.REPLICATE, Placement.REPLICATE],
+            stream=stream,
+            async_op=async_op,
+        )
+        for (param_group, weight_buffer), full_buffer in zip(owned_weight_buffers, full_buffers):
+            param_group._bind_params(weight_buffer, full_buffer)
+
+    def unshard(self, bwd_pass: bool = False, stream: Optional[torch.cuda.Stream] = None) -> None:
         """
         Unshard model weights by all-gathering from sharded buffer.
 
         After unshard, parameters point to full unsharded storage. FP8
         parameters rebind their TE raw payload instead of ``param.data``.
         """
-        weight_buffers = self.weight_buffers_for_unshard(bwd_pass=bwd_pass)
-        full_buffers = DataParallelBuffer.redistribute_buffers(
-            weight_buffers, [Placement.REPLICATE, Placement.REPLICATE], stream=stream
-        )
-        if bind_params:
-            for weight_buffer, full_buffer in zip(weight_buffers, full_buffers):
-                self.bind_params(weight_buffer, full_buffer)
-        self.post_unshard(bwd_pass=bwd_pass)
+        self.unshard_model_weights([self], bwd_pass=bwd_pass, stream=stream)
+        self.finalize_model_weight_unshard(bwd_pass=bwd_pass)
 
-    def bind_params(
+    def _bind_params(
         self, weight_buffer: DataParallelBuffer, buffer: Optional[torch.Tensor] = None
     ) -> None:
         """Bind this group's parameters to a fully replicated weight buffer."""
@@ -314,8 +419,8 @@ class ParameterGroup:
                     output_buffer.copy_(comm_output)
         grad_buffer.release_redistribution_workspace(changed_axis)
 
-    def has_unsharded_weight_buffers(self, bwd_pass: bool = False) -> bool:
-        """Return whether this phase can skip launching another distributed unshard."""
+    def model_weights_are_unsharded(self, bwd_pass: bool = False) -> bool:
+        """Return whether the model weights required by this pass are unsharded."""
         for weight_buffer in self.mp_policy.weight_buffers_for_unshard(
             self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
         ):
@@ -342,7 +447,7 @@ class ParameterGroup:
             full_weight_buffer = self.model_weight_buffer.fetch_buffer(
                 [Placement.REPLICATE, Placement.REPLICATE]
             )
-            self.bind_params(self.model_weight_buffer, full_weight_buffer)
+            self._bind_params(self.model_weight_buffer, full_weight_buffer)
         self.mp_policy.copy_main_weights_to_model_weights(
             self.params,
             self.param_idx,

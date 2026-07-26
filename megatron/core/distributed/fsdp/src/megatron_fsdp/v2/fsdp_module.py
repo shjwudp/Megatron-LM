@@ -14,7 +14,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from .allocator import BucketAllocator, TracePoolAllocator
-from .dp_buffer import DataParallelBuffer, Placement
+from .dp_buffer import Placement
 from .mixed_precision import MixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
@@ -326,39 +326,20 @@ class FSDPModule:
         """
         ctx = self._fsdp_root_context
 
-        # Collect (buffer, nbytes) pairs, largest first
-        entries: List[Tuple[Any, int]] = []
-        for module in self._get_fsdp_modules(recursive):
-            for pg in module._fsdp_param_groups:
-                for buf in (
-                    pg.model_weight_buffer,
-                    pg.transpose_weight_buffer,
-                    pg.main_weight_buffer,
-                    pg.main_grad_buffer,
-                ):
-                    if buf is not None and buf.data is not None and not buf._is_on_cpu():
-                        entries.append((buf, buf.data.nbytes))
-        entries.sort(key=lambda x: x[1], reverse=True)
-
-        offloaded_bytes = 0
-        skipped_bytes = 0
-        for buf, nbytes in entries:
-            if max_cpu_bytes is not None and offloaded_bytes + nbytes > max_cpu_bytes:
-                skipped_bytes += nbytes
-                continue
-            buf._move_data_to(torch.device("cpu"), pin_memory=pin_memory)
-            offloaded_bytes += nbytes
-
-        # Rebuild views after all moves
-        for module in self._get_fsdp_modules(recursive):
-            for pg in module._fsdp_param_groups:
-                pg._rebuild_dist_views()
+        param_groups = [
+            param_group
+            for module in self._get_fsdp_modules(recursive)
+            for param_group in module._fsdp_param_groups
+        ]
+        result = ParameterGroup.offload_storage_to_cpu(
+            param_groups, pin_memory=pin_memory, max_cpu_bytes=max_cpu_bytes
+        )
 
         # Release allocator slots (always — no CPU cost)
         if isinstance(ctx.bucket_allocator, TracePoolAllocator):
             ctx.bucket_allocator.release()
 
-        return {"offloaded_bytes": offloaded_bytes, "skipped_bytes": skipped_bytes}
+        return result
 
     def reload_to_gpu(self, recursive: bool = True) -> None:
         """Explicitly move all buffers back to GPU and rebuild views.
@@ -366,17 +347,12 @@ class FSDPModule:
         Normally not needed — every access path auto-reloads.
         Useful to hide first-touch CPU→GPU copy latency.
         """
-        for module in self._get_fsdp_modules(recursive):
-            for pg in module._fsdp_param_groups:
-                for buf in (
-                    pg.model_weight_buffer,
-                    pg.transpose_weight_buffer,
-                    pg.main_weight_buffer,
-                    pg.main_grad_buffer,
-                ):
-                    if buf is not None:
-                        buf._move_data_to(torch.device(f"cuda:{torch.cuda.current_device()}"))
-                pg._rebuild_dist_views()
+        param_groups = [
+            param_group
+            for module in self._get_fsdp_modules(recursive)
+            for param_group in module._fsdp_param_groups
+        ]
+        ParameterGroup.reload_storage_to_gpu(param_groups)
 
     def _init_named_param_groups(
         self,
@@ -661,14 +637,13 @@ class FSDPModule:
             prefetch_modules = []
         for module in [self] + prefetch_modules:
             if all(
-                param_group.has_unsharded_weight_buffers(bwd_pass=bwd_pass)
+                param_group.model_weights_are_unsharded(bwd_pass=bwd_pass)
                 for param_group in module._fsdp_param_groups
             ):
                 continue
             if bwd_pass and id(module) in ctx.backward_done_modules:
                 continue  # Skip prefetch for modules whose backward is already done
 
-            owned_weight_buffers = []
             for param_names, param_group in module._named_param_groups:
                 # Optional NaN checking for debugging
                 if getattr(module, "_enable_nan_checks", False):
@@ -676,19 +651,10 @@ class FSDPModule:
                         assert not torch.isnan(
                             dist_param._local_tensor
                         ).any(), f"NaN detected in dist param for parameter {name}"
-                for weight_buffer in param_group.weight_buffers_for_unshard(bwd_pass=bwd_pass):
-                    owned_weight_buffers.append((param_group, weight_buffer))
 
-            full_buffers = DataParallelBuffer.redistribute_buffers(
-                [weight_buffer for _, weight_buffer in owned_weight_buffers],
-                [Placement.REPLICATE, Placement.REPLICATE],
-                stream=stream,
-                async_op=async_op,
+            ParameterGroup.unshard_model_weights(
+                module._fsdp_param_groups, bwd_pass=bwd_pass, stream=stream, async_op=async_op
             )
-            for (param_group, weight_buffer), full_buffer in zip(
-                owned_weight_buffers, full_buffers
-            ):
-                param_group.bind_params(weight_buffer, full_buffer)
 
             # Post-processing may launch Transformer Engine kernels. Defer it
             # until this module's caller stream has waited for communication.
@@ -709,7 +675,7 @@ class FSDPModule:
         pending_post = ctx.unshard_pending_post[id(self)]
         if bwd_pass in pending_post:
             for _, param_group in self._named_param_groups:
-                param_group.post_unshard(bwd_pass=bwd_pass)
+                param_group.finalize_model_weight_unshard(bwd_pass=bwd_pass)
             pending_post.remove(bwd_pass)
 
         # Replace module parameters with unsharded versions
@@ -1055,22 +1021,21 @@ class FSDPModule:
                 buffer_entries = []
                 group_pad = 0
                 group_comm = 0
-                for buffer_label, buffer in (
-                    ("W", param_group.model_weight_buffer),
-                    ("MW", param_group.main_weight_buffer),
-                    ("G", param_group.main_grad_buffer),
-                ):
-                    if buffer is None:
-                        continue
-                    global_size = buffer.buffer_index.bucket_meta.size
-                    elem_size = _elem_size(buffer.dtype)
+                buffer_metadata, model_weight_ranges = param_group.buffer_diagnostics()
+                for (
+                    buffer_label,
+                    buffer_dtype,
+                    data_size,
+                    global_size,
+                    outer_sharded,
+                    inner_sharded,
+                ) in buffer_metadata:
+                    elem_size = _elem_size(buffer_dtype)
                     group_pad += max(0, global_size - numel) * elem_size
                     group_comm += global_size * elem_size
-                    dist_flag = (
-                        "O" if buffer.outer_sharded else "I" if buffer.inner_sharded else "R"
-                    )
+                    dist_flag = "O" if outer_sharded else "I" if inner_sharded else "R"
                     buffer_entries.append(
-                        f"{buffer_label}[{_fmt_dtype(buffer.dtype)}:{buffer.data_size}:{dist_flag}]"
+                        f"{buffer_label}[{_fmt_dtype(buffer_dtype)}:{data_size}:{dist_flag}]"
                     )
                 total_pad += group_pad
                 total_comm += group_comm
@@ -1085,19 +1050,13 @@ class FSDPModule:
                     f"comm={_mb(group_comm)} pad={_mb(group_pad)} "
                     f"{' '.join(buffer_entries)}"
                 )
-                for param_name, param, param_shape in zip(
-                    param_names, param_group.params, param_shapes
+                for param_name, param_shape, model_weight_range in zip(
+                    param_names, param_shapes, model_weight_ranges
                 ):
-                    dist_idx = param_group.param_idx.get(param)
                     offset_info = ""
-                    if param_group.model_weight_buffer is not None and dist_idx is not None:
-                        item_index = (
-                            param_group.model_weight_buffer.buffer_index.item_index_map.get(
-                                dist_idx
-                            )
-                        )
-                        if item_index is not None:
-                            offset_info = f" @{item_index.global_data_index:,}+{item_index.size:,}"
+                    if model_weight_range is not None:
+                        offset, size = model_weight_range
+                        offset_info = f" @{offset:,}+{size:,}"
                     lines.append(f"    {param_name:50s} {str(tuple(param_shape)):24s}{offset_info}")
                 group_idx += 1
 
@@ -1125,15 +1084,7 @@ class FSDPModule:
                 if not isinstance(child, FSDPModule):
                     continue
                 for param_group in child._fsdp_param_groups:
-                    for param in param_group.params:
-                        wbuf = param_group.model_weight_buffer
-                        param_data = wbuf.get_item(
-                            param_group.param_idx[param],
-                            placements=[Placement.REPLICATE, Placement.REPLICATE],
-                        )
-                        assert not torch.isnan(
-                            param_data
-                        ).any(), "NaN detected in model weight buffer"
+                    param_group.assert_model_weights_not_nan()
 
     def get_root_module(self):
         """Return the root FSDP module associated with this module."""

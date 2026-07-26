@@ -182,10 +182,13 @@ to `ParameterGroup`. See
 
 Groups parameters sharing the same (device, dtype, requires_grad):
 
-- `model_weight_buffer` — stores compute weights; replicated for no-shard/ZeRO-1/2 and sharded for ZeRO-3
-- `main_weight_buffer` — optional high-precision optimizer copy; sharded when optimizer state is sharded
-- `main_grad_buffer` — accumulates gradients before reduce
-- `dist_params` — DTensor views into the buffer
+- Owns model, transpose, main-weight, and main-gradient buffer roles
+- Selects and collectively unshards the weight representations required by each pass
+- Binds full weight views and finalizes mixed-precision representations
+- Commits gradient redistribution results and exposes optimizer-facing DTensors
+
+`FSDPModule` schedules semantic parameter-group operations; it does not select,
+redistribute, or bind weight buffers.
 
 ### Uneven DTensor Handling
 

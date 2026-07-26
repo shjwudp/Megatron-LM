@@ -173,24 +173,15 @@ else:
     prefetch = []
 
 for module in [self] + prefetch:
-    if all(pg.has_unsharded_weight_buffers(bwd_pass=bwd_pass) for pg in module._fsdp_param_groups):
+    if all(pg.model_weights_are_unsharded(bwd_pass=bwd_pass) for pg in module._fsdp_param_groups):
         continue          # Required buffers are already unsharded — skip
 
-    owned_weight_buffers = [
-        (param_group, buffer)
-        for _, param_group in module._named_param_groups
-        for buffer in param_group.weight_buffers_for_unshard(bwd_pass=bwd_pass)
-    ]
-    full_buffers = DataParallelBuffer.redistribute_buffers(
-        [buffer for _, buffer in owned_weight_buffers],
-        [Placement.REPLICATE, Placement.REPLICATE],
+    ParameterGroup.unshard_model_weights(
+        module._fsdp_param_groups,
+        bwd_pass=bwd_pass,
         stream=stream,
         async_op=async_op,
     )
-
-    # Caller stream: rebind tensor metadata; do not run TE post-processing yet.
-    for (param_group, buffer), full_buffer in zip(owned_weight_buffers, full_buffers):
-        param_group.bind_params(buffer, full_buffer)
 
     ctx.unshard_pending_post[id(module)].add(bwd_pass)
 
@@ -208,7 +199,7 @@ if ctx.unshard_done_events[id(self)] is not None:
 # this module's communication event has joined the caller stream.
 if bwd_pass in ctx.unshard_pending_post[id(self)]:
     for _, param_group in self._named_param_groups:
-        param_group.post_unshard(bwd_pass=bwd_pass)
+        param_group.finalize_model_weight_unshard(bwd_pass=bwd_pass)
     ctx.unshard_pending_post[id(self)].remove(bwd_pass)
 
 # Install full parameter tensors into the nn.Module (safe after event.wait)
@@ -220,10 +211,11 @@ for param_names, param_group in self._named_param_groups:
 **Stream ownership and buffer lifetime.** Temporary full buffers are allocated on the
 caller stream, while only the all-gather collective and its `Work.wait()` execute with
 `ag_stream` current. Tensor rebinding is metadata-only and returns to the caller stream.
-The caller waits for the module event before running mixed-precision `post_unshard()` or
-installing full parameters into the module. Explicit stream events order consumption and
-free; all all-gather outputs also record `ag_stream` so the allocator cannot recycle a
-temporary buffer while communication is still using it.
+The caller waits for the module event before running
+`finalize_model_weight_unshard()` or installing full parameters into the module.
+Explicit stream events order consumption and free; all all-gather outputs also record
+`ag_stream` so the allocator cannot recycle a temporary buffer while communication is
+still using it.
 
 **Stream ordering barrier.** When `async_op=True`, the caller stream is captured before
 any stream switch inside `redistribute_buffers()`. The batch allocates final output
@@ -239,21 +231,23 @@ captured async unshard.
 `torch.cuda.nvtx` range (`"MFSDP unshard"`, `"MFSDP reshard"`, `"MFSDP reduce_grad"`)
 for profiling visibility in tools like Nsight Systems.
 
-**All-gather coalescing.** `FSDPModule.unshard()` supplies the final replicated target;
-`DataParallelBuffer.redistribute_buffers()` derives mesh-axis order and groups consecutive
-buffers with the same process group, dtype, device, and source placement. It completes
-the outer dimension before the inner dimension, and each dimension uses one grouped
-launch when it contains multiple compatible buffers and its process group has more than
-one rank. Buffer state determines whether a placement needs a collective. Each
-`ParameterGroup` still owns binding and post-processing. With `async_ops=True`, the
-coalescing manager owns the resulting `Work`; the async path calls
+**All-gather coalescing.** `FSDPModule.unshard()` delegates the module's ordered
+parameter groups to `ParameterGroup.unshard_model_weights()`. The parameter-group
+operation privately selects the required weight representations and supplies their final
+replicated target to `DataParallelBuffer.redistribute_buffers()`. The buffer planner
+derives mesh-axis order and groups consecutive buffers with the same process group,
+dtype, device, and source placement. It completes the outer dimension before the inner
+dimension, and each dimension uses one grouped launch when it contains multiple
+compatible buffers and its process group has more than one rank. Buffer state determines
+whether a placement needs a collective. With `async_ops=True`, the coalescing manager
+owns the resulting `Work`; the async path calls
 `coalescing_event.wait()` while `ag_stream` is current before advancing to the next
 dimension or recording the module event.
 
 Prefetched modules keep their `bwd_pass` value in `unshard_pending_post`. When their own
 pre-hook later arrives, it skips the already-launched all-gather, waits for its event, and
-runs `post_unshard()` on the caller stream. Removing the phase from the pending set makes
-re-entry and activation recompute idempotent.
+runs `finalize_model_weight_unshard()` on the caller stream. Removing the phase from the
+pending set makes re-entry and activation recompute idempotent.
 
 ### `_get_prefetch_next_modules(bwd_pass)`
 
@@ -518,21 +512,21 @@ optimizer-facing DTensor shards through `dist_params`.
 For ZeRO-1/2, `copy_main_weights_to_model_weights()` marks the replicated
 `DataParallelBuffer` dirty when `main_weight_buffer` is sharded and
 `model_weight_buffer` is replicated. The next normal unshard for that buffer
-calls `DataParallelBuffer.unshard()`, which refreshes any dirty replicated
+asks `ParameterGroup.unshard_model_weights()` to refresh any dirty replicated
 buffer before compute:
 
 1. Non-FP8 weights copy this rank's updated main-weight shard into the matching
    slice of the replicated model-weight buffer.
 2. FP8 weights quantize the local FP32 main-weight shard into the local FP8
    model-weight shard first; MXFP8 marks the transpose buffer dirty as well.
-3. `DataParallelBuffer.unshard(bind_params=...)` sees the dirty flag and gathers
-   the updated shards directly into the full replicated compute buffer on every
-   rank, then clears the flag. The same call can bind params to `self.data` for
-   the current compute phase.
+3. `ParameterGroup.unshard_model_weights()` privately selects the dirty buffer,
+   asks `DataParallelBuffer.redistribute_buffers()` to gather the updated shards
+   into the full replicated compute buffer on every rank, and binds the result
+   for the current compute phase.
 
 The rowwise/model buffer is refreshed on forward unshard. For MXFP8, the
-transpose buffer is refreshed on backward unshard, where
-`weight_buffers_for_unshard(..., bwd_pass=True)` selects it.
+transpose buffer is refreshed on backward unshard, where the mixed-precision
+policy privately selects the backward representation.
 
 The final backward callback arms `ctx.model_weight_refresh_pending` only when
 `is_last_backward` is true. An optimizer integration that explicitly calls
@@ -567,7 +561,7 @@ Two mechanisms:
 | Mechanism | Effect |
 |---|---|
 | **Derived `backward_module`** | `_advance_backward_module()` scans `_reversed_order` for the first module **not** in `backward_done_modules`. This identifies the pending module even when activation recompute fires **before** any layer's `pre_backward_hook` (which is always the case — the checkpoint wrapper triggers recompute, then backward flows through the recomputed graph). |
-| **Buffer readiness check** | `has_unsharded_weight_buffers(bwd_pass=...)` skips redundant all-gathers for the buffers required by the current forward/backward phase. |
+| **Buffer readiness check** | `model_weights_are_unsharded(bwd_pass=...)` skips redundant all-gathers for the representations required by the current forward/backward phase. |
 
 The `backward_phase` flag gates the forward post-hook check; `backward_done_modules`
 drives both the derived pointer and the prefetch guard.
@@ -685,16 +679,16 @@ ag_stream:    |AG(L[0])  AG(L[1])|        AG(L[2])|                |
 
 pre-hook L[0]: async unshard L[0] + prefetch L[1] on ag_stream
                event[L[0]].wait() → main stream unblocks
-               post_unshard(L[0]) on main stream
+               finalize_model_weight_unshard(L[0]) on main stream
                _replace_module_parameter(L[0])
 
 pre-hook L[1]: event[L[1]] already set → wait (likely done)
-               post_unshard(L[1]) on main stream
+               finalize_model_weight_unshard(L[1]) on main stream
                _replace_module_parameter(L[1])
                async prefetch L[2] on ag_stream
 
 pre-hook L[2]: event[L[2]].wait() → main stream unblocks
-               post_unshard(L[2]) on main stream
+               finalize_model_weight_unshard(L[2]) on main stream
                _replace_module_parameter(L[2])
 
 BACKWARD PASS (enable_async_reduce_grad=True, full-iteration CUDA graph)

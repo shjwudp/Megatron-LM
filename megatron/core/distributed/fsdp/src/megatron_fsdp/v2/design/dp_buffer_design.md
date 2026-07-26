@@ -51,27 +51,30 @@ The parameter group owns consumers and training semantics:
 - the ordered parameters and parameter-to-item mapping;
 - model, transpose, main-weight, and main-gradient buffer roles;
 - mixed-precision policy;
+- selecting the weight representations required by a forward or backward pass;
+- batching weight redistribution across ordered parameter groups;
 - binding unsharded buffer views to parameters;
 - committing or accumulating gradient communication output;
 - optimizer-facing DTensor views;
 - the sequence of weight, gradient, and mixed-precision transformations.
 
-`bind_params()` belongs here because it combines parameter identity, buffer indexing,
-and mixed-precision representation rules. `commit_comm_output()` belongs here because
-copy-versus-accumulate is gradient-accumulation state, not a storage property.
+`_bind_params()` is private because it combines internal buffer identity, parameter
+indexing, and mixed-precision representation rules. `unshard_model_weights()` is the
+semantic entry point used by the module scheduler. `commit_comm_output()` belongs here
+because copy-versus-accumulate is gradient-accumulation state, not a storage property.
 
 ### FSDPModule
 
 The module runtime owns scheduling:
 
 - selecting communication streams;
-- selecting the target placements for a module operation;
 - prefetch, event, and hook coordination.
 
-Every scheduled weight buffer travels with its owning `ParameterGroup`.
-`DataParallelBuffer.redistribute_buffers()` derives compatibility and mesh-axis
-ordering from the buffers and target placements. After redistribution, the module
-asks each owner to bind its full buffer.
+The module passes an ordered parameter-group sequence and lifecycle context to
+`ParameterGroup.unshard_model_weights()`. It does not inspect weight-buffer roles,
+choose placements, call buffer redistribution, or bind storage. Mixed-precision
+finalization remains a separate semantic operation because prefetched communication
+must join the caller stream before Transformer Engine kernels may launch.
 
 ### MixedPrecisionPolicy
 
@@ -110,14 +113,15 @@ device, and source placement.
 ## Core Operations
 
 ```text
-FSDPModule / ParameterGroup             DataParallelBuffer
----------------------------             ------------------
-select final target  ---------------->  redistribute_buffers(target)
-                                        group compatible buffers
-                                        apply one-axis redistribute()
-                           <----------  result tensors
-ParameterGroup commits results
-ParameterGroup binds parameter views
+FSDPModule            ParameterGroup                    DataParallelBuffer
+----------            --------------                    ------------------
+schedule groups  ---> select private weight buffers
+                      select final target  ------------> redistribute_buffers(target)
+                                                            group compatible buffers
+                                                            apply one-axis redistribute()
+                      <---------------- result tensors
+                      bind parameter views
+wait event  --------> finalize mixed-precision views
 ```
 
 `redistribute()` updates the buffer placement and returns the tensor produced by that
@@ -133,17 +137,20 @@ gradients partial.
 
 1. `ParameterGroup` creates buffers with a shared mesh and layout inputs.
 2. It copies each policy-provided parameter representation with `set_item()`.
-3. For replicated compute weights, it calls `bind_params()` immediately.
+3. For replicated compute weights, it calls `_bind_params()` immediately.
 4. It builds optimizer-facing DTensor views from the appropriate buffer.
 
 ### Weight unshard and reshard
 
-1. `FSDPModule` collects `(ParameterGroup, DataParallelBuffer)` ownership pairs and
-   requests the final `[REPLICATE, REPLICATE]` target.
-2. `DataParallelBuffer.redistribute_buffers()` groups compatible buffers and
+1. `FSDPModule` schedules an ordered parameter-group sequence on the selected stream.
+2. `ParameterGroup.unshard_model_weights()` privately selects the required weight
+   buffers and requests the final `[REPLICATE, REPLICATE]` target.
+3. `DataParallelBuffer.redistribute_buffers()` groups compatible buffers and
    redistributes the outer placement before the inner placement.
-3. The owning group binds its parameters to the resulting full buffer.
-4. Resharding returns each buffer to its persistent placements and releases temporary
+4. Each owning group binds its parameters to the resulting full buffer.
+5. After async communication joins the caller stream, each group finalizes its
+   mixed-precision representation.
+6. Resharding returns each buffer to its persistent placements and releases temporary
    full storage.
 
 ### Gradient reduction
@@ -187,7 +194,8 @@ state.
 - only `ParameterGroup` binds storage to parameters.
 - only `ParameterGroup` decides whether a communication result overwrites or
   accumulates.
-- `FSDPModule` never binds a buffer without its owning group.
+- `FSDPModule` does not inspect, redistribute, or bind weight buffers.
+- weight-buffer selection and binding helpers remain private to `ParameterGroup`.
 - process groups used by a buffer are derived from its mesh and changed axis.
 
 ## Migration

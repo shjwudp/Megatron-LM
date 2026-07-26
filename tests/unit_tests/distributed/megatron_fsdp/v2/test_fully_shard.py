@@ -59,6 +59,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDP
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import mfsdp_forward_pre_hook
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 
 SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
@@ -510,13 +511,15 @@ class TestFullyShardBasic:
 
         monkeypatch.setattr(allocator, "allocate", capture_allocate)
         for param_group in layer._fsdp_param_groups:
-            original_post_unshard = param_group.post_unshard
+            original_finalize_unshard = param_group.finalize_model_weight_unshard
 
-            def capture_post_unshard(bwd_pass=False, *, _original=original_post_unshard):
+            def capture_finalize_unshard(bwd_pass=False, *, _original=original_finalize_unshard):
                 post_streams.append(torch.cuda.current_stream())
                 return _original(bwd_pass=bwd_pass)
 
-            monkeypatch.setattr(param_group, "post_unshard", capture_post_unshard)
+            monkeypatch.setattr(
+                param_group, "finalize_model_weight_unshard", capture_finalize_unshard
+            )
 
         try:
             model.unshard(async_op=True)
@@ -534,6 +537,32 @@ class TestFullyShardBasic:
         finally:
             model.reshard()
             layer.reshard()
+
+    def test_module_unshard_delegates_weight_ownership_to_param_group(self, monkeypatch):
+        """The module should schedule unshard without selecting or binding weight buffers."""
+        torch.manual_seed(42)
+        model = SimpleMLP(16).to(_device())
+        fully_shard(model, enable_unshard_prefetch=True, enable_async_reduce_grad=False)
+
+        delegated_groups = []
+        original_unshard = ParameterGroup.unshard_model_weights
+
+        def capture_unshard(param_groups, **kwargs):
+            delegated_groups.append((tuple(param_groups), kwargs.copy()))
+            return original_unshard(param_groups, **kwargs)
+
+        monkeypatch.setattr(ParameterGroup, "unshard_model_weights", staticmethod(capture_unshard))
+
+        try:
+            model.unshard(async_op=False)
+            assert delegated_groups == [
+                (
+                    tuple(model._fsdp_param_groups),
+                    {"bwd_pass": False, "stream": torch.cuda.current_stream(), "async_op": False},
+                )
+            ]
+        finally:
+            model.reshard()
 
     @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
     def test_weight_unshard_coalesces_outer_before_inner(self, monkeypatch, outer_strategy):
@@ -563,7 +592,7 @@ class TestFullyShardBasic:
         weight_buffers = []
 
         for param_group in model._fsdp_param_groups:
-            weight_buffers.extend(param_group.weight_buffers_for_unshard())
+            weight_buffers.extend(param_group._weight_buffers_for_unshard())
 
         assert len(weight_buffers) == 2
         first_buffer, second_buffer = weight_buffers
