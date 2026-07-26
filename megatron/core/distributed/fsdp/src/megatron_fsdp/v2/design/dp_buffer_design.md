@@ -226,11 +226,11 @@ lease from asynchronous all-gather launch through the final consumer.
    full-gradient owner is reused. Scaling is applied once during this preprocessing
    and does not cause allocation.
 5. `DataParallelBuffer.redistribute()` performs one all-reduce or reduce-scatter and
-   returns its destination DP buffer. Every target output is a placement view of the
-   same communication owner.
-6. Non-final inner results are copied or accumulated into the persistent `[P, S]`
-   gradient view. On the final backward, prior accumulation is merged into the new
-   inner result before the target loop advances to the outer redistribution.
+   returns its destination DP buffer. Each target output is a contained placement view
+   of the current communication buffer.
+6. Before an outer-axis transition, the parameter group merges any persistent
+   `[P, S]` inner-DP accumulation into the transition input. After the target loop, it
+   copies or accumulates the result once into the matching persistent gradient view.
 7. The group exposes the resulting shards through optimizer-facing DTensors and
    releases the full-gradient lease after asynchronous communication completes.
 

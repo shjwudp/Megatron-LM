@@ -422,9 +422,10 @@ def test_hsdp_reuses_one_grad_comm_workspace_across_axes():
             allocation_keys.append(kwargs.get("key", args[0] if args else None))
             return original_allocate(*args, **kwargs)
 
-        def capture_reduce_axis(input_buffer, output_buffer, changed_axis, **kwargs):
-            redistribution_dtypes.append((input_buffer.dtype, output_buffer.dtype))
-            return original_reduce_axis(input_buffer, output_buffer, changed_axis, **kwargs)
+        def capture_reduce_axis(input_buffer, target_placements, changed_axis, **kwargs):
+            result = original_reduce_axis(input_buffer, target_placements, changed_axis, **kwargs)
+            redistribution_dtypes.append((input_buffer.dtype, result.dtype))
+            return result
 
         pg.allocator.allocate = capture_allocate
         pg._reduce_gradient_axis = capture_reduce_axis

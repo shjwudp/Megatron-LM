@@ -585,14 +585,14 @@ class ParameterGroup:
             targets.append((changed_axis, current_placements.copy()))
         return targets
 
-    def _prepare_gradient_communication(
+    def _preprocess_gradient(
         self,
         full_grad_buffer: DataParallelBuffer,
         input_placements: list[Placement],
         *,
         stream: Optional[torch.cuda.Stream] = None,
-    ) -> tuple[DataParallelBuffer, DataParallelBuffer, tuple | None]:
-        """Prepare one communication owner before all gradient redistributions."""
+    ) -> tuple[DataParallelBuffer, tuple | None]:
+        """Convert and scale the full gradient once before redistribution."""
         comm_dtype = self.grad_comm_dtype or full_grad_buffer.dtype
         workspace_key = None
         communication_owner = full_grad_buffer
@@ -628,27 +628,48 @@ class ParameterGroup:
                 if needs_scaling:
                     communication_owner.data.mul_(self.gradient_scaling_factor)
 
-        communication_input = self._placement_view(communication_owner, input_placements)
-        return communication_owner, communication_input, workspace_key
+        return self._placement_view(communication_owner, input_placements), workspace_key
+
+    def _merge_reduced_gradient(
+        self,
+        input_buffer: DataParallelBuffer,
+        changed_axis: int,
+        *,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Merge persistent inner-DP accumulation before reducing the outer axis."""
+        if not self._reduced_grad_buffer_has_accumulated_grad or changed_axis != 0:
+            return
+        accumulation_placements = self._optimizer_placements()
+        if self.mesh.size(0) > 1:
+            accumulation_placements[0] = Placement.PARTIAL
+        if input_buffer.placements != accumulation_placements:
+            return
+        accumulated_buffer = self._gradient_storage_view(accumulation_placements)
+        self._commit_gradient(input_buffer, accumulated_buffer, accumulate=True, stream=stream)
+        self._reduced_grad_buffer_has_accumulated_grad = False
 
     def _reduce_gradient_axis(
         self,
         input_buffer: DataParallelBuffer,
-        output_buffer: DataParallelBuffer,
+        target_placements: list[Placement],
         changed_axis: int,
         *,
         stream: Optional[torch.cuda.Stream] = None,
     ) -> DataParallelBuffer:
-        """Redistribute one gradient axis between explicit DP buffers."""
+        """Merge any pending input and redistribute one gradient axis."""
+        self._merge_reduced_gradient(input_buffer, changed_axis, stream=stream)
+        storage_owner = input_buffer._storage_owner or input_buffer
+        output_buffer = self._placement_view(storage_owner, target_placements)
         expected_placements = input_buffer.placements.copy()
-        expected_placements[changed_axis] = output_buffer.placements[changed_axis]
-        if expected_placements != output_buffer.placements:
+        expected_placements[changed_axis] = target_placements[changed_axis]
+        if expected_placements != target_placements:
             raise ValueError(
                 f"Axis {changed_axis} does not describe gradient redistribution "
-                f"{input_buffer.placements} -> {output_buffer.placements}"
+                f"{input_buffer.placements} -> {target_placements}"
             )
         return input_buffer.redistribute(
-            output_buffer.placements, output_buffer=output_buffer, stream=stream
+            target_placements, output_buffer=output_buffer, stream=stream
         )
 
     @staticmethod
@@ -750,7 +771,6 @@ class ParameterGroup:
         # consumed below on every microbatch.
         self._full_grad_buffer_has_accumulated_grad = True
 
-        grad_buffer = self.main_grad_buffer
         full_grad_buffer = self._acquire_full_grad_buffer()
         partial_placements = full_grad_buffer.placements.copy()
         partial_placements[1] = Placement.PARTIAL
@@ -761,54 +781,27 @@ class ParameterGroup:
         if not targets:
             return
 
-        communication_owner, current_buffer, workspace_key = self._prepare_gradient_communication(
+        grad_input_buffer, workspace_key = self._preprocess_gradient(
             full_grad_buffer, partial_placements, stream=stream
         )
-        optimizer_placements = self._optimizer_placements()
-        accumulation_placements = optimizer_placements.copy()
-        if self.mesh.size(0) > 1:
-            accumulation_placements[0] = Placement.PARTIAL
-        merged_previous_accumulation = False
         try:
+            # Full gradient buffer to reduced buffer.
+            current_buffer = grad_input_buffer
             for changed_axis, target_placements in targets:
-                output_buffer = self._placement_view(communication_owner, target_placements)
                 current_buffer = self._reduce_gradient_axis(
-                    current_buffer, output_buffer, changed_axis, stream=stream
+                    current_buffer, target_placements, changed_axis, stream=stream
                 )
-                if current_buffer.placements[1] is Placement.SHARD:
-                    self._full_grad_buffer_has_accumulated_grad = False
+            if current_buffer.placements[1] is Placement.SHARD:
+                self._full_grad_buffer_has_accumulated_grad = False
 
-                if (
-                    is_last_backward
-                    and not merged_previous_accumulation
-                    and self._reduced_grad_buffer_has_accumulated_grad
-                    and current_buffer.placements == accumulation_placements
-                ):
-                    accumulated_buffer = self._gradient_storage_view(accumulation_placements)
-                    self._commit_gradient(
-                        current_buffer, accumulated_buffer, accumulate=True, stream=stream
-                    )
-                    merged_previous_accumulation = True
-
-            if not is_last_backward:
-                accumulated_buffer = self._gradient_storage_view(current_buffer.placements)
-                self._commit_gradient(
-                    accumulated_buffer,
-                    current_buffer,
-                    accumulate=self._reduced_grad_buffer_has_accumulated_grad,
-                    stream=stream,
-                )
-                self._reduced_grad_buffer_has_accumulated_grad = True
-                return
-
-            if self._reduced_grad_buffer_has_accumulated_grad and not merged_previous_accumulation:
-                raise RuntimeError(
-                    "Gradient reduction did not reach the persistent "
-                    f"accumulation placement {accumulation_placements}"
-                )
-
-            optimizer_grad = self._gradient_storage_view(optimizer_placements)
-            self._commit_gradient(optimizer_grad, current_buffer, accumulate=False, stream=stream)
+            # Commit the reduced buffer to persistent gradient storage.
+            accumulated_buffer = self._gradient_storage_view(current_buffer.placements)
+            self._commit_gradient(
+                accumulated_buffer,
+                current_buffer,
+                accumulate=self._reduced_grad_buffer_has_accumulated_grad,
+                stream=stream,
+            )
             self._reduced_grad_buffer_has_accumulated_grad = True
         finally:
             if workspace_key is not None:
