@@ -17,7 +17,12 @@ import torch
 from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from ..uneven_dtensor import copy_chunk_metadata, make_uneven_dtensor
+from ..uneven_dtensor import (
+    copy_chunk_metadata,
+    detach_uneven_dtensor_local_tensor,
+    make_uneven_dtensor,
+    rebind_uneven_dtensor_local_tensor,
+)
 from .allocator import BucketAllocator, TemporaryBucketAllocator
 from .buffer_index import BufferIndex, Placement
 from .dp_buffer import DataParallelBuffer
@@ -289,7 +294,11 @@ class ParameterGroupV2:
 
         grad_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])
         self.grad_buffer = self._new_buffer(grad_dtype, self.layout.grad_storage)
-        self._allocate_persistent(self.grad_buffer)
+
+    def _ensure_grad_storage(self) -> None:
+        """Lazily allocate persistent gradient storage for the current step."""
+        if self.grad_buffer.data is None:
+            self._allocate_persistent(self.grad_buffer)
 
     @staticmethod
     def _dtensor_placements(placements: Placements) -> list[Replicate | Shard]:
@@ -342,6 +351,13 @@ class ParameterGroupV2:
                     param.shape,
                     self.mesh,
                     optimizer_param.placements,
+                    copy_chunk_meta_from=optimizer_param,
+                )
+            elif self._optimizer_grads[index]._local_tensor is None:
+                rebind_uneven_dtensor_local_tensor(
+                    self._optimizer_grads[index],
+                    local_grad,
+                    param.shape,
                     copy_chunk_meta_from=optimizer_param,
                 )
 
@@ -464,6 +480,7 @@ class ParameterGroupV2:
 
     def begin_backward(self) -> DataParallelBuffer:
         """Acquire uninitialized storage for the full local-gradient contribution."""
+        self._ensure_grad_storage()
         if self.state.full_grad is None:
             self.state.full_grad = self._allocate_scratch(
                 "full_grad", self.grad_buffer, self.full_placements
@@ -606,5 +623,9 @@ class ParameterGroupV2:
                 optimizer_param.grad = None
                 if hasattr(optimizer_param, "decoupled_grad"):
                     optimizer_param.decoupled_grad = None
-        else:
+            for optimizer_grad in self._optimizer_grads:
+                if optimizer_grad is not None:
+                    detach_uneven_dtensor_local_tensor(optimizer_grad)
+            self.grad_buffer.unbind()
+        elif self.grad_buffer.data is not None:
             self.grad_buffer.data.zero_()

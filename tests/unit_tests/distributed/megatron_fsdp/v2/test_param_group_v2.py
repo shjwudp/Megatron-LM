@@ -346,6 +346,7 @@ def test_hsdp_layout_rejects_reversed_mesh_axes():
 
 def test_gradient_storage_zeroing_is_lazy(monkeypatch):
     group, _, _ = _build_1d_group("optim_grads_params")
+    assert group.grad_buffer.data is None
     allocate_scratch = group._allocate_scratch
 
     def allocate_with_sentinel(role, prototype, placements):
@@ -359,7 +360,7 @@ def test_gradient_storage_zeroing_is_lazy(monkeypatch):
     group.grad_buffer.data.fill_(11)
     group.zero_grad()
     assert group.state.grad_phase is GradientPhaseV2.EMPTY
-    assert torch.count_nonzero(group.grad_buffer.data != 11) == 0
+    assert group.grad_buffer.data is None
 
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
@@ -372,8 +373,22 @@ def test_gradient_storage_zeroing_is_lazy(monkeypatch):
         rtol=0,
         atol=0,
     )
+    optimizer_grad = group.optimizer_grads[0]
+    assert optimizer_grad is not None
+
+    group.zero_grad()
+    assert group.grad_buffer.data is None
+    assert optimizer_grad._local_tensor is None
+
+    group.begin_backward().data.fill_(rank + 2)
+    group.reduce_grad(is_last_backward=True)
+    assert group.optimizer_grads[0] is optimizer_grad
+    assert optimizer_grad._local_tensor.data_ptr() == group.optimizer_grad().tensor_view(
+        0
+    ).data_ptr()
 
     group.zero_grad(set_to_none=False)
+    assert group.grad_buffer.data is not None
     assert torch.count_nonzero(group.grad_buffer.data) == 0
 
 

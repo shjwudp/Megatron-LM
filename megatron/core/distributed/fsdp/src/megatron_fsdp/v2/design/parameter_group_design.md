@@ -114,8 +114,10 @@ distinct allocation, or it may be a placement view of `weight_buffer` when dtype
 and storage permit. Optimizer DTensors are therefore always built from
 `main_weight_buffer`, without an optional-main-buffer branch.
 
-`grad_buffer` owns enough persistent storage for `grad_storage`. The optimizer
-consumes its `main_weight` placement view after gradient finalization.
+`grad_buffer` persistently owns its index, dtype, mesh, and `grad_storage`
+placement, but its backing allocation is step-local. Storage is lazily bound when
+backward begins. The optimizer consumes its `main_weight` placement view after
+gradient finalization.
 
 Mixed-precision formats may require another physical weight representation. Such a
 representation reuses the same weight-state abstraction; it does not add HSDP
@@ -168,7 +170,7 @@ Initialization:
 2. allocates and packs persistent model weights;
 3. initializes or aliases optimizer main weights;
 4. creates optimizer parameter DTensors from `main_weight_buffer`;
-5. creates persistent gradient storage;
+5. creates gradient-buffer metadata without allocating its backing storage;
 6. records model-weight validity and an empty gradient state.
 
 The initial state is:
@@ -178,6 +180,7 @@ state.weight_valid = weight_buffer.placements
 state.grad_phase = GradientPhase.EMPTY
 state.full_weight = None
 state.full_grad = None
+grad_buffer.data = None
 ```
 
 For FSDP, initialized model weights are a valid `[S]` source. For HSDP, they
@@ -266,10 +269,12 @@ released. Non-final backward sets the phase to `ACCUMULATING`; the last backward
 sets it to `READY`.
 
 `zero_grad(set_to_none=True)` resets the phase to `EMPTY`, releases any active
-`full_grad` lease, and detaches optimizer-facing gradients without clearing
-`grad_buffer`. The next reduction overwrites stale storage because `EMPTY` means
-there is no value to accumulate. `zero_grad(set_to_none=False)` retains an
-explicit buffer zero to preserve its observable zero-tensor contract.
+`full_grad` lease, detaches the local tensors from cached optimizer-gradient
+DTensor wrappers, and unbinds `grad_buffer` storage. The next backward binds a
+fresh `torch.empty` allocation, reuses the cached DTensor wrappers, and overwrites
+storage because `EMPTY` means there is no value to accumulate.
+`zero_grad(set_to_none=False)` retains the allocation and explicitly zeros it to
+preserve its observable zero-tensor contract.
 
 ## Ownership boundaries
 
@@ -316,4 +321,6 @@ Distributed tests must cover:
 9. repeated unshard/reshard without leaked scratch leases;
 10. numerical equivalence across multiple microbatches;
 11. outer-to-inner weight all-gather and inner-to-outer gradient reduction
-    ordering for outer-optimizer-sharded HSDP.
+    ordering for outer-optimizer-sharded HSDP;
+12. lazy gradient allocation, release on `zero_grad(set_to_none=True)`, and
+    optimizer-gradient DTensor rebinding on the next step.
