@@ -564,11 +564,7 @@ class ParameterGroup:
         return self._placement_view(grad_buffer, placements)
 
     def _preprocess_gradient(
-        self,
-        full_grad_buffer: DataParallelBuffer,
-        input_placements: list[Placement],
-        *,
-        stream: Optional[torch.cuda.Stream] = None,
+        self, full_grad_buffer: DataParallelBuffer, input_placements: list[Placement]
     ) -> tuple[DataParallelBuffer, tuple | None]:
         """Convert and scale the full gradient once before redistribution."""
         comm_dtype = self.grad_comm_dtype or full_grad_buffer.dtype
@@ -594,17 +590,10 @@ class ParameterGroup:
 
         needs_scaling = self.gradient_scaling_factor not in (None, 1.0)
         if communication_owner is not full_grad_buffer or needs_scaling:
-            current_stream = torch.cuda.current_stream()
-            stream = stream or current_stream
-            if stream != current_stream:
-                stream.wait_stream(current_stream)
-            full_grad_buffer.data.record_stream(stream)
-            communication_owner.data.record_stream(stream)
-            with torch.cuda.stream(stream):
-                if communication_owner is not full_grad_buffer:
-                    communication_owner.data.copy_(full_grad_buffer.data)
-                if needs_scaling:
-                    communication_owner.data.mul_(self.gradient_scaling_factor)
+            if communication_owner is not full_grad_buffer:
+                communication_owner.data.copy_(full_grad_buffer.data)
+            if needs_scaling:
+                communication_owner.data.mul_(self.gradient_scaling_factor)
 
         return self._placement_view(communication_owner, input_placements), workspace_key
 
@@ -627,28 +616,20 @@ class ParameterGroup:
         *,
         has_accumulated_grad: bool,
         continue_redistribution: bool,
-        stream: Optional[torch.cuda.Stream] = None,
     ) -> DataParallelBuffer:
         """Assign or accumulate one stage and return the next redistribution input."""
         if persistent_buffer.data.data_ptr() == output_buffer.data.data_ptr():
             if has_accumulated_grad:
                 raise RuntimeError("Cannot accumulate a gradient buffer into itself")
             return persistent_buffer
-        current_stream = torch.cuda.current_stream()
-        stream = stream or current_stream
-        if stream != current_stream:
-            stream.wait_stream(current_stream)
-        persistent_buffer.data.record_stream(stream)
-        output_buffer.data.record_stream(stream)
-        with torch.cuda.stream(stream):
-            if continue_redistribution:
-                if has_accumulated_grad:
-                    output_buffer.data.add_(persistent_buffer.data)
-                return output_buffer
+        if continue_redistribution:
             if has_accumulated_grad:
-                persistent_buffer.data.add_(output_buffer.data)
-            else:
-                persistent_buffer.data.copy_(output_buffer.data)
+                output_buffer.data.add_(persistent_buffer.data)
+            return output_buffer
+        if has_accumulated_grad:
+            persistent_buffer.data.add_(output_buffer.data)
+        else:
+            persistent_buffer.data.copy_(output_buffer.data)
         return persistent_buffer
 
     def model_weights_are_unsharded(self, bwd_pass: bool = False) -> bool:
@@ -714,74 +695,74 @@ class ParameterGroup:
         ZeRO-1 keeps grads replicated during backward and reduce-scatters
         the replicated buffer once when the optimizer syncs.
         """
-        self._ensure_buffers_on_gpu()
-        if self.main_grad_buffer is None:
-            return
+        caller_stream = torch.cuda.current_stream()
+        stream = stream or caller_stream
+        if stream != caller_stream:
+            stream.wait_stream(caller_stream)
 
-        # FSDPModule has staged this microbatch into the full (0, 0) gradient
-        # buffer before calling here. For replicated gradient storage, that
-        # buffer accumulates microbatches until the step-boundary collective.
-        # For sharded gradient storage, it is fresh reduce-scatter input and is
-        # consumed below on every microbatch.
-        self._full_grad_buffer_has_accumulated_grad = True
+        with torch.cuda.stream(stream):
+            self._ensure_buffers_on_gpu()
+            if self.main_grad_buffer is None:
+                return
 
-        full_grad_buffer = self._acquire_full_grad_buffer()
-        partial_placements = full_grad_buffer.placements.copy()
-        partial_placements[1] = Placement.PARTIAL
-        if self.mesh.size(0) > 1:
-            partial_placements[0] = Placement.PARTIAL
+            # FSDPModule has staged this microbatch into the full (0, 0) gradient
+            # buffer before calling here. For replicated gradient storage, that
+            # buffer accumulates microbatches until the step-boundary collective.
+            # For sharded gradient storage, it is fresh reduce-scatter input and is
+            # consumed below on every microbatch.
+            self._full_grad_buffer_has_accumulated_grad = True
 
-        grad_buffer = self.main_grad_buffer
-        reduce_fsdp_grad = is_last_backward or grad_buffer.placements[1] is Placement.SHARD
-        if not reduce_fsdp_grad:
-            return
+            full_grad_buffer = self._acquire_full_grad_buffer()
+            partial_placements = full_grad_buffer.placements.copy()
+            partial_placements[1] = Placement.PARTIAL
+            if self.mesh.size(0) > 1:
+                partial_placements[0] = Placement.PARTIAL
 
-        grad_input_buffer, workspace_key = self._preprocess_gradient(
-            full_grad_buffer, partial_placements, stream=stream
-        )
-        try:
-            optimizer_placements = self._optimizer_placements()
-            fsdp_placements = partial_placements.copy()
-            fsdp_placements[1] = optimizer_placements[1]
-            fsdp_out = self._gradient_storage_view(fsdp_placements)
-            fsdp_has_accumulated_grad = self._reduced_grad_buffer_has_accumulated_grad
-            output_buffer = self._gradient_redistribution_output(
-                grad_input_buffer, fsdp_out, fsdp_has_accumulated_grad
+            grad_buffer = self.main_grad_buffer
+            reduce_fsdp_grad = is_last_backward or grad_buffer.placements[1] is Placement.SHARD
+            if not reduce_fsdp_grad:
+                return
+
+            grad_input_buffer, workspace_key = self._preprocess_gradient(
+                full_grad_buffer, partial_placements
             )
-            grad_input_buffer.redistribute(
-                fsdp_placements, output_buffer=output_buffer, stream=stream
-            )
-
-            reduce_hsdp_grad = self.mesh.size(0) > 1 and is_last_backward
-            fsdp_out = self._commit_gradient_stage(
-                fsdp_out,
-                output_buffer,
-                has_accumulated_grad=fsdp_has_accumulated_grad,
-                continue_redistribution=reduce_hsdp_grad,
-                stream=stream,
-            )
-            if fsdp_placements[1] is Placement.SHARD:
-                self._full_grad_buffer_has_accumulated_grad = False
-
-            if reduce_hsdp_grad:
-                hsdp_out = self._gradient_storage_view(optimizer_placements)
+            try:
+                optimizer_placements = self._optimizer_placements()
+                fsdp_placements = partial_placements.copy()
+                fsdp_placements[1] = optimizer_placements[1]
+                fsdp_out = self._gradient_storage_view(fsdp_placements)
+                fsdp_has_accumulated_grad = self._reduced_grad_buffer_has_accumulated_grad
                 output_buffer = self._gradient_redistribution_output(
-                    fsdp_out, hsdp_out, has_accumulated_grad=False
+                    grad_input_buffer, fsdp_out, fsdp_has_accumulated_grad
                 )
-                fsdp_out.redistribute(
-                    optimizer_placements, output_buffer=output_buffer, stream=stream
-                )
-                self._commit_gradient_stage(
-                    hsdp_out,
+                grad_input_buffer.redistribute(fsdp_placements, output_buffer=output_buffer)
+
+                reduce_hsdp_grad = self.mesh.size(0) > 1 and is_last_backward
+                fsdp_out = self._commit_gradient_stage(
+                    fsdp_out,
                     output_buffer,
-                    has_accumulated_grad=False,
-                    continue_redistribution=False,
-                    stream=stream,
+                    has_accumulated_grad=fsdp_has_accumulated_grad,
+                    continue_redistribution=reduce_hsdp_grad,
                 )
-            self._reduced_grad_buffer_has_accumulated_grad = True
-        finally:
-            if workspace_key is not None:
-                self.allocator.free(workspace_key)
+                if fsdp_placements[1] is Placement.SHARD:
+                    self._full_grad_buffer_has_accumulated_grad = False
+
+                if reduce_hsdp_grad:
+                    hsdp_out = self._gradient_storage_view(optimizer_placements)
+                    output_buffer = self._gradient_redistribution_output(
+                        fsdp_out, hsdp_out, has_accumulated_grad=False
+                    )
+                    fsdp_out.redistribute(optimizer_placements, output_buffer=output_buffer)
+                    self._commit_gradient_stage(
+                        hsdp_out,
+                        output_buffer,
+                        has_accumulated_grad=False,
+                        continue_redistribution=False,
+                    )
+                self._reduced_grad_buffer_has_accumulated_grad = True
+            finally:
+                if workspace_key is not None:
+                    self.allocator.free(workspace_key)
 
     def release_grad_buffer(self):
         """Release this group's temporary full-gradient lease."""

@@ -722,9 +722,11 @@ communication dtype; otherwise it uses a temporary output and assigns or accumul
 afterward. The buffer does not accept raw communication tensors, scaling policy, or
 accumulation policy.
 
-The caller (`FSDPModule.reduce_grad`) provides the stream context. Allocation remains
-on the caller stream before side-stream communication starts, preserving overlap and
-Trace Pool lifetime ordering.
+The caller (`FSDPModule.reduce_grad`) provides the reduction stream.
+`ParameterGroup.reduce_grad()` waits for its caller stream once, then performs
+preprocessing, temporary allocation, both reduction stages, commit, and temporary
+release inside the reduction-stream context. The helpers therefore require no
+additional waits or tensor stream recording.
 
 ---
 
