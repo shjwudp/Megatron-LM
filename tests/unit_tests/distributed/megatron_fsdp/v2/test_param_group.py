@@ -31,7 +31,7 @@ import torch.nn as nn
 from torch.distributed.tensor import DeviceMesh
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import Placement
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
@@ -186,15 +186,17 @@ def test_init_buffers(strategy):
             assert pg.model_weight_buffer is not None
             wbuf = pg.model_weight_buffer
             assert not hasattr(wbuf, "allocator")
+            assert not hasattr(wbuf, "_move_data_to")
+            assert not hasattr(wbuf, "_ensure_data_on_gpu")
             assert wbuf.storage_placements[1] is (
                 Placement.SHARD if w_dist else Placement.REPLICATE
             )
 
-            # Per-param check: get_item should return this rank's portion of
+            # Per-param check: tensor_view should return this rank's portion of
             # the original param. A param may span shard boundaries, so the
             # returned slice can be shorter than the full param or even empty.
             for i, p in enumerate(orig):
-                item = wbuf.get_item(i, placements=wbuf.storage_placements)
+                item = wbuf.tensor_view(i, placements=wbuf.storage_placements)
                 if w_dist:
                     s, e = wbuf.buffer_index._get_item_self_range(
                         i, placements=wbuf.storage_placements

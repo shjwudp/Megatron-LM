@@ -8,7 +8,7 @@ implementations remain valid while responsibilities move to their intended owner
 
 ## Goals
 
-`DataParallelBuffer` should behave like a flat, DTensor-like storage object:
+`DataParallelBuffer` should behave like a flat, DTensor-like distributed view:
 
 - a `DeviceMesh` identifies the data-parallel topology;
 - one logical placement per mesh dimension describes the current distribution;
@@ -37,7 +37,7 @@ The buffer owns bound-storage validation and distribution mechanics:
 - allocation-free placement views and aliases;
 - one-axis-at-a-time redistribution;
 - target-driven axis planning and coalescing for compatible buffers;
-- local item and shard views.
+- ordered local tensor and shard views.
 
 The buffer does not import or retain a `BucketAllocator`, construct allocation keys,
 allocate communication workspaces, or release temporary storage. `view()` succeeds
@@ -62,14 +62,15 @@ The parameter group owns consumers and training semantics:
 - selecting the weight representations required by a forward or backward pass;
 - batching weight redistribution across ordered parameter groups;
 - binding unsharded buffer views to parameters;
-- committing or accumulating gradient communication output;
+- finalizing gradient redistribution results;
 - optimizer-facing DTensor views;
 - the sequence of weight, gradient, and mixed-precision transformations.
 
 `_bind_params()` is private because it combines internal buffer identity, parameter
 indexing, and mixed-precision representation rules. `unshard_model_weights()` is the
-semantic entry point used by the module scheduler. `commit_comm_output()` belongs here
-because copy-versus-accumulate is gradient-accumulation state, not a storage property.
+semantic entry point used by the module scheduler.
+`_finalize_gradient_redistribution()` belongs here because copy-versus-accumulate and
+workspace release are gradient-lifecycle state, not buffer-storage properties.
 
 Logical lifetime and physical allocation lifetime are distinct. On reshard,
 `ParameterGroup` always unbinds and drops its logical lease. A storage-freeing
@@ -170,9 +171,15 @@ gradients partial.
 ### Initial packing
 
 1. `ParameterGroup` creates buffers with a shared mesh and layout inputs.
-2. It copies each policy-provided parameter representation with `set_item()`.
+2. It streams each policy-provided parameter representation through
+   `copy_tensors_()`.
 3. For replicated compute weights, it calls `_bind_params()` immediately.
 4. It builds optimizer-facing DTensor views from the appropriate buffer.
+
+`tensor_view()` returns a local `torch.Tensor` view, not a DTensor. `ParameterGroup`
+combines that local view with parameter shape and optimizer placement metadata to
+construct the optimizer-facing DTensor. Keeping DTensor construction out of the
+buffer preserves the boundary between flat storage/layout and parameter semantics.
 
 ### Weight unshard and reshard
 
@@ -201,8 +208,8 @@ lease from asynchronous all-gather launch through the final consumer.
 3. The gradient buffer performs all-reduce or reduce-scatter for the selected mesh
    axis into a caller-provided destination. `ParameterGroup` supplies a separate
    communication-dtype input when conversion or accumulation requires it.
-4. `ParameterGroup.commit_comm_output()` copies or accumulates the result according to
-   microbatch state.
+4. `ParameterGroup._finalize_gradient_redistribution()` copies or accumulates the
+   result according to microbatch state, then releases any communication workspace.
 5. The group exposes the resulting shards through optimizer-facing DTensors and
    releases the full-gradient lease after asynchronous communication completes.
 
@@ -222,10 +229,11 @@ data dependency explicit.
 
 ### CPU offload and checkpoint views
 
-Moving persistent storage may invalidate local DTensor views. The buffer owns the
-storage move, while `ParameterGroup` rebuilds parameter and gradient views. Checkpoint
-code consumes the optimizer-facing DTensors and should not reach into collective
-state.
+Moving persistent storage may invalidate local DTensor views. `ParameterGroup` owns
+the storage move and rebuilds parameter and gradient views afterwards.
+`DataParallelBuffer` only binds or unbinds the externally supplied replacement
+tensor. Checkpoint code consumes optimizer-facing DTensors and should not reach into
+collective state.
 
 ## Invariants
 
@@ -233,6 +241,7 @@ state.
 - `storage_placements` describe the tensor currently bound to that buffer object.
 - logical placements are limited to `REPLICATE`, `SHARD`, and `PARTIAL`.
 - `DataParallelBuffer` has no allocator, allocation key, or temporary-buffer cache.
+- `DataParallelBuffer` does not move, allocate, resize, or free storage.
 - `bind()` and `unbind()` never allocate or free storage.
 - a buffer returned by `view()` has exact placement-shaped data and retains its
   storage owner.
@@ -258,7 +267,8 @@ state.
 
 - Store `DeviceMesh` instead of cached outer/inner process groups.
 - Move parameter binding from `DataParallelBuffer` to `ParameterGroup`.
-- Move communication-result commit from `DataParallelBuffer` to `ParameterGroup`.
+- Move gradient-redistribution finalization from `DataParallelBuffer` to
+  `ParameterGroup`.
 - Move compatible-buffer grouping and mesh-axis planning out of `FSDPModule`.
 - Preserve placement transitions, collective selection, and allocation behavior.
 

@@ -151,7 +151,7 @@ Outer and inner decisions are combined as
 | Main weight | `(1, 1)` | Optimizer parameter `(1, 1)` |
 | Main gradient | `(0, 1)` | Optimizer gradient `(1, 1)` |
 
-`get_item()` and `set_item()` intersect the requested item range with the
+`tensor_view()` and `copy_tensors_()` intersect the requested tensor range with the
 range present in persistent storage, then translate it to storage-local
 coordinates.
 

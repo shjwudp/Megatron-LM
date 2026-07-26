@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import enum
 import math
 from collections import namedtuple
 from typing import Dict, List, Optional, Tuple
@@ -19,8 +20,19 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch.distributed.tensor import DeviceMesh
 
-from .dp_buffer import Placement
 from .utils import ParamGroupIdx
+
+
+class Placement(enum.Enum):
+    """Logical validity of a data-parallel buffer along one mesh dimension.
+
+    Placement is independent of physical allocation shape. A sharded value may
+    use compact storage or a rank-owned view into a replicated allocation.
+    """
+
+    SHARD = "shard"
+    REPLICATE = "replicate"
+    PARTIAL = "partial"
 
 
 class BufferIndex:

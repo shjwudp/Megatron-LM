@@ -21,10 +21,10 @@ from ..uneven_dtensor import (
     make_uneven_dtensor,
     rebind_uneven_dtensor_local_tensor,
 )
-from .allocator import BucketAllocator, TemporaryBucketAllocator
-from .dp_buffer import DataParallelBuffer, Placement
+from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
+from .buffer_index import Placement
+from .dp_buffer import DataParallelBuffer
 from .mixed_precision import MixedPrecisionPolicy
-from .storage import free_storage
 from .utils import ParamGroupIdx, _prepare_fsdp_mesh
 
 
@@ -151,6 +151,26 @@ class ParameterGroup:
         ]
 
     @staticmethod
+    def _move_buffer_storage_to(
+        buffer: DataParallelBuffer,
+        target_device: torch.device,
+        *,
+        pin_memory: bool = False,
+        non_blocking: bool = True,
+    ) -> bool:
+        """Move externally owned buffer storage as a parameter-group lifecycle operation."""
+        if buffer.data is None or buffer.data.device == target_device:
+            return False
+        if target_device.type == "cpu" and pin_memory:
+            cpu_data = torch.empty(buffer.data.shape, dtype=buffer.data.dtype, pin_memory=True)
+            cpu_data.copy_(buffer.data, non_blocking=non_blocking)
+            _free_storage(buffer.data)
+            buffer.bind(cpu_data)
+        else:
+            buffer.bind(buffer.data.to(target_device, non_blocking=non_blocking))
+        return True
+
+    @staticmethod
     def offload_storage_to_cpu(
         param_groups: List["ParameterGroup"],
         *,
@@ -162,7 +182,7 @@ class ParameterGroup:
             (buffer, buffer.data.nbytes)
             for param_group in param_groups
             for buffer in param_group._buffers()
-            if buffer.data is not None and not buffer._is_on_cpu()
+            if buffer.data is not None and buffer.data.device.type != "cpu"
         ]
         entries.sort(key=lambda entry: entry[1], reverse=True)
 
@@ -172,7 +192,9 @@ class ParameterGroup:
             if max_cpu_bytes is not None and offloaded_bytes + nbytes > max_cpu_bytes:
                 skipped_bytes += nbytes
                 continue
-            buffer._move_data_to(torch.device("cpu"), pin_memory=pin_memory)
+            ParameterGroup._move_buffer_storage_to(
+                buffer, torch.device("cpu"), pin_memory=pin_memory
+            )
             offloaded_bytes += nbytes
 
         for param_group in param_groups:
@@ -185,7 +207,7 @@ class ParameterGroup:
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         for param_group in param_groups:
             for buffer in param_group._buffers():
-                buffer._move_data_to(device)
+                param_group._move_buffer_storage_to(buffer, device)
             param_group._rebuild_dist_views()
 
     def buffer_diagnostics(
@@ -225,7 +247,7 @@ class ParameterGroup:
     def assert_model_weights_not_nan(self) -> None:
         """Assert that every fully replicated model-weight item contains no NaNs."""
         for param in self.params:
-            param_data = self.model_weight_buffer.get_item(
+            param_data = self.model_weight_buffer.tensor_view(
                 self.param_idx[param], placements=[Placement.REPLICATE, Placement.REPLICATE]
             )
             assert not torch.isnan(param_data).any(), "NaN detected in model weight buffer"
@@ -261,15 +283,15 @@ class ParameterGroup:
         model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
         wbuf = self._create_buffer(model_weight_dtype, "model_weight")
         wbuf.bind(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
-        for i, p in enumerate(self.params):
-            wbuf.set_item(i, self.mp_policy.get_param_data(p))
+        wbuf.copy_tensors_(self.mp_policy.get_param_data(param) for param in self.params)
         self.model_weight_buffer = wbuf
 
         if self.mp_policy.needs_transpose_weight_buffer(self.params[0]):
             tbuf = self._create_buffer(torch.uint8, "transpose_weight")
             tbuf.bind(torch.empty(tbuf.data_size, dtype=tbuf.dtype, device=self.device))
-            for i, p in enumerate(self.params):
-                tbuf.set_item(i, self.mp_policy.get_param_data(p, transpose=True))
+            tbuf.copy_tensors_(
+                self.mp_policy.get_param_data(param, transpose=True) for param in self.params
+            )
             self.transpose_weight_buffer = tbuf
 
         # Create main weight buffer for mixed precision. Skip the redundant
@@ -289,9 +311,10 @@ class ParameterGroup:
                 or mbuf.storage_placements != wbuf.storage_placements
             ):
                 mbuf.bind(torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device))
-                for i, p in enumerate(self.params):
-                    item = self.mp_policy.get_high_precision_value(p)
-                    mbuf.set_item(i, item.detach().to(main_params_dtype))
+                mbuf.copy_tensors_(
+                    self.mp_policy.get_high_precision_value(param).detach().to(main_params_dtype)
+                    for param in self.params
+                )
                 self.main_weight_buffer = mbuf
 
         # Free the original full parameter tensors now that their data has been
@@ -304,7 +327,7 @@ class ParameterGroup:
             for tensor in self.mp_policy.storage_tensors_to_free(
                 p, self.model_weight_buffer, self.main_weight_buffer
             ):
-                free_storage(tensor)
+                _free_storage(tensor)
 
         for weight_buffer in (self.model_weight_buffer, self.transpose_weight_buffer):
             if weight_buffer is not None and not weight_buffer.inner_sharded:
@@ -444,25 +467,25 @@ class ParameterGroup:
             self.mp_policy.bind_unsharded_param(param, param_data, buffer_role)
 
     @torch.no_grad()
-    def commit_comm_output(
+    def _finalize_gradient_redistribution(
         self,
         output_buffer: DataParallelBuffer,
-        comm_output: torch.Tensor,
+        result: torch.Tensor,
         changed_axis: int,
         *,
         stream: Optional[torch.cuda.Stream] = None,
         accumulate: bool = False,
         release_workspace: bool = False,
     ) -> None:
-        """Commit a gradient redistribution result into this group's storage."""
+        """Apply a gradient redistribution result and release its input workspace."""
         if output_buffer.data is None:
-            raise ValueError("Gradient communication output buffer is not bound")
+            raise ValueError("Gradient redistribution output buffer is not bound")
         with torch.cuda.stream(stream or torch.cuda.current_stream()):
-            if output_buffer.data.data_ptr() != comm_output.data_ptr():
+            if output_buffer.data.data_ptr() != result.data_ptr():
                 if accumulate:
-                    output_buffer.data.add_(comm_output)
+                    output_buffer.data.add_(result)
                 else:
-                    output_buffer.data.copy_(comm_output)
+                    output_buffer.data.copy_(result)
         if release_workspace:
             self.allocator.free(
                 (self.param_group_id, "main_grad", "grad_reduce_input", changed_axis)
@@ -628,16 +651,16 @@ class ParameterGroup:
                 and self.outer_dp_sharding_strategy != "optim"
             )
             comm_input = self._grad_comm_input(current_buffer, 1, force=accumulate)
-            comm_output = current_buffer.redistribute(
+            redistribution_result = current_buffer.redistribute(
                 inner_placements,
                 output_buffer=output_buffer,
                 comm_input=comm_input,
                 gradient_scaling_factor=self.gradient_scaling_factor,
                 stream=stream,
             )
-            self.commit_comm_output(
+            self._finalize_gradient_redistribution(
                 output_buffer,
-                comm_output,
+                redistribution_result,
                 1,
                 stream=stream,
                 accumulate=accumulate,
@@ -663,16 +686,16 @@ class ParameterGroup:
                 and self.outer_dp_sharding_strategy == "optim"
             )
             comm_input = self._grad_comm_input(current_buffer, 0, force=accumulate)
-            comm_output = current_buffer.redistribute(
+            redistribution_result = current_buffer.redistribute(
                 outer_placements,
                 output_buffer=output_buffer,
                 comm_input=comm_input,
                 gradient_scaling_factor=self.gradient_scaling_factor,
                 stream=stream,
             )
-            self.commit_comm_output(
+            self._finalize_gradient_redistribution(
                 output_buffer,
-                comm_output,
+                redistribution_result,
                 0,
                 stream=stream,
                 accumulate=accumulate,
@@ -729,7 +752,7 @@ class ParameterGroup:
                 detach_uneven_dtensor_local_tensor(dist_grad)
                 self._dist_grad_cache[index] = dist_grad
                 self.dist_grads[index] = None
-        self.main_grad_buffer.data = None
+        self.main_grad_buffer.unbind()
 
     def _init_dist_params(self):
         """Initialize optimizer-facing DTensor views into the weight buffers."""
@@ -749,7 +772,7 @@ class ParameterGroup:
 
         for param in self.params:
             item_id = self.param_idx[param]
-            data = optimizer_buffer.get_item(item_id, placements=buffer_placements)
+            data = optimizer_buffer.tensor_view(item_id, placements=buffer_placements)
             param_shape = (
                 param.shape
                 if self.main_weight_buffer is not None
@@ -808,7 +831,7 @@ class ParameterGroup:
         ):
             item_id = self.param_idx[p]
             grad_dtensor_placements = dist_param.placements
-            grad_data = gbuf.get_item(item_id, placements=buffer_placements)
+            grad_data = gbuf.tensor_view(item_id, placements=buffer_placements)
             # Empty local shards are optimizer no-ops. Keeping them as None also
             # avoids fused multi-tensor optimizer failures on neighboring shards.
             if not p.requires_grad or grad_data.numel() == 0:
@@ -846,14 +869,14 @@ class ParameterGroup:
             for placement in self.dist_params[0].placements
         ]
         for param, dist_param in zip(self.params, self.dist_params):
-            data = optimizer_buffer.get_item(self.param_idx[param], placements=buffer_placements)
+            data = optimizer_buffer.tensor_view(self.param_idx[param], placements=buffer_placements)
             object.__setattr__(dist_param._local_tensor, 'data', data)
 
         if self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
             for param, dist_grad in zip(self.params, self.dist_grads):
                 if dist_grad is None:
                     continue
-                grad_data = self.main_grad_buffer.get_item(
+                grad_data = self.main_grad_buffer.tensor_view(
                     self.param_idx[param], placements=buffer_placements
                 )
                 object.__setattr__(dist_grad._local_tensor, 'data', grad_data)
@@ -864,13 +887,13 @@ class ParameterGroup:
         Returns True if any buffer was moved (views were rebuilt).
         """
         moved = False
-        for buf in (
+        for buffer in (
             self.model_weight_buffer,
             self.main_weight_buffer,
             self.main_grad_buffer,
             self.transpose_weight_buffer,
         ):
-            if buf is not None and buf._ensure_data_on_gpu():
+            if buffer is not None and self._move_buffer_storage_to(buffer, self.device):
                 moved = True
         if moved:
             self._rebuild_dist_views()

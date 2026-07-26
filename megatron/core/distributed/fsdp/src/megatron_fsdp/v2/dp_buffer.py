@@ -2,39 +2,17 @@
 
 from __future__ import annotations
 
-import enum
 from contextlib import nullcontext
 from copy import copy
 from itertools import groupby
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 import torch
 from torch.distributed import _coalescing_manager
 from torch.distributed.tensor import DeviceMesh
 
-from .storage import free_storage
+from .buffer_index import BufferIndex, Placement
 from .utils import ParamGroupIdx
-
-
-class Placement(enum.Enum):
-    """Logical state of a DP buffer along one mesh dimension.
-
-    A buffer stores two enum members ordered as ``[outer-DP, inner-DP]``.
-
-    Supported data transitions are:
-
-    - ``SHARD`` -> ``REPLICATE``: all-gather
-    - ``PARTIAL`` -> ``REPLICATE``: all-reduce
-    - ``PARTIAL`` -> ``SHARD``: reduce-scatter
-    - ``REPLICATE`` -> ``SHARD``: retain the rank-owned shard
-
-    Allocation shape is intentionally not encoded here. A ``SHARD`` buffer
-    may be a compact allocation or a slice of a ``REPLICATE`` output buffer.
-    """
-
-    SHARD = "shard"
-    REPLICATE = "replicate"
-    PARTIAL = "partial"
 
 
 class DataParallelBuffer:
@@ -59,9 +37,6 @@ class DataParallelBuffer:
         sharding_strategy: str = "no_shard",
         outer_dp_sharding_strategy: str = "no_shard",
     ):
-        # Keep BufferIndex's Placement import from forming a module-level cycle.
-        from .buffer_index import BufferIndex
-
         assert mp_policy is not None, "DataParallelBuffer requires a mixed-precision policy"
         self.dtype = dtype
         self.device = device
@@ -136,64 +111,58 @@ class DataParallelBuffer:
         placeholder._storage_owner = None
         return placeholder
 
-    # ------------------------------------------------------------------ #
-    #  CPU offload
-    # ------------------------------------------------------------------ #
-
-    def _is_on_cpu(self) -> bool:
-        """True if ``self.data`` is resident on CPU."""
-        return self.data is not None and self.data.device.type == "cpu"
-
-    def _ensure_data_on_gpu(self) -> bool:
-        """Move ``self.data`` to GPU if currently on CPU.
-
-        Returns True if a move happened (caller must rebuild dist views).
-        """
-        if not self._is_on_cpu():
-            return False
-        self.data = self.data.to(self.device, non_blocking=True)
-        return True
-
-    def _move_data_to(
-        self, target_device: torch.device, pin_memory: bool = False, non_blocking: bool = True
-    ) -> None:
-        """Move ``self.data`` to *target_device*, optionally using pinned memory.
-
-        Caller must call ``ParameterGroup._rebuild_dist_views()`` afterwards
-        because ``dist_params._local_tensor`` views share ``self.data`` Storage.
-        """
-        if self.data is None or self.data.device == target_device:
-            return
-        if target_device.type == "cpu" and pin_memory:
-            cpu_data = torch.empty(self.data.shape, dtype=self.data.dtype, pin_memory=True)
-            cpu_data.copy_(self.data, non_blocking=non_blocking)
-            free_storage(self.data)
-            self.data = cpu_data
-        else:
-            self.data = self.data.to(target_device, non_blocking=non_blocking)
-
     @torch.no_grad()
-    def set_item(
-        self, item_id: int, item_data: torch.Tensor, *, placements: Optional[list[Placement]] = None
+    def copy_tensors_(
+        self, tensors: Iterable[torch.Tensor], *, placements: Optional[list[Placement]] = None
     ) -> None:
-        """Write a tensor item into its corresponding region of the buffer."""
-        requested_placements = placements if placements is not None else self.placements
-        source_slice, local_slice = self.buffer_index.local_slice_for(
-            self.buffer_index._get_item_global_range(item_id),
-            requested_placements,
-            self.storage_placements,
-        )
-        if source_slice is None or local_slice is None:
-            return
-        self.data[local_slice].copy_(item_data.flatten()[source_slice])
+        """Copy an ordered tensor sequence into this buffer in place.
 
-    def get_item(
-        self, item_id: int, *, placements: Optional[list[Placement]] = None
+        Args:
+            tensors: One tensor per layout entry, in constructor order.
+            placements: Logical source placements. Defaults to this buffer's
+                current placements.
+
+        Raises:
+            RuntimeError: If no storage is bound.
+            ValueError: If the tensor count does not match the layout.
+        """
+        if self.data is None:
+            raise RuntimeError("DataParallelBuffer has no bound storage")
+        requested_placements = placements if placements is not None else self.placements
+        expected_count = len(self.buffer_index.item_index_map)
+        copied_count = 0
+        for tensor_id, tensor in enumerate(tensors):
+            if tensor_id >= expected_count:
+                raise ValueError(f"Expected {expected_count} tensors, got more")
+            source_slice, local_slice = self.buffer_index.local_slice_for(
+                self.buffer_index._get_item_global_range(tensor_id),
+                requested_placements,
+                self.storage_placements,
+            )
+            if source_slice is not None and local_slice is not None:
+                self.data[local_slice].copy_(tensor.flatten()[source_slice])
+            copied_count += 1
+        if copied_count != expected_count:
+            raise ValueError(f"Expected {expected_count} tensors, got {copied_count}")
+
+    def tensor_view(
+        self, tensor_id: int, *, placements: Optional[list[Placement]] = None
     ) -> torch.Tensor:
-        """Read a tensor item (or its shard) from the buffer."""
+        """Return a local view of one tensor under the requested placements.
+
+        Args:
+            tensor_id: Tensor index in constructor order.
+            placements: Logical placements for the requested view. Defaults to
+                this buffer's current placements.
+
+        Returns:
+            A local ``torch.Tensor`` view, which may be empty on this rank.
+        """
+        if self.data is None:
+            raise RuntimeError("DataParallelBuffer has no bound storage")
         requested_placements = placements if placements is not None else self.placements
         _, local_slice = self.buffer_index.local_slice_for(
-            self.buffer_index._get_item_global_range(item_id),
+            self.buffer_index._get_item_global_range(tensor_id),
             requested_placements,
             self.storage_placements,
         )
