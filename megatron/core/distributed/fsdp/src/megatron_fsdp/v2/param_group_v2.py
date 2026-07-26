@@ -463,12 +463,11 @@ class ParameterGroupV2:
         self.state.weight_valid = self.layout.main_weight
 
     def begin_backward(self) -> DataParallelBuffer:
-        """Acquire and zero the full local-gradient contribution."""
+        """Acquire uninitialized storage for the full local-gradient contribution."""
         if self.state.full_grad is None:
             self.state.full_grad = self._allocate_scratch(
                 "full_grad", self.grad_buffer, self.full_placements
             )
-            self.state.full_grad.data.zero_()
         return self.state.full_grad
 
     def get_main_grad(self, param: torch.nn.Parameter) -> torch.Tensor:
@@ -602,9 +601,10 @@ class ParameterGroupV2:
         self._release_scratch("full_grad", self.state.full_grad)
         self.state.full_grad = None
         self.state.grad_phase = GradientPhaseV2.EMPTY
-        self.grad_buffer.data.zero_()
         if set_to_none:
             for optimizer_param in self._optimizer_params:
                 optimizer_param.grad = None
                 if hasattr(optimizer_param, "decoupled_grad"):
                     optimizer_param.decoupled_grad = None
+        else:
+            self.grad_buffer.data.zero_()

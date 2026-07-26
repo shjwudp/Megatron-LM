@@ -221,8 +221,10 @@ compute weights.
 
 ## Gradient lifecycle
 
-At backward start, the group acquires and zeroes `full_grad`. Autograd writes one
-full local contribution, interpreted logically as all-partial placements.
+At backward start, the group acquires uninitialized `full_grad` storage. Fused
+weight-gradient kernels overwrite their parameter slices, ordinary gradients are
+copied into their slices, and the staging layer zeroes only slices for parameters
+that did not produce a gradient. The whole bucket is never zeroed.
 
 Every strategy follows the same two-target process:
 
@@ -263,8 +265,11 @@ not persistent parameter-group state. After every microbatch, `full_grad` is
 released. Non-final backward sets the phase to `ACCUMULATING`; the last backward
 sets it to `READY`.
 
-`zero_grad()` resets the phase to `EMPTY` and releases any active `full_grad`
-lease.
+`zero_grad(set_to_none=True)` resets the phase to `EMPTY`, releases any active
+`full_grad` lease, and detaches optimizer-facing gradients without clearing
+`grad_buffer`. The next reduction overwrites stale storage because `EMPTY` means
+there is no value to accumulate. `zero_grad(set_to_none=False)` retains an
+explicit buffer zero to preserve its observable zero-tensor contract.
 
 ## Ownership boundaries
 

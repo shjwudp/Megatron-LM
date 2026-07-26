@@ -344,6 +344,39 @@ def test_hsdp_layout_rejects_reversed_mesh_axes():
         layout.validate(2)
 
 
+def test_gradient_storage_zeroing_is_lazy(monkeypatch):
+    group, _, _ = _build_1d_group("optim_grads_params")
+    allocate_scratch = group._allocate_scratch
+
+    def allocate_with_sentinel(role, prototype, placements):
+        buffer = allocate_scratch(role, prototype, placements)
+        buffer.data.fill_(13)
+        return buffer
+
+    monkeypatch.setattr(group, "_allocate_scratch", allocate_with_sentinel)
+    assert torch.count_nonzero(group.begin_backward().data != 13) == 0
+
+    group.grad_buffer.data.fill_(11)
+    group.zero_grad()
+    assert group.state.grad_phase is GradientPhaseV2.EMPTY
+    assert torch.count_nonzero(group.grad_buffer.data != 11) == 0
+
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    group.begin_backward().data.fill_(rank + 1)
+    group.reduce_grad(is_last_backward=True)
+    expected = world_size * (world_size + 1) / 2
+    torch.testing.assert_close(
+        group.optimizer_grad().data,
+        torch.full_like(group.optimizer_grad().data, expected),
+        rtol=0,
+        atol=0,
+    )
+
+    group.zero_grad(set_to_none=False)
+    assert torch.count_nonzero(group.grad_buffer.data) == 0
+
+
 @pytest.mark.parametrize("shard_optimizer_across_outer_dp", [False, True])
 @pytest.mark.parametrize("grad_comm_dtype", [None, torch.bfloat16])
 @pytest.mark.parametrize("use_decoupled_grad", [False, True])
@@ -392,6 +425,5 @@ def test_two_microbatch_hsdp_gradient(
 
     group.zero_grad()
     assert group.state.grad_phase is GradientPhaseV2.EMPTY
-    assert torch.count_nonzero(group.grad_buffer.data) == 0
     assert optimizer_param.grad is None
     assert getattr(optimizer_param, "decoupled_grad", None) is None
