@@ -387,11 +387,7 @@ class ParameterGroup:
         ]
 
     def _acquire_temporary_buffer(
-        self,
-        role: str,
-        persistent: DataParallelBuffer,
-        source: DataParallelBuffer,
-        placements: list[Placement],
+        self, role: str, persistent: DataParallelBuffer, placements: list[Placement]
     ) -> DataParallelBuffer:
         """Return a persistent view or an allocator-backed temporary buffer."""
         if role in self._temporary_buffers:
@@ -399,7 +395,7 @@ class ParameterGroup:
         if persistent.placements == placements:
             return persistent
         try:
-            return source.view(placements)
+            return persistent.view(placements)
         except ValueError:
             output = persistent.placeholder(placements)
             output.bind(
@@ -449,8 +445,8 @@ class ParameterGroup:
         ]
         full_placements = [Placement.REPLICATE, Placement.REPLICATE]
         output_buffers = [
-            param_group._acquire_temporary_buffer(role, weight_buffer, source, full_placements)
-            for param_group, role, weight_buffer, source in owned_weight_buffers
+            param_group._acquire_temporary_buffer(role, weight_buffer, full_placements)
+            for param_group, role, weight_buffer, _ in owned_weight_buffers
         ]
         full_buffers = DataParallelBuffer.redistribute_buffers(
             [source for _, _, _, source in owned_weight_buffers],
@@ -506,7 +502,7 @@ class ParameterGroup:
         if grad_buffer is None:
             raise RuntimeError("Parameter group has no gradient buffer")
         return self._acquire_temporary_buffer(
-            "main_grad", grad_buffer, grad_buffer, [Placement.REPLICATE, Placement.REPLICATE]
+            "main_grad", grad_buffer, [Placement.REPLICATE, Placement.REPLICATE]
         )
 
     def get_main_grad(self, param: torch.nn.Parameter) -> torch.Tensor:
@@ -636,10 +632,7 @@ class ParameterGroup:
         full_weight_buffer = None
         if self.main_weight_buffer is not None and self.mp_policy.is_nvfp4_param(self.params[0]):
             full_output = self._acquire_temporary_buffer(
-                "model_weight",
-                self.model_weight_buffer,
-                self.model_weight_buffer,
-                [Placement.REPLICATE, Placement.REPLICATE],
+                "model_weight", self.model_weight_buffer, [Placement.REPLICATE, Placement.REPLICATE]
             )
             full_weight_buffer = full_output.data
             self._bind_params("model_weight", self.model_weight_buffer, full_weight_buffer)
