@@ -1002,7 +1002,7 @@ class FSDPModule:
                 param_shapes = [p.shape for p in param_group.params]
                 numel = sum(s.numel() for s in param_shapes)
                 total_model_elems += numel
-                dp_size = torch.distributed.get_world_size(param_group.dp_group)
+                dp_size = param_group.mesh.size(1)
 
                 buffer_entries = []
                 group_pad = 0
@@ -1028,7 +1028,7 @@ class FSDPModule:
 
                 lines.append(
                     f"- {module_name} #{group_idx} dp={dp_size} "
-                    f"strategy={param_group.sharding_strategy} "
+                    f"layout={param_group.layout} "
                     f"chunk_factor={param_group.chunk_size_factor}"
                 )
                 lines.append(

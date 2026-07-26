@@ -236,13 +236,12 @@ class TestMegatronFSDPE2E:
                     ):
                         if buffer is None or buffer.placements[1] is Placement.SHARD:
                             continue
+                        inner_group = param_group.mesh.get_group(mesh_dim=1)
                         gathered = [
                             torch.empty_like(buffer.data)
-                            for _ in range(torch.distributed.get_world_size(param_group.dp_group))
+                            for _ in range(torch.distributed.get_world_size(inner_group))
                         ]
-                        torch.distributed.all_gather(
-                            gathered, buffer.data, group=param_group.dp_group
-                        )
+                        torch.distributed.all_gather(gathered, buffer.data, group=inner_group)
                         for group_rank, replica in enumerate(gathered):
                             assert torch.equal(buffer.data, replica), (
                                 f"Replicated {buffer_name} mismatch for "

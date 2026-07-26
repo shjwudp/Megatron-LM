@@ -138,6 +138,14 @@ def _build_hsdp_mesh(device):
     return DeviceMesh(device.type, mesh, mesh_dim_names=("dp_outer", "dp"))
 
 
+def _outer_group(param_group):
+    return param_group.mesh.get_group(mesh_dim=0)
+
+
+def _inner_group(param_group):
+    return param_group.mesh.get_group(mesh_dim=1)
+
+
 def _flags(s):
     """Return (has_model_weight_buf, has_grad_buf, weight_distributed, grad_distributed).
 
@@ -438,8 +446,8 @@ def test_hsdp_reuses_one_grad_comm_workspace_across_axes(monkeypatch):
         pg.allocator.allocate = capture_allocate
 
         expected = full.float().mul_(0.25)
-        expected = Ref.reduce_scatter(expected, pg.dp_group)
-        expected = Ref.reduce_scatter(expected, pg.outer_dp_group).to(gbuf.dtype)
+        expected = Ref.reduce_scatter(expected, _inner_group(pg))
+        expected = Ref.reduce_scatter(expected, _outer_group(pg)).to(gbuf.dtype)
 
         pg.reduce_grad(is_last_backward=True)
 
@@ -581,14 +589,14 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
 
         if strategy == "no_shard":
             expected = full.clone()
-            Ref.all_reduce(expected, pg.dp_group)
-            Ref.all_reduce(expected, pg.outer_dp_group)
+            Ref.all_reduce(expected, _inner_group(pg))
+            Ref.all_reduce(expected, _outer_group(pg))
         else:
-            expected = Ref.reduce_scatter(full.clone(), pg.dp_group)
+            expected = Ref.reduce_scatter(full.clone(), _inner_group(pg))
             if outer_strategy == "optim":
-                expected = Ref.reduce_scatter(expected, pg.outer_dp_group)
+                expected = Ref.reduce_scatter(expected, _outer_group(pg))
             else:
-                Ref.all_reduce(expected, pg.outer_dp_group)
+                Ref.all_reduce(expected, _outer_group(pg))
 
         pg.reduce_grad(is_last_backward=True)
         actual = gbuf.view(pg._optimizer_placements()).data
@@ -623,14 +631,14 @@ def test_hsdp_reduce_grad_multi_microbatch(strategy, outer_strategy, monkeypatch
     def capture_reduce_scatter(*args, **kwargs):
         nonlocal outer_collective_calls
         group = kwargs.get("group")
-        if groups and group is groups[0].outer_dp_group:
+        if groups and group is _outer_group(groups[0]):
             outer_collective_calls += 1
         return original_reduce_scatter(*args, **kwargs)
 
     def capture_all_reduce(*args, **kwargs):
         nonlocal outer_collective_calls
         group = kwargs.get("group")
-        if groups and group is groups[0].outer_dp_group:
+        if groups and group is _outer_group(groups[0]):
             outer_collective_calls += 1
         return original_all_reduce(*args, **kwargs)
 
@@ -671,16 +679,16 @@ def test_hsdp_reduce_grad_multi_microbatch(strategy, outer_strategy, monkeypatch
         actual_outer_calls = outer_collective_calls
         if strategy == "no_shard":
             ref = full_batch_grad
-            Ref.all_reduce(ref, pg.dp_group)
-            Ref.all_reduce(ref, pg.outer_dp_group)
+            Ref.all_reduce(ref, _inner_group(pg))
+            Ref.all_reduce(ref, _outer_group(pg))
             actual = gbuf.view(pg._optimizer_placements()).data
             assert torch.equal(actual, ref)
         else:
-            ref_shard = Ref.reduce_scatter(full_batch_grad, pg.dp_group)
+            ref_shard = Ref.reduce_scatter(full_batch_grad, _inner_group(pg))
             if outer_strategy == "optim":
-                ref_shard = Ref.reduce_scatter(ref_shard, pg.outer_dp_group)
+                ref_shard = Ref.reduce_scatter(ref_shard, _outer_group(pg))
             else:
-                Ref.all_reduce(ref_shard, pg.outer_dp_group)
+                Ref.all_reduce(ref_shard, _outer_group(pg))
             actual = gbuf.view(pg._optimizer_placements()).data
             assert torch.equal(actual, ref_shard)
         assert actual_outer_calls == 1

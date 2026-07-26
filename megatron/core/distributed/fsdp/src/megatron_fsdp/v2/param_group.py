@@ -52,6 +52,55 @@ class _WeightBufferState:
         return self.persistent.view(self.valid_placements)
 
 
+@dataclass(frozen=True)
+class ParameterGroupLayout:
+    """Persistent and intermediate placements for one parameter group."""
+
+    weight: tuple[Placement, ...]
+    main_weight: tuple[Placement, ...]
+    grad_storage: tuple[Placement, ...]
+    grad_accumulation: tuple[Placement, ...]
+
+    @classmethod
+    def from_strategies(
+        cls, sharding_strategy: str, outer_dp_sharding_strategy: str
+    ) -> "ParameterGroupLayout":
+        """Resolve public sharding strategies into placement-only runtime layout."""
+        valid_inner = ("no_shard", "optim", "optim_grads", "optim_grads_params")
+        if sharding_strategy not in valid_inner:
+            raise ValueError(f"Unsupported sharding strategy: {sharding_strategy}")
+        if outer_dp_sharding_strategy not in ("no_shard", "optim"):
+            raise ValueError(
+                f"Unsupported outer DP sharding strategy: {outer_dp_sharding_strategy}"
+            )
+        if outer_dp_sharding_strategy == "optim" and sharding_strategy != "optim_grads_params":
+            raise NotImplementedError(
+                "FSDP v2 outer-DP optimizer sharding currently requires inner "
+                f"optim_grads_params, got {sharding_strategy}."
+            )
+
+        outer_optimizer = (
+            Placement.SHARD if outer_dp_sharding_strategy == "optim" else Placement.REPLICATE
+        )
+        inner_optimizer = (
+            Placement.REPLICATE if sharding_strategy == "no_shard" else Placement.SHARD
+        )
+        inner_weight = (
+            Placement.SHARD if sharding_strategy == "optim_grads_params" else Placement.REPLICATE
+        )
+        inner_grad = (
+            Placement.SHARD
+            if sharding_strategy in ("optim_grads", "optim_grads_params")
+            else Placement.REPLICATE
+        )
+        return cls(
+            weight=(Placement.REPLICATE, inner_weight),
+            main_weight=(outer_optimizer, inner_optimizer),
+            grad_storage=(Placement.REPLICATE, inner_grad),
+            grad_accumulation=(Placement.PARTIAL, inner_grad),
+        )
+
+
 class ParameterGroup:
     """
     Groups parameters sharing same properties for collective buffer management.
@@ -92,7 +141,8 @@ class ParameterGroup:
         self.mp_policy = mp_policy
         self.mp_policy.validate_param_group(params)
 
-        # Setup device mesh and derived process group
+        # Setup the device mesh. Collective groups are derived from the changed
+        # mesh axis only when a DataParallelBuffer redistribution executes.
         if mesh is None:
             world_ranks = torch.arange(
                 torch.distributed.get_world_size(torch.distributed.group.WORLD)
@@ -100,24 +150,9 @@ class ParameterGroup:
             mesh = DeviceMesh(self.device.type, world_ranks, mesh_dim_names=("dp_outer", "dp"))
         mesh = _prepare_fsdp_mesh(mesh)
         self.mesh = mesh
-        self.outer_dp_group = self.mesh.get_group(mesh_dim=0)
-        self.dp_group = self.mesh.get_group(mesh_dim=1)
-        self._dp_rank = torch.distributed.get_rank(self.dp_group)
-        self._dp_world_size = torch.distributed.get_world_size(self.dp_group)
-
-        if sharding_strategy not in ("no_shard", "optim", "optim_grads", "optim_grads_params"):
-            raise ValueError(f"Unsupported sharding strategy: {sharding_strategy}")
-        if outer_dp_sharding_strategy not in ("no_shard", "optim"):
-            raise ValueError(
-                f"Unsupported outer DP sharding strategy: {outer_dp_sharding_strategy}"
-            )
-        if outer_dp_sharding_strategy == "optim" and sharding_strategy != "optim_grads_params":
-            raise NotImplementedError(
-                "FSDP v2 outer-DP optimizer sharding currently requires inner "
-                f"optim_grads_params, got {sharding_strategy}."
-            )
-        self.sharding_strategy = sharding_strategy
-        self.outer_dp_sharding_strategy = outer_dp_sharding_strategy
+        self.layout = ParameterGroupLayout.from_strategies(
+            sharding_strategy, outer_dp_sharding_strategy
+        )
         self.param_group_id = param_group_id
 
         # Compute chunk size factor for alignment
@@ -282,26 +317,20 @@ class ParameterGroup:
             assert not torch.isnan(param_data).any(), "NaN detected in model weight buffer"
 
     def _buffer_placements(self, role: str) -> list[Placement]:
-        """Derive one persistent buffer role's placements from group strategy."""
-        sharded_strategies = {
-            "model_weight": {"optim_grads_params"},
-            "transpose_weight": {"optim_grads_params"},
-            "main_weight": {"optim", "optim_grads", "optim_grads_params"},
-            "main_grad": {"optim_grads", "optim_grads_params"},
-        }.get(role)
-        if sharded_strategies is None:
+        """Return one persistent buffer role's resolved placements."""
+        if role in ("model_weight", "transpose_weight"):
+            placements = self.layout.weight
+        elif role == "main_weight":
+            placements = self.layout.main_weight
+        elif role == "main_grad":
+            placements = self.layout.grad_storage
+        else:
             raise ValueError(f"Unsupported data-parallel buffer role: {role}")
-        return [
-            Placement.SHARD if strategy in sharded_strategies else Placement.REPLICATE
-            for strategy in (self.outer_dp_sharding_strategy, self.sharding_strategy)
-        ]
+        return list(placements)
 
     def _optimizer_placements(self) -> list[Placement]:
-        """Return optimizer-facing placements derived from group strategy."""
-        return [
-            Placement.SHARD if self.outer_dp_sharding_strategy == "optim" else Placement.REPLICATE,
-            Placement.SHARD if self.sharding_strategy != "no_shard" else Placement.REPLICATE,
-        ]
+        """Return optimizer-facing placements from the resolved layout."""
+        return list(self.layout.main_weight)
 
     def _create_buffer(self, dtype: torch.dtype, role: str) -> DataParallelBuffer:
         """Create an unbound persistent buffer layout for one storage role."""
