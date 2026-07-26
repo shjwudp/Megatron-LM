@@ -6,6 +6,7 @@ This module owns the v2 policy data model. Translation from Megatron/MCore
 config objects belongs in the adapter layer.
 """
 
+import enum
 import inspect
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
@@ -177,6 +178,13 @@ class FullyShardNVFP4Policy:
 
     enabled: bool = False
     recipe: Optional[str] = None
+
+
+class WeightBufferRole(enum.Enum):
+    """Semantic weight representations selected by mixed-precision policy."""
+
+    MODEL = "model_weight"
+    TRANSPOSE = "transpose_weight"
 
 
 @dataclass(frozen=True)
@@ -394,13 +402,13 @@ class MixedPrecisionPolicy:
             tensors.append(get_fp8_raw_data(tensor, transpose=True))
         return tensors
 
-    def weight_buffers_for_unshard(
-        self, model_weight_buffer, transpose_weight_buffer=None, *, bwd_pass: bool = False
-    ) -> List:
-        """Return the weight buffer needed for forward or backward compute."""
-        if bwd_pass and transpose_weight_buffer is not None:
-            return [transpose_weight_buffer]
-        return [model_weight_buffer]
+    def weight_buffer_roles_for_unshard(
+        self, tensor: torch.Tensor, *, bwd_pass: bool = False
+    ) -> set[WeightBufferRole]:
+        """Return semantic weight-buffer roles required by one compute pass."""
+        if bwd_pass and self.needs_transpose_weight_buffer(tensor):
+            return {WeightBufferRole.TRANSPOSE}
+        return {WeightBufferRole.MODEL}
 
     def needs_transpose_weight_buffer(self, tensor: torch.Tensor) -> bool:
         """Return whether ``tensor`` needs an extra transpose/columnwise buffer."""

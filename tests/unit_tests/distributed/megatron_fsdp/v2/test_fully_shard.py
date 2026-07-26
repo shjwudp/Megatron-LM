@@ -58,7 +58,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Pla
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import mfsdp_forward_pre_hook
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
+    MixedPrecisionPolicy,
+    WeightBufferRole,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 
 SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
@@ -594,7 +597,9 @@ class TestFullyShardBasic:
                 for role, weight_buffer, _ in param_group._weight_buffers_for_unshard():
                     placements = weight_buffer.placements.copy()
                     placements[0] = Placement.SHARD
-                    param_group._optimizer_weight_views[role] = weight_buffer.view(placements)
+                    state = param_group._weight_buffer_states[role]
+                    state.valid_placements = placements
+                    state.full_output = None
 
         owned_weight_buffers = [
             entry
@@ -726,7 +731,8 @@ class TestFullyShardBasic:
         optimizer.step()
         # No optimizer integration performed an explicit model-weight copy.
         assert ctx.model_weight_refresh_pending
-        optimizer_weight_view = param_group._optimizer_weight_views["model_weight"]
+        state = param_group._weight_buffer_states[WeightBufferRole.MODEL]
+        optimizer_weight_view = state.redistribution_source()
         assert optimizer_weight_view.placements == [Placement.SHARD, Placement.SHARD]
         assert (
             optimizer_weight_view.data.untyped_storage().data_ptr()
@@ -738,7 +744,8 @@ class TestFullyShardBasic:
         # before unshard, which refreshes the outer replicas exactly once.
         model(torch.zeros_like(x))
         assert not ctx.model_weight_refresh_pending
-        assert "model_weight" not in param_group._optimizer_weight_views
+        assert state.valid_placements == model_buffer.placements
+        assert state.full_output is not None
 
         outer_replicas = [
             torch.empty_like(model_buffer.data)
@@ -1403,7 +1410,7 @@ class TestActivationCheckpointing:
         observed_full = []
 
         def capture_successor_full_buffer(_module, _args):
-            full_output = param_group._temporary_buffers.get("model_weight")
+            full_output = param_group._weight_buffer_states[WeightBufferRole.MODEL].full_output
             assert full_output is not None
             observed_full.append(full_output.data.detach().clone())
 

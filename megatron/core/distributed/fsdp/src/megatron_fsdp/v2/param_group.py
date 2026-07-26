@@ -9,6 +9,7 @@ and collective operations across parameters.
 """
 
 import math
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import torch
@@ -24,7 +25,7 @@ from ..uneven_dtensor import (
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .buffer_index import BufferIndex, Placement
 from .dp_buffer import DataParallelBuffer
-from .mixed_precision import MixedPrecisionPolicy
+from .mixed_precision import MixedPrecisionPolicy, WeightBufferRole
 from .utils import ParamGroupIdx, _prepare_fsdp_mesh
 
 
@@ -34,6 +35,21 @@ def _zero_tensor_storage(tensor: torch.Tensor) -> None:
     target = local_tensor if local_tensor is not None else tensor
     with torch.no_grad():
         target.zero_()
+
+
+@dataclass
+class _WeightBufferState:
+    """Track one persistent weight buffer's validity and optional full output."""
+
+    persistent: DataParallelBuffer
+    valid_placements: list[Placement]
+    full_output: Optional[DataParallelBuffer]
+
+    def redistribution_source(self) -> DataParallelBuffer:
+        """Return the persistent buffer or its currently valid placement view."""
+        if self.valid_placements == self.persistent.placements:
+            return self.persistent
+        return self.persistent.view(self.valid_placements)
 
 
 class ParameterGroup:
@@ -118,7 +134,7 @@ class ParameterGroup:
         self._full_grad_has_value = False
         self._reduced_grad_has_value = False
         self._temporary_buffers: Dict[str, DataParallelBuffer] = {}
-        self._optimizer_weight_views: Dict[str, DataParallelBuffer] = {}
+        self._weight_buffer_states: Dict[WeightBufferRole, _WeightBufferState] = {}
 
         # Buffer references (initialized in _init_buffers)
         self.model_weight_buffer: Optional[DataParallelBuffer] = None
@@ -127,6 +143,18 @@ class ParameterGroup:
         self.main_grad_buffer: Optional[DataParallelBuffer] = None
         # Initialize buffers and distributed parameters
         self._init_buffers()
+        self._weight_buffer_states = {
+            role: _WeightBufferState(
+                persistent=buffer,
+                valid_placements=buffer.placements.copy(),
+                full_output=buffer if buffer.is_unsharded() else None,
+            )
+            for role, buffer in (
+                (WeightBufferRole.MODEL, self.model_weight_buffer),
+                (WeightBufferRole.TRANSPOSE, self.transpose_weight_buffer),
+            )
+            if buffer is not None
+        }
         # DTensor shells cached across set_to_none gradient-buffer releases.
         # Cached entries are detached from local storage and never exposed
         # through dist_grads until _init_dist_grads rebinds them.
@@ -246,8 +274,8 @@ class ParameterGroup:
 
     def assert_model_weights_not_nan(self) -> None:
         """Assert that every fully replicated model-weight item contains no NaNs."""
-        model_weights = self._temporary_buffers.get("model_weight", self.model_weight_buffer)
-        if not model_weights.is_unsharded():
+        model_weights = self._weight_buffer_states[WeightBufferRole.MODEL].full_output
+        if model_weights is None:
             raise RuntimeError("Model weights must be unsharded before checking for NaNs")
         for param in self.params:
             param_data = model_weights.tensor_view(self.param_idx[param])
@@ -369,27 +397,69 @@ class ParameterGroup:
         # Create distributed parameter views.
         self._init_dist_params()
 
+    def _required_weight_states(
+        self, bwd_pass: bool = False
+    ) -> List[tuple[WeightBufferRole, _WeightBufferState]]:
+        """Return required weight states in stable collective order."""
+        required_roles = self.mp_policy.weight_buffer_roles_for_unshard(
+            self.params[0], bwd_pass=bwd_pass
+        )
+        missing_roles = required_roles.difference(self._weight_buffer_states)
+        if missing_roles:
+            raise RuntimeError(f"Required weight buffers are unavailable: {missing_roles}")
+        return [
+            (role, self._weight_buffer_states[role])
+            for role in (WeightBufferRole.MODEL, WeightBufferRole.TRANSPOSE)
+            if role in required_roles
+        ]
+
     def _weight_buffers_for_unshard(
         self, bwd_pass: bool = False
-    ) -> List[tuple[str, DataParallelBuffer, DataParallelBuffer]]:
-        """Return ``(role, persistent, source)`` weights required by one compute pass."""
+    ) -> List[tuple[WeightBufferRole, DataParallelBuffer, DataParallelBuffer]]:
+        """Return required weight buffers that do not have a full output."""
         self._ensure_buffers_on_gpu()
-        required = self.mp_policy.weight_buffers_for_unshard(
-            self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
-        )
         return [
-            (role, buffer, self._optimizer_weight_views.get(role, buffer))
-            for role, buffer in (
-                ("model_weight", self.model_weight_buffer),
-                ("transpose_weight", self.transpose_weight_buffer),
-            )
-            if buffer is not None and buffer in required
+            (role, state.persistent, state.redistribution_source())
+            for role, state in self._required_weight_states(bwd_pass)
+            if state.full_output is None
         ]
+
+    def _acquire_full_weight_buffer(self, role: WeightBufferRole) -> DataParallelBuffer:
+        """Return or allocate the full output for one weight role."""
+        state = self._weight_buffer_states[role]
+        if state.full_output is not None:
+            return state.full_output
+        persistent = state.persistent
+        if persistent.is_unsharded():
+            state.full_output = persistent
+            return persistent
+        output = persistent.placeholder([Placement.REPLICATE, Placement.REPLICATE])
+        output.bind(
+            self.allocator.allocate(
+                key=(self.param_group_id, role.value),
+                size=output.data_size,
+                dtype=output.dtype,
+                device=output.device,
+            ).data
+        )
+        state.full_output = output
+        return output
+
+    def _release_full_weight_buffer(self, role: WeightBufferRole) -> None:
+        """Release one allocator-backed full output and restore persistent validity."""
+        state = self._weight_buffer_states.get(role)
+        if state is None or state.full_output is None:
+            return
+        if state.full_output is not state.persistent:
+            state.full_output.unbind()
+            self.allocator.free((self.param_group_id, role.value))
+        state.valid_placements = state.persistent.placements.copy()
+        state.full_output = state.persistent if state.persistent.is_unsharded() else None
 
     def _acquire_temporary_buffer(
         self, role: str, persistent: DataParallelBuffer, placements: list[Placement]
     ) -> DataParallelBuffer:
-        """Return a persistent view or an allocator-backed temporary buffer."""
+        """Return a persistent view or allocator-backed full-gradient buffer."""
         if role in self._temporary_buffers:
             return self._temporary_buffers[role]
         if persistent.placements == placements:
@@ -445,8 +515,8 @@ class ParameterGroup:
         ]
         full_placements = [Placement.REPLICATE, Placement.REPLICATE]
         output_buffers = [
-            param_group._acquire_temporary_buffer(role, weight_buffer, full_placements)
-            for param_group, role, weight_buffer, _ in owned_weight_buffers
+            param_group._acquire_full_weight_buffer(role)
+            for param_group, role, _, _ in owned_weight_buffers
         ]
         full_buffers = DataParallelBuffer.redistribute_buffers(
             [source for _, _, _, source in owned_weight_buffers],
@@ -458,8 +528,10 @@ class ParameterGroup:
         for (param_group, role, weight_buffer, _), full_buffer in zip(
             owned_weight_buffers, full_buffers
         ):
-            param_group._bind_params(role, weight_buffer, full_buffer.data)
-            param_group._optimizer_weight_views.pop(role, None)
+            param_group._bind_params(role.value, weight_buffer, full_buffer.data)
+            param_group._weight_buffer_states[role].valid_placements = (
+                weight_buffer.placements.copy()
+            )
 
     def unshard(self, bwd_pass: bool = False, stream: Optional[torch.cuda.Stream] = None) -> None:
         """
@@ -472,17 +544,9 @@ class ParameterGroup:
         self.finalize_model_weight_unshard(bwd_pass=bwd_pass)
 
     def _bind_params(
-        self, role: str, weight_buffer: DataParallelBuffer, buffer: Optional[torch.Tensor] = None
+        self, role: str, weight_buffer: DataParallelBuffer, buffer: torch.Tensor
     ) -> None:
         """Bind this group's parameters to a fully replicated weight buffer."""
-        if buffer is None:
-            assert weight_buffer.is_unsharded(), "Cannot bind params from a sharded buffer"
-            role_output = self._temporary_buffers.get(role)
-            buffer = (
-                role_output.data
-                if role_output is not None
-                else weight_buffer.view(weight_buffer.placements).data
-            )
         assert buffer.numel() == weight_buffer.buffer_index.bucket_meta.size, (
             f"Buffer size {buffer.numel()} does not match expected size "
             f"{weight_buffer.buffer_index.bucket_meta.size}"
@@ -607,23 +671,15 @@ class ParameterGroup:
 
     def model_weights_are_unsharded(self, bwd_pass: bool = False) -> bool:
         """Return whether the model weights required by this pass are unsharded."""
-        required = self.mp_policy.weight_buffers_for_unshard(
-            self.model_weight_buffer, self.transpose_weight_buffer, bwd_pass=bwd_pass
-        )
         return all(
-            self._optimizer_weight_views.get(role, buffer).is_unsharded()
-            or role in self._temporary_buffers
-            for role, buffer in (
-                ("model_weight", self.model_weight_buffer),
-                ("transpose_weight", self.transpose_weight_buffer),
-            )
-            if buffer is not None and buffer in required
+            state.full_output is not None for _, state in self._required_weight_states(bwd_pass)
         )
 
     def reshard(self):
         """Detach parameter views and release temporary replicated weight leases."""
         self.mp_policy.post_reshard(self.params)
-        self._release_temporary_buffers("model_weight", "transpose_weight")
+        self._release_full_weight_buffer(WeightBufferRole.MODEL)
+        self._release_full_weight_buffer(WeightBufferRole.TRANSPOSE)
 
     @torch.no_grad()
     def copy_main_weights_to_model_weights(self):
@@ -640,13 +696,19 @@ class ParameterGroup:
             optimizer_placements=optimizer_placements,
         )
         for role, buffer in (
-            ("model_weight", self.model_weight_buffer),
-            ("transpose_weight", self.transpose_weight_buffer),
+            (WeightBufferRole.MODEL, self.model_weight_buffer),
+            (WeightBufferRole.TRANSPOSE, self.transpose_weight_buffer),
         ):
-            if buffer is None or buffer.placements == optimizer_placements:
-                self._optimizer_weight_views.pop(role, None)
-            else:
-                self._optimizer_weight_views[role] = buffer.view(optimizer_placements)
+            if buffer is None:
+                continue
+            self._release_full_weight_buffer(role)
+            state = self._weight_buffer_states[role]
+            state.valid_placements = optimizer_placements.copy()
+            state.full_output = (
+                buffer
+                if all(placement is Placement.REPLICATE for placement in state.valid_placements)
+                else None
+            )
 
     def reduce_grad(
         self, is_last_backward: bool = False, stream: Optional[torch.cuda.Stream] = None
@@ -873,17 +935,8 @@ class ParameterGroup:
         """Update ``dist_params`` and ``dist_grads`` after storage moves device.
 
         Moving a buffer between CPU and GPU replaces its backing tensor. Rebuild
-        the local DTensor views using the optimizer-buffer ownership metadata.
+        the local optimizer-facing DTensor views.
         """
-        for role, source in list(self._optimizer_weight_views.items()):
-            weight_buffer = (
-                self.model_weight_buffer if role == "model_weight" else self.transpose_weight_buffer
-            )
-            if weight_buffer is None:
-                self._optimizer_weight_views.pop(role)
-            else:
-                self._optimizer_weight_views[role] = weight_buffer.view(source.placements)
-
         optimizer_buffer = self.main_weight_buffer or self.model_weight_buffer
         buffer_placements = [
             Placement.SHARD if isinstance(placement, Shard) else Placement.REPLICATE

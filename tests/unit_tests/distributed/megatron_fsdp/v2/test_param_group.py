@@ -33,7 +33,10 @@ from torch.distributed.tensor import DeviceMesh
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import DataParallelBuffer
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
+    MixedPrecisionPolicy,
+    WeightBufferRole,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
 
@@ -240,16 +243,17 @@ def test_unshard_reshard(strategy):
         assert wbuf is not None
 
         shard_before = wbuf.data.view(torch.uint8).clone()
-        full_placements = [Placement.REPLICATE, Placement.REPLICATE]
         pg.unshard()
-        role_output = pg._temporary_buffers.get("model_weight")
-        unsharded = wbuf.data if role_output is None else role_output.data
+        state = pg._weight_buffer_states[WeightBufferRole.MODEL]
+        assert state.full_output is not None
+        unsharded = state.full_output.data
 
         if not w_dist:
             # ZeRO-1/2: replicated persistent storage needs no temporary lease.
             assert unsharded is wbuf.data
-            assert pg._temporary_buffers == {}
+            assert state.full_output is wbuf
         else:
+            assert state.full_output is not wbuf
             # Distributed: after all-gather, every param should be fully
             # recoverable from the unsharded buffer at its global offset
             for i, p in enumerate(orig):
@@ -259,7 +263,7 @@ def test_unshard_reshard(strategy):
 
         # Reshard: release the ParameterGroup-owned lease; persistent shard is intact.
         pg.reshard()
-        assert pg._temporary_buffers == {}
+        assert state.full_output is (wbuf if wbuf.is_unsharded() else None)
         # Compare the persistent storage bit-for-bit. The buffer can contain
         # uninitialized padding, including NaNs for which torch.equal is false
         # even when the before/after bit patterns are identical.

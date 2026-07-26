@@ -17,6 +17,7 @@ owns buffer allocation, sharding, unshard/reshard, and gradient reduction;
 - extraction of raw parameter storage into FSDP buffers;
 - rebinding a parameter to an unsharded FSDP buffer view;
 - post-unshard and post-reshard tensor-format hooks;
+- semantic weight-buffer roles required by forward and backward;
 - main-weight and main-gradient dtypes;
 - copying or quantizing optimizer main weights back to model weights.
 
@@ -37,11 +38,18 @@ Each `ParameterGroup` may own several `DataParallelBuffer`s:
 When a separate `main_weight_buffer` would be redundant (same dtype and same
 sharding layout as `model_weight_buffer`), `ParameterGroup._init_buffers()`
 skips it and lets the optimizer mutate model-weight storage directly.
-`copy_main_weights_to_model_weights()` still marks replicated HSDP storage
-represented by a shard view in this case, because an outer optimizer shard was
-updated even though there is no separate tensor payload to copy. The next
-unshard then refreshes the outer replicas. Quantized parameters require a
-separate high-precision main-weight buffer.
+`copy_main_weights_to_model_weights()` records the optimizer placements as the
+valid model-weight representation in this case, because an outer optimizer
+shard was updated even though there is no separate tensor payload to copy. The
+next unshard derives a view with those placements and refreshes the outer
+replicas. Quantized parameters require a separate high-precision main-weight
+buffer.
+
+`weight_buffer_roles_for_unshard()` returns `WeightBufferRole` values rather
+than concrete buffers. `ParameterGroup` resolves those roles through one
+role-keyed state table that tracks each persistent buffer, its valid placements,
+and an optional full output. The same required-state lookup drives both the
+readiness check and the unshard plan.
 
 ## Parameter grouping
 

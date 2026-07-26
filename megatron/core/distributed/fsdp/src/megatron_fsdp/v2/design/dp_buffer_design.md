@@ -190,11 +190,13 @@ buffer preserves the boundary between flat storage/layout and parameter semantic
 ### Weight unshard and reshard
 
 1. `FSDPModule` schedules an ordered parameter-group sequence on the selected stream.
-2. `ParameterGroup.unshard_model_weights()` privately selects the required weight
-   buffers. After an optimizer update, a shard view of replicated persistent storage
-   is retained in `_optimizer_weight_views` as the explicit redistribution source.
-   Replicated persistent weights provide the full output; compact sharded weights
-   acquire a role-keyed `[REPLICATE, REPLICATE]` output lease.
+2. The mixed-precision policy selects semantic weight roles for the compute pass.
+   `ParameterGroup` maps each role to a persistent buffer, its currently valid
+   placements, and an optional full output. After an optimizer update, the valid
+   placements identify the redistribution source without retaining another buffer
+   object. Roles that already have a full output are omitted from the unshard plan.
+   Replicated persistent weights provide that output directly; compact sharded
+   weights acquire a role-keyed `[REPLICATE, REPLICATE]` output lease.
 3. `DataParallelBuffer.redistribute_buffers()` groups compatible buffers and
    redistributes the outer placement before the inner placement into those explicit
    outputs.
