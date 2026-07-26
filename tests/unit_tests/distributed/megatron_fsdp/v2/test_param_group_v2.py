@@ -10,6 +10,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.allocator import TemporaryBucketAllocator
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Placement
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import DataParallelBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group_v2 import (
     GradientPhaseV2,
@@ -289,6 +290,58 @@ def test_weight_validity_and_scratch_lifecycle():
 
     group.reshard_weight()
     assert allocator.buckets == {}
+
+
+def test_outer_sharded_hsdp_collective_order(monkeypatch):
+    group, _, _ = _build_2d_group(shard_optimizer_across_outer_dp=True)
+    transitions = []
+    redistribute = DataParallelBuffer.redistribute
+
+    def record_redistribution(self, target_placements, *, output_buffer=None):
+        transitions.append((tuple(self.placements), tuple(target_placements)))
+        return redistribute(self, target_placements, output_buffer=output_buffer)
+
+    monkeypatch.setattr(DataParallelBuffer, "redistribute", record_redistribution)
+
+    group.refresh_model_weight()
+    transitions.clear()
+    group.unshard_weight()
+    assert transitions == [
+        (
+            (Placement.SHARD, Placement.SHARD),
+            (Placement.REPLICATE, Placement.SHARD),
+        ),
+        (
+            (Placement.REPLICATE, Placement.SHARD),
+            (Placement.REPLICATE, Placement.REPLICATE),
+        ),
+    ]
+
+    group.reshard_weight()
+    transitions.clear()
+    group.begin_backward().data.fill_(torch.distributed.get_rank() + 1)
+    group.reduce_grad(is_last_backward=True)
+    assert transitions == [
+        (
+            (Placement.PARTIAL, Placement.PARTIAL),
+            (Placement.PARTIAL, Placement.SHARD),
+        ),
+        (
+            (Placement.PARTIAL, Placement.SHARD),
+            (Placement.SHARD, Placement.SHARD),
+        ),
+    ]
+
+
+def test_hsdp_layout_rejects_reversed_mesh_axes():
+    layout = ParameterGroupLayoutV2(
+        weight=(Placement.SHARD, Placement.REPLICATE),
+        main_weight=(Placement.SHARD, Placement.SHARD),
+        grad_storage=(Placement.SHARD, Placement.REPLICATE),
+        grad_accumulation=(Placement.SHARD, Placement.PARTIAL),
+    )
+    with pytest.raises(ValueError, match="outer DP, inner DP"):
+        layout.validate(2)
 
 
 @pytest.mark.parametrize("shard_optimizer_across_outer_dp", [False, True])

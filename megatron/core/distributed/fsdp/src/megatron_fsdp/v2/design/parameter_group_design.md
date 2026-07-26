@@ -18,6 +18,21 @@ Sharding-strategy strings are resolved once, before runtime operations, into a
 placement-only layout. Runtime code compares source and target placements; it does
 not branch on inner or outer group names.
 
+For a 2D HSDP mesh, placement tuples have the fixed axis order
+`(outer DP, inner DP)`. Multi-axis communication follows a nesting invariant:
+
+```text
+weight all-gather:       outer DP -> inner DP
+gradient reduce-scatter: inner DP -> outer DP
+```
+
+The inverse ordering is required because the optimizer value is nested-sharded
+across the same flattened tensor dimension. An outer shard must first be
+all-gathered into the persistent inner-sharded model weight before the inner
+shard can be materialized for compute. Backward reverses that construction:
+the full local gradient is first reduced into its persistent inner shard, then
+the last backward reduces that shard across outer DP for the optimizer.
+
 The group has three persistent distributed values:
 
 - model weights used to materialize compute parameters;
@@ -174,8 +189,9 @@ Unshard first restores the canonical persistent owner, then materializes full
 compute weights:
 
 ```text
-optimizer-valid view       persistent owner       compute weight
-       [S, S]          ->      [R, S]         ->     [R, R]
+optimizer-valid view          persistent owner          compute weight
+       [S, S]          -- outer all-gather --> [R, S]
+                       -- inner all-gather --> [R, R]
 ```
 
 The first transition writes into `weight_buffer` and updates `weight_valid`. The
@@ -226,18 +242,20 @@ placement is already reached, so the last transition is a no-op.
 For HSDP, every microbatch performs:
 
 ```text
-[P, P] -- per-microbatch redistribution --> [P, S]
-                                           accumulate into grad_buffer
+[P, P] -- inner reduce-scatter --> [P, S]
+                                    accumulate into grad_buffer
 ```
 
-The last microbatch is included in persistent `[P, S]` accumulation before final
-redistribution:
+On the last microbatch, its `[P, S]` output is combined with any persistent
+`[P, S]` accumulation before final redistribution. The combined value may remain
+in a call-local communication buffer:
 
 ```text
-[P, S] -- optimizer-step redistribution --> [S, S]
+[P, S] -- outer reduce-scatter --> [S, S]
 ```
 
-For outer replication, the final transition is `[P, S] -> [R, S]`.
+For outer replication, the final transition is an outer all-reduce:
+`[P, S] -> [R, S]`.
 
 Gradient scaling and conversion to communication dtype happen once before the
 per-microbatch redistribution. Communication workspaces are call-local and are
@@ -291,4 +309,6 @@ Distributed tests must cover:
 7. final-microbatch accumulation before `[P, S] -> [S, S]`;
 8. outer-replicated final transition `[P, S] -> [R, S]`;
 9. repeated unshard/reshard without leaked scratch leases;
-10. numerical equivalence across multiple microbatches.
+10. numerical equivalence across multiple microbatches;
+11. outer-to-inner weight all-gather and inner-to-outer gradient reduction
+    ordering for outer-optimizer-sharded HSDP.

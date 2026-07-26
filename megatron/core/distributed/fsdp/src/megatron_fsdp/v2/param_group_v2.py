@@ -36,6 +36,38 @@ class ParameterGroupLayoutV2:
     grad_storage: Placements
     grad_accumulation: Placements
 
+    def validate(self, mesh_ndim: int) -> None:
+        """Validate placement rank and the supported 2D HSDP axis convention."""
+        for placements in (
+            self.weight,
+            self.main_weight,
+            self.grad_storage,
+            self.grad_accumulation,
+        ):
+            if len(placements) != mesh_ndim:
+                raise ValueError(f"Expected {mesh_ndim} placements, got {placements}")
+
+        if mesh_ndim != 2:
+            return
+
+        # A 2D layout is ordered as (outer DP, inner DP). Keeping model
+        # weights and accumulated gradients sharded on the inner axis makes
+        # weight unshard outer-to-inner and gradient reduction inner-to-outer.
+        replicate_shard = (Placement.REPLICATE, Placement.SHARD)
+        shard_shard = (Placement.SHARD, Placement.SHARD)
+        if (
+            self.weight != replicate_shard
+            or self.main_weight not in (replicate_shard, shard_shard)
+            or self.grad_storage != replicate_shard
+            or self.grad_accumulation != (Placement.PARTIAL, Placement.SHARD)
+        ):
+            raise ValueError(
+                "2D HSDP placements use (outer DP, inner DP) and require "
+                "weight/grad_storage=(REPLICATE, SHARD), "
+                "grad_accumulation=(PARTIAL, SHARD), and main_weight either "
+                "(REPLICATE, SHARD) or (SHARD, SHARD)"
+            )
+
     @classmethod
     def from_strategies(
         cls,
@@ -161,14 +193,7 @@ class ParameterGroupV2:
             raise ValueError(
                 f"ParameterGroupV2 expects a 1D DP or 2D hybrid-DP mesh, got {mesh.ndim}D"
             )
-        for placements in (
-            layout.weight,
-            layout.main_weight,
-            layout.grad_storage,
-            layout.grad_accumulation,
-        ):
-            if len(placements) != mesh.ndim:
-                raise ValueError(f"Expected {mesh.ndim} placements, got {placements}")
+        layout.validate(mesh.ndim)
 
         self.params = params
         self.param_idx = {param: index for index, param in enumerate(params)}
@@ -397,11 +422,14 @@ class ParameterGroupV2:
         current = self.weight_buffer.view(list(self.state.weight_valid))
         persistent_placements = tuple(self.weight_buffer.placements)
         if self.state.weight_valid != persistent_placements:
+            # For outer-optimizer-sharded HSDP this is [S,S] -> [R,S]:
+            # restore the outer replica before unsharding the inner DP axis.
             current.redistribute(list(persistent_placements), output_buffer=self.weight_buffer)
             self.state.weight_valid = persistent_placements
             current = self.weight_buffer
 
         if persistent_placements != self.full_placements:
+            # The remaining HSDP transition is [R,S] -> [R,R].
             self.state.full_weight = self._allocate_scratch(
                 "full_weight", self.weight_buffer, self.full_placements
             )
@@ -485,12 +513,12 @@ class ParameterGroupV2:
         target = self.layout.main_weight
         final = self._placement_view(self.grad_buffer, target)
         communication_owner = current._storage_owner or current
-        changed_axes = [
-            axis
-            for axis, (source, destination) in enumerate(zip(current.placements, target))
-            if source is not destination
-        ]
-        for axis in reversed(changed_axes):
+        # Reduce in reverse mesh-axis order. On the supported 2D HSDP mesh
+        # (outer DP, inner DP), this means inner reduce-scatter precedes outer
+        # reduce-scatter. Weight unshard uses the inverse order.
+        for axis in reversed(range(self.mesh.ndim)):
+            if current.placements[axis] is target[axis]:
+                continue
             next_placements = current.placements.copy()
             next_placements[axis] = target[axis]
             if tuple(next_placements) == target and current.dtype == final.dtype:
