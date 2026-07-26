@@ -3,8 +3,8 @@
 """Placement-first ParameterGroup prototype for Megatron FSDP v2.
 
 This module is intentionally not wired into ``fully_shard`` yet. It provides a
-small, reviewable implementation of the target HSDP ownership and state model
-without inheriting the lifecycle structure of ``param_group.py``.
+small, reviewable implementation of the target FSDP/HSDP ownership and state
+model without inheriting the lifecycle structure of ``param_group.py``.
 """
 
 from __future__ import annotations
@@ -13,25 +13,38 @@ import math
 from dataclasses import dataclass
 
 import torch
-from torch.distributed.tensor import DeviceMesh
+from torch.distributed.tensor import DeviceMesh, DTensor
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
+from ..uneven_dtensor import copy_chunk_metadata, make_uneven_dtensor
 from .allocator import BucketAllocator, TemporaryBucketAllocator
 from .buffer_index import BufferIndex, Placement
 from .dp_buffer import DataParallelBuffer
 from .mixed_precision import MixedPrecisionPolicy
-from .utils import ParamGroupIdx, _prepare_fsdp_mesh
+from .utils import ParamGroupIdx
 
 Placements = tuple[Placement, ...]
 
 
 @dataclass(frozen=True)
 class ParameterGroupLayoutV2:
-    """Persistent HSDP placements used by :class:`ParameterGroupV2`."""
+    """Persistent FSDP or HSDP placements used by :class:`ParameterGroupV2`."""
 
     weight: Placements
     main_weight: Placements
     grad_storage: Placements
     grad_accumulation: Placements
+
+    @classmethod
+    def fsdp(cls) -> "ParameterGroupLayoutV2":
+        """Build a one-dimensional fully sharded layout."""
+        sharded = (Placement.SHARD,)
+        return cls(
+            weight=sharded,
+            main_weight=sharded,
+            grad_storage=sharded,
+            grad_accumulation=sharded,
+        )
 
     @classmethod
     def hsdp(cls, *, shard_optimizer_across_outer_dp: bool) -> "ParameterGroupLayoutV2":
@@ -59,7 +72,7 @@ class ParameterGroupStateV2:
 
 
 class ParameterGroupV2:
-    """Own persistent HSDP values and their placement transitions.
+    """Own persistent FSDP/HSDP values and their placement transitions.
 
     This prototype focuses on the three semantic distributed values:
 
@@ -84,9 +97,10 @@ class ParameterGroupV2:
     ) -> None:
         if not params:
             raise ValueError("ParameterGroupV2 requires at least one parameter")
-        mesh = _prepare_fsdp_mesh(mesh)
-        if mesh.ndim != 2:
-            raise ValueError(f"ParameterGroupV2 expects a 2D HSDP mesh, got {mesh.ndim}D")
+        if mesh.ndim not in (1, 2):
+            raise ValueError(
+                f"ParameterGroupV2 expects a 1D FSDP or 2D HSDP mesh, got {mesh.ndim}D"
+            )
         for placements in (
             layout.weight,
             layout.main_weight,
@@ -115,6 +129,9 @@ class ParameterGroupV2:
         self._main_weight_aliases_weight = False
         self._initialize_buffers()
         self.state = ParameterGroupStateV2(weight_valid=tuple(self.weight_buffer.placements))
+        self._optimizer_params: list[torch.nn.Parameter] = []
+        self._optimizer_grads: list[DTensor | None] = []
+        self._initialize_optimizer_params()
 
         if self.state.weight_valid == self.full_placements:
             self._bind_weight(self.weight_buffer)
@@ -128,6 +145,16 @@ class ParameterGroupV2:
     def contribution_placements(self) -> Placements:
         """Logical placements of one local backward contribution."""
         return (Placement.PARTIAL,) * self.mesh.ndim
+
+    @property
+    def optimizer_params(self) -> list[torch.nn.Parameter]:
+        """Return optimizer-facing DTensor parameters."""
+        return self._optimizer_params
+
+    @property
+    def optimizer_grads(self) -> list[DTensor | None]:
+        """Return gradient DTensor views matching :attr:`optimizer_params`."""
+        return self._optimizer_grads
 
     def _new_index(self, *, compact_weight: bool = False) -> BufferIndex:
         index = BufferIndex(
@@ -178,6 +205,79 @@ class ParameterGroupV2:
         grad_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])
         self.grad_buffer = self._new_buffer(grad_dtype, self.layout.grad_storage)
         self._allocate_persistent(self.grad_buffer)
+
+    @staticmethod
+    def _dtensor_placements(placements: Placements) -> list[Replicate | Shard]:
+        dtensor_placements = []
+        for placement in placements:
+            if placement is Placement.REPLICATE:
+                dtensor_placements.append(Replicate())
+            elif placement is Placement.SHARD:
+                dtensor_placements.append(Shard(dim=0))
+            else:
+                raise ValueError(f"Optimizer values cannot use {placement} placement")
+        return dtensor_placements
+
+    def _initialize_optimizer_params(self) -> None:
+        """Create optimizer-facing DTensor parameters over persistent main weights."""
+        placements = self._dtensor_placements(self.layout.main_weight)
+        optimizer_view = self.main_weight_buffer.view(list(self.layout.main_weight))
+        if self.mesh.ndim == 2 and self.layout.main_weight[0] is Placement.SHARD:
+            setattr(self.mesh, "_shard_order", [1, 0])
+
+        for param in self.params:
+            local_data = optimizer_view.tensor_view(self.param_idx[param])
+            dist_data = make_uneven_dtensor(
+                local_data,
+                param.shape,
+                self.mesh,
+                placements,
+                post_process_uneven=True,
+            )
+            optimizer_param = torch.nn.Parameter(dist_data, requires_grad=param.requires_grad)
+            copy_chunk_metadata(dist_data, optimizer_param)
+            setattr(param, "__fsdp_param__", True)
+            setattr(optimizer_param, "__fsdp_param__", True)
+            self._optimizer_params.append(optimizer_param)
+            self._optimizer_grads.append(None)
+
+    def _initialize_optimizer_grads(self) -> None:
+        """Create gradient DTensor views over the final persistent gradient."""
+        grad_view = self.optimizer_grad()
+        for index, (param, optimizer_param) in enumerate(
+            zip(self.params, self._optimizer_params)
+        ):
+            local_grad = grad_view.tensor_view(self.param_idx[param])
+            if not param.requires_grad or local_grad.numel() == 0:
+                self._optimizer_grads[index] = None
+                continue
+            if self._optimizer_grads[index] is None:
+                self._optimizer_grads[index] = make_uneven_dtensor(
+                    local_grad,
+                    param.shape,
+                    self.mesh,
+                    optimizer_param.placements,
+                    copy_chunk_meta_from=optimizer_param,
+                )
+
+    def _install_optimizer_grads(self) -> None:
+        """Attach reduced gradients to the optimizer-facing parameters."""
+        self._initialize_optimizer_grads()
+        for optimizer_param, optimizer_grad in zip(
+            self._optimizer_params, self._optimizer_grads
+        ):
+            if self.mp_policy.use_decoupled_grad:
+                optimizer_param.grad = None
+                setattr(optimizer_param, "decoupled_grad", optimizer_grad)
+                continue
+            if optimizer_grad is not None and optimizer_param.dtype != optimizer_grad.dtype:
+                raise RuntimeError(
+                    "Optimizer parameter and gradient dtypes must match unless "
+                    "use_decoupled_grad is enabled"
+                )
+            optimizer_param.grad = optimizer_grad
+            if hasattr(optimizer_param, "decoupled_grad"):
+                optimizer_param.decoupled_grad = None
 
     def _allocate_scratch(
         self, role: str, prototype: DataParallelBuffer, placements: Placements
@@ -338,23 +438,29 @@ class ParameterGroupV2:
             if output.data.data_ptr() != accumulation.data.data_ptr():
                 if has_accumulation:
                     output.data.add_(accumulation.data)
-                if not is_last_backward:
+                if (
+                    not is_last_backward
+                    or self.layout.grad_accumulation == self.layout.main_weight
+                ):
                     accumulation.data.copy_(output.data)
+                    output = accumulation
             self.state.grad_valid = self.layout.grad_accumulation
             self.state.grad_ready = False
 
             if is_last_backward:
-                final = self._placement_view(self.grad_buffer, self.layout.main_weight)
-                communication_owner = output._storage_owner or output
-                communication_final = self._placement_view(
-                    communication_owner, self.layout.main_weight
-                )
-                output.redistribute(
-                    list(self.layout.main_weight), output_buffer=communication_final
-                )
-                final.data.copy_(communication_final.data)
+                if self.layout.grad_accumulation != self.layout.main_weight:
+                    final = self._placement_view(self.grad_buffer, self.layout.main_weight)
+                    communication_owner = output._storage_owner or output
+                    communication_final = self._placement_view(
+                        communication_owner, self.layout.main_weight
+                    )
+                    output.redistribute(
+                        list(self.layout.main_weight), output_buffer=communication_final
+                    )
+                    final.data.copy_(communication_final.data)
                 self.state.grad_valid = self.layout.main_weight
                 self.state.grad_ready = True
+                self._install_optimizer_grads()
         finally:
             if workspace_key is not None:
                 self.allocator.free(workspace_key)
@@ -371,10 +477,15 @@ class ParameterGroupV2:
             raise RuntimeError("Gradient is not ready for the optimizer")
         return self.grad_buffer.view(list(self.layout.main_weight))
 
-    def zero_grad(self) -> None:
-        """Reset logical gradient state and release an unfinished contribution."""
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        """Reset logical gradient state and optimizer-facing gradients."""
         self._release_scratch("full_grad", self.state.full_grad)
         self.state.full_grad = None
         self.state.grad_valid = None
         self.state.grad_ready = False
         self.grad_buffer.data.zero_()
+        if set_to_none:
+            for optimizer_param in self._optimizer_params:
+                optimizer_param.grad = None
+                if hasattr(optimizer_param, "decoupled_grad"):
+                    optimizer_param.decoupled_grad = None

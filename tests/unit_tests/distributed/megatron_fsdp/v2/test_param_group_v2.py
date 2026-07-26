@@ -5,7 +5,8 @@
 import pytest
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import DeviceMesh
+from torch.distributed.tensor import DeviceMesh, DTensor
+from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.allocator import TemporaryBucketAllocator
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Placement
@@ -40,11 +41,17 @@ def _hsdp_mesh() -> DeviceMesh:
     return DeviceMesh(_device().type, ranks, mesh_dim_names=("dp_outer", "dp"))
 
 
+def _fsdp_mesh() -> DeviceMesh:
+    ranks = torch.arange(torch.distributed.get_world_size(), dtype=torch.int)
+    return DeviceMesh(_device().type, ranks, mesh_dim_names=("dp",))
+
+
 def _build_group(
     *,
     shard_optimizer_across_outer_dp: bool,
     grad_comm_dtype: torch.dtype | None = None,
     gradient_scaling_factor: float | None = None,
+    use_decoupled_grad: bool = False,
 ) -> tuple[ParameterGroupV2, torch.Tensor, TemporaryBucketAllocator]:
     values = torch.arange(128, dtype=torch.float32, device=_device())
     param = nn.Parameter(values.clone())
@@ -57,12 +64,80 @@ def _build_group(
             shard_optimizer_across_outer_dp=shard_optimizer_across_outer_dp
         ),
         mp_policy=MixedPrecisionPolicy(
-            main_grads_dtype=torch.float32, grad_comm_dtype=grad_comm_dtype
+            main_grads_dtype=torch.float32,
+            grad_comm_dtype=grad_comm_dtype,
+            use_decoupled_grad=use_decoupled_grad,
         ),
         allocator=allocator,
         gradient_scaling_factor=gradient_scaling_factor,
     )
     return group, values, allocator
+
+
+def test_1d_fsdp_weight_and_gradient_lifecycle():
+    values = torch.arange(128, dtype=torch.float32, device=_device())
+    param = nn.Parameter(values.clone())
+    allocator = TemporaryBucketAllocator()
+    group = ParameterGroupV2(
+        [param],
+        ParamGroupIdx(0, 0),
+        mesh=_fsdp_mesh(),
+        layout=ParameterGroupLayoutV2.fsdp(),
+        mp_policy=MixedPrecisionPolicy(main_grads_dtype=torch.float32),
+        allocator=allocator,
+    )
+
+    assert group.mesh.ndim == 1
+    assert group.state.weight_valid == (Placement.SHARD,)
+    assert group.optimizer_params[0].placements == (Shard(0),)
+
+    group.unshard_weight()
+    torch.testing.assert_close(group.params[0], values)
+    group.reshard_weight()
+
+    rank = torch.distributed.get_rank()
+    group.begin_backward().data.fill_(rank + 1)
+    group.reduce_grad(is_last_backward=False)
+    assert group.state.grad_valid == (Placement.SHARD,)
+    assert not group.state.grad_ready
+
+    group.begin_backward().data.fill_(rank + 2)
+    group.reduce_grad(is_last_backward=True)
+    expected = torch.distributed.get_world_size() * (
+        torch.distributed.get_world_size() + 2
+    )
+    torch.testing.assert_close(
+        group.optimizer_grad().data,
+        torch.full_like(group.optimizer_grad().data, expected),
+        rtol=0,
+        atol=0,
+    )
+    assert group.optimizer_params[0].grad is group.optimizer_grads[0]
+    assert allocator.buckets == {}
+
+
+@pytest.mark.parametrize("shard_optimizer_across_outer_dp", [False, True])
+def test_optimizer_params_own_main_weight_views(shard_optimizer_across_outer_dp):
+    group, _, _ = _build_group(
+        shard_optimizer_across_outer_dp=shard_optimizer_across_outer_dp
+    )
+
+    assert len(group.optimizer_params) == 1
+    optimizer_param = group.optimizer_params[0]
+    assert isinstance(optimizer_param, DTensor)
+    expected_placements = (
+        (Shard(0), Shard(0))
+        if shard_optimizer_across_outer_dp
+        else (Replicate(), Shard(0))
+    )
+    assert optimizer_param.placements == expected_placements
+    assert optimizer_param._local_tensor.data_ptr() == group.main_weight_buffer.view(
+        list(group.layout.main_weight)
+    ).tensor_view(0).data_ptr()
+    assert hasattr(optimizer_param._local_tensor, "__create_chunk_list__")
+    assert getattr(optimizer_param, "__fsdp_param__")
+    assert getattr(group.params[0], "__fsdp_param__")
+    assert group.optimizer_grads == [None]
 
 
 def test_weight_validity_and_scratch_lifecycle():
@@ -96,11 +171,15 @@ def test_weight_validity_and_scratch_lifecycle():
 
 @pytest.mark.parametrize("shard_optimizer_across_outer_dp", [False, True])
 @pytest.mark.parametrize("grad_comm_dtype", [None, torch.bfloat16])
-def test_two_microbatch_hsdp_gradient(shard_optimizer_across_outer_dp, grad_comm_dtype):
+@pytest.mark.parametrize("use_decoupled_grad", [False, True])
+def test_two_microbatch_hsdp_gradient(
+    shard_optimizer_across_outer_dp, grad_comm_dtype, use_decoupled_grad
+):
     group, _, allocator = _build_group(
         shard_optimizer_across_outer_dp=shard_optimizer_across_outer_dp,
         grad_comm_dtype=grad_comm_dtype,
         gradient_scaling_factor=0.5,
+        use_decoupled_grad=use_decoupled_grad,
     )
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
@@ -125,7 +204,22 @@ def test_two_microbatch_hsdp_gradient(shard_optimizer_across_outer_dp, grad_comm
     assert group.state.full_grad is None
     assert allocator.buckets == {}
 
+    optimizer_param = group.optimizer_params[0]
+    optimizer_grad_dtensor = group.optimizer_grads[0]
+    assert optimizer_grad_dtensor is not None
+    assert optimizer_grad_dtensor._local_tensor.data_ptr() == optimizer_grad.tensor_view(
+        0
+    ).data_ptr()
+    if use_decoupled_grad:
+        assert optimizer_param.grad is None
+        assert optimizer_param.decoupled_grad is optimizer_grad_dtensor
+    else:
+        assert optimizer_param.grad is optimizer_grad_dtensor
+        assert getattr(optimizer_param, "decoupled_grad", None) is None
+
     group.zero_grad()
     assert group.state.grad_valid is None
     assert not group.state.grad_ready
     assert torch.count_nonzero(group.grad_buffer.data) == 0
+    assert optimizer_param.grad is None
+    assert getattr(optimizer_param, "decoupled_grad", None) is None

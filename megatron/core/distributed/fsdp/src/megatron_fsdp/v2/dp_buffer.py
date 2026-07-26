@@ -261,7 +261,10 @@ class DataParallelBuffer:
         Dtype conversion, gradient scaling, accumulation, and temporary
         communication storage are intentionally outside this abstraction.
         """
-        assert len(target_placements) == 2
+        if len(target_placements) != self.mesh.ndim:
+            raise ValueError(
+                f"Expected {self.mesh.ndim} target placements, got {target_placements}"
+            )
 
         changed_axis = None
         for axis, (source, target) in enumerate(zip(self.placements, target_placements)):

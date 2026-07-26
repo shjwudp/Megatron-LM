@@ -39,7 +39,8 @@ class BufferIndex:
     """Describes how params are laid out in a flat buffer, including global layout
     and per-rank shard information.
 
-    The index always builds coordinate metadata for a 2D (outer, inner) mesh.
+    The index builds coordinate metadata for a 1D FSDP mesh or a 2D
+    ``(outer, inner)`` HSDP mesh.
     Query APIs accept one placement per mesh dimension. SHARD selects the
     rank-owned range; REPLICATE and PARTIAL select the full range.
 
@@ -59,12 +60,19 @@ class BufferIndex:
         param_group_id: ParamGroupIdx,
         chunk_size_factor: int = 1,
     ):
-        assert mesh.ndim == 2, f"BufferIndex expects a 2D mesh, got {mesh.ndim}D."
+        if mesh.ndim not in (1, 2):
+            raise ValueError(f"BufferIndex expects a 1D or 2D mesh, got {mesh.ndim}D.")
         self.param_group_id = param_group_id
-        dp_rank = int(mesh.get_local_rank(mesh_dim=1))
-        dp_world_size = int(mesh.size(1))
-        outer_dp_rank = int(mesh.get_local_rank(mesh_dim=0))
-        outer_dp_world_size = int(mesh.size(0))
+        self.mesh_ndim = mesh.ndim
+        inner_dim = mesh.ndim - 1
+        dp_rank = int(mesh.get_local_rank(mesh_dim=inner_dim))
+        dp_world_size = int(mesh.size(inner_dim))
+        if mesh.ndim == 2:
+            outer_dp_rank = int(mesh.get_local_rank(mesh_dim=0))
+            outer_dp_world_size = int(mesh.size(0))
+        else:
+            outer_dp_rank = 0
+            outer_dp_world_size = 1
         self.dp_rank = dp_rank
         self.dp_world_size = dp_world_size
         self.outer_dp_rank = outer_dp_rank
@@ -313,12 +321,14 @@ class BufferIndex:
 
     def _get_shard_meta(self, placements: list[Placement]):
         """Return logical metadata for the requested placements."""
-        if len(placements) != 2:
-            raise ValueError(f"Expected two placements, got {len(placements)}")
+        if len(placements) != self.mesh_ndim:
+            raise ValueError(f"Expected {self.mesh_ndim} placements, got {len(placements)}")
         if not all(isinstance(placement, Placement) for placement in placements):
             raise TypeError(f"Unsupported placements: {placements}")
 
         key = tuple(int(placement is Placement.SHARD) for placement in placements)
+        if self.mesh_ndim == 1:
+            return self.inner_shard_metas[key[0]]
         return self.outer_shard_metas[key]
 
     def local_slice_for(
@@ -364,7 +374,7 @@ class BufferIndex:
         Placements select the valid range on each mesh dimension.
         """
         if placements is None:
-            placements = [Placement.REPLICATE, Placement.SHARD]
+            placements = [Placement.REPLICATE] * (self.mesh_ndim - 1) + [Placement.SHARD]
         idx = self.item_index_map[item_id]
         item_start = idx.global_data_index
         item_end = item_start + idx.size
@@ -390,7 +400,7 @@ class BufferIndex:
         The result is not aware of DataParallelBuffer storage.
         """
         if placements is None:
-            placements = [Placement.REPLICATE, Placement.REPLICATE]
+            placements = [Placement.REPLICATE] * self.mesh_ndim
         idx = self.item_index_map[item_id]
         range_start = idx.global_data_index
         range_end = range_start + idx.size

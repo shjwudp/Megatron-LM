@@ -47,6 +47,18 @@ contribution = (Placement.PARTIAL,) * mesh.ndim
 
 The optimizer gradient has the same placements as `main_weight`.
 
+For normal FSDP, the caller's 1D mesh remains 1D; it is not expanded into a
+synthetic `(1, N)` HSDP mesh:
+
+| Value | Placement |
+| --- | --- |
+| Persistent model weight | `[S]` |
+| Main weight / optimizer gradient | `[S]` |
+| Persistent gradient storage | `[S]` |
+| Microbatch gradient accumulation | `[S]` |
+| Full compute weight | `[R]` |
+| Local gradient contribution | `[P]` |
+
 For HSDP with outer optimizer sharding, the layout is:
 
 | Value | Placement |
@@ -131,7 +143,8 @@ state.full_weight = None
 state.full_grad = None
 ```
 
-For HSDP, initialized model weights are therefore a valid `[R, S]` source.
+For FSDP, initialized model weights are a valid `[S]` source. For HSDP, they
+are a valid `[R, S]` source.
 
 ## Weight lifecycle
 
@@ -173,7 +186,18 @@ compute weights.
 At backward start, the group acquires and zeroes `full_grad`. Autograd writes one
 full local contribution, interpreted logically as all-partial placements.
 
-Every microbatch performs:
+For normal FSDP, every microbatch performs the complete data-parallel
+reduce-scatter and accumulates into persistent optimizer placement:
+
+```text
+[P] -- per-microbatch redistribution --> [S]
+                                      accumulate into grad_buffer
+```
+
+There is no separate final placement transition. `is_last_backward` only marks
+the accumulated `[S]` value optimizer-ready.
+
+For HSDP, every microbatch performs:
 
 ```text
 [P, P] -- per-microbatch redistribution --> [P, S]
@@ -232,11 +256,13 @@ released. On the last backward, `grad_valid` becomes `layout.main_weight` and
 
 Distributed tests must cover:
 
-1. initialized `[R, S]` weight validity;
-2. first unshard `[R, S] -> [R, R]`;
-3. post-optimizer unshard `[S, S] -> [R, S] -> [R, R]`;
-4. non-final microbatch `[P, P] -> [P, S]` with no outer collective;
-5. final-microbatch accumulation before `[P, S] -> [S, S]`;
-6. outer-replicated final transition `[P, S] -> [R, S]`;
-7. repeated unshard/reshard without leaked scratch leases;
-8. numerical equivalence across multiple microbatches.
+1. 1D FSDP `[S] -> [R]` weight materialization;
+2. 1D FSDP per-microbatch `[P] -> [S]` reduction and accumulation;
+3. initialized HSDP `[R, S]` weight validity;
+4. first HSDP unshard `[R, S] -> [R, R]`;
+5. post-optimizer unshard `[S, S] -> [R, S] -> [R, R]`;
+6. non-final HSDP microbatch `[P, P] -> [P, S]` with no outer collective;
+7. final-microbatch accumulation before `[P, S] -> [S, S]`;
+8. outer-replicated final transition `[P, S] -> [R, S]`;
+9. repeated unshard/reshard without leaked scratch leases;
+10. numerical equivalence across multiple microbatches.
