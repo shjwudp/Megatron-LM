@@ -115,7 +115,7 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
 
     # ---- free stale grad data (safe to repeat, idempotent) ----------------
     for param_group in target._fsdp_param_groups:
-        param_group._release_grad_storage_if_unused()
+        param_group.release_grad_storage_if_unused()
 
     # ---- CUDA graph: record sample args (first optimized micro-batch) -----
     # Actual capture happens in mfsdp_post_backward_final_callback via

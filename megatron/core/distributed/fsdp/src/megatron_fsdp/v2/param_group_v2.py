@@ -1,10 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Placement-first data-parallel ParameterGroup prototype for Megatron FSDP v2.
+"""Placement-first data-parallel ParameterGroup for Megatron FSDP v2.
 
-This module is intentionally not wired into ``fully_shard`` yet. It provides a
-small, reviewable implementation of the target DDP, ZeRO, FSDP, and HSDP
-ownership model without inheriting the lifecycle structure of ``param_group.py``.
+The implementation provides the target DDP, ZeRO, FSDP, and HSDP ownership
+model without inheriting the lifecycle structure of ``param_group.py``. It is
+available through the experimental eager ``fully_shard`` integration.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from ..uneven_dtensor import (
     make_uneven_dtensor,
     rebind_uneven_dtensor_local_tensor,
 )
-from .allocator import BucketAllocator, TemporaryBucketAllocator
+from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .buffer_index import BufferIndex, Placement
 from .dp_buffer import DataParallelBuffer
 from .mixed_precision import MixedPrecisionPolicy
@@ -75,9 +75,7 @@ class ParameterGroupLayoutV2:
 
     @classmethod
     def from_strategies(
-        cls,
-        sharding_strategy: str,
-        outer_dp_sharding_strategy: str | None = None,
+        cls, sharding_strategy: str, outer_dp_sharding_strategy: str | None = None
     ) -> "ParameterGroupLayoutV2":
         """Resolve public sharding strategies into a placement-only layout."""
         valid_inner = ("no_shard", "optim", "optim_grads", "optim_grads_params")
@@ -85,25 +83,12 @@ class ParameterGroupLayoutV2:
             raise ValueError(f"Unsupported sharding strategy: {sharding_strategy}")
 
         weight = (
-            Placement.SHARD
-            if sharding_strategy == "optim_grads_params"
-            else Placement.REPLICATE
+            Placement.SHARD if sharding_strategy == "optim_grads_params" else Placement.REPLICATE
         )
-        optimizer = (
-            Placement.REPLICATE
-            if sharding_strategy == "no_shard"
-            else Placement.SHARD
-        )
-        reduce_each_microbatch = sharding_strategy in (
-            "optim_grads",
-            "optim_grads_params",
-        )
-        grad_accumulation = (
-            Placement.SHARD if reduce_each_microbatch else Placement.PARTIAL
-        )
-        grad_storage = (
-            Placement.SHARD if reduce_each_microbatch else Placement.REPLICATE
-        )
+        optimizer = Placement.REPLICATE if sharding_strategy == "no_shard" else Placement.SHARD
+        reduce_each_microbatch = sharding_strategy in ("optim_grads", "optim_grads_params")
+        grad_accumulation = Placement.SHARD if reduce_each_microbatch else Placement.PARTIAL
+        grad_storage = Placement.SHARD if reduce_each_microbatch else Placement.REPLICATE
         inner_layout = cls(
             weight=(weight,),
             main_weight=(optimizer,),
@@ -123,9 +108,7 @@ class ParameterGroupLayoutV2:
                 f"got {sharding_strategy}"
             )
         outer_optimizer = (
-            Placement.SHARD
-            if outer_dp_sharding_strategy == "optim"
-            else Placement.REPLICATE
+            Placement.SHARD if outer_dp_sharding_strategy == "optim" else Placement.REPLICATE
         )
         return cls(
             weight=(Placement.REPLICATE, inner_layout.weight[0]),
@@ -144,9 +127,7 @@ class ParameterGroupLayoutV2:
         """Build the two-dimensional HSDP layout discussed in the design document."""
         return cls.from_strategies(
             "optim_grads_params",
-            outer_dp_sharding_strategy=(
-                "optim" if shard_optimizer_across_outer_dp else "no_shard"
-            ),
+            outer_dp_sharding_strategy=("optim" if shard_optimizer_across_outer_dp else "no_shard"),
         )
 
 
@@ -317,6 +298,14 @@ class ParameterGroupV2:
                 for param in self.params
             )
 
+        # Parameter data has been copied into FSDP-owned persistent storage.
+        # Unshard will rebind the compute parameters to a full placement view.
+        for param in self.params:
+            for tensor in self.mp_policy.storage_tensors_to_free(
+                param, self.weight_buffer, self.main_weight_buffer
+            ):
+                _free_storage(tensor)
+
         grad_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])
         self.grad_buffer = self._new_buffer(grad_dtype, self.layout.grad_storage)
 
@@ -347,11 +336,7 @@ class ParameterGroupV2:
         for param in self.params:
             local_data = optimizer_view.tensor_view(self.param_idx[param])
             dist_data = make_uneven_dtensor(
-                local_data,
-                param.shape,
-                self.mesh,
-                placements,
-                post_process_uneven=True,
+                local_data, param.shape, self.mesh, placements, post_process_uneven=True
             )
             optimizer_param = torch.nn.Parameter(dist_data, requires_grad=param.requires_grad)
             copy_chunk_metadata(dist_data, optimizer_param)
@@ -363,9 +348,7 @@ class ParameterGroupV2:
     def _initialize_optimizer_grads(self) -> None:
         """Create gradient DTensor views over the final persistent gradient."""
         grad_view = self.optimizer_grad()
-        for index, (param, optimizer_param) in enumerate(
-            zip(self.params, self._optimizer_params)
-        ):
+        for index, (param, optimizer_param) in enumerate(zip(self.params, self._optimizer_params)):
             local_grad = grad_view.tensor_view(self.param_idx[param])
             if not param.requires_grad or local_grad.numel() == 0:
                 self._optimizer_grads[index] = None
@@ -389,9 +372,7 @@ class ParameterGroupV2:
     def _install_optimizer_grads(self) -> None:
         """Attach reduced gradients to the optimizer-facing parameters."""
         self._initialize_optimizer_grads()
-        for optimizer_param, optimizer_grad in zip(
-            self._optimizer_params, self._optimizer_grads
-        ):
+        for optimizer_param, optimizer_grad in zip(self._optimizer_params, self._optimizer_grads):
             if self.mp_policy.use_decoupled_grad:
                 optimizer_param.grad = None
                 setattr(optimizer_param, "decoupled_grad", optimizer_grad)
@@ -451,6 +432,11 @@ class ParameterGroupV2:
             return self.weight_buffer
         return self.state.full_weight
 
+    def weights_are_unsharded(self, bwd_pass: bool = False) -> bool:
+        """Return whether full compute weights are available."""
+        _ = bwd_pass
+        return self.compute_weight() is not None
+
     @torch.no_grad()
     def unshard_weight(self) -> DataParallelBuffer:
         """Restore persistent weight validity, materialize full weights, and bind params."""
@@ -486,6 +472,23 @@ class ParameterGroupV2:
         self.mp_policy.post_reshard(self.params)
         self._release_scratch("full_weight", self.state.full_weight)
         self.state.full_weight = None
+
+    def release_grad_buffer(self) -> None:
+        """Release any full-gradient scratch lease."""
+        self._release_scratch("full_grad", self.state.full_grad)
+        self.state.full_grad = None
+
+    def release_grad_storage_if_unused(self) -> None:
+        """Release gradient storage after optimizer-facing gradients are cleared."""
+        if self.state.grad_phase is GradientPhaseV2.ACCUMULATING:
+            return
+        if any(
+            getattr(param, "grad", None) is not None
+            or getattr(param, "decoupled_grad", None) is not None
+            for param in self._optimizer_params
+        ):
+            return
+        self.zero_grad(set_to_none=True)
 
     @torch.no_grad()
     def refresh_model_weight(self) -> None:
@@ -547,9 +550,7 @@ class ParameterGroupV2:
 
         return self._placement_view(owner, self.contribution_placements), workspace_key
 
-    def _finalize_gradient_placement(
-        self, current: DataParallelBuffer
-    ) -> DataParallelBuffer:
+    def _finalize_gradient_placement(self, current: DataParallelBuffer) -> DataParallelBuffer:
         """Redistribute delayed mesh axes into the persistent optimizer gradient."""
         target = self.layout.main_weight
         final = self._placement_view(self.grad_buffer, target)
@@ -565,9 +566,7 @@ class ParameterGroupV2:
             if tuple(next_placements) == target and current.dtype == final.dtype:
                 output = final
             else:
-                output = self._placement_view(
-                    communication_owner, tuple(next_placements)
-                )
+                output = self._placement_view(communication_owner, tuple(next_placements))
             current.redistribute(next_placements, output_buffer=output)
             current = output
 
@@ -637,6 +636,42 @@ class ParameterGroupV2:
         if self.state.grad_phase is not GradientPhaseV2.READY:
             raise RuntimeError("Gradient is not ready for the optimizer")
         return self.grad_buffer.view(list(self.layout.main_weight))
+
+    def assert_model_weights_not_nan(self) -> None:
+        """Assert that full compute weights contain no NaNs."""
+        weight = self.compute_weight()
+        if weight is None:
+            raise RuntimeError("Model weights must be unsharded before checking for NaNs")
+        for param in self.params:
+            assert not torch.isnan(
+                weight.tensor_view(self.param_idx[param])
+            ).any(), "NaN detected in model weight buffer"
+
+    def buffer_diagnostics(
+        self,
+    ) -> tuple[list[tuple[str, torch.dtype, int, int, bool, bool]], list[tuple[int, int] | None]]:
+        """Return read-only buffer metadata and model-weight item ranges."""
+        metadata = []
+        for label, buffer in (
+            ("W", self.weight_buffer),
+            ("MW", self.main_weight_buffer),
+            ("G", self.grad_buffer),
+        ):
+            metadata.append(
+                (
+                    label,
+                    buffer.dtype,
+                    buffer.data_size,
+                    buffer.buffer_index.bucket_meta.size,
+                    self.mesh.ndim == 2 and buffer.placements[0] is Placement.SHARD,
+                    buffer.placements[-1] is Placement.SHARD,
+                )
+            )
+        ranges = []
+        for param in self.params:
+            item = self.weight_buffer.buffer_index.item_index_map.get(self.param_idx[param])
+            ranges.append(None if item is None else (item.global_data_index, item.size))
+        return metadata, ranges
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Reset logical gradient state and optimizer-facing gradients."""

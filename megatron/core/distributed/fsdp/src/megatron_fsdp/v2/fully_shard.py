@@ -52,6 +52,7 @@ def fully_shard(
     fine_grained_hooks: bool = False,
     skip_backward_callback: bool = False,  # Skip autograd RegisterFSDPBackwardFunction.
     skip_final_backward_callback: bool = False,
+    use_parameter_group_v2: bool = False,
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -79,6 +80,9 @@ def fully_shard(
             ``_register_post_backward_final_callback`` during the backward
             pre-hook.  The caller must invoke the final callback manually
             (used by the 1F1B EP overlap schedule).
+        use_parameter_group_v2: Use the placement-first parameter-group
+            implementation. This experimental path currently supports eager
+            FP32/BF16 execution without communication overlap or CUDA graphs.
     """
     unsupported_args = {
         "reshard_after_forward": reshard_after_forward,
@@ -94,10 +98,35 @@ def fully_shard(
             "The input module has already been fully sharded. "
             "Please do not call fully_shard on the same module more than once."
         )
-    mesh = _prepare_fsdp_mesh(mesh or _init_default_fully_shard_mesh())
-
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy()
+
+    mesh = mesh or _init_default_fully_shard_mesh()
+    if use_parameter_group_v2:
+        unsupported_v2_options = {
+            "enable_unshard_prefetch": enable_unshard_prefetch,
+            "enable_async_reduce_grad": enable_async_reduce_grad,
+            "enable_trace_pool": enable_trace_pool,
+            "enable_cuda_graph": enable_cuda_graph,
+            "enable_full_iteration_cuda_graph": enable_full_iteration_cuda_graph,
+            "skip_backward_callback": skip_backward_callback,
+            "skip_final_backward_callback": skip_final_backward_callback,
+        }
+        enabled = [name for name, value in unsupported_v2_options.items() if value]
+        if enabled:
+            raise NotImplementedError(
+                "ParameterGroupV2 eager integration does not support: " + ", ".join(enabled)
+            )
+        if mp_policy.fp8.enabled or mp_policy.nvfp4.enabled:
+            raise NotImplementedError("ParameterGroupV2 does not support quantized weights yet")
+        if mesh.ndim == 2 and sharding_strategy != "optim_grads_params":
+            raise NotImplementedError(
+                "ParameterGroupV2 currently requires optim_grads_params on a 2D HSDP mesh"
+            )
+        if mesh.ndim == 1 and outer_dp_sharding_strategy == "optim":
+            raise ValueError("Outer-DP optimizer sharding requires a 2D DeviceMesh")
+    else:
+        mesh = _prepare_fsdp_mesh(mesh)
 
     cls = module.__class__
     if cls not in _fsdp_class_cache:
@@ -123,6 +152,7 @@ def fully_shard(
         gradient_scaling_factor=gradient_scaling_factor,
         sharding_strategy=sharding_strategy,
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+        use_parameter_group_v2=use_parameter_group_v2,
     )
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,

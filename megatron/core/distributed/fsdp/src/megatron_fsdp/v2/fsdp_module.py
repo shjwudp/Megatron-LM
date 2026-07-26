@@ -16,6 +16,7 @@ from torch.distributed.tensor import DTensor
 from .allocator import BucketAllocator, TracePoolAllocator
 from .mixed_precision import MixedPrecisionPolicy
 from .param_group import ParameterGroup
+from .param_group_v2 import ParameterGroupLayoutV2, ParameterGroupV2
 from .utils import ParamGroupIdx, _replace_module_parameter
 
 logger = logging.getLogger(__name__)
@@ -330,6 +331,8 @@ class FSDPModule:
             for module in self._get_fsdp_modules(recursive)
             for param_group in module._fsdp_param_groups
         ]
+        if any(isinstance(param_group, ParameterGroupV2) for param_group in param_groups):
+            raise NotImplementedError("ParameterGroupV2 CPU offload is not implemented yet")
         result = ParameterGroup.offload_storage_to_cpu(
             param_groups, pin_memory=pin_memory, max_cpu_bytes=max_cpu_bytes
         )
@@ -351,6 +354,8 @@ class FSDPModule:
             for module in self._get_fsdp_modules(recursive)
             for param_group in module._fsdp_param_groups
         ]
+        if any(isinstance(param_group, ParameterGroupV2) for param_group in param_groups):
+            raise NotImplementedError("ParameterGroupV2 CPU reload is not implemented yet")
         ParameterGroup.reload_storage_to_gpu(param_groups)
 
     def _init_named_param_groups(
@@ -361,6 +366,7 @@ class FSDPModule:
         gradient_scaling_factor: Optional[float] = None,
         sharding_strategy: str = "optim_grads_params",
         outer_dp_sharding_strategy: str = "no_shard",
+        use_parameter_group_v2: bool = False,
     ):
         """
         Initialize parameter groups and build param name mapping.
@@ -393,6 +399,7 @@ class FSDPModule:
             gradient_scaling_factor=gradient_scaling_factor,
             sharding_strategy=sharding_strategy,
             outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+            use_parameter_group_v2=use_parameter_group_v2,
         )
         setattr(self, "_fsdp_param_groups", fsdp_param_groups)
 
@@ -623,7 +630,7 @@ class FSDPModule:
             prefetch_modules = []
         for module in [self] + prefetch_modules:
             if all(
-                param_group.model_weights_are_unsharded(bwd_pass=bwd_pass)
+                param_group.weights_are_unsharded(bwd_pass=bwd_pass)
                 for param_group in module._fsdp_param_groups
             ):
                 continue
@@ -638,13 +645,21 @@ class FSDPModule:
                             dist_param._local_tensor
                         ).any(), f"NaN detected in dist param for parameter {name}"
 
-            ParameterGroup.unshard_model_weights(
-                module._fsdp_param_groups, bwd_pass=bwd_pass, stream=stream, async_op=async_op
+            uses_v2 = bool(module._fsdp_param_groups) and isinstance(
+                module._fsdp_param_groups[0], ParameterGroupV2
             )
-
-            # Post-processing may launch Transformer Engine kernels. Defer it
-            # until this module's caller stream has waited for communication.
-            ctx.unshard_pending_post[id(module)].add(bwd_pass)
+            if uses_v2:
+                if async_op:
+                    raise RuntimeError("ParameterGroupV2 does not support async unshard yet")
+                for param_group in module._fsdp_param_groups:
+                    param_group.unshard_weight()
+            else:
+                ParameterGroup.unshard_model_weights(
+                    module._fsdp_param_groups, bwd_pass=bwd_pass, stream=stream, async_op=async_op
+                )
+                # Post-processing may launch Transformer Engine kernels. Defer it
+                # until this module's caller stream has waited for communication.
+                ctx.unshard_pending_post[id(module)].add(bwd_pass)
 
             # Record event to track when unshard is done for this module
             if async_op:
@@ -687,7 +702,7 @@ class FSDPModule:
             # communication before releasing caller-owned temporary buffers.
             unshard_event.wait()
         for param_names, param_group in self._named_param_groups:
-            param_group.reshard()
+            param_group.reshard_weight()
             for name, dist_param in zip(param_names, param_group.optimizer_params):
                 _replace_module_parameter(self, name, dist_param)
         ctx.unshard_done_events[id(self)] = None  # Clear unshard event for this module
@@ -733,7 +748,12 @@ class FSDPModule:
                 continue
 
             # Initialize main gradient buffer and param -> main_grad mapping if not already done.
-            param_group._init_dist_grads()
+            uses_v2 = isinstance(param_group, ParameterGroupV2)
+            if uses_v2:
+                if async_op:
+                    raise RuntimeError("ParameterGroupV2 does not support async grad reduce yet")
+            else:
+                param_group._init_dist_grads()
 
             # NaN check before reduction
             if getattr(self, "_enable_nan_checks", False):
@@ -836,7 +856,8 @@ class FSDPModule:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
                 param_group.reduce_grad(is_last_backward=ctx.is_last_backward)
-                param_group.release_grad_buffer()
+                if not uses_v2:
+                    param_group.release_grad_buffer()
 
             # Install reduced gradients to distributed parameters
             for name, param, dist_param, dist_grad in zip(
@@ -959,7 +980,7 @@ class FSDPModule:
             if not isinstance(child, FSDPModule):
                 continue
             for param_group in child._fsdp_param_groups:
-                param_group.copy_main_weights_to_model_weights()
+                param_group.refresh_model_weight()
         # Explicit optimizer integrations and the lazy pre-forward path share
         # this method. Whichever installs the weights first consumes the work.
         self._fsdp_root_context.model_weight_refresh_pending = False
@@ -1119,7 +1140,8 @@ def _get_module_fsdp_param_groups(
     gradient_scaling_factor: Optional[float] = None,
     sharding_strategy: str = "optim_grads_params",
     outer_dp_sharding_strategy: str = "no_shard",
-) -> List[ParameterGroup]:
+    use_parameter_group_v2: bool = False,
+) -> List[ParameterGroup | ParameterGroupV2]:
     """
     Group module parameters by (device, dtype, requires_grad) and create ParameterGroups.
 
@@ -1131,6 +1153,11 @@ def _get_module_fsdp_param_groups(
     for param in module.parameters():
         if ignored_params is not None and param in ignored_params:
             continue
+        if use_parameter_group_v2 and param.dtype not in (torch.float32, torch.bfloat16):
+            raise NotImplementedError(
+                "ParameterGroupV2 eager integration supports FP32/BF16 parameters, "
+                f"got {param.dtype}"
+            )
 
         # The policy owns dtype-sensitive grouping, including FP8/MXFP8 tensors
         # whose logical dtype may differ from their communication payload.
@@ -1143,8 +1170,22 @@ def _get_module_fsdp_param_groups(
     # Create ParameterGroup for each group
     fsdp_param_groups = []
     for i, params in enumerate(param_groups.values()):
-        fsdp_param_groups.append(
-            ParameterGroup(
+        if use_parameter_group_v2:
+            if mesh is None:
+                raise ValueError("ParameterGroupV2 requires an explicit DeviceMesh")
+            layout = ParameterGroupLayoutV2.from_strategies(
+                sharding_strategy, outer_dp_sharding_strategy if mesh.ndim == 2 else None
+            )
+            param_group = ParameterGroupV2(
+                params,
+                mesh=mesh,
+                param_group_id=ParamGroupIdx(id(module), i),
+                layout=layout,
+                mp_policy=mp_policy,
+                gradient_scaling_factor=gradient_scaling_factor,
+            )
+        else:
+            param_group = ParameterGroup(
                 params,
                 mesh=mesh,
                 param_group_id=ParamGroupIdx(id(module), i),
@@ -1153,6 +1194,6 @@ def _get_module_fsdp_param_groups(
                 sharding_strategy=sharding_strategy,
                 outer_dp_sharding_strategy=outer_dp_sharding_strategy,
             )
-        )
+        fsdp_param_groups.append(param_group)
 
     return fsdp_param_groups

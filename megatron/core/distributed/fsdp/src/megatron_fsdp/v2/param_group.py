@@ -754,11 +754,19 @@ class ParameterGroup:
             for _, state in self._required_weight_states(bwd_pass)
         )
 
+    def weights_are_unsharded(self, bwd_pass: bool = False) -> bool:
+        """Return whether the weights required by this pass are unsharded."""
+        return self.model_weights_are_unsharded(bwd_pass=bwd_pass)
+
     def reshard(self):
         """Detach parameter views and release temporary replicated weight leases."""
         self.mp_policy.post_reshard(self.params)
         self._release_full_weight_buffer(WeightBufferRole.MODEL)
         self._release_full_weight_buffer(WeightBufferRole.TRANSPOSE)
+
+    def reshard_weight(self) -> None:
+        """Release temporary replicated weight leases."""
+        self.reshard()
 
     @torch.no_grad()
     def copy_main_weights_to_model_weights(self):
@@ -783,6 +791,10 @@ class ParameterGroup:
             self._release_full_weight_buffer(role)
             state = self._weight_buffer_states[role]
             state.valid_placements = tuple(optimizer_placements)
+
+    def refresh_model_weight(self) -> None:
+        """Install optimizer weights into model-weight storage."""
+        self.copy_main_weights_to_model_weights()
 
     def reduce_grad(
         self, is_last_backward: bool = False, stream: Optional[torch.cuda.Stream] = None
@@ -906,6 +918,10 @@ class ParameterGroup:
                 self._dist_grad_cache[index] = dist_grad
                 self.dist_grads[index] = None
         self.main_grad_buffer.unbind()
+
+    def release_grad_storage_if_unused(self) -> None:
+        """Release stale gradient storage after optimizer gradients are cleared."""
+        self._release_grad_storage_if_unused()
 
     def _init_dist_params(self):
         """Initialize optimizer-facing DTensor views into the weight buffers."""

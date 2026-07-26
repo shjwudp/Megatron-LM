@@ -3,8 +3,11 @@
 ## Status
 
 This document defines the target ownership and state model for Megatron FSDP v2
-`ParameterGroup`. The implementation may migrate to this model incrementally, but
-each intermediate step must preserve the HSDP lifecycle in
+`ParameterGroup`. `ParameterGroupV2` implements this model and is wired to
+`fully_shard(..., use_parameter_group_v2=True)` for eager FP32/BF16 validation.
+Communication overlap, CUDA graphs, CPU offload, and quantized weights remain on
+the existing `ParameterGroup` path while the migration proceeds. Each
+intermediate step must preserve the HSDP lifecycle in
 [`hsdp_design.md`](hsdp_design.md).
 
 ## Design principles

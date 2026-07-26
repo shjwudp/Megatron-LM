@@ -63,6 +63,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import 
     WeightBufferRole,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group_v2 import (
+    GradientPhaseV2,
+    ParameterGroupV2,
+)
 
 SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
@@ -289,6 +293,82 @@ class TestFullyShardBasic:
         loss = _forward_backward(model, x)
         assert not torch.isnan(torch.tensor(loss)), "Loss is NaN"
         assert not torch.isinf(torch.tensor(loss)), "Loss is Inf"
+
+    @pytest.mark.parametrize(
+        "sharding_strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"]
+    )
+    @pytest.mark.parametrize(
+        ("model_dtype", "main_dtype"),
+        [
+            pytest.param(torch.float32, None, id="fp32"),
+            pytest.param(torch.bfloat16, torch.float32, id="bf16-fp32-main"),
+        ],
+    )
+    def test_parameter_group_v2_eager_1d(self, sharding_strategy, model_dtype, main_dtype):
+        """The experimental eager path runs the complete 1D FSDP lifecycle."""
+        torch.manual_seed(42)
+        model = SimpleMLP(16).to(_device(), dtype=model_dtype)
+        fully_shard(
+            model,
+            sharding_strategy=sharding_strategy,
+            mp_policy=MixedPrecisionPolicy(
+                main_params_dtype=main_dtype, main_grads_dtype=main_dtype
+            ),
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+            use_parameter_group_v2=True,
+        )
+
+        assert model._fsdp_param_groups
+        assert all(
+            isinstance(param_group, ParameterGroupV2) and param_group.mesh.ndim == 1
+            for param_group in model._fsdp_param_groups
+        )
+
+        model.set_is_last_backward(True)
+        loss = _forward_backward(model, torch.randn(2, 16, device=_device(), dtype=model_dtype))
+        assert torch.isfinite(torch.tensor(loss))
+        model.finish_grad_sync()
+
+        for param_group in model._fsdp_param_groups:
+            assert param_group.state.grad_phase is GradientPhaseV2.READY
+            for optimizer_param in param_group.optimizer_params:
+                if optimizer_param.requires_grad:
+                    assert optimizer_param.grad is not None
+
+        model.zero_grad(set_to_none=True)
+        for param_group in model._fsdp_param_groups:
+            assert param_group.state.grad_phase is GradientPhaseV2.EMPTY
+            assert param_group.grad_buffer.data is None
+
+    @pytest.mark.parametrize("outer_dp_sharding_strategy", ["no_shard", "optim"])
+    def test_parameter_group_v2_eager_hsdp(self, outer_dp_sharding_strategy):
+        """The eager HSDP path preserves the caller's 2D mesh and final layout."""
+        torch.manual_seed(42)
+        model = SimpleMLP(16).to(_device())
+        fully_shard(
+            model,
+            mesh=_build_hsdp_mesh(),
+            sharding_strategy="optim_grads_params",
+            outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+            use_parameter_group_v2=True,
+        )
+
+        model.set_is_last_backward(True)
+        loss = _forward_backward(model, torch.randn(2, 16, device=_device()))
+        assert torch.isfinite(torch.tensor(loss))
+        model.finish_grad_sync()
+
+        expected_outer = (
+            Placement.SHARD if outer_dp_sharding_strategy == "optim" else Placement.REPLICATE
+        )
+        for param_group in model._fsdp_param_groups:
+            assert isinstance(param_group, ParameterGroupV2)
+            assert param_group.mesh.ndim == 2
+            assert param_group.layout.main_weight == (expected_outer, Placement.SHARD)
+            assert param_group.state.grad_phase is GradientPhaseV2.READY
 
     def test_no_shard_forward_backward_finish_grad_sync(self):
         """no_shard keeps full replicated buffers and all-reduces at grad sync."""
