@@ -76,7 +76,13 @@ class MixedDtypeLayer(nn.Module):
 # ------------------------------------------------------------------ #
 
 
-def _build_groups(strategy, mesh=None, mp_policy=None, outer_dp_sharding_strategy="no_shard"):
+def _build_groups(
+    strategy,
+    mesh=None,
+    mp_policy=None,
+    outer_dp_sharding_strategy="no_shard",
+    gradient_scaling_factor=None,
+):
     """Create two ParameterGroups (bf16 + uint8) and call init_buffers.
 
     Returns (groups, originals, dp_group, rank, world_size, device) where
@@ -114,6 +120,7 @@ def _build_groups(strategy, mesh=None, mp_policy=None, outer_dp_sharding_strateg
             mesh=mesh,
             sharding_strategy=strategy,
             outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+            gradient_scaling_factor=gradient_scaling_factor,
         )
         groups.append(pg)
     return groups, originals, dp_group, rank, torch.distributed.get_world_size(), device
@@ -292,8 +299,17 @@ def test_redistribute_into_shared_replicate_output():
         expected = torch.cat(
             [torch.full_like(input_buffer.data, peer_rank + 1) for peer_rank in range(ws)]
         )
-        assert result is output_buffer.data
+        assert result is output_buffer
         assert torch.equal(output_buffer.data, expected)
+
+        # A local REPLICATE -> SHARD transition must also populate a separate
+        # destination rather than only validate its placement.
+        shard_output = output_buffer.placeholder(shard_placements)
+        shard_output.bind(torch.empty_like(input_buffer.data))
+        expected_shard = output_buffer.view(shard_placements).data.clone()
+        result = output_buffer.redistribute(shard_placements, output_buffer=shard_output)
+        assert result is shard_output
+        assert torch.equal(shard_output.data, expected_shard)
 
     torch.distributed.barrier(group=dp_group)
 
@@ -326,6 +342,36 @@ def test_reduce_grad(strategy):
         pg.reduce_grad(is_last_backward=True)
         actual = gbuf.data
         assert torch.equal(actual, expected)
+
+    torch.distributed.barrier()
+
+
+@pytest.mark.parametrize("grad_comm_dtype", [None, torch.float32])
+def test_reduce_grad_owns_comm_conversion_and_scaling(grad_comm_dtype):
+    """Communication dtype and scaling are ParameterGroup workspace policy."""
+    mp_policy = MixedPrecisionPolicy(
+        main_params_dtype=torch.float32, grad_comm_dtype=grad_comm_dtype
+    )
+    groups, _, dp_group, rank, _, device = _build_groups(
+        "optim_grads_params", mp_policy=mp_policy, gradient_scaling_factor=0.25
+    )
+
+    for pg in groups:
+        pg._init_dist_grads()
+        gbuf = pg.main_grad_buffer
+        if gbuf is None:
+            continue
+
+        full = torch.full(
+            (gbuf.buffer_index.bucket_meta.size,), float(rank + 1), dtype=gbuf.dtype, device=device
+        )
+        pg._acquire_full_grad_buffer().data.copy_(full)
+        expected_input = full.to(grad_comm_dtype or full.dtype).mul_(0.25)
+        expected = Ref.reduce_scatter(expected_input, dp_group).to(gbuf.dtype)
+
+        pg.reduce_grad(is_last_backward=True)
+
+        assert torch.equal(gbuf.data, expected)
 
     torch.distributed.barrier()
 

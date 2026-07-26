@@ -716,9 +716,11 @@ No `async_op` parameter is needed. The method is purely synchronous within the c
 `ParameterGroup.reduce_grad()` acquires any full-gradient and communication-dtype
 leases, binds explicit destination buffers, and calls
 `DataParallelBuffer.redistribute()`. The buffer performs only the placement-selected
-collective. `ParameterGroup._finalize_gradient_redistribution()` then decides whether
-the result overwrites or accumulates persistent gradient storage and releases any
-temporary redistribution workspace.
+collective and returns the destination `DataParallelBuffer`. It does not accept raw
+communication tensors or gradient-scaling policy. `ParameterGroup` stages dtype
+conversion and scaling in its own temporary DP buffer, then one reduction-stage
+helper decides whether the result overwrites or accumulates persistent gradient
+storage and releases the workspace.
 
 The caller (`FSDPModule.reduce_grad`) provides the stream context. Allocation remains
 on the caller stream before side-stream communication starts, preserving overlap and

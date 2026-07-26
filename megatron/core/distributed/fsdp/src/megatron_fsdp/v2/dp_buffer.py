@@ -255,15 +255,16 @@ class DataParallelBuffer:
         target_placements: list[Placement],
         *,
         output_buffer: "DataParallelBuffer" | None = None,
-        comm_input: torch.Tensor | None = None,
-        gradient_scaling_factor: float | None = None,
         stream: Optional[torch.cuda.Stream] = None,
-    ) -> torch.Tensor:
-        """Redistribute one mesh axis and return the destination tensor.
+    ) -> "DataParallelBuffer":
+        """Redistribute one mesh axis and return the destination DP buffer.
 
         ``output_buffer`` may name an explicit destination. This permits an
         in-place all-gather whose ``REPLICATE`` output owns full storage while
         this ``SHARD`` input is a slice sharing that same storage.
+
+        Dtype conversion, gradient scaling, accumulation, and temporary
+        communication storage are intentionally outside this abstraction.
         """
         assert len(target_placements) == 2
 
@@ -279,11 +280,22 @@ class DataParallelBuffer:
             changed_axis = axis
         if changed_axis is None:
             if output_buffer is None:
-                return self.data
+                return self
             self._validate_output_buffer(output_buffer, target_placements)
-            if output_buffer.data.data_ptr() != self.data.data_ptr():
-                output_buffer.data.copy_(self.data)
-            return output_buffer.data
+            if self.data is None:
+                raise RuntimeError("Redistribution requires a bound input buffer")
+            current_stream = torch.cuda.current_stream()
+            stream = stream or current_stream
+            if stream != current_stream:
+                stream.wait_stream(current_stream)
+            if self.data.is_cuda:
+                self.data.record_stream(stream)
+            if output_buffer.data.is_cuda:
+                output_buffer.data.record_stream(stream)
+            with torch.cuda.stream(stream):
+                if output_buffer.data.data_ptr() != self.data.data_ptr():
+                    output_buffer.data.copy_(self.data)
+            return output_buffer
 
         current_stream = torch.cuda.current_stream()
         stream = stream or current_stream
@@ -299,13 +311,11 @@ class DataParallelBuffer:
                 output_buffer = self.view(target_placements)
             else:
                 self._validate_output_buffer(output_buffer, target_placements)
-            output = output_buffer.data
         elif target is Placement.PARTIAL:
             if output_buffer is None:
                 output_buffer = self.reinterpret(target_placements)
             else:
                 self._validate_output_buffer(output_buffer, target_placements)
-            output = output_buffer.data
         else:
             if output_buffer is None:
                 raise ValueError(
@@ -313,51 +323,40 @@ class DataParallelBuffer:
                     "requires an externally bound output buffer"
                 )
             self._validate_output_buffer(output_buffer, target_placements)
-            input_buffer = self._bound_view(self.placements)
-            output = output_buffer.data
+        input_data = self.data
+        output_data = output_buffer.data
+        if input_data is None or output_data is None:
+            raise RuntimeError("Redistribution requires bound input and output buffers")
+        if input_data.is_cuda:
+            input_data.record_stream(stream)
+        if output_data.is_cuda:
+            output_data.record_stream(stream)
 
-        if source is Placement.SHARD and target is Placement.REPLICATE:
-            with torch.cuda.stream(stream):
-                torch.distributed.all_gather_into_tensor(output, input_buffer, group=group)
-        elif source is Placement.PARTIAL:
-            scaling_factor = gradient_scaling_factor
-            scale_inner = changed_axis == 1 and scaling_factor not in (None, 1.0)
-            comm_input = input_buffer if comm_input is None else comm_input
-            prescale = scale_inner and (
-                comm_input.dtype == torch.bfloat16 or torch.distributed.get_world_size(group) == 1
-            )
-            op = (
-                torch.distributed.ReduceOp.SUM
-                if not scale_inner or prescale
-                else torch.distributed._make_nccl_premul_sum(scaling_factor)
-            )
-
-            if comm_input.is_cuda:
-                comm_input.record_stream(stream)
-
-            with torch.cuda.stream(stream):
-                if comm_input is not input_buffer:
-                    comm_input.copy_(input_buffer)
-                if prescale:
-                    comm_input.mul_(scaling_factor)
+        with torch.cuda.stream(stream):
+            if source is Placement.SHARD and target is Placement.REPLICATE:
+                torch.distributed.all_gather_into_tensor(output_data, input_data, group=group)
+            elif source is Placement.PARTIAL:
                 if target is Placement.REPLICATE:
-                    torch.distributed.all_reduce(comm_input, group=group, op=op)
-                    output = comm_input
+                    if output_data.data_ptr() != input_data.data_ptr():
+                        output_data.copy_(input_data)
+                    torch.distributed.all_reduce(output_data, group=group)
                 else:
-                    if comm_input is not input_buffer:
-                        input_meta = self.buffer_index._get_shard_meta(self.placements)
-                        output_meta = self.buffer_index._get_shard_meta(target_placements)
-                        output_offset = output_meta.global_data_index - input_meta.global_data_index
-                        output = comm_input[output_offset : output_offset + output_meta.size]
                     torch.distributed.reduce_scatter_tensor(
-                        output=output, input=comm_input, group=group, op=op
+                        output=output_data, input=input_data, group=group
                     )
-        elif target in (Placement.PARTIAL, Placement.SHARD):
-            pass
-        else:
-            raise NotImplementedError(f"Unsupported placement transition: {source!r} -> {target!r}")
+            elif source is Placement.REPLICATE and target is Placement.SHARD:
+                local_input = self._bound_view(target_placements)
+                if output_data.data_ptr() != local_input.data_ptr():
+                    output_data.copy_(local_input)
+            elif target is Placement.PARTIAL:
+                if output_data.data_ptr() != input_data.data_ptr():
+                    output_data.copy_(input_data)
+            else:
+                raise NotImplementedError(
+                    f"Unsupported placement transition: {source!r} -> {target!r}"
+                )
 
-        return output
+        return output_buffer
 
     def _validate_output_buffer(
         self, output_buffer: "DataParallelBuffer", target_placements: list[Placement]

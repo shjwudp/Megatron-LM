@@ -62,15 +62,16 @@ The parameter group owns consumers and training semantics:
 - selecting the weight representations required by a forward or backward pass;
 - batching weight redistribution across ordered parameter groups;
 - binding unsharded buffer views to parameters;
-- finalizing gradient redistribution results;
+- planning and committing gradient redistribution stages;
 - optimizer-facing DTensor views;
 - the sequence of weight, gradient, and mixed-precision transformations.
 
 `_bind_params()` is private because it combines internal buffer identity, parameter
 indexing, and mixed-precision representation rules. `unshard_model_weights()` is the
 semantic entry point used by the module scheduler.
-`_finalize_gradient_redistribution()` belongs here because copy-versus-accumulate and
-workspace release are gradient-lifecycle state, not buffer-storage properties.
+Copy-versus-accumulate, communication dtype, gradient scaling, and workspace release
+belong to the parameter group's reduction-stage helper because they are
+gradient-lifecycle policy, not buffer-storage properties.
 
 Logical lifetime and physical allocation lifetime are distinct. On reshard,
 `ParameterGroup` always unbinds and drops its logical lease. A storage-freeing
@@ -217,12 +218,16 @@ lease from asynchronous all-gather launch through the final consumer.
 1. `ParameterGroup` acquires a full-gradient lease only when persistent gradient
    storage cannot contain the replicated backward output.
 2. It aliases the staged full buffer as `PARTIAL` on active DP mesh dimensions.
-3. The gradient buffer performs all-reduce or reduce-scatter for the selected mesh
-   axis into a caller-provided destination. `ParameterGroup` supplies a separate
-   communication-dtype input when conversion or accumulation requires it.
-4. `ParameterGroup._finalize_gradient_redistribution()` copies or accumulates the
-   result according to microbatch state, then releases any communication workspace.
-5. The group exposes the resulting shards through optimizer-facing DTensors and
+3. `ParameterGroup` determines an ordered list of target placements. Inner-DP runs at
+   the step boundary or whenever persistent gradients are inner-sharded. Outer-DP
+   runs at the step boundary or whenever optimizer state is outer-sharded.
+4. When dtype conversion, scaling, or accumulation requires temporary storage, the
+   group creates an externally allocated DP-buffer owner and derives input and output
+   placement views from it.
+5. `DataParallelBuffer.redistribute()` performs one all-reduce or reduce-scatter and
+   returns its destination DP buffer. The group stage helper copies or accumulates
+   that result into persistent storage and releases any workspace.
+6. The group exposes the resulting shards through optimizer-facing DTensors and
    releases the full-gradient lease after asynchronous communication completes.
 
 Gradient reduction intentionally does not use a single batched final target. Inner-DP
