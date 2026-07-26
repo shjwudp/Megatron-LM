@@ -21,9 +21,10 @@ from ..uneven_dtensor import (
     make_uneven_dtensor,
     rebind_uneven_dtensor_local_tensor,
 )
-from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
+from .allocator import BucketAllocator, TemporaryBucketAllocator
 from .dp_buffer import DataParallelBuffer, Placement
 from .mixed_precision import MixedPrecisionPolicy
+from .storage import free_storage
 from .utils import ParamGroupIdx, _prepare_fsdp_mesh
 
 
@@ -111,10 +112,13 @@ class ParameterGroup:
             self.chunk_size_factor = 1
 
         self.gradient_scaling_factor = gradient_scaling_factor
+        self.grad_comm_dtype = self.mp_policy.grad_comm_dtype
         self.allocator = allocator if allocator is not None else TemporaryBucketAllocator()
         self.enable_full_iteration_cuda_graph = False
         self._full_grad_buffer_has_accumulated_grad = False
         self._reduced_grad_buffer_has_accumulated_grad = False
+        self._unsharded_weight_buffers: Dict[str, DataParallelBuffer] = {}
+        self._full_grad_buffer: Optional[DataParallelBuffer] = None
 
         # Buffer references (initialized in _init_buffers)
         self.model_weight_buffer: Optional[DataParallelBuffer] = None
@@ -130,10 +134,8 @@ class ParameterGroup:
         self._dist_grad_cache_validated = [False for _ in self.dist_grads]
 
     def set_allocator(self, allocator: BucketAllocator) -> None:
-        """Replace the allocator used by every buffer in this parameter group."""
+        """Replace the allocator used for this group's temporary buffer leases."""
         self.allocator = allocator
-        for buffer in self._buffers():
-            buffer.allocator = allocator
 
     def _buffers(self) -> List[DataParallelBuffer]:
         """Return all internal buffers owned by this parameter group."""
@@ -229,16 +231,14 @@ class ParameterGroup:
             assert not torch.isnan(param_data).any(), "NaN detected in model weight buffer"
 
     def _create_buffer(self, dtype: torch.dtype, role: str) -> DataParallelBuffer:
-        """Create a buffer and namespace its temporary bucket by role."""
+        """Create an unbound persistent buffer layout for one storage role."""
         return DataParallelBuffer(
             tensors=self.params,
             dtype=dtype,
             device=self.device,
             mesh=self.mesh,
-            allocator=self.allocator,
             buffer_role=role,
             param_group_id=self.param_group_id,
-            gradient_scaling_factor=self.gradient_scaling_factor,
             chunk_size_factor=self.chunk_size_factor,
             sharding_strategy=self.sharding_strategy,
             outer_dp_sharding_strategy=self.outer_dp_sharding_strategy,
@@ -260,14 +260,14 @@ class ParameterGroup:
         # choices and exposes the tensor view that should be packed.
         model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
         wbuf = self._create_buffer(model_weight_dtype, "model_weight")
-        wbuf.init_data(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
+        wbuf.bind(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
         for i, p in enumerate(self.params):
             wbuf.set_item(i, self.mp_policy.get_param_data(p))
         self.model_weight_buffer = wbuf
 
         if self.mp_policy.needs_transpose_weight_buffer(self.params[0]):
             tbuf = self._create_buffer(torch.uint8, "transpose_weight")
-            tbuf.init_data(torch.empty(tbuf.data_size, dtype=tbuf.dtype, device=self.device))
+            tbuf.bind(torch.empty(tbuf.data_size, dtype=tbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):
                 tbuf.set_item(i, self.mp_policy.get_param_data(p, transpose=True))
             self.transpose_weight_buffer = tbuf
@@ -288,7 +288,7 @@ class ParameterGroup:
                 main_params_dtype != model_weight_dtype
                 or mbuf.storage_placements != wbuf.storage_placements
             ):
-                mbuf.init_data(torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device))
+                mbuf.bind(torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device))
                 for i, p in enumerate(self.params):
                     item = self.mp_policy.get_high_precision_value(p)
                     mbuf.set_item(i, item.detach().to(main_params_dtype))
@@ -304,7 +304,7 @@ class ParameterGroup:
             for tensor in self.mp_policy.storage_tensors_to_free(
                 p, self.model_weight_buffer, self.main_weight_buffer
             ):
-                _free_storage(tensor)
+                free_storage(tensor)
 
         for weight_buffer in (self.model_weight_buffer, self.transpose_weight_buffer):
             if weight_buffer is not None and not weight_buffer.inner_sharded:
@@ -330,6 +330,42 @@ class ParameterGroup:
             if weight_buffer is not None
         ]
 
+    def _weight_buffer_role(self, weight_buffer: DataParallelBuffer) -> str:
+        """Return the allocator role for one of this group's weight buffers."""
+        if weight_buffer is self.model_weight_buffer:
+            return "model_weight"
+        if weight_buffer is self.transpose_weight_buffer:
+            return "transpose_weight"
+        raise ValueError("Weight buffer does not belong to this parameter group")
+
+    def _acquire_weight_output(self, weight_buffer: DataParallelBuffer) -> DataParallelBuffer:
+        """Return a bound replicated destination for a weight redistribution."""
+        full_placements = [Placement.REPLICATE, Placement.REPLICATE]
+        role = self._weight_buffer_role(weight_buffer)
+        if role in self._unsharded_weight_buffers:
+            return self._unsharded_weight_buffers[role]
+
+        try:
+            return weight_buffer.view(full_placements)
+        except ValueError:
+            output = weight_buffer.placeholder(full_placements)
+            bucket = self.allocator.allocate(
+                key=(self.param_group_id, role),
+                size=output.data_size,
+                dtype=output.dtype,
+                device=output.device,
+            )
+            output.bind(bucket.data)
+            self._unsharded_weight_buffers[role] = output
+            return output
+
+    def _release_weight_outputs(self) -> None:
+        """Release all temporary replicated weight destinations owned by this group."""
+        for role, output in self._unsharded_weight_buffers.items():
+            output.unbind()
+            self.allocator.free((self.param_group_id, role))
+        self._unsharded_weight_buffers.clear()
+
     def finalize_model_weight_unshard(self, bwd_pass: bool = False) -> None:
         """Finalize model weights after the caller has waited for async communication."""
         self.mp_policy.post_unshard(self.params, bwd_pass=bwd_pass)
@@ -354,14 +390,19 @@ class ParameterGroup:
             for param_group in param_groups
             for weight_buffer in param_group._weight_buffers_for_unshard(bwd_pass=bwd_pass)
         ]
+        output_buffers = [
+            param_group._acquire_weight_output(weight_buffer)
+            for param_group, weight_buffer in owned_weight_buffers
+        ]
         full_buffers = DataParallelBuffer.redistribute_buffers(
             [weight_buffer for _, weight_buffer in owned_weight_buffers],
             [Placement.REPLICATE, Placement.REPLICATE],
+            output_buffers=output_buffers,
             stream=stream,
             async_op=async_op,
         )
         for (param_group, weight_buffer), full_buffer in zip(owned_weight_buffers, full_buffers):
-            param_group._bind_params(weight_buffer, full_buffer)
+            param_group._bind_params(weight_buffer, full_buffer.data)
 
     def unshard(self, bwd_pass: bool = False, stream: Optional[torch.cuda.Stream] = None) -> None:
         """
@@ -385,7 +426,12 @@ class ParameterGroup:
             raise ValueError("Parameters may only be bound to this group's weight buffers")
         if buffer is None:
             assert weight_buffer.is_unsharded(), "Cannot bind params from a sharded buffer"
-            buffer = weight_buffer.fetch_buffer(weight_buffer.placements)
+            role_output = self._unsharded_weight_buffers.get(buffer_role)
+            buffer = (
+                role_output.data
+                if role_output is not None
+                else weight_buffer.view(weight_buffer.placements).data
+            )
         assert buffer.numel() == weight_buffer.buffer_index.bucket_meta.size, (
             f"Buffer size {buffer.numel()} does not match expected size "
             f"{weight_buffer.buffer_index.bucket_meta.size}"
@@ -400,24 +446,104 @@ class ParameterGroup:
     @torch.no_grad()
     def commit_comm_output(
         self,
-        grad_buffer: DataParallelBuffer,
+        output_buffer: DataParallelBuffer,
         comm_output: torch.Tensor,
         changed_axis: int,
         *,
         stream: Optional[torch.cuda.Stream] = None,
         accumulate: bool = False,
+        release_workspace: bool = False,
     ) -> None:
         """Commit a gradient redistribution result into this group's storage."""
-        if grad_buffer is not self.main_grad_buffer:
-            raise ValueError("Communication output may only target this group's grad buffer")
-        output_buffer = grad_buffer.fetch_buffer(grad_buffer.placements)
+        if output_buffer.data is None:
+            raise ValueError("Gradient communication output buffer is not bound")
         with torch.cuda.stream(stream or torch.cuda.current_stream()):
-            if output_buffer.data_ptr() != comm_output.data_ptr():
+            if output_buffer.data.data_ptr() != comm_output.data_ptr():
                 if accumulate:
-                    output_buffer.add_(comm_output)
+                    output_buffer.data.add_(comm_output)
                 else:
-                    output_buffer.copy_(comm_output)
-        grad_buffer.release_redistribution_workspace(changed_axis)
+                    output_buffer.data.copy_(comm_output)
+        if release_workspace:
+            self.allocator.free(
+                (self.param_group_id, "main_grad", "grad_reduce_input", changed_axis)
+            )
+
+    def _acquire_full_grad_buffer(self) -> DataParallelBuffer:
+        """Return the full gradient destination, allocating a temporary lease if needed."""
+        self._init_dist_grads()
+        grad_buffer = self.main_grad_buffer
+        if grad_buffer is None:
+            raise RuntimeError("Parameter group has no gradient buffer")
+        full_placements = [Placement.REPLICATE, Placement.REPLICATE]
+        if self._full_grad_buffer is not None:
+            return self._full_grad_buffer
+        try:
+            return grad_buffer.view(full_placements)
+        except ValueError:
+            output = grad_buffer.placeholder(full_placements)
+            bucket = self.allocator.allocate(
+                key=(self.param_group_id, "main_grad"),
+                size=output.data_size,
+                dtype=output.dtype,
+                device=output.device,
+            )
+            output.bind(bucket.data)
+            self._full_grad_buffer = output
+            return output
+
+    def get_main_grad(self, param: torch.nn.Parameter) -> torch.Tensor:
+        """Return the full gradient item used by backward accumulation."""
+        full_grad_buffer = self._acquire_full_grad_buffer()
+        item_id = self.param_idx[param]
+        start, end = full_grad_buffer.buffer_index._get_item_global_range(item_id)
+        param_shape = full_grad_buffer.buffer_index.item_index_map[item_id].shape
+        return full_grad_buffer.data[start:end].view(param_shape)
+
+    def ensure_full_grad_buffer(self) -> None:
+        """Materialize the full gradient lease before CUDA graph trace or capture."""
+        self._acquire_full_grad_buffer()
+
+    def _gradient_output_buffer(self, target_placements: list[Placement]) -> DataParallelBuffer:
+        """Return externally owned storage for one gradient redistribution output."""
+        grad_buffer = self.main_grad_buffer
+        if grad_buffer is None:
+            raise RuntimeError("Parameter group has no gradient buffer")
+        physical_placements = [
+            Placement.REPLICATE if placement is Placement.PARTIAL else placement
+            for placement in target_placements
+        ]
+        # With outer optimizer sharding, inner reduction produces an
+        # outer-PARTIAL intermediate. Keep it in the full temporary lease so
+        # it cannot overwrite the persistent outer shard accumulated by an
+        # earlier microbatch.
+        if self.outer_dp_sharding_strategy == "optim" and target_placements[0] is Placement.PARTIAL:
+            owners = (self._full_grad_buffer, grad_buffer)
+        else:
+            owners = (grad_buffer, self._full_grad_buffer)
+        for owner in owners:
+            if owner is None:
+                continue
+            try:
+                return owner.view(physical_placements).reinterpret(target_placements)
+            except ValueError:
+                continue
+        raise RuntimeError(
+            f"No bound gradient storage contains output placements {target_placements}"
+        )
+
+    def _grad_comm_input(
+        self, input_buffer: DataParallelBuffer, changed_axis: int, *, force: bool = False
+    ) -> torch.Tensor | None:
+        """Acquire an optional communication-dtype input owned by this group."""
+        comm_dtype = self.grad_comm_dtype or input_buffer.dtype
+        if comm_dtype == input_buffer.dtype and not force:
+            return None
+        return self.allocator.allocate(
+            key=(self.param_group_id, "main_grad", "grad_reduce_input", changed_axis),
+            size=input_buffer.data.numel(),
+            dtype=comm_dtype,
+            device=input_buffer.device,
+        ).data
 
     def model_weights_are_unsharded(self, bwd_pass: bool = False) -> bool:
         """Return whether the model weights required by this pass are unsharded."""
@@ -426,36 +552,41 @@ class ParameterGroup:
         ):
             if weight_buffer is None:
                 continue
-            if not weight_buffer.is_unsharded():
+            role = self._weight_buffer_role(weight_buffer)
+            if not weight_buffer.is_unsharded() and role not in self._unsharded_weight_buffers:
                 return False
         return True
 
     def reshard(self):
-        """Reshard model weights by releasing unsharded buffer."""
-        self.model_weight_buffer.redistribute(self.model_weight_buffer.storage_placements)
-        if self.transpose_weight_buffer is not None:
-            self.transpose_weight_buffer.redistribute(
-                self.transpose_weight_buffer.storage_placements
-            )
+        """Detach parameter views and release temporary replicated weight leases."""
+        for weight_buffer in (self.model_weight_buffer, self.transpose_weight_buffer):
+            if weight_buffer is not None:
+                weight_buffer.placements = weight_buffer.storage_placements.copy()
         self.mp_policy.post_reshard(self.params)
+        self._release_weight_outputs()
 
     @torch.no_grad()
     def copy_main_weights_to_model_weights(self):
         """Install optimized main weights into model compute weights."""
         self._ensure_buffers_on_gpu()
+        full_weight_buffer = None
         if self.main_weight_buffer is not None and self.mp_policy.is_nvfp4_param(self.params[0]):
-            full_weight_buffer = self.model_weight_buffer.fetch_buffer(
-                [Placement.REPLICATE, Placement.REPLICATE]
-            )
+            full_output = self._acquire_weight_output(self.model_weight_buffer)
+            full_weight_buffer = full_output.data
             self._bind_params(self.model_weight_buffer, full_weight_buffer)
-        self.mp_policy.copy_main_weights_to_model_weights(
-            self.params,
-            self.param_idx,
-            self.mesh,
-            self.model_weight_buffer,
-            self.main_weight_buffer,
-            self.transpose_weight_buffer,
-        )
+        try:
+            self.mp_policy.copy_main_weights_to_model_weights(
+                self.params,
+                self.param_idx,
+                self.mesh,
+                self.model_weight_buffer,
+                self.main_weight_buffer,
+                self.transpose_weight_buffer,
+                full_weight_buffer=full_weight_buffer,
+            )
+        finally:
+            if full_weight_buffer is not None:
+                self._release_weight_outputs()
 
     def reduce_grad(
         self, is_last_backward: bool = False, stream: Optional[torch.cuda.Stream] = None
@@ -479,45 +610,90 @@ class ParameterGroup:
         self._full_grad_buffer_has_accumulated_grad = True
 
         grad_buffer = self.main_grad_buffer
-        partial_placements = grad_buffer.placements.copy()
+        full_grad_buffer = self._acquire_full_grad_buffer()
+        partial_placements = full_grad_buffer.placements.copy()
         partial_placements[1] = Placement.PARTIAL
         if self.mesh.size(0) > 1:
             partial_placements[0] = Placement.PARTIAL
-        DataParallelBuffer.redistribute_buffers([grad_buffer], partial_placements)
+        current_buffer = full_grad_buffer.reinterpret(partial_placements)
+        grad_buffer.placements = partial_placements.copy()
 
         storage = grad_buffer.storage_placements
         if is_last_backward or grad_buffer.inner_sharded:
             inner_target = Placement.SHARD if self.sharding_strategy == "optim" else storage[1]
-            comm_output = grad_buffer.redistribute(
-                [grad_buffer.placements[0], inner_target], stream=stream
+            inner_placements = [current_buffer.placements[0], inner_target]
+            output_buffer = self._gradient_output_buffer(inner_placements)
+            accumulate = (
+                self._reduced_grad_buffer_has_accumulated_grad
+                and self.outer_dp_sharding_strategy != "optim"
             )
-            accumulate = self._reduced_grad_buffer_has_accumulated_grad
+            comm_input = self._grad_comm_input(current_buffer, 1, force=accumulate)
+            comm_output = current_buffer.redistribute(
+                inner_placements,
+                output_buffer=output_buffer,
+                comm_input=comm_input,
+                gradient_scaling_factor=self.gradient_scaling_factor,
+                stream=stream,
+            )
             self.commit_comm_output(
-                grad_buffer, comm_output, 1, stream=stream, accumulate=accumulate
+                output_buffer,
+                comm_output,
+                1,
+                stream=stream,
+                accumulate=accumulate,
+                release_workspace=comm_input is not None,
             )
-            self._reduced_grad_buffer_has_accumulated_grad = True
+            current_buffer = output_buffer
+            grad_buffer.placements = inner_placements
+            if self.outer_dp_sharding_strategy != "optim":
+                self._reduced_grad_buffer_has_accumulated_grad = True
             if inner_target is not Placement.REPLICATE:
                 self._full_grad_buffer_has_accumulated_grad = False
 
-        if is_last_backward and self.mesh.size(0) > 1:
+        if self.mesh.size(0) > 1 and (
+            is_last_backward or self.outer_dp_sharding_strategy == "optim"
+        ):
             outer_target = (
                 Placement.SHARD if self.outer_dp_sharding_strategy == "optim" else storage[0]
             )
-            comm_output = grad_buffer.redistribute(
-                [outer_target, grad_buffer.placements[1]], stream=stream
+            outer_placements = [outer_target, current_buffer.placements[1]]
+            output_buffer = self._gradient_output_buffer(outer_placements)
+            accumulate = (
+                self._reduced_grad_buffer_has_accumulated_grad
+                and self.outer_dp_sharding_strategy == "optim"
             )
-            self.commit_comm_output(grad_buffer, comm_output, 0, stream=stream)
+            comm_input = self._grad_comm_input(current_buffer, 0, force=accumulate)
+            comm_output = current_buffer.redistribute(
+                outer_placements,
+                output_buffer=output_buffer,
+                comm_input=comm_input,
+                gradient_scaling_factor=self.gradient_scaling_factor,
+                stream=stream,
+            )
+            self.commit_comm_output(
+                output_buffer,
+                comm_output,
+                0,
+                stream=stream,
+                accumulate=accumulate,
+                release_workspace=comm_input is not None,
+            )
+            grad_buffer.placements = outer_placements
+            self._reduced_grad_buffer_has_accumulated_grad = True
 
     def release_grad_buffer(self):
-        """Release the main gradient buffer to free memory."""
+        """Release this group's temporary full-gradient lease."""
         if self.main_grad_buffer is not None:
             # Drop weight.main_grad views that layers.py stores during gradient-accumulation-fusion
-            # backward. Those views keep _unsharded_buffer alive after its internal reference is
-            # cleared, causing the grad buffer to leak until the next backward.
+            # backward. Those views keep the full-gradient lease alive after its
+            # group reference is cleared, causing it to leak until the next backward.
             for param in self.params:
                 if hasattr(param, 'main_grad'):
                     del param.main_grad
-            self.main_grad_buffer.release_unsharded_buffer()
+            if self._full_grad_buffer is not None:
+                self._full_grad_buffer.unbind()
+                self._full_grad_buffer = None
+                self.allocator.free((self.param_group_id, "main_grad"))
 
     def _release_grad_storage_if_unused(self) -> None:
         """Drop ``main_grad_buffer.data`` if it has no live gradients.
@@ -620,7 +796,7 @@ class ParameterGroup:
             return  # already initialised
 
         gbuf.placements = gbuf.storage_placements.copy()
-        gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
+        gbuf.bind(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
 
         buffer_placements = [
             Placement.SHARD if isinstance(placement, Shard) else Placement.REPLICATE

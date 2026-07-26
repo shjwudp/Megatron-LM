@@ -297,16 +297,14 @@ def test_capture_backward_pre_hook_prefetches_only_te_fused_wgrad():
     regular_fetch_calls = []
     fused_group = SimpleNamespace(
         params=(fused_param,),
-        main_grad_buffer=SimpleNamespace(
-            fetch_buffer=lambda _placements: fused_fetch_calls.append(True)
-        ),
+        main_grad_buffer=SimpleNamespace(),
+        ensure_full_grad_buffer=lambda: fused_fetch_calls.append(True),
         _init_dist_grads=lambda: fused_init_calls.append(True),
     )
     regular_group = SimpleNamespace(
         params=(regular_param,),
-        main_grad_buffer=SimpleNamespace(
-            fetch_buffer=lambda _placements: regular_fetch_calls.append(True)
-        ),
+        main_grad_buffer=SimpleNamespace(),
+        ensure_full_grad_buffer=lambda: regular_fetch_calls.append(True),
         _init_dist_grads=lambda: regular_init_calls.append(True),
     )
     unshard_calls = []
@@ -334,9 +332,8 @@ def test_trace_prefetches_static_main_grad_before_backward():
         params=(param,),
         requires_grad=True,
         sharding_strategy="optim_grads_params",
-        main_grad_buffer=SimpleNamespace(
-            dtype=param.dtype, fetch_buffer=lambda _placements: fetch_calls.append(True)
-        ),
+        main_grad_buffer=SimpleNamespace(dtype=param.dtype),
+        ensure_full_grad_buffer=lambda: fetch_calls.append(True),
         _init_dist_grads=lambda: init_calls.append(True),
     )
     module = SimpleNamespace(

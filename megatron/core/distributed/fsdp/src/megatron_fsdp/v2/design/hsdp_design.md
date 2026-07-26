@@ -155,16 +155,19 @@ Outer and inner decisions are combined as
 range present in persistent storage, then translate it to storage-local
 coordinates.
 
-`fetch_buffer(layout)` follows three rules:
+Bound buffer views follow three rules:
 
-1. Return storage for an exact layout.
-2. Return a view when storage contains the requested shard, such as
+1. `view(layout)` returns storage for an exact layout.
+2. It returns a view when bound storage contains the requested shard, such as
    `(0, 1) -> (1, 1)`.
-3. Otherwise use a full temporary bucket, such as `(1, 1) -> (0, 1)`.
+3. Otherwise `ParameterGroup` acquires an external destination, creates a
+   placeholder for it, and binds the allocation before redistribution, such as
+   `(1, 1) -> (0, 1)`.
 
 An all-gather changes one layout bit from 1 to 0. A reduce-scatter changes one
 bit from 0 to 1. An all-reduce leaves the layout unchanged. Parameters are
-bound only from `(0, 0)`; reshard releases temporary storage.
+bound only from `(0, 0)`; reshard unbinds group-owned leases before returning
+their keys to the allocator.
 
 ## State transitions
 

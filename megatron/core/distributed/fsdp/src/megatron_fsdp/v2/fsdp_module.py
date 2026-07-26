@@ -14,7 +14,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from .allocator import BucketAllocator, TracePoolAllocator
-from .dp_buffer import Placement
 from .mixed_precision import MixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
@@ -61,8 +60,8 @@ class _FSDPRootContext:
     """
     Bucket allocator for temporary all-gather and reduce-scatter buffers.
 
-    Buffer roles are part of each allocation key, so one allocator can safely
-    manage all DataParallelBuffer temporary buckets without requiring separate
+    ParameterGroup buffer roles are part of each allocation key, so one
+    allocator can safely manage all temporary leases without separate
     weight/gradient allocator instances.
     """
 
@@ -419,25 +418,12 @@ class FSDPModule:
 
         def main_grad_getter(p):
             """Get main gradient from buffer with proper offset/size."""
-            gbuf = p._gbuf
-            item_id = p._item_id
-
-            # The backward writes a fully replicated gradient; reduce_grad later
-            # reduces it to the requested placement.
-            gbuf_data = gbuf.fetch_buffer([Placement.REPLICATE, Placement.REPLICATE])
-            assert gbuf_data is not None
-            assert gbuf_data.numel() > 0
-
-            # Get offset and size from buffer index
-            start, end = gbuf.buffer_index._get_item_global_range(item_id)
-            param_shape = gbuf.buffer_index.item_index_map[item_id].shape
-            grad_data = gbuf_data[start:end].view(param_shape)
-
-            return grad_data
+            return p._fsdp_param_group.get_main_grad(p)
 
         # Attach getter to each parameter
         for param_group in self._fsdp_param_groups:
             for param in param_group.params:
+                setattr(param, "_fsdp_param_group", param_group)
                 setattr(param, "_gbuf", param_group.main_grad_buffer)
                 setattr(param, "_item_id", param_group.param_idx[param])
                 param.get_main_grad = main_grad_getter.__get__(param)

@@ -13,7 +13,6 @@ from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from .allocator import TracePoolAllocator
 from .cuda_graph_runner import CudaGraphRunner
-from .dp_buffer import Placement
 from .fsdp_module import FSDPModule, _FSDPState
 from .utils import RegisterFSDPBackwardFunction
 
@@ -436,7 +435,7 @@ def _pre_backward_setup(module: FSDPModule, skip_final_callback: bool = False):
             and param_group.main_grad_buffer.dtype == param_group.params[0].dtype
         ):
             param_group._init_dist_grads()
-            param_group.main_grad_buffer.fetch_buffer([Placement.REPLICATE, Placement.REPLICATE])
+            param_group.ensure_full_grad_buffer()
 
     return ctx
 

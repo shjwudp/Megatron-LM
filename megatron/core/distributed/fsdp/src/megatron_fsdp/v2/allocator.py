@@ -19,6 +19,8 @@ from typing import Dict, Hashable, List, Optional, Set, Tuple
 
 import torch
 
+from .storage import alloc_storage, free_storage
+
 logger = logging.getLogger(__name__)
 
 AllocatorKey = Hashable
@@ -63,8 +65,7 @@ class BucketAllocator:
 class TemporaryBucketAllocator(BucketAllocator):
     """Manages temporary flat buffers keyed by a caller-provided key.
 
-    Used by DataParallelBuffer for unshard (all-gather) and gradient
-    reduction (reduce-scatter) operations.
+    Used by ``ParameterGroup`` for unshard and gradient-reduction leases.
     """
 
     def __init__(self):
@@ -91,7 +92,7 @@ class TemporaryBucketAllocator(BucketAllocator):
     ) -> None:
         key = _resolve_key(key, param_group_id)
         if key in self.buckets:
-            _free_storage(self.buckets[key].data)
+            free_storage(self.buckets[key].data)
             del self.buckets[key]
 
 
@@ -116,7 +117,7 @@ class StorageFreeingBucketAllocator(BucketAllocator):
         if key not in self.buckets:
             self.buckets[key] = Bucket(data=torch.empty(size, dtype=dtype, device=device))
             return self.buckets[key]
-        _alloc_storage(self.buckets[key].data, torch.Size([size]))
+        alloc_storage(self.buckets[key].data, torch.Size([size]))
         return self.buckets[key]
 
     def free(
@@ -124,7 +125,7 @@ class StorageFreeingBucketAllocator(BucketAllocator):
     ) -> None:
         key = _resolve_key(key, param_group_id)
         if key in self.buckets:
-            _free_storage(self.buckets[key].data)
+            free_storage(self.buckets[key].data)
 
 
 class TracePoolAllocator(BucketAllocator):
@@ -137,7 +138,7 @@ class TracePoolAllocator(BucketAllocator):
     **Phase 1 — Trace** (first micro-batch)
 
     Records alloc/free calls with monotonic sequence numbers.  Buckets are
-    created with ``torch.empty`` and freed via ``_free_storage`` so the same
+    created with ``torch.empty`` and freed via ``free_storage`` so the same
     tensor object can be resurrected on re-alloc (keeping outstanding views
     alive, e.g.  NVFP4 ``_rowwise_data`` references).
 
@@ -250,7 +251,7 @@ class TracePoolAllocator(BucketAllocator):
         else:
             self._trace.append(self._TraceEvent(seq=self._seq, op="alloc", key=key))
             self._seq += 1
-            _alloc_storage(self._buckets[key].data, torch.Size([size]))
+            alloc_storage(self._buckets[key].data, torch.Size([size]))
 
         self._active_keys.add(key)
         return self._buckets[key]
@@ -261,7 +262,7 @@ class TracePoolAllocator(BucketAllocator):
         self._trace.append(self._TraceEvent(seq=self._seq, op="free", key=key))
         self._seq += 1
         if key in self._buckets:
-            _free_storage(self._buckets[key].data)
+            free_storage(self._buckets[key].data)
         self._active_keys.discard(key)
 
     # -- Phase 2: plan --------------------------------------------------- #
@@ -522,7 +523,7 @@ class TracePoolAllocator(BucketAllocator):
             self._phase == "optimized"
         ), f"release() requires 'optimized' or 'trace' phase, got '{self._phase}'"
         for slot in self._slots:
-            _free_storage(slot.tensor)
+            free_storage(slot.tensor)
             slot.tensor = torch.empty(0, dtype=slot.dtype, device=slot.device)
             slot.in_use = False
         self._active_keys.clear()
@@ -664,45 +665,3 @@ def _intervals_overlap(ivs_a: List[Tuple[int, int]], ivs_b: List[Tuple[int, int]
             else:
                 active_b -= 1
     return False
-
-
-def _is_torchdynamo_compiling() -> bool:
-    """Check whether torchdynamo is compiling — safe across PyTorch versions."""
-    try:
-        return torch.distributed._functional_collectives.is_torchdynamo_compiling()
-    except (AttributeError, RuntimeError):
-        return False
-
-
-def _free_storage(tensor: torch.Tensor) -> None:
-    """Free the underlying storage of ``tensor`` by resizing it to 0."""
-    with torch.no_grad():
-        if not _is_torchdynamo_compiling():
-            already_freed = tensor._typed_storage()._size() == 0
-            if not already_freed:
-                assert tensor.storage_offset() == 0, (
-                    "Freeing a tensor's storage is unsafe when it is not the sole occupant\n"
-                    f"storage offset: {tensor.storage_offset()}\n"
-                    f"storage size: {tensor._typed_storage()._size()}\n"
-                    f"tensor shape: {tensor.shape}"
-                )
-                tensor._typed_storage()._resize_(0)
-
-
-def _alloc_storage(tensor: torch.Tensor, size: torch.Size) -> None:
-    """Re-allocate storage for ``tensor`` to the given ``size``.
-
-    Requires that the tensor's storage has been freed (resized to 0)
-    before calling.  The caller must ensure ``size`` matches the tensor's
-    existing shape.
-    """
-    with torch.no_grad():
-        if not _is_torchdynamo_compiling():
-            already_allocated = tensor._typed_storage()._size() == size.numel()
-            if not already_allocated:
-                tensor_storage_size = tensor._typed_storage()._size()
-                assert tensor_storage_size == 0, (
-                    "Tensor storage should have been resized to 0 but got "
-                    f"{tensor_storage_size} (shape={tensor.shape})"
-                )
-                tensor._typed_storage()._resize_(size.numel())

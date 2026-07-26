@@ -268,9 +268,9 @@ if pending_post and unshard_event is not None:
     unshard_event.wait()  # skipped prefetch: join AG before freeing its buffer
 
 for param_names, param_group in self._named_param_groups:
-    param_group.reshard()                           # → DataParallelBuffer.reshard()
-                                                    #   frees TemporaryBucketAllocator bucket
-                                                    #   sets _unsharded_buffer = None
+    param_group.reshard()                           # detaches unsharded parameter views
+                                                    # unbinds group-owned weight outputs
+                                                    # releases their allocator keys
     for name, dist_param in zip(param_names, param_group.dist_params):
         _replace_module_parameter(self, name, dist_param)   # reinstall sharded DTensor
 ctx.unshard_done_events[id(self)] = None    # reset so next iteration can prefetch again
@@ -362,10 +362,9 @@ def reduce_grad(self, async_op: bool = False):
         # --- Step 3: Reduce-scatter on rs_stream ---
         if async_op:
             param_group.reduce_grad(stream=stream)
-            #   → DataParallelBuffer.reduce_grad() (synchronous within this stream):
-            #       fetch_unsharded_buffer() allocates full grad buffer
-            #       reduce_scatter_tensor(output=grad_shard, input=full_grad)
-            #       self.data[local_idx:...] += grad_shard
+            #   → ParameterGroup owns full-grad/output/workspace leases
+            #   → DataParallelBuffer.redistribute() runs the selected collective
+            #   → ParameterGroup commits or accumulates the result
             event = stream.record_event()
             ctx.reduce_grad_buckets[id(self)].append((event, param_group))
             # param_group.release_grad_buffer() is NOT called here; deferred until drain/final CB
@@ -495,8 +494,9 @@ optimizer-facing DTensor shards through `dist_params`.
 
 1. Forward and backward also read replicated `model_weight_buffer`; no parameter
    all-gather is needed in the steady state.
-2. Backward writes gradients into a temporary full grad buffer returned by
-   `main_grad_buffer.fetch_unsharded_buffer()`.
+2. Backward writes gradients into the full grad buffer acquired by
+   `ParameterGroup`; persistent replicated storage is reused when it already
+   contains the full value.
 3. The post-backward hook reduce-scatters that temporary full buffer and
    accumulates the result into the persistent sharded `main_grad_buffer.data`.
    With overlap enabled, this reduce-scatter is launched on `ctx.rs_stream` and
@@ -709,33 +709,19 @@ final_callback:
 
 ---
 
-## `DataParallelBuffer.reduce_grad()` — Implementation Note
+## Gradient Redistribution — Implementation Note
 
 No `async_op` parameter is needed. The method is purely synchronous within the calling stream:
 
-```python
-def reduce_grad(self, *, accumulate_reduced_grad=False, reduce_scatter=True):
-    input_buffer = self.fetch_buffer(input_shard_layout)
-    output_buffer = self.fetch_buffer(output_shard_layout)
+`ParameterGroup.reduce_grad()` acquires any full-gradient and communication-dtype
+leases, binds explicit destination buffers, and calls
+`DataParallelBuffer.redistribute()`. The buffer performs only the placement-selected
+collective. `ParameterGroup.commit_comm_output()` then decides whether the result
+overwrites or accumulates persistent gradient storage.
 
-    if not reduce_scatter:
-        torch.distributed.all_reduce(input_buffer, group=group)
-        return
-
-    reduced_grad = input_buffer[output_offset : output_offset + output_buffer.numel()]
-    torch.distributed.reduce_scatter_tensor(
-        output=reduced_grad, input=input_buffer, group=group
-    )
-    if output_buffer.data_ptr() != reduced_grad.data_ptr():
-        if accumulate_reduced_grad:
-            output_buffer += reduced_grad
-        else:
-            output_buffer.copy_(reduced_grad)
-```
-
-The caller (`FSDPModule.reduce_grad`) provides the stream context; `DataParallelBuffer`
-just does the collective. This clean separation means `DataParallelBuffer` requires no
-modifications for the overlap feature.
+The caller (`FSDPModule.reduce_grad`) provides the stream context. Allocation remains
+on the caller stream before side-stream communication starts, preserving overlap and
+Trace Pool lifetime ordering.
 
 ---
 
@@ -877,7 +863,7 @@ fully-synchronized parameters and gradients.
 
 `allocator.py` provides a polymorphic allocator family via the `BucketAllocator`
 interface, letting callers swap allocation strategies without changing
-`DataParallelBuffer` or `ParameterGroup`.
+`DataParallelBuffer`. `ParameterGroup` is the sole allocation-policy owner.
 
 ```
 BucketAllocator  (interface)

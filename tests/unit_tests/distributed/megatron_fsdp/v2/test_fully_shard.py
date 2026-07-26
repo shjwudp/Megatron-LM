@@ -620,7 +620,7 @@ class TestFullyShardBasic:
         def capture_redistribute(buffer, *args, **kwargs):
             active_group = active_manager_groups[-1] if active_manager_groups else None
             comm_dim = 0 if active_group is outer_dp_group else 1
-            unshard_calls.append((id(buffer), comm_dim, active_group))
+            unshard_calls.append((id(buffer.buffer_index), comm_dim, active_group))
             return original_redistribute(buffer, *args, **kwargs)
 
         def capture_all_gather(*args, **kwargs):
@@ -644,10 +644,16 @@ class TestFullyShardBasic:
             expected_unshard_calls = []
             if outer_strategy == "optim":
                 expected_unshard_calls.extend(
-                    [(id(first_buffer), 0, outer_dp_group), (id(second_buffer), 0, outer_dp_group)]
+                    [
+                        (id(first_buffer.buffer_index), 0, outer_dp_group),
+                        (id(second_buffer.buffer_index), 0, outer_dp_group),
+                    ]
                 )
             expected_unshard_calls.extend(
-                [(id(first_buffer), 1, inner_dp_group), (id(second_buffer), 1, inner_dp_group)]
+                [
+                    (id(first_buffer.buffer_index), 1, inner_dp_group),
+                    (id(second_buffer.buffer_index), 1, inner_dp_group),
+                ]
             )
             assert len(unshard_calls) == len(expected_unshard_calls)
             assert all(
@@ -1386,8 +1392,9 @@ class TestActivationCheckpointing:
         observed_full = []
 
         def capture_successor_full_buffer(_module, _args):
-            assert model_buffer._unsharded_buffer is not None
-            observed_full.append(model_buffer._unsharded_buffer.detach().clone())
+            full_output = param_group._unsharded_weight_buffers.get("model_weight")
+            assert full_output is not None
+            observed_full.append(full_output.data.detach().clone())
 
         handle = successor.register_forward_pre_hook(capture_successor_full_buffer)
         try:

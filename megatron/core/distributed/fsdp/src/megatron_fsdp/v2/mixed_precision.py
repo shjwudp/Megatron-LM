@@ -552,6 +552,8 @@ class MixedPrecisionPolicy:
         model_weight_buffer,
         main_weight_buffer,
         transpose_weight_buffer=None,
+        *,
+        full_weight_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         """Install optimized main weights into model compute weights."""
         assert model_weight_buffer is not None, "FSDP parameters require a model-weight buffer"
@@ -582,7 +584,12 @@ class MixedPrecisionPolicy:
                     "HSDP outer optimizer sharding is not supported for NVFP4."
                 )
             quantize_main_weights_to_nvfp4(
-                params, param_idx, inner_dp_group, model_weight_buffer, main_weight_buffer
+                params,
+                param_idx,
+                inner_dp_group,
+                model_weight_buffer,
+                main_weight_buffer,
+                full_weight_buffer=full_weight_buffer,
             )
         elif not self.is_fp8_param(params[0]):
             if model_weight_buffer.storage_placements == optimizer_placements:
@@ -763,6 +770,8 @@ def quantize_main_weights_to_nvfp4(
     data_parallel_group: torch.distributed.ProcessGroup,
     model_weight_buffer,
     main_weight_buffer,
+    *,
+    full_weight_buffer: Optional[torch.Tensor],
 ) -> None:
     """Quantize FP32 main-weight shards into NVFP4 model-weight shards."""
     if not HAVE_TE_QUANTIZE_MASTER_WEIGHTS:
@@ -780,7 +789,8 @@ def quantize_main_weights_to_nvfp4(
     if wbuf.storage_placements[1] is not Placement.SHARD:
         raise RuntimeError("FIXME: implement non-distributed NVFP4 quantization path")
 
-    full_weight_buffer = wbuf.fetch_buffer([Placement.REPLICATE, Placement.REPLICATE])
+    if full_weight_buffer is None:
+        raise ValueError("NVFP4 quantization requires an externally allocated full weight buffer")
 
     for param in model_params:
         item_id = param_idx[param]
@@ -822,6 +832,3 @@ def quantize_main_weights_to_nvfp4(
             + inner_shard_meta.size
         ]
     )
-
-    # The persistent buffer remains sharded; release only the temporary full payload.
-    wbuf.release_unsharded_buffer()
