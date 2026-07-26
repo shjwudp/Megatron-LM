@@ -20,7 +20,8 @@ v2/
 ├── fully_shard.py               # Public fully_shard() API entry point
 ├── fsdp_module.py               # FSDPModule runtime state (unshard/reshard/reduce_grad)
 ├── hooks.py                     # Forward/backward hook registration
-├── param_group.py               # ParameterGroup — groups params with shared buffers
+├── param_group.py               # Legacy ParameterGroup for compatibility-only features
+├── param_group_v2.py            # Placement-first ParameterGroup replacement
 ├── dp_buffer.py                 # DataParallelBuffer — flat buffer management
 ├── buffer_index.py              # Flat-buffer item indexing and shard metadata
 ├── allocator.py                 # BucketAllocator (Temporary, StorageFreeing, TracePool)
@@ -213,6 +214,15 @@ strategy controls which buffers and communication collectives are used.
 | `no_shard` | No | No | **Supported** | Like DDP: replicated weights, full-gradient all-reduce, replicated optimizer states. No param-gather overlap. |
 
 ## Known Limitations
+
+### Parameter-group migration
+
+The MCore adapter automatically selects the placement-first parameter group for
+non-quantized `optim_grads_params` training, including full-iteration CUDA
+graphs. It retains the legacy parameter group for FP8/NVFP4 parameter gather,
+trace-pool or per-module CUDA graphs, delayed weight-gradient/MoE callbacks, and
+other sharding strategies. Standalone callers may select the placement-first
+path with `use_parameter_group_v2=True` while this compatibility phase is active.
 
 ### Parallelism
 

@@ -111,7 +111,10 @@ def fully_shard(
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy()
 
-    mesh = mesh or _init_default_fully_shard_mesh()
+    if mesh is None:
+        mesh = _init_default_fully_shard_mesh()
+        if use_parameter_group_v2:
+            mesh = mesh[mesh.mesh_dim_names[-1]]
     if use_parameter_group_v2:
         unsupported_v2_options = {
             "enable_trace_pool": enable_trace_pool,

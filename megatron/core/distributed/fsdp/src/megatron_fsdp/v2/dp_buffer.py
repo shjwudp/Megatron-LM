@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from copy import copy
-from itertools import groupby
 from typing import Iterable, Optional, Sequence
 
 import torch
@@ -240,10 +239,10 @@ class DataParallelBuffer:
                 if axis_stream != previous_stream:
                     axis_stream.wait_stream(previous_stream)
                 with torch.cuda.stream(axis_stream):
-                    for _, compatible_items_iter in groupby(
-                        axis_transitions, key=lambda item: compatibility_key(item, mesh_dim)
-                    ):
-                        compatible_items = list(compatible_items_iter)
+                    compatible_runs = {}
+                    for item in axis_transitions:
+                        compatible_runs.setdefault(compatibility_key(item, mesh_dim), []).append(item)
+                    for compatible_items in compatible_runs.values():
                         group = compatible_items[0][0].mesh.get_group(mesh_dim=mesh_dim)
                         context = (
                             _coalescing_manager(group, async_ops=async_op)

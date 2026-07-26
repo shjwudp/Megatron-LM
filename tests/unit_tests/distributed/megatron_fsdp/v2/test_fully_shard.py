@@ -302,6 +302,7 @@ class TestFullyShardBasic:
         [
             pytest.param(torch.float32, None, id="fp32"),
             pytest.param(torch.bfloat16, torch.float32, id="bf16-fp32-main"),
+            pytest.param(torch.float16, torch.float32, id="fp16-fp32-main"),
         ],
     )
     def test_parameter_group_v2_eager_1d(self, sharding_strategy, model_dtype, main_dtype):
@@ -402,6 +403,40 @@ class TestFullyShardBasic:
             param_group.state.grad_phase is GradientPhaseV2.READY
             for param_group in model._fsdp_param_groups
         )
+
+    def test_parameter_group_v2_batches_module_unshard(self, monkeypatch):
+        """One module unshard batches all compatible V2 parameter groups."""
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import DataParallelBuffer
+
+        model = MultimodalModel(hidden=16).to(_device())
+        for param in model.vision_encoder.parameters():
+            param.requires_grad = False
+        fully_shard(
+            model,
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+            use_parameter_group_v2=True,
+        )
+        assert len(model._fsdp_param_groups) == 2
+
+        calls = []
+        redistribute_buffers = DataParallelBuffer.redistribute_buffers
+
+        def capture_redistribute_buffers(buffers, target_placements, **kwargs):
+            calls.append(tuple(buffers))
+            return redistribute_buffers(buffers, target_placements, **kwargs)
+
+        monkeypatch.setattr(
+            DataParallelBuffer,
+            "redistribute_buffers",
+            capture_redistribute_buffers,
+        )
+        try:
+            model.unshard()
+            assert len(calls) == 1
+            assert len(calls[0]) == 2
+        finally:
+            model.reshard()
 
     @pytest.mark.parametrize("sharding_strategy", ["no_shard", "optim_grads_params"])
     @pytest.mark.parametrize("use_decoupled_grad", [False, True])
@@ -2027,6 +2062,11 @@ class TestCheckpoint:
                     main_params_dtype=torch.float32, main_grads_dtype=torch.float32
                 ),
                 enable_async_reduce_grad=False,
+                use_parameter_group_v2=True,
+            )
+            assert all(
+                isinstance(param_group, ParameterGroupV2)
+                for param_group in model._fsdp_param_groups
             )
             return model, torch.optim.AdamW(model.parameters(), lr=1e-3)
 

@@ -469,6 +469,95 @@ class ParameterGroupV2:
         changed = [axis for axis, pair in enumerate(zip(source, target)) if pair[0] is not pair[1]]
         return changed[-1] if changed else None
 
+    @staticmethod
+    @torch.no_grad()
+    def unshard_weights(
+        param_groups: Sequence["ParameterGroupV2"],
+        stream: torch.cuda.Stream | None = None,
+        *,
+        streams: AxisStreams | None = None,
+        async_op: bool = False,
+    ) -> list[DataParallelBuffer]:
+        """Unshard compatible parameter groups in one coalesced axis plan."""
+        if not param_groups:
+            return []
+        axis_streams = param_groups[0]._axis_streams(stream=stream, streams=streams)
+        results: list[DataParallelBuffer | None] = [None] * len(param_groups)
+        plans = []
+
+        try:
+            for index, param_group in enumerate(param_groups):
+                if param_group.mesh.ndim != len(axis_streams):
+                    raise ValueError("All parameter groups must use the same mesh dimensionality")
+                compute_weight = param_group.compute_weight()
+                if compute_weight is not None:
+                    param_group._bind_weight(compute_weight)
+                    param_group.mp_policy.post_unshard(param_group.params)
+                    results[index] = compute_weight
+                    continue
+
+                source_placements = param_group.state.weight_valid
+                source = param_group.weight_buffer.view(list(source_placements))
+                persistent_placements = tuple(param_group.weight_buffer.placements)
+                if persistent_placements == param_group.full_placements:
+                    output = param_group.weight_buffer
+                else:
+                    param_group.state.full_weight = param_group._allocate_scratch(
+                        "full_weight", param_group.weight_buffer, param_group.full_placements
+                    )
+                    output = param_group.state.full_weight
+                plans.append(
+                    (
+                        index,
+                        param_group,
+                        source_placements,
+                        persistent_placements,
+                        source,
+                        output,
+                    )
+                )
+        except Exception:
+            for _, param_group, _, _, _, output in plans:
+                if param_group.state.full_weight is output:
+                    param_group._release_scratch("full_weight", output)
+                    param_group.state.full_weight = None
+            raise
+
+        if plans:
+            DataParallelBuffer.redistribute_buffers(
+                [source for _, _, _, _, source, _ in plans],
+                list(param_groups[0].full_placements),
+                output_buffers=[output for _, _, _, _, _, output in plans],
+                streams=axis_streams,
+                async_op=async_op,
+            )
+
+        for (
+            index,
+            param_group,
+            source_placements,
+            persistent_placements,
+            _,
+            output,
+        ) in plans:
+            param_group.state.weight_valid = persistent_placements
+            terminal_axis = param_group._last_changed_axis(
+                source_placements, param_group.full_placements
+            )
+            terminal_stream = (
+                torch.cuda.current_stream()
+                if terminal_axis is None
+                else axis_streams[terminal_axis]
+            )
+            with torch.cuda.stream(terminal_stream):
+                param_group._bind_weight(output)
+                param_group.mp_policy.post_unshard(param_group.params)
+            results[index] = output
+
+        if any(result is None for result in results):
+            raise RuntimeError("Weight unshard did not produce every parameter-group output")
+        return [result for result in results if result is not None]
+
     @torch.no_grad()
     def unshard_weight(
         self,
@@ -477,41 +566,10 @@ class ParameterGroupV2:
         streams: AxisStreams | None = None,
         async_op: bool = False,
     ) -> DataParallelBuffer:
-        """Restore persistent weight validity, materialize full weights, and bind params."""
-        compute_weight = self.compute_weight()
-        if compute_weight is not None:
-            self._bind_weight(compute_weight)
-            self.mp_policy.post_unshard(self.params)
-            return compute_weight
-
-        source_placements = self.state.weight_valid
-        current = self.weight_buffer.view(list(source_placements))
-        persistent_placements = tuple(self.weight_buffer.placements)
-        if persistent_placements == self.full_placements:
-            output = self.weight_buffer
-        else:
-            self.state.full_weight = self._allocate_scratch(
-                "full_weight", self.weight_buffer, self.full_placements
-            )
-            output = self.state.full_weight
-
-        axis_streams = self._axis_streams(stream=stream, streams=streams)
-        DataParallelBuffer.redistribute_buffers(
-            [current],
-            list(self.full_placements),
-            output_buffers=[output],
-            streams=axis_streams,
-            async_op=async_op,
-        )
-        self.state.weight_valid = persistent_placements
-        terminal_axis = self._last_changed_axis(source_placements, self.full_placements)
-        terminal_stream = (
-            torch.cuda.current_stream() if terminal_axis is None else axis_streams[terminal_axis]
-        )
-        with torch.cuda.stream(terminal_stream):
-            self._bind_weight(output)
-            self.mp_policy.post_unshard(self.params)
-        return output
+        """Unshard this parameter group and return its full compute weight."""
+        return self.unshard_weights(
+            [self], stream=stream, streams=streams, async_op=async_op
+        )[0]
 
     def reshard_weight(self) -> None:
         """Release only the full compute-weight lease."""

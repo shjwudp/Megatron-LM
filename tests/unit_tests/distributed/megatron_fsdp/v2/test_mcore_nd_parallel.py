@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import copy
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -8,7 +9,10 @@ from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import _init_dp_mesh
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    _can_use_parameter_group_v2,
+    _init_dp_mesh,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
@@ -47,6 +51,46 @@ class TestMegatronFSDPE2E:
     def teardown_method(self):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
+
+    def test_parameter_group_v2_adapter_selection(self):
+        config = SimpleNamespace(
+            delay_wgrad_compute=False,
+            overlap_moe_expert_parallel_comm=False,
+        )
+        ddp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params"
+        )
+        assert _can_use_parameter_group_v2(config, ddp_config)
+        assert not _can_use_parameter_group_v2(
+            config, ddp_config, torch.nn.Linear(2, 2, dtype=torch.float64)
+        )
+
+        for field_name, value in (
+            ("fp8_param_gather", True),
+            ("fp4_param_gather", True),
+            ("fsdp_double_buffer", True),
+            ("fsdp_trace_pool", True),
+            ("mfsdp_cuda_graph_modules", ["transformer"]),
+            ("data_parallel_sharding_strategy", "optim_grads"),
+        ):
+            unsupported = copy.deepcopy(ddp_config)
+            setattr(unsupported, field_name, value)
+            assert not _can_use_parameter_group_v2(config, unsupported)
+
+        assert not _can_use_parameter_group_v2(
+            SimpleNamespace(
+                delay_wgrad_compute=True,
+                overlap_moe_expert_parallel_comm=False,
+            ),
+            ddp_config,
+        )
+        assert not _can_use_parameter_group_v2(
+            SimpleNamespace(
+                delay_wgrad_compute=False,
+                overlap_moe_expert_parallel_comm=True,
+            ),
+            ddp_config,
+        )
 
     @pytest.mark.parametrize("outer_dp_size", [1, 2])
     def test_dp_mesh_flatten_groups_reuse_full_dp_groups(self, outer_dp_size):
@@ -399,6 +443,16 @@ class TestMegatronFSDPE2E:
     @pytest.mark.parametrize(
         "spec_configs",
         [
+            pytest.param(
+                dict(
+                    bf16=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    overlap_param_gather=True,
+                    overlap_grad_reduce=True,
+                    use_megatron_fsdp_v2=True,
+                ),
+                id="optim_grads_params_parameter_group_v2",
+            ),
             pytest.param(
                 dict(
                     data_parallel_sharding_strategy="optim_grads_params",

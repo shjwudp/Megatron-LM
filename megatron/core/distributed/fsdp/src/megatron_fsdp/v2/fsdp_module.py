@@ -677,8 +677,9 @@ class FSDPModule:
                     if async_op
                     else (caller_stream,) * module._fsdp_param_groups[0].mesh.ndim
                 )
-                for param_group in module._fsdp_param_groups:
-                    param_group.unshard_weight(streams=streams, async_op=async_op)
+                ParameterGroupV2.unshard_weights(
+                    module._fsdp_param_groups, streams=streams, async_op=async_op
+                )
             else:
                 ParameterGroup.unshard_model_weights(
                     module._fsdp_param_groups, bwd_pass=bwd_pass, stream=stream, async_op=async_op
@@ -1184,9 +1185,13 @@ def _get_module_fsdp_param_groups(
     for param in module.parameters():
         if ignored_params is not None and param in ignored_params:
             continue
-        if use_parameter_group_v2 and param.dtype not in (torch.float32, torch.bfloat16):
+        if use_parameter_group_v2 and param.dtype not in (
+            torch.float32,
+            torch.bfloat16,
+            torch.float16,
+        ):
             raise NotImplementedError(
-                "ParameterGroupV2 eager integration supports FP32/BF16 parameters, "
+                "ParameterGroupV2 eager integration supports FP32/BF16/FP16 parameters, "
                 f"got {param.dtype}"
             )
 

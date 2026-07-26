@@ -69,6 +69,31 @@ from .checkpoint import _propagate_chunk_metadata_to_state_dict
 logger = logging.getLogger(__name__)
 
 
+def _can_use_parameter_group_v2(
+    config: TransformerConfig,
+    ddp_config: DistributedDataParallelConfig,
+    module: nn.Module | None = None,
+) -> bool:
+    """Return whether the adapter configuration is supported by ParameterGroupV2."""
+    return (
+        ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        and not ddp_config.fp8_param_gather
+        and not ddp_config.fp4_param_gather
+        and not ddp_config.fsdp_double_buffer
+        and not ddp_config.fsdp_trace_pool
+        and not ddp_config.mfsdp_cuda_graph_modules
+        and not config.delay_wgrad_compute
+        and not config.overlap_moe_expert_parallel_comm
+        and (
+            module is None
+            or all(
+                param.dtype in (torch.float32, torch.bfloat16, torch.float16)
+                for param in module.parameters()
+            )
+        )
+    )
+
+
 class FullyShardedDataParallel(_BaseDataParallel):
     """
     Fully Sharded Data Parallel (FSDP) wrapper for the Megatron model.
@@ -320,6 +345,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "fine_grained_hooks": config.overlap_moe_expert_parallel_comm,
             "skip_backward_callback": config.delay_wgrad_compute,
             "skip_final_backward_callback": config.overlap_moe_expert_parallel_comm,
+            "use_parameter_group_v2": _can_use_parameter_group_v2(config, ddp_config, module),
         }
         if config.calculate_per_token_loss:
             gradient_scaling_factor = None
@@ -385,7 +411,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             if not isinstance(child, FSDPModule):
                 continue
             for param_group in child._fsdp_param_groups:
-                for param, dist_param in zip(param_group.params, param_group.dist_params):
+                for param, dist_param in zip(param_group.params, param_group.optimizer_params):
                     for attr_name in [
                         # allreduce: expert params have allreduce=False set by
                         # te layers.  Missing this causes is_expert_parallel
