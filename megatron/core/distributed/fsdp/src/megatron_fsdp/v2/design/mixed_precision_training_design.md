@@ -121,7 +121,8 @@ size.
 
 After optimizer step, `copy_main_weights_to_model_weights()` dispatches NVFP4
 groups to `quantize_main_weights_to_nvfp4()`, which calls Transformer Engine's
-`quantize_master_weights()`.
+`quantize_master_weights()`. The policy creates the temporary full packed-weight
+tensor directly with `torch.empty`; it is not a `ParameterGroup` allocator lease.
 
 The quantization start offsets are derived from `main_weight_buffer`, not
 `model_weight_buffer`, because TE expects logical-element offsets rather than

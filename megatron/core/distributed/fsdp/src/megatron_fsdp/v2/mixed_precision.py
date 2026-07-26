@@ -554,7 +554,6 @@ class MixedPrecisionPolicy:
         transpose_weight_buffer=None,
         *,
         optimizer_placements,
-        full_weight_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         """Install optimized main weights into model compute weights."""
         assert model_weight_buffer is not None, "FSDP parameters require a model-weight buffer"
@@ -572,13 +571,26 @@ class MixedPrecisionPolicy:
                 raise NotImplementedError(
                     "HSDP outer optimizer sharding is not supported for NVFP4."
                 )
+            assert main_weight_buffer.placements == optimizer_placements
+            full_weight_buffer = torch.empty(
+                model_weight_buffer.buffer_index.bucket_meta.size,
+                dtype=model_weight_buffer.dtype,
+                device=model_weight_buffer.device,
+            )
+            for param in params:
+                item_id = param_idx[param]
+                start, end = model_weight_buffer.buffer_index._get_item_global_range(item_id)
+                item_shape = model_weight_buffer.buffer_index.item_index_map[item_id].shape
+                self.bind_unsharded_param(
+                    param, full_weight_buffer[start:end].view(item_shape), "model_weight"
+                )
             quantize_main_weights_to_nvfp4(
                 params,
                 param_idx,
                 inner_dp_group,
                 model_weight_buffer,
                 main_weight_buffer,
-                full_weight_buffer=full_weight_buffer,
+                full_weight_buffer,
             )
         elif not self.is_fp8_param(params[0]):
             if model_weight_buffer.placements == optimizer_placements:
@@ -749,8 +761,7 @@ def quantize_main_weights_to_nvfp4(
     data_parallel_group: torch.distributed.ProcessGroup,
     model_weight_buffer,
     main_weight_buffer,
-    *,
-    full_weight_buffer: Optional[torch.Tensor],
+    full_weight_buffer: torch.Tensor,
 ) -> None:
     """Quantize FP32 main-weight shards into NVFP4 model-weight shards."""
     if not HAVE_TE_QUANTIZE_MASTER_WEIGHTS:
@@ -768,9 +779,6 @@ def quantize_main_weights_to_nvfp4(
     main_weight_view = main_weight_buffer.view(sharded_placements)
     if wbuf.placements[1] is not Placement.SHARD:
         raise RuntimeError("FIXME: implement non-distributed NVFP4 quantization path")
-
-    if full_weight_buffer is None:
-        raise ValueError("NVFP4 quantization requires an externally allocated full weight buffer")
 
     for param in model_params:
         item_id = param_idx[param]

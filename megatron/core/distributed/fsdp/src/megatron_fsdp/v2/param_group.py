@@ -629,36 +629,24 @@ class ParameterGroup:
     def copy_main_weights_to_model_weights(self):
         """Install optimized main weights into model compute weights."""
         self._ensure_buffers_on_gpu()
-        full_weight_buffer = None
-        if self.main_weight_buffer is not None and self.mp_policy.is_nvfp4_param(self.params[0]):
-            full_output = self._acquire_temporary_buffer(
-                "model_weight", self.model_weight_buffer, [Placement.REPLICATE, Placement.REPLICATE]
-            )
-            full_weight_buffer = full_output.data
-            self._bind_params("model_weight", self.model_weight_buffer, full_weight_buffer)
         optimizer_placements = self._optimizer_placements()
-        try:
-            self.mp_policy.copy_main_weights_to_model_weights(
-                self.params,
-                self.param_idx,
-                self.mesh,
-                self.model_weight_buffer,
-                self.main_weight_buffer,
-                self.transpose_weight_buffer,
-                optimizer_placements=optimizer_placements,
-                full_weight_buffer=full_weight_buffer,
-            )
-            for role, buffer in (
-                ("model_weight", self.model_weight_buffer),
-                ("transpose_weight", self.transpose_weight_buffer),
-            ):
-                if buffer is None or buffer.placements == optimizer_placements:
-                    self._optimizer_weight_views.pop(role, None)
-                else:
-                    self._optimizer_weight_views[role] = buffer.view(optimizer_placements)
-        finally:
-            if full_weight_buffer is not None:
-                self._release_temporary_buffers("model_weight")
+        self.mp_policy.copy_main_weights_to_model_weights(
+            self.params,
+            self.param_idx,
+            self.mesh,
+            self.model_weight_buffer,
+            self.main_weight_buffer,
+            self.transpose_weight_buffer,
+            optimizer_placements=optimizer_placements,
+        )
+        for role, buffer in (
+            ("model_weight", self.model_weight_buffer),
+            ("transpose_weight", self.transpose_weight_buffer),
+        ):
+            if buffer is None or buffer.placements == optimizer_placements:
+                self._optimizer_weight_views.pop(role, None)
+            else:
+                self._optimizer_weight_views[role] = buffer.view(optimizer_placements)
 
     def reduce_grad(
         self, is_last_backward: bool = False, stream: Optional[torch.cuda.Stream] = None
