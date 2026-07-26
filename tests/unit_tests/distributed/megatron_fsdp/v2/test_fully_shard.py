@@ -598,8 +598,8 @@ class TestFullyShardBasic:
                     placements = weight_buffer.placements.copy()
                     placements[0] = Placement.SHARD
                     state = param_group._weight_buffer_states[role]
-                    state.valid_placements = placements
-                    state.full_output = None
+                    state.valid_placements = tuple(placements)
+                    state.full_buffer = None
 
         owned_weight_buffers = [
             entry
@@ -744,8 +744,8 @@ class TestFullyShardBasic:
         # before unshard, which refreshes the outer replicas exactly once.
         model(torch.zeros_like(x))
         assert not ctx.model_weight_refresh_pending
-        assert state.valid_placements == model_buffer.placements
-        assert state.full_output is not None
+        assert state.valid_placements == tuple(model_buffer.placements)
+        assert state.compute_buffer(param_group._full_placements()) is not None
 
         outer_replicas = [
             torch.empty_like(model_buffer.data)
@@ -1410,9 +1410,10 @@ class TestActivationCheckpointing:
         observed_full = []
 
         def capture_successor_full_buffer(_module, _args):
-            full_output = param_group._weight_buffer_states[WeightBufferRole.MODEL].full_output
-            assert full_output is not None
-            observed_full.append(full_output.data.detach().clone())
+            state = param_group._weight_buffer_states[WeightBufferRole.MODEL]
+            compute_buffer = state.compute_buffer(param_group._full_placements())
+            assert compute_buffer is not None
+            observed_full.append(compute_buffer.data.detach().clone())
 
         handle = successor.register_forward_pre_hook(capture_successor_full_buffer)
         try:

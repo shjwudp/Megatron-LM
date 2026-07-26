@@ -253,15 +253,16 @@ def test_unshard_reshard(strategy):
         shard_before = wbuf.data.view(torch.uint8).clone()
         pg.unshard()
         state = pg._weight_buffer_states[WeightBufferRole.MODEL]
-        assert state.full_output is not None
-        unsharded = state.full_output.data
+        compute_buffer = state.compute_buffer(pg._full_placements())
+        assert compute_buffer is not None
+        unsharded = compute_buffer.data
 
         if not w_dist:
             # ZeRO-1/2: replicated persistent storage needs no temporary lease.
             assert unsharded is wbuf.data
-            assert state.full_output is wbuf
+            assert state.full_buffer is None
         else:
-            assert state.full_output is not wbuf
+            assert state.full_buffer is compute_buffer
             # Distributed: after all-gather, every param should be fully
             # recoverable from the unsharded buffer at its global offset
             for i, p in enumerate(orig):
@@ -271,7 +272,9 @@ def test_unshard_reshard(strategy):
 
         # Reshard: release the ParameterGroup-owned lease; persistent shard is intact.
         pg.reshard()
-        assert state.full_output is (wbuf if wbuf.is_unsharded() else None)
+        assert state.full_buffer is None
+        expected_compute = wbuf if wbuf.is_unsharded() else None
+        assert state.compute_buffer(pg._full_placements()) is expected_compute
         # Compare the persistent storage bit-for-bit. The buffer can contain
         # uninitialized padding, including NaNs for which torch.equal is false
         # even when the before/after bit patterns are identical.

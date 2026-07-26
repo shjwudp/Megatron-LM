@@ -39,17 +39,25 @@ def _zero_tensor_storage(tensor: torch.Tensor) -> None:
 
 @dataclass
 class _WeightBufferState:
-    """Track one persistent weight buffer's validity and optional full output."""
+    """Track one persistent weight representation and optional full scratch."""
 
-    persistent: DataParallelBuffer
-    valid_placements: list[Placement]
-    full_output: Optional[DataParallelBuffer]
+    buffer: DataParallelBuffer
+    valid_placements: tuple[Placement, ...]
+    full_buffer: Optional[DataParallelBuffer] = None
 
     def redistribution_source(self) -> DataParallelBuffer:
         """Return the persistent buffer or its currently valid placement view."""
-        if self.valid_placements == self.persistent.placements:
-            return self.persistent
-        return self.persistent.view(self.valid_placements)
+        if self.valid_placements == tuple(self.buffer.placements):
+            return self.buffer
+        return self.buffer.view(list(self.valid_placements))
+
+    def compute_buffer(
+        self, full_placements: tuple[Placement, ...]
+    ) -> Optional[DataParallelBuffer]:
+        """Return the currently available full compute representation."""
+        if self.valid_placements == full_placements:
+            return self.buffer
+        return self.full_buffer
 
 
 @dataclass(frozen=True)
@@ -179,11 +187,7 @@ class ParameterGroup:
         # Initialize buffers and distributed parameters
         self._init_buffers()
         self._weight_buffer_states = {
-            role: _WeightBufferState(
-                persistent=buffer,
-                valid_placements=buffer.placements.copy(),
-                full_output=buffer if buffer.is_unsharded() else None,
-            )
+            role: _WeightBufferState(buffer=buffer, valid_placements=tuple(buffer.placements))
             for role, buffer in (
                 (WeightBufferRole.MODEL, self.model_weight_buffer),
                 (WeightBufferRole.TRANSPOSE, self.transpose_weight_buffer),
@@ -309,7 +313,9 @@ class ParameterGroup:
 
     def assert_model_weights_not_nan(self) -> None:
         """Assert that every fully replicated model-weight item contains no NaNs."""
-        model_weights = self._weight_buffer_states[WeightBufferRole.MODEL].full_output
+        model_weights = self._weight_buffer_states[WeightBufferRole.MODEL].compute_buffer(
+            self._full_placements()
+        )
         if model_weights is None:
             raise RuntimeError("Model weights must be unsharded before checking for NaNs")
         for param in self.params:
@@ -331,6 +337,10 @@ class ParameterGroup:
     def _optimizer_placements(self) -> list[Placement]:
         """Return optimizer-facing placements from the resolved layout."""
         return list(self.layout.main_weight)
+
+    def _full_placements(self) -> tuple[Placement, ...]:
+        """Return fully replicated placements for this group's mesh."""
+        return (Placement.REPLICATE,) * self.mesh.ndim
 
     def _create_buffer(self, dtype: torch.dtype, role: str) -> DataParallelBuffer:
         """Create an unbound persistent buffer layout for one storage role."""
@@ -448,21 +458,20 @@ class ParameterGroup:
         """Return required weight buffers that do not have a full output."""
         self._ensure_buffers_on_gpu()
         return [
-            (role, state.persistent, state.redistribution_source())
+            (role, state.buffer, state.redistribution_source())
             for role, state in self._required_weight_states(bwd_pass)
-            if state.full_output is None
+            if state.compute_buffer(self._full_placements()) is None
         ]
 
     def _acquire_full_weight_buffer(self, role: WeightBufferRole) -> DataParallelBuffer:
-        """Return or allocate the full output for one weight role."""
+        """Return the persistent full buffer or acquire full scratch."""
         state = self._weight_buffer_states[role]
-        if state.full_output is not None:
-            return state.full_output
-        persistent = state.persistent
-        if persistent.is_unsharded():
-            state.full_output = persistent
-            return persistent
-        output = persistent.placeholder([Placement.REPLICATE, Placement.REPLICATE])
+        compute_buffer = state.compute_buffer(self._full_placements())
+        if compute_buffer is not None:
+            return compute_buffer
+        if tuple(state.buffer.placements) == self._full_placements():
+            return state.buffer
+        output = state.buffer.placeholder(list(self._full_placements()))
         output.bind(
             self.allocator.allocate(
                 key=(self.param_group_id, role.value),
@@ -471,19 +480,17 @@ class ParameterGroup:
                 device=output.device,
             ).data
         )
-        state.full_output = output
+        state.full_buffer = output
         return output
 
     def _release_full_weight_buffer(self, role: WeightBufferRole) -> None:
-        """Release one allocator-backed full output and restore persistent validity."""
+        """Release one allocator-backed full-weight scratch lease."""
         state = self._weight_buffer_states.get(role)
-        if state is None or state.full_output is None:
+        if state is None or state.full_buffer is None:
             return
-        if state.full_output is not state.persistent:
-            state.full_output.unbind()
-            self.allocator.free((self.param_group_id, role.value))
-        state.valid_placements = state.persistent.placements.copy()
-        state.full_output = state.persistent if state.persistent.is_unsharded() else None
+        state.full_buffer.unbind()
+        self.allocator.free((self.param_group_id, role.value))
+        state.full_buffer = None
 
     def _acquire_temporary_buffer(
         self, role: str, persistent: DataParallelBuffer, placements: list[Placement]
@@ -535,6 +542,8 @@ class ParameterGroup:
         communication stream so buffers from consecutive parameter groups can
         still share coalesced collectives.
         """
+        if not param_groups:
+            return
         owned_weight_buffers = [
             (param_group, role, weight_buffer, source)
             for param_group in param_groups
@@ -542,7 +551,7 @@ class ParameterGroup:
                 bwd_pass=bwd_pass
             )
         ]
-        full_placements = [Placement.REPLICATE, Placement.REPLICATE]
+        full_placements = list(param_groups[0]._full_placements())
         output_buffers = [
             param_group._acquire_full_weight_buffer(role)
             for param_group, role, _, _ in owned_weight_buffers
@@ -558,8 +567,8 @@ class ParameterGroup:
             owned_weight_buffers, full_buffers
         ):
             param_group._bind_params(role.value, weight_buffer, full_buffer.data)
-            param_group._weight_buffer_states[role].valid_placements = (
-                weight_buffer.placements.copy()
+            param_group._weight_buffer_states[role].valid_placements = tuple(
+                weight_buffer.placements
             )
 
     def unshard(self, bwd_pass: bool = False, stream: Optional[torch.cuda.Stream] = None) -> None:
@@ -701,7 +710,8 @@ class ParameterGroup:
     def model_weights_are_unsharded(self, bwd_pass: bool = False) -> bool:
         """Return whether the model weights required by this pass are unsharded."""
         return all(
-            state.full_output is not None for _, state in self._required_weight_states(bwd_pass)
+            state.compute_buffer(self._full_placements()) is not None
+            for _, state in self._required_weight_states(bwd_pass)
         )
 
     def reshard(self):
@@ -732,12 +742,7 @@ class ParameterGroup:
                 continue
             self._release_full_weight_buffer(role)
             state = self._weight_buffer_states[role]
-            state.valid_placements = optimizer_placements.copy()
-            state.full_output = (
-                buffer
-                if all(placement is Placement.REPLICATE for placement in state.valid_placements)
-                else None
-            )
+            state.valid_placements = tuple(optimizer_placements)
 
     def reduce_grad(
         self, is_last_backward: bool = False, stream: Optional[torch.cuda.Stream] = None
