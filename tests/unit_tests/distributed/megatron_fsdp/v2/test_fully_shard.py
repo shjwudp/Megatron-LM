@@ -370,6 +370,165 @@ class TestFullyShardBasic:
             assert param_group.layout.main_weight == (expected_outer, Placement.SHARD)
             assert param_group.state.grad_phase is GradientPhaseV2.READY
 
+    @pytest.mark.parametrize("sharding_strategy", ["no_shard", "optim_grads_params"])
+    @pytest.mark.parametrize("use_decoupled_grad", [False, True])
+    def test_parameter_group_v2_full_iteration_gradients_are_stable(
+        self, sharding_strategy, use_decoupled_grad
+    ):
+        """Full-iteration mode preserves graph-visible gradient objects and storage."""
+        torch.manual_seed(42)
+        model = SimpleMLP(16).to(_device())
+        fully_shard(
+            model,
+            sharding_strategy=sharding_strategy,
+            mp_policy=MixedPrecisionPolicy(
+                main_params_dtype=torch.float32,
+                main_grads_dtype=torch.float32,
+                use_decoupled_grad=use_decoupled_grad,
+            ),
+            enable_unshard_prefetch=True,
+            enable_async_reduce_grad=True,
+            enable_full_iteration_cuda_graph=True,
+            use_parameter_group_v2=True,
+        )
+
+        def backward():
+            model.set_is_last_backward(True)
+            _forward_backward(model, torch.randn(2, 16, device=_device()))
+            model.finish_grad_sync()
+
+        backward()
+        gradient_state = []
+        for param_group in model._fsdp_param_groups:
+            assert param_group.state.grad_phase is GradientPhaseV2.READY
+            assert param_group.grad_buffer.data is not None
+            gradient_state.append(
+                (
+                    param_group,
+                    param_group.grad_buffer.data.data_ptr(),
+                    tuple(param_group.optimizer_grads),
+                )
+            )
+
+        model.zero_grad(set_to_none=True)
+        for param_group, data_ptr, optimizer_grads in gradient_state:
+            assert param_group.state.grad_phase is GradientPhaseV2.EMPTY
+            assert param_group.grad_buffer.data.data_ptr() == data_ptr
+            assert all(
+                current is previous
+                for current, previous in zip(param_group.optimizer_grads, optimizer_grads)
+            )
+            assert torch.count_nonzero(param_group.grad_buffer.data) == 0
+            for optimizer_param, optimizer_grad in zip(
+                param_group.optimizer_params, optimizer_grads
+            ):
+                if optimizer_grad is None:
+                    continue
+                installed_grad = (
+                    optimizer_param.decoupled_grad if use_decoupled_grad else optimizer_param.grad
+                )
+                assert installed_grad is optimizer_grad
+                assert optimizer_param._mfsdp_keep_grad_for_cuda_graph
+
+        backward()
+        for param_group, data_ptr, optimizer_grads in gradient_state:
+            assert param_group.state.grad_phase is GradientPhaseV2.READY
+            assert param_group.grad_buffer.data.data_ptr() == data_ptr
+            assert all(
+                current is previous
+                for current, previous in zip(param_group.optimizer_grads, optimizer_grads)
+            )
+
+    @pytest.mark.parametrize("outer_dp_sharding_strategy", ["no_shard", "optim"])
+    def test_parameter_group_v2_full_iteration_hsdp(self, outer_dp_sharding_strategy):
+        """Full-iteration gradient identity is stable for both HSDP final layouts."""
+        model = SimpleMLP(16).to(_device())
+        fully_shard(
+            model,
+            mesh=_build_hsdp_mesh(),
+            sharding_strategy="optim_grads_params",
+            outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+            enable_unshard_prefetch=True,
+            enable_async_reduce_grad=True,
+            enable_full_iteration_cuda_graph=True,
+            use_parameter_group_v2=True,
+        )
+
+        model.set_is_last_backward(True)
+        _forward_backward(model, torch.randn(2, 16, device=_device()))
+        model.finish_grad_sync()
+        gradient_state = [
+            (param_group.grad_buffer.data.data_ptr(), tuple(param_group.optimizer_grads))
+            for param_group in model._fsdp_param_groups
+        ]
+
+        model.zero_grad(set_to_none=True)
+        for param_group, (data_ptr, optimizer_grads) in zip(
+            model._fsdp_param_groups, gradient_state
+        ):
+            assert param_group.grad_buffer.data.data_ptr() == data_ptr
+            assert all(
+                current is previous
+                for current, previous in zip(param_group.optimizer_grads, optimizer_grads)
+            )
+            assert torch.count_nonzero(param_group.grad_buffer.data) == 0
+
+    def test_parameter_group_v2_full_iteration_capture_and_replay(self):
+        """The production full-iteration wrapper captures and replays V2 FSDP."""
+        if _world_size() < 2:
+            pytest.skip("Full-iteration FSDP capture requires at least two ranks")
+
+        from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
+
+        FullCudaGraphWrapper.curr_iteration = {"training": 0, "validation": 0}
+        FullCudaGraphWrapper.cuda_graph = {"training": None, "validation": None}
+        FullCudaGraphWrapper.result = {"training": None, "validation": None}
+        StaticBufferLoader.static_buffers = {"training": [], "validation": []}
+
+        torch.manual_seed(42)
+        model = SimpleMLP(4, bias=False).to(_device())
+        fully_shard(
+            model,
+            sharding_strategy="optim_grads_params",
+            enable_unshard_prefetch=True,
+            enable_async_reduce_grad=True,
+            enable_full_iteration_cuda_graph=True,
+            use_parameter_group_v2=True,
+        )
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
+
+        def forward_backward_func(*, model, data_iterator, **_):
+            batch = next(data_iterator[0])
+            output = model[0](batch["input"])
+            loss = output.float().square().mean()
+            loss.backward()
+            return loss.detach()
+
+        wrapper = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=1)
+        losses = []
+        try:
+            for _ in range(4):
+                model.zero_grad(set_to_none=True)
+                loss = wrapper(
+                    model=[model],
+                    data_iterator=[iter([{"input": torch.ones(2, 4, device=_device())}])],
+                    num_microbatches=1,
+                    seq_length=None,
+                    forward_only=False,
+                )
+                model.finish_grad_sync()
+                optimizer.step()
+                losses.append(loss.clone())
+
+            assert FullCudaGraphWrapper.cuda_graph["training"] is not None
+            loss_values = torch.stack(losses).cpu()
+            assert torch.isfinite(loss_values).all()
+            assert loss_values[-1] < loss_values[0]
+        finally:
+            torch.cuda.synchronize()
+            wrapper.reset_cuda_graph()
+            StaticBufferLoader.static_buffers = {"training": [], "validation": []}
+
     def test_no_shard_forward_backward_finish_grad_sync(self):
         """no_shard keeps full replicated buffers and all-reduces at grad sync."""
         torch.manual_seed(42)

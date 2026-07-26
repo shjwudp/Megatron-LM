@@ -189,6 +189,7 @@ class ParameterGroupV2:
         self.mp_policy = mp_policy
         self.mp_policy.validate_param_group(params)
         self.allocator = allocator or TemporaryBucketAllocator()
+        self.enable_full_iteration_cuda_graph = False
         self.gradient_scaling_factor = gradient_scaling_factor
         self.device = params[0].device
         self.dtype = params[0].dtype
@@ -236,8 +237,8 @@ class ParameterGroupV2:
 
     @property
     def overwrites_full_grad(self) -> bool:
-        """Return whether every backward writes a fresh inner-DP gradient shard."""
-        return self.layout.grad_storage[-1] is Placement.SHARD
+        """Return whether every backward overwrites its fresh full-gradient lease."""
+        return self.requires_grad
 
     @property
     def supports_fused_grad_capture(self) -> bool:
@@ -347,7 +348,9 @@ class ParameterGroupV2:
 
     def _initialize_optimizer_grads(self) -> None:
         """Create gradient DTensor views over the final persistent gradient."""
-        grad_view = self.optimizer_grad()
+        if self.grad_buffer.data is None:
+            raise RuntimeError("Gradient storage must be allocated before creating gradient views")
+        grad_view = self._placement_view(self.grad_buffer, self.layout.main_weight)
         for index, (param, optimizer_param) in enumerate(zip(self.params, self._optimizer_params)):
             local_grad = grad_view.tensor_view(self.param_idx[param])
             if not param.requires_grad or local_grad.numel() == 0:
@@ -368,6 +371,13 @@ class ParameterGroupV2:
                     param.shape,
                     copy_chunk_meta_from=optimizer_param,
                 )
+
+    def prepare_gradient_storage(self) -> None:
+        """Materialize persistent optimizer-gradient storage and DTensor views."""
+        if not self.requires_grad:
+            return
+        self._ensure_grad_storage()
+        self._initialize_optimizer_grads()
 
     def _install_optimizer_grads(self) -> None:
         """Attach reduced gradients to the optimizer-facing parameters."""
@@ -438,34 +448,42 @@ class ParameterGroupV2:
         return self.compute_weight() is not None
 
     @torch.no_grad()
-    def unshard_weight(self) -> DataParallelBuffer:
+    def unshard_weight(self, stream: torch.cuda.Stream | None = None) -> DataParallelBuffer:
         """Restore persistent weight validity, materialize full weights, and bind params."""
-        compute_weight = self.compute_weight()
-        if compute_weight is not None:
-            self._bind_weight(compute_weight)
+        caller_stream = torch.cuda.current_stream()
+        stream = stream or caller_stream
+        if stream != caller_stream:
+            stream.wait_stream(caller_stream)
+
+        with torch.cuda.stream(stream):
+            compute_weight = self.compute_weight()
+            if compute_weight is not None:
+                self._bind_weight(compute_weight)
+                self.mp_policy.post_unshard(self.params)
+                return compute_weight
+
+            current = self.weight_buffer.view(list(self.state.weight_valid))
+            persistent_placements = tuple(self.weight_buffer.placements)
+            if self.state.weight_valid != persistent_placements:
+                # For outer-optimizer-sharded HSDP this is [S,S] -> [R,S]:
+                # restore the outer replica before unsharding the inner DP axis.
+                current.redistribute(list(persistent_placements), output_buffer=self.weight_buffer)
+                self.state.weight_valid = persistent_placements
+                current = self.weight_buffer
+
+            if persistent_placements != self.full_placements:
+                # The remaining HSDP transition is [R,S] -> [R,R].
+                self.state.full_weight = self._allocate_scratch(
+                    "full_weight", self.weight_buffer, self.full_placements
+                )
+                current.redistribute(
+                    list(self.full_placements), output_buffer=self.state.full_weight
+                )
+                current = self.state.full_weight
+
+            self._bind_weight(current)
             self.mp_policy.post_unshard(self.params)
-            return compute_weight
-
-        current = self.weight_buffer.view(list(self.state.weight_valid))
-        persistent_placements = tuple(self.weight_buffer.placements)
-        if self.state.weight_valid != persistent_placements:
-            # For outer-optimizer-sharded HSDP this is [S,S] -> [R,S]:
-            # restore the outer replica before unsharding the inner DP axis.
-            current.redistribute(list(persistent_placements), output_buffer=self.weight_buffer)
-            self.state.weight_valid = persistent_placements
-            current = self.weight_buffer
-
-        if persistent_placements != self.full_placements:
-            # The remaining HSDP transition is [R,S] -> [R,R].
-            self.state.full_weight = self._allocate_scratch(
-                "full_weight", self.weight_buffer, self.full_placements
-            )
-            current.redistribute(list(self.full_placements), output_buffer=self.state.full_weight)
-            current = self.state.full_weight
-
-        self._bind_weight(current)
-        self.mp_policy.post_unshard(self.params)
-        return current
+            return current
 
     def reshard_weight(self) -> None:
         """Release only the full compute-weight lease."""
@@ -475,11 +493,16 @@ class ParameterGroupV2:
 
     def release_grad_buffer(self) -> None:
         """Release any full-gradient scratch lease."""
+        for param in self.params:
+            if hasattr(param, "main_grad"):
+                del param.main_grad
         self._release_scratch("full_grad", self.state.full_grad)
         self.state.full_grad = None
 
     def release_grad_storage_if_unused(self) -> None:
         """Release gradient storage after optimizer-facing gradients are cleared."""
+        if self.enable_full_iteration_cuda_graph:
+            return
         if self.state.grad_phase is GradientPhaseV2.ACCUMULATING:
             return
         if any(
@@ -574,9 +597,8 @@ class ParameterGroupV2:
             final.data.copy_(current.data)
         return final
 
-    @torch.no_grad()
-    def reduce_grad(self, *, is_last_backward: bool) -> None:
-        """Reduce one microbatch and finalize delayed DP axes on the last backward."""
+    def _reduce_grad(self, *, is_last_backward: bool) -> None:
+        """Run one gradient reduction on the current CUDA stream."""
         if self.state.full_grad is None:
             raise RuntimeError("begin_backward() must run before reduce_grad()")
         if self.state.grad_phase is GradientPhaseV2.READY:
@@ -624,8 +646,29 @@ class ParameterGroupV2:
         finally:
             if workspace_key is not None:
                 self.allocator.free(workspace_key)
-            self._release_scratch("full_grad", self.state.full_grad)
-            self.state.full_grad = None
+
+    @torch.no_grad()
+    def reduce_grad(
+        self, *, is_last_backward: bool, stream: torch.cuda.Stream | None = None
+    ) -> None:
+        """Reduce one microbatch and finalize delayed DP axes on the last backward.
+
+        A caller-supplied stream enables overlap. In that case the caller owns
+        completion tracking and releases the full-gradient lease after waiting
+        for its recorded event.
+        """
+        caller_stream = torch.cuda.current_stream()
+        stream = stream or caller_stream
+        if stream != caller_stream:
+            stream.wait_stream(caller_stream)
+        try:
+            with torch.cuda.stream(stream):
+                self._reduce_grad(is_last_backward=is_last_backward)
+        except Exception:
+            self.release_grad_buffer()
+            raise
+        if stream == caller_stream:
+            self.release_grad_buffer()
 
     def optimizer_weight(self) -> DataParallelBuffer:
         """Return the persistent optimizer-weight representation."""
@@ -673,11 +716,24 @@ class ParameterGroupV2:
             ranges.append(None if item is None else (item.global_data_index, item.size))
         return metadata, ranges
 
+    @torch.no_grad()
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Reset logical gradient state and optimizer-facing gradients."""
-        self._release_scratch("full_grad", self.state.full_grad)
-        self.state.full_grad = None
+        self.release_grad_buffer()
         self.state.grad_phase = GradientPhaseV2.EMPTY
+        if self.enable_full_iteration_cuda_graph:
+            self.prepare_gradient_storage()
+            self.grad_buffer.data.zero_()
+            for optimizer_param in self._optimizer_params:
+                for grad_name in ("grad", "decoupled_grad"):
+                    grad = getattr(optimizer_param, grad_name, None)
+                    if grad is None:
+                        continue
+                    local_grad = getattr(grad, "_local_tensor", None)
+                    (local_grad if local_grad is not None else grad).zero_()
+                    setattr(optimizer_param, "_mfsdp_keep_grad_for_cuda_graph", True)
+            return
+
         if set_to_none:
             for optimizer_param in self._optimizer_params:
                 optimizer_param.grad = None

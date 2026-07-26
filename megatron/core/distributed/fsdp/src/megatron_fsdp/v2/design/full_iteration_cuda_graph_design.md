@@ -51,6 +51,12 @@ Megatron FSDP v2 handles this by:
 - keeping transient full weight/gradient buffers outside the optimizer-facing
   object contract.
 
+Both parameter-group implementations expose this through
+`prepare_gradient_storage()`. The placement-first `ParameterGroupV2` keeps its
+`grad_buffer` allocation and optimizer-gradient DTensor identities stable while
+resetting `GradientPhaseV2` to `EMPTY` at the optimizer boundary. Its transient
+full-gradient lease is still released after the reduction stream completes.
+
 ## Buffer ownership
 
 Full-iteration mode uses `StorageFreeingBucketAllocator`, not the
@@ -84,6 +90,6 @@ execution pattern.
 | --- | --- |
 | `mcore_fsdp_adapter.py` | Passes `enable_full_iteration_cuda_graph` into `fully_shard()`. |
 | `fully_shard.py` | Stores full-iteration graph mode in FSDP state. |
-| `param_group.py` | Preserves optimizer-facing gradient storage and zeroes it in place. |
+| `param_group.py` / `param_group_v2.py` | Preserve optimizer-facing gradient storage and zero it in place. |
 | `fsdp_module.py` | Releases transient buffers while keeping graph-visible gradient objects stable. |
 | `training.py` | Wraps the forward/backward function with `FullCudaGraphWrapper`. |

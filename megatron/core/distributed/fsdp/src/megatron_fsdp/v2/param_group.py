@@ -1021,6 +1021,10 @@ class ParameterGroup:
                 self._dist_grad_cache_validated[index] = True
             self.dist_grads[index] = dist_grad
 
+    def prepare_gradient_storage(self) -> None:
+        """Materialize persistent optimizer-gradient storage and DTensor views."""
+        self._init_dist_grads()
+
     def _rebuild_dist_views(self) -> None:
         """Update ``dist_params`` and ``dist_grads`` after storage moves device.
 

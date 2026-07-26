@@ -419,7 +419,7 @@ def _pre_backward_setup(module: FSDPModule, skip_final_callback: bool = False):
             param.grad_added_to_main_grad = False
             param.overwrite_main_grad = param_group.overwrites_full_grad
         if module._fsdp_state.enable_full_iteration_cuda_graph:
-            param_group._init_dist_grads()
+            param_group.prepare_gradient_storage()
         # Keep per-module CUDA graph trace and replay on the same compatible
         # main-grad buffer allocation. Full-iteration graphs manage optimizer
         # gradient storage through their separate persistent-buffer path.
@@ -428,7 +428,7 @@ def _pre_backward_setup(module: FSDPModule, skip_final_callback: bool = False):
             and module._fsdp_state.enable_cuda_graph
             and param_group.supports_fused_grad_capture
         ):
-            param_group._init_dist_grads()
+            param_group.prepare_gradient_storage()
             param_group.ensure_full_grad_buffer()
 
     return ctx

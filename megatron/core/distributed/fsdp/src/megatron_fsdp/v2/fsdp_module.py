@@ -649,10 +649,8 @@ class FSDPModule:
                 module._fsdp_param_groups[0], ParameterGroupV2
             )
             if uses_v2:
-                if async_op:
-                    raise RuntimeError("ParameterGroupV2 does not support async unshard yet")
                 for param_group in module._fsdp_param_groups:
-                    param_group.unshard_weight()
+                    param_group.unshard_weight(stream=stream)
             else:
                 ParameterGroup.unshard_model_weights(
                     module._fsdp_param_groups, bwd_pass=bwd_pass, stream=stream, async_op=async_op
@@ -747,13 +745,8 @@ class FSDPModule:
             if not param_group.requires_grad:
                 continue
 
-            # Initialize main gradient buffer and param -> main_grad mapping if not already done.
-            uses_v2 = isinstance(param_group, ParameterGroupV2)
-            if uses_v2:
-                if async_op:
-                    raise RuntimeError("ParameterGroupV2 does not support async grad reduce yet")
-            else:
-                param_group._init_dist_grads()
+            # Materialize optimizer-gradient storage and DTensor views if needed.
+            param_group.prepare_gradient_storage()
 
             # NaN check before reduction
             if getattr(self, "_enable_nan_checks", False):
@@ -856,8 +849,7 @@ class FSDPModule:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
                 param_group.reduce_grad(is_last_backward=ctx.is_last_backward)
-                if not uses_v2:
-                    param_group.release_grad_buffer()
+                param_group.release_grad_buffer()
 
             # Install reduced gradients to distributed parameters
             for name, param, dist_param, dist_grad in zip(

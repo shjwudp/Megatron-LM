@@ -463,7 +463,7 @@ def _make_bwd_pre_hook(module):
                 getattr(param, "_mfsdp_recorded_te_wgrad", False) for param in param_group.params
             )
             if has_fused_wgrad and param_group.grad_buffer is not None:
-                param_group._init_dist_grads()
+                param_group.prepare_gradient_storage()
                 param_group.ensure_full_grad_buffer()
 
     return hook

@@ -81,8 +81,10 @@ def fully_shard(
             pre-hook.  The caller must invoke the final callback manually
             (used by the 1F1B EP overlap schedule).
         use_parameter_group_v2: Use the placement-first parameter-group
-            implementation. This experimental path currently supports eager
-            FP32/BF16 execution without communication overlap or CUDA graphs.
+            implementation. This experimental path supports eager and
+            full-iteration CUDA-graph FP32/BF16 training. Per-module CUDA
+            graphs, trace-pool allocation, CPU offload, and quantized weights
+            remain on the existing parameter-group path.
     """
     unsupported_args = {
         "reshard_after_forward": reshard_after_forward,
@@ -104,18 +106,15 @@ def fully_shard(
     mesh = mesh or _init_default_fully_shard_mesh()
     if use_parameter_group_v2:
         unsupported_v2_options = {
-            "enable_unshard_prefetch": enable_unshard_prefetch,
-            "enable_async_reduce_grad": enable_async_reduce_grad,
             "enable_trace_pool": enable_trace_pool,
             "enable_cuda_graph": enable_cuda_graph,
-            "enable_full_iteration_cuda_graph": enable_full_iteration_cuda_graph,
             "skip_backward_callback": skip_backward_callback,
             "skip_final_backward_callback": skip_final_backward_callback,
         }
         enabled = [name for name, value in unsupported_v2_options.items() if value]
         if enabled:
             raise NotImplementedError(
-                "ParameterGroupV2 eager integration does not support: " + ", ".join(enabled)
+                "ParameterGroupV2 integration does not support: " + ", ".join(enabled)
             )
         if mp_policy.fp8.enabled or mp_policy.nvfp4.enabled:
             raise NotImplementedError("ParameterGroupV2 does not support quantized weights yet")
