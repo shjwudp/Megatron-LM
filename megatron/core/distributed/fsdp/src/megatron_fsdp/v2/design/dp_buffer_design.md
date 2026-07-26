@@ -218,19 +218,19 @@ lease from asynchronous all-gather launch through the final consumer.
 1. `ParameterGroup` acquires a full-gradient lease only when persistent gradient
    storage cannot contain the replicated backward output.
 2. It aliases the staged full buffer as `PARTIAL` on active DP mesh dimensions.
-3. `ParameterGroup` determines an ordered list of one-axis target placements.
-   Inner-DP runs at the step boundary or whenever persistent gradients are
-   inner-sharded. Outer-DP runs only at the step boundary.
+3. `ParameterGroup` runs an explicit inner-FSDP stage at the step boundary or
+   whenever persistent gradients are inner-sharded. On the last HSDP backward, it
+   follows with an explicit outer-HSDP stage.
 4. When the communication dtype differs from the full-gradient dtype, the group
-   allocates one communication owner before entering the target loop. Otherwise the
+   allocates one communication owner before entering the stages. Otherwise the
    full-gradient owner is reused. Scaling is applied once during this preprocessing
    and does not cause allocation.
 5. `DataParallelBuffer.redistribute()` performs one all-reduce or reduce-scatter and
-   returns its destination DP buffer. Each target output is a contained placement view
-   of the current communication buffer.
-6. After each stage, the parameter group either merges persistent `[P, S]`
-   accumulation into an intermediate that feeds the next stage, or assigns/accumulates
-   the final result into the matching persistent gradient view.
+   returns its destination DP buffer. An empty, dtype-compatible persistent buffer can
+   be the direct output; otherwise the stage uses a contained temporary view.
+6. After each stage, the parameter group assigns or accumulates the result. When an
+   outer stage follows, the logical inner result remains in communication dtype and
+   becomes that stage's input.
 7. The group exposes the resulting shards through optimizer-facing DTensors and
    releases the full-gradient lease after asynchronous communication completes.
 

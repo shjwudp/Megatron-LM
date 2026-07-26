@@ -32,6 +32,7 @@ from torch.distributed.tensor import DeviceMesh
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Placement
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import DataParallelBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
@@ -389,10 +390,19 @@ def test_reduce_grad_owns_comm_conversion_and_scaling(grad_comm_dtype):
     torch.distributed.barrier()
 
 
-def test_hsdp_reuses_one_grad_comm_workspace_across_axes():
+def test_hsdp_reuses_one_grad_comm_workspace_across_axes(monkeypatch):
     """One communication-dtype owner feeds both HSDP redistribution axes."""
     device = torch.device(f"cuda:{torch.distributed.get_rank() % torch.cuda.device_count()}")
     mesh = _build_hsdp_mesh(device)
+    redistribution_dtypes = []
+    original_redistribute = DataParallelBuffer.redistribute
+
+    def capture_redistribute(input_buffer, target_placements, **kwargs):
+        result = original_redistribute(input_buffer, target_placements, **kwargs)
+        redistribution_dtypes.append((input_buffer.dtype, result.dtype))
+        return result
+
+    monkeypatch.setattr(DataParallelBuffer, "redistribute", capture_redistribute)
     mp_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32, grad_comm_dtype=torch.float32)
     groups, _, _, rank, _, _ = _build_groups(
         "optim_grads_params",
@@ -414,21 +424,14 @@ def test_hsdp_reuses_one_grad_comm_workspace_across_axes():
         pg._acquire_full_grad_buffer().data.copy_(full)
 
         allocation_keys = []
-        redistribution_dtypes = []
+        redistribution_dtypes.clear()
         original_allocate = pg.allocator.allocate
-        original_reduce_axis = pg._reduce_gradient_axis
 
         def capture_allocate(*args, **kwargs):
             allocation_keys.append(kwargs.get("key", args[0] if args else None))
             return original_allocate(*args, **kwargs)
 
-        def capture_reduce_axis(input_buffer, target_placements, changed_axis, **kwargs):
-            result = original_reduce_axis(input_buffer, target_placements, changed_axis, **kwargs)
-            redistribution_dtypes.append((input_buffer.dtype, result.dtype))
-            return result
-
         pg.allocator.allocate = capture_allocate
-        pg._reduce_gradient_axis = capture_reduce_axis
 
         expected = full.float().mul_(0.25)
         expected = Ref.reduce_scatter(expected, pg.dp_group)
