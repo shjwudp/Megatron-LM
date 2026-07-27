@@ -116,6 +116,12 @@ by a `REPLICATE` buffer. The latter representation uses two explicit objects—a
 replicated output placeholder and its shared-storage shard input view—without a second
 ``storage_placements`` state.
 
+`view()` treats `PARTIAL` as `REPLICATE` when selecting physical storage, then
+reinterprets the returned buffer with the requested logical placement. Thus
+`[REPLICATE, SHARD] -> [PARTIAL, SHARD]` is a zero-copy validity change, while
+`[REPLICATE, REPLICATE] -> [PARTIAL, SHARD]` first selects the inner shard and
+then marks the outer dimension partial.
+
 Only one mesh placement changes per `redistribute()` call. This keeps the operation
 equivalent to applying one DTensor redistribution step and makes the selected mesh
 dimension unambiguous. `redistribute_buffers()` is the batch planner: it applies that
@@ -291,6 +297,8 @@ collective state.
 - `bind()` and `unbind()` never allocate or free storage.
 - a buffer returned by `view()` has exact placement-shaped data and retains its
   storage owner.
+- `view()` resolves `PARTIAL` through its equivalent `REPLICATE` physical shape
+  without treating the value as logically replicated.
 - `view()` never grows storage and fails when the bound tensor cannot contain the
   requested placement.
 - an explicit redistribution output shares layout, mesh, and device with its input

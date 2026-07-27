@@ -103,6 +103,34 @@ def _build_1d_group(
     return group, values, allocator
 
 
+def test_dp_buffer_view_resolves_partial_as_replicated_physical_storage():
+    group, _, allocator = _build_2d_group(shard_optimizer_across_outer_dp=True)
+    group.prepare_gradient_storage()
+
+    persistent_partial = group.grad_buffer.view(
+        (Placement.PARTIAL, Placement.SHARD)
+    )
+    persistent_physical = group.grad_buffer.view(
+        (Placement.REPLICATE, Placement.SHARD)
+    )
+    assert persistent_partial.placements == [Placement.PARTIAL, Placement.SHARD]
+    assert persistent_partial.data.data_ptr() == persistent_physical.data.data_ptr()
+    with pytest.raises(ValueError, match="do not contain"):
+        persistent_partial.view((Placement.REPLICATE, Placement.SHARD))
+
+    full_grad = group.acquire_full_grad_buffer()
+    full_partial = full_grad.view((Placement.PARTIAL, Placement.PARTIAL))
+    inner_shard_partial = full_grad.view((Placement.PARTIAL, Placement.SHARD))
+    inner_shard_physical = full_grad.view((Placement.REPLICATE, Placement.SHARD))
+    assert full_partial.placements == [Placement.PARTIAL, Placement.PARTIAL]
+    assert full_partial.data.data_ptr() == full_grad.data.data_ptr()
+    assert inner_shard_partial.placements == [Placement.PARTIAL, Placement.SHARD]
+    assert inner_shard_partial.data.data_ptr() == inner_shard_physical.data.data_ptr()
+
+    group.release_temporary_grad_buffers()
+    assert allocator.buckets == {}
+
+
 @pytest.mark.parametrize(
     ("sharding_strategy", "weight", "main_weight", "grad_storage", "grad_accumulation"),
     [

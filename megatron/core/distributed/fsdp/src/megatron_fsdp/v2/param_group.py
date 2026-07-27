@@ -331,10 +331,8 @@ class ParameterGroup:
         if self.grad_buffer.data is None:
             return
         if self.accumulates_full_grad:
-            self.state.full_grad = self._placement_view(
-                self.grad_buffer, self.contribution_placements
-            )
-        grad_view = self._placement_view(self.grad_buffer, self.layout.main_weight)
+            self.state.full_grad = self.grad_buffer.view(self.contribution_placements)
+        grad_view = self.grad_buffer.view(self.layout.main_weight)
         for param, optimizer_grad in zip(self.params, self._optimizer_grads):
             if optimizer_grad is None:
                 continue
@@ -463,9 +461,7 @@ class ParameterGroup:
         if self.grad_buffer.data is None:
             self._allocate_persistent(self.grad_buffer)
         if self.accumulates_full_grad and self.state.full_grad is None:
-            self.state.full_grad = self._placement_view(
-                self.grad_buffer, self.contribution_placements
-            )
+            self.state.full_grad = self.grad_buffer.view(self.contribution_placements)
 
     def _release_grad_storage(self) -> None:
         """Release persistent gradient storage after temporary leases are gone."""
@@ -511,7 +507,7 @@ class ParameterGroup:
         """Create gradient DTensor views over the final persistent gradient."""
         if self.grad_buffer.data is None:
             raise RuntimeError("Gradient storage must be allocated before creating gradient views")
-        grad_view = self._placement_view(self.grad_buffer, self.layout.main_weight)
+        grad_view = self.grad_buffer.view(self.layout.main_weight)
         for index, (param, optimizer_param) in enumerate(zip(self.params, self._optimizer_params)):
             local_grad = grad_view.tensor_view(self.param_idx[param])
             if not param.requires_grad or local_grad.numel() == 0:
@@ -576,15 +572,6 @@ class ParameterGroup:
             return
         buffer.unbind()
         self.allocator.free((self.param_group_id, role))
-
-    @staticmethod
-    def _placement_view(owner: DataParallelBuffer, placements: Placements) -> DataParallelBuffer:
-        physical = tuple(
-            Placement.REPLICATE if placement is Placement.PARTIAL else placement
-            for placement in placements
-        )
-        view = owner.view(list(physical))
-        return view if physical == placements else view.reinterpret(list(placements))
 
     def _required_weight_roles(self, bwd_pass: bool = False) -> tuple[WeightBufferRole, ...]:
         """Return compute-weight roles required for this pass in stable order."""
@@ -997,7 +984,7 @@ class ParameterGroup:
         terminal_stream = axis_streams[-1]
 
         if is_last_backward and needs_outer_reduction:
-            final = self._placement_view(self.grad_buffer, self.layout.main_weight)
+            final = self.grad_buffer.view(self.layout.main_weight)
             outer_stream = axis_streams[0]
             if outer_stream != terminal_stream:
                 outer_stream.wait_stream(terminal_stream)

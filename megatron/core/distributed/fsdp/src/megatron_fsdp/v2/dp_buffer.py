@@ -116,12 +116,14 @@ class DataParallelBuffer:
         """Return whether this buffer currently has a full unsharded view."""
         return all(placement is Placement.REPLICATE for placement in self.placements)
 
-    def view(self, placements: list[Placement]) -> "DataParallelBuffer":
+    def view(self, placements: Sequence[Placement]) -> "DataParallelBuffer":
         """Return a non-owning DP-buffer view with explicit placements.
 
         The returned buffer has exact placement-shaped ``data``. For example,
         taking a ``SHARD`` view of a ``REPLICATE`` placeholder returns the
         rank-owned slice while retaining the placeholder as its storage owner.
+        ``PARTIAL`` has the same physical shape as ``REPLICATE``; the method
+        selects that physical view and reinterprets its logical validity.
 
         Args:
             placements: Logical placement for each mesh dimension.
@@ -131,11 +133,27 @@ class DataParallelBuffer:
         """
         if len(placements) != self.mesh.ndim:
             raise ValueError(f"Expected {self.mesh.ndim} placements, got {placements}")
-        view = self.placeholder(placements)
-        view.data = self._bound_view(placements)
+        logical_placements = list(placements)
+        physical_placements = [
+            Placement.REPLICATE if placement is Placement.PARTIAL else placement
+            for placement in logical_placements
+        ]
+        view = self.placeholder(physical_placements)
+        partial_axes = {
+            axis
+            for axis, placement in enumerate(logical_placements)
+            if placement is Placement.PARTIAL
+        }
+        view.data = self._bound_view(
+            physical_placements, partial_storage_axes=partial_axes
+        )
         view.data_size = view.data.numel()
         view._storage_owner = self
-        return view
+        return (
+            view
+            if physical_placements == logical_placements
+            else view.reinterpret(logical_placements)
+        )
 
     def reinterpret(self, placements: list[Placement]) -> "DataParallelBuffer":
         """Return an alias with same-sized storage and different validity placements.
@@ -379,21 +397,39 @@ class DataParallelBuffer:
                 f"got {None if output_buffer.data is None else output_buffer.data.numel()}"
             )
 
-    def _bound_view(self, placements: list[Placement]) -> torch.Tensor:
+    def _bound_view(
+        self,
+        placements: list[Placement],
+        *,
+        partial_storage_axes: set[int] | None = None,
+    ) -> torch.Tensor:
         """Return a placement-shaped view when the bound storage contains it."""
         if self.data is None:
             raise RuntimeError("DataParallelBuffer has no bound storage")
         if placements == self.placements:
             return self.data
 
+        partial_storage_axes = partial_storage_axes or set()
+        storage_placements = [
+            (
+                Placement.REPLICATE
+                if placement is Placement.PARTIAL and axis in partial_storage_axes
+                else placement
+            )
+            for axis, placement in enumerate(self.placements)
+        ]
         data_contains_requested = all(
             storage_placement is requested_placement
             or (storage_placement is Placement.REPLICATE and requested_placement is Placement.SHARD)
-            for storage_placement, requested_placement in zip(self.placements, placements)
+            for storage_placement, requested_placement in zip(
+                storage_placements, placements
+            )
         )
         if data_contains_requested:
             _, local_slice = self.buffer_index.local_slice_for(
-                (0, self.buffer_index.bucket_meta.size), placements, self.placements
+                (0, self.buffer_index.bucket_meta.size),
+                placements,
+                storage_placements,
             )
             return self.data[:0] if local_slice is None else self.data[local_slice]
         raise ValueError(
