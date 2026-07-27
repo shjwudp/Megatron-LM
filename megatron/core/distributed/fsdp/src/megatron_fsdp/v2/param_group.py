@@ -125,7 +125,7 @@ class PendingWeightTransition:
 
 @dataclass
 class ParameterGroupState:
-    """Minimal value-validity and scratch-lease state."""
+    """Minimal value-validity and runtime-buffer state."""
 
     weight_valid_by_role: dict[WeightBufferRole, Placements]
     full_weights: dict[WeightBufferRole, DataParallelBuffer] = field(default_factory=dict)
@@ -320,6 +320,10 @@ class ParameterGroup:
 
         if self.grad_buffer.data is None:
             return
+        if self.accumulates_full_grad:
+            self.state.full_grad = self._placement_view(
+                self.grad_buffer, self.contribution_placements
+            )
         grad_view = self._placement_view(self.grad_buffer, self.layout.main_weight)
         for param, optimizer_grad in zip(self.params, self._optimizer_grads):
             if optimizer_grad is None:
@@ -448,6 +452,19 @@ class ParameterGroup:
         """Lazily allocate persistent gradient storage for the current step."""
         if self.grad_buffer.data is None:
             self._allocate_persistent(self.grad_buffer)
+        if self.accumulates_full_grad and self.state.full_grad is None:
+            self.state.full_grad = self._placement_view(
+                self.grad_buffer, self.contribution_placements
+            )
+
+    def _release_grad_storage(self) -> None:
+        """Release persistent gradient storage after temporary leases are gone."""
+        if self.state.full_grad is not None:
+            if not self.accumulates_full_grad:
+                raise RuntimeError("Temporary full-gradient storage must be released first")
+            self.state.full_grad.unbind()
+            self.state.full_grad = None
+        self.grad_buffer.unbind()
 
     @staticmethod
     def _dtensor_placements(placements: Placements) -> list[Replicate | Shard]:
@@ -848,15 +865,13 @@ class ParameterGroup:
         self.state.full_weights.clear()
 
     def release_grad_buffer(self) -> None:
-        """Release any full-gradient scratch lease."""
+        """Release per-backward gradient bindings and allocator-backed buffers."""
         for param in self.params:
             if hasattr(param, "main_grad"):
                 del param.main_grad
-        if self.state.full_grad is not None and self.accumulates_full_grad:
-            self.state.full_grad.unbind()
-        else:
+        if not self.accumulates_full_grad:
             self._release_scratch("full_grad", self.state.full_grad)
-        self.state.full_grad = None
+            self.state.full_grad = None
         self._release_scratch("grad_comm", self.state.grad_comm)
         self.state.grad_comm = None
 
@@ -897,14 +912,9 @@ class ParameterGroup:
         """Acquire uninitialized storage for the full local-gradient contribution."""
         self._ensure_grad_storage()
         if self.state.full_grad is None:
-            if self.accumulates_full_grad:
-                self.state.full_grad = self._placement_view(
-                    self.grad_buffer, self.contribution_placements
-                )
-            else:
-                self.state.full_grad = self._allocate_scratch(
-                    "full_grad", self.grad_buffer, self.full_placements
-                )
+            self.state.full_grad = self._allocate_scratch(
+                "full_grad", self.grad_buffer, self.full_placements
+            )
         return self.state.full_grad
 
     def get_main_grad(self, param: torch.nn.Parameter) -> torch.Tensor:
@@ -940,6 +950,8 @@ class ParameterGroup:
         if self.gradient_scaling_factor not in (None, 1.0):
             owner.data.mul_(self.gradient_scaling_factor)
 
+        if tuple(owner.placements) == self.contribution_placements:
+            return owner
         return self._placement_view(owner, self.contribution_placements)
 
     def _finalize_gradient_placement(
@@ -1162,6 +1174,6 @@ class ParameterGroup:
             for optimizer_grad in self._optimizer_grads:
                 if optimizer_grad is not None:
                     detach_uneven_dtensor_local_tensor(optimizer_grad)
-            self.grad_buffer.unbind()
+            self._release_grad_storage()
         elif self.grad_buffer.data is not None:
             self.grad_buffer.data.zero_()

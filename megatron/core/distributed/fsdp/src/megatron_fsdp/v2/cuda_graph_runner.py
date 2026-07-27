@@ -490,13 +490,11 @@ def _make_bwd_pre_hook(module):
 def _make_bwd_post_hook(module):
     def hook(mod, grad_input, grad_output):
         module.reshard()
-        # Capture binds compatible parameter gradients directly to the full
-        # main-grad buffer. The normal post-backward path releases that
-        # temporary buffer after reducing it; capture does not run reduction,
-        # so mirror the release here after the graph has recorded the address.
-        # Otherwise each captured module leaves its TracePoolAllocator key
-        # active and a later module collides with a slot whose traced lifetime
-        # was non-overlapping.
+        # Capture can bind compatible parameter gradients directly to
+        # allocator-backed full-gradient scratch. Capture does not run the
+        # normal reduction, so release its temporary buffers after the graph
+        # records their addresses. Persistent DDP and ZeRO-1 gradient views are
+        # retained because they do not occupy a TracePoolAllocator slot.
         for param_group in module._fsdp_param_groups:
             for param in param_group.params:
                 param.grad = None

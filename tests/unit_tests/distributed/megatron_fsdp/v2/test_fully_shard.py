@@ -1353,6 +1353,13 @@ class TestLifecycle:
                 optimizer_param._local_tensor.device.type == "cpu"
                 for optimizer_param in param_group.optimizer_params
             )
+            if param_group.accumulates_full_grad:
+                assert param_group.state.full_grad is not None
+                assert param_group.state.full_grad.data.device.type == "cpu"
+                assert (
+                    param_group.state.full_grad.data.data_ptr()
+                    == param_group.grad_buffer.data.data_ptr()
+                )
 
         model.unshard()
         assert optimizer_ids == [
@@ -1369,6 +1376,13 @@ class TestLifecycle:
                     param_group.grad_buffer,
                 )
             )
+            if param_group.accumulates_full_grad:
+                assert param_group.state.full_grad is not None
+                assert param_group.state.full_grad.data.device.type == "cuda"
+                assert (
+                    param_group.state.full_grad.data.data_ptr()
+                    == param_group.grad_buffer.data.data_ptr()
+                )
             assert all(
                 optimizer_param._local_tensor.device.type == "cuda"
                 for optimizer_param in param_group.optimizer_params

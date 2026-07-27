@@ -158,6 +158,7 @@ def test_1d_strategy_weight_and_gradient_lifecycle(sharding_strategy):
     assert group.mesh.ndim == 1
     assert group.state.weight_valid == group.layout.weight
     assert group.accumulates_full_grad is accumulates_full_grad
+    assert group.state.full_grad is None
     expected_optimizer_placement = (
         Replicate() if sharding_strategy == "no_shard" else Shard(0)
     )
@@ -174,6 +175,10 @@ def test_1d_strategy_weight_and_gradient_lifecycle(sharding_strategy):
     full_grad.data.fill_(rank + 1)
     group.reduce_grad(is_last_backward=False)
     assert group.state.grad_phase is GradientPhase.ACCUMULATING
+    if accumulates_full_grad:
+        assert group.state.full_grad is full_grad
+    else:
+        assert group.state.full_grad is None
     assert group.full_grad_has_value is accumulates_full_grad
     assert group.overwrites_full_grad is not accumulates_full_grad
     if accumulates_full_grad:
@@ -188,7 +193,9 @@ def test_1d_strategy_weight_and_gradient_lifecycle(sharding_strategy):
         atol=0,
     )
 
-    full_grad = group.begin_backward()
+    next_full_grad = group.begin_backward()
+    assert (next_full_grad is full_grad) is accumulates_full_grad
+    full_grad = next_full_grad
     if group.full_grad_has_value:
         full_grad.data.add_(rank + 2)
     else:
@@ -203,11 +210,60 @@ def test_1d_strategy_weight_and_gradient_lifecycle(sharding_strategy):
         atol=0,
     )
     assert group.state.grad_phase is GradientPhase.READY
+    if accumulates_full_grad:
+        assert group.state.full_grad is full_grad
+    else:
+        assert group.state.full_grad is None
     assert group.optimizer_params[0].grad is group.optimizer_grads[0]
     assert allocator.buckets == {}
 
     group.zero_grad()
     assert group.state.grad_phase is GradientPhase.EMPTY
+    assert group.state.full_grad is None
+
+
+@pytest.mark.parametrize("sharding_strategy", ["no_shard", "optim"])
+def test_full_gradient_view_follows_persistent_storage_lifetime(sharding_strategy):
+    group, _, _ = _build_1d_group(sharding_strategy)
+
+    assert group.grad_buffer.data is None
+    assert group.state.full_grad is None
+    group.prepare_gradient_storage()
+    full_grad = group.state.full_grad
+    assert full_grad is not None
+    assert group.begin_backward() is full_grad
+    grad_storage = group.grad_buffer.data
+    group.release_grad_buffer()
+    assert group.state.full_grad is full_grad
+    assert group.state.full_grad.data.data_ptr() == grad_storage.data_ptr()
+
+    group.zero_grad(set_to_none=False)
+    assert group.state.full_grad is full_grad
+    assert group.state.full_grad.data.data_ptr() == grad_storage.data_ptr()
+
+    group.zero_grad(set_to_none=True)
+    assert group.state.full_grad is None
+    assert group.grad_buffer.data is None
+
+    rebound_full_grad = group.begin_backward()
+    assert rebound_full_grad is not full_grad
+    assert rebound_full_grad.data.data_ptr() == group.grad_buffer.data.data_ptr()
+
+
+def test_temporary_full_gradient_lease_precedes_grad_storage_release():
+    group, _, allocator = _build_1d_group("optim_grads_params")
+
+    full_grad = group.begin_backward()
+    with pytest.raises(RuntimeError, match="Temporary full-gradient storage"):
+        group._release_grad_storage()
+    assert group.state.full_grad is full_grad
+    assert any(key[1] == "full_grad" for key in allocator.buckets)
+
+    group.release_grad_buffer()
+    group._release_grad_storage()
+    assert group.state.full_grad is None
+    assert group.grad_buffer.data is None
+    assert allocator.buckets == {}
 
 
 @pytest.mark.parametrize(

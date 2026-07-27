@@ -890,7 +890,7 @@ class FSDPModule:
                     )
             else:
                 # ---- Non-overlapped path ----
-                # Reduce gradients immediately and release grad buffer
+                # Reduce gradients immediately and release temporary workspaces.
                 completion_stream = param_group.reduce_grad(is_last_backward=ctx.is_last_backward)
                 param_group.release_grad_buffer()
 
