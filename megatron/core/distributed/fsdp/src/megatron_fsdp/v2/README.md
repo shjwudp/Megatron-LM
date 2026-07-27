@@ -20,7 +20,7 @@ v2/
 ├── fully_shard.py               # Public fully_shard() API entry point
 ├── fsdp_module.py               # FSDPModule runtime state (unshard/reshard/reduce_grad)
 ├── hooks.py                     # Forward/backward hook registration
-├── param_group.py               # ParameterGroup — groups params with shared buffers
+├── param_group.py               # Placement-first ParameterGroup
 ├── dp_buffer.py                 # DataParallelBuffer — flat buffer management
 ├── buffer_index.py              # Flat-buffer item indexing and shard metadata
 ├── allocator.py                 # BucketAllocator (Temporary, StorageFreeing, TracePool)
@@ -35,6 +35,7 @@ v2/
     ├── full_iteration_cuda_graph_design.md    # Full-iteration CUDA graph design
     ├── hsdp_design.md                         # HSDP mesh, buffer layouts, and conversions
     ├── hooks_api.md                           # Hook API contracts and Q&A
+    ├── dp_buffer_design.md                    # DP buffer and ParameterGroup ownership
     ├── lazy_grad_buffer_design.md             # Lazy main grad buffer lifecycle
     ├── mixed_precision_training_design.md     # Mixed precision training support
     └── mcore_fsdp_checkpoint_design.md        # Checkpoint save/load and conversion design
@@ -62,22 +63,17 @@ Controls parameter/gradient dtypes and communication precision.
 
 | Field | Default | Purpose |
 |-------|---------|---------|
-| `main_params_dtype` | ``None`` | Dtype for optimizer main-weight buffer. ``None`` = no separate buffer, optimizer mutates model weights directly. Set to ``torch.float32`` for quantized models (FP8/NVFP4) so the optimizer works on high-precision copies. When this equals the model-weight dtype and the sharding layout matches, the separate buffer is skipped automatically to avoid a redundant copy. |
+| `main_params_dtype` | ``None`` | Dtype for optimizer main-weight buffer. ``None`` = no separate buffer, optimizer mutates model weights directly. Set to ``torch.float32`` for FP8/NVFP4 compute weights. |
 | `main_grads_dtype` | ``None`` | Dtype for optimizer main-grad buffer. When ``None`` and ``use_decoupled_grad=False``, aligns with ``main_params_dtype``. Otherwise falls back to ``param.dtype``. |
 | `grad_comm_dtype` | ``None`` | Dtype for gradient reduce-scatter communication. ``None`` = use ``main_grads_dtype``. |
 | `use_decoupled_grad` | ``False`` | When ``False``, ``main_grads_dtype`` is inferred from ``main_params_dtype`` so the optimizer operates in a consistent precision context. |
 
-**FP8 & NVFP4 recipes**
-
-`FullyShardFP8Policy` and `FullyShardNVFP4Policy` are recipe dataclasses
-that configure quantized mixed-precision behavior within `MixedPrecisionPolicy`,
-passed via the ``fp8`` and ``nvfp4`` fields respectively.  They are not
-standalone policies.
-
 ```python
 from megatron_fsdp.v2 import (
-    fully_shard, MixedPrecisionPolicy,
-    FullyShardFP8Policy, FullyShardNVFP4Policy,
+    FullyShardFP8Policy,
+    FullyShardNVFP4Policy,
+    MixedPrecisionPolicy,
+    fully_shard,
 )
 
 # No separate main buffer — optimizer mutates model params directly
@@ -88,14 +84,13 @@ fully_shard(model, mp_policy=mp_policy)
 mp_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
 fully_shard(model, mp_policy=mp_policy)
 
-# FP8 mixed precision — fp32 main weights + MXFP8 rowwise/colwise quantized compute
+# Quantized compute weights with fp32 optimizer weights
 mp_policy = MixedPrecisionPolicy(
     main_params_dtype=torch.float32,
     fp8=FullyShardFP8Policy(enabled=True),
 )
 fully_shard(model, mp_policy=mp_policy)
 
-# NVFP4 mixed precision — fp32 main weights + NVFP4 primary compute weights
 mp_policy = MixedPrecisionPolicy(
     main_params_dtype=torch.float32,
     nvfp4=FullyShardNVFP4Policy(enabled=True),
@@ -112,74 +107,34 @@ Mixin class added to wrapped modules. Methods:
 | `unshard()` | Pre-forward | All-gather params from sharded buffer |
 | `reshard()` | Post-forward, post-backward | Release unsharded buffer |
 | `reduce_grad()` | Post-backward / grad sync | All-reduce no-shard grads or reduce-scatter ZeRO grads |
-
-### CUDA Graph Capture
-
-> **Experimental** — CUDA graph support in Megatron FSDP v2 is an experimental
-> feature.  The API and behaviour may change in future releases without notice.
-
-**Why MFSDP v2 can support CUDA graphs.**  The [`TracePoolAllocator`](allocator.py)
-traces one micro-batch, assigns each FSDP temporary buffer key to a stable slot,
-and returns the same cached tensor view on later micro-batches.  Those stable
-addresses are the memory foundation that CUDA graph capture requires.
-
-When using the standalone API, enable per-module capture with
-``enable_cuda_graph=True``:
-
-```python
-for layer in model.layers:
-    fully_shard(layer, enable_cuda_graph=True)
-fully_shard(model)  # root without CUDA graph
-```
-
-**How it works:**
-
-1. The first optimized forward pass records sample arguments for each
-   eligible module.
-2. After the first backward completes, a single batch call to
-   `te-graph-runtime`'s `make_graphed_callables` captures forward + backward
-   graphs for all modules in correct order (fwds in forward-module order,
-   bwds in reverse) using the shared trace pool.
-3. FSDP unshard/reshard hooks run **outside** the CUDA graph capture via
-   `capture_time_hooks` — they are never graphed.  During replay they
-   fire normally around the graphed forward/backward.
-4. Replay runs entirely through the captured graphs — no Python hooks fire
-   inside the graphed region.
-
-**Limitation — nesting:** A parent FSDP module that contains other FSDP
-modules as children **cannot** use ``enable_cuda_graph=True``.  Only leaf
-FSDP modules (those without FSDP children) are eligible.  Attempting to
-enable CUDA graph on a module with FSDP children raises a ``RuntimeError``.
-
-```python
-# OK — layers are leaf FSDP modules
-for layer in model.layers:
-    fully_shard(layer, enable_cuda_graph=True)
-
-# NOT OK — model contains FSDP layers as children
-fully_shard(model, enable_cuda_graph=True)   # raises RuntimeError
-```
-
-See [`design/mfsdp_v2_builtin_cuda_graph_design.md`](design/mfsdp_v2_builtin_cuda_graph_design.md)
-for the full per-module architecture.
+| `offload_to_cpu()` | Between iterations | Move persistent parameter-group storage to CPU |
+| `reload_to_gpu()` | Before reuse (optional) | Eagerly restore offloaded storage; normal access reloads automatically |
 
 ### DataParallelBuffer
 
 Flat buffer managing (a shard of) parameter/gradient data:
 
-- `unshard()` — all-gather to full tensor
-- `reshard()` — free temporary buffer
-- `reduce_grad()` — all-reduce no-shard grads or reduce-scatter ZeRO grads
+- Stores a `DeviceMesh` plus DTensor-like logical placements
+- Derives the process group for the placement axis being redistributed
+- Plans target-driven, axis-ordered redistribution for compatible buffer batches
+- Manages persistent, sharded, and temporary full-buffer tensor views
 - Uses `BufferIndex` to track parameter layout within the buffer
+
+Parameter binding, gradient-result accumulation, and transformation ordering belong
+to `ParameterGroup`. See
+[the data-parallel buffer design](design/dp_buffer_design.md) for the ownership model.
 
 ### ParameterGroup
 
 Groups parameters sharing the same (device, dtype, requires_grad):
 
-- `model_weight_buffer` — stores compute weights; replicated for no-shard/ZeRO-1/2 and sharded for ZeRO-3
-- `main_weight_buffer` — optional high-precision optimizer copy; sharded when optimizer state is sharded
-- `main_grad_buffer` — accumulates gradients before reduce
-- `dist_params` — DTensor views into the buffer
+- Owns model, transpose, main-weight, and main-gradient buffer roles
+- Selects and collectively unshards the weight representations required by each pass
+- Binds full weight views and finalizes mixed-precision representations
+- Commits gradient redistribution results and exposes optimizer-facing DTensors
+
+`FSDPModule` schedules semantic parameter-group operations; it does not select,
+redistribute, or bind weight buffers.
 
 ### Uneven DTensor Handling
 
@@ -205,6 +160,13 @@ strategy controls which buffers and communication collectives are used.
 
 ## Known Limitations
 
+### Parameter-group features
+
+The placement-first parameter group supports DDP, ZeRO-1/2/3, HSDP,
+FP8/NVFP4 parameter gather, trace-pool allocation, per-module and
+full-iteration CUDA graphs, delayed weight-gradient/MoE callbacks, and
+explicit CPU offload.
+
 ### Parallelism
 
 - **Tensor Parallelism (TP):** The FSDP DeviceMesh contains DP/EDP dimensions,
@@ -225,17 +187,13 @@ overlap (prefetch/unshard pipelining) is not applicable.
 
 ### CUDA Graph
 
-- **Experimental.** Enable via ``enable_cuda_graph=True`` on leaf FSDP modules.
-  In Megatron-LM training, use ``--mfsdp-cuda-graph`` with one or more module
-  selectors (`transformer`, `mamba`, `attn`, `mlp`, `moe`, `moe_router`).
-  Built on vendored [te-graph-runtime](https://github.com/buptzyb/te-graph-runtime)
-  with local modifications. See
-  [`design/mfsdp_v2_builtin_cuda_graph_design.md`](design/mfsdp_v2_builtin_cuda_graph_design.md).
-- **Requires `TracePoolAllocator`.** CUDA graph capture depends on the
-  deterministic buffer addresses provided by the trace pool. It is selected
-  automatically when ``enable_cuda_graph=True``.
-- **Nesting not supported.** Only leaf FSDP modules (those without FSDP children)
-  are eligible for capture.
+Full-iteration CUDA graphs are enabled with
+`enable_full_iteration_cuda_graph=True`. Per-module capture is enabled with
+`enable_cuda_graph=True` on leaf FSDP modules and automatically selects the
+`TracePoolAllocator` needed for stable scratch-buffer addresses. See
+[`design/full_iteration_cuda_graph_design.md`](design/full_iteration_cuda_graph_design.md)
+and
+[`design/mfsdp_v2_builtin_cuda_graph_design.md`](design/mfsdp_v2_builtin_cuda_graph_design.md).
 
 ### `fully_shard()` API Parameters
 
@@ -245,14 +203,13 @@ signature but are **not supported yet**. Passing any of them raises
 
 - `reshard_after_forward`
 - `shard_placement_fn`; all parameters currently use `Shard(0)` on the DP dimension
-- `offload_policy`; CPU offloading is not supported
+- `offload_policy`; use `FSDPModule.offload_to_cpu()` for explicit offload
 
 ### Hardware & Platform
 
 - **GPU only.** CUDA devices only. CPU, XPU, and ROCm are not tested or supported.
-- **NVFP4** (`mixed_precision.py`): The non-distributed quantization path is
-  not implemented. Distributed NVFP4 quantization is implemented for sharded
-  model-weight buffers.
+- **Quantized weights:** FP8 and NVFP4 parameter gather require a compatible
+  Transformer Engine release and supported NVIDIA GPU.
 
 ### Checkpointing
 
@@ -341,11 +298,14 @@ torchrun --nproc_per_node=2 \
 - **Zero-numel gradient shards and fused optimizers.** When a parameter's local shard is empty on some DP ranks (e.g., small biases on high DP counts), creating a `DTensor` gradient with `numel() == 0` and passing it to fused multi-tensor optimizers (TE `FusedAdam`) can silently corrupt updates for neighboring non-empty parameters. This manifests only as convergence divergence with no error — see [design.md § Pitfall](design/design.md) for details and the fix in `param_group.py`.
 - **Temporary communication bucket lifecycle.** Temporary all-gather /
   reduce-scatter buckets are allocated on the caller CUDA stream. Parameter
-  all-gathers run on `ag_stream`; gradient collectives run on `rs_stream`,
-  where full-iteration graphs may also stage add/copy/zero work immediately
-  before reduction. CUDA events order preparation, communication, consumption,
-  and free. All all-gather outputs additionally record their producer stream so
-  the allocator cannot recycle a temporary buffer while communication is using it.
+  all-gathers and gradient collectives may use one stream per device-mesh axis.
+  HSDP all-gather runs outer then inner; reduction runs inner then outer, with
+  explicit stream dependencies between stages. Eager and per-module CUDA graph
+  paths stage gradients on the caller stream. Full-iteration CUDA graphs instead
+  stage ordinary async gradients on the inner reduction stream and record detached
+  source tensors on that stream so their storage remains live. CUDA events order
+  communication, consumption, and release, and `ParameterGroup` retains each
+  temporary lease until its event completes.
 
 ## Unit Tests
 

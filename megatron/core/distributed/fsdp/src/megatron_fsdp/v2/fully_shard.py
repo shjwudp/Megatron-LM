@@ -8,8 +8,9 @@ The implementation is split across:
 - hooks.py: forward/backward hook registration
 """
 
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
+import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Shard
@@ -23,7 +24,7 @@ from .hooks import (
     _register_forward_pre_hook,
 )
 from .mixed_precision import MixedPrecisionPolicy
-from .utils import _init_default_fully_shard_mesh, _prepare_fsdp_mesh
+from .utils import _init_default_fully_shard_mesh
 
 __all__ = ["FSDPModule", "fully_shard"]
 _fsdp_class_cache = {}  # module-level cache
@@ -42,7 +43,10 @@ def fully_shard(
     ignored_params: Optional[set[nn.Parameter]] = None,
     # --- Megatron-FSDP specific options ---
     enable_unshard_prefetch: bool = True,
+    outer_dp_all_gather_prefetch_depth: int = 1,
     enable_async_reduce_grad: bool = True,
+    all_gather_streams: Sequence[torch.cuda.Stream | None] | None = None,
+    reduce_scatter_streams: Sequence[torch.cuda.Stream | None] | None = None,
     gradient_scaling_factor: Optional[float] = None,
     enable_trace_pool: bool = False,
     sharding_strategy: str = "optim_grads_params",
@@ -66,6 +70,17 @@ def fully_shard(
     Args:
         enable_full_iteration_cuda_graph: If ``True``, keep graph-visible FSDP
             optimizer gradient objects stable across full-iteration graph replay.
+        all_gather_streams: Optional stream for each device-mesh axis. HSDP
+            all-gathers execute in mesh order (outer DP, then inner DP).
+        outer_dp_all_gather_prefetch_depth: Number of future HSDP modules whose
+            outer-DP weight all-gather is prefetched. Zero disables this
+            placement-stage pipeline.
+        outer_dp_sharding_strategy: Sharding strategy for the outer axis of a
+            2D HSDP mesh, supporting ``"no_shard"`` and ``"optim"``. This
+            option is ignored for a 1D mesh.
+        reduce_scatter_streams: Optional stream for each device-mesh axis. HSDP
+            gradient reduction executes in reverse mesh order (inner DP, then
+            outer DP on the last backward).
         fine_grained_hooks: If ``True``, register pre-forward/backward hooks
             on every sub-module (for EP-overlap / 1F1B schedules).
         skip_backward_callback: If ``True``, skip the autograd post-backward
@@ -94,10 +109,34 @@ def fully_shard(
             "The input module has already been fully sharded. "
             "Please do not call fully_shard on the same module more than once."
         )
-    mesh = _prepare_fsdp_mesh(mesh or _init_default_fully_shard_mesh())
-
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy()
+    for param in module.parameters():
+        if ignored_params is not None and param in ignored_params:
+            continue
+        if param.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+            raise NotImplementedError(
+                "ParameterGroup supports FP32/BF16/FP16 parameters, "
+                f"got {param.dtype}"
+            )
+
+    if mesh is None:
+        mesh = _init_default_fully_shard_mesh()
+        mesh = mesh[mesh.mesh_dim_names[-1]]
+
+    if mesh.ndim == 2 and outer_dp_sharding_strategy not in ("no_shard", "optim"):
+        raise ValueError(
+            f"Unsupported outer DP sharding strategy: {outer_dp_sharding_strategy}"
+        )
+    if outer_dp_all_gather_prefetch_depth < 0:
+        raise ValueError("outer_dp_all_gather_prefetch_depth must be non-negative")
+
+    for name, streams in (
+        ("all_gather_streams", all_gather_streams),
+        ("reduce_scatter_streams", reduce_scatter_streams),
+    ):
+        if streams is not None and len(streams) != mesh.ndim:
+            raise ValueError(f"Expected {mesh.ndim} {name}, got {len(streams)}")
 
     cls = module.__class__
     if cls not in _fsdp_class_cache:
@@ -105,15 +144,11 @@ def fully_shard(
     new_cls = _fsdp_class_cache[cls]
     module.__class__ = new_cls
 
-    use_trace_pool = (
-        enable_trace_pool
-        or enable_cuda_graph
-        or any(
-            getattr(m._fsdp_state, "enable_cuda_graph", False)
-            for m in module.modules()
-            if isinstance(m, FSDPModule) and m is not module
-        )
-    ) and sharding_strategy in ("no_shard", "optim", "optim_grads", "optim_grads_params")
+    use_trace_pool = enable_trace_pool or enable_cuda_graph or any(
+        getattr(m._fsdp_state, "enable_cuda_graph", False)
+        for m in module.modules()
+        if isinstance(m, FSDPModule) and m is not module
+    )
     bucket_allocator = TracePoolAllocator() if use_trace_pool else StorageFreeingBucketAllocator()
 
     module._init_named_param_groups(
@@ -126,7 +161,11 @@ def fully_shard(
     )
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,
+        outer_dp_all_gather_prefetch_depth=outer_dp_all_gather_prefetch_depth,
         enable_async_reduce_grad=enable_async_reduce_grad,
+        mesh_ndim=mesh.ndim,
+        all_gather_streams=all_gather_streams,
+        reduce_scatter_streams=reduce_scatter_streams,
         bucket_allocator=bucket_allocator,
         enable_cuda_graph=enable_cuda_graph,
         enable_full_iteration_cuda_graph=enable_full_iteration_cuda_graph,

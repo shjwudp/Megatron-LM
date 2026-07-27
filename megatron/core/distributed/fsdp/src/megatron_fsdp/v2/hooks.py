@@ -13,7 +13,6 @@ from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from .allocator import TracePoolAllocator
 from .cuda_graph_runner import CudaGraphRunner
-from .dp_buffer import Placement
 from .fsdp_module import FSDPModule, _FSDPState
 from .utils import RegisterFSDPBackwardFunction
 
@@ -92,8 +91,8 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
     if target._fsdp_state._is_root and not is_recompute:
         # A plain torch optimizer clears ``dist_param.grad`` without entering
         # FSDPModule.zero_grad(). Sweep every FSDP parameter group at the root
-        # boundary so stale distributed-gradient storage is released before
-        # the first parameter unshard of the new forward.
+        # boundary so eligible storage is released before the first parameter
+        # unshard of the new forward.
         target._release_grad_storage_if_unused()
         # The last-backward contract guarantees that an optimizer decision has
         # happened before this next normal forward. Install updated main-weight
@@ -116,7 +115,7 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
 
     # ---- free stale grad data (safe to repeat, idempotent) ----------------
     for param_group in target._fsdp_param_groups:
-        param_group._release_grad_storage_if_unused()
+        param_group.release_grad_storage_if_unused()
 
     # ---- CUDA graph: record sample args (first optimized micro-batch) -----
     # Actual capture happens in mfsdp_post_backward_final_callback via
@@ -282,13 +281,14 @@ def mfsdp_post_backward_final_callback(root_module: nn.Module):
         module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
 
     # ---- drain pending async reduce-grad events -----------------------
-    stream = ctx.rs_stream
     for buckets in ctx.reduce_grad_buckets.values():
         while len(buckets) > 0:
             event, param_group = buckets.pop()
             event.wait()
-            param_group.release_grad_buffer()
-    torch.cuda.current_stream().wait_stream(stream)
+            param_group.release_temporary_grad_buffers()
+    caller_stream = torch.cuda.current_stream()
+    for stream in ctx.rs_streams:
+        caller_stream.wait_stream(stream)
 
     # ``is_last_backward`` is the optimizer-step boundary. The optimizer may
     # install model weights explicitly; otherwise the next normal pre-forward
@@ -418,25 +418,19 @@ def _pre_backward_setup(module: FSDPModule, skip_final_callback: bool = False):
     for param_group in module._fsdp_param_groups:
         for param in param_group.params:
             param.grad_added_to_main_grad = False
-            param.overwrite_main_grad = param_group.sharding_strategy in (
-                "optim_grads_params",
-                "optim_grads",
-            )
+            param.overwrite_main_grad = param_group.overwrites_full_grad
         if module._fsdp_state.enable_full_iteration_cuda_graph:
-            param_group._init_dist_grads()
+            param_group.prepare_gradient_storage()
         # Keep per-module CUDA graph trace and replay on the same compatible
         # main-grad buffer allocation. Full-iteration graphs manage optimizer
         # gradient storage through their separate persistent-buffer path.
         if (
             not module._fsdp_state.enable_full_iteration_cuda_graph
             and module._fsdp_state.enable_cuda_graph
-            and param_group.requires_grad
-            and param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
-            and param_group.main_grad_buffer is not None
-            and param_group.main_grad_buffer.dtype == param_group.params[0].dtype
+            and param_group.supports_fused_grad_capture
         ):
-            param_group._init_dist_grads()
-            param_group.main_grad_buffer.fetch_buffer([Placement.REPLICATE, Placement.REPLICATE])
+            param_group.prepare_gradient_storage()
+            param_group.acquire_full_grad_buffer()
 
     return ctx
 

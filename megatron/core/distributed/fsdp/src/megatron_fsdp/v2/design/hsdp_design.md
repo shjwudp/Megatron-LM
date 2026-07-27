@@ -3,6 +3,205 @@
 FSDP v2 implements HSDP as layout transitions over a two-dimensional
 data-parallel mesh.
 
+The target `ParameterGroup` ownership and runtime-state model is defined in
+[`parameter_group_design.md`](parameter_group_design.md).
+
+## Established lifecycle facts
+
+This section is the normative starting point for the refactor. It describes outer
+`optim` with inner `optim_grads_params`; later implementation work must preserve these
+facts.
+
+The placement vector is ordered as `[outer, inner]`:
+
+| Short name | Placement |
+| --- | --- |
+| `R` | `REPLICATE` |
+| `S` | `SHARD` |
+| `P` | `PARTIAL` |
+
+`R` and `P` have the same local extent, but not the same validity. `R` is a complete
+value along that mesh dimension. `P` is an unreduced contribution. A bound `[R, S]`
+buffer may therefore own the physical storage used by a current `[P, S]` logical
+view; those are two `DataParallelBuffer` objects sharing one allocation.
+
+### Persistent owners and active views
+
+| Data | Persistent storage owner | Active or consumer view |
+| --- | --- | --- |
+| Model/transpose weight | `[R, S]` | Optimizer refresh source `[S, S]`; compute weight `[R, R]` |
+| Main weight | `[S, S]` | Optimizer parameter `[S, S]` |
+| Main gradient | `[R, S]` | Accumulating gradient `[P, S]`; optimizer gradient `[S, S]` |
+| Full-gradient scratch | `[R, R]` while leased | One-microbatch contribution `[P, P]` |
+
+The owner describes allocation capacity and the view it can contain. Only the active
+view describes which values are currently valid. In particular, the main-gradient
+owner remains `[R, S]`; producing an optimizer gradient does not replace it with a
+compact persistent `[S, S]` buffer. The optimizer consumes an `[S, S]` view of that
+owner.
+
+### Initialization and weight materialization
+
+1. `ParameterGroup` allocates persistent model-weight capacity as `[R, S]` and
+   persistent main-weight storage as `[S, S]`.
+2. Before the first optimizer update, the initialized model-weight owner is already a
+   valid `[R, S]` source. Inner all-gather materializes temporary `[R, R]` compute
+   weights.
+3. After an optimizer update, only the optimizer-owned `[S, S]` slice is current.
+   That slice is represented as an explicit view into the `[R, S]` model-weight
+   owner.
+4. Outer all-gather transforms `[S, S] -> [R, S]` into the containing owner.
+5. Inner all-gather transforms `[R, S] -> [R, R]` into a temporary compute-weight
+   output.
+6. Parameters bind to `[R, R]` for computation. Reshard releases only the temporary
+   `[R, R]` lease; the `[R, S]` model-weight owner persists.
+
+There is no `DIRTY` placement or dirty flag in this model. The explicit `[S, S]`
+source view records what is current, and the explicit `[R, S]` output records what
+the outer all-gather will make current.
+
+### Gradient reduction across microbatches
+
+For every microbatch:
+
+1. Backward stages a full local gradient contribution in `[R, R]` storage and treats
+   that contribution logically as `[P, P]`.
+2. Inner reduce-scatter transforms `[P, P] -> [P, S]`.
+3. The result is accumulated into a persistent `[P, S]` view backed by the `[R, S]`
+   main-gradient owner.
+
+For non-final microbatches, the process stops there: there is no outer collective.
+On the last backward:
+
+4. The last inner result is first included in the accumulated `[P, S]` value.
+5. Outer reduce-scatter transforms the accumulated `[P, S] -> [S, S]`.
+6. The optimizer consumes that final `[S, S]` view.
+
+Thus inner-DP reduction runs once per microbatch, while outer-DP reduction runs once
+per optimizer step, after the final microbatch. The final outer output may be the
+rank-owned `[S, S]` slice of the same `[R, S]` allocation used for accumulation.
+
+For outer `no_shard`, steps 1–4 are identical. The last outer operation is an
+all-reduce `[P, S] -> [R, S]`, and the optimizer consumes `[R, S]`.
+
+### Cross-stream dependencies
+
+Axis-specific streams do not make the two HSDP stages independent. The second
+stage consumes the first stage's output, so `DataParallelBuffer.redistribute_buffers`
+establishes CUDA stream dependencies in placement-transition order.
+
+Weight materialization follows mesh order:
+
+```text
+caller stream
+    -> outer AG stream: [S, S] -> [R, S]
+    -> inner AG stream: [R, S] -> [R, R]
+    -> bind parameters and run mixed-precision post-unshard processing
+```
+
+When the streams differ, the outer stream first waits for the caller stream and
+the inner stream waits for the outer stream. If `[R, S]` is already valid, the
+outer stage is skipped and the inner stream waits directly for the caller.
+Parameter binding and post-unshard processing run on the last active axis stream.
+
+#### Optional outer-DP all-gather prefetch
+
+Outer optimizer sharding permits the persistent `[S, S] -> [R, S]` stage of a
+future module to run before that module leases `[R, R]` compute-weight storage.
+`outer_dp_all_gather_prefetch_depth=N` keeps at most `N` eligible future modules
+in this placement stage. The default is one; zero disables it. The first module's
+`unshard()` call bootstraps its own outer stage and refills the configured future
+window after dispatching its inner stage.
+
+Each module has its own completion event. The current module's inner-DP stream
+waits only for that module's outer event, never for the full lookahead window.
+The scheduler gives the critical inner stage priority and then refills the outer
+window:
+
+```text
+bootstrap:
+  outer AG L0
+        +--> inner AG L0
+        `--> outer AG L1
+
+steady state at L1:
+  consume prefetched [R,S] L1
+        +--> inner AG L1
+        `--> outer AG L2
+```
+
+Depth one produces this two-stage pipeline. Larger depths can hide longer outer
+latency, but are not universally faster: outer and inner collectives may contend
+for the same network links. The depth is therefore a performance-tuning choice,
+not a correctness requirement. When this pipeline is enabled, it replaces the
+generic full-unshard-next-module prefetch so future inner all-gathers are not
+launched ahead of the current module's progression.
+
+Gradient reduction follows the inverse dependency chain:
+
+```text
+caller stream
+    -> inner RS stream: [P, P] -> [P, S]
+    -> accumulate the microbatch result on the inner stream
+    -> outer RS/AR stream: [P, S] -> [S, S] or [R, S]
+```
+
+The final outer redistribution is invoked while the inner stream is current.
+Consequently, its outer stream waits for both the inner collective and the
+accumulation queued after it. `wait_stream()` supplies the CUDA event dependency;
+no additional explicit event is required between the two axis collectives.
+
+### Concrete `3 x 4` reduction example
+
+Let the mesh shape be `(O, I) = (3, 4)`, with three outer-DP rows and four
+inner-DP columns. Let `e[m, o, i]` be the full local gradient contribution
+produced by microbatch `m` at rank coordinate `(o, i)`. Both partial placements
+use `SUM`, and both shard placements shard the same flat gradient dimension.
+
+At the start of a microbatch:
+
+```text
+[P, P]
+
+[
+  [e[m,0,0], e[m,0,1], e[m,0,2], e[m,0,3]],
+  [e[m,1,0], e[m,1,1], e[m,1,2], e[m,1,3]],
+  [e[m,2,0], e[m,2,1], e[m,2,2], e[m,2,3]],
+]
+```
+
+Inner reduce-scatter independently reduces each row:
+
+```text
+[P, P] -- inner reduce-scatter --> [P, S]
+
+r[m,o] = sum(i=0..3) e[m,o,i]
+```
+
+Each `r[m,o]` is a logical reduced tensor sharded across the four inner ranks
+in row `o`; no rank in that row materializes the complete `r[m,o]`. The outer
+placement remains `P`, because the three row results have not been summed.
+
+The persistent inner-reduced accumulation after microbatch `m` is:
+
+```text
+a[o] += r[m,o]
+```
+
+It remains `[P, S]`. On the final backward, outer reduce-scatter computes:
+
+```text
+[P, S] -- outer reduce-scatter --> [S, S]
+
+reduced_e = sum(o=0..2) a[o]
+          = sum(m) sum(o=0..2) sum(i=0..3) e[m,o,i]
+```
+
+The result is fully reduced and nested-sharded along the same flat gradient
+dimension: inner sharding first, then outer sharding. A `3 x 4` mesh therefore
+produces 12 logical chunks, subject to the uneven-chunk rules represented by
+`BufferIndex`.
+
 ## Notation
 
 ### Mesh and layout
@@ -34,7 +233,8 @@ The mesh dimension names are `dp_outer` for the outer dimension and
 
 The inner `sharding_strategy` supports all four strategies below. The outer
 `outer_dp_sharding_strategy` supports `no_shard` and `optim`; outer
-`optim` requires inner `optim_grads_params`.
+`optim` requires inner `optim_grads_params`. A 1D mesh has no outer axis and
+therefore ignores `outer_dp_sharding_strategy`.
 
 | Strategy | State sharded along the selected mesh dimension |
 | --- | --- |
@@ -84,9 +284,9 @@ shard_layout = (outer_sharded, inner_sharded)
 | `(1, 0)` | Outer shard of the full bucket |
 | `(1, 1)` | Outer shard of the inner shard |
 
-`storage_shard_layout` describes persistent storage. In contrast,
-`unshard_dim`, `reduce_dim`, and `shard_dim` are mesh dimension IDs:
-0 selects outer and 1 selects inner.
+Persistent storage owners and active logical views are separate buffers that may
+share one allocation. In contrast, `unshard_dim`, `reduce_dim`, and `shard_dim` are
+mesh dimension IDs: 0 selects outer and 1 selects inner.
 
 Using the notation above, `BufferIndex` defines:
 
@@ -145,26 +345,29 @@ Outer and inner decisions are combined as
 `(outer_sharded, inner_sharded)`. For outer `optim` plus inner
 `optim_grads_params`:
 
-| Data | Persistent layout | Active view |
+| Data | Persistent placement | Active view |
 | --- | --- | --- |
-| Model/transpose weight | `(0, 1)` | Compute weight `(0, 0)` |
-| Main weight | `(1, 1)` | Optimizer parameter `(1, 1)` |
-| Main gradient | `(0, 1)` | Optimizer gradient `(1, 1)` |
+| Model/transpose weight | `[R, S]` | Optimizer refresh source `[S, S]`; compute weight `[R, R]` |
+| Main weight | `[S, S]` | Optimizer parameter `[S, S]` |
+| Main gradient | `[R, S]` | Accumulation `[P, S]`; optimizer gradient `[S, S]` |
 
-`get_item()` and `set_item()` intersect the requested item range with the
+`tensor_view()` and `copy_tensors_()` intersect the requested tensor range with the
 range present in persistent storage, then translate it to storage-local
 coordinates.
 
-`fetch_buffer(layout)` follows three rules:
+Bound buffer views follow three rules:
 
-1. Return storage for an exact layout.
-2. Return a view when storage contains the requested shard, such as
+1. `view(layout)` returns storage for an exact layout.
+2. It returns a view when bound storage contains the requested shard, such as
    `(0, 1) -> (1, 1)`.
-3. Otherwise use a full temporary bucket, such as `(1, 1) -> (0, 1)`.
+3. Otherwise `ParameterGroup` acquires an external destination, creates a
+   placeholder for it, and binds the allocation before redistribution, such as
+   `(1, 1) -> (0, 1)`.
 
 An all-gather changes one layout bit from 1 to 0. A reduce-scatter changes one
 bit from 0 to 1. An all-reduce leaves the layout unchanged. Parameters are
-bound only from `(0, 0)`; reshard releases temporary storage.
+bound only from `(0, 0)`; reshard unbinds group-owned leases before returning
+their keys to the allocator.
 
 ## State transitions
 
@@ -175,20 +378,20 @@ optimizer may install updated model weights immediately; otherwise the next
 normal root pre-forward installs them before any outer or inner unshard.
 Activation-recompute forwards do not consume the pending refresh.
 
-The unshard tables distinguish the persistent model-storage allocation from
-the currently valid weight view. Under the assumed inner strategy,
-`_inner_dirty` remains `False`, so only `_outer_dirty` is shown.
+The unshard tables distinguish the persistent model-storage owner from the
+currently valid weight view.
 
 ### Outer `no_shard`
 
 #### Reduce grad
 
-| Step | Operation | Resulting layout |
-| --- | --- | --- |
-| Backward gradient | — | `(0, 0)` |
-| Reduce or accumulate inner gradient shard | Inner reduce-scatter | `(0, 1)` |
-| Synchronize outer replicas at the step boundary | Outer all-reduce | `(0, 1)` |
-| Optimizer consumes gradient | — | `(0, 1)` |
+| Step | Frequency | Operation | Active placement |
+| --- | --- | --- | --- |
+| Backward contribution | Every microbatch | — | `[P, P]` |
+| Reduce inner contribution | Every microbatch | Inner reduce-scatter | `[P, S]` |
+| Accumulate inner result | Every microbatch | Local accumulation | `[P, S]` |
+| Synchronize outer replicas | Last backward only | Outer all-reduce | `[R, S]` |
+| Optimizer consumes gradient | Step boundary | — | `[R, S]` |
 
 The outer all-reduce gives every outer rank the same inner gradient shard.
 Main weights and optimizer state are also replicated on outer, so every outer
@@ -196,46 +399,47 @@ rank applies the same update.
 
 #### Unshard
 
-| Step | Operation | Persistent model storage | Current valid weight view | `_outer_dirty` |
-| --- | --- | --- | --- | --- |
-| Main weight, replicated on outer | — | — | `(0, 1)` | — |
-| Copy the complete inner shard into model storage | Copy | `(0, 1)` | `(0, 1)` | `False` |
-| Skip outer all-gather | — | `(0, 1)` | `(0, 1)` | `False` |
-| Materialize compute weight | Inner all-gather | `(0, 1)` | `(0, 0)` | `False` |
-| Bind parameters | — | `(0, 1)` | `(0, 0)` | `False` |
+| Step | Operation | Persistent model owner | Current valid weight view |
+| --- | --- | --- | --- |
+| Main weight, replicated on outer | — | — | `[R, S]` |
+| Copy the complete inner shard into model storage | Copy | `[R, S]` | `[R, S]` |
+| Skip outer all-gather | — | `[R, S]` | `[R, S]` |
+| Materialize compute weight | Inner all-gather | `[R, S]` | `[R, R]` |
+| Bind parameters | — | `[R, S]` | `[R, R]` |
 
 The model-weight storage is already complete on outer after the copy. Reshard
-releases the temporary `(0, 0)` compute buffer and keeps the persistent
-`(0, 1)` storage.
+releases the temporary `[R, R]` compute buffer and keeps the persistent
+`[R, S]` owner.
 
 ### Outer `optim`
 
 #### Reduce grad
 
-| Step | Operation | Resulting layout |
-| --- | --- | --- |
-| Backward gradient | — | `(0, 0)` |
-| Reduce or accumulate inner gradient shard | Inner reduce-scatter | `(0, 1)` |
-| Shard across outer ranks at the step boundary | Outer reduce-scatter | `(1, 1)` |
-| Optimizer consumes gradient | — | `(1, 1)` |
+| Step | Frequency | Operation | Active placement |
+| --- | --- | --- | --- |
+| Backward contribution | Every microbatch | — | `[P, P]` |
+| Reduce inner contribution | Every microbatch | Inner reduce-scatter | `[P, S]` |
+| Accumulate inner result in `[R, S]` owner | Every microbatch | Local accumulation | `[P, S]` |
+| Shard across outer ranks | Last backward only | Outer reduce-scatter | `[S, S]` |
+| Optimizer consumes gradient | Step boundary | — | `[S, S]` |
 
 The outer reduce-scatter leaves each outer rank with one slice of the inner
-gradient shard. Main weights and optimizer state use the same `(1, 1)`
-ownership.
+gradient shard. Main weights and optimizer state use the same `[S, S]`
+ownership. The main-gradient allocation remains owned by the persistent
+`[R, S]` buffer; `[S, S]` is its optimizer-facing final view.
 
 #### Unshard
 
-| Step | Operation | Persistent model storage | Current valid weight view | `_outer_dirty` |
-| --- | --- | --- | --- | --- |
-| Main weight | — | — | `(1, 1)` | — |
-| Copy the local slice into model storage | Copy | `(0, 1)` | `(1, 1)` | `True` |
-| Reconstruct the complete inner shard | Outer all-gather | `(0, 1)` | `(0, 1)` | `False` |
-| Materialize compute weight | Inner all-gather | `(0, 1)` | `(0, 0)` | `False` |
-| Bind parameters | — | `(0, 1)` | `(0, 0)` | `False` |
+| Step | Operation | Persistent model owner | Current valid weight view |
+| --- | --- | --- | --- |
+| Main weight | — | — | `[S, S]` |
+| Copy the local slice into model storage | Copy | `[R, S]` | `[S, S]` |
+| Reconstruct the complete inner shard | Outer all-gather | `[R, S]` | `[R, S]` |
+| Materialize compute weight | Inner all-gather | `[R, S]` | `[R, R]` |
+| Bind parameters | — | `[R, S]` | `[R, R]` |
 
-The persistent model-weight allocation has layout `(0, 1)`, but immediately
-after the copy only its local `(1, 1)` slice is current. While
-`_outer_dirty=True`, outer unshard treats that storage as a `(1, 1)` source.
-The outer all-gather restores the complete `(0, 1)` inner shard and clears
-`_outer_dirty`. Inner unshard and reshard leave it clear; the next
-optimizer-to-model copy starts the next dirty cycle.
+Immediately after the optimizer-to-model copy, only the explicit `[S, S]`
+source view is current. Outer all-gather writes into the containing `[R, S]`
+owner, making that output current. No dirty state is stored on
+`DataParallelBuffer`; the source and output objects make the transition
+explicit. Inner unshard then writes temporary `[R, R]` compute weights.

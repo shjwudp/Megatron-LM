@@ -63,8 +63,7 @@ class BucketAllocator:
 class TemporaryBucketAllocator(BucketAllocator):
     """Manages temporary flat buffers keyed by a caller-provided key.
 
-    Used by DataParallelBuffer for unshard (all-gather) and gradient
-    reduction (reduce-scatter) operations.
+    Used by ``ParameterGroup`` for unshard and gradient-reduction leases.
     """
 
     def __init__(self):
@@ -667,7 +666,7 @@ def _intervals_overlap(ivs_a: List[Tuple[int, int]], ivs_b: List[Tuple[int, int]
 
 
 def _is_torchdynamo_compiling() -> bool:
-    """Check whether torchdynamo is compiling — safe across PyTorch versions."""
+    """Check whether torchdynamo is compiling, safely across PyTorch versions."""
     try:
         return torch.distributed._functional_collectives.is_torchdynamo_compiling()
     except (AttributeError, RuntimeError):
@@ -675,7 +674,7 @@ def _is_torchdynamo_compiling() -> bool:
 
 
 def _free_storage(tensor: torch.Tensor) -> None:
-    """Free the underlying storage of ``tensor`` by resizing it to 0."""
+    """Free the underlying storage of ``tensor`` by resizing it to zero."""
     with torch.no_grad():
         if not _is_torchdynamo_compiling():
             already_freed = tensor._typed_storage()._size() == 0
@@ -690,12 +689,7 @@ def _free_storage(tensor: torch.Tensor) -> None:
 
 
 def _alloc_storage(tensor: torch.Tensor, size: torch.Size) -> None:
-    """Re-allocate storage for ``tensor`` to the given ``size``.
-
-    Requires that the tensor's storage has been freed (resized to 0)
-    before calling.  The caller must ensure ``size`` matches the tensor's
-    existing shape.
-    """
+    """Reallocate previously freed ``tensor`` storage to ``size``."""
     with torch.no_grad():
         if not _is_torchdynamo_compiling():
             already_allocated = tensor._typed_storage()._size() == size.numel()

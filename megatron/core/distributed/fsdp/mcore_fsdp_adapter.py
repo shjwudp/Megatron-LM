@@ -312,6 +312,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
         kwargs = {
             "mp_policy": fully_shard_mp_policy,
             "enable_unshard_prefetch": ddp_config.overlap_param_gather,
+            "outer_dp_all_gather_prefetch_depth": (
+                ddp_config.fsdp_outer_dp_all_gather_prefetch_depth
+            ),
             "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
             "enable_trace_pool": ddp_config.fsdp_double_buffer or ddp_config.fsdp_trace_pool,
             "enable_full_iteration_cuda_graph": config.cuda_graph_impl == "full_iteration",
@@ -372,12 +375,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
         fully_shard(module, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
 
         # Propagate relevant attributes from original parameters to the new
-        # distributed parameters created by FSDP.  This is REQUIRED for
+        # optimizer-facing parameters created by FSDP.  This is REQUIRED for
         # correctness: the optimizer's param group builder
         # (_get_param_groups) relies on attributes like
         # is_embedding_parameter and is_embedding_or_output_parameter to
         # classify parameters into groups.  If these attributes are missing
-        # on the DTensor dist_params, the optimizer may assign a param to
+        # on the optimizer DTensors, the optimizer may assign a param to
         # the wrong group, causing skipped weight decay on embeddings or
         # incorrect learning-rate multipliers, which leads to convergence
         # divergence.
@@ -385,7 +388,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             if not isinstance(child, FSDPModule):
                 continue
             for param_group in child._fsdp_param_groups:
-                for param, dist_param in zip(param_group.params, param_group.dist_params):
+                for param, dist_param in zip(param_group.params, param_group.optimizer_params):
                     for attr_name in [
                         # allreduce: expert params have allreduce=False set by
                         # te layers.  Missing this causes is_expert_parallel
@@ -440,7 +443,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         def synchronize_param_gather():
             ctx = self.module._fsdp_root_context
-            torch.cuda.current_stream().wait_stream(ctx.ag_stream)
+            caller_stream = torch.cuda.current_stream()
+            for stream in ctx.ag_streams:
+                caller_stream.wait_stream(stream)
 
         self.finish_grad_sync = self.module.finish_grad_sync
         self.scale_gradients = self.module._scale_gradients
@@ -714,8 +719,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
         """
         if self.ddp_config.use_megatron_fsdp_v2:
             ctx = self.module._fsdp_root_context
-            torch.cuda.current_stream().wait_stream(ctx.ag_stream)
-            torch.cuda.current_stream().wait_stream(ctx.rs_stream)
+            caller_stream = torch.cuda.current_stream()
+            for stream in (*ctx.ag_streams, *ctx.rs_streams):
+                caller_stream.wait_stream(stream)
             return
 
         self.module.synchronize_gradient_reduce()

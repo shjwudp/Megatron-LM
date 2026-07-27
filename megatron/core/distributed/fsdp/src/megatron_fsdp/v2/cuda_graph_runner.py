@@ -36,8 +36,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch.utils._pytree import tree_flatten
 
-from .dp_buffer import Placement
-
 logger = logging.getLogger(__name__)
 
 
@@ -211,6 +209,7 @@ class CudaGraphRunner:
         self._sample_kwargs: Dict[int, Dict[str, Any]] = {}
         self._sample_outputs: Dict[int, Any] = {}
         self._modules_ordered: List[torch.nn.Module] = []
+        self._original_forwards: Dict[int, Any] = {}
         self._compiled_module_state = []
 
     # ---- called from hooks ------------------------------------------------
@@ -223,6 +222,7 @@ class CudaGraphRunner:
         if mid in self._sample_args:
             return
 
+        self._original_forwards[mid] = module.forward
         # Normalize Module.compile() before capture setup. te-graph-runtime
         # detects this compiled forward body and warms the capture-equivalent
         # hook specialization before entering torch.cuda.graph.
@@ -437,6 +437,22 @@ class CudaGraphRunner:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info("CudaGraphRunner: installed CUDA graphs on %d modules", n)
 
+    def reset(self) -> None:
+        """Restore eager forwards and clear all recorded or captured graph state."""
+        for module in self._modules_ordered:
+            original_forward = self._original_forwards.get(id(module))
+            if original_forward is not None:
+                module.forward = original_forward
+            if hasattr(module, "_fsdp_cg_installed"):
+                delattr(module, "_fsdp_cg_installed")
+        self._sample_args.clear()
+        self._sample_kwargs.clear()
+        self._sample_outputs.clear()
+        self._modules_ordered.clear()
+        self._original_forwards.clear()
+        self._compiled_module_state.clear()
+        self._captured = False
+
 
 # ---------------------------------------------------------------------------
 # capture_time_hooks (unshard / reshard outside graph, not replayed)
@@ -464,11 +480,9 @@ def _make_bwd_pre_hook(module):
             has_fused_wgrad = any(
                 getattr(param, "_mfsdp_recorded_te_wgrad", False) for param in param_group.params
             )
-            if has_fused_wgrad and param_group.main_grad_buffer is not None:
-                param_group._init_dist_grads()
-                param_group.main_grad_buffer.fetch_buffer(
-                    [Placement.REPLICATE, Placement.REPLICATE]
-                )
+            if has_fused_wgrad and param_group.grad_buffer is not None:
+                param_group.prepare_gradient_storage()
+                param_group.acquire_full_grad_buffer()
 
     return hook
 
@@ -476,16 +490,14 @@ def _make_bwd_pre_hook(module):
 def _make_bwd_post_hook(module):
     def hook(mod, grad_input, grad_output):
         module.reshard()
-        # Capture binds compatible parameter gradients directly to the full
-        # main-grad buffer. The normal post-backward path releases that
-        # temporary buffer after reducing it; capture does not run reduction,
-        # so mirror the release here after the graph has recorded the address.
-        # Otherwise each captured module leaves its TracePoolAllocator key
-        # active and a later module collides with a slot whose traced lifetime
-        # was non-overlapping.
+        # Capture can bind compatible parameter gradients directly to
+        # allocator-backed full-gradient scratch. Capture does not run the
+        # normal reduction, so release its temporary buffers after the graph
+        # records their addresses. Persistent DDP and ZeRO-1 gradient views are
+        # retained because they do not occupy a TracePoolAllocator slot.
         for param_group in module._fsdp_param_groups:
             for param in param_group.params:
                 param.grad = None
-            param_group.release_grad_buffer()
+            param_group.release_temporary_grad_buffers()
 
     return hook

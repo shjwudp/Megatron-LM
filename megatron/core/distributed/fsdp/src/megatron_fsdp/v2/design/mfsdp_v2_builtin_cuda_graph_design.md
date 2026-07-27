@@ -109,12 +109,14 @@ During capture, real module hooks are temporarily removed because
 `make_graphed_callables()` requires hook-free modules. Equivalent FSDP
 unshard/reshard work is passed as `capture_time_hooks`.
 
-The capture-time backward post-hook also releases the temporary full
-`main_grad` buffer after each module graph records its address. This mirrors
-the normal post-backward lifetime without launching gradient reduction during
-capture. It is required because `TracePoolAllocator` may assign sequential
-module-gradient keys to the same physical slot; leaving an earlier key active
-would make the optimized capture lifetime differ from the eager trace.
+The capture-time backward post-hook also releases allocator-backed full
+`main_grad` scratch after each module graph records its address. Persistent DDP
+and ZeRO-1 gradient views remain attached to their gradient storage. Releasing
+scratch mirrors the normal post-backward lifetime without launching gradient
+reduction during capture. It is required because `TracePoolAllocator` may
+assign sequential module-gradient keys to the same physical slot; leaving an
+earlier key active would make the optimized capture lifetime differ from the
+eager trace.
 Clone-slot detection after capture reuses the static main-gradient binding
 recorded before backward. It must not call `get_main_grad()` again after the
 post-hook release, because that getter can reacquire the just-released trace

@@ -54,11 +54,20 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     get_state_dict,
     preprocess_state_dict_for_uneven_dtensor,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import Placement
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.allocator import TracePoolAllocator
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import mfsdp_forward_pre_hook
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+    mfsdp_forward_pre_hook,
+    mfsdp_post_backward_final_callback,
+    mfsdp_post_backward_hook,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import (
+    GradientPhase,
+    ParameterGroup,
+)
 
 SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
@@ -123,8 +132,8 @@ class MixedDtypeBuffers(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(hidden, hidden))
         nn.init.normal_(self.weight)
-        self.uint8_weight = nn.Parameter(
-            torch.arange(hidden * hidden, dtype=torch.uint8).reshape(hidden, hidden),
+        self.bfloat16_weight = nn.Parameter(
+            torch.arange(hidden * hidden, dtype=torch.bfloat16).reshape(hidden, hidden),
             requires_grad=False,
         )
 
@@ -249,6 +258,43 @@ def _count_fsdp_modules(module):
 
 
 class TestFullyShardBasic:
+    @pytest.mark.parametrize(
+        "outer_dp_sharding_strategy",
+        ["no_shard", "optim", "ignored_for_1d"],
+    )
+    def test_1d_mesh_ignores_outer_dp_strategy(self, outer_dp_sharding_strategy):
+        """A 1D layout ignores the outer-axis strategy."""
+        model = SimpleMLP(16).to(_device())
+        mesh = DeviceMesh(
+            _device().type,
+            torch.arange(_world_size()),
+            mesh_dim_names=("dp",),
+        )
+
+        fully_shard(
+            model,
+            mesh=mesh,
+            outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+        )
+
+        assert all(
+            param_group.mesh.ndim == 1
+            and len(param_group.layout.weight) == 1
+            and len(param_group.layout.main_weight) == 1
+            for param_group in model._fsdp_param_groups
+        )
+
+    def test_2d_mesh_rejects_invalid_outer_dp_strategy(self):
+        """A 2D layout validates its outer-axis strategy."""
+        model = SimpleMLP(16).to(_device())
+
+        with pytest.raises(ValueError, match="Unsupported outer DP sharding strategy"):
+            fully_shard(
+                model,
+                mesh=_build_hsdp_mesh(),
+                outer_dp_sharding_strategy="optim_grads",
+            )
+
     def test_module_class_becomes_fsdp(self):
         """fully_shard should dynamically convert the module class to a FSDPModule mixin."""
         torch.manual_seed(42)
@@ -286,6 +332,418 @@ class TestFullyShardBasic:
         assert not torch.isnan(torch.tensor(loss)), "Loss is NaN"
         assert not torch.isinf(torch.tensor(loss)), "Loss is Inf"
 
+    @pytest.mark.parametrize(
+        "sharding_strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"]
+    )
+    @pytest.mark.parametrize(
+        ("model_dtype", "main_dtype"),
+        [
+            pytest.param(torch.float32, None, id="fp32"),
+            pytest.param(torch.bfloat16, torch.float32, id="bf16-fp32-main"),
+            pytest.param(torch.float16, torch.float32, id="fp16-fp32-main"),
+        ],
+    )
+    def test_parameter_group_eager_1d(self, sharding_strategy, model_dtype, main_dtype):
+        """The experimental eager path runs the complete 1D FSDP lifecycle."""
+        torch.manual_seed(42)
+        model = SimpleMLP(16).to(_device(), dtype=model_dtype)
+        fully_shard(
+            model,
+            sharding_strategy=sharding_strategy,
+            mp_policy=MixedPrecisionPolicy(
+                main_params_dtype=main_dtype, main_grads_dtype=main_dtype
+            ),
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+        )
+
+        assert model._fsdp_param_groups
+        assert all(
+            isinstance(param_group, ParameterGroup) and param_group.mesh.ndim == 1
+            for param_group in model._fsdp_param_groups
+        )
+
+        model.set_is_last_backward(True)
+        loss = _forward_backward(model, torch.randn(2, 16, device=_device(), dtype=model_dtype))
+        assert torch.isfinite(torch.tensor(loss))
+        model.finish_grad_sync()
+
+        for param_group in model._fsdp_param_groups:
+            assert param_group.state.grad_phase is GradientPhase.READY
+            for optimizer_param in param_group.optimizer_params:
+                if optimizer_param.requires_grad:
+                    assert optimizer_param.grad is not None
+
+        model.zero_grad(set_to_none=True)
+        for param_group in model._fsdp_param_groups:
+            assert param_group.state.grad_phase is GradientPhase.EMPTY
+            assert param_group.grad_buffer.data is None
+
+    @pytest.mark.parametrize("sharding_strategy", ["no_shard", "optim_grads_params"])
+    def test_parameter_group_per_module_cuda_graph(self, sharding_strategy):
+        """Per-module capture preserves placement-first gradient accumulation."""
+        model = fully_shard(
+            SimpleMLP(4).to(_device()),
+            sharding_strategy=sharding_strategy,
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+            enable_cuda_graph=True,
+        )
+
+        for index, value in enumerate((2.0, 3.0, 4.0)):
+            if index == 2:
+                model.set_is_last_backward(True)
+            sample = torch.full((2, 4), value, device=_device(), requires_grad=True)
+            model(sample).sum().backward()
+            if index == 1:
+                assert model._fsdp_cg_installed
+
+        model.finish_grad_sync()
+        for param_names, param_group in model._named_param_groups:
+            assert param_group.state.grad_phase is GradientPhase.READY
+            for name, optimizer_grad in zip(param_names, param_group.optimizer_grads):
+                if optimizer_grad is None:
+                    continue
+                local_expected = 18.0 if name.endswith("weight") else 6.0
+                expected = local_expected * _world_size()
+                torch.testing.assert_close(
+                    optimizer_grad.to_local(),
+                    torch.full_like(optimizer_grad.to_local(), expected),
+                )
+
+        model.zero_grad()
+        for param_group in model._fsdp_param_groups:
+            assert param_group.state.grad_phase is GradientPhase.EMPTY
+
+    @pytest.mark.parametrize(
+        "sharding_strategy,outer_dp_sharding_strategy",
+        [
+            ("no_shard", "no_shard"),
+            ("optim", "no_shard"),
+            ("optim_grads", "no_shard"),
+            ("optim_grads_params", "no_shard"),
+            ("optim_grads_params", "optim"),
+        ],
+    )
+    def test_parameter_group_eager_hsdp(
+        self, sharding_strategy, outer_dp_sharding_strategy
+    ):
+        """The eager HSDP path preserves the caller's 2D mesh and final layout."""
+        torch.manual_seed(42)
+        model = SimpleMLP(16).to(_device())
+        fully_shard(
+            model,
+            mesh=_build_hsdp_mesh(),
+            sharding_strategy=sharding_strategy,
+            outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+        )
+
+        model.set_is_last_backward(True)
+        loss = _forward_backward(model, torch.randn(2, 16, device=_device()))
+        assert torch.isfinite(torch.tensor(loss))
+        model.finish_grad_sync()
+
+        expected_outer = (
+            Placement.SHARD if outer_dp_sharding_strategy == "optim" else Placement.REPLICATE
+        )
+        expected_inner = (
+            Placement.REPLICATE
+            if sharding_strategy == "no_shard"
+            else Placement.SHARD
+        )
+        for param_group in model._fsdp_param_groups:
+            assert isinstance(param_group, ParameterGroup)
+            assert param_group.mesh.ndim == 2
+            assert param_group.layout.main_weight == (expected_outer, expected_inner)
+            assert param_group.state.grad_phase is GradientPhase.READY
+
+    def test_parameter_group_hsdp_axis_streams(self):
+        """HSDP accepts independent outer/inner all-gather and reduction streams."""
+        torch.manual_seed(42)
+        model = SimpleMLP(16).to(_device())
+        outer_ag_stream = torch.cuda.Stream()
+        inner_ag_stream = torch.cuda.Stream()
+        outer_rs_stream = torch.cuda.Stream()
+        inner_rs_stream = torch.cuda.Stream()
+        fully_shard(
+            model,
+            mesh=_build_hsdp_mesh(),
+            sharding_strategy="optim_grads_params",
+            outer_dp_sharding_strategy="optim",
+            enable_unshard_prefetch=True,
+            enable_async_reduce_grad=True,
+            all_gather_streams=(outer_ag_stream, inner_ag_stream),
+            reduce_scatter_streams=(outer_rs_stream, inner_rs_stream),
+        )
+
+        ctx = model._fsdp_root_context
+        assert ctx.ag_streams == (outer_ag_stream, inner_ag_stream)
+        assert ctx.rs_streams == (outer_rs_stream, inner_rs_stream)
+
+        model.set_is_last_backward(True)
+        loss = _forward_backward(model, torch.randn(2, 16, device=_device()))
+        model.finish_grad_sync()
+        assert torch.isfinite(torch.tensor(loss))
+        assert all(
+            param_group.state.grad_phase is GradientPhase.READY
+            for param_group in model._fsdp_param_groups
+        )
+
+    @pytest.mark.parametrize("depth", [None, 0, 1, 2])
+    def test_hsdp_outer_weight_prefetch_window(self, depth):
+        """The first unshard bootstraps and advances the outer prefetch window."""
+
+        class LayerStack(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([SimpleMLP(16) for _ in range(4)])
+
+            def forward(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+
+        mesh = _build_hsdp_mesh()
+        model = LayerStack().to(_device())
+        shard_kwargs = {
+            "mesh": mesh,
+            "sharding_strategy": "optim_grads_params",
+            "outer_dp_sharding_strategy": "optim",
+            "enable_unshard_prefetch": True,
+            "enable_async_reduce_grad": False,
+        }
+        for layer in model.layers:
+            fully_shard(layer, **shard_kwargs)
+        root_kwargs = dict(shard_kwargs)
+        if depth is not None:
+            root_kwargs["outer_dp_all_gather_prefetch_depth"] = depth
+        fully_shard(model, **root_kwargs)
+        effective_depth = 1 if depth is None else depth
+
+        # Model an optimizer update: only each [S, S] main-weight view is current.
+        model._copy_main_weights_to_model_weights()
+
+        # Layer 0 performs its own outer then inner AG before refilling exactly
+        # the configured number of future outer stages.
+        model.layers[0].unshard(async_op=True)
+        assert not any(
+            param_group.state.pending_weights
+            for param_group in model.layers[0]._fsdp_param_groups
+        )
+        pending = [
+            any(param_group.state.pending_weights for param_group in layer._fsdp_param_groups)
+            for layer in model.layers
+        ]
+        assert pending == [
+            effective_depth > 0 and 0 < index <= effective_depth
+            for index in range(4)
+        ]
+        model.layers[0].reshard()
+
+        if effective_depth == 0:
+            # The generic prefetch path fully unshards the immediate next module.
+            model.layers[1].reshard()
+            return
+
+        # Advancing to layer 1 refills exactly one newly exposed window slot.
+        model.layers[1].unshard(async_op=True)
+        assert any(
+            param_group.state.pending_weights
+            for param_group in model.layers[effective_depth + 1]._fsdp_param_groups
+        )
+        model.layers[1].reshard()
+
+    def test_parameter_group_batches_module_unshard(self, monkeypatch):
+        """One module unshard batches all compatible V2 parameter groups."""
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import DataParallelBuffer
+
+        model = MultimodalModel(hidden=16).to(_device())
+        for param in model.vision_encoder.parameters():
+            param.requires_grad = False
+        fully_shard(
+            model,
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+        )
+        assert len(model._fsdp_param_groups) == 2
+
+        calls = []
+        redistribute_buffers = DataParallelBuffer.redistribute_buffers
+
+        def capture_redistribute_buffers(buffers, target_placements, **kwargs):
+            calls.append(tuple(buffers))
+            return redistribute_buffers(buffers, target_placements, **kwargs)
+
+        monkeypatch.setattr(
+            DataParallelBuffer,
+            "redistribute_buffers",
+            capture_redistribute_buffers,
+        )
+        try:
+            model.unshard()
+            assert len(calls) == 1
+            assert len(calls[0]) == 2
+        finally:
+            model.reshard()
+
+    @pytest.mark.parametrize("sharding_strategy", ["no_shard", "optim_grads_params"])
+    @pytest.mark.parametrize("use_decoupled_grad", [False, True])
+    def test_parameter_group_full_iteration_gradients_are_stable(
+        self, sharding_strategy, use_decoupled_grad
+    ):
+        """Full-iteration mode preserves graph-visible gradient objects and storage."""
+        torch.manual_seed(42)
+        model = SimpleMLP(16).to(_device())
+        fully_shard(
+            model,
+            sharding_strategy=sharding_strategy,
+            mp_policy=MixedPrecisionPolicy(
+                main_params_dtype=torch.float32,
+                main_grads_dtype=torch.float32,
+                use_decoupled_grad=use_decoupled_grad,
+            ),
+            enable_unshard_prefetch=True,
+            enable_async_reduce_grad=True,
+            enable_full_iteration_cuda_graph=True,
+        )
+
+        def backward():
+            model.set_is_last_backward(True)
+            _forward_backward(model, torch.randn(2, 16, device=_device()))
+            model.finish_grad_sync()
+
+        backward()
+        gradient_state = []
+        for param_group in model._fsdp_param_groups:
+            assert param_group.state.grad_phase is GradientPhase.READY
+            assert param_group.grad_buffer.data is not None
+            gradient_state.append(
+                (
+                    param_group,
+                    param_group.grad_buffer.data.data_ptr(),
+                    tuple(param_group.optimizer_grads),
+                )
+            )
+
+        model.zero_grad(set_to_none=True)
+        for param_group, data_ptr, optimizer_grads in gradient_state:
+            assert param_group.state.grad_phase is GradientPhase.EMPTY
+            assert param_group.grad_buffer.data.data_ptr() == data_ptr
+            assert all(
+                current is previous
+                for current, previous in zip(param_group.optimizer_grads, optimizer_grads)
+            )
+            assert torch.count_nonzero(param_group.grad_buffer.data) == 0
+            for optimizer_param, optimizer_grad in zip(
+                param_group.optimizer_params, optimizer_grads
+            ):
+                if optimizer_grad is None:
+                    continue
+                installed_grad = (
+                    optimizer_param.decoupled_grad if use_decoupled_grad else optimizer_param.grad
+                )
+                assert installed_grad is optimizer_grad
+                assert optimizer_param._mfsdp_keep_grad_for_cuda_graph
+
+        backward()
+        for param_group, data_ptr, optimizer_grads in gradient_state:
+            assert param_group.state.grad_phase is GradientPhase.READY
+            assert param_group.grad_buffer.data.data_ptr() == data_ptr
+            assert all(
+                current is previous
+                for current, previous in zip(param_group.optimizer_grads, optimizer_grads)
+            )
+
+    @pytest.mark.parametrize("outer_dp_sharding_strategy", ["no_shard", "optim"])
+    def test_parameter_group_full_iteration_hsdp(self, outer_dp_sharding_strategy):
+        """Full-iteration gradient identity is stable for both HSDP final layouts."""
+        model = SimpleMLP(16).to(_device())
+        fully_shard(
+            model,
+            mesh=_build_hsdp_mesh(),
+            sharding_strategy="optim_grads_params",
+            outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+            enable_unshard_prefetch=True,
+            enable_async_reduce_grad=True,
+            enable_full_iteration_cuda_graph=True,
+        )
+
+        model.set_is_last_backward(True)
+        _forward_backward(model, torch.randn(2, 16, device=_device()))
+        model.finish_grad_sync()
+        gradient_state = [
+            (param_group.grad_buffer.data.data_ptr(), tuple(param_group.optimizer_grads))
+            for param_group in model._fsdp_param_groups
+        ]
+
+        model.zero_grad(set_to_none=True)
+        for param_group, (data_ptr, optimizer_grads) in zip(
+            model._fsdp_param_groups, gradient_state
+        ):
+            assert param_group.grad_buffer.data.data_ptr() == data_ptr
+            assert all(
+                current is previous
+                for current, previous in zip(param_group.optimizer_grads, optimizer_grads)
+            )
+            assert torch.count_nonzero(param_group.grad_buffer.data) == 0
+
+    def test_parameter_group_full_iteration_capture_and_replay(self):
+        """The production full-iteration wrapper captures and replays V2 FSDP."""
+        if _world_size() < 2:
+            pytest.skip("Full-iteration FSDP capture requires at least two ranks")
+
+        from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
+
+        FullCudaGraphWrapper.curr_iteration = {"training": 0, "validation": 0}
+        FullCudaGraphWrapper.cuda_graph = {"training": None, "validation": None}
+        FullCudaGraphWrapper.result = {"training": None, "validation": None}
+        StaticBufferLoader.static_buffers = {"training": [], "validation": []}
+
+        torch.manual_seed(42)
+        model = SimpleMLP(4, bias=False).to(_device())
+        fully_shard(
+            model,
+            sharding_strategy="optim_grads_params",
+            enable_unshard_prefetch=True,
+            enable_async_reduce_grad=True,
+            enable_full_iteration_cuda_graph=True,
+        )
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
+
+        def forward_backward_func(*, model, data_iterator, **_):
+            batch = next(data_iterator[0])
+            output = model[0](batch["input"])
+            loss = output.float().square().mean()
+            loss.backward()
+            return loss.detach()
+
+        wrapper = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=1)
+        losses = []
+        try:
+            for _ in range(4):
+                model.zero_grad(set_to_none=True)
+                loss = wrapper(
+                    model=[model],
+                    data_iterator=[iter([{"input": torch.ones(2, 4, device=_device())}])],
+                    num_microbatches=1,
+                    seq_length=None,
+                    forward_only=False,
+                )
+                model.finish_grad_sync()
+                optimizer.step()
+                losses.append(loss.clone())
+
+            assert FullCudaGraphWrapper.cuda_graph["training"] is not None
+            loss_values = torch.stack(losses).cpu()
+            assert torch.isfinite(loss_values).all()
+            assert loss_values[-1] < loss_values[0]
+        finally:
+            torch.cuda.synchronize()
+            wrapper.reset_cuda_graph()
+            StaticBufferLoader.static_buffers = {"training": [], "validation": []}
+
     def test_no_shard_forward_backward_finish_grad_sync(self):
         """no_shard keeps full replicated buffers and all-reduces at grad sync."""
         torch.manual_seed(42)
@@ -299,11 +757,9 @@ class TestFullyShardBasic:
         model.finish_grad_sync()
 
         for param_group in model._fsdp_param_groups:
-            assert param_group.model_weight_buffer is not None
-            assert not param_group.model_weight_buffer.inner_sharded
-            assert param_group.main_grad_buffer is not None
-            assert not param_group.main_grad_buffer.inner_sharded
-            for dist_grad in param_group.dist_grads:
+            assert param_group.weight_buffer.placements == [Placement.REPLICATE]
+            assert param_group.grad_buffer.placements == [Placement.REPLICATE]
+            for dist_grad in param_group.optimizer_grads:
                 if dist_grad is None:
                     continue
                 local_grad = dist_grad._local_tensor
@@ -311,117 +767,6 @@ class TestFullyShardBasic:
                 torch.distributed.all_gather(gathered, local_grad)
                 for replica in gathered:
                     torch.testing.assert_close(replica, local_grad)
-
-    @pytest.mark.parametrize(
-        "sharding_strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"]
-    )
-    @pytest.mark.parametrize(
-        ("model_dtype", "main_grad_dtype"),
-        [
-            pytest.param(torch.float32, None, id="fp32"),
-            pytest.param(torch.bfloat16, torch.float32, id="bf16-param-fp32-grad"),
-        ],
-    )
-    def test_cuda_graph_accumulates_microbatches(
-        self, sharding_strategy, model_dtype, main_grad_dtype
-    ):
-        """Accumulate one eager and one replayed M-FSDP microbatch.
-
-        :param sharding_strategy: M-FSDP gradient sharding strategy.
-        :type sharding_strategy: str
-        :param model_dtype: Compute parameter dtype.
-        :type model_dtype: torch.dtype
-        :param main_grad_dtype: Optimizer gradient dtype.
-        :type main_grad_dtype: Optional[torch.dtype]
-        """
-        if sharding_strategy == "optim":
-            pytest.skip("ZeRO-1 CUDA graph microbatch accumulation is not supported yet")
-
-        model = SimpleMLP(4, bias=True).to(_device(), dtype=model_dtype)
-        fully_shard(
-            model,
-            sharding_strategy=sharding_strategy,
-            mp_policy=MixedPrecisionPolicy(
-                main_params_dtype=main_grad_dtype, main_grads_dtype=main_grad_dtype
-            ),
-            enable_unshard_prefetch=False,
-            enable_async_reduce_grad=False,
-            enable_cuda_graph=True,
-        )
-
-        values = [2.0, 3.0]
-        for i, value in enumerate(values):
-            sample = torch.full(
-                (2, 4), value, device=_device(), dtype=model_dtype, requires_grad=True
-            )
-            if i == len(values) - 1:
-                model.set_is_last_backward(True)
-            model(sample).sum().backward()
-            for _, param_group in model._named_param_groups:
-                expect_full_grad = sharding_strategy == "no_shard" or (
-                    sharding_strategy == "optim" and i < len(values) - 1
-                )
-                assert param_group._full_grad_buffer_has_accumulated_grad == expect_full_grad
-                expect_reduced_grad = (
-                    sharding_strategy in ("optim_grads", "optim_grads_params")
-                    or i == len(values) - 1
-                )
-                assert param_group._reduced_grad_buffer_has_accumulated_grad == expect_reduced_grad
-        model.finish_grad_sync()
-
-        for param_names, param_group in model._named_param_groups:
-            for name, dist_grad in zip(param_names, param_group.dist_grads):
-                if dist_grad is None:
-                    continue
-                local_expected = 10.0 if name.endswith("weight") else 4.0
-                expected = local_expected * _world_size()
-                torch.testing.assert_close(
-                    dist_grad.to_local(), torch.full_like(dist_grad.to_local(), expected)
-                )
-
-        model.zero_grad()
-        for _, param_group in model._named_param_groups:
-            assert not param_group._full_grad_buffer_has_accumulated_grad
-            assert not param_group._reduced_grad_buffer_has_accumulated_grad
-
-    @pytest.mark.skip(reason="ZeRO-1 CUDA graph microbatch accumulation is not supported yet")
-    def test_cuda_graph_accumulates_with_empty_optim_shard(self):
-        """Preserve ZeRO-1 accumulation on ranks that own only padding."""
-        if _world_size() < 2:
-            pytest.skip("Empty optimizer-shard coverage requires at least two ranks")
-
-        model = SimpleMLP(1, bias=False).to(_device())
-        fully_shard(
-            model,
-            sharding_strategy="optim",
-            enable_unshard_prefetch=False,
-            enable_async_reduce_grad=False,
-            enable_cuda_graph=True,
-        )
-
-        values = [2.0, 3.0]
-        for i, value in enumerate(values):
-            sample = torch.full((2, 1), value, device=_device(), requires_grad=True)
-            if i == len(values) - 1:
-                model.set_is_last_backward(True)
-            model(sample).sum().backward()
-        model.finish_grad_sync()
-
-        expected = 10.0 * _world_size()
-        for _, param_group in model._named_param_groups:
-            assert not param_group._full_grad_buffer_has_accumulated_grad
-            assert param_group._reduced_grad_buffer_has_accumulated_grad
-            for dist_grad in param_group.dist_grads:
-                if dist_grad is not None:
-                    torch.testing.assert_close(
-                        dist_grad.to_local(), torch.full_like(dist_grad.to_local(), expected)
-                    )
-
-        model.zero_grad()
-        for _, param_group in model._named_param_groups:
-            assert not param_group._full_grad_buffer_has_accumulated_grad
-            assert not param_group._reduced_grad_buffer_has_accumulated_grad
-            assert param_group.main_grad_buffer.data is None
 
     @pytest.mark.parametrize(
         "enable_unshard_prefetch,enable_async_reduce_grad",
@@ -444,103 +789,83 @@ class TestFullyShardBasic:
 
     def test_unshard_coalescing_keeps_mixed_dtypes_separate(self, monkeypatch):
         """Coalesced all-gathers should not group buffers with different dtypes."""
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import (
-            fsdp_module as fsdp_module_mod,
-        )
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import dp_buffer as dp_buffer_mod
 
         torch.manual_seed(42)
         model = MixedDtypeBuffers(16).to(_device())
         fully_shard(model, enable_unshard_prefetch=True, enable_async_reduce_grad=False)
 
-        captured_run_dtypes = []
-        original_unshard_weight_buffers = fsdp_module_mod._unshard_weight_buffers
+        collective_dtypes = []
+        coalesced_dtype_runs = []
+        active_dtype_runs = []
+        original_all_gather = torch.distributed.all_gather_into_tensor
+        original_coalescing_manager = dp_buffer_mod._coalescing_manager
+        original_redistribute = dp_buffer_mod.DataParallelBuffer.redistribute
 
-        def capture_unshard(
-            outer_dp_group, inner_dp_group, weight_buffers, *, async_op, stream, caller_stream
-        ):
-            captured_run_dtypes.append(
-                tuple(weight_buffer.dtype for weight_buffer in weight_buffers)
-            )
-            return original_unshard_weight_buffers(
-                outer_dp_group,
-                inner_dp_group,
-                weight_buffers,
-                async_op=async_op,
-                stream=stream,
-                caller_stream=caller_stream,
-            )
+        @contextmanager
+        def capture_coalescing_manager(group, *args, **kwargs):
+            dtype_run = []
+            with original_coalescing_manager(group, *args, **kwargs) as event:
+                active_dtype_runs.append(dtype_run)
+                try:
+                    yield event
+                finally:
+                    active_dtype_runs.pop()
+                    coalesced_dtype_runs.append(tuple(dtype_run))
 
-        monkeypatch.setattr(fsdp_module_mod, "_unshard_weight_buffers", capture_unshard)
+        def capture_redistribute(buffer, *args, **kwargs):
+            if active_dtype_runs:
+                active_dtype_runs[-1].append(buffer.dtype)
+            return original_redistribute(buffer, *args, **kwargs)
+
+        def capture_all_gather(output_tensor, input_tensor, *args, **kwargs):
+            collective_dtypes.append(input_tensor.dtype)
+            return original_all_gather(output_tensor, input_tensor, *args, **kwargs)
+
+        monkeypatch.setattr(dp_buffer_mod, "_coalescing_manager", capture_coalescing_manager)
+        monkeypatch.setattr(dp_buffer_mod.DataParallelBuffer, "redistribute", capture_redistribute)
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", capture_all_gather)
 
         try:
             model.unshard(async_op=True)
-            assert captured_run_dtypes
-            assert {dtype for run_dtypes in captured_run_dtypes for dtype in run_dtypes} == {
-                torch.float32,
-                torch.uint8,
-            }
-            assert len(captured_run_dtypes) >= 2
-            for run_dtypes in captured_run_dtypes:
-                assert len(set(run_dtypes)) == 1, (
-                    "Unshard coalescing must keep mixed dtype buffers in separate runs, "
-                    f"got {run_dtypes}"
-                )
+            assert set(collective_dtypes) == {torch.float32, torch.bfloat16}
+            assert all(len(set(dtype_run)) == 1 for dtype_run in coalesced_dtype_runs)
         finally:
             model.reshard()
 
-    def test_prefetch_defers_post_unshard_to_caller_stream(self, monkeypatch):
-        """Prefetch should allocate now but run post-processing when consumed."""
+    def test_module_unshard_delegates_weight_ownership_to_param_group(self, monkeypatch):
+        """The module should schedule unshard without selecting or binding weight buffers."""
         torch.manual_seed(42)
-        model = TinyLLM(vocab=32, hidden=16, num_layers=1).to(_device())
-        layer = model.layers[0]
-        fully_shard(layer, enable_unshard_prefetch=True, enable_async_reduce_grad=False)
+        model = SimpleMLP(16).to(_device())
         fully_shard(model, enable_unshard_prefetch=True, enable_async_reduce_grad=False)
 
-        ctx = model._fsdp_root_context
-        caller_stream = torch.cuda.current_stream()
-        allocation_streams = []
-        post_streams = []
+        delegated_groups = []
+        original_unshard = ParameterGroup.unshard_weights
 
-        allocator = ctx.bucket_allocator
-        original_allocate = allocator.allocate
+        def capture_unshard(param_groups, **kwargs):
+            delegated_groups.append((tuple(param_groups), kwargs.copy()))
+            return original_unshard(param_groups, **kwargs)
 
-        def capture_allocate(*args, **kwargs):
-            allocation_streams.append(torch.cuda.current_stream())
-            return original_allocate(*args, **kwargs)
-
-        monkeypatch.setattr(allocator, "allocate", capture_allocate)
-        for param_group in layer._fsdp_param_groups:
-            original_post_unshard = param_group.post_unshard
-
-            def capture_post_unshard(bwd_pass=False, *, _original=original_post_unshard):
-                post_streams.append(torch.cuda.current_stream())
-                return _original(bwd_pass=bwd_pass)
-
-            monkeypatch.setattr(param_group, "post_unshard", capture_post_unshard)
+        monkeypatch.setattr(ParameterGroup, "unshard_weights", staticmethod(capture_unshard))
 
         try:
-            model.unshard(async_op=True)
-            assert False in ctx.unshard_pending_post[id(layer)]
-            assert not post_streams, "Prefetch must not run post-unshard processing"
-            assert allocation_streams
-            assert all(stream == caller_stream for stream in allocation_streams)
-
-            model.reshard()
-            layer.unshard(async_op=True)
-
-            assert False not in ctx.unshard_pending_post[id(layer)]
-            assert post_streams
-            assert all(stream == caller_stream for stream in post_streams)
+            model.unshard(async_op=False)
+            assert delegated_groups == [
+                (
+                    tuple(model._fsdp_param_groups),
+                    {
+                        "streams": (torch.cuda.current_stream(),),
+                        "async_op": False,
+                    },
+                )
+            ]
         finally:
             model.reshard()
-            layer.reshard()
 
     @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
     def test_weight_unshard_coalesces_outer_before_inner(self, monkeypatch, outer_strategy):
         """Outer runs should finish before inner AGs; no_shard outer is a no-op."""
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import (
-            fsdp_module as fsdp_module_mod,
-        )
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import dp_buffer as dp_buffer_mod
         from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import DataParallelBuffer
 
         torch.manual_seed(42)
@@ -556,30 +881,26 @@ class TestFullyShardBasic:
         )
 
         original_redistribute = DataParallelBuffer.redistribute
-        original_coalescing_manager = fsdp_module_mod._coalescing_manager
+        original_coalescing_manager = dp_buffer_mod._coalescing_manager
         original_all_gather = torch.distributed.all_gather_into_tensor
         manager_groups = []
         active_manager_groups = []
         unshard_calls = []
         collective_groups = []
-        weight_buffers = []
+        if outer_strategy == "optim":
+            for param_group in model._fsdp_param_groups:
+                param_group.refresh_model_weight()
 
-        for param_group in model._fsdp_param_groups:
-            weight_buffers.extend(param_group.weight_buffers_for_unshard())
-
-        assert len(weight_buffers) == 2
-        first_buffer, second_buffer = weight_buffers
-        assert first_buffer.outer_dp_group is second_buffer.outer_dp_group
-        assert first_buffer.inner_dp_group is second_buffer.inner_dp_group
+        owned_weight_buffers = [
+            param_group.weight_buffer for param_group in model._fsdp_param_groups
+        ]
+        assert len(owned_weight_buffers) == 2
+        first_buffer, second_buffer = owned_weight_buffers
+        assert first_buffer.mesh is second_buffer.mesh
         assert first_buffer.dtype == second_buffer.dtype
         assert first_buffer.device == second_buffer.device
-        outer_dp_group = first_buffer.outer_dp_group
-        inner_dp_group = first_buffer.inner_dp_group
-
-        if outer_strategy == "optim":
-            for weight_buffer in weight_buffers:
-                # Force the post-optimizer/checkpoint state so dim 0 launches AG.
-                weight_buffer.placements[0] = Placement.DIRTY
+        outer_dp_group = first_buffer.mesh.get_group(mesh_dim=0)
+        inner_dp_group = first_buffer.mesh.get_group(mesh_dim=1)
 
         @contextmanager
         def capture_coalescing_manager(group, *args, **kwargs):
@@ -594,7 +915,7 @@ class TestFullyShardBasic:
         def capture_redistribute(buffer, *args, **kwargs):
             active_group = active_manager_groups[-1] if active_manager_groups else None
             comm_dim = 0 if active_group is outer_dp_group else 1
-            unshard_calls.append((id(buffer), comm_dim, active_group))
+            unshard_calls.append((id(buffer.buffer_index), comm_dim, active_group))
             return original_redistribute(buffer, *args, **kwargs)
 
         def capture_all_gather(*args, **kwargs):
@@ -602,22 +923,33 @@ class TestFullyShardBasic:
             return original_all_gather(*args, **kwargs)
 
         monkeypatch.setattr(DataParallelBuffer, "redistribute", capture_redistribute)
-        monkeypatch.setattr(fsdp_module_mod, "_coalescing_manager", capture_coalescing_manager)
+        monkeypatch.setattr(dp_buffer_mod, "_coalescing_manager", capture_coalescing_manager)
         monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", capture_all_gather)
 
         try:
             model.unshard(async_op=True)
-            assert len(manager_groups) == 2
+            expected_manager_groups = (
+                [outer_dp_group, inner_dp_group] if outer_strategy == "optim" else [inner_dp_group]
+            )
+            assert len(manager_groups) == len(expected_manager_groups)
             assert all(
                 actual is expected
-                for actual, expected in zip(manager_groups, [outer_dp_group, inner_dp_group])
+                for actual, expected in zip(manager_groups, expected_manager_groups)
             )
-            expected_unshard_calls = [
-                (id(first_buffer), 0, outer_dp_group),
-                (id(second_buffer), 0, outer_dp_group),
-                (id(first_buffer), 1, inner_dp_group),
-                (id(second_buffer), 1, inner_dp_group),
-            ]
+            expected_unshard_calls = []
+            if outer_strategy == "optim":
+                expected_unshard_calls.extend(
+                    [
+                        (id(first_buffer.buffer_index), 0, outer_dp_group),
+                        (id(second_buffer.buffer_index), 0, outer_dp_group),
+                    ]
+                )
+            expected_unshard_calls.extend(
+                [
+                    (id(first_buffer.buffer_index), 1, inner_dp_group),
+                    (id(second_buffer.buffer_index), 1, inner_dp_group),
+                ]
+            )
             assert len(unshard_calls) == len(expected_unshard_calls)
             assert all(
                 actual_buffer == expected_buffer
@@ -638,7 +970,10 @@ class TestFullyShardBasic:
                 actual is expected
                 for actual, expected in zip(collective_groups, expected_collective_groups)
             )
-            assert all(weight_buffer.is_unsharded() for weight_buffer in weight_buffers)
+            assert all(
+                param_group.weights_are_unsharded()
+                for param_group in model._fsdp_param_groups
+            )
         finally:
             model.reshard()
 
@@ -656,14 +991,18 @@ class TestFullyShardBasic:
         )
 
         param_group = model._fsdp_param_groups[0]
-        model_buffer = param_group.model_weight_buffer
-        assert param_group.main_weight_buffer is None
-        assert model_buffer.storage_placements == [Placement.REPLICATE, Placement.FLAT]
-        assert model_buffer.placements == model_buffer.storage_placements
+        model_buffer = param_group.weight_buffer
+        main_buffer = param_group.main_weight_buffer
+        assert model_buffer.placements == [Placement.REPLICATE, Placement.SHARD]
+        assert main_buffer.placements == [Placement.SHARD, Placement.SHARD]
+        assert (
+            main_buffer.data.untyped_storage().data_ptr()
+            == model_buffer.data.untyped_storage().data_ptr()
+        )
         from torch.distributed.tensor.placement_types import Shard
 
         assert all(
-            isinstance(placement, Shard) for placement in param_group.dist_params[0].placements
+            isinstance(placement, Shard) for placement in param_group.optimizer_params[0].placements
         )
 
         optimizer = torch.optim.SGD(model.parameters(), lr=0.25)
@@ -676,7 +1015,11 @@ class TestFullyShardBasic:
         model.set_is_last_backward(True)
         model(x).float().sum().backward()
         model.finish_grad_sync()
-        assert param_group.main_grad_buffer.placements == [Placement.DIRTY, Placement.FLAT]
+        assert param_group.grad_buffer.placements == [Placement.REPLICATE, Placement.SHARD]
+        optimizer_grad_view = param_group.grad_buffer.view([Placement.SHARD, Placement.SHARD])
+        assert optimizer_grad_view.data.numel() * _world_size() == (
+            param_group.grad_buffer.buffer_index.bucket_meta.size
+        )
 
         ctx = model._fsdp_root_context
         assert ctx.model_weight_refresh_pending
@@ -684,20 +1027,23 @@ class TestFullyShardBasic:
         optimizer.step()
         # No optimizer integration performed an explicit model-weight copy.
         assert ctx.model_weight_refresh_pending
-        assert model_buffer.placements == model_buffer.storage_placements
+        assert model_buffer.placements == [Placement.REPLICATE, Placement.SHARD]
 
-        # The normal pre-forward hook marks the direct model-weight storage
-        # dirty before unshard, which refreshes the outer replicas exactly once.
+        # The normal pre-forward hook selects the direct model-weight SHARD view
+        # before unshard, which refreshes the outer replicas exactly once.
         model(torch.zeros_like(x))
         assert not ctx.model_weight_refresh_pending
-        assert model_buffer.placements == model_buffer.storage_placements
+        assert param_group.state.weight_valid == tuple(model_buffer.placements)
+        assert param_group.get_unsharded_weight_buffer() is None
 
         outer_replicas = [
             torch.empty_like(model_buffer.data)
-            for _ in range(torch.distributed.get_world_size(model_buffer.outer_dp_group))
+            for _ in range(
+                torch.distributed.get_world_size(model_buffer.mesh.get_group(mesh_dim=0))
+            )
         ]
         torch.distributed.all_gather(
-            outer_replicas, model_buffer.data, group=model_buffer.outer_dp_group
+            outer_replicas, model_buffer.data, group=model_buffer.mesh.get_group(mesh_dim=0)
         )
         assert all(torch.equal(replica, outer_replicas[0]) for replica in outer_replicas[1:])
 
@@ -725,19 +1071,18 @@ class TestFullyShardBasic:
 
         ctx.unshard_done_events[id(layer)] = CompletedEvent()
         for param_group in layer._fsdp_param_groups:
-            original_reshard = param_group.reshard
+            original_reshard = param_group.reshard_weight
 
             def capture_reshard(*, _original=original_reshard):
                 order.append("reshard")
                 return _original()
 
-            monkeypatch.setattr(param_group, "reshard", capture_reshard)
+            monkeypatch.setattr(param_group, "reshard_weight", capture_reshard)
 
         try:
             layer.reshard()
             assert order
             assert order[0] == "wait"
-            assert False not in ctx.unshard_pending_post[id(layer)]
             assert ctx.unshard_done_events[id(layer)] is None
         finally:
             model.reshard()
@@ -931,15 +1276,14 @@ class TestMixedPrecision:
         model = SimpleMLP(64).to(_device()).bfloat16()
         fully_shard(model, mp_policy=mp_policy)
 
-        # Verify main_weight_buffer exists and is fp32
+        # Verify the separate main-weight storage is fp32.
         for param_group in model._fsdp_param_groups:
-            if param_group.main_weight_buffer is not None:
-                assert (
-                    param_group.main_weight_buffer.dtype == torch.float32
-                ), f"Expected fp32 main weight buffer, got {param_group.main_weight_buffer.dtype}"
+            assert (
+                param_group.main_weight_buffer.dtype == torch.float32
+            ), f"Expected fp32 main weight buffer, got {param_group.main_weight_buffer.dtype}"
 
     def test_main_params_none(self):
-        """With no main_params_dtype, no main_weight_buffer should be created."""
+        """Without a main dtype, optimizer weights alias model-weight storage."""
         torch.manual_seed(42)
         mp_policy = MixedPrecisionPolicy(main_params_dtype=None)
         model = SimpleMLP(64).to(_device())
@@ -947,8 +1291,9 @@ class TestMixedPrecision:
 
         for param_group in model._fsdp_param_groups:
             assert (
-                param_group.main_weight_buffer is None
-            ), "main_weight_buffer should be None when main_params_dtype is None"
+                param_group.main_weight_buffer.data.untyped_storage().data_ptr()
+                == param_group.weight_buffer.data.untyped_storage().data_ptr()
+            )
 
     def test_fp32_grad_reduce(self):
         """grad_reduce_in_fp32=True should use fp32 gradient communication."""
@@ -1006,6 +1351,139 @@ class TestIgnoredParams:
 
 
 class TestLifecycle:
+    @pytest.mark.parametrize("sharding_strategy", ["no_shard", "optim_grads_params"])
+    def test_cpu_offload_rebinds_persistent_parameter_group_views(self, sharding_strategy):
+        """CPU offload and automatic reload preserve optimizer DTensor identities."""
+        model = fully_shard(
+            SimpleMLP(16).to(_device(), dtype=torch.bfloat16),
+            mp_policy=MixedPrecisionPolicy(
+                main_params_dtype=torch.float32,
+                main_grads_dtype=torch.float32,
+            ),
+            sharding_strategy=sharding_strategy,
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+        )
+        model.set_is_last_backward(True)
+        model(
+            torch.randn(2, 16, device=_device(), dtype=torch.bfloat16)
+        ).float().square().mean().backward()
+        model.finish_grad_sync()
+
+        optimizer_ids = [
+            id(optimizer_param)
+            for param_group in model._fsdp_param_groups
+            for optimizer_param in param_group.optimizer_params
+        ]
+        result = model.offload_to_cpu(pin_memory=True)
+        assert result["offloaded_bytes"] > 0
+        for param_group in model._fsdp_param_groups:
+            assert all(
+                buffer.data is None or buffer.data.device.type == "cpu"
+                for buffer in (
+                    param_group.weight_buffer,
+                    param_group.main_weight_buffer,
+                    param_group.grad_buffer,
+                )
+            )
+            assert all(
+                optimizer_param._local_tensor.device.type == "cpu"
+                for optimizer_param in param_group.optimizer_params
+            )
+            if param_group.accumulates_full_grad:
+                assert param_group.state.full_grad is not None
+                assert param_group.state.full_grad.data.device.type == "cpu"
+                assert (
+                    param_group.state.full_grad.data.data_ptr()
+                    == param_group.grad_buffer.data.data_ptr()
+                )
+
+        model.unshard()
+        assert optimizer_ids == [
+            id(optimizer_param)
+            for param_group in model._fsdp_param_groups
+            for optimizer_param in param_group.optimizer_params
+        ]
+        for param_group in model._fsdp_param_groups:
+            assert all(
+                buffer.data is None or buffer.data.device.type == "cuda"
+                for buffer in (
+                    param_group.weight_buffer,
+                    param_group.main_weight_buffer,
+                    param_group.grad_buffer,
+                )
+            )
+            if param_group.accumulates_full_grad:
+                assert param_group.state.full_grad is not None
+                assert param_group.state.full_grad.data.device.type == "cuda"
+                assert (
+                    param_group.state.full_grad.data.data_ptr()
+                    == param_group.grad_buffer.data.data_ptr()
+                )
+            assert all(
+                optimizer_param._local_tensor.device.type == "cuda"
+                for optimizer_param in param_group.optimizer_params
+            )
+        model.reshard()
+
+    def test_external_backward_callbacks_finalize_parameter_group_gradients(self):
+        """Delayed-wgrad callers may explicitly finalize gradients after backward."""
+        model = fully_shard(
+            SimpleMLP(16).to(_device()),
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+            skip_backward_callback=True,
+            skip_final_backward_callback=True,
+        )
+        model.set_is_last_backward(True)
+
+        model(torch.randn(2, 16, device=_device())).float().square().mean().backward()
+        for param_group in model._fsdp_param_groups:
+            assert param_group.state.grad_phase is GradientPhase.EMPTY
+
+        mfsdp_post_backward_hook(model)
+        mfsdp_post_backward_final_callback(model)
+
+        for param_group in model._fsdp_param_groups:
+            assert param_group.state.grad_phase is GradientPhase.READY
+            assert all(
+                optimizer_grad is not None
+                for optimizer_param, optimizer_grad in zip(
+                    param_group.optimizer_params, param_group.optimizer_grads
+                )
+                if optimizer_param.requires_grad
+            )
+
+    def test_trace_pool_plans_and_reuses_parameter_group_scratch(self):
+        """TracePoolAllocator plans the new parameter-group scratch lifecycle."""
+        torch.manual_seed(42)
+        model = fully_shard(
+            SimpleMLP(16).to(_device()),
+            enable_trace_pool=True,
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+        )
+        allocator = model._fsdp_root_context.bucket_allocator
+        assert isinstance(allocator, TracePoolAllocator)
+        assert allocator.phase == "trace"
+
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        scratch_addresses = None
+        for _ in range(2):
+            model(torch.randn(2, 16, device=_device())).float().square().mean().backward()
+            model.finish_grad_sync()
+            optimizer.step()
+            model.zero_grad(set_to_none=True)
+
+            assert allocator.phase == "optimized"
+            current_addresses = {
+                key: view.data_ptr() for key, view in allocator._key_to_view.items()
+            }
+            if scratch_addresses is None:
+                scratch_addresses = current_addresses
+            else:
+                assert current_addresses == scratch_addresses
+
     def test_root_grad_release_skips_full_iteration_cuda_graph(self, monkeypatch):
         """Full-iteration graphs own stable grad storage and zeroing."""
         torch.manual_seed(42)
@@ -1024,7 +1502,7 @@ class TestLifecycle:
         assert zero_grad_calls == []
 
     def test_root_grad_release_keeps_live_accumulation(self):
-        """A live optimizer-facing grad prevents a root-wide storage release."""
+        """A live optimizer-facing grad prevents its storage release."""
         torch.manual_seed(42)
         model = SimpleMLP(16).to(_device())
         # Keep an optimizer-facing gradient on every rank so the test's
@@ -1034,16 +1512,45 @@ class TestLifecycle:
         model(torch.randn(2, 16, device=_device())).float().square().mean().backward()
         model.finish_grad_sync()
         param_group = model._fsdp_param_groups[0]
-        assert param_group.main_grad_buffer.data is not None
+        assert param_group.grad_buffer.data is not None
         assert any(
             getattr(dist_param, "grad", None) is not None
             or getattr(dist_param, "decoupled_grad", None) is not None
-            for dist_param in param_group.dist_params
+            for dist_param in param_group.optimizer_params
         )
 
         model._release_grad_storage_if_unused()
 
-        assert param_group.main_grad_buffer.data is not None
+        assert param_group.grad_buffer.data is not None
+
+    def test_root_forward_releases_unused_grad_storage_per_group(self):
+        """The root sweep releases eligible groups without a global liveness check."""
+        torch.manual_seed(42)
+        model = TinyLLM(vocab=32, hidden=16, num_layers=2).to(_device())
+        for index, layer in enumerate(model.layers):
+            model.layers[index] = fully_shard(layer, sharding_strategy="no_shard")
+        model = fully_shard(model, sharding_strategy="no_shard")
+        param_groups = [
+            param_group
+            for module in model._get_fsdp_modules(recursive=True)
+            for param_group in module._fsdp_param_groups
+        ]
+        assert len(param_groups) > 1
+        for param_group in param_groups:
+            param_group.prepare_gradient_storage()
+
+        live_group = param_groups[0]
+        live_group._install_optimizer_grads()
+        released_groups = param_groups[1:]
+        assert any(
+            getattr(dist_param, "grad", None) is not None
+            for dist_param in live_group.optimizer_params
+        )
+
+        model(torch.randint(0, 32, (2, 4), device=_device()))
+
+        assert live_group.grad_buffer.data is not None
+        assert all(param_group.grad_buffer.data is None for param_group in released_groups)
 
     def test_root_forward_releases_optimizer_cleared_grad_storage_before_unshard(self, monkeypatch):
         """Plain optimizer zero-grad must not overlap stale grads with next unshard."""
@@ -1068,15 +1575,13 @@ class TestLifecycle:
             for param_group in module._fsdp_param_groups
         ]
         assert any(
-            param_group.main_grad_buffer is not None
-            and param_group.main_grad_buffer.data is not None
-            for param_group in param_groups
+            param_group.grad_buffer.data is not None for param_group in param_groups
         )
         assert all(
             getattr(dist_param, "grad", None) is None
             and getattr(dist_param, "decoupled_grad", None) is None
             for param_group in param_groups
-            for dist_param in param_group.dist_params
+            for dist_param in param_group.optimizer_params
         )
 
         observed_at_root_unshard = []
@@ -1085,8 +1590,7 @@ class TestLifecycle:
         def capture_root_unshard(*args, **kwargs):
             observed_at_root_unshard.append(
                 [
-                    param_group.main_grad_buffer is None
-                    or param_group.main_grad_buffer.data is None
+                    param_group.grad_buffer.data is None
                     for param_group in param_groups
                 ]
             )
@@ -1114,13 +1618,13 @@ class TestLifecycle:
             model.finish_grad_sync()
 
             param_group = model._fsdp_param_groups[0]
-            live_grads = [grad for grad in param_group.dist_grads if grad is not None]
+            live_grads = [grad for grad in param_group.optimizer_grads if grad is not None]
             assert live_grads
             if wrapper_ids is None:
                 wrapper_ids = [id(grad) for grad in live_grads]
             else:
                 assert [id(grad) for grad in live_grads] == wrapper_ids
-            for dist_param, dist_grad in zip(param_group.dist_params, param_group.dist_grads):
+            for dist_param, dist_grad in zip(param_group.optimizer_params, param_group.optimizer_grads):
                 if dist_grad is not None:
                     assert dist_grad._local_tensor.shape == dist_param._local_tensor.shape
 
@@ -1131,7 +1635,7 @@ class TestLifecycle:
             if iteration < 2:
                 # Plain optimizer zero-grad leaves release to the next root
                 # forward. The following iteration exercises detach + rebind.
-                assert param_group.main_grad_buffer.data is not None
+                assert param_group.grad_buffer.data is not None
 
         assert all(torch.isfinite(param._local_tensor).all() for param in model.parameters())
 
@@ -1323,12 +1827,12 @@ class TestActivationCheckpointing:
 
         successor = model.layers[1]
         param_group = successor._fsdp_param_groups[0]
-        model_buffer = param_group.model_weight_buffer
+        model_buffer = param_group.weight_buffer
         main_buffer = param_group.main_weight_buffer
         assert main_buffer is not None
-        expected_storage_placements = [Placement.REPLICATE, Placement.FLAT]
-        assert model_buffer.storage_placements == expected_storage_placements
-        assert main_buffer.storage_placements == expected_storage_placements
+        expected_placements = [Placement.REPLICATE, Placement.SHARD]
+        assert model_buffer.placements == expected_placements
+        assert main_buffer.placements == expected_placements
 
         model.set_is_last_backward(True)
         x = torch.randn(4, 32, device=device, dtype=torch.bfloat16, requires_grad=True)
@@ -1347,14 +1851,15 @@ class TestActivationCheckpointing:
             model_buffer.buffer_index.bucket_meta.size, dtype=model_buffer.dtype, device=device
         )
         torch.distributed.all_gather_into_tensor(
-            expected_full, model_buffer.data, group=model_buffer.inner_dp_group
+            expected_full, model_buffer.data, group=model_buffer.mesh.get_group(mesh_dim=1)
         )
 
         observed_full = []
 
         def capture_successor_full_buffer(_module, _args):
-            assert model_buffer._unsharded_buffer is not None
-            observed_full.append(model_buffer._unsharded_buffer.detach().clone())
+            compute_buffer = param_group.get_unsharded_weight_buffer()
+            assert compute_buffer is not None
+            observed_full.append(compute_buffer.data.detach().clone())
 
         handle = successor.register_forward_pre_hook(capture_successor_full_buffer)
         try:
@@ -1696,6 +2201,10 @@ class TestCheckpoint:
                     main_params_dtype=torch.float32, main_grads_dtype=torch.float32
                 ),
                 enable_async_reduce_grad=False,
+            )
+            assert all(
+                isinstance(param_group, ParameterGroup)
+                for param_group in model._fsdp_param_groups
             )
             return model, torch.optim.AdamW(model.parameters(), lr=1e-3)
 

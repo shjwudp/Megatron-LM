@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import enum
 import math
 from collections import namedtuple
 from typing import Dict, List, Optional, Tuple
@@ -19,16 +20,28 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch.distributed.tensor import DeviceMesh
 
-from .dp_buffer import Placement
 from .utils import ParamGroupIdx
+
+
+class Placement(enum.Enum):
+    """Logical validity of a data-parallel buffer along one mesh dimension.
+
+    Placement is independent of physical allocation shape. A sharded value may
+    use compact storage or a rank-owned view into a replicated allocation.
+    """
+
+    SHARD = "shard"
+    REPLICATE = "replicate"
+    PARTIAL = "partial"
 
 
 class BufferIndex:
     """Describes how params are laid out in a flat buffer, including global layout
     and per-rank shard information.
 
-    The index always builds coordinate metadata for a 2D (outer, inner) mesh.
-    Query APIs accept one placement per mesh dimension. FLAT and DIRTY select the
+    The index builds coordinate metadata for a 1D FSDP mesh or a 2D
+    ``(outer, inner)`` HSDP mesh.
+    Query APIs accept one placement per mesh dimension. SHARD selects the
     rank-owned range; REPLICATE and PARTIAL select the full range.
 
     Each DataParallelBuffer owns its own independent BufferIndex instance.
@@ -47,12 +60,19 @@ class BufferIndex:
         param_group_id: ParamGroupIdx,
         chunk_size_factor: int = 1,
     ):
-        assert mesh.ndim == 2, f"BufferIndex expects a 2D mesh, got {mesh.ndim}D."
+        if mesh.ndim not in (1, 2):
+            raise ValueError(f"BufferIndex expects a 1D or 2D mesh, got {mesh.ndim}D.")
         self.param_group_id = param_group_id
-        dp_rank = int(mesh.get_local_rank(mesh_dim=1))
-        dp_world_size = int(mesh.size(1))
-        outer_dp_rank = int(mesh.get_local_rank(mesh_dim=0))
-        outer_dp_world_size = int(mesh.size(0))
+        self.mesh_ndim = mesh.ndim
+        inner_dim = mesh.ndim - 1
+        dp_rank = int(mesh.get_local_rank(mesh_dim=inner_dim))
+        dp_world_size = int(mesh.size(inner_dim))
+        if mesh.ndim == 2:
+            outer_dp_rank = int(mesh.get_local_rank(mesh_dim=0))
+            outer_dp_world_size = int(mesh.size(0))
+        else:
+            outer_dp_rank = 0
+            outer_dp_world_size = 1
         self.dp_rank = dp_rank
         self.dp_world_size = dp_world_size
         self.outer_dp_rank = outer_dp_rank
@@ -300,41 +320,44 @@ class BufferIndex:
     # ------------------------------------------------------------------ #
 
     def _get_shard_meta(self, placements: list[Placement]):
-        """Return logical metadata, treating FLAT and DIRTY as sharded."""
-        if len(placements) != 2:
-            raise ValueError(f"Expected two placements, got {len(placements)}")
+        """Return logical metadata for the requested placements."""
+        if len(placements) != self.mesh_ndim:
+            raise ValueError(f"Expected {self.mesh_ndim} placements, got {len(placements)}")
         if not all(isinstance(placement, Placement) for placement in placements):
             raise TypeError(f"Unsupported placements: {placements}")
 
-        key = tuple(int(placement in (Placement.FLAT, Placement.DIRTY)) for placement in placements)
+        key = tuple(int(placement is Placement.SHARD) for placement in placements)
+        if self.mesh_ndim == 1:
+            return self.inner_shard_metas[key[0]]
         return self.outer_shard_metas[key]
 
     def local_slice_for(
         self,
         global_range: Tuple[int, int],
         requested_placements: list[Placement],
-        storage_placements: list[Placement],
+        bound_placements: list[Placement],
     ) -> Tuple[Optional[slice], Optional[slice]]:
-        """Clip global_range to requested and storage placements.
+        """Clip ``global_range`` to requested and bound-buffer placements.
 
         The source slice indexes the object described by global_range relative
-        to global_range[0]. The local slice indexes storage physically laid out
-        as storage_placements. Returns (None, None) when the intersection is empty.
+        to global_range[0]. The local slice indexes the tensor bound to a buffer
+        with ``bound_placements``. Returns (None, None) when the intersection is
+        empty.
         """
         global_start, global_end = global_range
         requested_meta = self._get_shard_meta(requested_placements)
-        storage_meta = self._get_shard_meta(storage_placements)
-        start = max(global_start, requested_meta.global_data_index, storage_meta.global_data_index)
+        bound_meta = self._get_shard_meta(bound_placements)
+        start = max(global_start, requested_meta.global_data_index, bound_meta.global_data_index)
         end = min(
             global_end,
             requested_meta.global_data_index + requested_meta.size,
-            storage_meta.global_data_index + storage_meta.size,
+            bound_meta.global_data_index + bound_meta.size,
         )
         if start >= end:
             return None, None
 
         source_slice = slice(start - global_start, end - global_start)
-        local_start = storage_meta.local_data_index + start - storage_meta.global_data_index
+        local_start = bound_meta.local_data_index + start - bound_meta.global_data_index
         local_slice = slice(local_start, local_start + end - start)
         return source_slice, local_slice
 
@@ -351,7 +374,7 @@ class BufferIndex:
         Placements select the valid range on each mesh dimension.
         """
         if placements is None:
-            placements = [Placement.REPLICATE, Placement.FLAT]
+            placements = [Placement.REPLICATE] * (self.mesh_ndim - 1) + [Placement.SHARD]
         idx = self.item_index_map[item_id]
         item_start = idx.global_data_index
         item_end = item_start + idx.size
@@ -377,7 +400,7 @@ class BufferIndex:
         The result is not aware of DataParallelBuffer storage.
         """
         if placements is None:
-            placements = [Placement.REPLICATE, Placement.REPLICATE]
+            placements = [Placement.REPLICATE] * self.mesh_ndim
         idx = self.item_index_map[item_id]
         range_start = idx.global_data_index
         range_end = range_start + idx.size

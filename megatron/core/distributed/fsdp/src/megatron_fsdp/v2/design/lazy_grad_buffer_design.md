@@ -1,11 +1,11 @@
-# Lazy main_grad_buffer management in Megatron FSDP v2
+# Lazy grad_buffer management in Megatron FSDP v2
 
-`main_grad_buffer` is the `DataParallelBuffer` owned by each `ParameterGroup`
+`grad_buffer` is the `DataParallelBuffer` owned by each `ParameterGroup`
 for optimizer-facing gradients.
 
 During backward, Megatron FSDP v2 stages local parameter gradients into this
 buffer, runs the required data-parallel collective, and exposes DTensor views of
-the reduced result through `dist_param.grad` or `dist_param.decoupled_grad`.
+the reduced result through `optimizer_param.grad` or `optimizer_param.decoupled_grad`.
 The optimizer consumes those DTensor gradient views.
 
 Lazy management means the buffer layout is created during FSDP initialization,
@@ -22,28 +22,28 @@ gradients when the parameter group requires gradients:
 ```python
 if self.requires_grad:
     main_grads_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])
-    self.main_grad_buffer = self._create_buffer(main_grads_dtype, "main_grad")
+    self.grad_buffer = self._create_buffer(main_grads_dtype, "main_grad")
 ```
 
 At this point the buffer has layout metadata (`BufferIndex`, shard sizes,
-parameter offsets), but `main_grad_buffer.data` is still `None`. The
-corresponding `dist_grads` entries are placeholders.
+parameter offsets), but `grad_buffer.data` is still `None`. The
+corresponding `optimizer_grads` entries are placeholders.
 
-`ParameterGroup._init_dist_grads()` performs the deferred allocation:
+`ParameterGroup.prepare_gradient_storage()` performs the deferred allocation:
 
 1. return immediately if the group has no grad buffer, does not require grads,
    or the buffer is already allocated;
-2. allocate `main_grad_buffer.data` with `torch.empty(...)`;
+2. allocate `grad_buffer.data` with `torch.empty(...)`;
 3. slice the buffer according to the active sharding layout;
-4. build DTensor gradient views in `dist_grads` on first use, or rebind cached
+4. build DTensor gradient views in `optimizer_grads` on first use, or rebind cached
    wrappers to the new local slices after a prior storage release.
 
 The DTensor views are what the optimizer later sees through
-`dist_param.grad` or `dist_param.decoupled_grad`.
+`optimizer_param.grad` or `optimizer_param.decoupled_grad`.
 
 Reusing wrappers avoids rebuilding the complete Python DTensor object graph on
-every iteration. `ParameterGroup._dist_grad_cache` owns those wrappers while
-storage is absent. During that detached interval, public `dist_grads` entries
+every iteration. `ParameterGroup._optimizer_grads` owns those wrappers while
+storage is absent. During that detached interval, public `optimizer_grads` entries
 remain `None`; a DTensor whose local tensor has been detached is never exposed
 to optimizer or checkpoint code. The uneven-DTensor module centralizes the
 private `_local_tensor` detach/rebind operation, including local-shape recovery
@@ -55,33 +55,34 @@ DTensor field.
 
 | Point in step | Behavior |
 | --- | --- |
-| FSDP initialization | Create `main_grad_buffer` metadata only. `main_grad_buffer.data` is `None`; `dist_grads` contains placeholders. |
-| First post-backward `reduce_grad()` | `_init_dist_grads()` allocates `main_grad_buffer.data` and rebuilds `dist_grads` DTensor views. |
-| Gradient reduction | `param.grad` is staged into `main_grad_buffer`; all-reduce or reduce-scatter writes the optimizer-facing result. |
-| Optimizer step | Optimizer consumes `dist_param.grad` or `dist_param.decoupled_grad`, which are backed by `main_grad_buffer.data`. |
-| `zero_grad(set_to_none=True)` | Clear optimizer-facing gradient references, privately cache and detach reusable DTensor wrappers, reset accumulation flags, and release `main_grad_buffer.data` if nothing still references valid gradients. |
-| `zero_grad(set_to_none=False)` | Keep `main_grad_buffer.data` allocated and zero it in place. |
+| FSDP initialization | Create `grad_buffer` metadata only. `grad_buffer.data` is `None`; `optimizer_grads` contains placeholders. |
+| First backward staging | `prepare_gradient_storage()` allocates `grad_buffer.data`, establishes the direct DDP/ZeRO-1 full-gradient view, and rebuilds `optimizer_grads` DTensor views. |
+| Gradient reduction | DDP and ZeRO-1 stage directly into persistent full-gradient storage; sharded-gradient strategies use full scratch. All-reduce or reduce-scatter writes the optimizer-facing result. |
+| Optimizer step | Optimizer consumes `optimizer_param.grad` or `optimizer_param.decoupled_grad`, which are backed by `grad_buffer.data`. |
+| `zero_grad(set_to_none=True)` | Clear optimizer-facing gradient references, unbind any direct DDP/ZeRO-1 full-gradient view, privately cache and detach reusable DTensor wrappers, reset accumulation state, and release `grad_buffer.data` if nothing still references valid gradients. |
+| `zero_grad(set_to_none=False)` | Keep `grad_buffer.data` and any direct full-gradient view allocated and zero storage in place. |
 
-`_release_grad_storage_if_unused()` is also called from the forward pre-hook.
+`release_grad_storage_if_unused()` is also called from the forward pre-hook.
 That call is idempotent and handles the common case where `zero_grad()` has
 already cleared all optimizer-facing gradient references before the next
 forward.
 
 The normal root forward additionally calls
 `FSDPModule._release_grad_storage_if_unused()` before the first parameter
-unshard. This root-wide sweep supports plain PyTorch optimizers: their
-`zero_grad(set_to_none=True)` clears `dist_param.grad` but does not call the
+unshard. The module method only traverses the root's parameter groups and
+delegates to `ParameterGroup.release_grad_storage_if_unused()`. This root-wide
+sweep supports plain PyTorch optimizers: their
+`zero_grad(set_to_none=True)` clears `optimizer_param.grad` but does not call the
 FSDP module's zero-grad method, leaving parameter-group accumulation flags from
-the previous step. When no optimizer-facing gradient is live anywhere in the
-FSDP root, the sweep resets those stale flags through
-`ParameterGroup.zero_grad()` and releases every eligible grad buffer. If any
-gradient remains live, the sweep is a no-op because the model may be between
-gradient-accumulation microbatches.
+the previous step. Each parameter group independently retains live or
+accumulating gradients and resets stale state through `ParameterGroup.zero_grad()`
+when its optimizer-facing gradients have been cleared.
 
 The root-wide sweep is outside the full-iteration CUDA graph lifecycle. When
-`enable_full_iteration_cuda_graph=True`, it returns before gradient-liveness
-inspection and never calls `ParameterGroup.zero_grad()`. Full-iteration mode
-keeps graph-visible gradient objects and owns its in-place zeroing separately.
+`enable_full_iteration_cuda_graph=True`, each parameter-group guard returns
+before gradient-liveness inspection and never calls `ParameterGroup.zero_grad()`.
+Full-iteration mode keeps graph-visible gradient objects and owns its in-place
+zeroing separately.
 
 Doing this at the root boundary is important: the older per-module release
 path ran after each module unshard, so later-layer gradient shards could overlap
@@ -91,25 +92,26 @@ directly.
 
 ## Release guard
 
-`_release_grad_storage_if_unused()` frees `main_grad_buffer.data` only when all
+`release_grad_storage_if_unused()` frees `grad_buffer.data` only when all
 of these are true:
 
 - full-iteration CUDA graph mode is not enabled for the group;
-- `main_grad_buffer.data` exists;
-- the full staging buffer does not contain accumulated gradient data;
-- the reduced output buffer does not contain accumulated gradient data;
-- no `dist_param.grad` or `dist_param.decoupled_grad` still references the
+- `grad_buffer.data` exists;
+- the gradient phase is not `ACCUMULATING`;
+- no `optimizer_param.grad` or `optimizer_param.decoupled_grad` still references the
   gradient DTensor.
 
 If any of those conditions fail, storage is kept because it may still be needed
 by gradient accumulation or the optimizer.
 
-On release, each live `dist_grads` wrapper moves to the private cache before
-its local tensor reference is removed. `dist_grads` is then reset to `None`
-placeholders. On the next `_init_dist_grads()`, the backing buffer is allocated,
-the cached wrappers are rebound to correctly shaped local slices, uneven chunk
-metadata is restored from the corresponding distributed parameter, and only
-then are the wrappers published through `dist_grads` again.
+On release, each live `optimizer_grads` wrapper moves to the private cache before
+its local tensor reference is removed, and any direct full-gradient view is
+cleared before `grad_buffer` is unbound. `optimizer_grads` is then reset to
+`None` placeholders. On the next `prepare_gradient_storage()`, the backing
+buffer is allocated, the cached wrappers are rebound to correctly shaped local
+slices, uneven chunk metadata is restored from the corresponding distributed
+parameter, and only then are the wrappers published through `optimizer_grads`
+again.
 
 The wrapper layout is immutable for the lifetime of a parameter group. Rebind
 validates shape, dtype, device, mesh, placements, and checkpoint metadata the
@@ -117,21 +119,20 @@ first time a cached wrapper is reused. Later iterations update the fixed-size
 cache and live-gradient lists in place and skip repeated structural validation;
 the backing buffer may change, but its established layout contract does not.
 
-## Accumulation flags
+## Accumulation state
 
-Two flags track where valid gradient data currently lives:
+`GradientPhase` records whether the persistent gradient is `EMPTY`,
+`ACCUMULATING`, or optimizer-`READY`. Placement determines where accumulation
+happens. When `grad_storage` is fully replicated and `grad_accumulation` is
+fully partial, DDP and ZeRO-1 accumulate local microbatches directly in
+`grad_buffer`; `full_grad_has_value` is then derived from the
+`ACCUMULATING` phase. ZeRO-2, FSDP, and HSDP reduce every microbatch into their
+configured accumulation placement instead.
 
-- `_full_grad_buffer_has_accumulated_grad` tracks the full `(0, 0)` staging
-  buffer used before the collective.
-- `_reduced_grad_buffer_has_accumulated_grad` tracks the collective output
-  consumed by the optimizer.
-
-`zero_grad()` resets both flags before trying to release storage. `reduce_grad()`
-sets them according to the active sharding strategy and whether the collective
-consumes the full staging buffer.
-
-These flags are required because some ranks can have empty local optimizer
-shards while the shared buffer still contains valid data for another layout.
+`zero_grad()` resets the phase before trying to release storage. The phase is
+required because placement alone cannot distinguish a partial accumulation
+from an optimizer-ready value, and some ranks can have empty local optimizer
+shards while the shared buffer still contains valid data.
 
 ## Safe use of `torch.empty`
 
@@ -141,18 +142,19 @@ accumulation flags:
 
 - if no previous gradient has accumulated, staging and collective outputs
   overwrite the destination;
-- if a previous microbatch has accumulated, later microbatches add into the
-  existing buffer.
+- if a previous microbatch has accumulated, DDP and ZeRO-1 stage by addition
+  into persistent full storage, while reduced-gradient strategies add their
+  collective output into the configured accumulation placement.
 
 `zero_grad(set_to_none=False)` is the explicit keep-storage path: it zeros
-`main_grad_buffer.data` in place when the buffer exists instead of releasing it.
+`grad_buffer.data` in place when the buffer exists instead of releasing it.
 
 ## CUDA graph exceptions
 
 Full-iteration CUDA graph mode keeps optimizer-facing gradient storage alive so
 the captured step can reuse stable gradient objects. In that mode,
-both the root-wide and per-parameter-group
-`_release_grad_storage_if_unused()` paths return without scanning or freeing
+both the root-wide and per-module
+`release_grad_storage_if_unused()` calls return without scanning or freeing
 the buffer, and the full-iteration optimizer lifecycle clears the existing
 storage in place.
 
@@ -164,6 +166,6 @@ same buffer surface.
 
 | File | Relevant pieces |
 | --- | --- |
-| `param_group.py` | `_init_buffers()`, `_init_dist_grads()`, `_release_grad_storage_if_unused()`, `zero_grad()` |
-| `fsdp_module.py` | `reduce_grad()` installs optimizer-facing grads; root-wide `_release_grad_storage_if_unused()` handles plain optimizer zero-grad |
-| `hooks.py` | Root-before-unshard and per-module forward pre-hook release paths, plus CUDA-graph pre-initialization |
+| `param_group.py` | `_init_buffers()`, `prepare_gradient_storage()`, `release_grad_storage_if_unused()`, `zero_grad()` |
+| `fsdp_module.py` | `reduce_grad()` installs optimizer-facing gradients; `_release_grad_storage_if_unused()` traverses the root's parameter groups |
+| `hooks.py` | Root-before-unshard and per-module gradient-storage release paths, plus CUDA-graph pre-initialization |

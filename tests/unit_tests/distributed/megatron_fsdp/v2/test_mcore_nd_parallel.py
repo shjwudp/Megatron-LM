@@ -10,11 +10,13 @@ import megatron.core.parallel_state as mpu
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import _init_dp_mesh
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
     HAVE_TE_NVFP4,
     HAVE_TE_NVFP4_RECIPE,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import GradientPhase
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -109,11 +111,11 @@ class TestMegatronFSDPE2E:
             )
 
             param_group = model._fsdp_param_groups[0]
-            grad_buffer = param_group.main_grad_buffer
+            grad_buffer = param_group.grad_buffer
             assert grad_buffer is not None
-            assert grad_buffer.inner_dp_group.size() == 1
-            assert grad_buffer.inner_sharded
-            param_group._init_dist_grads()
+            assert grad_buffer.mesh.get_group(mesh_dim=1).size() == 1
+            assert grad_buffer.placements[1] is Placement.SHARD
+            param_group.prepare_gradient_storage()
 
             param = param_group.params[0]
             item_id = param_group.param_idx[param]
@@ -129,7 +131,7 @@ class TestMegatronFSDPE2E:
                 while pending:
                     event, pending_group = pending.pop()
                     event.synchronize()
-                    pending_group.release_grad_buffer()
+                    pending_group.release_temporary_grad_buffers()
 
             try:
                 # MB1: scale a fused wgrad into the fresh optimizer shard.
@@ -140,18 +142,16 @@ class TestMegatronFSDPE2E:
                 param.grad_added_to_main_grad = True
                 param._mfsdp_recorded_te_wgrad = False
                 assert param.grad is None
-                assert not param_group._full_grad_buffer_has_accumulated_grad
-                assert not param_group._reduced_grad_buffer_has_accumulated_grad
+                assert param_group.state.grad_phase is GradientPhase.EMPTY
 
                 reduce_and_wait()
-                optimizer_grad = param_group.dist_params[item_id].grad
+                optimizer_grad = param_group.optimizer_params[item_id].grad
                 assert optimizer_grad is not None
                 torch.testing.assert_close(
                     optimizer_grad._local_tensor, torch.full_like(optimizer_grad._local_tensor, 2.0)
                 )
                 assert param.grad_added_to_main_grad is False
-                assert not param_group._full_grad_buffer_has_accumulated_grad
-                assert param_group._reduced_grad_buffer_has_accumulated_grad
+                assert param_group.state.grad_phase is GradientPhase.ACCUMULATING
                 drain_pending()
                 assert not hasattr(param, "main_grad")
 
@@ -164,9 +164,8 @@ class TestMegatronFSDPE2E:
 
                 reduce_and_wait()
                 assert torch.count_nonzero(stale_main_grad) == 0
-                assert not param_group._full_grad_buffer_has_accumulated_grad
-                assert param_group._reduced_grad_buffer_has_accumulated_grad
-                optimizer_grad = param_group.dist_params[item_id].grad
+                assert param_group.state.grad_phase is GradientPhase.ACCUMULATING
+                optimizer_grad = param_group.optimizer_params[item_id].grad
                 assert optimizer_grad is not None
                 torch.testing.assert_close(
                     optimizer_grad._local_tensor, torch.full_like(optimizer_grad._local_tensor, 2.0)
@@ -220,34 +219,21 @@ class TestMegatronFSDPE2E:
                 if not isinstance(module, FSDPModule):
                     continue
                 for param_group in module._fsdp_param_groups:
-                    if (
-                        param_group.model_weight_buffer is None
-                        or param_group.model_weight_buffer.inner_sharded
-                    ):
+                    buffer = param_group.weight_buffer
+                    if buffer.placements[-1] is Placement.SHARD:
                         continue
-                    param_group.unshard(bwd_pass=False)
-                    if param_group.transpose_weight_buffer is not None:
-                        param_group.unshard(bwd_pass=True)
-
-                    for buffer_name, buffer in (
-                        ("model_weight_buffer", param_group.model_weight_buffer),
-                        ("transpose_weight_buffer", param_group.transpose_weight_buffer),
-                    ):
-                        if buffer is None or buffer.inner_sharded:
-                            continue
-                        gathered = [
-                            torch.empty_like(buffer.data)
-                            for _ in range(torch.distributed.get_world_size(param_group.dp_group))
-                        ]
-                        torch.distributed.all_gather(
-                            gathered, buffer.data, group=param_group.dp_group
+                    inner_group = param_group.mesh.get_group(mesh_dim=param_group.mesh.ndim - 1)
+                    gathered = [
+                        torch.empty_like(buffer.data)
+                        for _ in range(torch.distributed.get_world_size(inner_group))
+                    ]
+                    torch.distributed.all_gather(gathered, buffer.data, group=inner_group)
+                    for group_rank, replica in enumerate(gathered):
+                        assert torch.equal(buffer.data, replica), (
+                            f"Replicated weight buffer mismatch for "
+                            f"param_group={param_group.param_group_id}, "
+                            f"group_rank={group_rank}"
                         )
-                        for group_rank, replica in enumerate(gathered):
-                            assert torch.equal(buffer.data, replica), (
-                                f"Replicated {buffer_name} mismatch for "
-                                f"param_group={param_group.param_group_id}, "
-                                f"group_rank={group_rank}"
-                            )
 
     @staticmethod
     def _training_loop(seed=42, **kwargs):
@@ -401,6 +387,16 @@ class TestMegatronFSDPE2E:
         [
             pytest.param(
                 dict(
+                    bf16=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    overlap_param_gather=True,
+                    overlap_grad_reduce=True,
+                    use_megatron_fsdp_v2=True,
+                ),
+                id="optim_grads_params_parameter_group",
+            ),
+            pytest.param(
+                dict(
                     data_parallel_sharding_strategy="optim_grads_params",
                     recompute_granularity="full",
                     recompute_method="uniform",
@@ -411,7 +407,7 @@ class TestMegatronFSDPE2E:
                     gradient_accumulation_fusion=True,
                     fsdp_trace_pool=True,
                 ),
-                id="optim_grads_params_double_buffer",
+                id="optim_grads_params_trace_pool",
             ),
             pytest.param(
                 dict(
@@ -455,7 +451,7 @@ class TestMegatronFSDPE2E:
                     overlap_moe_expert_parallel_comm=True,
                     delay_wgrad_compute=True,
                 ),
-                id="ep_overlap-optim_grads_params",
+                id="ep_overlap_delayed_wgrad-optim_grads_params",
             ),
         ],
     )
@@ -723,13 +719,8 @@ class TestMegatronFSDPE2E:
         ],
     )
     def test_zero_strategy_non_equivalent_precision_paths_run(self, strategy, precision_configs):
-        """Exercise valid ZeRO paths that intentionally lack a strict reference.
-
-        MXFP8 ZeRO-1/2 refreshes replicated quantized compute buffers after
-        sharded optimizer updates; v1 and v2 do not provide a strict multi-step
-        golden comparison for that replicated-weight quantization path.
-        """
-        if precision_configs.get("fp8_recipe") == "mxfp8" and (
+        """Exercise valid ZeRO paths that intentionally lack a strict reference."""
+        if (
             not torch.cuda.is_available()
             or torch.cuda.get_device_capability()[0] < 10
             or not HAVE_TE_MXFP8TENSOR

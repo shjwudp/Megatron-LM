@@ -191,6 +191,10 @@ class DistributedDataParallelConfig:
     CG capture scope but is waited on during the capture scope.
     """
 
+    fsdp_outer_dp_all_gather_prefetch_depth: int = 1
+    """Number of future Megatron-FSDP v2 HSDP modules whose outer-DP weight
+    all-gather is prefetched. Zero disables the placement-stage pipeline."""
+
     outer_dp_sharding_strategy: str = 'no_shard'
     """
     Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode.
@@ -294,6 +298,9 @@ class DistributedDataParallelConfig:
         """Check the validity of the config."""
         if self.use_megatron_fsdp_v2:
             self.use_megatron_fsdp = True
+        assert self.fsdp_outer_dp_all_gather_prefetch_depth >= 0, (
+            "fsdp_outer_dp_all_gather_prefetch_depth must be non-negative"
+        )
 
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
