@@ -277,6 +277,11 @@ not produce a gradient. On later DDP and ZeRO-1 microbatches, produced
 gradients add into the persistent full-gradient value and missing gradients
 leave their prior values unchanged. The whole bucket is never zeroed.
 
+`acquire_full_grad_buffer()` is an idempotent resource-acquisition operation,
+not a backward lifecycle transition. It returns the persistent full-gradient
+view for DDP and ZeRO-1 or leases full-size scratch for ZeRO-2, FSDP, and HSDP.
+Backward phase changes remain owned by the module and hook layer.
+
 Every strategy follows the same two-target process:
 
 ```text

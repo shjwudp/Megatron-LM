@@ -430,7 +430,7 @@ def _pre_backward_setup(module: FSDPModule, skip_final_callback: bool = False):
             and param_group.supports_fused_grad_capture
         ):
             param_group.prepare_gradient_storage()
-            param_group.begin_backward()
+            param_group.acquire_full_grad_buffer()
 
     return ctx
 

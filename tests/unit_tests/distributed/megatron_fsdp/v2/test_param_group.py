@@ -169,7 +169,7 @@ def test_1d_strategy_weight_and_gradient_lifecycle(sharding_strategy):
     group.reshard_weight()
 
     rank = torch.distributed.get_rank()
-    full_grad = group.begin_backward()
+    full_grad = group.acquire_full_grad_buffer()
     assert (full_grad.data.data_ptr() == group.grad_buffer.data.data_ptr()) is accumulates_full_grad
     assert any(key[1] == "full_grad" for key in allocator.buckets) is not accumulates_full_grad
     full_grad.data.fill_(rank + 1)
@@ -193,7 +193,7 @@ def test_1d_strategy_weight_and_gradient_lifecycle(sharding_strategy):
         atol=0,
     )
 
-    next_full_grad = group.begin_backward()
+    next_full_grad = group.acquire_full_grad_buffer()
     assert (next_full_grad is full_grad) is accumulates_full_grad
     full_grad = next_full_grad
     if group.full_grad_has_value:
@@ -231,7 +231,7 @@ def test_full_gradient_view_follows_persistent_storage_lifetime(sharding_strateg
     group.prepare_gradient_storage()
     full_grad = group.state.full_grad
     assert full_grad is not None
-    assert group.begin_backward() is full_grad
+    assert group.acquire_full_grad_buffer() is full_grad
     grad_storage = group.grad_buffer.data
     group.release_temporary_grad_buffers()
     assert group.state.full_grad is full_grad
@@ -245,7 +245,7 @@ def test_full_gradient_view_follows_persistent_storage_lifetime(sharding_strateg
     assert group.state.full_grad is None
     assert group.grad_buffer.data is None
 
-    rebound_full_grad = group.begin_backward()
+    rebound_full_grad = group.acquire_full_grad_buffer()
     assert rebound_full_grad is not full_grad
     assert rebound_full_grad.data.data_ptr() == group.grad_buffer.data.data_ptr()
 
@@ -253,7 +253,7 @@ def test_full_gradient_view_follows_persistent_storage_lifetime(sharding_strateg
 def test_temporary_full_gradient_lease_precedes_grad_storage_release():
     group, _, allocator = _build_1d_group("optim_grads_params")
 
-    full_grad = group.begin_backward()
+    full_grad = group.acquire_full_grad_buffer()
     with pytest.raises(RuntimeError, match="Temporary full-gradient storage"):
         group._release_grad_storage()
     assert group.state.full_grad is full_grad
@@ -281,7 +281,7 @@ def test_2d_strategy_gradient_lifecycle(sharding_strategy):
     accumulates_full_grad = sharding_strategy in ("no_shard", "optim")
     assert group.accumulates_full_grad is accumulates_full_grad
 
-    full_grad = group.begin_backward()
+    full_grad = group.acquire_full_grad_buffer()
     assert (full_grad.data.data_ptr() == group.grad_buffer.data.data_ptr()) is accumulates_full_grad
     full_grad.data.fill_(rank + 1)
     group.reduce_grad(is_last_backward=False)
@@ -302,7 +302,7 @@ def test_2d_strategy_gradient_lifecycle(sharding_strategy):
         atol=0,
     )
 
-    full_grad = group.begin_backward()
+    full_grad = group.acquire_full_grad_buffer()
     if group.full_grad_has_value:
         full_grad.data.add_(rank + 2)
     else:
@@ -327,11 +327,11 @@ def test_full_gradient_accumulation_is_preprocessed_once(sharding_strategy):
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
 
-    group.begin_backward().data.fill_(rank + 1)
+    group.acquire_full_grad_buffer().data.fill_(rank + 1)
     group.reduce_grad(is_last_backward=False)
     assert allocator.buckets == {}
 
-    group.begin_backward().data.add_(rank + 2)
+    group.acquire_full_grad_buffer().data.add_(rank + 2)
     group.reduce_grad(is_last_backward=True)
 
     expected = 0.5 * world_size * (world_size + 2)
@@ -438,7 +438,7 @@ def test_outer_sharded_hsdp_collective_order(monkeypatch):
 
     group.reshard_weight()
     transitions.clear()
-    group.begin_backward().data.fill_(torch.distributed.get_rank() + 1)
+    group.acquire_full_grad_buffer().data.fill_(torch.distributed.get_rank() + 1)
     outer_rs_stream = torch.cuda.Stream()
     inner_rs_stream = torch.cuda.Stream()
     completion_stream = group.reduce_grad(
@@ -483,7 +483,7 @@ def test_gradient_storage_zeroing_is_lazy(monkeypatch):
         return buffer
 
     monkeypatch.setattr(group, "_allocate_scratch", allocate_with_sentinel)
-    assert torch.count_nonzero(group.begin_backward().data != 13) == 0
+    assert torch.count_nonzero(group.acquire_full_grad_buffer().data != 13) == 0
 
     group.grad_buffer.data.fill_(11)
     group.zero_grad()
@@ -492,7 +492,7 @@ def test_gradient_storage_zeroing_is_lazy(monkeypatch):
 
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
-    group.begin_backward().data.fill_(rank + 1)
+    group.acquire_full_grad_buffer().data.fill_(rank + 1)
     group.reduce_grad(is_last_backward=True)
     expected = world_size * (world_size + 1) / 2
     torch.testing.assert_close(
@@ -508,7 +508,7 @@ def test_gradient_storage_zeroing_is_lazy(monkeypatch):
     assert group.grad_buffer.data is None
     assert optimizer_grad._local_tensor is None
 
-    group.begin_backward().data.fill_(rank + 2)
+    group.acquire_full_grad_buffer().data.fill_(rank + 2)
     group.reduce_grad(is_last_backward=True)
     assert group.optimizer_grads[0] is optimizer_grad
     assert optimizer_grad._local_tensor.data_ptr() == group.optimizer_grad().tensor_view(
@@ -535,13 +535,13 @@ def test_two_microbatch_hsdp_gradient(
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
 
-    group.begin_backward().data.fill_(rank + 1)
+    group.acquire_full_grad_buffer().data.fill_(rank + 1)
     group.reduce_grad(is_last_backward=False)
     assert group.state.grad_phase is GradientPhase.ACCUMULATING
     assert group.state.full_grad is None
     assert allocator.buckets == {}
 
-    group.begin_backward().data.fill_(rank + 2)
+    group.acquire_full_grad_buffer().data.fill_(rank + 2)
     group.reduce_grad(is_last_backward=True)
 
     expected = 0.5 * world_size * (world_size + 2)
