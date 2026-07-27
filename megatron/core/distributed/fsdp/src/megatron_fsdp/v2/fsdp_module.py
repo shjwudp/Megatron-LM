@@ -294,14 +294,32 @@ class FSDPModule:
     def offload_to_cpu(
         self, recursive: bool = True, pin_memory: bool = False, max_cpu_bytes: Optional[int] = None
     ) -> Dict[str, int]:
-        """Raise because CPU offload is not supported."""
-        _ = recursive, pin_memory, max_cpu_bytes
-        raise NotImplementedError("ParameterGroup CPU offload is not implemented yet")
+        """Offload persistent parameter-group storage within an optional CPU budget."""
+        modules = self._get_fsdp_modules(recursive)
+        for module in modules:
+            module.reshard()
+        self.release_memory_pool()
+
+        offloaded_bytes = 0
+        skipped_bytes = 0
+        for module in modules:
+            for param_group in module._fsdp_param_groups:
+                remaining = (
+                    None if max_cpu_bytes is None else max_cpu_bytes - offloaded_bytes
+                )
+                group_offloaded, group_skipped = param_group.offload_to_cpu(
+                    pin_memory=pin_memory,
+                    max_cpu_bytes=remaining,
+                )
+                offloaded_bytes += group_offloaded
+                skipped_bytes += group_skipped
+        return {"offloaded_bytes": offloaded_bytes, "skipped_bytes": skipped_bytes}
 
     def reload_to_gpu(self, recursive: bool = True) -> None:
-        """Raise because CPU reload is not supported."""
-        _ = recursive
-        raise NotImplementedError("ParameterGroup CPU reload is not implemented yet")
+        """Reload persistent parameter-group storage to its configured CUDA device."""
+        for module in self._get_fsdp_modules(recursive):
+            for param_group in module._fsdp_param_groups:
+                param_group.reload_to_gpu()
 
     def _init_named_param_groups(
         self,

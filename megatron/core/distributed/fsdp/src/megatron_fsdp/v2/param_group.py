@@ -251,6 +251,105 @@ class ParameterGroup:
         """Replace the allocator used for temporary buffer leases."""
         self.allocator = allocator
 
+    def _persistent_storage_owners(self) -> list[DataParallelBuffer]:
+        """Return distinct buffers that own persistent storage."""
+        owners = [self.weight_buffer]
+        if not self._main_weight_aliases_weight:
+            owners.append(self.main_weight_buffer)
+        owners.append(self.grad_buffer)
+        return [buffer for buffer in owners if buffer.data is not None]
+
+    @staticmethod
+    def _rebind_dtensor_storage(
+        dtensor: DTensor, local_tensor: torch.Tensor, shape: torch.Size
+    ) -> None:
+        """Rebind one optimizer DTensor while preserving checkpoint metadata."""
+        old_local_tensor = dtensor._local_tensor
+        if local_tensor.numel() == 0:
+            local_shape = (0,) + tuple(shape[1:]) if len(shape) > 1 else (0,)
+            new_local_tensor = local_tensor.reshape(local_shape)
+        else:
+            new_local_tensor = local_tensor.view(-1, *shape[1:])
+        for attr_name in (
+            "__create_chunk_list__",
+            "__create_write_items__",
+            "_chunk_meta_source",
+        ):
+            if hasattr(old_local_tensor, attr_name):
+                setattr(new_local_tensor, attr_name, getattr(old_local_tensor, attr_name))
+        dtensor._local_tensor = new_local_tensor
+
+    def _rebuild_persistent_views(self) -> None:
+        """Rebuild aliases and optimizer DTensor views after storage migration."""
+        if self._main_weight_aliases_weight:
+            self.main_weight_buffer = self.weight_buffer.view(list(self.layout.main_weight))
+
+        optimizer_view = self.main_weight_buffer.view(list(self.layout.main_weight))
+        for param, optimizer_param in zip(self.params, self._optimizer_params):
+            self._rebind_dtensor_storage(
+                optimizer_param,
+                optimizer_view.tensor_view(self.param_idx[param]),
+                param.shape,
+            )
+
+        if self.grad_buffer.data is None:
+            return
+        grad_view = self._placement_view(self.grad_buffer, self.layout.main_weight)
+        for param, optimizer_grad in zip(self.params, self._optimizer_grads):
+            if optimizer_grad is None:
+                continue
+            self._rebind_dtensor_storage(
+                optimizer_grad,
+                grad_view.tensor_view(self.param_idx[param]),
+                param.shape,
+            )
+
+    @torch.no_grad()
+    def offload_to_cpu(
+        self, *, pin_memory: bool = False, max_cpu_bytes: int | None = None
+    ) -> tuple[int, int]:
+        """Move persistent storage to CPU and return offloaded/skipped byte counts."""
+        self.reshard_weight()
+        self.release_grad_buffer()
+        offloaded_bytes = 0
+        skipped_bytes = 0
+        owners = sorted(
+            self._persistent_storage_owners(),
+            key=lambda buffer: buffer.data.nbytes,
+            reverse=True,
+        )
+        for buffer in owners:
+            if buffer.data.device.type == "cpu":
+                continue
+            num_bytes = buffer.data.nbytes
+            if max_cpu_bytes is not None and offloaded_bytes + num_bytes > max_cpu_bytes:
+                skipped_bytes += num_bytes
+                continue
+            cpu_data = torch.empty(
+                buffer.data.shape,
+                dtype=buffer.data.dtype,
+                device="cpu",
+                pin_memory=pin_memory,
+            )
+            cpu_data.copy_(buffer.data)
+            _free_storage(buffer.data)
+            buffer.data = cpu_data
+            offloaded_bytes += num_bytes
+        self._rebuild_persistent_views()
+        return offloaded_bytes, skipped_bytes
+
+    @torch.no_grad()
+    def reload_to_gpu(self) -> None:
+        """Move offloaded persistent storage back to its configured CUDA device."""
+        moved = False
+        for buffer in self._persistent_storage_owners():
+            if buffer.data.device == buffer.device:
+                continue
+            buffer.data = buffer.data.to(buffer.device)
+            moved = True
+        if moved:
+            self._rebuild_persistent_views()
+
     def _new_index(self, *, compact_weight: bool = False) -> BufferIndex:
         index = BufferIndex(
             param_shapes=[param.shape for param in self.params],
@@ -484,6 +583,7 @@ class ParameterGroup:
             for index, param_group in enumerate(param_groups):
                 if param_group.mesh.ndim != len(axis_streams):
                     raise ValueError("All parameter groups must use the same mesh dimensionality")
+                param_group.reload_to_gpu()
                 compute_weight = param_group.compute_weight()
                 if compute_weight is not None:
                     param_group._bind_weight(compute_weight)
@@ -599,6 +699,7 @@ class ParameterGroup:
     @torch.no_grad()
     def refresh_model_weight(self) -> None:
         """Install optimizer weights and record the optimizer placement as valid."""
+        self.reload_to_gpu()
         self.reshard_weight()
         if not self._main_weight_aliases_weight:
             self.mp_policy.copy_main_weights_to_model_weights(

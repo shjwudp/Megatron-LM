@@ -1234,6 +1234,64 @@ class TestIgnoredParams:
 
 
 class TestLifecycle:
+    def test_cpu_offload_rebinds_persistent_parameter_group_views(self):
+        """CPU offload and reload preserve optimizer-facing DTensor identities."""
+        model = fully_shard(
+            SimpleMLP(16).to(_device(), dtype=torch.bfloat16),
+            mp_policy=MixedPrecisionPolicy(
+                main_params_dtype=torch.float32,
+                main_grads_dtype=torch.float32,
+            ),
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+        )
+        model.set_is_last_backward(True)
+        model(
+            torch.randn(2, 16, device=_device(), dtype=torch.bfloat16)
+        ).float().square().mean().backward()
+        model.finish_grad_sync()
+
+        optimizer_ids = [
+            id(optimizer_param)
+            for param_group in model._fsdp_param_groups
+            for optimizer_param in param_group.optimizer_params
+        ]
+        result = model.offload_to_cpu(pin_memory=True)
+        assert result["offloaded_bytes"] > 0
+        for param_group in model._fsdp_param_groups:
+            assert all(
+                buffer.data is None or buffer.data.device.type == "cpu"
+                for buffer in (
+                    param_group.weight_buffer,
+                    param_group.main_weight_buffer,
+                    param_group.grad_buffer,
+                )
+            )
+            assert all(
+                optimizer_param._local_tensor.device.type == "cpu"
+                for optimizer_param in param_group.optimizer_params
+            )
+
+        model.reload_to_gpu()
+        assert optimizer_ids == [
+            id(optimizer_param)
+            for param_group in model._fsdp_param_groups
+            for optimizer_param in param_group.optimizer_params
+        ]
+        for param_group in model._fsdp_param_groups:
+            assert all(
+                buffer.data is None or buffer.data.device.type == "cuda"
+                for buffer in (
+                    param_group.weight_buffer,
+                    param_group.main_weight_buffer,
+                    param_group.grad_buffer,
+                )
+            )
+            assert all(
+                optimizer_param._local_tensor.device.type == "cuda"
+                for optimizer_param in param_group.optimizer_params
+            )
+
     def test_external_backward_callbacks_finalize_parameter_group_gradients(self):
         """Delayed-wgrad callers may explicitly finalize gradients after backward."""
         model = fully_shard(
