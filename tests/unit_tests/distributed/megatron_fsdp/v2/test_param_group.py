@@ -294,6 +294,41 @@ def test_temporary_full_gradient_lease_precedes_grad_storage_release():
     assert allocator.buckets == {}
 
 
+def test_reduce_grad_failure_releases_temporary_buffers(monkeypatch):
+    group, _, allocator = _build_1d_group(
+        "optim_grads_params", grad_comm_dtype=torch.bfloat16
+    )
+    group.acquire_full_grad_buffer().data.fill_(1)
+
+    def fail_redistribution(*args, **kwargs):
+        raise RuntimeError("redistribution failed")
+
+    monkeypatch.setattr(DataParallelBuffer, "redistribute_buffers", fail_redistribution)
+    with pytest.raises(RuntimeError, match="redistribution failed"):
+        group.reduce_grad(is_last_backward=True)
+
+    assert group.state.full_grad is None
+    assert group.state.grad_comm is None
+    assert allocator.buckets == {}
+
+
+def test_unshard_planning_failure_releases_earlier_weight_buffers(monkeypatch):
+    first, _, first_allocator = _build_2d_group(shard_optimizer_across_outer_dp=True)
+    second, _, second_allocator = _build_2d_group(shard_optimizer_across_outer_dp=True)
+
+    def fail_allocation(*args, **kwargs):
+        raise RuntimeError("allocation failed")
+
+    monkeypatch.setattr(second, "_allocate_scratch", fail_allocation)
+    with pytest.raises(RuntimeError, match="allocation failed"):
+        ParameterGroup.unshard_weights([first, second])
+
+    assert first.state.full_weights == {}
+    assert second.state.full_weights == {}
+    assert first_allocator.buckets == {}
+    assert second_allocator.buckets == {}
+
+
 @pytest.mark.parametrize(
     "sharding_strategy",
     ["no_shard", "optim", "optim_grads", "optim_grads_params"],

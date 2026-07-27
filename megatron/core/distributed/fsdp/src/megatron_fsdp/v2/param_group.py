@@ -755,42 +755,49 @@ class ParameterGroup:
         terminal_axes: list[int | None] = [None] * len(param_groups)
         plans = []
 
-        for index, param_group in enumerate(param_groups):
-            if param_group.mesh.ndim != len(axis_streams):
-                raise ValueError("All parameter groups must use the same mesh dimensionality")
-            param_group.reload_to_gpu()
-            required_roles = param_group._required_weight_roles(bwd_pass=bwd_pass)
-            param_group._consume_pending_weights(required_roles, axis_streams[-1])
-            required_by_group.append(required_roles)
-            for role in required_roles:
-                compute_weight = param_group.get_unsharded_weight_buffer(role)
-                if compute_weight is not None:
-                    outputs_by_group[index][role] = compute_weight
-                    continue
+        try:
+            for index, param_group in enumerate(param_groups):
+                if param_group.mesh.ndim != len(axis_streams):
+                    raise ValueError("All parameter groups must use the same mesh dimensionality")
+                param_group.reload_to_gpu()
+                required_roles = param_group._required_weight_roles(bwd_pass=bwd_pass)
+                param_group._consume_pending_weights(required_roles, axis_streams[-1])
+                required_by_group.append(required_roles)
+                for role in required_roles:
+                    compute_weight = param_group.get_unsharded_weight_buffer(role)
+                    if compute_weight is not None:
+                        outputs_by_group[index][role] = compute_weight
+                        continue
 
-                weight_buffer = param_group.weight_buffers[role]
-                source_placements = param_group.state.weight_valid_by_role[role]
-                source = weight_buffer.view(list(source_placements))
-                persistent_placements = tuple(weight_buffer.placements)
-                if persistent_placements == param_group.full_placements:
-                    output = weight_buffer
-                else:
-                    scratch_role = f"full_weight:{role.value}"
-                    output = param_group._allocate_scratch(
-                        scratch_role, weight_buffer, param_group.full_placements
+                    weight_buffer = param_group.weight_buffers[role]
+                    source_placements = param_group.state.weight_valid_by_role[role]
+                    source = weight_buffer.view(list(source_placements))
+                    persistent_placements = tuple(weight_buffer.placements)
+                    if persistent_placements == param_group.full_placements:
+                        output = weight_buffer
+                    else:
+                        scratch_role = f"full_weight:{role.value}"
+                        output = param_group._allocate_scratch(
+                            scratch_role, weight_buffer, param_group.full_placements
+                        )
+                        param_group.state.full_weights[role] = output
+                    plans.append(
+                        (
+                            index,
+                            param_group,
+                            role,
+                            source_placements,
+                            persistent_placements,
+                            source,
+                            output,
+                        )
                     )
-                    param_group.state.full_weights[role] = output
-                plans.append(
-                    (
-                        index,
-                        param_group,
-                        role,
-                        source_placements,
-                        persistent_placements,
-                        source,
-                        output,
-                    )
-                )
+        except Exception:
+            for _, param_group, role, _, _, _, output in plans:
+                if param_group.state.full_weights.get(role) is output:
+                    param_group._release_scratch(f"full_weight:{role.value}", output)
+                    param_group.state.full_weights.pop(role, None)
+            raise
 
         if plans:
             DataParallelBuffer.redistribute_buffers(
@@ -960,87 +967,93 @@ class ParameterGroup:
             self.state.grad_phase = GradientPhase.ACCUMULATING
             return caller_stream
 
-        full_grad = self.state.full_grad
-        comm_dtype = self.mp_policy.grad_comm_dtype or full_grad.dtype
-        if comm_dtype != full_grad.dtype:
-            comm_buffer = self._allocate_scratch(
-                "grad_comm", full_grad, self.full_placements, dtype=comm_dtype
+        try:
+            full_grad = self.state.full_grad
+            comm_dtype = self.mp_policy.grad_comm_dtype or full_grad.dtype
+            if comm_dtype != full_grad.dtype:
+                comm_buffer = self._allocate_scratch(
+                    "grad_comm", full_grad, self.full_placements, dtype=comm_dtype
+                )
+                comm_buffer.data.copy_(full_grad.data)
+                self.state.grad_comm = comm_buffer
+                full_grad = comm_buffer
+            if self.gradient_scaling_factor not in (None, 1.0):
+                full_grad.data.mul_(self.gradient_scaling_factor)
+            grad_input = full_grad.view(self.contribution_placements)
+
+            # The inner-DP placement is the persistent accumulation state for
+            # ZeRO-2/3 and HSDP. DDP/ZeRO-1 instead start from their full
+            # accumulation and reduce directly toward the inner optimizer state.
+            if self.accumulates_full_grad:
+                target = list(self.contribution_placements)
+                target[-1] = self.layout.main_weight[-1]
+            else:
+                target = list(self.layout.grad_accumulation)
+            main_grad = self.grad_buffer.view(tuple(target))
+            has_accumulation = (
+                not self.accumulates_full_grad
+                and self.state.grad_phase is GradientPhase.ACCUMULATING
             )
-            comm_buffer.data.copy_(full_grad.data)
-            self.state.grad_comm = comm_buffer
-            full_grad = comm_buffer
-        if self.gradient_scaling_factor not in (None, 1.0):
-            full_grad.data.mul_(self.gradient_scaling_factor)
-        grad_input = full_grad.view(self.contribution_placements)
+            needs_outer_reduction = tuple(target) != self.layout.main_weight
+            needs_workspace = (
+                has_accumulation
+                or grad_input.dtype != main_grad.dtype
+                or (is_last_backward and needs_outer_reduction)
+            )
+            output = full_grad.view(target) if needs_workspace else main_grad
 
-        # The inner-DP placement is the persistent accumulation state for
-        # ZeRO-2/3 and HSDP. DDP/ZeRO-1 instead start from their full
-        # accumulation and reduce directly toward the inner optimizer state.
-        if self.accumulates_full_grad:
-            target = list(self.contribution_placements)
-            target[-1] = self.layout.main_weight[-1]
-        else:
-            target = list(self.layout.grad_accumulation)
-        main_grad = self.grad_buffer.view(tuple(target))
-        has_accumulation = (
-            not self.accumulates_full_grad
-            and self.state.grad_phase is GradientPhase.ACCUMULATING
-        )
-        needs_outer_reduction = tuple(target) != self.layout.main_weight
-        needs_workspace = (
-            has_accumulation
-            or grad_input.dtype != main_grad.dtype
-            or (is_last_backward and needs_outer_reduction)
-        )
-        output = full_grad.view(target) if needs_workspace else main_grad
+            DataParallelBuffer.redistribute_buffers(
+                [grad_input],
+                target,
+                output_buffers=[output],
+                streams=axis_streams,
+                async_op=async_op,
+            )
+            terminal_stream = axis_streams[-1]
 
-        DataParallelBuffer.redistribute_buffers(
-            [grad_input],
-            target,
-            output_buffers=[output],
-            streams=axis_streams,
-            async_op=async_op,
-        )
-        terminal_stream = axis_streams[-1]
-
-        with torch.cuda.stream(terminal_stream):
-            if output is not main_grad:
-                if has_accumulation:
-                    if is_last_backward and needs_outer_reduction:
-                        output.data.add_(main_grad.data)
-                    else:
-                        main_grad.data.add_(output.data)
+            with torch.cuda.stream(terminal_stream):
+                if output is not main_grad:
+                    if has_accumulation:
+                        if is_last_backward and needs_outer_reduction:
+                            output.data.add_(main_grad.data)
+                        else:
+                            main_grad.data.add_(output.data)
+                            output = main_grad
+                    elif not is_last_backward or not needs_outer_reduction:
+                        main_grad.data.copy_(output.data)
                         output = main_grad
-                elif not is_last_backward or not needs_outer_reduction:
-                    main_grad.data.copy_(output.data)
-                    output = main_grad
 
-            if is_last_backward and needs_outer_reduction:
-                final = self.grad_buffer.view(self.layout.main_weight)
-                outer_output = (
-                    final if output.dtype == final.dtype else full_grad.view(self.layout.main_weight)
-                )
-                DataParallelBuffer.redistribute_buffers(
-                    [output],
-                    list(self.layout.main_weight),
-                    output_buffers=[outer_output],
-                    streams=axis_streams,
-                    async_op=async_op,
-                )
-                terminal_stream = axis_streams[0]
-                if outer_output is not final:
-                    with torch.cuda.stream(terminal_stream):
-                        final.data.copy_(outer_output.data)
+                if is_last_backward and needs_outer_reduction:
+                    final = self.grad_buffer.view(self.layout.main_weight)
+                    outer_output = (
+                        final
+                        if output.dtype == final.dtype
+                        else full_grad.view(self.layout.main_weight)
+                    )
+                    DataParallelBuffer.redistribute_buffers(
+                        [output],
+                        list(self.layout.main_weight),
+                        output_buffers=[outer_output],
+                        streams=axis_streams,
+                        async_op=async_op,
+                    )
+                    terminal_stream = axis_streams[0]
+                    if outer_output is not final:
+                        with torch.cuda.stream(terminal_stream):
+                            final.data.copy_(outer_output.data)
 
-        self.state.grad_phase = (
-            GradientPhase.READY if is_last_backward else GradientPhase.ACCUMULATING
-        )
-        if is_last_backward:
-            self._install_optimizer_grads()
+            self.state.grad_phase = (
+                GradientPhase.READY if is_last_backward else GradientPhase.ACCUMULATING
+            )
+            if is_last_backward:
+                self._install_optimizer_grads()
 
-        if terminal_stream == caller_stream:
+            if terminal_stream == caller_stream:
+                self.release_temporary_grad_buffers()
+            return terminal_stream
+        except Exception:
             self.release_temporary_grad_buffers()
-        return terminal_stream
+            raise
 
     def optimizer_weight(self) -> DataParallelBuffer:
         """Return the persistent optimizer-weight representation."""
