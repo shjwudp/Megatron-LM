@@ -378,15 +378,26 @@ class TestFullyShardBasic:
         for param_group in model._fsdp_param_groups:
             assert param_group.state.grad_phase is GradientPhase.EMPTY
 
-    @pytest.mark.parametrize("outer_dp_sharding_strategy", ["no_shard", "optim"])
-    def test_parameter_group_eager_hsdp(self, outer_dp_sharding_strategy):
+    @pytest.mark.parametrize(
+        "sharding_strategy,outer_dp_sharding_strategy",
+        [
+            ("no_shard", "no_shard"),
+            ("optim", "no_shard"),
+            ("optim_grads", "no_shard"),
+            ("optim_grads_params", "no_shard"),
+            ("optim_grads_params", "optim"),
+        ],
+    )
+    def test_parameter_group_eager_hsdp(
+        self, sharding_strategy, outer_dp_sharding_strategy
+    ):
         """The eager HSDP path preserves the caller's 2D mesh and final layout."""
         torch.manual_seed(42)
         model = SimpleMLP(16).to(_device())
         fully_shard(
             model,
             mesh=_build_hsdp_mesh(),
-            sharding_strategy="optim_grads_params",
+            sharding_strategy=sharding_strategy,
             outer_dp_sharding_strategy=outer_dp_sharding_strategy,
             enable_unshard_prefetch=False,
             enable_async_reduce_grad=False,
@@ -400,10 +411,15 @@ class TestFullyShardBasic:
         expected_outer = (
             Placement.SHARD if outer_dp_sharding_strategy == "optim" else Placement.REPLICATE
         )
+        expected_inner = (
+            Placement.REPLICATE
+            if sharding_strategy == "no_shard"
+            else Placement.SHARD
+        )
         for param_group in model._fsdp_param_groups:
             assert isinstance(param_group, ParameterGroup)
             assert param_group.mesh.ndim == 2
-            assert param_group.layout.main_weight == (expected_outer, Placement.SHARD)
+            assert param_group.layout.main_weight == (expected_outer, expected_inner)
             assert param_group.state.grad_phase is GradientPhase.READY
 
     def test_parameter_group_hsdp_axis_streams(self):

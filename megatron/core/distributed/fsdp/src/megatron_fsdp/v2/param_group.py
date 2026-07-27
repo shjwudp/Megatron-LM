@@ -52,22 +52,54 @@ class ParameterGroupLayout:
         if mesh_ndim != 2:
             return
 
-        # A 2D layout is ordered as (outer DP, inner DP). Keeping model
-        # weights and accumulated gradients sharded on the inner axis makes
-        # weight unshard outer-to-inner and gradient reduction inner-to-outer.
-        replicate_shard = (Placement.REPLICATE, Placement.SHARD)
-        shard_shard = (Placement.SHARD, Placement.SHARD)
+        # A 2D layout is ordered as (outer DP, inner DP). The inner axis may
+        # use any DDP/ZeRO strategy. The outer axis keeps persistent model and
+        # gradient storage replicated, accumulates partial contributions, and
+        # optionally shards the optimizer state.
+        valid_inner_layouts = {
+            (
+                Placement.REPLICATE,
+                Placement.REPLICATE,
+                Placement.REPLICATE,
+                Placement.PARTIAL,
+            ),
+            (
+                Placement.REPLICATE,
+                Placement.SHARD,
+                Placement.REPLICATE,
+                Placement.PARTIAL,
+            ),
+            (
+                Placement.REPLICATE,
+                Placement.SHARD,
+                Placement.SHARD,
+                Placement.SHARD,
+            ),
+            (
+                Placement.SHARD,
+                Placement.SHARD,
+                Placement.SHARD,
+                Placement.SHARD,
+            ),
+        }
+        inner_layout = (
+            self.weight[1],
+            self.main_weight[1],
+            self.grad_storage[1],
+            self.grad_accumulation[1],
+        )
         if (
-            self.weight != replicate_shard
-            or self.main_weight not in (replicate_shard, shard_shard)
-            or self.grad_storage != replicate_shard
-            or self.grad_accumulation != (Placement.PARTIAL, Placement.SHARD)
+            self.weight[0] is not Placement.REPLICATE
+            or self.main_weight[0] not in (Placement.REPLICATE, Placement.SHARD)
+            or self.grad_storage[0] is not Placement.REPLICATE
+            or self.grad_accumulation[0] is not Placement.PARTIAL
+            or inner_layout not in valid_inner_layouts
         ):
             raise ValueError(
-                "2D HSDP placements use (outer DP, inner DP) and require "
-                "weight/grad_storage=(REPLICATE, SHARD), "
-                "grad_accumulation=(PARTIAL, SHARD), and main_weight either "
-                "(REPLICATE, SHARD) or (SHARD, SHARD)"
+                "2D HSDP placements use (outer DP, inner DP): the outer axis "
+                "requires replicated weight/gradient storage, partial gradient "
+                "accumulation, and replicated or sharded optimizer state; the "
+                "inner axis must match a DDP or ZeRO-1/2/3 layout"
             )
 
     @classmethod
