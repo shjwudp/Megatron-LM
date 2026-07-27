@@ -379,7 +379,7 @@ def test_weight_validity_and_scratch_lifecycle():
     )
 
     assert group.state.weight_valid == (Placement.REPLICATE, Placement.SHARD)
-    assert group.compute_weight() is None
+    assert group.get_unsharded_weight_buffer() is None
 
     compute_weight = group.unshard_weight()
     assert compute_weight.placements == [Placement.REPLICATE, Placement.REPLICATE]
