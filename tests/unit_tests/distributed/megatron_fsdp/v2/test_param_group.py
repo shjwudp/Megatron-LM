@@ -409,11 +409,11 @@ def test_outer_sharded_hsdp_collective_order(monkeypatch):
     transitions = []
     redistribute = DataParallelBuffer.redistribute
 
-    def record_redistribution(self, target_placements, *, output_buffer=None):
+    def record_redistribution(self, target_placements, **kwargs):
         transitions.append(
             (tuple(self.placements), tuple(target_placements), torch.cuda.current_stream())
         )
-        return redistribute(self, target_placements, output_buffer=output_buffer)
+        return redistribute(self, target_placements, **kwargs)
 
     monkeypatch.setattr(DataParallelBuffer, "redistribute", record_redistribution)
 

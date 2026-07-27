@@ -682,20 +682,21 @@ final_callback:
 
 No `async_op` parameter is needed. The method is purely synchronous within the calling stream:
 
-`ParameterGroup.reduce_grad()` acquires the full-gradient lease and allocates one
-communication owner only when the communication dtype differs. It converts and
-scales once before redistribution. Gradient reduction then has an explicit inner-FSDP
-stage and, on the last HSDP backward, an explicit outer-HSDP stage. A stage writes
-directly to persistent storage only when the destination is empty and has the
-communication dtype; otherwise it uses a temporary output and assigns or accumulates
-afterward. The buffer does not accept raw communication tensors, scaling policy, or
-accumulation policy.
+`ParameterGroup.reduce_grad()` acquires the full-gradient lease and asks the buffer to
+cast through the group allocator only when the communication dtype differs. It scales
+once before redistribution. The function body then shows the complete algorithm: one
+inner-FSDP redistribution for every reduced microbatch, followed by one outer-HSDP
+redistribution only on the last backward. `add_buffer` is supplied to the inner stage
+only when an earlier reduced microbatch exists. This specific operation replaces the
+old generic finalize/commit helpers while gradient scaling and phase decisions remain
+parameter-group policy.
 
 The caller (`FSDPModule.reduce_grad`) provides the reduction stream.
 `ParameterGroup.reduce_grad()` waits for its caller stream once, then performs
-preprocessing, temporary allocation, both reduction stages, commit, and temporary
-release inside the reduction-stream context. The helpers therefore require no
-additional waits or tensor stream recording.
+the inner redistribution on the configured inner-axis stream. For HSDP, the
+outer-axis stream waits for that stream before consuming its output. Temporary leases
+are released only after the terminal stream completes; no tensor stream recording is
+required inside the buffer.
 
 ---
 

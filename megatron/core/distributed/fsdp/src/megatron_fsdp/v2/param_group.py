@@ -935,155 +935,6 @@ class ParameterGroup:
         shape = full_grad.buffer_index.item_index_map[item_id].shape
         return full_grad.data[start:end].view(shape)
 
-    def _preprocess_gradient(self, full_grad: DataParallelBuffer) -> DataParallelBuffer:
-        comm_dtype = self.mp_policy.grad_comm_dtype or full_grad.dtype
-        owner = full_grad
-        if comm_dtype != full_grad.dtype:
-            owner = DataParallelBuffer(
-                buffer_index=full_grad.buffer_index,
-                dtype=comm_dtype,
-                device=full_grad.device,
-                mesh=full_grad.mesh,
-                placements=list(self.full_placements),
-            )
-            owner.bind(
-                self.allocator.allocate(
-                    key=(self.param_group_id, "grad_comm"),
-                    size=owner.data_size,
-                    dtype=owner.dtype,
-                    device=owner.device,
-                ).data
-            )
-            owner.data.copy_(full_grad.data)
-            self.state.grad_comm = owner
-
-        if self.gradient_scaling_factor not in (None, 1.0):
-            owner.data.mul_(self.gradient_scaling_factor)
-
-        if tuple(owner.placements) == self.contribution_placements:
-            return owner
-        return self._placement_view(owner, self.contribution_placements)
-
-    def _finalize_gradient_placement(
-        self, current: DataParallelBuffer, *, streams: tuple[torch.cuda.Stream, ...], async_op: bool
-    ) -> tuple[DataParallelBuffer, torch.cuda.Stream]:
-        """Redistribute delayed mesh axes into the persistent optimizer gradient."""
-        target = self.layout.main_weight
-        final = self._placement_view(self.grad_buffer, target)
-        communication_owner = current._storage_owner or current
-        terminal_stream = torch.cuda.current_stream()
-        # Reduce in reverse mesh-axis order. On the supported 2D HSDP mesh
-        # (outer DP, inner DP), this means inner reduce-scatter precedes outer
-        # reduce-scatter. Weight unshard uses the inverse order.
-        for axis in reversed(range(self.mesh.ndim)):
-            if current.placements[axis] is target[axis]:
-                continue
-            next_placements = current.placements.copy()
-            next_placements[axis] = target[axis]
-            if tuple(next_placements) == target and current.dtype == final.dtype:
-                output = final
-            else:
-                output = self._placement_view(communication_owner, tuple(next_placements))
-            with torch.cuda.stream(terminal_stream):
-                DataParallelBuffer.redistribute_buffers(
-                    [current],
-                    next_placements,
-                    output_buffers=[output],
-                    streams=streams,
-                    async_op=async_op,
-                )
-            terminal_stream = streams[axis]
-            current = output
-
-        with torch.cuda.stream(terminal_stream):
-            if current.data.data_ptr() != final.data.data_ptr():
-                final.data.copy_(current.data)
-        return final, terminal_stream
-
-    def _reduce_grad(
-        self, *, is_last_backward: bool, streams: tuple[torch.cuda.Stream, ...], async_op: bool
-    ) -> torch.cuda.Stream:
-        """Reduce one gradient contribution and return its completion stream."""
-        if self.state.full_grad is None:
-            raise RuntimeError("acquire_full_grad_buffer() must run before reduce_grad()")
-        if self.state.grad_phase is GradientPhase.READY:
-            raise RuntimeError("zero_grad() must run before starting another gradient")
-
-        if self.accumulates_full_grad:
-            if not is_last_backward:
-                # Backward already copied or added this microbatch directly into
-                # persistent full-gradient storage. Delay scaling, dtype conversion,
-                # and the DP reduction until the final microbatch.
-                self.state.grad_phase = GradientPhase.ACCUMULATING
-                return torch.cuda.current_stream()
-
-            grad_input = self._preprocess_gradient(self.state.full_grad)
-            _, terminal_stream = self._finalize_gradient_placement(
-                grad_input, streams=streams, async_op=async_op
-            )
-            self.state.grad_phase = GradientPhase.READY
-            self._install_optimizer_grads()
-            return terminal_stream
-
-        grad_input = self._preprocess_gradient(self.state.full_grad)
-        accumulation = self._placement_view(self.grad_buffer, self.layout.grad_accumulation)
-        # A pending accumulation contains reduced gradients from earlier
-        # microbatches but is not yet optimizer-ready. Placement alone cannot
-        # express this: ZeRO-2/FSDP use the same placement for both phases.
-        has_accumulation = self.state.grad_phase is GradientPhase.ACCUMULATING
-        needs_final_redistribution = self.layout.grad_accumulation != self.layout.main_weight
-        if (
-            has_accumulation
-            or grad_input.dtype != accumulation.dtype
-            or (is_last_backward and needs_final_redistribution)
-        ):
-            owner = grad_input._storage_owner or grad_input
-            output = self._placement_view(owner, self.layout.grad_accumulation)
-        else:
-            output = accumulation
-
-        terminal_stream = torch.cuda.current_stream()
-        DataParallelBuffer.redistribute_buffers(
-            [grad_input],
-            list(self.layout.grad_accumulation),
-            output_buffers=[output],
-            streams=streams,
-            async_op=async_op,
-        )
-        first_axis = self._last_changed_axis(
-            tuple(grad_input.placements), self.layout.grad_accumulation
-        )
-        if first_axis is not None:
-            terminal_stream = streams[first_axis]
-
-        with torch.cuda.stream(terminal_stream):
-            if output.data.data_ptr() != accumulation.data.data_ptr():
-                if has_accumulation:
-                    if is_last_backward and needs_final_redistribution:
-                        # Keep the combined value in communication dtype; it is
-                        # the input to the delayed DDP, ZeRO-1, or HSDP reduction.
-                        output.data.add_(accumulation.data)
-                    else:
-                        accumulation.data.add_(output.data)
-                        output = accumulation
-                elif not is_last_backward or not needs_final_redistribution:
-                    accumulation.data.copy_(output.data)
-                    output = accumulation
-
-            if is_last_backward:
-                if needs_final_redistribution:
-                    # This call remains inside the current terminal-stream
-                    # context. The next axis stream therefore waits for the
-                    # inner reduction and accumulation before consuming output.
-                    _, terminal_stream = self._finalize_gradient_placement(
-                        output, streams=streams, async_op=async_op
-                    )
-                self.state.grad_phase = GradientPhase.READY
-                self._install_optimizer_grads()
-            else:
-                self.state.grad_phase = GradientPhase.ACCUMULATING
-        return terminal_stream
-
     @torch.no_grad()
     def reduce_grad(
         self,
@@ -1093,18 +944,96 @@ class ParameterGroup:
         streams: AxisStreams | None = None,
         async_op: bool = False,
     ) -> torch.cuda.Stream:
-        """Reduce one microbatch and finalize delayed DP axes on the last backward.
+        """Reduce one microbatch, then finalize the outer HSDP axis when required.
 
-        Axis-indexed streams allow HSDP inner and outer reduce-scatter stages
-        to run on distinct streams. The returned stream owns the terminal
-        operation; an asynchronous caller records its completion event there.
+        HSDP has two explicit stages: every microbatch reduces the inner-DP
+        axis into the accumulation placement, while only the last backward
+        reduces the outer-DP axis into the optimizer placement. The second
+        stream waits for the first because it consumes the first stage's
+        output. One-dimensional FSDP, DDP, and ZeRO use only the first stage.
+
+        ``async_op`` is retained for the public synchronization contract;
+        individual CUDA collectives are asynchronous with respect to the host.
         """
         caller_stream = torch.cuda.current_stream()
         axis_streams = self._axis_streams(stream=stream, streams=streams)
         try:
-            terminal_stream = self._reduce_grad(
-                is_last_backward=is_last_backward, streams=axis_streams, async_op=async_op
+            if self.state.full_grad is None:
+                raise RuntimeError("acquire_full_grad_buffer() must run before reduce_grad()")
+            if self.state.grad_phase is GradientPhase.READY:
+                raise RuntimeError("zero_grad() must run before starting another gradient")
+
+            if self.accumulates_full_grad and not is_last_backward:
+                # DDP and ZeRO-1 accumulate microbatches directly in persistent
+                # full-gradient storage, so they communicate only on the last one.
+                self.state.grad_phase = GradientPhase.ACCUMULATING
+                self.release_temporary_grad_buffers()
+                return caller_stream
+
+            grad_input = self.state.full_grad
+            if tuple(grad_input.placements) != self.contribution_placements:
+                grad_input = self._placement_view(grad_input, self.contribution_placements)
+            comm_dtype = self.mp_policy.grad_comm_dtype or grad_input.dtype
+            comm_key = (self.param_group_id, "grad_comm")
+            if comm_dtype != grad_input.dtype:
+                grad_input = grad_input.cast(
+                    comm_dtype,
+                    allocator=self.allocator,
+                    allocator_key=comm_key,
+                )
+                self.state.grad_comm = grad_input
+            if self.gradient_scaling_factor not in (None, 1.0):
+                grad_input.data.mul_(self.gradient_scaling_factor)
+
+            # The inner-DP placement is the persistent accumulation state for
+            # ZeRO-2/3 and HSDP. DDP/ZeRO-1 instead start from their full
+            # accumulation and reduce directly toward the inner optimizer state.
+            if self.accumulates_full_grad:
+                inner_target = list(self.contribution_placements)
+                inner_target[-1] = self.layout.main_weight[-1]
+            else:
+                inner_target = list(self.layout.grad_accumulation)
+            accumulation = self._placement_view(self.grad_buffer, tuple(inner_target))
+            has_accumulation = (
+                not self.accumulates_full_grad
+                and self.state.grad_phase is GradientPhase.ACCUMULATING
             )
+            needs_outer_reduction = tuple(inner_target) != self.layout.main_weight
+
+            inner_stream = axis_streams[-1]
+            if inner_stream != caller_stream:
+                inner_stream.wait_stream(caller_stream)
+            with torch.cuda.stream(inner_stream):
+                current = grad_input.redistribute(
+                    inner_target,
+                    output_buffer=(
+                        None if is_last_backward and needs_outer_reduction else accumulation
+                    ),
+                    add_buffer=accumulation if has_accumulation else None,
+                    allocator=self.allocator,
+                    allocator_key=comm_key,
+                )
+            terminal_stream = inner_stream
+
+            if is_last_backward and needs_outer_reduction:
+                final = self._placement_view(self.grad_buffer, self.layout.main_weight)
+                outer_stream = axis_streams[0]
+                if outer_stream != inner_stream:
+                    outer_stream.wait_stream(inner_stream)
+                with torch.cuda.stream(outer_stream):
+                    current.redistribute(
+                        list(self.layout.main_weight),
+                        output_buffer=final,
+                        allocator=self.allocator,
+                        allocator_key=comm_key,
+                    )
+                terminal_stream = outer_stream
+
+            self.state.grad_phase = (
+                GradientPhase.READY if is_last_backward else GradientPhase.ACCUMULATING
+            )
+            if is_last_backward:
+                self._install_optimizer_grads()
         except Exception:
             self.release_temporary_grad_buffers()
             raise
