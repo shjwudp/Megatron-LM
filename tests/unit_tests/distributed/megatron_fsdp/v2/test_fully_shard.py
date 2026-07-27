@@ -322,10 +322,12 @@ class TestFullyShardBasic:
         ],
     )
     def test_cuda_graph_accumulates_microbatches(
-        self, sharding_strategy, model_dtype, main_grad_dtype
+        self, request, sharding_strategy, model_dtype, main_grad_dtype
     ):
-        """Accumulate one eager and one replayed M-FSDP microbatch.
+        """Accumulate eager, capture, and replayed M-FSDP microbatches.
 
+        :param request: Pytest request used for graph-pool cleanup.
+        :type request: pytest.FixtureRequest
         :param sharding_strategy: M-FSDP gradient sharding strategy.
         :type sharding_strategy: str
         :param model_dtype: Compute parameter dtype.
@@ -347,8 +349,9 @@ class TestFullyShardBasic:
             enable_async_reduce_grad=False,
             enable_cuda_graph=True,
         )
+        request.addfinalizer(model.release_memory_pool)
 
-        values = [2.0, 3.0]
+        values = [2.0, 3.0, 4.0]
         for i, value in enumerate(values):
             sample = torch.full(
                 (2, 4), value, device=_device(), dtype=model_dtype, requires_grad=True
@@ -372,11 +375,13 @@ class TestFullyShardBasic:
             for name, dist_grad in zip(param_names, param_group.dist_grads):
                 if dist_grad is None:
                     continue
-                local_expected = 10.0 if name.endswith("weight") else 4.0
+                local_expected = 18.0 if name.endswith("weight") else 6.0
                 expected = local_expected * _world_size()
                 torch.testing.assert_close(
                     dist_grad.to_local(), torch.full_like(dist_grad.to_local(), expected)
                 )
+        assert model._fsdp_root_context.cuda_graph_runner.captured
+        assert model._fsdp_cg_installed
 
         model.zero_grad()
         for _, param_group in model._named_param_groups:
@@ -1377,7 +1382,7 @@ class TestActivationCheckpointing:
         monkeypatch.setattr(target, "unshard", capture_unshard)
         mfsdp_forward_pre_hook(target, (), {})
 
-        assert calls == [(True, True, True), (True, False, False)]
+        assert calls == [(True, True, True), (False, False, False)]
 
     def test_activation_checkpointing_forward_backward(self):
         """Forward + backward with activation checkpointing should produce finite loss."""

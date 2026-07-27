@@ -121,6 +121,7 @@ class ParameterGroup:
         self.transpose_weight_buffer: Optional[DataParallelBuffer] = None
         self.main_weight_buffer: Optional[DataParallelBuffer] = None
         self.main_grad_buffer: Optional[DataParallelBuffer] = None
+        self._main_grad_buffer_has_unreduced_data = False
         # Initialize buffers and distributed parameters
         self._init_buffers()
         # DTensor shells cached across set_to_none gradient-buffer releases.
@@ -354,6 +355,9 @@ class ParameterGroup:
                 stream=stream,
             )
             self._reduced_grad_buffer_has_accumulated_grad = True
+        self._main_grad_buffer_has_unreduced_data = (
+            self._full_grad_buffer_has_accumulated_grad and not (reduce_inner or reduce_outer)
+        )
 
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""
@@ -369,10 +373,9 @@ class ParameterGroup:
     def _release_grad_storage_if_unused(self) -> None:
         """Drop ``main_grad_buffer.data`` if it has no live gradients.
 
-        After ``zero_grad()`` (or before the first backward), all
-        ``dist_param.grad`` are ``None``, so the gradient buffer holds no
-        meaningful data.  Free the backing tensor — ``_init_dist_grads``
-        will re-allocate on the next ``reduce_grad``.
+        Preserve fused-wgrad data until deferred reduction consumes it. CUDA
+        Graph replay also requires non-distributed fused buffers to keep their
+        captured address, so zero those buffers in place after optimizer clear.
         """
         if self.enable_full_iteration_cuda_graph:
             return
@@ -384,12 +387,18 @@ class ParameterGroup:
         if (
             self._full_grad_buffer_has_accumulated_grad
             or self._reduced_grad_buffer_has_accumulated_grad
+            or self._main_grad_buffer_has_unreduced_data
         ):
             return
         if any(
             [getattr(p, "grad", None) is not None for p in self.dist_params]
             + [getattr(p, "decoupled_grad", None) is not None for p in self.dist_params]
         ):
+            return
+        if self.main_grad_buffer.storage_shard_layout == (0, 0) and any(
+            getattr(param, "_mfsdp_recorded_te_wgrad", False) for param in self.params
+        ):
+            self.main_grad_buffer.data.zero_()
             return
         # Cache DTensor wrappers and their global metadata while dropping the
         # local views that retain gradient-buffer storage. dist_grads itself
@@ -604,6 +613,7 @@ class ParameterGroup:
         """Zero the main gradient buffer and mark grads as zeroed."""
         self._full_grad_buffer_has_accumulated_grad = False
         self._reduced_grad_buffer_has_accumulated_grad = False
+        self._main_grad_buffer_has_unreduced_data = False
         if self.enable_full_iteration_cuda_graph:
             if self.main_grad_buffer is not None:
                 if self.main_grad_buffer.data is not None:
@@ -618,7 +628,6 @@ class ParameterGroup:
                     _zero_tensor_storage(decoupled_grad)
                     setattr(dist_param, "_mfsdp_keep_grad_for_cuda_graph", True)
             return
-
         if set_to_none:
             for dist_param in self.dist_params:
                 if dist_param.grad is not None:
