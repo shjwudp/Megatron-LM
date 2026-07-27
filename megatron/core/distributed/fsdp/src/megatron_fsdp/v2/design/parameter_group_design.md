@@ -81,6 +81,14 @@ backward from reductions delayed until the last backward:
 | HSDP, outer replicated | `[R,S]` | `[R,S]` | `[R,S]` | `[P,S]` | `[R,S]` |
 | HSDP, outer sharded | `[R,S]` | `[S,S]` | `[R,S]` | `[P,S]` | `[S,S]` |
 
+These layouts produce two full-gradient ownership modes:
+
+| Scenario | `full_grad` source | Ownership and lifetime |
+| --- | --- | --- |
+| DDP / ZeRO-1 | `[P]` view of persistent `[R]` `grad_buffer` | Created with gradient storage and released with gradient storage |
+| ZeRO-2 / ZeRO-3 | Allocator-backed full `[P]` contribution | Acquired for one backward reduction and released when that reduction completes |
+| HSDP | Allocator-backed full `[P,P]` contribution | Acquired for one backward reduction and released after the ordered inner/outer stages complete |
+
 The HSDP rows show inner ZeRO-3. With outer replication, the inner axis may
 instead use any 1D DDP/ZeRO row above: prepend `R` to weight, main-weight, and
 gradient-storage placements and prepend `P` to gradient accumulation. Outer
@@ -173,13 +181,14 @@ derived from `grad_phase`:
 Value existence must not be inferred from placement equality. ZeRO-2 and FSDP
 use `[S]` for both accumulation and the optimizer-ready gradient.
 
-The runtime fields are optional handles:
+The runtime fields record active views and allocator leases:
 
 - `full_weights[role]` is a full compute-weight allocation when that role's
   persistent storage cannot contain `[R, R]`;
-- `full_grad` is either full-gradient scratch containing the current backward
-  contribution or, for DDP and ZeRO-1, a partial-placement alias of persistent
-  accumulated gradient storage;
+- for DDP and ZeRO-1, `full_grad` is a `[P]` view of persistent gradient
+  storage and follows that storage's lifetime;
+- for ZeRO-2, ZeRO-3, and HSDP, `full_grad` is an active allocator-backed
+  lease and returns to `None` immediately after release;
 - `grad_comm` exists only when communication dtype differs from gradient dtype.
 
 There is no dirty placement, cached optimizer buffer view, generic temporary-buffer
@@ -257,15 +266,16 @@ compute weights.
 
 ## Gradient lifecycle
 
-At backward start, the group exposes a `full_grad` contribution view. DDP and
-ZeRO-1 reinterpret persistent replicated gradient storage as `[P]`; other
-strategies acquire uninitialized full-gradient scratch. On the first
-microbatch, fused weight-gradient kernels overwrite their parameter slices,
-ordinary gradients are copied into their slices, and the staging layer zeroes
-only slices for parameters that did not produce a gradient. On later DDP and
-ZeRO-1 microbatches, produced gradients add into the persistent full-gradient
-value and missing gradients leave their prior values unchanged. The whole
-bucket is never zeroed.
+When `_ensure_grad_storage()` allocates persistent gradient storage for DDP or
+ZeRO-1, it immediately establishes `full_grad` as a `[P]` view of that storage.
+The view is rebuilt whenever persistent storage migrates and invalidated when
+the storage is unbound. Other strategies acquire uninitialized full-gradient
+scratch at backward start. On the first microbatch, fused weight-gradient
+kernels overwrite their parameter slices, ordinary gradients are copied into
+their slices, and the staging layer zeroes only slices for parameters that did
+not produce a gradient. On later DDP and ZeRO-1 microbatches, produced
+gradients add into the persistent full-gradient value and missing gradients
+leave their prior values unchanged. The whole bucket is never zeroed.
 
 Every strategy follows the same two-target process:
 
@@ -305,18 +315,22 @@ For strategies reduced every microbatch, gradient scaling and conversion to
 communication dtype happen before each redistribution. DDP and ZeRO-1 defer
 both operations until the last backward so accumulated full gradients are
 processed exactly once. Communication workspaces are call-local and are not
-persistent parameter-group state. After every microbatch, the transient
-`full_grad` handle is released; for DDP and ZeRO-1 this only drops the alias,
-not the persistent accumulated value. Non-final backward sets the phase to
+persistent parameter-group state. After every microbatch,
+`release_grad_buffer()` unbinds and releases allocator-backed full-gradient
+scratch, communication workspaces, and parameter bindings, then clears the
+temporary `full_grad` lease. It leaves the DDP and ZeRO-1 `full_grad` view
+attached to persistent gradient storage. Non-final backward sets the phase to
 `ACCUMULATING`; the last backward sets it to `READY`.
 
-`zero_grad(set_to_none=True)` resets the phase to `EMPTY`, releases any active
-`full_grad` lease, detaches the local tensors from cached optimizer-gradient
-DTensor wrappers, and unbinds `grad_buffer` storage. The next backward binds a
-fresh `torch.empty` allocation, reuses the cached DTensor wrappers, and overwrites
-storage because `EMPTY` means there is no value to accumulate.
-`zero_grad(set_to_none=False)` retains the allocation and explicitly zeros it to
-preserve its observable zero-tensor contract.
+`zero_grad(set_to_none=True)` resets the phase to `EMPTY`, releases temporary
+gradient buffers, unbinds the DDP or ZeRO-1 `full_grad` view, detaches the local
+tensors from cached optimizer-gradient DTensor wrappers, and unbinds
+`grad_buffer` storage. The next backward binds a fresh `torch.empty`
+allocation, rebuilds persistent views, reuses the cached DTensor wrappers, and
+overwrites storage because `EMPTY` means there is no value to accumulate.
+`zero_grad(set_to_none=False)` retains the allocation and its direct
+full-gradient view and explicitly zeros storage to preserve its observable
+zero-tensor contract.
 
 Full-iteration CUDA graphs extend this lifetime rule. Before backward, the
 group materializes `grad_buffer` and its optimizer-gradient DTensor views.

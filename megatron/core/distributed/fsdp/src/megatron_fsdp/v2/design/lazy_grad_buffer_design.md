@@ -56,11 +56,11 @@ DTensor field.
 | Point in step | Behavior |
 | --- | --- |
 | FSDP initialization | Create `grad_buffer` metadata only. `grad_buffer.data` is `None`; `optimizer_grads` contains placeholders. |
-| First backward staging | `prepare_gradient_storage()` allocates `grad_buffer.data` and rebuilds `optimizer_grads` DTensor views. |
+| First backward staging | `prepare_gradient_storage()` allocates `grad_buffer.data`, establishes the direct DDP/ZeRO-1 full-gradient view, and rebuilds `optimizer_grads` DTensor views. |
 | Gradient reduction | DDP and ZeRO-1 stage directly into persistent full-gradient storage; sharded-gradient strategies use full scratch. All-reduce or reduce-scatter writes the optimizer-facing result. |
 | Optimizer step | Optimizer consumes `optimizer_param.grad` or `optimizer_param.decoupled_grad`, which are backed by `grad_buffer.data`. |
-| `zero_grad(set_to_none=True)` | Clear optimizer-facing gradient references, privately cache and detach reusable DTensor wrappers, reset accumulation flags, and release `grad_buffer.data` if nothing still references valid gradients. |
-| `zero_grad(set_to_none=False)` | Keep `grad_buffer.data` allocated and zero it in place. |
+| `zero_grad(set_to_none=True)` | Clear optimizer-facing gradient references, unbind any direct DDP/ZeRO-1 full-gradient view, privately cache and detach reusable DTensor wrappers, reset accumulation state, and release `grad_buffer.data` if nothing still references valid gradients. |
+| `zero_grad(set_to_none=False)` | Keep `grad_buffer.data` and any direct full-gradient view allocated and zero storage in place. |
 
 `_release_grad_storage_if_unused()` is also called from the forward pre-hook.
 That call is idempotent and handles the common case where `zero_grad()` has
@@ -104,11 +104,13 @@ If any of those conditions fail, storage is kept because it may still be needed
 by gradient accumulation or the optimizer.
 
 On release, each live `optimizer_grads` wrapper moves to the private cache before
-its local tensor reference is removed. `optimizer_grads` is then reset to `None`
-placeholders. On the next `prepare_gradient_storage()`, the backing buffer is allocated,
-the cached wrappers are rebound to correctly shaped local slices, uneven chunk
-metadata is restored from the corresponding distributed parameter, and only
-then are the wrappers published through `optimizer_grads` again.
+its local tensor reference is removed, and any direct full-gradient view is
+cleared before `grad_buffer` is unbound. `optimizer_grads` is then reset to
+`None` placeholders. On the next `prepare_gradient_storage()`, the backing
+buffer is allocated, the cached wrappers are rebound to correctly shaped local
+slices, uneven chunk metadata is restored from the corresponding distributed
+parameter, and only then are the wrappers published through `optimizer_grads`
+again.
 
 The wrapper layout is immutable for the lifetime of a parameter group. Rebind
 validates shape, dtype, device, mesh, placements, and checkpoint metadata the
