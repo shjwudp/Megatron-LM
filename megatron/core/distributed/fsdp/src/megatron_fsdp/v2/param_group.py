@@ -757,49 +757,42 @@ class ParameterGroup:
         terminal_axes: list[int | None] = [None] * len(param_groups)
         plans = []
 
-        try:
-            for index, param_group in enumerate(param_groups):
-                if param_group.mesh.ndim != len(axis_streams):
-                    raise ValueError("All parameter groups must use the same mesh dimensionality")
-                param_group.reload_to_gpu()
-                required_roles = param_group._required_weight_roles(bwd_pass=bwd_pass)
-                param_group._consume_pending_weights(required_roles, axis_streams[-1])
-                required_by_group.append(required_roles)
-                for role in required_roles:
-                    compute_weight = param_group.get_unsharded_weight_buffer(role)
-                    if compute_weight is not None:
-                        outputs_by_group[index][role] = compute_weight
-                        continue
+        for index, param_group in enumerate(param_groups):
+            if param_group.mesh.ndim != len(axis_streams):
+                raise ValueError("All parameter groups must use the same mesh dimensionality")
+            param_group.reload_to_gpu()
+            required_roles = param_group._required_weight_roles(bwd_pass=bwd_pass)
+            param_group._consume_pending_weights(required_roles, axis_streams[-1])
+            required_by_group.append(required_roles)
+            for role in required_roles:
+                compute_weight = param_group.get_unsharded_weight_buffer(role)
+                if compute_weight is not None:
+                    outputs_by_group[index][role] = compute_weight
+                    continue
 
-                    weight_buffer = param_group.weight_buffers[role]
-                    source_placements = param_group.state.weight_valid_by_role[role]
-                    source = weight_buffer.view(list(source_placements))
-                    persistent_placements = tuple(weight_buffer.placements)
-                    if persistent_placements == param_group.full_placements:
-                        output = weight_buffer
-                    else:
-                        scratch_role = f"full_weight:{role.value}"
-                        output = param_group._allocate_scratch(
-                            scratch_role, weight_buffer, param_group.full_placements
-                        )
-                        param_group.state.full_weights[role] = output
-                    plans.append(
-                        (
-                            index,
-                            param_group,
-                            role,
-                            source_placements,
-                            persistent_placements,
-                            source,
-                            output,
-                        )
+                weight_buffer = param_group.weight_buffers[role]
+                source_placements = param_group.state.weight_valid_by_role[role]
+                source = weight_buffer.view(list(source_placements))
+                persistent_placements = tuple(weight_buffer.placements)
+                if persistent_placements == param_group.full_placements:
+                    output = weight_buffer
+                else:
+                    scratch_role = f"full_weight:{role.value}"
+                    output = param_group._allocate_scratch(
+                        scratch_role, weight_buffer, param_group.full_placements
                     )
-        except Exception:
-            for _, param_group, role, _, _, _, output in plans:
-                if param_group.state.full_weights.get(role) is output:
-                    param_group._release_scratch(f"full_weight:{role.value}", output)
-                    param_group.state.full_weights.pop(role, None)
-            raise
+                    param_group.state.full_weights[role] = output
+                plans.append(
+                    (
+                        index,
+                        param_group,
+                        role,
+                        source_placements,
+                        persistent_placements,
+                        source,
+                        output,
+                    )
+                )
 
         if plans:
             DataParallelBuffer.redistribute_buffers(
@@ -969,9 +962,12 @@ class ParameterGroup:
             self.state.grad_phase = GradientPhase.ACCUMULATING
             return caller_stream
 
-        grad_input = self.state.full_grad.view(self.contribution_placements)
+        full_grad = self.state.full_grad.view(self.contribution_placements)
+        comm_dtype = self.mp_policy.grad_comm_dtype or full_grad.dtype
+        if comm_dtype != full_grad.dtype:
+            full_grad = self._allocate_scratch("grad_comm", full_grad, self.full_placements)
         if self.gradient_scaling_factor not in (None, 1.0):
-            grad_input.data.mul_(self.gradient_scaling_factor)
+            full_grad.data.mul_(self.gradient_scaling_factor)
 
         # The inner-DP placement is the persistent accumulation state for
         # ZeRO-2/3 and HSDP. DDP/ZeRO-1 instead start from their full
@@ -988,9 +984,9 @@ class ParameterGroup:
         )
         needs_outer_reduction = tuple(target) != self.layout.main_weight
 
-        reduced_grad = grad_input if has_accumulation else main_grad
+        reduced_grad = full_grad if has_accumulation else main_grad
         DataParallelBuffer.redistribute_buffers(
-            [grad_input],
+            [full_grad],
             target,
             output_buffers=[reduced_grad],
             streams=axis_streams,
