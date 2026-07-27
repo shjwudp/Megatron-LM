@@ -14,7 +14,7 @@
 | `param_group.py` | `ParameterGroup.unshard()`, `reduce_grad()`, `release_temporary_grad_buffers()`, `_init_buffers()` (memory optimization) |
 | `dp_buffer.py` | Placement-shaped flat-buffer views and one-axis redistribution collectives |
 | `allocator.py` | `BucketAllocator` hierarchy: `TemporaryBucketAllocator`, `StorageFreeingBucketAllocator`, `TracePoolAllocator` — pooled memory for unsharded parameter and gradient buffers |
-| `mcore_fsdp_adapter.py` | `FullyShardedDataParallel.stop_communication()` — synchronizes ag_stream and rs_stream into main stream |
+| `mcore_fsdp_adapter.py` | `FullyShardedDataParallel.stop_communication()` — synchronizes all AG and RS streams into the main stream |
 | `utils.py` | V2-to-v1 compatibility proxy used by the existing EP-overlap schedule |
 
 The generic `combined_1f1b` schedule remains unchanged. `find_megatron_fsdp()`
@@ -32,8 +32,8 @@ One instance is created by the root `FSDPModule` at `_init_fsdp_state()` time an
 @dataclass
 class _FSDPRootContext:
     # --- CUDA streams ---
-    ag_stream: torch.cuda.Stream   # all-gather (unshard) side stream
-    rs_stream: torch.cuda.Stream   # reduce-scatter side stream
+    ag_streams: Tuple[torch.cuda.Stream, ...]  # one all-gather stream per mesh axis
+    rs_streams: Tuple[torch.cuda.Stream, ...]  # one reduce-scatter stream per mesh axis
     # When the corresponding feature flag is False, these are set to
     # torch.cuda.current_stream() so stream-context switches become no-ops.
 
@@ -268,7 +268,8 @@ module.post_backward_issued = True
 
 ```python
 def reduce_grad(self, async_op: bool = False):
-    stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
+    # Reduction traverses mesh axes in reverse.
+    stream = ctx.rs_streams[-1] if async_op else torch.cuda.current_stream()
 
     # --- Step 1: Sliding drain — free grad buffers 2 positions back in backward order ---
     if async_op:
@@ -403,7 +404,6 @@ Registered on the root by `_register_post_backward_final_callback()` via
 ```python
 def _post_backward_final_callback(root_state, root_module):
     ctx = root_module._fsdp_root_context
-    stream = ctx.rs_stream
 
     # Handle modules whose post_backward hook was never triggered
     # (e.g. modules with no grad-requiring inputs on this micro-batch)
@@ -420,8 +420,10 @@ def _post_backward_final_callback(root_state, root_module):
             event.wait()
             param_group.release_temporary_grad_buffers()
 
-    # Ensure main stream sees all rs_stream work before optimizer step
-    torch.cuda.current_stream().wait_stream(stream)
+    # Ensure the caller sees every reduction stage before the optimizer step.
+    caller_stream = torch.cuda.current_stream()
+    for stream in ctx.rs_streams:
+        caller_stream.wait_stream(stream)
 
     root_state._post_backward_callback_queued = False
 ```
@@ -465,10 +467,11 @@ optimizer-facing DTensor shards through `optimizer_params`.
    contains the full value.
 3. The post-backward hook reduce-scatters that temporary full buffer and
    accumulates the result into the persistent sharded `main_grad_buffer.data`.
-   With overlap enabled, this reduce-scatter is launched on `ctx.rs_stream` and
+   With overlap enabled, this 1D reduce-scatter is launched on
+   `ctx.rs_streams[-1]` and
    the normal sliding drain/final callback releases the temporary buffer after
    its event completes.
-4. `finish_grad_sync()` only waits for outstanding `rs_stream` work for
+4. `finish_grad_sync()` only waits for outstanding `rs_streams` work for
    `optim_grads`; it does not launch another reduce-scatter.
 5. The optimizer updates this rank's sharded `main_weight_buffer` view. The next
    forward refreshes replicated compute weights the same way as ZeRO-1.
@@ -812,12 +815,13 @@ For the `fully_shard` path, the implementation was previously `NotImplementedErr
 calls:
 
 ```python
-torch.cuda.current_stream().wait_stream(ctx.ag_stream)  # finish all-gather work
-torch.cuda.current_stream().wait_stream(ctx.rs_stream)   # finish reduce-scatter work
+caller_stream = torch.cuda.current_stream()
+for stream in (*ctx.ag_streams, *ctx.rs_streams):
+    caller_stream.wait_stream(stream)
 ```
 
-This brings both communication streams into the main stream, ensuring the optimizer sees
-fully-synchronized parameters and gradients.
+This brings every communication stream into the caller stream, ensuring the
+optimizer sees fully synchronized parameters and gradients.
 
 ---
 

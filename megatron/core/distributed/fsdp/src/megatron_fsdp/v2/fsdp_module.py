@@ -53,11 +53,6 @@ class _FSDPRootContext:
     ag_streams: Tuple[torch.cuda.Stream, ...]  # one all-gather stream per mesh axis
     rs_streams: Tuple[torch.cuda.Stream, ...]  # one reduce-scatter stream per mesh axis
 
-    @property
-    def rs_stream(self) -> torch.cuda.Stream:
-        """Return the first HSDP reduction stream for shared-stream call sites."""
-        return self.rs_streams[-1]
-
     # ------------------------------------------------------------------
     # Bucket allocator
     # ------------------------------------------------------------------
@@ -772,7 +767,9 @@ class FSDPModule:
         torch.cuda.nvtx.range_push("MFSDP reduce_grad")
         ctx = self._fsdp_root_context
         caller_stream = torch.cuda.current_stream()
-        stream = ctx.rs_stream if async_op else caller_stream
+        # Reduction traverses mesh axes in reverse, so the last axis stream
+        # executes the first reduction stage.
+        stream = ctx.rs_streams[-1] if async_op else caller_stream
 
         # Handle pending reduce events before this module to release buffers promptly.
         self._wait_for_previous_async_reduce_grad()
