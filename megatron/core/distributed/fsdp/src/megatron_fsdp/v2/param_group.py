@@ -957,86 +957,69 @@ class ParameterGroup:
         """
         caller_stream = torch.cuda.current_stream()
         axis_streams = self._axis_streams(stream=stream, streams=streams)
-        try:
-            if self.state.full_grad is None:
-                raise RuntimeError("acquire_full_grad_buffer() must run before reduce_grad()")
-            if self.state.grad_phase is GradientPhase.READY:
-                raise RuntimeError("zero_grad() must run before starting another gradient")
 
-            if self.accumulates_full_grad and not is_last_backward:
-                # DDP and ZeRO-1 accumulate microbatches directly in persistent
-                # full-gradient storage, so they communicate only on the last one.
-                self.state.grad_phase = GradientPhase.ACCUMULATING
-                self.release_temporary_grad_buffers()
-                return caller_stream
+        if self.state.full_grad is None:
+            raise RuntimeError("acquire_full_grad_buffer() must run before reduce_grad()")
+        if self.state.grad_phase is GradientPhase.READY:
+            raise RuntimeError("zero_grad() must run before starting another gradient")
 
-            grad_input = self.state.full_grad
-            if tuple(grad_input.placements) != self.contribution_placements:
-                grad_input = self._placement_view(grad_input, self.contribution_placements)
-            comm_dtype = self.mp_policy.grad_comm_dtype or grad_input.dtype
-            comm_key = (self.param_group_id, "grad_comm")
-            if comm_dtype != grad_input.dtype:
-                grad_input = grad_input.cast(
-                    comm_dtype,
-                    allocator=self.allocator,
-                    allocator_key=comm_key,
-                )
-                self.state.grad_comm = grad_input
-            if self.gradient_scaling_factor not in (None, 1.0):
-                grad_input.data.mul_(self.gradient_scaling_factor)
+        if self.accumulates_full_grad and not is_last_backward:
+            # DDP and ZeRO-1 accumulate microbatches directly in persistent
+            # full-gradient storage, so they communicate only on the last one.
+            self.state.grad_phase = GradientPhase.ACCUMULATING
+            return caller_stream
 
-            # The inner-DP placement is the persistent accumulation state for
-            # ZeRO-2/3 and HSDP. DDP/ZeRO-1 instead start from their full
-            # accumulation and reduce directly toward the inner optimizer state.
-            if self.accumulates_full_grad:
-                inner_target = list(self.contribution_placements)
-                inner_target[-1] = self.layout.main_weight[-1]
-            else:
-                inner_target = list(self.layout.grad_accumulation)
-            accumulation = self._placement_view(self.grad_buffer, tuple(inner_target))
-            has_accumulation = (
-                not self.accumulates_full_grad
-                and self.state.grad_phase is GradientPhase.ACCUMULATING
+        grad_input = self.state.full_grad.view(self.contribution_placements)
+        if self.gradient_scaling_factor not in (None, 1.0):
+            grad_input.data.mul_(self.gradient_scaling_factor)
+
+        # The inner-DP placement is the persistent accumulation state for
+        # ZeRO-2/3 and HSDP. DDP/ZeRO-1 instead start from their full
+        # accumulation and reduce directly toward the inner optimizer state.
+        if self.accumulates_full_grad:
+            target = list(self.contribution_placements)
+            target[-1] = self.layout.main_weight[-1]
+        else:
+            target = list(self.layout.grad_accumulation)
+        main_grad = self.grad_buffer.view(tuple(target))
+        has_accumulation = (
+            not self.accumulates_full_grad
+            and self.state.grad_phase is GradientPhase.ACCUMULATING
+        )
+        needs_outer_reduction = tuple(target) != self.layout.main_weight
+
+        reduced_grad = grad_input if has_accumulation else main_grad
+        DataParallelBuffer.redistribute_buffers(
+            [grad_input],
+            target,
+            output_buffers=[reduced_grad],
+            streams=axis_streams,
+            async_op=async_op,
+        )
+        if has_accumulation:
+            main_grad.data.add_(reduced_grad.data)
+        terminal_stream = axis_streams[-1]
+
+        if is_last_backward and needs_outer_reduction:
+            final = self._placement_view(self.grad_buffer, self.layout.main_weight)
+            outer_stream = axis_streams[0]
+            if outer_stream != terminal_stream:
+                outer_stream.wait_stream(terminal_stream)
+            DataParallelBuffer.redistribute_buffers(
+                [main_grad],
+                list(self.layout.main_weight),
+                output_buffers=[final],
+                streams=axis_streams,
+                async_op=async_op,
             )
-            needs_outer_reduction = tuple(inner_target) != self.layout.main_weight
+            terminal_stream = outer_stream
 
-            inner_stream = axis_streams[-1]
-            if inner_stream != caller_stream:
-                inner_stream.wait_stream(caller_stream)
-            with torch.cuda.stream(inner_stream):
-                current = grad_input.redistribute(
-                    inner_target,
-                    output_buffer=(
-                        None if is_last_backward and needs_outer_reduction else accumulation
-                    ),
-                    add_buffer=accumulation if has_accumulation else None,
-                    allocator=self.allocator,
-                    allocator_key=comm_key,
-                )
-            terminal_stream = inner_stream
+        self.state.grad_phase = (
+            GradientPhase.READY if is_last_backward else GradientPhase.ACCUMULATING
+        )
+        if is_last_backward:
+            self._install_optimizer_grads()
 
-            if is_last_backward and needs_outer_reduction:
-                final = self._placement_view(self.grad_buffer, self.layout.main_weight)
-                outer_stream = axis_streams[0]
-                if outer_stream != inner_stream:
-                    outer_stream.wait_stream(inner_stream)
-                with torch.cuda.stream(outer_stream):
-                    current.redistribute(
-                        list(self.layout.main_weight),
-                        output_buffer=final,
-                        allocator=self.allocator,
-                        allocator_key=comm_key,
-                    )
-                terminal_stream = outer_stream
-
-            self.state.grad_phase = (
-                GradientPhase.READY if is_last_backward else GradientPhase.ACCUMULATING
-            )
-            if is_last_backward:
-                self._install_optimizer_grads()
-        except Exception:
-            self.release_temporary_grad_buffers()
-            raise
         if terminal_stream == caller_stream:
             self.release_temporary_grad_buffers()
         return terminal_stream

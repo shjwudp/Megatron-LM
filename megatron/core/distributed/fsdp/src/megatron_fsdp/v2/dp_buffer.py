@@ -4,23 +4,21 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from copy import copy
-from typing import Hashable, Iterable, Optional, Sequence
+from typing import Iterable, Optional, Sequence
 
 import torch
 from torch.distributed import _coalescing_manager
 from torch.distributed.tensor import DeviceMesh
 
-from .allocator import BucketAllocator
 from .buffer_index import BufferIndex, Placement
 
 
 class DataParallelBuffer:
     """Manage mesh-aware flat storage for tensor values.
 
-    The buffer owns layout and placement transitions. Persistent storage is
-    allocated by its caller and attached with :meth:`bind`. Redistribution may
-    use a caller-provided allocator for a returned temporary buffer, while the
-    caller remains responsible for releasing that allocator lease.
+    The buffer owns layout and placement transitions. Storage is allocated by
+    its caller and attached with :meth:`bind`; allocator policy and temporary
+    storage lifetimes belong to the owning ``ParameterGroup``.
     """
 
     def __init__(
@@ -157,35 +155,6 @@ class DataParallelBuffer:
         alias._storage_owner = self
         return alias
 
-    @torch.no_grad()
-    def cast(
-        self,
-        dtype: torch.dtype,
-        *,
-        allocator: BucketAllocator,
-        allocator_key: Hashable,
-    ) -> "DataParallelBuffer":
-        """Copy this buffer into allocator-backed storage with another dtype.
-
-        ``PARTIAL`` is a logical validity state, so its physical storage is
-        allocated as ``REPLICATE``. The returned logical view retains that
-        containing buffer, allowing later redistribution stages to reuse it.
-        The caller owns the allocator lease identified by ``allocator_key``.
-        """
-        if dtype == self.dtype:
-            return self
-        if self.data is None:
-            raise RuntimeError("Casting requires a bound input buffer")
-
-        output = self._allocate_temporary(
-            self.placements,
-            dtype=dtype,
-            allocator=allocator,
-            allocator_key=allocator_key,
-        )
-        output.data.copy_(self.data)
-        return output
-
     @staticmethod
     @torch.no_grad()
     def redistribute_buffers(
@@ -304,9 +273,6 @@ class DataParallelBuffer:
         target_placements: list[Placement],
         *,
         output_buffer: "DataParallelBuffer" | None = None,
-        add_buffer: "DataParallelBuffer" | None = None,
-        allocator: BucketAllocator | None = None,
-        allocator_key: Hashable | None = None,
     ) -> "DataParallelBuffer":
         """Redistribute one mesh axis and return the destination DP buffer.
 
@@ -314,28 +280,13 @@ class DataParallelBuffer:
         in-place all-gather whose ``REPLICATE`` output owns full storage while
         this ``SHARD`` input is a slice sharing that same storage.
 
-        ``add_buffer`` adds an existing value at the target placements after
-        communication. If it aliases ``output_buffer``, communication first
-        uses a target-shaped view of the input's containing storage, preserving
-        the old output value until the addition.
-
-        When no output is supplied and the input storage does not contain the
-        target, ``allocator`` and ``allocator_key`` may allocate a temporary
-        result. The returned buffer owns that lease logically; its caller must
-        release the allocator key after the result's terminal stream completes.
+        Dtype conversion, gradient scaling, accumulation, and temporary
+        communication storage are intentionally outside this abstraction.
         """
         if len(target_placements) != self.mesh.ndim:
             raise ValueError(
                 f"Expected {self.mesh.ndim} target placements, got {target_placements}"
             )
-        if (allocator is None) != (allocator_key is None):
-            raise ValueError("allocator and allocator_key must be specified together")
-        if output_buffer is not None:
-            self._validate_output_buffer(
-                output_buffer, target_placements, require_same_dtype=False
-            )
-        if add_buffer is not None:
-            self._validate_output_buffer(add_buffer, target_placements, require_same_dtype=False)
 
         changed_axis = None
         for axis, (source, target) in enumerate(zip(self.placements, target_placements)):
@@ -349,19 +300,12 @@ class DataParallelBuffer:
             changed_axis = axis
         if changed_axis is None:
             if output_buffer is None:
-                output_buffer = self
+                return self
+            self._validate_output_buffer(output_buffer, target_placements)
             if self.data is None:
                 raise RuntimeError("Redistribution requires a bound input buffer")
-            communication_output = self._communication_output(
-                target_placements,
-                output_buffer=output_buffer,
-                add_buffer=add_buffer,
-                allocator=allocator,
-                allocator_key=allocator_key,
-            )
-            if communication_output.data.data_ptr() != self.data.data_ptr():
-                communication_output.data.copy_(self.data)
-            self._finish_redistribution(communication_output, output_buffer, add_buffer)
+            if output_buffer.data.data_ptr() != self.data.data_ptr():
+                output_buffer.data.copy_(self.data)
             return output_buffer
 
         source = self.placements[changed_axis]
@@ -371,27 +315,22 @@ class DataParallelBuffer:
         if source is Placement.REPLICATE and target is Placement.SHARD:
             if output_buffer is None:
                 output_buffer = self.view(target_placements)
+            else:
+                self._validate_output_buffer(output_buffer, target_placements)
         elif target is Placement.PARTIAL:
             if output_buffer is None:
                 output_buffer = self.reinterpret(target_placements)
-        elif output_buffer is None:
-            output_buffer = self._communication_output(
-                target_placements,
-                output_buffer=None,
-                add_buffer=add_buffer,
-                allocator=allocator,
-                allocator_key=allocator_key,
-            )
-
-        communication_output = self._communication_output(
-            target_placements,
-            output_buffer=output_buffer,
-            add_buffer=add_buffer,
-            allocator=allocator,
-            allocator_key=allocator_key,
-        )
+            else:
+                self._validate_output_buffer(output_buffer, target_placements)
+        else:
+            if output_buffer is None:
+                raise ValueError(
+                    f"Redistribution {self.placements} -> {target_placements} "
+                    "requires an externally bound output buffer"
+                )
+            self._validate_output_buffer(output_buffer, target_placements)
         input_data = self.data
-        output_data = communication_output.data
+        output_data = output_buffer.data
         if input_data is None or output_data is None:
             raise RuntimeError("Redistribution requires bound input and output buffers")
 
@@ -416,25 +355,18 @@ class DataParallelBuffer:
         else:
             raise NotImplementedError(f"Unsupported placement transition: {source!r} -> {target!r}")
 
-        self._finish_redistribution(communication_output, output_buffer, add_buffer)
         return output_buffer
 
     def _validate_output_buffer(
-        self,
-        output_buffer: "DataParallelBuffer",
-        target_placements: list[Placement],
-        *,
-        require_same_dtype: bool = True,
+        self, output_buffer: "DataParallelBuffer", target_placements: list[Placement]
     ) -> None:
         """Validate an explicit redistribution destination."""
         if output_buffer.buffer_index is not self.buffer_index:
             raise ValueError("Redistribution output must share the input buffer layout")
         if output_buffer.mesh is not self.mesh:
             raise ValueError("Redistribution output must share the input buffer mesh")
-        if output_buffer.device != self.device:
-            raise ValueError("Redistribution output must share the input device")
-        if require_same_dtype and output_buffer.dtype != self.dtype:
-            raise ValueError("Redistribution output must share the input dtype")
+        if output_buffer.dtype != self.dtype or output_buffer.device != self.device:
+            raise ValueError("Redistribution output must share the input dtype and device")
         if output_buffer.placements != target_placements:
             raise ValueError(
                 f"Output placements {output_buffer.placements} do not match target "
@@ -446,112 +378,6 @@ class DataParallelBuffer:
                 f"Output buffer size does not match target: expected {expected_size}, "
                 f"got {None if output_buffer.data is None else output_buffer.data.numel()}"
             )
-
-    def _communication_output(
-        self,
-        target_placements: list[Placement],
-        *,
-        output_buffer: "DataParallelBuffer" | None,
-        add_buffer: "DataParallelBuffer" | None,
-        allocator: BucketAllocator | None,
-        allocator_key: Hashable | None,
-    ) -> "DataParallelBuffer":
-        """Select same-dtype communication storage without clobbering an addend."""
-        output_can_receive = (
-            output_buffer is not None
-            and output_buffer.dtype == self.dtype
-            and (
-                add_buffer is None
-                or output_buffer.data.data_ptr() != add_buffer.data.data_ptr()
-            )
-        )
-        if output_can_receive:
-            return output_buffer
-
-        workspace = self._containing_view(target_placements, exclude=add_buffer)
-        if workspace is not None:
-            return workspace
-        if output_buffer is not None:
-            raise ValueError(
-                "Redistribution needs same-dtype temporary storage to preserve or convert "
-                "the explicit output, but the input storage does not contain the target"
-            )
-        if allocator is None or allocator_key is None:
-            raise ValueError(
-                f"Redistribution {self.placements} -> {target_placements} requires "
-                "an output buffer or temporary allocator"
-            )
-        return self._allocate_temporary(
-            target_placements,
-            dtype=self.dtype,
-            allocator=allocator,
-            allocator_key=allocator_key,
-        )
-
-    @staticmethod
-    def _finish_redistribution(
-        communication_output: "DataParallelBuffer",
-        output_buffer: "DataParallelBuffer",
-        add_buffer: "DataParallelBuffer" | None,
-    ) -> None:
-        """Apply the optional addend and commit the communication result."""
-        if add_buffer is not None:
-            communication_output.data.add_(add_buffer.data)
-        if communication_output.data.data_ptr() != output_buffer.data.data_ptr():
-            output_buffer.data.copy_(communication_output.data)
-
-    def _containing_view(
-        self,
-        placements: list[Placement],
-        *,
-        exclude: "DataParallelBuffer" | None = None,
-    ) -> "DataParallelBuffer" | None:
-        """Return a target-shaped view from this buffer's storage-owner chain."""
-        physical = [
-            Placement.REPLICATE if placement is Placement.PARTIAL else placement
-            for placement in placements
-        ]
-        candidate: DataParallelBuffer | None = self
-        while candidate is not None:
-            try:
-                view = candidate if candidate.placements == physical else candidate.view(physical)
-                view = view if physical == placements else view.reinterpret(placements)
-                if exclude is None or view.data.data_ptr() != exclude.data.data_ptr():
-                    return view
-            except ValueError:
-                pass
-            candidate = candidate._storage_owner
-        return None
-
-    def _allocate_temporary(
-        self,
-        placements: list[Placement],
-        *,
-        dtype: torch.dtype,
-        allocator: BucketAllocator,
-        allocator_key: Hashable,
-    ) -> "DataParallelBuffer":
-        """Allocate containing storage and return its requested logical view."""
-        physical = [
-            Placement.REPLICATE if placement is Placement.PARTIAL else placement
-            for placement in placements
-        ]
-        owner = DataParallelBuffer(
-            buffer_index=self.buffer_index,
-            dtype=dtype,
-            device=self.device,
-            mesh=self.mesh,
-            placements=physical,
-        )
-        owner.bind(
-            allocator.allocate(
-                key=allocator_key,
-                size=owner.data_size,
-                dtype=owner.dtype,
-                device=owner.device,
-            ).data
-        )
-        return owner if physical == placements else owner.reinterpret(placements)
 
     def _bound_view(self, placements: list[Placement]) -> torch.Tensor:
         """Return a placement-shaped view when the bound storage contains it."""
