@@ -62,26 +62,27 @@ DTensor field.
 | `zero_grad(set_to_none=True)` | Clear optimizer-facing gradient references, unbind any direct DDP/ZeRO-1 full-gradient view, privately cache and detach reusable DTensor wrappers, reset accumulation state, and release `grad_buffer.data` if nothing still references valid gradients. |
 | `zero_grad(set_to_none=False)` | Keep `grad_buffer.data` and any direct full-gradient view allocated and zero storage in place. |
 
-`_release_grad_storage_if_unused()` is also called from the forward pre-hook.
+`release_grad_storage_if_unused()` is also called from the forward pre-hook.
 That call is idempotent and handles the common case where `zero_grad()` has
 already cleared all optimizer-facing gradient references before the next
 forward.
 
 The normal root forward additionally calls
 `FSDPModule._release_grad_storage_if_unused()` before the first parameter
-unshard. This root-wide sweep supports plain PyTorch optimizers: their
+unshard. The module method only traverses the root's parameter groups and
+delegates to `ParameterGroup.release_grad_storage_if_unused()`. This root-wide
+sweep supports plain PyTorch optimizers: their
 `zero_grad(set_to_none=True)` clears `optimizer_param.grad` but does not call the
 FSDP module's zero-grad method, leaving parameter-group accumulation flags from
-the previous step. When no optimizer-facing gradient is live anywhere in the
-FSDP root, the sweep resets those stale flags through
-`ParameterGroup.zero_grad()` and releases every eligible grad buffer. If any
-gradient remains live, the sweep is a no-op because the model may be between
-gradient-accumulation microbatches.
+the previous step. Each parameter group independently retains live or
+accumulating gradients and resets stale state through `ParameterGroup.zero_grad()`
+when its optimizer-facing gradients have been cleared.
 
 The root-wide sweep is outside the full-iteration CUDA graph lifecycle. When
-`enable_full_iteration_cuda_graph=True`, it returns before gradient-liveness
-inspection and never calls `ParameterGroup.zero_grad()`. Full-iteration mode
-keeps graph-visible gradient objects and owns its in-place zeroing separately.
+`enable_full_iteration_cuda_graph=True`, each parameter-group guard returns
+before gradient-liveness inspection and never calls `ParameterGroup.zero_grad()`.
+Full-iteration mode keeps graph-visible gradient objects and owns its in-place
+zeroing separately.
 
 Doing this at the root boundary is important: the older per-module release
 path ran after each module unshard, so later-layer gradient shards could overlap
@@ -91,7 +92,7 @@ directly.
 
 ## Release guard
 
-`_release_grad_storage_if_unused()` frees `grad_buffer.data` only when all
+`release_grad_storage_if_unused()` frees `grad_buffer.data` only when all
 of these are true:
 
 - full-iteration CUDA graph mode is not enabled for the group;
@@ -152,8 +153,8 @@ accumulation flags:
 
 Full-iteration CUDA graph mode keeps optimizer-facing gradient storage alive so
 the captured step can reuse stable gradient objects. In that mode,
-both the root-wide and per-parameter-group
-`_release_grad_storage_if_unused()` paths return without scanning or freeing
+both the root-wide and per-module
+`release_grad_storage_if_unused()` calls return without scanning or freeing
 the buffer, and the full-iteration optimizer lifecycle clears the existing
 storage in place.
 
@@ -165,6 +166,6 @@ same buffer surface.
 
 | File | Relevant pieces |
 | --- | --- |
-| `param_group.py` | `_init_buffers()`, `prepare_gradient_storage()`, `_release_grad_storage_if_unused()`, `zero_grad()` |
-| `fsdp_module.py` | `reduce_grad()` installs optimizer-facing grads; root-wide `_release_grad_storage_if_unused()` handles plain optimizer zero-grad |
-| `hooks.py` | Root-before-unshard and per-module forward pre-hook release paths, plus CUDA-graph pre-initialization |
+| `param_group.py` | `_init_buffers()`, `prepare_gradient_storage()`, `release_grad_storage_if_unused()`, `zero_grad()` |
+| `fsdp_module.py` | `reduce_grad()` installs optimizer-facing gradients; `_release_grad_storage_if_unused()` traverses the root's parameter groups |
+| `hooks.py` | Root-before-unshard and per-module gradient-storage release paths, plus CUDA-graph pre-initialization |

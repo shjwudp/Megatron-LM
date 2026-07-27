@@ -341,7 +341,7 @@ class ParameterGroup:
         """Move persistent storage to CPU and return offloaded/skipped byte counts."""
         self._join_pending_weights()
         self.reshard_weight()
-        self.release_grad_buffer()
+        self.release_temporary_grad_buffers()
         offloaded_bytes = 0
         skipped_bytes = 0
         owners = sorted(
@@ -864,8 +864,8 @@ class ParameterGroup:
             self._release_scratch(f"full_weight:{role.value}", buffer)
         self.state.full_weights.clear()
 
-    def release_grad_buffer(self) -> None:
-        """Release per-backward gradient bindings and allocator-backed buffers."""
+    def release_temporary_grad_buffers(self) -> None:
+        """Release per-backward gradient bindings and allocator-backed scratch buffers."""
         for param in self.params:
             if hasattr(param, "main_grad"):
                 del param.main_grad
@@ -1096,10 +1096,10 @@ class ParameterGroup:
                 is_last_backward=is_last_backward, streams=axis_streams, async_op=async_op
             )
         except Exception:
-            self.release_grad_buffer()
+            self.release_temporary_grad_buffers()
             raise
         if terminal_stream == caller_stream:
-            self.release_grad_buffer()
+            self.release_temporary_grad_buffers()
         return terminal_stream
 
     def optimizer_weight(self) -> DataParallelBuffer:
@@ -1151,7 +1151,7 @@ class ParameterGroup:
     @torch.no_grad()
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Reset logical gradient state and optimizer-facing gradients."""
-        self.release_grad_buffer()
+        self.release_temporary_grad_buffers()
         self.state.grad_phase = GradientPhase.EMPTY
         if self.enable_full_iteration_cuda_graph:
             self.prepare_gradient_storage()

@@ -131,7 +131,7 @@ class TestMegatronFSDPE2E:
                 while pending:
                     event, pending_group = pending.pop()
                     event.synchronize()
-                    pending_group.release_grad_buffer()
+                    pending_group.release_temporary_grad_buffers()
 
             try:
                 # MB1: scale a fused wgrad into the fresh optimizer shard.

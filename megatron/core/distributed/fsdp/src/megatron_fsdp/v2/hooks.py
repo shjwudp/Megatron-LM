@@ -91,8 +91,8 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
     if target._fsdp_state._is_root and not is_recompute:
         # A plain torch optimizer clears ``dist_param.grad`` without entering
         # FSDPModule.zero_grad(). Sweep every FSDP parameter group at the root
-        # boundary so stale distributed-gradient storage is released before
-        # the first parameter unshard of the new forward.
+        # boundary so eligible storage is released before the first parameter
+        # unshard of the new forward.
         target._release_grad_storage_if_unused()
         # The last-backward contract guarantees that an optimizer decision has
         # happened before this next normal forward. Install updated main-weight
@@ -285,7 +285,7 @@ def mfsdp_post_backward_final_callback(root_module: nn.Module):
         while len(buckets) > 0:
             event, param_group = buckets.pop()
             event.wait()
-            param_group.release_grad_buffer()
+            param_group.release_temporary_grad_buffers()
     caller_stream = torch.cuda.current_stream()
     for stream in ctx.rs_streams:
         caller_stream.wait_stream(stream)

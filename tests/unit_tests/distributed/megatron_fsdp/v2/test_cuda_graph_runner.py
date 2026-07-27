@@ -58,7 +58,7 @@ def test_capture_backward_post_hook_clears_only_unsharded_parameter_grads():
             SimpleNamespace(
                 params=[full_param],
                 dist_params=[dist_param],
-                release_grad_buffer=lambda: release_calls.append(True),
+                release_temporary_grad_buffers=lambda: release_calls.append(True),
             )
         ],
         reshard=lambda: reshard_calls.append(True),
@@ -90,7 +90,10 @@ def test_capture_backward_post_hook_releases_reusable_trace_pool_grad_slot():
     allocator.allocate(key=first_key, size=16, dtype=torch.float32, device=torch.device("cpu"))
     module = SimpleNamespace(
         _fsdp_param_groups=[
-            SimpleNamespace(params=[], release_grad_buffer=lambda: allocator.free(key=first_key))
+            SimpleNamespace(
+                params=[],
+                release_temporary_grad_buffers=lambda: allocator.free(key=first_key),
+            )
         ],
         reshard=lambda: None,
     )
@@ -140,7 +143,7 @@ def test_reduce_grad_skips_aliased_main_grad_copy():
         mp_policy=SimpleNamespace(use_decoupled_grad=False),
         prepare_gradient_storage=lambda: None,
         reduce_grad=lambda **_: reduce_calls.append(True),
-        release_grad_buffer=lambda: release_calls.append(True),
+        release_temporary_grad_buffers=lambda: release_calls.append(True),
     )
     module = SimpleNamespace(
         _fsdp_root_context=SimpleNamespace(rs_stream=None, is_last_backward=True),

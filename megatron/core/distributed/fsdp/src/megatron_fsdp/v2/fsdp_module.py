@@ -277,7 +277,7 @@ class FSDPModule:
         allocator = ctx.bucket_allocator
         for module in self._get_fsdp_modules(recursive=True):
             for pg in module._fsdp_param_groups:
-                pg.release_grad_buffer()
+                pg.release_temporary_grad_buffers()
 
         if not isinstance(allocator, TracePoolAllocator):
             return
@@ -756,7 +756,7 @@ class FSDPModule:
                 while len(buckets) > 0:
                     event, param_group = buckets.pop()
                     event.wait()
-                    param_group.release_grad_buffer()
+                    param_group.release_temporary_grad_buffers()
             if module is self:
                 break
 
@@ -892,7 +892,7 @@ class FSDPModule:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release temporary workspaces.
                 completion_stream = param_group.reduce_grad(is_last_backward=ctx.is_last_backward)
-                param_group.release_grad_buffer()
+                param_group.release_temporary_grad_buffers()
 
             # Install reduced gradients to distributed parameters
             for name, param, dist_param, dist_grad in zip(
@@ -971,43 +971,10 @@ class FSDPModule:
                 param_group.zero_grad(set_to_none=set_to_none)
 
     def _release_grad_storage_if_unused(self) -> None:
-        """Release stale gradient storage across the complete FSDP root.
-
-        A plain ``torch.optim.Optimizer.zero_grad(set_to_none=True)`` clears
-        optimizer-facing ``dist_param.grad`` references without calling
-        :meth:`FSDPModule.zero_grad`, so the parameter-group accumulation flags
-        may still describe the previous step. At the next root forward, an
-        absence of optimizer-facing gradients across *all* parameter groups is
-        an optimizer-boundary signal. Reset those stale flags through the
-        parameter-group zero-grad path and release every eligible grad buffer
-        before any parameter unshard can overlap it.
-
-        If any gradient is still live, the model may be between accumulated
-        microbatches, so this method leaves every group untouched.
-
-        Full-iteration CUDA graph mode owns stable optimizer-facing gradient
-        storage across iterations. Its zeroing is part of the graph-compatible
-        optimizer lifecycle, so this eager root sweep must not inspect or
-        mutate parameter-group gradient state in that mode.
-        """
-        if self._fsdp_state.enable_full_iteration_cuda_graph:
-            return
-
-        param_groups = [
-            param_group
-            for child in self._get_fsdp_modules(recursive=True)
-            for param_group in child._fsdp_param_groups
-        ]
-        if any(
-            getattr(dist_param, "grad", None) is not None
-            or getattr(dist_param, "decoupled_grad", None) is not None
-            for param_group in param_groups
-            for dist_param in param_group.optimizer_params
-        ):
-            return
-
-        for param_group in param_groups:
-            param_group.zero_grad(set_to_none=True)
+        """Release unused gradient storage across the complete FSDP root."""
+        for child in self._get_fsdp_modules(recursive=True):
+            for param_group in child._fsdp_param_groups:
+                param_group.release_grad_storage_if_unused()
 
     def _zero_grad_buffer(self):
         """Zero the gradient buffer for all parameter groups."""

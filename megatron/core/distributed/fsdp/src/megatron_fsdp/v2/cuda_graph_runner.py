@@ -498,6 +498,6 @@ def _make_bwd_post_hook(module):
         for param_group in module._fsdp_param_groups:
             for param in param_group.params:
                 param.grad = None
-            param_group.release_grad_buffer()
+            param_group.release_temporary_grad_buffers()
 
     return hook
