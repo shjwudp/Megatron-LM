@@ -125,7 +125,17 @@ class PendingWeightTransition:
 
 @dataclass
 class ParameterGroupState:
-    """Minimal value-validity and runtime-buffer state."""
+    """Minimal value-validity and runtime-buffer state.
+
+    ``weight_valid_by_role`` records which placements currently contain the
+    valid value in each persistent weight representation's shared storage.
+    These placements may differ from the representation buffer's placements.
+    For example, after an outer-sharded HSDP optimizer update, only the
+    ``[S, S]`` optimizer view is valid in storage whose persistent model-weight
+    buffer is ``[R, S]``. The outer-DP all-gather restores ``[R, S]`` validity.
+    An asynchronous transition updates this mapping only after its consumer
+    stream has waited for the corresponding pending event.
+    """
 
     weight_valid_by_role: dict[WeightBufferRole, Placements]
     full_weights: dict[WeightBufferRole, DataParallelBuffer] = field(default_factory=dict)
