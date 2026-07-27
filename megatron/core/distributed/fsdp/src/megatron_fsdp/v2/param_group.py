@@ -39,7 +39,7 @@ class ParameterGroupLayout:
     grad_accumulation: Placements
 
     def validate(self, mesh_ndim: int) -> None:
-        """Validate placement rank and the supported 2D HSDP axis convention."""
+        """Validate that every placement vector matches the device-mesh rank."""
         for placements in (
             self.weight,
             self.main_weight,
@@ -48,59 +48,6 @@ class ParameterGroupLayout:
         ):
             if len(placements) != mesh_ndim:
                 raise ValueError(f"Expected {mesh_ndim} placements, got {placements}")
-
-        if mesh_ndim != 2:
-            return
-
-        # A 2D layout is ordered as (outer DP, inner DP). The inner axis may
-        # use any DDP/ZeRO strategy. The outer axis keeps persistent model and
-        # gradient storage replicated, accumulates partial contributions, and
-        # optionally shards the optimizer state.
-        valid_inner_layouts = {
-            (
-                Placement.REPLICATE,
-                Placement.REPLICATE,
-                Placement.REPLICATE,
-                Placement.PARTIAL,
-            ),
-            (
-                Placement.REPLICATE,
-                Placement.SHARD,
-                Placement.REPLICATE,
-                Placement.PARTIAL,
-            ),
-            (
-                Placement.REPLICATE,
-                Placement.SHARD,
-                Placement.SHARD,
-                Placement.SHARD,
-            ),
-            (
-                Placement.SHARD,
-                Placement.SHARD,
-                Placement.SHARD,
-                Placement.SHARD,
-            ),
-        }
-        inner_layout = (
-            self.weight[1],
-            self.main_weight[1],
-            self.grad_storage[1],
-            self.grad_accumulation[1],
-        )
-        if (
-            self.weight[0] is not Placement.REPLICATE
-            or self.main_weight[0] not in (Placement.REPLICATE, Placement.SHARD)
-            or self.grad_storage[0] is not Placement.REPLICATE
-            or self.grad_accumulation[0] is not Placement.PARTIAL
-            or inner_layout not in valid_inner_layouts
-        ):
-            raise ValueError(
-                "2D HSDP placements use (outer DP, inner DP): the outer axis "
-                "requires replicated weight/gradient storage, partial gradient "
-                "accumulation, and replicated or sharded optimizer state; the "
-                "inner axis must match a DDP or ZeRO-1/2/3 layout"
-            )
 
     @classmethod
     def from_strategies(

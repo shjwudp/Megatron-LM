@@ -95,8 +95,11 @@ class _FSDPRootContext:
     enable_unshard_prefetch: bool = True
     """Whether to prefetch (pipeline) parameter unshard for upcoming modules."""
 
-    outer_dp_all_gather_prefetch_depth: int = 0
+    outer_dp_all_gather_prefetch_depth: int = 1
     """Number of future HSDP modules whose persistent outer-DP weight stage is prefetched."""
+
+    has_outer_weight_all_gather: bool = False
+    """Whether this root contains an outer optimizer-sharded HSDP unit."""
 
     # ------------------------------------------------------------------
     # Reduce-scatter (gradient sync) tracking
@@ -564,6 +567,10 @@ class FSDPModule:
             unshard_done_events={id(module): None for module in forward_order},
             enable_unshard_prefetch=enable_unshard_prefetch,
             outer_dp_all_gather_prefetch_depth=outer_dp_all_gather_prefetch_depth,
+            has_outer_weight_all_gather=any(
+                _FSDPRootContext._uses_outer_weight_all_gather(module)
+                for module in forward_order
+            ),
             enable_async_reduce_grad=enable_async_reduce_grad,
             _reversed_order=list(reversed(forward_order)),
             bucket_allocator=bucket_allocator,
@@ -643,6 +650,7 @@ class FSDPModule:
             async_op
             and prefetch
             and ctx.outer_dp_all_gather_prefetch_depth > 0
+            and ctx.has_outer_weight_all_gather
         )
         if outer_prefetch:
             # Bootstrap the current outer stage. The current inner stage

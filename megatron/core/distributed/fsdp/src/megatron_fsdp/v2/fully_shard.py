@@ -43,7 +43,7 @@ def fully_shard(
     ignored_params: Optional[set[nn.Parameter]] = None,
     # --- Megatron-FSDP specific options ---
     enable_unshard_prefetch: bool = True,
-    outer_dp_all_gather_prefetch_depth: int = 0,
+    outer_dp_all_gather_prefetch_depth: int = 1,
     enable_async_reduce_grad: bool = True,
     all_gather_streams: Sequence[torch.cuda.Stream | None] | None = None,
     reduce_scatter_streams: Sequence[torch.cuda.Stream | None] | None = None,

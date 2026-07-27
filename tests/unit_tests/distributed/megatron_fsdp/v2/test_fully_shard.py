@@ -454,7 +454,7 @@ class TestFullyShardBasic:
             for param_group in model._fsdp_param_groups
         )
 
-    @pytest.mark.parametrize("depth", [0, 1, 2])
+    @pytest.mark.parametrize("depth", [None, 0, 1, 2])
     def test_hsdp_outer_weight_prefetch_window(self, depth):
         """The first unshard bootstraps and advances the outer prefetch window."""
 
@@ -479,11 +479,11 @@ class TestFullyShardBasic:
         }
         for layer in model.layers:
             fully_shard(layer, **shard_kwargs)
-        fully_shard(
-            model,
-            outer_dp_all_gather_prefetch_depth=depth,
-            **shard_kwargs,
-        )
+        root_kwargs = dict(shard_kwargs)
+        if depth is not None:
+            root_kwargs["outer_dp_all_gather_prefetch_depth"] = depth
+        fully_shard(model, **root_kwargs)
+        effective_depth = 1 if depth is None else depth
 
         # Model an optimizer update: only each [S, S] main-weight view is current.
         model._copy_main_weights_to_model_weights()
@@ -500,11 +500,12 @@ class TestFullyShardBasic:
             for layer in model.layers
         ]
         assert pending == [
-            depth > 0 and 0 < index <= depth for index in range(4)
+            effective_depth > 0 and 0 < index <= effective_depth
+            for index in range(4)
         ]
         model.layers[0].reshard()
 
-        if depth == 0:
+        if effective_depth == 0:
             # The generic prefetch path fully unshards the immediate next module.
             model.layers[1].reshard()
             return
@@ -513,7 +514,7 @@ class TestFullyShardBasic:
         model.layers[1].unshard(async_op=True)
         assert any(
             param_group.state.pending_weights
-            for param_group in model.layers[depth + 1]._fsdp_param_groups
+            for param_group in model.layers[effective_depth + 1]._fsdp_param_groups
         )
         model.layers[1].reshard()
 

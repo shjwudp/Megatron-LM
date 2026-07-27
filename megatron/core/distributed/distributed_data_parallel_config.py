@@ -191,7 +191,7 @@ class DistributedDataParallelConfig:
     CG capture scope but is waited on during the capture scope.
     """
 
-    fsdp_outer_dp_all_gather_prefetch_depth: int = 0
+    fsdp_outer_dp_all_gather_prefetch_depth: int = 1
     """Number of future Megatron-FSDP v2 HSDP modules whose outer-DP weight
     all-gather is prefetched. Zero disables the placement-stage pipeline."""
 

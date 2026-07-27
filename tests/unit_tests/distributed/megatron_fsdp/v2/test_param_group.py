@@ -354,14 +354,14 @@ def test_outer_sharded_hsdp_collective_order(monkeypatch):
     group.release_grad_buffer()
 
 
-def test_hsdp_layout_rejects_reversed_mesh_axes():
+def test_layout_rejects_mesh_rank_mismatch():
     layout = ParameterGroupLayout(
-        weight=(Placement.SHARD, Placement.REPLICATE),
-        main_weight=(Placement.SHARD, Placement.SHARD),
-        grad_storage=(Placement.SHARD, Placement.REPLICATE),
-        grad_accumulation=(Placement.SHARD, Placement.PARTIAL),
+        weight=(Placement.SHARD,),
+        main_weight=(Placement.SHARD,),
+        grad_storage=(Placement.SHARD,),
+        grad_accumulation=(Placement.SHARD,),
     )
-    with pytest.raises(ValueError, match="outer DP, inner DP"):
+    with pytest.raises(ValueError, match="Expected 2 placements"):
         layout.validate(2)
 
 

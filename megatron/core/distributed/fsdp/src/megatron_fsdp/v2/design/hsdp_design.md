@@ -109,9 +109,9 @@ Parameter binding and post-unshard processing run on the last active axis stream
 Outer optimizer sharding permits the persistent `[S, S] -> [R, S]` stage of a
 future module to run before that module leases `[R, R]` compute-weight storage.
 `outer_dp_all_gather_prefetch_depth=N` keeps at most `N` eligible future modules
-in this placement stage; zero disables it. The first module's `unshard()` call
-bootstraps its own outer stage and refills the configured future window after
-dispatching its inner stage.
+in this placement stage. The default is one; zero disables it. The first module's
+`unshard()` call bootstraps its own outer stage and refills the configured future
+window after dispatching its inner stage.
 
 Each module has its own completion event. The current module's inner-DP stream
 waits only for that module's outer event, never for the full lookahead window.
