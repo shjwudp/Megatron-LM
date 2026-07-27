@@ -286,7 +286,7 @@ def reduce_grad(self, async_op: bool = False):
     for param_names, param_group in self._named_param_groups:
         if not param_group.requires_grad: continue
 
-        accumulate_full_grad = param_group._full_grad_has_value
+        accumulate_full_grad = param_group.full_grad_has_value
         stage_tensors = []
         stage_sources = []
         zero_tensors = []
@@ -372,12 +372,11 @@ directly into `param.main_grad` (bypassing `.grad`). Two flags coordinate this:
   pass; the kernel sets it to `True` after writing. In `reduce_grad`, the `zero_()` call is
   skipped when `True` to preserve the fused-gradient value.
 
-- **`overwrite_main_grad`**: Set to `True` in `pre_backward_hook` for sharded parameters
-  (`optim_grads_params` / `optim_grads`). By default TE **accumulates** (adds) into
-  `main_grad` — useful for micro-batch gradient accumulation in non-FSDP settings. With FSDP
-  the gradient buffer is re-used across micro-batches; accumulation would silently **double**
-  gradients and produce NaN after the first step. This flag tells TE to **overwrite** instead
-  of accumulate.
+- **`overwrite_main_grad`**: Derived from gradient state in `pre_backward_hook`.
+  ZeRO-2/FSDP/HSDP use fresh full-gradient scratch and therefore overwrite on
+  every microbatch. DDP and ZeRO-1 overwrite while the phase is `EMPTY`, then
+  let TE accumulate into persistent full-gradient storage while the phase is
+  `ACCUMULATING`.
 
 ### Sliding Drain: The `i-2` Rule
 

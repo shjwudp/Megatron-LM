@@ -82,6 +82,9 @@ def _build_2d_group(
 
 def _build_1d_group(
     sharding_strategy: str,
+    *,
+    grad_comm_dtype: torch.dtype | None = None,
+    gradient_scaling_factor: float | None = None,
 ) -> tuple[ParameterGroup, torch.Tensor, TemporaryBucketAllocator]:
     values = torch.arange(128, dtype=torch.float32, device=_device())
     param = nn.Parameter(values.clone())
@@ -91,8 +94,11 @@ def _build_1d_group(
         ParamGroupIdx(0, 0),
         mesh=_dp_mesh(),
         layout=ParameterGroupLayout.from_strategies(sharding_strategy),
-        mp_policy=MixedPrecisionPolicy(main_grads_dtype=torch.float32),
+        mp_policy=MixedPrecisionPolicy(
+            main_grads_dtype=torch.float32, grad_comm_dtype=grad_comm_dtype
+        ),
         allocator=allocator,
+        gradient_scaling_factor=gradient_scaling_factor,
     )
     return group, values, allocator
 
@@ -147,9 +153,11 @@ def test_1d_strategy_layout(
 )
 def test_1d_strategy_weight_and_gradient_lifecycle(sharding_strategy):
     group, values, allocator = _build_1d_group(sharding_strategy)
+    accumulates_full_grad = sharding_strategy in ("no_shard", "optim")
 
     assert group.mesh.ndim == 1
     assert group.state.weight_valid == group.layout.weight
+    assert group.accumulates_full_grad is accumulates_full_grad
     expected_optimizer_placement = (
         Replicate() if sharding_strategy == "no_shard" else Shard(0)
     )
@@ -160,10 +168,15 @@ def test_1d_strategy_weight_and_gradient_lifecycle(sharding_strategy):
     group.reshard_weight()
 
     rank = torch.distributed.get_rank()
-    group.begin_backward().data.fill_(rank + 1)
+    full_grad = group.begin_backward()
+    assert (full_grad.data.data_ptr() == group.grad_buffer.data.data_ptr()) is accumulates_full_grad
+    assert any(key[1] == "full_grad" for key in allocator.buckets) is not accumulates_full_grad
+    full_grad.data.fill_(rank + 1)
     group.reduce_grad(is_last_backward=False)
     assert group.state.grad_phase is GradientPhase.ACCUMULATING
-    if sharding_strategy in ("no_shard", "optim"):
+    assert group.full_grad_has_value is accumulates_full_grad
+    assert group.overwrites_full_grad is not accumulates_full_grad
+    if accumulates_full_grad:
         first_microbatch = rank + 1
     else:
         world_size = torch.distributed.get_world_size()
@@ -175,7 +188,11 @@ def test_1d_strategy_weight_and_gradient_lifecycle(sharding_strategy):
         atol=0,
     )
 
-    group.begin_backward().data.fill_(rank + 2)
+    full_grad = group.begin_backward()
+    if group.full_grad_has_value:
+        full_grad.data.add_(rank + 2)
+    else:
+        full_grad.data.fill_(rank + 2)
     group.reduce_grad(is_last_backward=True)
     world_size = torch.distributed.get_world_size()
     expected = world_size * (world_size + 2)
@@ -205,11 +222,16 @@ def test_2d_strategy_gradient_lifecycle(sharding_strategy):
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
     inner_size = world_size // 2
+    accumulates_full_grad = sharding_strategy in ("no_shard", "optim")
+    assert group.accumulates_full_grad is accumulates_full_grad
 
-    group.begin_backward().data.fill_(rank + 1)
+    full_grad = group.begin_backward()
+    assert (full_grad.data.data_ptr() == group.grad_buffer.data.data_ptr()) is accumulates_full_grad
+    full_grad.data.fill_(rank + 1)
     group.reduce_grad(is_last_backward=False)
     assert group.state.grad_phase is GradientPhase.ACCUMULATING
-    if sharding_strategy in ("no_shard", "optim"):
+    assert group.full_grad_has_value is accumulates_full_grad
+    if accumulates_full_grad:
         first_microbatch = rank + 1
     else:
         outer_rank = rank // inner_size
@@ -224,7 +246,11 @@ def test_2d_strategy_gradient_lifecycle(sharding_strategy):
         atol=0,
     )
 
-    group.begin_backward().data.fill_(rank + 2)
+    full_grad = group.begin_backward()
+    if group.full_grad_has_value:
+        full_grad.data.add_(rank + 2)
+    else:
+        full_grad.data.fill_(rank + 2)
     group.reduce_grad(is_last_backward=True)
     expected = world_size * (world_size + 2)
     torch.testing.assert_close(
@@ -234,6 +260,31 @@ def test_2d_strategy_gradient_lifecycle(sharding_strategy):
         atol=0,
     )
     assert group.state.grad_phase is GradientPhase.READY
+    assert allocator.buckets == {}
+
+
+@pytest.mark.parametrize("sharding_strategy", ["no_shard", "optim"])
+def test_full_gradient_accumulation_is_preprocessed_once(sharding_strategy):
+    group, _, allocator = _build_1d_group(
+        sharding_strategy, grad_comm_dtype=torch.bfloat16, gradient_scaling_factor=0.5
+    )
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+
+    group.begin_backward().data.fill_(rank + 1)
+    group.reduce_grad(is_last_backward=False)
+    assert allocator.buckets == {}
+
+    group.begin_backward().data.add_(rank + 2)
+    group.reduce_grad(is_last_backward=True)
+
+    expected = 0.5 * world_size * (world_size + 2)
+    torch.testing.assert_close(
+        group.optimizer_grad().data,
+        torch.full_like(group.optimizer_grad().data, expected),
+        rtol=0,
+        atol=0,
+    )
     assert allocator.buckets == {}
 
 

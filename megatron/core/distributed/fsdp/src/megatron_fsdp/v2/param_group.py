@@ -247,14 +247,22 @@ class ParameterGroup:
         return self._optimizer_grads
 
     @property
+    def accumulates_full_grad(self) -> bool:
+        """Return whether microbatches accumulate in persistent full-gradient storage."""
+        return (
+            self.layout.grad_storage == self.full_placements
+            and self.layout.grad_accumulation == self.contribution_placements
+        )
+
+    @property
     def full_grad_has_value(self) -> bool:
         """Return whether full-gradient storage contains prior accumulation."""
-        return False
+        return self.accumulates_full_grad and self.state.grad_phase is GradientPhase.ACCUMULATING
 
     @property
     def overwrites_full_grad(self) -> bool:
-        """Return whether every backward overwrites its fresh full-gradient lease."""
-        return self.requires_grad
+        """Return whether this backward initializes rather than accumulates full gradients."""
+        return self.requires_grad and not self.full_grad_has_value
 
     @property
     def supports_fused_grad_capture(self) -> bool:
@@ -844,7 +852,10 @@ class ParameterGroup:
         for param in self.params:
             if hasattr(param, "main_grad"):
                 del param.main_grad
-        self._release_scratch("full_grad", self.state.full_grad)
+        if self.state.full_grad is not None and self.accumulates_full_grad:
+            self.state.full_grad.unbind()
+        else:
+            self._release_scratch("full_grad", self.state.full_grad)
         self.state.full_grad = None
         self._release_scratch("grad_comm", self.state.grad_comm)
         self.state.grad_comm = None
@@ -886,9 +897,14 @@ class ParameterGroup:
         """Acquire uninitialized storage for the full local-gradient contribution."""
         self._ensure_grad_storage()
         if self.state.full_grad is None:
-            self.state.full_grad = self._allocate_scratch(
-                "full_grad", self.grad_buffer, self.full_placements
-            )
+            if self.accumulates_full_grad:
+                self.state.full_grad = self._placement_view(
+                    self.grad_buffer, self.contribution_placements
+                )
+            else:
+                self.state.full_grad = self._allocate_scratch(
+                    "full_grad", self.grad_buffer, self.full_placements
+                )
         return self.state.full_grad
 
     def get_main_grad(self, param: torch.nn.Parameter) -> torch.Tensor:
@@ -970,6 +986,22 @@ class ParameterGroup:
             raise RuntimeError("begin_backward() must run before reduce_grad()")
         if self.state.grad_phase is GradientPhase.READY:
             raise RuntimeError("zero_grad() must run before starting another gradient")
+
+        if self.accumulates_full_grad:
+            if not is_last_backward:
+                # Backward already copied or added this microbatch directly into
+                # persistent full-gradient storage. Delay scaling, dtype conversion,
+                # and the DP reduction until the final microbatch.
+                self.state.grad_phase = GradientPhase.ACCUMULATING
+                return torch.cuda.current_stream()
+
+            grad_input = self._preprocess_gradient(self.state.full_grad)
+            _, terminal_stream = self._finalize_gradient_placement(
+                grad_input, streams=streams, async_op=async_op
+            )
+            self.state.grad_phase = GradientPhase.READY
+            self._install_optimizer_grads()
+            return terminal_stream
 
         grad_input = self._preprocess_gradient(self.state.full_grad)
         accumulation = self._placement_view(self.grad_buffer, self.layout.grad_accumulation)

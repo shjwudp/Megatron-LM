@@ -56,8 +56,8 @@ DTensor field.
 | Point in step | Behavior |
 | --- | --- |
 | FSDP initialization | Create `grad_buffer` metadata only. `grad_buffer.data` is `None`; `optimizer_grads` contains placeholders. |
-| First post-backward `reduce_grad()` | `prepare_gradient_storage()` allocates `grad_buffer.data` and rebuilds `optimizer_grads` DTensor views. |
-| Gradient reduction | `param.grad` is staged into `grad_buffer`; all-reduce or reduce-scatter writes the optimizer-facing result. |
+| First backward staging | `prepare_gradient_storage()` allocates `grad_buffer.data` and rebuilds `optimizer_grads` DTensor views. |
+| Gradient reduction | DDP and ZeRO-1 stage directly into persistent full-gradient storage; sharded-gradient strategies use full scratch. All-reduce or reduce-scatter writes the optimizer-facing result. |
 | Optimizer step | Optimizer consumes `optimizer_param.grad` or `optimizer_param.decoupled_grad`, which are backed by `grad_buffer.data`. |
 | `zero_grad(set_to_none=True)` | Clear optimizer-facing gradient references, privately cache and detach reusable DTensor wrappers, reset accumulation flags, and release `grad_buffer.data` if nothing still references valid gradients. |
 | `zero_grad(set_to_none=False)` | Keep `grad_buffer.data` allocated and zero it in place. |
@@ -96,8 +96,7 @@ of these are true:
 
 - full-iteration CUDA graph mode is not enabled for the group;
 - `grad_buffer.data` exists;
-- the full staging buffer does not contain accumulated gradient data;
-- the reduced output buffer does not contain accumulated gradient data;
+- the gradient phase is not `ACCUMULATING`;
 - no `optimizer_param.grad` or `optimizer_param.decoupled_grad` still references the
   gradient DTensor.
 
@@ -117,21 +116,20 @@ first time a cached wrapper is reused. Later iterations update the fixed-size
 cache and live-gradient lists in place and skip repeated structural validation;
 the backing buffer may change, but its established layout contract does not.
 
-## Accumulation flags
+## Accumulation state
 
-Two flags track where valid gradient data currently lives:
+`GradientPhase` records whether the persistent gradient is `EMPTY`,
+`ACCUMULATING`, or optimizer-`READY`. Placement determines where accumulation
+happens. When `grad_storage` is fully replicated and `grad_accumulation` is
+fully partial, DDP and ZeRO-1 accumulate local microbatches directly in
+`grad_buffer`; `full_grad_has_value` is then derived from the
+`ACCUMULATING` phase. ZeRO-2, FSDP, and HSDP reduce every microbatch into their
+configured accumulation placement instead.
 
-- `_full_grad_has_value` tracks the full `(0, 0)` staging
-  buffer used before the collective.
-- `_reduced_grad_has_value` tracks the collective output
-  consumed by the optimizer.
-
-`zero_grad()` resets both flags before trying to release storage. `reduce_grad()`
-sets them according to the active sharding strategy and whether the collective
-consumes the full staging buffer.
-
-These flags are required because some ranks can have empty local optimizer
-shards while the shared buffer still contains valid data for another layout.
+`zero_grad()` resets the phase before trying to release storage. The phase is
+required because placement alone cannot distinguish a partial accumulation
+from an optimizer-ready value, and some ranks can have empty local optimizer
+shards while the shared buffer still contains valid data.
 
 ## Safe use of `torch.empty`
 
@@ -141,8 +139,9 @@ accumulation flags:
 
 - if no previous gradient has accumulated, staging and collective outputs
   overwrite the destination;
-- if a previous microbatch has accumulated, later microbatches add into the
-  existing buffer.
+- if a previous microbatch has accumulated, DDP and ZeRO-1 stage by addition
+  into persistent full storage, while reduced-gradient strategies add their
+  collective output into the configured accumulation placement.
 
 `zero_grad(set_to_none=False)` is the explicit keep-storage path: it zeros
 `grad_buffer.data` in place when the buffer exists instead of releasing it.

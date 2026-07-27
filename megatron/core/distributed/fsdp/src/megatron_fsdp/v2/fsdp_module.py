@@ -880,10 +880,14 @@ class FSDPModule:
 
             if async_op:
                 # ---- Overlapped path ----
-                # Switch to rs_stream for the reduce-scatter kernel
-                completion_stream = param_group.reduce_grad(
-                    is_last_backward=ctx.is_last_backward, streams=ctx.rs_streams, async_op=True
-                )
+                # Ordinary full-iteration-graph gradients were staged on the RS
+                # stream above. Make that stream the caller so direct DDP/ZeRO-1
+                # accumulation and the first collective inherit the dependency.
+                reduce_context = torch.cuda.stream(stream) if stage_on_rs_stream else nullcontext()
+                with reduce_context:
+                    completion_stream = param_group.reduce_grad(
+                        is_last_backward=ctx.is_last_backward, streams=ctx.rs_streams, async_op=True
+                    )
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer

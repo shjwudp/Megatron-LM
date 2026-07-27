@@ -45,8 +45,10 @@ The group has three persistent distributed values:
 - optimizer main weights;
 - persistent accumulated or reduced gradients.
 
-It may temporarily lease a full model-weight buffer and a full gradient buffer.
-Those leases are logical runtime state, not persistent buffer roles.
+It may temporarily lease a full model-weight buffer. Strategies that reduce
+every microbatch also lease a full gradient buffer. DDP and ZeRO-1 instead use
+their persistent replicated gradient storage directly. These leases and views
+are logical runtime state, not persistent buffer roles.
 
 ## Placement layout
 
@@ -171,11 +173,13 @@ derived from `grad_phase`:
 Value existence must not be inferred from placement equality. ZeRO-2 and FSDP
 use `[S]` for both accumulation and the optimizer-ready gradient.
 
-The scratch fields are optional leases:
+The runtime fields are optional handles:
 
 - `full_weights[role]` is a full compute-weight allocation when that role's
   persistent storage cannot contain `[R, R]`;
-- `full_grad` contains the current backward contribution.
+- `full_grad` is either full-gradient scratch containing the current backward
+  contribution or, for DDP and ZeRO-1, a partial-placement alias of persistent
+  accumulated gradient storage;
 - `grad_comm` exists only when communication dtype differs from gradient dtype.
 
 There is no dirty placement, cached optimizer buffer view, generic temporary-buffer
@@ -253,10 +257,15 @@ compute weights.
 
 ## Gradient lifecycle
 
-At backward start, the group acquires uninitialized `full_grad` storage. Fused
-weight-gradient kernels overwrite their parameter slices, ordinary gradients are
-copied into their slices, and the staging layer zeroes only slices for parameters
-that did not produce a gradient. The whole bucket is never zeroed.
+At backward start, the group exposes a `full_grad` contribution view. DDP and
+ZeRO-1 reinterpret persistent replicated gradient storage as `[P]`; other
+strategies acquire uninitialized full-gradient scratch. On the first
+microbatch, fused weight-gradient kernels overwrite their parameter slices,
+ordinary gradients are copied into their slices, and the staging layer zeroes
+only slices for parameters that did not produce a gradient. On later DDP and
+ZeRO-1 microbatches, produced gradients add into the persistent full-gradient
+value and missing gradients leave their prior values unchanged. The whole
+bucket is never zeroed.
 
 Every strategy follows the same two-target process:
 
@@ -266,9 +275,10 @@ local contribution
     -> layout.main_weight on the last backward
 ```
 
-For DDP and ZeRO-1, the first transition performs no collective: full local
-gradients accumulate as `[P]`. The last backward performs `[P] -> [R]`
-all-reduce for DDP or `[P] -> [S]` reduce-scatter for ZeRO-1.
+For DDP and ZeRO-1, the first transition performs no collective or buffer copy:
+full local gradients accumulate directly in persistent `[R]` storage viewed as
+`[P]`. The last backward performs `[P] -> [R]` all-reduce for DDP or
+`[P] -> [S]` reduce-scatter for ZeRO-1.
 
 For ZeRO-2 and FSDP, every microbatch reduce-scatters `[P] -> [S]`; the final
 placement is already reached, so the last transition is a no-op.
@@ -291,11 +301,14 @@ in a call-local communication buffer:
 For outer replication, the final transition is an outer all-reduce:
 `[P, S] -> [R, S]`.
 
-Gradient scaling and conversion to communication dtype happen once before the
-per-microbatch redistribution. Communication workspaces are call-local and are
-not persistent parameter-group state. After every microbatch, `full_grad` is
-released. Non-final backward sets the phase to `ACCUMULATING`; the last backward
-sets it to `READY`.
+For strategies reduced every microbatch, gradient scaling and conversion to
+communication dtype happen before each redistribution. DDP and ZeRO-1 defer
+both operations until the last backward so accumulated full gradients are
+processed exactly once. Communication workspaces are call-local and are not
+persistent parameter-group state. After every microbatch, the transient
+`full_grad` handle is released; for DDP and ZeRO-1 this only drops the alias,
+not the persistent accumulated value. Non-final backward sets the phase to
+`ACCUMULATING`; the last backward sets it to `READY`.
 
 `zero_grad(set_to_none=True)` resets the phase to `EMPTY`, releases any active
 `full_grad` lease, detaches the local tensors from cached optimizer-gradient
@@ -311,8 +324,9 @@ After installation, those Python objects and the persistent buffer allocation
 remain stable across optimizer steps and graph replays. `zero_grad()` resets
 the logical phase to `EMPTY` and zeros storage in place regardless of
 `set_to_none`; it does not detach DTensor local tensors or unbind
-`grad_buffer`. Full weight and full gradient scratch remain transient because
-the CUDA graph private pool owns their replay addresses.
+`grad_buffer`. Full weight scratch and any strategy-required full-gradient
+scratch remain transient because the CUDA graph private pool owns their replay
+addresses.
 
 ## Ownership boundaries
 
@@ -327,7 +341,7 @@ the CUDA graph private pool owns their replay addresses.
 ### `ParameterGroup`
 
 - owns the persistent buffers and concise validity state;
-- acquires and releases full weight/full gradient scratch;
+- acquires and releases full-weight scratch and, when required, full-gradient scratch;
 - binds compute parameters;
 - commits or accumulates gradient stages;
 - performs main-to-model representation conversion;
