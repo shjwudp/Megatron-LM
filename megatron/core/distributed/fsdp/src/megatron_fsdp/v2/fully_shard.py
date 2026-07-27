@@ -76,9 +76,8 @@ def fully_shard(
             outer-DP weight all-gather is prefetched. Zero disables this
             placement-stage pipeline.
         outer_dp_sharding_strategy: Sharding strategy for the outer axis of a
-            2D HSDP mesh. A 1D mesh accepts only ``"no_shard"``, where the
-            option is a no-op. A 2D mesh supports ``"no_shard"`` and
-            ``"optim"``.
+            2D HSDP mesh, supporting ``"no_shard"`` and ``"optim"``. This
+            option is ignored for a 1D mesh.
         reduce_scatter_streams: Optional stream for each device-mesh axis. HSDP
             gradient reduction executes in reverse mesh order (inner DP, then
             outer DP on the last backward).
@@ -125,12 +124,10 @@ def fully_shard(
         mesh = _init_default_fully_shard_mesh()
         mesh = mesh[mesh.mesh_dim_names[-1]]
 
-    if outer_dp_sharding_strategy not in ("no_shard", "optim"):
+    if mesh.ndim == 2 and outer_dp_sharding_strategy not in ("no_shard", "optim"):
         raise ValueError(
             f"Unsupported outer DP sharding strategy: {outer_dp_sharding_strategy}"
         )
-    if mesh.ndim == 1 and outer_dp_sharding_strategy == "optim":
-        raise ValueError("Outer-DP optimizer sharding requires a 2D DeviceMesh")
     if outer_dp_all_gather_prefetch_depth < 0:
         raise ValueError("outer_dp_all_gather_prefetch_depth must be non-negative")
 
