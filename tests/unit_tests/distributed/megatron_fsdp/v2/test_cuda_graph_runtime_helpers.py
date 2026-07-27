@@ -11,7 +11,6 @@ import torch
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.te_graph_runtime.graph import (
     _activation_recompute_capture_schedule,
-    _activation_recompute_forward_grad_modes,
     _activation_recompute_region_groups,
     _get_tracked_cuda_generators,
     _graph_context_wrapper,
@@ -36,17 +35,6 @@ def test_activation_recompute_region_schedule():
 
     with pytest.raises(ValueError, match="contiguous and numbered"):
         _activation_recompute_region_groups((0, 1, 0), 3)
-
-
-def test_activation_recompute_forward_grad_modes():
-    """Accept one grad mode per callable and reject malformed input."""
-    assert _activation_recompute_forward_grad_modes(True, 2) == (True, True)
-    assert _activation_recompute_forward_grad_modes((False, True), 2) == (False, True)
-
-    with pytest.raises(ValueError, match="number of callables"):
-        _activation_recompute_forward_grad_modes((True,), 2)
-    with pytest.raises(TypeError, match="only bool"):
-        _activation_recompute_forward_grad_modes((True, 1), 2)
 
 
 def test_registered_buffer_slots_detect_metadata_and_replacement():
