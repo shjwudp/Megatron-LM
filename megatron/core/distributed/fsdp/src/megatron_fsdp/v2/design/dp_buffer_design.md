@@ -30,17 +30,14 @@ The buffer owns bound-storage validation and distribution mechanics:
 - `BufferIndex`;
 - binding and unbinding externally allocated tensors without freeing them;
 - allocation-free placement views and aliases;
-- caller-keyed temporary allocation for dtype conversion or redistribution output;
 - one-axis-at-a-time redistribution;
-- one explicit addend applied after redistribution;
 - target-driven axis planning and coalescing for compatible buffers;
 - ordered local tensor and shard views.
 
 The buffer never retains an allocator, invents role keys, or releases temporary
 storage. `view()` succeeds only when the currently bound storage contains the
 requested shape. For a storage-growing redistribution, the caller either provides an
-explicit `output_buffer` or passes an allocator and stable key; in the latter case the
-returned buffer is the caller's active lease.
+explicit, externally bound `output_buffer`.
 
 The buffer derives a process group from `mesh.get_group(mesh_dim=changed_axis)` only
 when executing a redistribution. It does not cache `outer_dp_group` or
@@ -66,9 +63,9 @@ The parameter group owns consumers and training semantics:
 indexing, and mixed-precision representation rules. `unshard_weights()` is the
 semantic entry point used by the module scheduler.
 Communication dtype, gradient scaling, whether an accumulation exists, and workspace
-release remain parameter-group policy. Once that decision is made, the buffer can
-cast through a caller-provided allocator and apply the selected `add_buffer` as part
-of the placement transition.
+release remain parameter-group policy. The parameter group allocates and preprocesses
+any communication workspace, then asks the buffer to perform only the placement
+transition.
 
 Logical and physical lifetimes are distinct. On reshard, `ParameterGroup` unbinds and
 drops its logical lease. An allocator may retain an empty tensor shell or a stable trace
@@ -154,21 +151,18 @@ shard.redistribute(replicated.placements, output_buffer=replicated)
 The two DP-buffer objects have different placements and exact placement-shaped data,
 while their tensors share one allocation.
 
-For gradient accumulation, `add_buffer` is a narrowly defined operation:
+For gradient accumulation, the parameter group selects a temporary output only when
+the persistent accumulation cannot be overwritten:
 
 ```python
-reduced = grad_input.redistribute(
-    target_placements,
-    output_buffer=accumulation,
-    add_buffer=accumulation if has_accumulation else None,
-    allocator=allocator,
-    allocator_key=grad_comm_key,
-)
+output = full_grad.view(target) if needs_workspace else accumulation
+grad_input.redistribute(target, output_buffer=output)
+if output is not accumulation:
+    accumulation.data.add_(output.data)
 ```
 
-If the addend aliases the destination, the collective uses a same-dtype view of the
-input's containing storage before adding and committing. This keeps “accumulate or
-replace” visible in `ParameterGroup` without a generic post-processing callback.
+This keeps “accumulate or replace” visible in `ParameterGroup` and leaves dtype
+conversion and arithmetic outside the communication abstraction.
 
 For a multi-axis transition, the batch planner prefers a source view's containing
 storage owner when that owner's placement is the next intermediate target. Thus
@@ -250,10 +244,10 @@ lease from asynchronous all-gather launch through the final consumer.
    allocates one communication owner before entering the stages. Otherwise the
    full-gradient owner is reused. Scaling is applied once during this preprocessing
    and does not cause allocation.
-5. `ParameterGroup` calls `redistribute()` once on the inner-axis stream. The
-   `add_buffer` argument is present only when an earlier microbatch has accumulated.
-   A dtype-compatible persistent buffer can be the direct output; otherwise the
-   operation uses a contained temporary view and commits the result.
+5. `ParameterGroup` calls `redistribute_buffers()` once for the inner stage. A
+   dtype-compatible persistent buffer can be the direct output; otherwise the
+   operation uses a contained temporary view and commits or accumulates the result
+   on the inner-axis stream.
 6. On the last HSDP backward, `ParameterGroup` makes the second `redistribute()` call
    on the outer-axis stream. That stream waits for the inner-axis stream and consumes
    the first call's returned buffer.
@@ -292,8 +286,7 @@ collective state.
 - buffer roles and sharding strategies are owned and interpreted by `ParameterGroup`.
 - `DataParallelBuffer` does not retain an allocator, allocation key, or
   temporary-buffer cache.
-- `DataParallelBuffer` allocates only through an explicit caller-provided allocator
-  and key, returns the resulting lease, and never frees or resizes it.
+- `DataParallelBuffer` never allocates, frees, or resizes storage.
 - `bind()` and `unbind()` never allocate or free storage.
 - a buffer returned by `view()` has exact placement-shaped data and retains its
   storage owner.
@@ -302,15 +295,15 @@ collective state.
 - `view()` never grows storage and fails when the bound tensor cannot contain the
   requested placement.
 - an explicit redistribution output shares layout, mesh, and device with its input
-  and exactly matches the target placements; its dtype may differ from communication.
+  and exactly matches the input dtype and target placements.
 - `redistribute()` changes at most one placement per call.
 - `redistribute_buffers()` completes each mesh axis across compatible buffers before
   advancing to the next axis; distinct axis streams are linked by explicit waits.
 - parameter identity and `param_idx` are owned by `ParameterGroup`.
 - only `ParameterGroup` binds storage to parameters.
 - only `ParameterGroup` owns allocator keys and releases temporary storage.
-- only `ParameterGroup` decides whether to pass an existing accumulation as the
-  redistribution addend.
+- only `ParameterGroup` decides whether redistribution writes persistent storage or
+  temporary workspace and how that result is accumulated.
 - `FSDPModule` does not inspect, redistribute, or bind weight buffers.
 - weight-buffer selection and binding helpers remain private to `ParameterGroup`.
 - process groups used by a buffer are derived from its mesh and changed axis.

@@ -355,8 +355,9 @@ def reduce_grad(self, async_op: bool = False):
 handle.** The primitive executes synchronously within the current stream, while its
 caller owns stream ordering and tensor lifetime. Eager, per-module CUDA graph, and
 synchronous-reduction paths stage gradients on the caller stream; then
-`ParameterGroup.reduce_grad(stream=...)` inserts one wait before preprocessing and
-redistribution on `rs_stream`.
+`ParameterGroup.reduce_grad(stream=...)` preprocesses them on that caller stream.
+`DataParallelBuffer.redistribute_buffers()` makes the first active reduction stream
+wait for the caller before starting redistribution.
 
 Full-iteration CUDA graphs instead dispatch ordinary async gradient add/copy/zero
 staging to `rs_stream` immediately before reduction. The stream first waits for
@@ -682,21 +683,21 @@ final_callback:
 
 No `async_op` parameter is needed. The method is purely synchronous within the calling stream:
 
-`ParameterGroup.reduce_grad()` acquires the full-gradient lease and asks the buffer to
-cast through the group allocator only when the communication dtype differs. It scales
-once before redistribution. The function body then shows the complete algorithm: one
-inner-FSDP redistribution for every reduced microbatch, followed by one outer-HSDP
-redistribution only on the last backward. `add_buffer` is supplied to the inner stage
-only when an earlier reduced microbatch exists. This specific operation replaces the
-old generic finalize/commit helpers while gradient scaling and phase decisions remain
-parameter-group policy.
+`ParameterGroup.reduce_grad()` acquires the full-gradient lease and allocates a
+full-size communication buffer only when the communication dtype differs. It copies
+and scales once before redistribution. The function body then shows the complete
+algorithm: one inner-FSDP redistribution for every reduced microbatch, followed by one
+outer-HSDP redistribution only on the last backward. When an earlier reduced
+microbatch exists, the new result uses the full-gradient storage as workspace before
+it is accumulated into the persistent gradient. Allocation, accumulation, scaling,
+and phase decisions remain parameter-group policy.
 
 The caller (`FSDPModule.reduce_grad`) provides the reduction stream.
-`ParameterGroup.reduce_grad()` waits for its caller stream once, then performs
-the inner redistribution on the configured inner-axis stream. For HSDP, the
-outer-axis stream waits for that stream before consuming its output. Temporary leases
-are released only after the terminal stream completes; no tensor stream recording is
-required inside the buffer.
+The inner redistribution waits for its caller stream and runs on the configured
+inner-axis stream. Accumulation runs on that terminal stream. For HSDP,
+`redistribute_buffers()` then makes the outer-axis stream wait for the inner stream
+before consuming its output. Temporary leases are released only after the terminal
+stream completes; no tensor stream recording is required inside the buffer.
 
 ---
 

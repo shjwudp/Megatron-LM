@@ -554,9 +554,20 @@ class ParameterGroup:
                 optimizer_param.decoupled_grad = None
 
     def _allocate_scratch(
-        self, role: str, prototype: DataParallelBuffer, placements: Placements
+        self,
+        role: str,
+        prototype: DataParallelBuffer,
+        placements: Placements,
+        *,
+        dtype: torch.dtype | None = None,
     ) -> DataParallelBuffer:
-        output = prototype.placeholder(list(placements))
+        output = DataParallelBuffer(
+            buffer_index=prototype.buffer_index,
+            dtype=dtype or prototype.dtype,
+            device=prototype.device,
+            mesh=prototype.mesh,
+            placements=list(placements),
+        )
         output.bind(
             self.allocator.allocate(
                 key=(self.param_group_id, role),
@@ -949,12 +960,18 @@ class ParameterGroup:
             self.state.grad_phase = GradientPhase.ACCUMULATING
             return caller_stream
 
-        full_grad = self.state.full_grad.view(self.contribution_placements)
+        full_grad = self.state.full_grad
         comm_dtype = self.mp_policy.grad_comm_dtype or full_grad.dtype
         if comm_dtype != full_grad.dtype:
-            full_grad = self._allocate_scratch("grad_comm", full_grad, self.full_placements)
+            comm_buffer = self._allocate_scratch(
+                "grad_comm", full_grad, self.full_placements, dtype=comm_dtype
+            )
+            comm_buffer.data.copy_(full_grad.data)
+            self.state.grad_comm = comm_buffer
+            full_grad = comm_buffer
         if self.gradient_scaling_factor not in (None, 1.0):
             full_grad.data.mul_(self.gradient_scaling_factor)
+        grad_input = full_grad.view(self.contribution_placements)
 
         # The inner-DP placement is the persistent accumulation state for
         # ZeRO-2/3 and HSDP. DDP/ZeRO-1 instead start from their full
@@ -970,32 +987,50 @@ class ParameterGroup:
             and self.state.grad_phase is GradientPhase.ACCUMULATING
         )
         needs_outer_reduction = tuple(target) != self.layout.main_weight
+        needs_workspace = (
+            has_accumulation
+            or grad_input.dtype != main_grad.dtype
+            or (is_last_backward and needs_outer_reduction)
+        )
+        output = full_grad.view(target) if needs_workspace else main_grad
 
-        reduced_grad = full_grad if has_accumulation else main_grad
         DataParallelBuffer.redistribute_buffers(
-            [full_grad],
+            [grad_input],
             target,
-            output_buffers=[reduced_grad],
+            output_buffers=[output],
             streams=axis_streams,
             async_op=async_op,
         )
-        if has_accumulation:
-            main_grad.data.add_(reduced_grad.data)
         terminal_stream = axis_streams[-1]
 
-        if is_last_backward and needs_outer_reduction:
-            final = self.grad_buffer.view(self.layout.main_weight)
-            outer_stream = axis_streams[0]
-            if outer_stream != terminal_stream:
-                outer_stream.wait_stream(terminal_stream)
-            DataParallelBuffer.redistribute_buffers(
-                [main_grad],
-                list(self.layout.main_weight),
-                output_buffers=[final],
-                streams=axis_streams,
-                async_op=async_op,
-            )
-            terminal_stream = outer_stream
+        with torch.cuda.stream(terminal_stream):
+            if output is not main_grad:
+                if has_accumulation:
+                    if is_last_backward and needs_outer_reduction:
+                        output.data.add_(main_grad.data)
+                    else:
+                        main_grad.data.add_(output.data)
+                        output = main_grad
+                elif not is_last_backward or not needs_outer_reduction:
+                    main_grad.data.copy_(output.data)
+                    output = main_grad
+
+            if is_last_backward and needs_outer_reduction:
+                final = self.grad_buffer.view(self.layout.main_weight)
+                outer_output = (
+                    final if output.dtype == final.dtype else full_grad.view(self.layout.main_weight)
+                )
+                DataParallelBuffer.redistribute_buffers(
+                    [output],
+                    list(self.layout.main_weight),
+                    output_buffers=[outer_output],
+                    streams=axis_streams,
+                    async_op=async_op,
+                )
+                terminal_stream = axis_streams[0]
+                if outer_output is not final:
+                    with torch.cuda.stream(terminal_stream):
+                        final.data.copy_(outer_output.data)
 
         self.state.grad_phase = (
             GradientPhase.READY if is_last_backward else GradientPhase.ACCUMULATING
