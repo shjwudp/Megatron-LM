@@ -622,7 +622,10 @@ class FSDPModule:
                 else (caller_stream,) * module._fsdp_param_groups[0].mesh.ndim
             )
             ParameterGroup.unshard_weights(
-                module._fsdp_param_groups, streams=streams, async_op=async_op
+                module._fsdp_param_groups,
+                streams=streams,
+                bwd_pass=bwd_pass,
+                async_op=async_op,
             )
 
             # Record event to track when unshard is done for this module

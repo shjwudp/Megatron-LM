@@ -572,10 +572,10 @@ class MixedPrecisionPolicy:
         if main_weight_buffer is None:
             return
 
-        inner_dp_group = mesh.get_group(mesh_dim=1)
+        inner_dp_group = mesh.get_group(mesh_dim=mesh.ndim - 1)
 
         if self.is_nvfp4_param(params[0]):
-            if optimizer_placements[0] is Placement.SHARD:
+            if mesh.ndim == 2 and optimizer_placements[0] is Placement.SHARD:
                 raise NotImplementedError(
                     "HSDP outer optimizer sharding is not supported for NVFP4."
                 )
@@ -642,7 +642,7 @@ class MixedPrecisionPolicy:
                 model_param_shards.append((model_shard, transpose_shard))
 
             amax_reduce_group = inner_dp_group
-            if optimizer_placements[0] is Placement.SHARD:
+            if mesh.ndim == 2 and optimizer_placements[0] is Placement.SHARD:
                 amax_reduce_group = mesh._flatten("_".join(mesh.mesh_dim_names)).get_group()
             quantize_main_weights_to_fp8(
                 fp8_params, main_params, start_offsets, amax_reduce_group, model_param_shards

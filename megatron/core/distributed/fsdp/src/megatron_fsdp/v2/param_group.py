@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import enum
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 import torch
@@ -22,7 +22,7 @@ from ..uneven_dtensor import (
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .buffer_index import BufferIndex, Placement
 from .dp_buffer import DataParallelBuffer
-from .mixed_precision import MixedPrecisionPolicy
+from .mixed_precision import MixedPrecisionPolicy, WeightBufferRole
 from .utils import ParamGroupIdx
 
 Placements = tuple[Placement, ...]
@@ -140,11 +140,32 @@ class GradientPhase(enum.Enum):
 class ParameterGroupState:
     """Minimal value-validity and scratch-lease state."""
 
-    weight_valid: Placements
+    weight_valid_by_role: dict[WeightBufferRole, Placements]
+    full_weights: dict[WeightBufferRole, DataParallelBuffer] = field(default_factory=dict)
     grad_phase: GradientPhase = GradientPhase.EMPTY
-    full_weight: DataParallelBuffer | None = None
     full_grad: DataParallelBuffer | None = None
     grad_comm: DataParallelBuffer | None = None
+
+    @property
+    def weight_valid(self) -> Placements:
+        """Return the canonical model-weight validity placement."""
+        return self.weight_valid_by_role[WeightBufferRole.MODEL]
+
+    @weight_valid.setter
+    def weight_valid(self, placements: Placements) -> None:
+        self.weight_valid_by_role[WeightBufferRole.MODEL] = placements
+
+    @property
+    def full_weight(self) -> DataParallelBuffer | None:
+        """Return the canonical model-weight scratch buffer."""
+        return self.full_weights.get(WeightBufferRole.MODEL)
+
+    @full_weight.setter
+    def full_weight(self, buffer: DataParallelBuffer | None) -> None:
+        if buffer is None:
+            self.full_weights.pop(WeightBufferRole.MODEL, None)
+        else:
+            self.full_weights[WeightBufferRole.MODEL] = buffer
 
 
 class ParameterGroup:
@@ -195,18 +216,25 @@ class ParameterGroup:
         row_sizes = [param.shape[1:].numel() for param in params if param.ndim > 1]
         self.chunk_size_factor = max(1, math.lcm(*row_sizes)) if row_sizes else 1
 
+        self.weight_buffers: dict[WeightBufferRole, DataParallelBuffer]
         self.weight_buffer: DataParallelBuffer
+        self.transpose_weight_buffer: DataParallelBuffer | None
         self.main_weight_buffer: DataParallelBuffer
         self.grad_buffer: DataParallelBuffer
         self._main_weight_aliases_weight = False
         self._initialize_buffers()
-        self.state = ParameterGroupState(weight_valid=tuple(self.weight_buffer.placements))
+        self.state = ParameterGroupState(
+            weight_valid_by_role={
+                role: tuple(buffer.placements) for role, buffer in self.weight_buffers.items()
+            }
+        )
         self._optimizer_params: list[torch.nn.Parameter] = []
         self._optimizer_grads: list[DTensor | None] = []
         self._initialize_optimizer_params()
 
-        if self.state.weight_valid == self.full_placements:
-            self._bind_weight(self.weight_buffer)
+        for role, buffer in self.weight_buffers.items():
+            if self.state.weight_valid_by_role[role] == self.full_placements:
+                self._bind_weight(buffer, role)
 
     @property
     def full_placements(self) -> Placements:
@@ -253,7 +281,7 @@ class ParameterGroup:
 
     def _persistent_storage_owners(self) -> list[DataParallelBuffer]:
         """Return distinct buffers that own persistent storage."""
-        owners = [self.weight_buffer]
+        owners = list(self.weight_buffers.values())
         if not self._main_weight_aliases_weight:
             owners.append(self.main_weight_buffer)
         owners.append(self.grad_buffer)
@@ -383,6 +411,16 @@ class ParameterGroup:
         self.weight_buffer.copy_tensors_(
             self.mp_policy.get_param_data(param) for param in self.params
         )
+        self.weight_buffers = {WeightBufferRole.MODEL: self.weight_buffer}
+
+        self.transpose_weight_buffer = None
+        if self.mp_policy.needs_transpose_weight_buffer(self.params[0]):
+            self.transpose_weight_buffer = self._new_buffer(torch.uint8, self.layout.weight)
+            self._allocate_persistent(self.transpose_weight_buffer)
+            self.transpose_weight_buffer.copy_tensors_(
+                self.mp_policy.get_param_data(param, transpose=True) for param in self.params
+            )
+            self.weight_buffers[WeightBufferRole.TRANSPOSE] = self.transpose_weight_buffer
 
         main_dtype = self.mp_policy.main_params_dtype_for_param(self.params[0]) or model_dtype
         if main_dtype == model_dtype:
@@ -522,27 +560,47 @@ class ParameterGroup:
         view = owner.view(list(physical))
         return view if physical == placements else view.reinterpret(list(placements))
 
-    def _bind_weight(self, buffer: DataParallelBuffer) -> None:
+    def _required_weight_roles(self, bwd_pass: bool = False) -> tuple[WeightBufferRole, ...]:
+        """Return compute-weight roles required for this pass in stable order."""
+        required = set()
+        for param in self.params:
+            required.update(
+                self.mp_policy.weight_buffer_roles_for_unshard(param, bwd_pass=bwd_pass)
+            )
+        missing = required.difference(self.weight_buffers)
+        if missing:
+            raise RuntimeError(f"Required weight buffers are unavailable: {missing}")
+        return tuple(
+            role
+            for role in (WeightBufferRole.MODEL, WeightBufferRole.TRANSPOSE)
+            if role in required
+        )
+
+    def _bind_weight(self, buffer: DataParallelBuffer, role: WeightBufferRole) -> None:
         if buffer.data is None:
             raise RuntimeError("Cannot bind parameters from an unbound weight buffer")
         for param in self.params:
             item_id = self.param_idx[param]
-            start, end = self.weight_buffer.buffer_index._get_item_global_range(item_id)
-            shape = self.weight_buffer.buffer_index.item_index_map[item_id].shape
+            start, end = buffer.buffer_index._get_item_global_range(item_id)
+            shape = buffer.buffer_index.item_index_map[item_id].shape
             self.mp_policy.bind_unsharded_param(
-                param, buffer.data[start:end].view(shape), "model_weight"
+                param, buffer.data[start:end].view(shape), role.value
             )
 
-    def compute_weight(self) -> DataParallelBuffer | None:
-        """Return the full compute-weight buffer when it is currently available."""
-        if self.state.weight_valid == self.full_placements:
-            return self.weight_buffer
-        return self.state.full_weight
+    def compute_weight(
+        self, role: WeightBufferRole = WeightBufferRole.MODEL
+    ) -> DataParallelBuffer | None:
+        """Return one full compute-weight representation when available."""
+        if self.state.weight_valid_by_role[role] == self.full_placements:
+            return self.weight_buffers[role]
+        return self.state.full_weights.get(role)
 
     def weights_are_unsharded(self, bwd_pass: bool = False) -> bool:
-        """Return whether full compute weights are available."""
-        _ = bwd_pass
-        return self.compute_weight() is not None
+        """Return whether all compute-weight representations for this pass are available."""
+        return all(
+            self.compute_weight(role) is not None
+            for role in self._required_weight_roles(bwd_pass=bwd_pass)
+        )
 
     def _axis_streams(
         self, *, stream: torch.cuda.Stream | None = None, streams: AxisStreams | None = None
@@ -570,13 +628,18 @@ class ParameterGroup:
         stream: torch.cuda.Stream | None = None,
         *,
         streams: AxisStreams | None = None,
+        bwd_pass: bool = False,
         async_op: bool = False,
     ) -> list[DataParallelBuffer]:
-        """Unshard compatible parameter groups in one coalesced axis plan."""
+        """Unshard pass-specific weight representations in one coalesced axis plan."""
         if not param_groups:
             return []
         axis_streams = param_groups[0]._axis_streams(stream=stream, streams=streams)
-        results: list[DataParallelBuffer | None] = [None] * len(param_groups)
+        outputs_by_group: list[dict[WeightBufferRole, DataParallelBuffer]] = [
+            {} for _ in param_groups
+        ]
+        required_by_group: list[tuple[WeightBufferRole, ...]] = []
+        terminal_axes: list[int | None] = [None] * len(param_groups)
         plans = []
 
         try:
@@ -584,45 +647,49 @@ class ParameterGroup:
                 if param_group.mesh.ndim != len(axis_streams):
                     raise ValueError("All parameter groups must use the same mesh dimensionality")
                 param_group.reload_to_gpu()
-                compute_weight = param_group.compute_weight()
-                if compute_weight is not None:
-                    param_group._bind_weight(compute_weight)
-                    param_group.mp_policy.post_unshard(param_group.params)
-                    results[index] = compute_weight
-                    continue
+                required_roles = param_group._required_weight_roles(bwd_pass=bwd_pass)
+                required_by_group.append(required_roles)
+                for role in required_roles:
+                    compute_weight = param_group.compute_weight(role)
+                    if compute_weight is not None:
+                        outputs_by_group[index][role] = compute_weight
+                        continue
 
-                source_placements = param_group.state.weight_valid
-                source = param_group.weight_buffer.view(list(source_placements))
-                persistent_placements = tuple(param_group.weight_buffer.placements)
-                if persistent_placements == param_group.full_placements:
-                    output = param_group.weight_buffer
-                else:
-                    param_group.state.full_weight = param_group._allocate_scratch(
-                        "full_weight", param_group.weight_buffer, param_group.full_placements
+                    weight_buffer = param_group.weight_buffers[role]
+                    source_placements = param_group.state.weight_valid_by_role[role]
+                    source = weight_buffer.view(list(source_placements))
+                    persistent_placements = tuple(weight_buffer.placements)
+                    if persistent_placements == param_group.full_placements:
+                        output = weight_buffer
+                    else:
+                        scratch_role = f"full_weight:{role.value}"
+                        output = param_group._allocate_scratch(
+                            scratch_role, weight_buffer, param_group.full_placements
+                        )
+                        param_group.state.full_weights[role] = output
+                    plans.append(
+                        (
+                            index,
+                            param_group,
+                            role,
+                            source_placements,
+                            persistent_placements,
+                            source,
+                            output,
+                        )
                     )
-                    output = param_group.state.full_weight
-                plans.append(
-                    (
-                        index,
-                        param_group,
-                        source_placements,
-                        persistent_placements,
-                        source,
-                        output,
-                    )
-                )
         except Exception:
-            for _, param_group, _, _, _, output in plans:
-                if param_group.state.full_weight is output:
-                    param_group._release_scratch("full_weight", output)
-                    param_group.state.full_weight = None
+            for _, param_group, role, _, _, _, output in plans:
+                if param_group.state.full_weights.get(role) is output:
+                    param_group._release_scratch(f"full_weight:{role.value}", output)
+                    param_group.state.full_weights.pop(role, None)
             raise
 
         if plans:
             DataParallelBuffer.redistribute_buffers(
-                [source for _, _, _, _, source, _ in plans],
+                [source for _, _, _, _, _, source, _ in plans],
                 list(param_groups[0].full_placements),
-                output_buffers=[output for _, _, _, _, _, output in plans],
+                output_buffers=[output for _, _, _, _, _, _, output in plans],
                 streams=axis_streams,
                 async_op=async_op,
             )
@@ -630,28 +697,41 @@ class ParameterGroup:
         for (
             index,
             param_group,
+            role,
             source_placements,
             persistent_placements,
             _,
             output,
         ) in plans:
-            param_group.state.weight_valid = persistent_placements
+            param_group.state.weight_valid_by_role[role] = persistent_placements
             terminal_axis = param_group._last_changed_axis(
                 source_placements, param_group.full_placements
             )
+            if terminal_axis is not None:
+                terminal_axes[index] = max(terminal_axes[index] or 0, terminal_axis)
+            outputs_by_group[index][role] = output
+
+        results = []
+        for index, (param_group, required_roles) in enumerate(
+            zip(param_groups, required_by_group)
+        ):
+            terminal_axis = terminal_axes[index]
             terminal_stream = (
-                torch.cuda.current_stream()
-                if terminal_axis is None
-                else axis_streams[terminal_axis]
+                torch.cuda.current_stream() if terminal_axis is None else axis_streams[terminal_axis]
             )
             with torch.cuda.stream(terminal_stream):
-                param_group._bind_weight(output)
-                param_group.mp_policy.post_unshard(param_group.params)
-            results[index] = output
-
-        if any(result is None for result in results):
-            raise RuntimeError("Weight unshard did not produce every parameter-group output")
-        return [result for result in results if result is not None]
+                for role in required_roles:
+                    param_group._bind_weight(outputs_by_group[index][role], role)
+                param_group.mp_policy.post_unshard(
+                    param_group.params, bwd_pass=bwd_pass
+                )
+            result_role = (
+                WeightBufferRole.MODEL
+                if WeightBufferRole.MODEL in required_roles
+                else required_roles[0]
+            )
+            results.append(outputs_by_group[index][result_role])
+        return results
 
     @torch.no_grad()
     def unshard_weight(
@@ -659,18 +739,24 @@ class ParameterGroup:
         stream: torch.cuda.Stream | None = None,
         *,
         streams: AxisStreams | None = None,
+        bwd_pass: bool = False,
         async_op: bool = False,
     ) -> DataParallelBuffer:
         """Unshard this parameter group and return its full compute weight."""
         return self.unshard_weights(
-            [self], stream=stream, streams=streams, async_op=async_op
+            [self],
+            stream=stream,
+            streams=streams,
+            bwd_pass=bwd_pass,
+            async_op=async_op,
         )[0]
 
     def reshard_weight(self) -> None:
-        """Release only the full compute-weight lease."""
+        """Release all full compute-weight representation leases."""
         self.mp_policy.post_reshard(self.params)
-        self._release_scratch("full_weight", self.state.full_weight)
-        self.state.full_weight = None
+        for role, buffer in tuple(self.state.full_weights.items()):
+            self._release_scratch(f"full_weight:{role.value}", buffer)
+        self.state.full_weights.clear()
 
     def release_grad_buffer(self) -> None:
         """Release any full-gradient scratch lease."""
@@ -708,10 +794,11 @@ class ParameterGroup:
                 self.mesh,
                 self.weight_buffer,
                 self.main_weight_buffer,
-                None,
+                self.transpose_weight_buffer,
                 optimizer_placements=list(self.layout.main_weight),
             )
-        self.state.weight_valid = self.layout.main_weight
+        for role in self.weight_buffers:
+            self.state.weight_valid_by_role[role] = self.layout.main_weight
 
     def begin_backward(self) -> DataParallelBuffer:
         """Acquire uninitialized storage for the full local-gradient contribution."""
@@ -911,11 +998,11 @@ class ParameterGroup:
     ) -> tuple[list[tuple[str, torch.dtype, int, int, bool, bool]], list[tuple[int, int] | None]]:
         """Return read-only buffer metadata and model-weight item ranges."""
         metadata = []
-        for label, buffer in (
-            ("W", self.weight_buffer),
-            ("MW", self.main_weight_buffer),
-            ("G", self.grad_buffer),
-        ):
+        buffers = [("W", self.weight_buffer)]
+        if self.transpose_weight_buffer is not None:
+            buffers.append(("WT", self.transpose_weight_buffer))
+        buffers.extend((("MW", self.main_weight_buffer), ("G", self.grad_buffer)))
+        for label, buffer in buffers:
             metadata.append(
                 (
                     label,

@@ -22,6 +22,14 @@ logger = logging.getLogger(__name__)
 
 SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
+try:
+    from transformer_engine.pytorch.fp8 import check_nvfp4_support
+
+    _NVFP4_AVAILABLE, _NVFP4_SKIP_REASON = check_nvfp4_support()
+except Exception:
+    _NVFP4_AVAILABLE = False
+    _NVFP4_SKIP_REASON = "NVFP4 support unavailable"
+
 
 # ------------------------------------------------------------------
 # Helpers
@@ -452,6 +460,26 @@ class TestMegatronFsdpV2Checkpoint:
                 dict(data_parallel_sharding_strategy="optim_grads"),
                 dict(data_parallel_sharding_strategy="optim_grads_params"),
                 id="v2_x_optim_grads_to_optim_grads_params",
+            ),
+            # ---- MFSDP v2 → MFSDP v2 (round-trip, NVFP4) ----
+            pytest.param(
+                "v2",
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fp4="e2m1",
+                    fp4_recipe="nvfp4",
+                    fp4_param_gather=True,
+                    bf16=True,
+                ),
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fp4="e2m1",
+                    fp4_recipe="nvfp4",
+                    fp4_param_gather=True,
+                    bf16=True,
+                ),
+                marks=pytest.mark.skipif(not _NVFP4_AVAILABLE, reason=_NVFP4_SKIP_REASON),
+                id="v2_rt_nvfp4_optim_grads_params",
             ),
             # ---- MFSDP v1 baseline → MFSDP v2 ----
             pytest.param(

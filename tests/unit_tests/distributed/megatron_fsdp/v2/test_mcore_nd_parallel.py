@@ -9,8 +9,13 @@ from torch.testing import assert_close
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import _init_dp_mesh
+from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
+    HAVE_TE_NVFP4,
+    HAVE_TE_NVFP4_RECIPE,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import GradientPhase
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -390,9 +395,59 @@ class TestMegatronFSDPE2E:
                 ),
                 id="optim_grads_params_parameter_group",
             ),
+            pytest.param(
+                dict(
+                    bf16=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fp8="e4m3",
+                    fp8_param_gather=True,
+                    fp8_recipe="mxfp8",
+                    moe_grouped_gemm=True,
+                    overlap_param_gather=True,
+                    overlap_grad_reduce=True,
+                    use_megatron_fsdp_v2=True,
+                ),
+                id="optim_grads_params_mxfp8_param_gather",
+            ),
+            pytest.param(
+                dict(
+                    bf16=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fp4="e2m1",
+                    fp4_recipe="nvfp4",
+                    fp4_param_gather=True,
+                    main_grads_dtype="fp32",
+                    main_params_dtype="fp32",
+                    overlap_param_gather=True,
+                    overlap_grad_reduce=True,
+                    use_megatron_fsdp_v2=True,
+                ),
+                id="optim_grads_params_nvfp4_param_gather",
+            ),
         ],
     )
     def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, spec_configs):
+        if spec_configs.get("fp8_recipe") == "mxfp8" and (
+            not torch.cuda.is_available()
+            or torch.cuda.get_device_capability()[0] < 10
+            or not HAVE_TE_MXFP8TENSOR
+        ):
+            pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
+
+        if spec_configs.get("fp4_param_gather"):
+            if not torch.cuda.is_available():
+                pytest.skip("CUDA is required for NVFP4")
+            if not (HAVE_TE_NVFP4 and HAVE_TE_NVFP4_RECIPE):
+                pytest.skip("NVFP4 requires Transformer Engine >= 2.7.0.dev0")
+            try:
+                from transformer_engine.pytorch.fp8 import check_nvfp4_support
+
+                is_nvfp4_available, reason = check_nvfp4_support()
+                if not is_nvfp4_available:
+                    pytest.skip("NVFP4 not available: " + reason)
+            except ImportError:
+                pytest.skip("NVFP4 support check requires Transformer Engine >= 2.7.0.dev0")
+
         reference_kind = "distopt"
         ref_cache_key = (
             reference_kind,
@@ -469,11 +524,37 @@ class TestMegatronFSDPE2E:
                 ),
                 id="bf16-optim_grads_params",
             ),
+            pytest.param(
+                dict(
+                    strategy="optim_grads_params",
+                    precision_configs=dict(
+                        bf16=True,
+                        fp8="e4m3",
+                        fp8_param_gather=True,
+                        fp8_recipe="mxfp8",
+                        main_grads_dtype="fp32",
+                        main_params_dtype="fp32",
+                        exp_avg_dtype="bf16",
+                        exp_avg_sq_dtype="bf16",
+                        moe_grouped_gemm=True,
+                        use_precision_aware_optimizer=True,
+                    ),
+                    reference_kind="fsdp_v1",
+                    capture_param_snapshots=False,
+                ),
+                id="mxfp8_param_gather-optim_grads_params",
+            ),
         ],
     )
     def test_strict_iter_equivalence_zero_strategies(self, ref_cache, case):
         strategy = case["strategy"]
         precision_configs = case["precision_configs"]
+        if precision_configs.get("fp8_recipe") == "mxfp8" and (
+            not torch.cuda.is_available()
+            or torch.cuda.get_device_capability()[0] < 10
+            or not HAVE_TE_MXFP8TENSOR
+        ):
+            pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
         if Utils.world_size < 2:
             pytest.skip("Requires at least 2 distributed ranks for ZeRO sharding")
 
@@ -576,6 +657,70 @@ class TestMegatronFSDPE2E:
                         f"reference_shape={tuple(ref_params[name].shape)}"
                     ),
                 )
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize(
+        "strategy,precision_configs",
+        [
+            pytest.param(
+                strategy,
+                dict(
+                    bf16=True,
+                    fp8="e4m3",
+                    fp8_param_gather=True,
+                    fp8_recipe="mxfp8",
+                    main_grads_dtype="fp32",
+                    main_params_dtype="fp32",
+                    exp_avg_dtype="bf16",
+                    exp_avg_sq_dtype="bf16",
+                    moe_grouped_gemm=True,
+                    use_precision_aware_optimizer=True,
+                ),
+                id=f"mxfp8_param_gather-{strategy}",
+            )
+            for strategy in ("optim", "optim_grads")
+        ],
+    )
+    def test_zero_strategy_non_equivalent_precision_paths_run(self, strategy, precision_configs):
+        """Exercise valid ZeRO paths that intentionally lack a strict reference."""
+        if (
+            not torch.cuda.is_available()
+            or torch.cuda.get_device_capability()[0] < 10
+            or not HAVE_TE_MXFP8TENSOR
+        ):
+            pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
+        if Utils.world_size < 2:
+            pytest.skip("Requires at least 2 distributed ranks for ZeRO sharding")
+
+        outputs = TestMegatronFSDPE2E._training_loop(
+            use_megatron_fsdp=True,
+            use_megatron_fsdp_v2=True,
+            ckpt_format="fsdp_dtensor",
+            data_parallel_sharding_strategy=strategy,
+            train_iters=3,
+            seq_length=64,
+            micro_batch_size=1,
+            global_batch_size=8,
+            init_model_with_meta_device=False,
+            gradient_accumulation_fusion=False,
+            overlap_param_gather=False,
+            overlap_grad_reduce=False,
+            **precision_configs,
+        )
+
+        if torch.distributed.get_rank() != 0:
+            return
+
+        assert len(outputs) == 3
+        for step, output in enumerate(outputs):
+            loss = output["lm loss"]
+            assert torch.isfinite(loss), (
+                f"Non-finite loss at step {step}, strategy={strategy}, "
+                f"precision={precision_configs}"
+            )
+
 
 def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
     """

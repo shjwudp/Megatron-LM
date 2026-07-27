@@ -117,8 +117,6 @@ def fully_shard(
         mesh = _init_default_fully_shard_mesh()
         mesh = mesh[mesh.mesh_dim_names[-1]]
 
-    if mp_policy.fp8.enabled or mp_policy.nvfp4.enabled:
-        raise NotImplementedError("ParameterGroup does not support quantized weights yet")
     if mesh.ndim == 2 and sharding_strategy != "optim_grads_params":
         if mesh.size(0) != 1:
             raise NotImplementedError(
