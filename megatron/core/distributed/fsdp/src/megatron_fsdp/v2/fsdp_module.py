@@ -258,21 +258,13 @@ class FSDPModule:
 
     @staticmethod
     def _release_cuda_graphs(ctx: "_FSDPRootContext") -> None:
-        """Tear down all captured CUDA graphs on every FSDP module.
-
-        Supports both the per-module runner path (``_fsdp_cg_runner``) and
-        the batch helper path (``_fsdp_cuda_graphs``, ``_fsdp_cg_runner`` sentinel).
-        Restores original ``forward`` methods before deleting graph objects.
-        """
+        """Tear down captured graphs and restore eager module forwards."""
         if not ctx.enable_cuda_graph:
             return
 
-        for module in ctx.forward_order:
-            if hasattr(module, "_fsdp_cg_runner"):
-                runner = module._fsdp_cg_runner
-                if hasattr(runner, "reset"):
-                    runner.reset()
-                delattr(module, "_fsdp_cg_runner")
+        if ctx.cuda_graph_runner is not None:
+            ctx.cuda_graph_runner.reset()
+            ctx.cuda_graph_runner = None
 
         ctx.cuda_graph_active = False
         ctx.cuda_graph_stream = None
@@ -282,8 +274,8 @@ class FSDPModule:
     def _clear_cuda_graph_sentinels(ctx: "_FSDPRootContext") -> None:
         """Clear CUDA graph sentinels so hooks will re-capture on next forward."""
         for module in ctx.forward_order:
-            if hasattr(module, "_fsdp_cg_runner"):
-                delattr(module, "_fsdp_cg_runner")
+            if hasattr(module, "_fsdp_cg_installed"):
+                delattr(module, "_fsdp_cg_installed")
 
     # ----------------------------------------------------------------
     # CPU offload

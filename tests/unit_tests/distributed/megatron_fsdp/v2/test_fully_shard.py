@@ -338,6 +338,42 @@ class TestFullyShardBasic:
             assert param_group.state.grad_phase is GradientPhase.EMPTY
             assert param_group.grad_buffer.data is None
 
+    @pytest.mark.parametrize("sharding_strategy", ["no_shard", "optim_grads_params"])
+    def test_parameter_group_per_module_cuda_graph(self, sharding_strategy):
+        """Per-module capture preserves placement-first gradient accumulation."""
+        model = fully_shard(
+            SimpleMLP(4).to(_device()),
+            sharding_strategy=sharding_strategy,
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+            enable_cuda_graph=True,
+        )
+
+        for index, value in enumerate((2.0, 3.0, 4.0)):
+            if index == 2:
+                model.set_is_last_backward(True)
+            sample = torch.full((2, 4), value, device=_device(), requires_grad=True)
+            model(sample).sum().backward()
+            if index == 1:
+                assert model._fsdp_cg_installed
+
+        model.finish_grad_sync()
+        for param_names, param_group in model._named_param_groups:
+            assert param_group.state.grad_phase is GradientPhase.READY
+            for name, optimizer_grad in zip(param_names, param_group.optimizer_grads):
+                if optimizer_grad is None:
+                    continue
+                local_expected = 18.0 if name.endswith("weight") else 6.0
+                expected = local_expected * _world_size()
+                torch.testing.assert_close(
+                    optimizer_grad.to_local(),
+                    torch.full_like(optimizer_grad.to_local(), expected),
+                )
+
+        model.zero_grad()
+        for param_group in model._fsdp_param_groups:
+            assert param_group.state.grad_phase is GradientPhase.EMPTY
+
     @pytest.mark.parametrize("outer_dp_sharding_strategy", ["no_shard", "optim"])
     def test_parameter_group_eager_hsdp(self, outer_dp_sharding_strategy):
         """The eager HSDP path preserves the caller's 2D mesh and final layout."""
@@ -1772,7 +1808,6 @@ class TestSafety:
     @pytest.mark.parametrize(
         "kwargs",
         [
-            pytest.param({"enable_cuda_graph": True}, id="per-module-cuda-graph"),
             pytest.param({"skip_backward_callback": True}, id="delayed-wgrad"),
             pytest.param({"skip_final_backward_callback": True}, id="external-final-callback"),
         ],

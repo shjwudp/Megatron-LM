@@ -209,6 +209,7 @@ class CudaGraphRunner:
         self._sample_kwargs: Dict[int, Dict[str, Any]] = {}
         self._sample_outputs: Dict[int, Any] = {}
         self._modules_ordered: List[torch.nn.Module] = []
+        self._original_forwards: Dict[int, Any] = {}
         self._compiled_module_state = []
 
     # ---- called from hooks ------------------------------------------------
@@ -221,6 +222,7 @@ class CudaGraphRunner:
         if mid in self._sample_args:
             return
 
+        self._original_forwards[mid] = module.forward
         # Normalize Module.compile() before capture setup. te-graph-runtime
         # detects this compiled forward body and warms the capture-equivalent
         # hook specialization before entering torch.cuda.graph.
@@ -434,6 +436,22 @@ class CudaGraphRunner:
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info("CudaGraphRunner: installed CUDA graphs on %d modules", n)
+
+    def reset(self) -> None:
+        """Restore eager forwards and clear all recorded or captured graph state."""
+        for module in self._modules_ordered:
+            original_forward = self._original_forwards.get(id(module))
+            if original_forward is not None:
+                module.forward = original_forward
+            if hasattr(module, "_fsdp_cg_installed"):
+                delattr(module, "_fsdp_cg_installed")
+        self._sample_args.clear()
+        self._sample_kwargs.clear()
+        self._sample_outputs.clear()
+        self._modules_ordered.clear()
+        self._original_forwards.clear()
+        self._compiled_module_state.clear()
+        self._captured = False
 
 
 # ---------------------------------------------------------------------------

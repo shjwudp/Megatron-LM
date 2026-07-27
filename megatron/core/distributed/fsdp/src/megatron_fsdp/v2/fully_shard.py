@@ -118,7 +118,6 @@ def fully_shard(
         mesh = mesh[mesh.mesh_dim_names[-1]]
 
     unsupported_options = {
-        "enable_cuda_graph": enable_cuda_graph,
         "skip_backward_callback": skip_backward_callback,
         "skip_final_backward_callback": skip_final_backward_callback,
     }
@@ -149,7 +148,7 @@ def fully_shard(
     new_cls = _fsdp_class_cache[cls]
     module.__class__ = new_cls
 
-    use_trace_pool = enable_trace_pool or any(
+    use_trace_pool = enable_trace_pool or enable_cuda_graph or any(
         getattr(m._fsdp_state, "enable_cuda_graph", False)
         for m in module.modules()
         if isinstance(m, FSDPModule) and m is not module
