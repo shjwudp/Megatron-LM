@@ -316,10 +316,10 @@ communication dtype happen before each redistribution. DDP and ZeRO-1 defer
 both operations until the last backward so accumulated full gradients are
 processed exactly once. Communication workspaces are call-local and are not
 persistent parameter-group state. After every microbatch,
-`release_grad_buffer()` unbinds and releases allocator-backed full-gradient
-scratch, communication workspaces, and parameter bindings, then clears the
-temporary `full_grad` lease. It leaves the DDP and ZeRO-1 `full_grad` view
-attached to persistent gradient storage. Non-final backward sets the phase to
+`release_temporary_grad_buffers()` unbinds and releases allocator-backed
+full-gradient scratch, communication workspaces, and parameter bindings, then
+clears the temporary `full_grad` lease. It leaves the DDP and ZeRO-1 `full_grad`
+view attached to persistent gradient storage. Non-final backward sets the phase to
 `ACCUMULATING`; the last backward sets it to `READY`.
 
 `zero_grad(set_to_none=True)` resets the phase to `EMPTY`, releases temporary

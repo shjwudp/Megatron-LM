@@ -233,7 +233,7 @@ def test_full_gradient_view_follows_persistent_storage_lifetime(sharding_strateg
     assert full_grad is not None
     assert group.begin_backward() is full_grad
     grad_storage = group.grad_buffer.data
-    group.release_grad_buffer()
+    group.release_temporary_grad_buffers()
     assert group.state.full_grad is full_grad
     assert group.state.full_grad.data.data_ptr() == grad_storage.data_ptr()
 
@@ -259,7 +259,7 @@ def test_temporary_full_gradient_lease_precedes_grad_storage_release():
     assert group.state.full_grad is full_grad
     assert any(key[1] == "full_grad" for key in allocator.buckets)
 
-    group.release_grad_buffer()
+    group.release_temporary_grad_buffers()
     group._release_grad_storage()
     assert group.state.full_grad is None
     assert group.grad_buffer.data is None
@@ -458,7 +458,7 @@ def test_outer_sharded_hsdp_collective_order(monkeypatch):
     ]
     assert completion_stream == outer_rs_stream
     completion_stream.synchronize()
-    group.release_grad_buffer()
+    group.release_temporary_grad_buffers()
 
 
 def test_layout_rejects_mesh_rank_mismatch():

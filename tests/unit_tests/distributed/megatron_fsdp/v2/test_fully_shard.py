@@ -1465,7 +1465,7 @@ class TestLifecycle:
         assert zero_grad_calls == []
 
     def test_root_grad_release_keeps_live_accumulation(self):
-        """A live optimizer-facing grad prevents a root-wide storage release."""
+        """A live optimizer-facing grad prevents its storage release."""
         torch.manual_seed(42)
         model = SimpleMLP(16).to(_device())
         # Keep an optimizer-facing gradient on every rank so the test's
@@ -1485,6 +1485,35 @@ class TestLifecycle:
         model._release_grad_storage_if_unused()
 
         assert param_group.grad_buffer.data is not None
+
+    def test_root_forward_releases_unused_grad_storage_per_group(self):
+        """The root sweep releases eligible groups without a global liveness check."""
+        torch.manual_seed(42)
+        model = TinyLLM(vocab=32, hidden=16, num_layers=2).to(_device())
+        for index, layer in enumerate(model.layers):
+            model.layers[index] = fully_shard(layer, sharding_strategy="no_shard")
+        model = fully_shard(model, sharding_strategy="no_shard")
+        param_groups = [
+            param_group
+            for module in model._get_fsdp_modules(recursive=True)
+            for param_group in module._fsdp_param_groups
+        ]
+        assert len(param_groups) > 1
+        for param_group in param_groups:
+            param_group.prepare_gradient_storage()
+
+        live_group = param_groups[0]
+        live_group._install_optimizer_grads()
+        released_groups = param_groups[1:]
+        assert any(
+            getattr(dist_param, "grad", None) is not None
+            for dist_param in live_group.optimizer_params
+        )
+
+        model(torch.randint(0, 32, (2, 4), device=_device()))
+
+        assert live_group.grad_buffer.data is not None
+        assert all(param_group.grad_buffer.data is None for param_group in released_groups)
 
     def test_root_forward_releases_optimizer_cleared_grad_storage_before_unshard(self, monkeypatch):
         """Plain optimizer zero-grad must not overlap stale grads with next unshard."""

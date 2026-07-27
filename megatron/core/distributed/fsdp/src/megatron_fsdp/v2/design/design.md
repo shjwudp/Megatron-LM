@@ -11,7 +11,7 @@
 | `fully_shard.py` | Public `fully_shard()` API and allocator selection |
 | `fsdp_module.py` | `FSDPModule`, `_FSDPRootContext`, `_FSDPState`, `unshard()`, `reshard()`, `reduce_grad()` |
 | `hooks.py` | Forward/backward hook registration and final callback |
-| `param_group.py` | `ParameterGroup.unshard()`, `reduce_grad()`, `release_grad_buffer()`, `_init_buffers()` (memory optimization) |
+| `param_group.py` | `ParameterGroup.unshard()`, `reduce_grad()`, `release_temporary_grad_buffers()`, `_init_buffers()` (memory optimization) |
 | `dp_buffer.py` | Placement-shaped flat-buffer views and one-axis redistribution collectives |
 | `allocator.py` | `BucketAllocator` hierarchy: `TemporaryBucketAllocator`, `StorageFreeingBucketAllocator`, `TracePoolAllocator` — pooled memory for unsharded parameter and gradient buffers |
 | `mcore_fsdp_adapter.py` | `FullyShardedDataParallel.stop_communication()` — synchronizes ag_stream and rs_stream into main stream |
@@ -277,7 +277,7 @@ def reduce_grad(self, async_op: bool = False):
             if i - 2 >= 0:
                 for event, param_group in drain(ctx.reduce_grad_buckets[id(backward_order[i-2])]):
                     event.wait()
-                    param_group.release_grad_buffer()
+                    param_group.release_temporary_grad_buffers()
                     #   → deletes param.main_grad views (prevents TE grad-accum-fusion leak)
                     #   → releases the ParameterGroup-owned full-grad lease
             if module is self: break
@@ -335,10 +335,10 @@ def reduce_grad(self, async_op: bool = False):
             #   → ParameterGroup commits or accumulates the result
             event = stream.record_event()
             ctx.reduce_grad_buckets[id(self)].append((event, param_group))
-            # param_group.release_grad_buffer() is NOT called here; deferred until drain/final CB
+            # param_group.release_temporary_grad_buffers() is NOT called here; deferred until drain/final CB
         else:
             param_group.reduce_grad()
-            param_group.release_grad_buffer()
+            param_group.release_temporary_grad_buffers()
 
         # --- Step 4: Install dist_grad on dist_param (runs in stream context) ---
         for name, param, dist_param, dist_grad in zip(
@@ -418,7 +418,7 @@ def _post_backward_final_callback(root_state, root_module):
         while buckets:
             event, param_group = buckets.pop()
             event.wait()
-            param_group.release_grad_buffer()
+            param_group.release_temporary_grad_buffers()
 
     # Ensure main stream sees all rs_stream work before optimizer step
     torch.cuda.current_stream().wait_stream(stream)

@@ -65,7 +65,7 @@ and fine-grained submodule hooks.
 - Sets root forward/backward phase state for a normal forward pass.
 - Unshards the target's parameters for forward; during activation recomputation,
   also ensures backward-pass buffers are available.
-- Calls `ParameterGroup._release_grad_storage_if_unused()` for each parameter
+- Calls `ParameterGroup.release_grad_storage_if_unused()` for each parameter
   group. This path must stay idempotent because fine-grained hooks may call the
   function more than once for the same FSDP target.
 - Records CUDA-graph sample inputs only when the hook was invoked on the
