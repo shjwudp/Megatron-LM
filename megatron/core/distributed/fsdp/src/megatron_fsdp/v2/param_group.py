@@ -634,10 +634,10 @@ class ParameterGroup:
                 param, buffer.data[start:end].view(shape), role.value
             )
 
-    def compute_weight(
+    def get_unsharded_weight_buffer(
         self, role: WeightBufferRole = WeightBufferRole.MODEL
     ) -> DataParallelBuffer | None:
-        """Return one full compute-weight representation when available."""
+        """Return an available unsharded weight buffer for the requested role."""
         if self.state.weight_valid_by_role[role] == self.full_placements:
             buffer = self.weight_buffers[role]
         else:
@@ -649,7 +649,7 @@ class ParameterGroup:
     def weights_are_unsharded(self, bwd_pass: bool = False) -> bool:
         """Return whether all compute-weight representations for this pass are available."""
         return all(
-            self.compute_weight(role) is not None
+            self.get_unsharded_weight_buffer(role) is not None
             for role in self._required_weight_roles(bwd_pass=bwd_pass)
         )
 
@@ -693,7 +693,7 @@ class ParameterGroup:
             for role in param_group._required_weight_roles(bwd_pass=bwd_pass):
                 if role in param_group.state.pending_weights:
                     continue
-                if param_group.compute_weight(role) is not None:
+                if param_group.get_unsharded_weight_buffer(role) is not None:
                     continue
                 weight_buffer = param_group.weight_buffers[role]
                 target = tuple(weight_buffer.placements)
@@ -766,7 +766,7 @@ class ParameterGroup:
                 param_group._consume_pending_weights(required_roles, axis_streams[-1])
                 required_by_group.append(required_roles)
                 for role in required_roles:
-                    compute_weight = param_group.compute_weight(role)
+                    compute_weight = param_group.get_unsharded_weight_buffer(role)
                     if compute_weight is not None:
                         outputs_by_group[index][role] = compute_weight
                         continue
@@ -1124,7 +1124,7 @@ class ParameterGroup:
 
     def assert_model_weights_not_nan(self) -> None:
         """Assert that full compute weights contain no NaNs."""
-        weight = self.compute_weight()
+        weight = self.get_unsharded_weight_buffer()
         if weight is None:
             raise RuntimeError("Model weights must be unsharded before checking for NaNs")
         for param in self.params:

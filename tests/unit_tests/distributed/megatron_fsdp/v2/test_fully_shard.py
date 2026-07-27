@@ -1034,7 +1034,7 @@ class TestFullyShardBasic:
         model(torch.zeros_like(x))
         assert not ctx.model_weight_refresh_pending
         assert param_group.state.weight_valid == tuple(model_buffer.placements)
-        assert param_group.compute_weight() is None
+        assert param_group.get_unsharded_weight_buffer() is None
 
         outer_replicas = [
             torch.empty_like(model_buffer.data)
@@ -1857,7 +1857,7 @@ class TestActivationCheckpointing:
         observed_full = []
 
         def capture_successor_full_buffer(_module, _args):
-            compute_buffer = param_group.compute_weight()
+            compute_buffer = param_group.get_unsharded_weight_buffer()
             assert compute_buffer is not None
             observed_full.append(compute_buffer.data.detach().clone())
 
