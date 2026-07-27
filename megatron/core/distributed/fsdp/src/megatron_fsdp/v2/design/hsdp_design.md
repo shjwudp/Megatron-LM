@@ -233,7 +233,8 @@ The mesh dimension names are `dp_outer` for the outer dimension and
 
 The inner `sharding_strategy` supports all four strategies below. The outer
 `outer_dp_sharding_strategy` supports `no_shard` and `optim`; outer
-`optim` requires inner `optim_grads_params`.
+`optim` requires inner `optim_grads_params`. A 1D mesh accepts only
+`outer_dp_sharding_strategy=no_shard`, where the outer-axis option is a no-op.
 
 | Strategy | State sharded along the selected mesh dimension |
 | --- | --- |

@@ -258,6 +258,44 @@ def _count_fsdp_modules(module):
 
 
 class TestFullyShardBasic:
+    def test_1d_mesh_accepts_outer_no_shard(self):
+        """A 1D mesh accepts the explicit no-op outer-DP strategy."""
+        model = SimpleMLP(16).to(_device())
+        mesh = DeviceMesh(
+            _device().type,
+            torch.arange(_world_size()),
+            mesh_dim_names=("dp",),
+        )
+
+        fully_shard(model, mesh=mesh, outer_dp_sharding_strategy="no_shard")
+
+        assert all(param_group.mesh.ndim == 1 for param_group in model._fsdp_param_groups)
+
+    @pytest.mark.parametrize(
+        ("outer_dp_sharding_strategy", "error"),
+        [
+            ("optim", "requires a 2D DeviceMesh"),
+            ("optim_grads", "Unsupported outer DP sharding strategy"),
+        ],
+    )
+    def test_1d_mesh_rejects_non_no_shard_outer_strategy(
+        self, outer_dp_sharding_strategy, error
+    ):
+        """A 1D mesh rejects outer-axis sharding instead of silently ignoring it."""
+        model = SimpleMLP(16).to(_device())
+        mesh = DeviceMesh(
+            _device().type,
+            torch.arange(_world_size()),
+            mesh_dim_names=("dp",),
+        )
+
+        with pytest.raises(ValueError, match=error):
+            fully_shard(
+                model,
+                mesh=mesh,
+                outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+            )
+
     def test_module_class_becomes_fsdp(self):
         """fully_shard should dynamically convert the module class to a FSDPModule mixin."""
         torch.manual_seed(42)
