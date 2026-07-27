@@ -63,13 +63,18 @@ Controls parameter/gradient dtypes and communication precision.
 
 | Field | Default | Purpose |
 |-------|---------|---------|
-| `main_params_dtype` | ``None`` | Dtype for optimizer main-weight buffer. ``None`` = no separate buffer, optimizer mutates model weights directly. When this equals the model-weight dtype and the sharding layout matches, the separate buffer is skipped automatically to avoid a redundant copy. |
+| `main_params_dtype` | ``None`` | Dtype for optimizer main-weight buffer. ``None`` = no separate buffer, optimizer mutates model weights directly. Set to ``torch.float32`` for FP8/NVFP4 compute weights. |
 | `main_grads_dtype` | ``None`` | Dtype for optimizer main-grad buffer. When ``None`` and ``use_decoupled_grad=False``, aligns with ``main_params_dtype``. Otherwise falls back to ``param.dtype``. |
 | `grad_comm_dtype` | ``None`` | Dtype for gradient reduce-scatter communication. ``None`` = use ``main_grads_dtype``. |
 | `use_decoupled_grad` | ``False`` | When ``False``, ``main_grads_dtype`` is inferred from ``main_params_dtype`` so the optimizer operates in a consistent precision context. |
 
 ```python
-from megatron_fsdp.v2 import fully_shard, MixedPrecisionPolicy
+from megatron_fsdp.v2 import (
+    FullyShardFP8Policy,
+    FullyShardNVFP4Policy,
+    MixedPrecisionPolicy,
+    fully_shard,
+)
 
 # No separate main buffer — optimizer mutates model params directly
 mp_policy = MixedPrecisionPolicy()
@@ -77,6 +82,19 @@ fully_shard(model, mp_policy=mp_policy)
 
 # fp32 optimizer precision for bf16 model
 mp_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
+fully_shard(model, mp_policy=mp_policy)
+
+# Quantized compute weights with fp32 optimizer weights
+mp_policy = MixedPrecisionPolicy(
+    main_params_dtype=torch.float32,
+    fp8=FullyShardFP8Policy(enabled=True),
+)
+fully_shard(model, mp_policy=mp_policy)
+
+mp_policy = MixedPrecisionPolicy(
+    main_params_dtype=torch.float32,
+    nvfp4=FullyShardNVFP4Policy(enabled=True),
+)
 fully_shard(model, mp_policy=mp_policy)
 ```
 
@@ -89,6 +107,8 @@ Mixin class added to wrapped modules. Methods:
 | `unshard()` | Pre-forward | All-gather params from sharded buffer |
 | `reshard()` | Post-forward, post-backward | Release unsharded buffer |
 | `reduce_grad()` | Post-backward / grad sync | All-reduce no-shard grads or reduce-scatter ZeRO grads |
+| `offload_to_cpu()` | Between iterations | Move persistent parameter-group storage to CPU |
+| `reload_to_gpu()` | Before reuse (optional) | Eagerly restore offloaded storage; normal access reloads automatically |
 
 ### DataParallelBuffer
 
@@ -142,10 +162,10 @@ strategy controls which buffers and communication collectives are used.
 
 ### Parameter-group features
 
-The placement-first parameter group supports DDP, ZeRO-1/2/3, HSDP, and
-full-iteration CUDA graphs. FP8/NVFP4 parameter gather, trace-pool or per-module
-CUDA graphs, delayed weight-gradient/MoE callbacks, and CPU offload are not
-supported.
+The placement-first parameter group supports DDP, ZeRO-1/2/3, HSDP,
+FP8/NVFP4 parameter gather, trace-pool allocation, per-module and
+full-iteration CUDA graphs, delayed weight-gradient/MoE callbacks, and
+explicit CPU offload.
 
 ### Parallelism
 
@@ -167,11 +187,13 @@ overlap (prefetch/unshard pipelining) is not applicable.
 
 ### CUDA Graph
 
-Full-iteration CUDA graphs are supported through
-`enable_full_iteration_cuda_graph=True`. Per-module capture through
-`enable_cuda_graph=True` is not supported by the placement-first parameter
-group. See
-[`design/full_iteration_cuda_graph_design.md`](design/full_iteration_cuda_graph_design.md).
+Full-iteration CUDA graphs are enabled with
+`enable_full_iteration_cuda_graph=True`. Per-module capture is enabled with
+`enable_cuda_graph=True` on leaf FSDP modules and automatically selects the
+`TracePoolAllocator` needed for stable scratch-buffer addresses. See
+[`design/full_iteration_cuda_graph_design.md`](design/full_iteration_cuda_graph_design.md)
+and
+[`design/mfsdp_v2_builtin_cuda_graph_design.md`](design/mfsdp_v2_builtin_cuda_graph_design.md).
 
 ### `fully_shard()` API Parameters
 
@@ -181,12 +203,13 @@ signature but are **not supported yet**. Passing any of them raises
 
 - `reshard_after_forward`
 - `shard_placement_fn`; all parameters currently use `Shard(0)` on the DP dimension
-- `offload_policy`; CPU offloading is not supported
+- `offload_policy`; use `FSDPModule.offload_to_cpu()` for explicit offload
 
 ### Hardware & Platform
 
 - **GPU only.** CUDA devices only. CPU, XPU, and ROCm are not tested or supported.
-- **Quantized weights:** FP8/NVFP4 parameter gather is not supported.
+- **Quantized weights:** FP8 and NVFP4 parameter gather require a compatible
+  Transformer Engine release and supported NVIDIA GPU.
 
 ### Checkpointing
 

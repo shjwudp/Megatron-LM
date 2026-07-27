@@ -4,9 +4,9 @@
 
 This document defines the target ownership and state model for Megatron FSDP v2
 `ParameterGroup`. It is the sole parameter-group implementation used by
-`fully_shard()` for eager and full-iteration CUDA-graph FP32/BF16 validation.
-Communication overlap is supported on this path. Per-module CUDA graphs,
-trace-pool allocation, CPU offload, and quantized weights are not supported.
+`fully_shard()`. It supports eager execution, communication overlap, trace-pool
+allocation, per-module and full-iteration CUDA graphs, explicit CPU offload,
+delayed backward callbacks, and FP8/NVFP4 parameter gather.
 The HSDP lifecycle is defined in [`hsdp_design.md`](hsdp_design.md).
 
 ## Design principles
@@ -37,7 +37,7 @@ the last backward reduces that shard across outer DP for the optimizer.
 
 The group has three persistent distributed values:
 
-- model weights used to materialize compute parameters;
+- one or more model-weight representations used to materialize compute parameters;
 - optimizer main weights;
 - persistent accumulated or reduced gradients.
 
@@ -75,6 +75,11 @@ backward from reductions delayed until the last backward:
 | HSDP, outer replicated | `[R,S]` | `[R,S]` | `[R,S]` | `[P,S]` | `[R,S]` |
 | HSDP, outer sharded | `[R,S]` | `[S,S]` | `[R,S]` | `[P,S]` | `[S,S]` |
 
+The HSDP rows show inner ZeRO-3. With outer replication, the inner axis may
+instead use any 1D DDP/ZeRO row above: prepend `R` to weight, main-weight, and
+gradient-storage placements and prepend `P` to gradient accumulation. Outer
+optimizer sharding currently remains paired with inner ZeRO-3.
+
 For normal FSDP, the caller's 1D mesh remains 1D; it is not expanded into a
 synthetic `(1, N)` HSDP mesh:
 
@@ -103,13 +108,18 @@ other placements are unchanged.
 
 ## Persistent buffers
 
-The group exposes three semantic buffers internally:
+The group exposes three canonical semantic buffers internally:
 
 ```python
 self.weight_buffer
 self.main_weight_buffer
 self.grad_buffer
 ```
+
+Quantized policies may add entries to
+`weight_buffers: dict[WeightBufferRole, DataParallelBuffer]`. `MODEL` is the
+canonical forward representation and aliases `weight_buffer`; MXFP8 also owns a
+`TRANSPOSE` representation used by backward.
 
 `main_weight_buffer` is always the optimizer-facing representation. It may own a
 distinct allocation, or it may be a placement view of `weight_buffer` when dtype
@@ -136,14 +146,17 @@ class GradientPhase(Enum):
 
 @dataclass
 class ParameterGroupState:
-    weight_valid: tuple[Placement, ...]
+    weight_valid_by_role: dict[WeightBufferRole, tuple[Placement, ...]]
+    full_weights: dict[WeightBufferRole, DataParallelBuffer]
     grad_phase: GradientPhase = GradientPhase.EMPTY
-    full_weight: DataParallelBuffer | None = None
     full_grad: DataParallelBuffer | None = None
+    grad_comm: DataParallelBuffer | None = None
 ```
 
-`weight_valid` identifies the current placement view of persistent model-weight
-storage. Gradient placement is derived from `grad_phase`:
+`weight_valid_by_role` identifies the current placement view of each persistent
+model-weight representation. `full_weights` contains only allocator-backed
+compute representations currently leased by a role. Gradient placement is
+derived from `grad_phase`:
 
 | Phase | Valid gradient placement |
 | --- | --- |
@@ -154,11 +167,12 @@ storage. Gradient placement is derived from `grad_phase`:
 Value existence must not be inferred from placement equality. ZeRO-2 and FSDP
 use `[S]` for both accumulation and the optimizer-ready gradient.
 
-The two buffer fields are optional scratch leases:
+The scratch fields are optional leases:
 
-- `full_weight` is a full compute-weight allocation when persistent weight storage
-  cannot contain `[R, R]`;
+- `full_weights[role]` is a full compute-weight allocation when that role's
+  persistent storage cannot contain `[R, R]`;
 - `full_grad` contains the current backward contribution.
+- `grad_comm` exists only when communication dtype differs from gradient dtype.
 
 There is no dirty placement, cached optimizer buffer view, generic temporary-buffer
 dictionary, or separate full-gradient/reduced-gradient value flags. Views are
@@ -178,9 +192,11 @@ Initialization:
 The initial state is:
 
 ```python
-state.weight_valid = weight_buffer.placements
+state.weight_valid_by_role = {
+    role: buffer.placements for role, buffer in weight_buffers.items()
+}
 state.grad_phase = GradientPhase.EMPTY
-state.full_weight = None
+state.full_weights = {}
 state.full_grad = None
 grad_buffer.data = None
 ```
@@ -199,26 +215,33 @@ optimizer-valid view          persistent owner          compute weight
                        -- inner all-gather --> [R, R]
 ```
 
-The first transition writes into `weight_buffer` and updates `weight_valid`. The
-second transition writes into `full_weight` only when the persistent owner is not
-already full. Parameters are then bound privately by `ParameterGroup`.
+The same transition is planned independently for each representation required by
+the pass. Forward normally selects `MODEL`; MXFP8 backward selects `TRANSPOSE`.
+The first transition writes into the role's persistent buffer and updates its
+valid placement. The second writes into `full_weights[role]` only when the
+persistent owner is not already full. Parameters are then bound privately by
+`ParameterGroup`, and the mixed-precision policy finalizes recipe-specific state.
 
 Weight readiness is derived:
 
 ```python
-weight_valid == full or full_weight is not None
+all(
+    state.weight_valid_by_role[role] == full or role in state.full_weights
+    for role in required_roles
+)
 ```
 
-Reshard unbinds parameter representations and releases `full_weight`. It does not
-invalidate the persistent owner.
+Reshard releases every leased full representation. It does not invalidate the
+persistent owners.
 
 After an optimizer step, mixed-precision conversion copies or quantizes the
 optimizer placement of `main_weight_buffer` into model-weight storage when the two
 do not alias. The group then records:
 
 ```python
-state.weight_valid = layout.main_weight
-state.full_weight = None
+for role in weight_buffers:
+    state.weight_valid_by_role[role] = layout.main_weight
+state.full_weights = {}
 ```
 
 The next unshard refreshes any missing persistent replicas before producing full

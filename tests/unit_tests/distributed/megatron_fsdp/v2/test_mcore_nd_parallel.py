@@ -397,6 +397,20 @@ class TestMegatronFSDPE2E:
             ),
             pytest.param(
                 dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    recompute_granularity="full",
+                    recompute_method="uniform",
+                    recompute_num_layers=1,
+                    overlap_param_gather=True,
+                    overlap_grad_reduce=True,
+                    use_megatron_fsdp_v2=True,
+                    gradient_accumulation_fusion=True,
+                    fsdp_trace_pool=True,
+                ),
+                id="optim_grads_params_trace_pool",
+            ),
+            pytest.param(
+                dict(
                     bf16=True,
                     data_parallel_sharding_strategy="optim_grads_params",
                     fp8="e4m3",
@@ -424,6 +438,21 @@ class TestMegatronFSDPE2E:
                 ),
                 id="optim_grads_params_nvfp4_param_gather",
             ),
+            pytest.param(
+                dict(
+                    bf16=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fp8="e4m3",
+                    fp8_param_gather=True,
+                    fp8_recipe="mxfp8",
+                    moe_grouped_gemm=True,
+                    use_megatron_fsdp_v2=True,
+                    moe_token_dispatcher_type="alltoall",
+                    overlap_moe_expert_parallel_comm=True,
+                    delay_wgrad_compute=True,
+                ),
+                id="ep_overlap_delayed_wgrad-optim_grads_params",
+            ),
         ],
     )
     def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, spec_configs):
@@ -447,6 +476,12 @@ class TestMegatronFSDPE2E:
                     pytest.skip("NVFP4 not available: " + reason)
             except ImportError:
                 pytest.skip("NVFP4 support check requires Transformer Engine >= 2.7.0.dev0")
+
+        if spec_configs.get("overlap_moe_expert_parallel_comm"):
+            from megatron.core.utils import is_te_min_version
+
+            if not is_te_min_version("2.3.0"):
+                pytest.skip("EP overlap requires Transformer Engine >= 2.3.0")
 
         reference_kind = "distopt"
         ref_cache_key = (
