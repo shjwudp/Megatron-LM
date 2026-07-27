@@ -54,6 +54,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     get_state_dict,
     preprocess_state_dict_for_uneven_dtensor,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.allocator import TracePoolAllocator
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
@@ -1193,6 +1194,36 @@ class TestIgnoredParams:
 
 
 class TestLifecycle:
+    def test_trace_pool_plans_and_reuses_parameter_group_scratch(self):
+        """TracePoolAllocator plans the new parameter-group scratch lifecycle."""
+        torch.manual_seed(42)
+        model = fully_shard(
+            SimpleMLP(16).to(_device()),
+            enable_trace_pool=True,
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+        )
+        allocator = model._fsdp_root_context.bucket_allocator
+        assert isinstance(allocator, TracePoolAllocator)
+        assert allocator.phase == "trace"
+
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        scratch_addresses = None
+        for _ in range(2):
+            model(torch.randn(2, 16, device=_device())).float().square().mean().backward()
+            model.finish_grad_sync()
+            optimizer.step()
+            model.zero_grad(set_to_none=True)
+
+            assert allocator.phase == "optimized"
+            current_addresses = {
+                key: view.data_ptr() for key, view in allocator._key_to_view.items()
+            }
+            if scratch_addresses is None:
+                scratch_addresses = current_addresses
+            else:
+                assert current_addresses == scratch_addresses
+
     def test_root_grad_release_skips_full_iteration_cuda_graph(self, monkeypatch):
         """Full-iteration graphs own stable grad storage and zeroing."""
         torch.manual_seed(42)
@@ -1741,7 +1772,6 @@ class TestSafety:
     @pytest.mark.parametrize(
         "kwargs",
         [
-            pytest.param({"enable_trace_pool": True}, id="trace-pool"),
             pytest.param({"enable_cuda_graph": True}, id="per-module-cuda-graph"),
             pytest.param({"skip_backward_callback": True}, id="delayed-wgrad"),
             pytest.param({"skip_final_backward_callback": True}, id="external-final-callback"),

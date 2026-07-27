@@ -15,7 +15,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Shard
 
-from .allocator import StorageFreeingBucketAllocator
+from .allocator import StorageFreeingBucketAllocator, TracePoolAllocator
 from .fsdp_module import FSDPModule
 from .hooks import (
     _register_backward_hook,
@@ -118,7 +118,6 @@ def fully_shard(
         mesh = mesh[mesh.mesh_dim_names[-1]]
 
     unsupported_options = {
-        "enable_trace_pool": enable_trace_pool,
         "enable_cuda_graph": enable_cuda_graph,
         "skip_backward_callback": skip_backward_callback,
         "skip_final_backward_callback": skip_final_backward_callback,
@@ -150,7 +149,12 @@ def fully_shard(
     new_cls = _fsdp_class_cache[cls]
     module.__class__ = new_cls
 
-    bucket_allocator = StorageFreeingBucketAllocator()
+    use_trace_pool = enable_trace_pool or any(
+        getattr(m._fsdp_state, "enable_cuda_graph", False)
+        for m in module.modules()
+        if isinstance(m, FSDPModule) and m is not module
+    )
+    bucket_allocator = TracePoolAllocator() if use_trace_pool else StorageFreeingBucketAllocator()
 
     module._init_named_param_groups(
         mesh,

@@ -13,7 +13,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from .allocator import BucketAllocator
+from .allocator import BucketAllocator, TracePoolAllocator
 from .mixed_precision import MixedPrecisionPolicy
 from .param_group import ParameterGroup, ParameterGroupLayout
 from .utils import ParamGroupIdx, _replace_module_parameter
