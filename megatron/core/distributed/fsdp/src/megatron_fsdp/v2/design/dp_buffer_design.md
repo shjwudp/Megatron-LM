@@ -144,11 +144,12 @@ shard.redistribute(replicated.placements, output_buffer=replicated)
 The two DP-buffer objects have different placements and exact placement-shaped data,
 while their tensors share one allocation.
 
-For a multi-axis transition, the batch planner prefers a source view's containing
-storage owner when that owner's placement is the next intermediate target. Thus
-`[SHARD, SHARD] -> [REPLICATE, SHARD] -> [REPLICATE, REPLICATE]` refreshes an existing
-`[REPLICATE, SHARD]` persistent owner directly before writing the final full output.
-No role or sharding-strategy knowledge is needed for that choice.
+For a multi-axis transition with persistent intermediate state, `ParameterGroup`
+submits explicit stages. Thus
+`[SHARD, SHARD] -> [REPLICATE, SHARD] -> [REPLICATE, REPLICATE]` names the persistent
+`[REPLICATE, SHARD]` buffer as the first output and the temporary full buffer as the
+second output. `DataParallelBuffer` does not discover storage ancestry or decide which
+representation must become current.
 
 ## Core Operations
 
@@ -266,8 +267,8 @@ collective state.
 - `DataParallelBuffer` has no allocator, allocation key, or temporary-buffer cache.
 - `DataParallelBuffer` does not move, allocate, resize, or free storage.
 - `bind()` and `unbind()` never allocate or free storage.
-- a buffer returned by `view()` has exact placement-shaped data and retains its
-  storage owner.
+- a buffer returned by `view()` has exact placement-shaped data; its tensor view
+  retains the shared storage without buffer-level ownership metadata.
 - `view()` never grows storage and fails when the bound tensor cannot contain the
   requested placement.
 - an explicit redistribution output shares layout, mesh, dtype, and device with its

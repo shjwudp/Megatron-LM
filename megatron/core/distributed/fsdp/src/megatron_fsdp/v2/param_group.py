@@ -791,14 +791,47 @@ class ParameterGroup:
                     param_group.state.full_weights.pop(role, None)
             raise
 
-        if plans:
-            DataParallelBuffer.redistribute_buffers(
-                [source for _, _, _, _, _, source, _ in plans],
-                list(param_groups[0].full_placements),
-                output_buffers=[output for _, _, _, _, _, _, output in plans],
-                streams=axis_streams,
-                async_op=async_op,
-            )
+        current_buffers = [source for _, _, _, _, _, source, _ in plans]
+        previous_stream = torch.cuda.current_stream()
+        # Name every stage output explicitly. In outer-sharded HSDP the outer
+        # all-gather refreshes persistent [R, S] storage before the inner
+        # all-gather writes temporary [R, R] compute weights.
+        for axis, axis_stream in enumerate(axis_streams):
+            transitions_by_target: dict[
+                Placements, list[tuple[DataParallelBuffer, DataParallelBuffer]]
+            ] = {}
+            next_buffers: list[DataParallelBuffer] = []
+            for plan, current in zip(plans, current_buffers):
+                _, param_group, role, _, persistent_placements, _, final_output = plan
+                if current.placements[axis] is Placement.REPLICATE:
+                    next_buffers.append(current)
+                    continue
+
+                next_placements = current.placements.copy()
+                next_placements[axis] = Placement.REPLICATE
+                if tuple(next_placements) == persistent_placements:
+                    output = param_group.weight_buffers[role]
+                elif tuple(next_placements) == param_group.full_placements:
+                    output = final_output
+                else:
+                    output = final_output.view(next_placements)
+                transitions_by_target.setdefault(tuple(next_placements), []).append(
+                    (current, output)
+                )
+                next_buffers.append(output)
+
+            if transitions_by_target:
+                with torch.cuda.stream(previous_stream):
+                    for target, transitions in transitions_by_target.items():
+                        DataParallelBuffer.redistribute_buffers(
+                            [source for source, _ in transitions],
+                            list(target),
+                            output_buffers=[output for _, output in transitions],
+                            stream=axis_stream,
+                            async_op=async_op,
+                        )
+                previous_stream = axis_stream
+            current_buffers = next_buffers
 
         for (
             index,
@@ -925,42 +958,49 @@ class ParameterGroup:
         shape = full_grad.buffer_index.item_index_map[item_id].shape
         return full_grad.data[start:end].view(shape)
 
-    def _preprocess_gradient(self, full_grad: DataParallelBuffer) -> DataParallelBuffer:
+    def _preprocess_gradient(
+        self, full_grad: DataParallelBuffer
+    ) -> tuple[DataParallelBuffer, DataParallelBuffer]:
+        """Return the logical contribution and its full-size workspace."""
         comm_dtype = self.mp_policy.grad_comm_dtype or full_grad.dtype
-        owner = full_grad
+        workspace = self.grad_buffer if self.accumulates_full_grad else full_grad
         if comm_dtype != full_grad.dtype:
-            owner = DataParallelBuffer(
+            workspace = DataParallelBuffer(
                 buffer_index=full_grad.buffer_index,
                 dtype=comm_dtype,
                 device=full_grad.device,
                 mesh=full_grad.mesh,
                 placements=list(self.full_placements),
             )
-            owner.bind(
+            workspace.bind(
                 self.allocator.allocate(
                     key=(self.param_group_id, "grad_comm"),
-                    size=owner.data_size,
-                    dtype=owner.dtype,
-                    device=owner.device,
+                    size=workspace.data_size,
+                    dtype=workspace.dtype,
+                    device=workspace.device,
                 ).data
             )
-            owner.data.copy_(full_grad.data)
-            self.state.grad_comm = owner
+            workspace.data.copy_(full_grad.data)
+            self.state.grad_comm = workspace
 
         if self.gradient_scaling_factor not in (None, 1.0):
-            owner.data.mul_(self.gradient_scaling_factor)
+            workspace.data.mul_(self.gradient_scaling_factor)
 
-        if tuple(owner.placements) == self.contribution_placements:
-            return owner
-        return self._placement_view(owner, self.contribution_placements)
+        if tuple(full_grad.placements) == self.contribution_placements and workspace is full_grad:
+            return full_grad, workspace
+        return self._placement_view(workspace, self.contribution_placements), workspace
 
     def _finalize_gradient_placement(
-        self, current: DataParallelBuffer, *, streams: tuple[torch.cuda.Stream, ...], async_op: bool
+        self,
+        current: DataParallelBuffer,
+        workspace: DataParallelBuffer,
+        *,
+        streams: tuple[torch.cuda.Stream, ...],
+        async_op: bool,
     ) -> tuple[DataParallelBuffer, torch.cuda.Stream]:
         """Redistribute delayed mesh axes into the persistent optimizer gradient."""
         target = self.layout.main_weight
         final = self._placement_view(self.grad_buffer, target)
-        communication_owner = current._storage_owner or current
         terminal_stream = torch.cuda.current_stream()
         # Reduce in reverse mesh-axis order. On the supported 2D HSDP mesh
         # (outer DP, inner DP), this means inner reduce-scatter precedes outer
@@ -973,7 +1013,7 @@ class ParameterGroup:
             if tuple(next_placements) == target and current.dtype == final.dtype:
                 output = final
             else:
-                output = self._placement_view(communication_owner, tuple(next_placements))
+                output = self._placement_view(workspace, tuple(next_placements))
             with torch.cuda.stream(terminal_stream):
                 DataParallelBuffer.redistribute_buffers(
                     [current],
@@ -1007,15 +1047,15 @@ class ParameterGroup:
                 self.state.grad_phase = GradientPhase.ACCUMULATING
                 return torch.cuda.current_stream()
 
-            grad_input = self._preprocess_gradient(self.state.full_grad)
+            grad_input, grad_workspace = self._preprocess_gradient(self.state.full_grad)
             _, terminal_stream = self._finalize_gradient_placement(
-                grad_input, streams=streams, async_op=async_op
+                grad_input, grad_workspace, streams=streams, async_op=async_op
             )
             self.state.grad_phase = GradientPhase.READY
             self._install_optimizer_grads()
             return terminal_stream
 
-        grad_input = self._preprocess_gradient(self.state.full_grad)
+        grad_input, grad_workspace = self._preprocess_gradient(self.state.full_grad)
         accumulation = self._placement_view(self.grad_buffer, self.layout.grad_accumulation)
         # A pending accumulation contains reduced gradients from earlier
         # microbatches but is not yet optimizer-ready. Placement alone cannot
@@ -1027,8 +1067,7 @@ class ParameterGroup:
             or grad_input.dtype != accumulation.dtype
             or (is_last_backward and needs_final_redistribution)
         ):
-            owner = grad_input._storage_owner or grad_input
-            output = self._placement_view(owner, self.layout.grad_accumulation)
+            output = self._placement_view(grad_workspace, self.layout.grad_accumulation)
         else:
             output = accumulation
 
@@ -1066,7 +1105,7 @@ class ParameterGroup:
                     # context. The next axis stream therefore waits for the
                     # inner reduction and accumulation before consuming output.
                     _, terminal_stream = self._finalize_gradient_placement(
-                        output, streams=streams, async_op=async_op
+                        output, grad_workspace, streams=streams, async_op=async_op
                     )
                 self.state.grad_phase = GradientPhase.READY
                 self._install_optimizer_grads()

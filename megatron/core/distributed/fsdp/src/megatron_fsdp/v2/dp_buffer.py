@@ -39,7 +39,6 @@ class DataParallelBuffer:
         self.data_size = self.buffer_index._get_shard_meta(self.placements).size
 
         self.data: Optional[torch.Tensor] = None
-        self._storage_owner: Optional["DataParallelBuffer"] = None
 
     # ------------------------------------------------------------------ #
     #  Public API
@@ -54,7 +53,6 @@ class DataParallelBuffer:
     def unbind(self) -> None:
         """Detach this buffer from storage without freeing the external allocation."""
         self.data = None
-        self._storage_owner = None
 
     def placeholder(self, placements: list[Placement]) -> "DataParallelBuffer":
         """Return an unbound buffer with this layout and explicit placements."""
@@ -64,7 +62,6 @@ class DataParallelBuffer:
         placeholder.data_size = self.buffer_index._get_shard_meta(placements).size
         placeholder.data = None
         placeholder.placements = placements.copy()
-        placeholder._storage_owner = None
         return placeholder
 
     @torch.no_grad()
@@ -121,7 +118,7 @@ class DataParallelBuffer:
 
         The returned buffer has exact placement-shaped ``data``. For example,
         taking a ``SHARD`` view of a ``REPLICATE`` placeholder returns the
-        rank-owned slice while retaining the placeholder as its storage owner.
+        rank-owned slice. The tensor view itself retains the shared storage.
 
         Args:
             placements: Logical placement for each mesh dimension.
@@ -134,7 +131,6 @@ class DataParallelBuffer:
         view = self.placeholder(placements)
         view.data = self._bound_view(placements)
         view.data_size = view.data.numel()
-        view._storage_owner = self
         return view
 
     def reinterpret(self, placements: list[Placement]) -> "DataParallelBuffer":
@@ -152,7 +148,6 @@ class DataParallelBuffer:
                 f"({alias.data_size} elements)"
             )
         alias.data = self.data
-        alias._storage_owner = self
         return alias
 
     @staticmethod
@@ -221,14 +216,6 @@ class DataParallelBuffer:
                 axis_target[mesh_dim] = target
                 if axis_target == target_placements:
                     axis_output = final_output
-                elif (
-                    buffer._storage_owner is not None
-                    and buffer._storage_owner.placements == axis_target
-                ):
-                    # Prefer the containing placement view when one exists.
-                    # For [S, S] -> [R, S] -> [R, R], this refreshes the
-                    # persistent [R, S] owner before the final all-gather.
-                    axis_output = buffer._storage_owner
                 else:
                     axis_output = final_output.view(axis_target)
                 axis_transitions.append((buffer, axis_output))
@@ -241,7 +228,9 @@ class DataParallelBuffer:
                 with torch.cuda.stream(axis_stream):
                     compatible_runs = {}
                     for item in axis_transitions:
-                        compatible_runs.setdefault(compatibility_key(item, mesh_dim), []).append(item)
+                        compatible_runs.setdefault(compatibility_key(item, mesh_dim), []).append(
+                            item
+                        )
                     for compatible_items in compatible_runs.values():
                         group = compatible_items[0][0].mesh.get_group(mesh_dim=mesh_dim)
                         context = (

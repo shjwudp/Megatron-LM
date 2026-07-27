@@ -50,7 +50,8 @@ owner.
 3. After an optimizer update, only the optimizer-owned `[S, S]` slice is current.
    That slice is represented as an explicit view into the `[R, S]` model-weight
    owner.
-4. Outer all-gather transforms `[S, S] -> [R, S]` into the containing owner.
+4. Outer all-gather transforms `[S, S] -> [R, S]` into the explicitly selected
+   persistent model-weight buffer.
 5. Inner all-gather transforms `[R, S] -> [R, R]` into a temporary compute-weight
    output.
 6. Parameters bind to `[R, R]` for computation. Reshard releases only the temporary

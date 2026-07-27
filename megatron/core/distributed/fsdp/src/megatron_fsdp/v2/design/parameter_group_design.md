@@ -238,6 +238,8 @@ The first transition writes into the role's persistent buffer and updates its
 valid placement. The second writes into `full_weights[role]` only when the
 persistent owner is not already full. Parameters are then bound privately by
 `ParameterGroup`, and the mixed-precision policy finalizes recipe-specific state.
+Each stage passes its output buffer explicitly; buffer views do not carry
+ancestry metadata used to recover the persistent destination.
 
 Weight readiness is derived:
 
@@ -315,7 +317,9 @@ For strategies reduced every microbatch, gradient scaling and conversion to
 communication dtype happen before each redistribution. DDP and ZeRO-1 defer
 both operations until the last backward so accumulated full gradients are
 processed exactly once. Communication workspaces are call-local and are not
-persistent parameter-group state. After every microbatch,
+persistent parameter-group state. Preprocessing returns the logical `[P, ...]`
+contribution together with its full-size workspace, so later stages derive
+intermediate placement views from that explicit workspace. After every microbatch,
 `release_grad_buffer()` unbinds and releases allocator-backed full-gradient
 scratch, communication workspaces, and parameter bindings, then clears the
 temporary `full_grad` lease. It leaves the DDP and ZeRO-1 `full_grad` view

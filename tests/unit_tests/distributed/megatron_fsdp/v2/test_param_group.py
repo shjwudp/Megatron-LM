@@ -266,6 +266,18 @@ def test_temporary_full_gradient_lease_precedes_grad_storage_release():
     assert allocator.buckets == {}
 
 
+def test_buffer_view_retains_tensor_storage_after_parent_unbind():
+    group, _, _ = _build_1d_group("optim_grads_params")
+    parent = group.grad_buffer.placeholder(list(group.full_placements))
+    parent.bind(torch.arange(parent.data_size, dtype=parent.dtype, device=parent.device))
+    shard = parent.view(list(group.layout.grad_storage))
+    expected = shard.data.clone()
+
+    parent.unbind()
+
+    torch.testing.assert_close(shard.data, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "sharding_strategy",
     ["no_shard", "optim", "optim_grads", "optim_grads_params"],
@@ -407,12 +419,14 @@ def test_weight_validity_and_scratch_lifecycle():
 def test_outer_sharded_hsdp_collective_order(monkeypatch):
     group, _, _ = _build_2d_group(shard_optimizer_across_outer_dp=True)
     transitions = []
+    destinations = []
     redistribute = DataParallelBuffer.redistribute
 
     def record_redistribution(self, target_placements, *, output_buffer=None):
         transitions.append(
             (tuple(self.placements), tuple(target_placements), torch.cuda.current_stream())
         )
+        destinations.append(output_buffer)
         return redistribute(self, target_placements, output_buffer=output_buffer)
 
     monkeypatch.setattr(DataParallelBuffer, "redistribute", record_redistribution)
@@ -421,6 +435,7 @@ def test_outer_sharded_hsdp_collective_order(monkeypatch):
     inner_ag_stream = torch.cuda.Stream()
     group.refresh_model_weight()
     transitions.clear()
+    destinations.clear()
     group.unshard_weight(streams=(outer_ag_stream, inner_ag_stream), async_op=True)
     inner_ag_stream.synchronize()
     assert transitions == [
@@ -435,9 +450,12 @@ def test_outer_sharded_hsdp_collective_order(monkeypatch):
             inner_ag_stream,
         ),
     ]
+    assert destinations[0] is group.weight_buffer
+    assert destinations[1] is group.state.full_weight
 
     group.reshard_weight()
     transitions.clear()
+    destinations.clear()
     group.begin_backward().data.fill_(torch.distributed.get_rank() + 1)
     outer_rs_stream = torch.cuda.Stream()
     inner_rs_stream = torch.cuda.Stream()
