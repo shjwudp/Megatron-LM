@@ -159,18 +159,26 @@ class GradientPhase(Enum):
 
 
 @dataclass
-class ParameterGroupState:
-    weight_valid_by_role: dict[WeightBufferRole, tuple[Placement, ...]]
-    full_weights: dict[WeightBufferRole, DataParallelBuffer]
-    grad_phase: GradientPhase = GradientPhase.EMPTY
-    full_grad: DataParallelBuffer | None = None
-    grad_comm: DataParallelBuffer | None = None
+class WeightRepresentationState:
+    persistent: DataParallelBuffer
+    valid_placements: tuple[Placement, ...]
+    full: DataParallelBuffer | None = None
+    pending: PendingWeightTransition | None = None
+
+
+@dataclass
+class GradientState:
+    persistent: DataParallelBuffer
+    phase: GradientPhase = GradientPhase.EMPTY
+    full: DataParallelBuffer | None = None
+    communication: DataParallelBuffer | None = None
 ```
 
-`weight_valid_by_role` identifies the current placement view of each persistent
-model-weight representation. `full_weights` contains only allocator-backed
-compute representations currently leased by a role. Gradient placement is
-derived from `grad_phase`:
+`WeightSynchronizer` owns one `WeightRepresentationState` for each
+`WeightBufferRole`. This keeps a representation's persistent buffer, valid
+placement, full lease, and pending transition together rather than maintaining
+parallel dictionaries. `GradientSynchronizer` independently owns
+`GradientState`. Gradient placement is derived from `phase`:
 
 | Phase | Valid gradient placement |
 | --- | --- |
@@ -183,13 +191,14 @@ use `[S]` for both accumulation and the optimizer-ready gradient.
 
 The runtime fields record active views and allocator leases:
 
-- `full_weights[role]` is a full compute-weight allocation when that role's
+- `weight_state[role].full` is a full compute-weight allocation when that role's
   persistent storage cannot contain `[R, R]`;
-- for DDP and ZeRO-1, `full_grad` is a `[P]` view of persistent gradient
+- for DDP and ZeRO-1, `gradient_state.full` is a `[P]` view of persistent gradient
   storage and follows that storage's lifetime;
 - for ZeRO-2, ZeRO-3, and HSDP, `full_grad` is an active allocator-backed
   lease and returns to `None` immediately after release;
-- `grad_comm` exists only when communication dtype differs from gradient dtype.
+- `gradient_state.communication` exists only when communication dtype differs
+  from gradient dtype.
 
 There is no dirty placement, cached optimizer buffer view, generic temporary-buffer
 dictionary, or separate full-gradient/reduced-gradient value flags. Views are
@@ -209,12 +218,14 @@ Initialization:
 The initial state is:
 
 ```python
-state.weight_valid_by_role = {
-    role: buffer.placements for role, buffer in weight_buffers.items()
+weight_state = {
+    role: WeightRepresentationState(
+        persistent=buffer,
+        valid_placements=tuple(buffer.placements),
+    )
+    for role, buffer in weight_buffers.items()
 }
-state.grad_phase = GradientPhase.EMPTY
-state.full_weights = {}
-state.full_grad = None
+gradient_state = GradientState(persistent=grad_buffer)
 grad_buffer.data = None
 ```
 
@@ -235,7 +246,7 @@ optimizer-valid view          persistent owner          compute weight
 The same transition is planned independently for each representation required by
 the pass. Forward normally selects `MODEL`; MXFP8 backward selects `TRANSPOSE`.
 The first transition writes into the role's persistent buffer and updates its
-valid placement. The second writes into `full_weights[role]` only when the
+valid placement. The second writes into `weight_state[role].full` only when the
 persistent owner is not already full. Parameters are then bound privately by
 `ParameterGroup`, and the mixed-precision policy finalizes recipe-specific state.
 
@@ -243,7 +254,8 @@ Weight readiness is derived:
 
 ```python
 all(
-    state.weight_valid_by_role[role] == full or role in state.full_weights
+    weight_state[role].valid_placements == full
+    or weight_state[role].full is not None
     for role in required_roles
 )
 ```
@@ -256,9 +268,9 @@ optimizer placement of `main_weight_buffer` into model-weight storage when the t
 do not alias. The group then records:
 
 ```python
-for role in weight_buffers:
-    state.weight_valid_by_role[role] = layout.main_weight
-state.full_weights = {}
+for state in weight_state.values():
+    state.valid_placements = layout.main_weight
+    state.full = None
 ```
 
 The next unshard refreshes any missing persistent replicas before producing full
@@ -266,8 +278,9 @@ compute weights.
 
 ## Gradient lifecycle
 
-When `_ensure_grad_storage()` allocates persistent gradient storage for DDP or
-ZeRO-1, it immediately establishes `full_grad` as a `[P]` view of that storage.
+When `GradientSynchronizer.ensure_storage()` allocates persistent gradient
+storage for DDP or ZeRO-1, it immediately establishes `gradient_state.full` as
+a `[P]` view of that storage.
 The view is rebuilt whenever persistent storage migrates and invalidated when
 the storage is unbound. Other strategies acquire uninitialized full-gradient
 scratch at backward start. On the first microbatch, fused weight-gradient

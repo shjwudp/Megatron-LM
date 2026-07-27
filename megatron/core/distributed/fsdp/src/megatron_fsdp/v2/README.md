@@ -20,7 +20,11 @@ v2/
 ├── fully_shard.py               # Public fully_shard() API entry point
 ├── fsdp_module.py               # FSDPModule runtime state (unshard/reshard/reduce_grad)
 ├── hooks.py                     # Forward/backward hook registration
-├── param_group.py               # Placement-first ParameterGroup
+├── param_group.py               # ParameterGroup facade and persistent buffer ownership
+├── param_group_state.py         # Placement layout and independent runtime state
+├── weight_sync.py               # Weight prefetch, unshard, refresh, and reshard
+├── grad_sync.py                 # Gradient storage, accumulation, and reduction
+├── sync_utils.py                # Shared placement and stream helpers
 ├── dp_buffer.py                 # DataParallelBuffer — flat buffer management
 ├── buffer_index.py              # Flat-buffer item indexing and shard metadata
 ├── allocator.py                 # BucketAllocator (Temporary, StorageFreeing, TracePool)

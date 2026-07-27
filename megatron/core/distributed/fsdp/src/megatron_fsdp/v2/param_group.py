@@ -4,168 +4,31 @@
 
 from __future__ import annotations
 
-import enum
 import math
-from dataclasses import dataclass, field
 from typing import Sequence
 
 import torch
 from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from ..uneven_dtensor import (
-    copy_chunk_metadata,
-    detach_uneven_dtensor_local_tensor,
-    make_uneven_dtensor,
-    rebind_uneven_dtensor_local_tensor,
-)
+from ..uneven_dtensor import copy_chunk_metadata, make_uneven_dtensor
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .buffer_index import BufferIndex, Placement
 from .dp_buffer import DataParallelBuffer
+from .grad_sync import GradientSynchronizer
 from .mixed_precision import MixedPrecisionPolicy, WeightBufferRole
+from .param_group_state import (
+    GradientPhase,
+    GradientState,
+    ParameterGroupLayout,
+    ParameterGroupStateView,
+    Placements,
+    WeightRepresentationState,
+)
 from .utils import ParamGroupIdx
+from .weight_sync import WeightSynchronizer
 
-Placements = tuple[Placement, ...]
-AxisStreams = Sequence[torch.cuda.Stream | None]
-
-
-@dataclass(frozen=True)
-class ParameterGroupLayout:
-    """Persistent data-parallel placements used by :class:`ParameterGroup`."""
-
-    weight: Placements
-    main_weight: Placements
-    grad_storage: Placements
-    grad_accumulation: Placements
-
-    def validate(self, mesh_ndim: int) -> None:
-        """Validate that every placement vector matches the device-mesh rank."""
-        for placements in (
-            self.weight,
-            self.main_weight,
-            self.grad_storage,
-            self.grad_accumulation,
-        ):
-            if len(placements) != mesh_ndim:
-                raise ValueError(f"Expected {mesh_ndim} placements, got {placements}")
-
-    @classmethod
-    def from_strategies(
-        cls, sharding_strategy: str, outer_dp_sharding_strategy: str | None = None
-    ) -> "ParameterGroupLayout":
-        """Resolve public sharding strategies into a placement-only layout."""
-        valid_inner = ("no_shard", "optim", "optim_grads", "optim_grads_params")
-        if sharding_strategy not in valid_inner:
-            raise ValueError(f"Unsupported sharding strategy: {sharding_strategy}")
-
-        weight = (
-            Placement.SHARD if sharding_strategy == "optim_grads_params" else Placement.REPLICATE
-        )
-        optimizer = Placement.REPLICATE if sharding_strategy == "no_shard" else Placement.SHARD
-        reduce_each_microbatch = sharding_strategy in ("optim_grads", "optim_grads_params")
-        grad_accumulation = Placement.SHARD if reduce_each_microbatch else Placement.PARTIAL
-        grad_storage = Placement.SHARD if reduce_each_microbatch else Placement.REPLICATE
-        inner_layout = cls(
-            weight=(weight,),
-            main_weight=(optimizer,),
-            grad_storage=(grad_storage,),
-            grad_accumulation=(grad_accumulation,),
-        )
-        if outer_dp_sharding_strategy is None:
-            return inner_layout
-
-        if outer_dp_sharding_strategy not in ("no_shard", "optim"):
-            raise ValueError(
-                f"Unsupported outer DP sharding strategy: {outer_dp_sharding_strategy}"
-            )
-        if outer_dp_sharding_strategy == "optim" and sharding_strategy != "optim_grads_params":
-            raise NotImplementedError(
-                "Outer-DP optimizer sharding requires inner optim_grads_params, "
-                f"got {sharding_strategy}"
-            )
-        outer_optimizer = (
-            Placement.SHARD if outer_dp_sharding_strategy == "optim" else Placement.REPLICATE
-        )
-        return cls(
-            weight=(Placement.REPLICATE, inner_layout.weight[0]),
-            main_weight=(outer_optimizer, inner_layout.main_weight[0]),
-            grad_storage=(Placement.REPLICATE, inner_layout.grad_storage[0]),
-            grad_accumulation=(Placement.PARTIAL, inner_layout.grad_accumulation[0]),
-        )
-
-    @classmethod
-    def fsdp(cls) -> "ParameterGroupLayout":
-        """Build a one-dimensional fully sharded layout."""
-        return cls.from_strategies("optim_grads_params")
-
-    @classmethod
-    def hsdp(cls, *, shard_optimizer_across_outer_dp: bool) -> "ParameterGroupLayout":
-        """Build the two-dimensional HSDP layout discussed in the design document."""
-        return cls.from_strategies(
-            "optim_grads_params",
-            outer_dp_sharding_strategy=("optim" if shard_optimizer_across_outer_dp else "no_shard"),
-        )
-
-
-class GradientPhase(enum.Enum):
-    """Lifecycle phase of the value stored in the persistent gradient buffer."""
-
-    EMPTY = enum.auto()
-    ACCUMULATING = enum.auto()
-    READY = enum.auto()
-
-
-@dataclass(frozen=True)
-class PendingWeightTransition:
-    """An asynchronously produced persistent weight placement."""
-
-    target: Placements
-    event: torch.cuda.Event
-
-
-@dataclass
-class ParameterGroupState:
-    """Minimal value-validity and runtime-buffer state.
-
-    ``weight_valid_by_role`` records which placements currently contain the
-    valid value in each persistent weight representation's shared storage.
-    These placements may differ from the representation buffer's placements.
-    For example, after an outer-sharded HSDP optimizer update, only the
-    ``[S, S]`` optimizer view is valid in storage whose persistent model-weight
-    buffer is ``[R, S]``. The outer-DP all-gather restores ``[R, S]`` validity.
-    An asynchronous transition updates this mapping only after its consumer
-    stream has waited for the corresponding pending event.
-    """
-
-    weight_valid_by_role: dict[WeightBufferRole, Placements]
-    full_weights: dict[WeightBufferRole, DataParallelBuffer] = field(default_factory=dict)
-    pending_weights: dict[WeightBufferRole, PendingWeightTransition] = field(
-        default_factory=dict
-    )
-    grad_phase: GradientPhase = GradientPhase.EMPTY
-    full_grad: DataParallelBuffer | None = None
-    grad_comm: DataParallelBuffer | None = None
-
-    @property
-    def weight_valid(self) -> Placements:
-        """Return the canonical model-weight validity placement."""
-        return self.weight_valid_by_role[WeightBufferRole.MODEL]
-
-    @weight_valid.setter
-    def weight_valid(self, placements: Placements) -> None:
-        self.weight_valid_by_role[WeightBufferRole.MODEL] = placements
-
-    @property
-    def full_weight(self) -> DataParallelBuffer | None:
-        """Return the canonical model-weight scratch buffer."""
-        return self.full_weights.get(WeightBufferRole.MODEL)
-
-    @full_weight.setter
-    def full_weight(self, buffer: DataParallelBuffer | None) -> None:
-        if buffer is None:
-            self.full_weights.pop(WeightBufferRole.MODEL, None)
-        else:
-            self.full_weights[WeightBufferRole.MODEL] = buffer
+__all__ = ["GradientPhase", "ParameterGroup", "ParameterGroupLayout"]
 
 
 class ParameterGroup:
@@ -178,7 +41,9 @@ class ParameterGroup:
     - persistent accumulated/reduced gradients.
 
     ``DataParallelBuffer`` owns layout and communication mechanics. This class
-    owns allocation, validity, parameter binding, and gradient accumulation.
+    remains the public facade and persistent-storage owner;
+    :class:`WeightSynchronizer` and :class:`GradientSynchronizer` own their
+    independent runtime state and synchronization algorithms.
     """
 
     def __init__(
@@ -223,18 +88,14 @@ class ParameterGroup:
         self.grad_buffer: DataParallelBuffer
         self._main_weight_aliases_weight = False
         self._initialize_buffers()
-        self.state = ParameterGroupState(
-            weight_valid_by_role={
-                role: tuple(buffer.placements) for role, buffer in self.weight_buffers.items()
-            }
-        )
         self._optimizer_params: list[torch.nn.Parameter] = []
         self._optimizer_grads: list[DTensor | None] = []
         self._initialize_optimizer_params()
-
-        for role, buffer in self.weight_buffers.items():
-            if self.state.weight_valid_by_role[role] == self.full_placements:
-                self._bind_weight(buffer, role)
+        self._weight_sync = WeightSynchronizer(self)
+        self._gradient_sync = GradientSynchronizer(self)
+        self.state = ParameterGroupStateView(
+            self._weight_sync.representations, self._gradient_sync.state
+        )
 
     @property
     def full_placements(self) -> Placements:
@@ -257,31 +118,34 @@ class ParameterGroup:
         return self._optimizer_grads
 
     @property
+    def weight_state(self) -> dict[WeightBufferRole, WeightRepresentationState]:
+        """Return runtime state for each model-weight representation."""
+        return self._weight_sync.representations
+
+    @property
+    def gradient_state(self) -> GradientState:
+        """Return gradient storage and accumulation state."""
+        return self._gradient_sync.state
+
+    @property
     def accumulates_full_grad(self) -> bool:
         """Return whether microbatches accumulate in persistent full-gradient storage."""
-        return (
-            self.layout.grad_storage == self.full_placements
-            and self.layout.grad_accumulation == self.contribution_placements
-        )
+        return self._gradient_sync.accumulates_full_grad
 
     @property
     def full_grad_has_value(self) -> bool:
         """Return whether full-gradient storage contains prior accumulation."""
-        return self.accumulates_full_grad and self.state.grad_phase is GradientPhase.ACCUMULATING
+        return self._gradient_sync.full_grad_has_value
 
     @property
     def overwrites_full_grad(self) -> bool:
         """Return whether this backward initializes rather than accumulates full gradients."""
-        return self.requires_grad and not self.full_grad_has_value
+        return self._gradient_sync.overwrites_full_grad
 
     @property
     def supports_fused_grad_capture(self) -> bool:
         """Return whether fused wgrad can target this group's full-gradient storage."""
-        return (
-            self.requires_grad
-            and self.overwrites_full_grad
-            and self.grad_buffer.dtype == self.params[0].dtype
-        )
+        return self._gradient_sync.supports_fused_grad_capture
 
     def set_allocator(self, allocator: BucketAllocator) -> None:
         """Replace the allocator used for temporary buffer leases."""
@@ -331,10 +195,12 @@ class ParameterGroup:
         if self.grad_buffer.data is None:
             return
         if self.accumulates_full_grad:
-            self.state.full_grad = self._placement_view(
+            self.gradient_state.full = self._gradient_sync.placement_view(
                 self.grad_buffer, self.contribution_placements
             )
-        grad_view = self._placement_view(self.grad_buffer, self.layout.main_weight)
+        grad_view = self._gradient_sync.placement_view(
+            self.grad_buffer, self.layout.main_weight
+        )
         for param, optimizer_grad in zip(self.params, self._optimizer_grads):
             if optimizer_grad is None:
                 continue
@@ -349,7 +215,7 @@ class ParameterGroup:
         self, *, pin_memory: bool = False, max_cpu_bytes: int | None = None
     ) -> tuple[int, int]:
         """Move persistent storage to CPU and return offloaded/skipped byte counts."""
-        self._join_pending_weights()
+        self._weight_sync.join_pending()
         self.reshard_weight()
         self.release_temporary_grad_buffers()
         offloaded_bytes = 0
@@ -458,24 +324,6 @@ class ParameterGroup:
         grad_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])
         self.grad_buffer = self._new_buffer(grad_dtype, self.layout.grad_storage)
 
-    def _ensure_grad_storage(self) -> None:
-        """Lazily allocate persistent gradient storage for the current step."""
-        if self.grad_buffer.data is None:
-            self._allocate_persistent(self.grad_buffer)
-        if self.accumulates_full_grad and self.state.full_grad is None:
-            self.state.full_grad = self._placement_view(
-                self.grad_buffer, self.contribution_placements
-            )
-
-    def _release_grad_storage(self) -> None:
-        """Release persistent gradient storage after temporary leases are gone."""
-        if self.state.full_grad is not None:
-            if not self.accumulates_full_grad:
-                raise RuntimeError("Temporary full-gradient storage must be released first")
-            self.state.full_grad.unbind()
-            self.state.full_grad = None
-        self.grad_buffer.unbind()
-
     @staticmethod
     def _dtensor_placements(placements: Placements) -> list[Replicate | Shard]:
         dtensor_placements = []
@@ -507,55 +355,21 @@ class ParameterGroup:
             self._optimizer_params.append(optimizer_param)
             self._optimizer_grads.append(None)
 
-    def _initialize_optimizer_grads(self) -> None:
-        """Create gradient DTensor views over the final persistent gradient."""
-        if self.grad_buffer.data is None:
-            raise RuntimeError("Gradient storage must be allocated before creating gradient views")
-        grad_view = self._placement_view(self.grad_buffer, self.layout.main_weight)
-        for index, (param, optimizer_param) in enumerate(zip(self.params, self._optimizer_params)):
-            local_grad = grad_view.tensor_view(self.param_idx[param])
-            if not param.requires_grad or local_grad.numel() == 0:
-                self._optimizer_grads[index] = None
-                continue
-            if self._optimizer_grads[index] is None:
-                self._optimizer_grads[index] = make_uneven_dtensor(
-                    local_grad,
-                    param.shape,
-                    self.mesh,
-                    optimizer_param.placements,
-                    copy_chunk_meta_from=optimizer_param,
-                )
-            elif self._optimizer_grads[index]._local_tensor is None:
-                rebind_uneven_dtensor_local_tensor(
-                    self._optimizer_grads[index],
-                    local_grad,
-                    param.shape,
-                    copy_chunk_meta_from=optimizer_param,
-                )
-
     def prepare_gradient_storage(self) -> None:
         """Materialize persistent optimizer-gradient storage and DTensor views."""
-        if not self.requires_grad:
-            return
-        self._ensure_grad_storage()
-        self._initialize_optimizer_grads()
+        self._gradient_sync.prepare_storage()
+
+    def _ensure_grad_storage(self) -> None:
+        self._gradient_sync.ensure_storage()
+
+    def _release_grad_storage(self) -> None:
+        self._gradient_sync.release_storage()
+
+    def _initialize_optimizer_grads(self) -> None:
+        self._gradient_sync.initialize_optimizer_grads()
 
     def _install_optimizer_grads(self) -> None:
-        """Attach reduced gradients to the optimizer-facing parameters."""
-        self._initialize_optimizer_grads()
-        for optimizer_param, optimizer_grad in zip(self._optimizer_params, self._optimizer_grads):
-            if self.mp_policy.use_decoupled_grad:
-                optimizer_param.grad = None
-                setattr(optimizer_param, "decoupled_grad", optimizer_grad)
-                continue
-            if optimizer_grad is not None and optimizer_param.dtype != optimizer_grad.dtype:
-                raise RuntimeError(
-                    "Optimizer parameter and gradient dtypes must match unless "
-                    "use_decoupled_grad is enabled"
-                )
-            optimizer_param.grad = optimizer_grad
-            if hasattr(optimizer_param, "decoupled_grad"):
-                optimizer_param.decoupled_grad = None
+        self._gradient_sync.install_optimizer_grads()
 
     def _allocate_scratch(
         self, role: str, prototype: DataParallelBuffer, placements: Placements
@@ -577,284 +391,54 @@ class ParameterGroup:
         buffer.unbind()
         self.allocator.free((self.param_group_id, role))
 
-    @staticmethod
-    def _placement_view(owner: DataParallelBuffer, placements: Placements) -> DataParallelBuffer:
-        physical = tuple(
-            Placement.REPLICATE if placement is Placement.PARTIAL else placement
-            for placement in placements
-        )
-        view = owner.view(list(physical))
-        return view if physical == placements else view.reinterpret(list(placements))
-
-    def _required_weight_roles(self, bwd_pass: bool = False) -> tuple[WeightBufferRole, ...]:
-        """Return compute-weight roles required for this pass in stable order."""
-        required = set()
-        for param in self.params:
-            required.update(
-                self.mp_policy.weight_buffer_roles_for_unshard(param, bwd_pass=bwd_pass)
-            )
-        missing = required.difference(self.weight_buffers)
-        if missing:
-            raise RuntimeError(f"Required weight buffers are unavailable: {missing}")
-        return tuple(
-            role
-            for role in (WeightBufferRole.MODEL, WeightBufferRole.TRANSPOSE)
-            if role in required
-        )
-
-    def _consume_pending_weights(
-        self, roles: tuple[WeightBufferRole, ...], stream: torch.cuda.Stream
-    ) -> None:
-        """Make one stream depend on pending persistent-weight transitions."""
-        waited_events: set[int] = set()
-        for role in roles:
-            pending = self.state.pending_weights.pop(role, None)
-            if pending is None:
-                continue
-            event_id = id(pending.event)
-            if event_id not in waited_events:
-                stream.wait_event(pending.event)
-                waited_events.add(event_id)
-            self.state.weight_valid_by_role[role] = pending.target
-
-    def _join_pending_weights(self) -> None:
-        """Join pending persistent-weight transitions on the caller stream."""
-        caller_stream = torch.cuda.current_stream()
-        roles = tuple(self.state.pending_weights)
-        self._consume_pending_weights(roles, caller_stream)
-
-    def _bind_weight(self, buffer: DataParallelBuffer, role: WeightBufferRole) -> None:
-        if buffer.data is None:
-            raise RuntimeError("Cannot bind parameters from an unbound weight buffer")
-        for param in self.params:
-            item_id = self.param_idx[param]
-            start, end = buffer.buffer_index._get_item_global_range(item_id)
-            shape = buffer.buffer_index.item_index_map[item_id].shape
-            self.mp_policy.bind_unsharded_param(
-                param, buffer.data[start:end].view(shape), role.value
-            )
-
     def get_unsharded_weight_buffer(
         self, role: WeightBufferRole = WeightBufferRole.MODEL
     ) -> DataParallelBuffer | None:
         """Return an available unsharded weight buffer for the requested role."""
-        if self.state.weight_valid_by_role[role] == self.full_placements:
-            buffer = self.weight_buffers[role]
-        else:
-            buffer = self.state.full_weights.get(role)
-        if buffer is None or buffer.data is None or buffer.data.device != self.device:
-            return None
-        return buffer
+        return self._weight_sync.get_unsharded_buffer(role)
 
     def weights_are_unsharded(self, bwd_pass: bool = False) -> bool:
         """Return whether all compute-weight representations for this pass are available."""
-        return all(
-            self.get_unsharded_weight_buffer(role) is not None
-            for role in self._required_weight_roles(bwd_pass=bwd_pass)
-        )
-
-    def _axis_streams(
-        self, *, stream: torch.cuda.Stream | None = None, streams: AxisStreams | None = None
-    ) -> tuple[torch.cuda.Stream, ...]:
-        """Resolve a legacy shared stream or one stream per mesh axis."""
-        if stream is not None and streams is not None:
-            raise ValueError("Specify either stream or streams, not both")
-        caller_stream = torch.cuda.current_stream()
-        if streams is None:
-            return (stream or caller_stream,) * self.mesh.ndim
-        if len(streams) != self.mesh.ndim:
-            raise ValueError(f"Expected {self.mesh.ndim} streams, got {len(streams)}")
-        return tuple(axis_stream or caller_stream for axis_stream in streams)
+        return self._weight_sync.weights_are_unsharded(bwd_pass=bwd_pass)
 
     @staticmethod
-    def _last_changed_axis(source: Placements, target: Placements) -> int | None:
-        """Return the last changed axis in forward mesh order."""
-        changed = [axis for axis, pair in enumerate(zip(source, target)) if pair[0] is not pair[1]]
-        return changed[-1] if changed else None
-
-    @staticmethod
-    @torch.no_grad()
     def prefetch_weight_storage(
         param_groups: Sequence["ParameterGroup"],
         *,
         stream: torch.cuda.Stream,
         bwd_pass: bool = False,
     ) -> torch.cuda.Event | None:
-        """Asynchronously refresh pass-specific persistent weight storage.
-
-        For outer-optimizer HSDP this materializes ``[R, S]`` from the valid
-        optimizer-owned ``[S, S]`` view without allocating full ``[R, R]``
-        compute-weight storage.
-        """
-        plans = []
-        target_placements = None
-        for param_group in param_groups:
-            param_group.reload_to_gpu()
-            for role in param_group._required_weight_roles(bwd_pass=bwd_pass):
-                if role in param_group.state.pending_weights:
-                    continue
-                if param_group.get_unsharded_weight_buffer(role) is not None:
-                    continue
-                weight_buffer = param_group.weight_buffers[role]
-                target = tuple(weight_buffer.placements)
-                source_placements = param_group.state.weight_valid_by_role[role]
-                if source_placements == target:
-                    continue
-                if target_placements is None:
-                    target_placements = target
-                elif target_placements != target:
-                    raise ValueError("Prefetched parameter groups must share weight placements")
-                plans.append(
-                    (
-                        param_group,
-                        role,
-                        weight_buffer.view(list(source_placements)),
-                        weight_buffer,
-                        target,
-                    )
-                )
-
-        if not plans:
-            return None
-
-        DataParallelBuffer.redistribute_buffers(
-            [source for _, _, source, _, _ in plans],
-            list(target_placements),
-            output_buffers=[output for _, _, _, output, _ in plans],
+        """Asynchronously refresh pass-specific persistent weight storage."""
+        return WeightSynchronizer.prefetch_storage(
+            [param_group._weight_sync for param_group in param_groups],
             stream=stream,
-            async_op=True,
+            bwd_pass=bwd_pass,
         )
-        event = stream.record_event()
-        for param_group, role, _, _, target in plans:
-            param_group.state.pending_weights[role] = PendingWeightTransition(
-                target=target, event=event
-            )
-        return event
 
     @staticmethod
-    @torch.no_grad()
     def unshard_weights(
         param_groups: Sequence["ParameterGroup"],
         stream: torch.cuda.Stream | None = None,
         *,
-        streams: AxisStreams | None = None,
+        streams: Sequence[torch.cuda.Stream | None] | None = None,
         bwd_pass: bool = False,
         async_op: bool = False,
     ) -> list[DataParallelBuffer]:
-        """Unshard pass-specific weight representations in one coalesced axis plan.
-
-        Mesh axes are materialized in forward order. For HSDP this means the
-        inner-DP stream waits for the outer-DP stream before consuming its
-        all-gather output.
-        """
-        if not param_groups:
-            return []
-        axis_streams = param_groups[0]._axis_streams(stream=stream, streams=streams)
-        outputs_by_group: list[dict[WeightBufferRole, DataParallelBuffer]] = [
-            {} for _ in param_groups
-        ]
-        required_by_group: list[tuple[WeightBufferRole, ...]] = []
-        terminal_axes: list[int | None] = [None] * len(param_groups)
-        plans = []
-
-        try:
-            for index, param_group in enumerate(param_groups):
-                if param_group.mesh.ndim != len(axis_streams):
-                    raise ValueError("All parameter groups must use the same mesh dimensionality")
-                param_group.reload_to_gpu()
-                required_roles = param_group._required_weight_roles(bwd_pass=bwd_pass)
-                param_group._consume_pending_weights(required_roles, axis_streams[-1])
-                required_by_group.append(required_roles)
-                for role in required_roles:
-                    compute_weight = param_group.get_unsharded_weight_buffer(role)
-                    if compute_weight is not None:
-                        outputs_by_group[index][role] = compute_weight
-                        continue
-
-                    weight_buffer = param_group.weight_buffers[role]
-                    source_placements = param_group.state.weight_valid_by_role[role]
-                    source = weight_buffer.view(list(source_placements))
-                    persistent_placements = tuple(weight_buffer.placements)
-                    if persistent_placements == param_group.full_placements:
-                        output = weight_buffer
-                    else:
-                        scratch_role = f"full_weight:{role.value}"
-                        output = param_group._allocate_scratch(
-                            scratch_role, weight_buffer, param_group.full_placements
-                        )
-                        param_group.state.full_weights[role] = output
-                    plans.append(
-                        (
-                            index,
-                            param_group,
-                            role,
-                            source_placements,
-                            persistent_placements,
-                            source,
-                            output,
-                        )
-                    )
-        except Exception:
-            for _, param_group, role, _, _, _, output in plans:
-                if param_group.state.full_weights.get(role) is output:
-                    param_group._release_scratch(f"full_weight:{role.value}", output)
-                    param_group.state.full_weights.pop(role, None)
-            raise
-
-        if plans:
-            DataParallelBuffer.redistribute_buffers(
-                [source for _, _, _, _, _, source, _ in plans],
-                list(param_groups[0].full_placements),
-                output_buffers=[output for _, _, _, _, _, _, output in plans],
-                streams=axis_streams,
-                async_op=async_op,
-            )
-
-        for (
-            index,
-            param_group,
-            role,
-            source_placements,
-            persistent_placements,
-            _,
-            output,
-        ) in plans:
-            param_group.state.weight_valid_by_role[role] = persistent_placements
-            terminal_axis = param_group._last_changed_axis(
-                source_placements, param_group.full_placements
-            )
-            if terminal_axis is not None:
-                terminal_axes[index] = max(terminal_axes[index] or 0, terminal_axis)
-            outputs_by_group[index][role] = output
-
-        results = []
-        for index, (param_group, required_roles) in enumerate(
-            zip(param_groups, required_by_group)
-        ):
-            terminal_axis = terminal_axes[index]
-            terminal_stream = (
-                torch.cuda.current_stream() if terminal_axis is None else axis_streams[terminal_axis]
-            )
-            with torch.cuda.stream(terminal_stream):
-                for role in required_roles:
-                    param_group._bind_weight(outputs_by_group[index][role], role)
-                param_group.mp_policy.post_unshard(
-                    param_group.params, bwd_pass=bwd_pass
-                )
-            result_role = (
-                WeightBufferRole.MODEL
-                if WeightBufferRole.MODEL in required_roles
-                else required_roles[0]
-            )
-            results.append(outputs_by_group[index][result_role])
-        return results
+        """Unshard pass-specific weight representations in one coalesced axis plan."""
+        return WeightSynchronizer.unshard(
+            [param_group._weight_sync for param_group in param_groups],
+            stream=stream,
+            streams=streams,
+            bwd_pass=bwd_pass,
+            async_op=async_op,
+        )
 
     @torch.no_grad()
     def unshard_weight(
         self,
         stream: torch.cuda.Stream | None = None,
         *,
-        streams: AxisStreams | None = None,
+        streams: Sequence[torch.cuda.Stream | None] | None = None,
         bwd_pass: bool = False,
         async_op: bool = False,
     ) -> DataParallelBuffer:
@@ -869,220 +453,28 @@ class ParameterGroup:
 
     def reshard_weight(self) -> None:
         """Release all full compute-weight representation leases."""
-        self.mp_policy.post_reshard(self.params)
-        for role, buffer in tuple(self.state.full_weights.items()):
-            self._release_scratch(f"full_weight:{role.value}", buffer)
-        self.state.full_weights.clear()
+        self._weight_sync.reshard()
 
     def release_temporary_grad_buffers(self) -> None:
         """Release per-backward gradient bindings and allocator-backed scratch buffers."""
-        for param in self.params:
-            if hasattr(param, "main_grad"):
-                del param.main_grad
-        if not self.accumulates_full_grad:
-            self._release_scratch("full_grad", self.state.full_grad)
-            self.state.full_grad = None
-        self._release_scratch("grad_comm", self.state.grad_comm)
-        self.state.grad_comm = None
+        self._gradient_sync.release_temporaries()
 
     def release_grad_storage_if_unused(self) -> None:
         """Release gradient storage after optimizer-facing gradients are cleared."""
-        if self.enable_full_iteration_cuda_graph:
-            return
-        if self.state.grad_phase is GradientPhase.ACCUMULATING:
-            return
-        if any(
-            getattr(param, "grad", None) is not None
-            or getattr(param, "decoupled_grad", None) is not None
-            for param in self._optimizer_params
-        ):
-            return
-        self.zero_grad(set_to_none=True)
+        self._gradient_sync.release_storage_if_unused()
 
     @torch.no_grad()
     def refresh_model_weight(self) -> None:
         """Install optimizer weights and record the optimizer placement as valid."""
-        self.reload_to_gpu()
-        self._join_pending_weights()
-        self.reshard_weight()
-        if not self._main_weight_aliases_weight:
-            self.mp_policy.copy_main_weights_to_model_weights(
-                self.params,
-                self.param_idx,
-                self.mesh,
-                self.weight_buffer,
-                self.main_weight_buffer,
-                self.transpose_weight_buffer,
-                optimizer_placements=list(self.layout.main_weight),
-            )
-        for role in self.weight_buffers:
-            self.state.weight_valid_by_role[role] = self.layout.main_weight
+        self._weight_sync.refresh_from_optimizer()
 
     def acquire_full_grad_buffer(self) -> DataParallelBuffer:
         """Acquire the full-size local gradient buffer used by backward."""
-        self._ensure_grad_storage()
-        if self.state.full_grad is None:
-            self.state.full_grad = self._allocate_scratch(
-                "full_grad", self.grad_buffer, self.full_placements
-            )
-        return self.state.full_grad
+        return self._gradient_sync.acquire_full_buffer()
 
     def get_main_grad(self, param: torch.nn.Parameter) -> torch.Tensor:
         """Return one parameter view in the current full-gradient contribution."""
-        full_grad = self.acquire_full_grad_buffer()
-        item_id = self.param_idx[param]
-        start, end = full_grad.buffer_index._get_item_global_range(item_id)
-        shape = full_grad.buffer_index.item_index_map[item_id].shape
-        return full_grad.data[start:end].view(shape)
-
-    def _preprocess_gradient(self, full_grad: DataParallelBuffer) -> DataParallelBuffer:
-        comm_dtype = self.mp_policy.grad_comm_dtype or full_grad.dtype
-        owner = full_grad
-        if comm_dtype != full_grad.dtype:
-            owner = DataParallelBuffer(
-                buffer_index=full_grad.buffer_index,
-                dtype=comm_dtype,
-                device=full_grad.device,
-                mesh=full_grad.mesh,
-                placements=list(self.full_placements),
-            )
-            owner.bind(
-                self.allocator.allocate(
-                    key=(self.param_group_id, "grad_comm"),
-                    size=owner.data_size,
-                    dtype=owner.dtype,
-                    device=owner.device,
-                ).data
-            )
-            owner.data.copy_(full_grad.data)
-            self.state.grad_comm = owner
-
-        if self.gradient_scaling_factor not in (None, 1.0):
-            owner.data.mul_(self.gradient_scaling_factor)
-
-        if tuple(owner.placements) == self.contribution_placements:
-            return owner
-        return self._placement_view(owner, self.contribution_placements)
-
-    def _finalize_gradient_placement(
-        self, current: DataParallelBuffer, *, streams: tuple[torch.cuda.Stream, ...], async_op: bool
-    ) -> tuple[DataParallelBuffer, torch.cuda.Stream]:
-        """Redistribute delayed mesh axes into the persistent optimizer gradient."""
-        target = self.layout.main_weight
-        final = self._placement_view(self.grad_buffer, target)
-        communication_owner = current._storage_owner or current
-        terminal_stream = torch.cuda.current_stream()
-        # Reduce in reverse mesh-axis order. On the supported 2D HSDP mesh
-        # (outer DP, inner DP), this means inner reduce-scatter precedes outer
-        # reduce-scatter. Weight unshard uses the inverse order.
-        for axis in reversed(range(self.mesh.ndim)):
-            if current.placements[axis] is target[axis]:
-                continue
-            next_placements = current.placements.copy()
-            next_placements[axis] = target[axis]
-            if tuple(next_placements) == target and current.dtype == final.dtype:
-                output = final
-            else:
-                output = self._placement_view(communication_owner, tuple(next_placements))
-            with torch.cuda.stream(terminal_stream):
-                DataParallelBuffer.redistribute_buffers(
-                    [current],
-                    next_placements,
-                    output_buffers=[output],
-                    streams=streams,
-                    async_op=async_op,
-                )
-            terminal_stream = streams[axis]
-            current = output
-
-        with torch.cuda.stream(terminal_stream):
-            if current.data.data_ptr() != final.data.data_ptr():
-                final.data.copy_(current.data)
-        return final, terminal_stream
-
-    def _reduce_grad(
-        self, *, is_last_backward: bool, streams: tuple[torch.cuda.Stream, ...], async_op: bool
-    ) -> torch.cuda.Stream:
-        """Reduce one gradient contribution and return its completion stream."""
-        if self.state.full_grad is None:
-            raise RuntimeError("acquire_full_grad_buffer() must run before reduce_grad()")
-        if self.state.grad_phase is GradientPhase.READY:
-            raise RuntimeError("zero_grad() must run before starting another gradient")
-
-        if self.accumulates_full_grad:
-            if not is_last_backward:
-                # Backward already copied or added this microbatch directly into
-                # persistent full-gradient storage. Delay scaling, dtype conversion,
-                # and the DP reduction until the final microbatch.
-                self.state.grad_phase = GradientPhase.ACCUMULATING
-                return torch.cuda.current_stream()
-
-            grad_input = self._preprocess_gradient(self.state.full_grad)
-            _, terminal_stream = self._finalize_gradient_placement(
-                grad_input, streams=streams, async_op=async_op
-            )
-            self.state.grad_phase = GradientPhase.READY
-            self._install_optimizer_grads()
-            return terminal_stream
-
-        grad_input = self._preprocess_gradient(self.state.full_grad)
-        accumulation = self._placement_view(self.grad_buffer, self.layout.grad_accumulation)
-        # A pending accumulation contains reduced gradients from earlier
-        # microbatches but is not yet optimizer-ready. Placement alone cannot
-        # express this: ZeRO-2/FSDP use the same placement for both phases.
-        has_accumulation = self.state.grad_phase is GradientPhase.ACCUMULATING
-        needs_final_redistribution = self.layout.grad_accumulation != self.layout.main_weight
-        if (
-            has_accumulation
-            or grad_input.dtype != accumulation.dtype
-            or (is_last_backward and needs_final_redistribution)
-        ):
-            owner = grad_input._storage_owner or grad_input
-            output = self._placement_view(owner, self.layout.grad_accumulation)
-        else:
-            output = accumulation
-
-        terminal_stream = torch.cuda.current_stream()
-        DataParallelBuffer.redistribute_buffers(
-            [grad_input],
-            list(self.layout.grad_accumulation),
-            output_buffers=[output],
-            streams=streams,
-            async_op=async_op,
-        )
-        first_axis = self._last_changed_axis(
-            tuple(grad_input.placements), self.layout.grad_accumulation
-        )
-        if first_axis is not None:
-            terminal_stream = streams[first_axis]
-
-        with torch.cuda.stream(terminal_stream):
-            if output.data.data_ptr() != accumulation.data.data_ptr():
-                if has_accumulation:
-                    if is_last_backward and needs_final_redistribution:
-                        # Keep the combined value in communication dtype; it is
-                        # the input to the delayed DDP, ZeRO-1, or HSDP reduction.
-                        output.data.add_(accumulation.data)
-                    else:
-                        accumulation.data.add_(output.data)
-                        output = accumulation
-                elif not is_last_backward or not needs_final_redistribution:
-                    accumulation.data.copy_(output.data)
-                    output = accumulation
-
-            if is_last_backward:
-                if needs_final_redistribution:
-                    # This call remains inside the current terminal-stream
-                    # context. The next axis stream therefore waits for the
-                    # inner reduction and accumulation before consuming output.
-                    _, terminal_stream = self._finalize_gradient_placement(
-                        output, streams=streams, async_op=async_op
-                    )
-                self.state.grad_phase = GradientPhase.READY
-                self._install_optimizer_grads()
-            else:
-                self.state.grad_phase = GradientPhase.ACCUMULATING
-        return terminal_stream
+        return self._gradient_sync.get_main_grad(param)
 
     @torch.no_grad()
     def reduce_grad(
@@ -1090,27 +482,17 @@ class ParameterGroup:
         *,
         is_last_backward: bool,
         stream: torch.cuda.Stream | None = None,
-        streams: AxisStreams | None = None,
+        streams: Sequence[torch.cuda.Stream | None] | None = None,
         async_op: bool = False,
     ) -> torch.cuda.Stream:
-        """Reduce one microbatch and finalize delayed DP axes on the last backward.
+        """Reduce one microbatch and finalize delayed DP axes on the last backward."""
+        return self._gradient_sync.reduce(
+            is_last_backward=is_last_backward,
+            stream=stream,
+            streams=streams,
+            async_op=async_op,
+        )
 
-        Axis-indexed streams allow HSDP inner and outer reduce-scatter stages
-        to run on distinct streams. The returned stream owns the terminal
-        operation; an asynchronous caller records its completion event there.
-        """
-        caller_stream = torch.cuda.current_stream()
-        axis_streams = self._axis_streams(stream=stream, streams=streams)
-        try:
-            terminal_stream = self._reduce_grad(
-                is_last_backward=is_last_backward, streams=axis_streams, async_op=async_op
-            )
-        except Exception:
-            self.release_temporary_grad_buffers()
-            raise
-        if terminal_stream == caller_stream:
-            self.release_temporary_grad_buffers()
-        return terminal_stream
 
     def optimizer_weight(self) -> DataParallelBuffer:
         """Return the persistent optimizer-weight representation."""
@@ -1118,9 +500,7 @@ class ParameterGroup:
 
     def optimizer_grad(self) -> DataParallelBuffer:
         """Return the optimizer gradient after final data-parallel reduction."""
-        if self.state.grad_phase is not GradientPhase.READY:
-            raise RuntimeError("Gradient is not ready for the optimizer")
-        return self.grad_buffer.view(list(self.layout.main_weight))
+        return self._gradient_sync.optimizer_grad()
 
     def assert_model_weights_not_nan(self) -> None:
         """Assert that full compute weights contain no NaNs."""
@@ -1161,29 +541,4 @@ class ParameterGroup:
     @torch.no_grad()
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Reset logical gradient state and optimizer-facing gradients."""
-        self.release_temporary_grad_buffers()
-        self.state.grad_phase = GradientPhase.EMPTY
-        if self.enable_full_iteration_cuda_graph:
-            self.prepare_gradient_storage()
-            self.grad_buffer.data.zero_()
-            for optimizer_param in self._optimizer_params:
-                for grad_name in ("grad", "decoupled_grad"):
-                    grad = getattr(optimizer_param, grad_name, None)
-                    if grad is None:
-                        continue
-                    local_grad = getattr(grad, "_local_tensor", None)
-                    (local_grad if local_grad is not None else grad).zero_()
-                    setattr(optimizer_param, "_mfsdp_keep_grad_for_cuda_graph", True)
-            return
-
-        if set_to_none:
-            for optimizer_param in self._optimizer_params:
-                optimizer_param.grad = None
-                if hasattr(optimizer_param, "decoupled_grad"):
-                    optimizer_param.decoupled_grad = None
-            for optimizer_grad in self._optimizer_grads:
-                if optimizer_grad is not None:
-                    detach_uneven_dtensor_local_tensor(optimizer_grad)
-            self._release_grad_storage()
-        elif self.grad_buffer.data is not None:
-            self.grad_buffer.data.zero_()
+        self._gradient_sync.zero_grad(set_to_none=set_to_none)
