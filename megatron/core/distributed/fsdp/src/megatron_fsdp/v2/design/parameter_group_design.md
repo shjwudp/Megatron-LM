@@ -34,6 +34,10 @@ all-gathered into the persistent inner-sharded model weight before the inner
 shard can be materialized for compute. Backward reverses that construction:
 the full local gradient is first reduced into its persistent inner shard, then
 the last backward reduces that shard across outer DP for the optimizer.
+When axis operations use different CUDA streams, each consumer stream waits for
+the preceding producer stream. The exact forward and backward dependency chains
+are documented in
+[`hsdp_design.md#cross-stream-dependencies`](hsdp_design.md#cross-stream-dependencies).
 
 The group has three persistent distributed values:
 

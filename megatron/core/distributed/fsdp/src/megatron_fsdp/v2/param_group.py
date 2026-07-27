@@ -667,7 +667,12 @@ class ParameterGroup:
         bwd_pass: bool = False,
         async_op: bool = False,
     ) -> list[DataParallelBuffer]:
-        """Unshard pass-specific weight representations in one coalesced axis plan."""
+        """Unshard pass-specific weight representations in one coalesced axis plan.
+
+        Mesh axes are materialized in forward order. For HSDP this means the
+        inner-DP stream waits for the outer-DP stream before consuming its
+        all-gather output.
+        """
         if not param_groups:
             return []
         axis_streams = param_groups[0]._axis_streams(stream=stream, streams=streams)
@@ -972,6 +977,9 @@ class ParameterGroup:
 
             if is_last_backward:
                 if needs_final_redistribution:
+                    # This call remains inside the current terminal-stream
+                    # context. The next axis stream therefore waits for the
+                    # inner reduction and accumulation before consuming output.
                     _, terminal_stream = self._finalize_gradient_placement(
                         output, streams=streams, async_op=async_op
                     )

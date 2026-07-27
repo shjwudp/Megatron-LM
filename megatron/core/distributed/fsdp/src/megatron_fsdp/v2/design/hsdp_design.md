@@ -84,6 +84,40 @@ rank-owned `[S, S]` slice of the same `[R, S]` allocation used for accumulation.
 For outer `no_shard`, steps 1–4 are identical. The last outer operation is an
 all-reduce `[P, S] -> [R, S]`, and the optimizer consumes `[R, S]`.
 
+### Cross-stream dependencies
+
+Axis-specific streams do not make the two HSDP stages independent. The second
+stage consumes the first stage's output, so `DataParallelBuffer.redistribute_buffers`
+establishes CUDA stream dependencies in placement-transition order.
+
+Weight materialization follows mesh order:
+
+```text
+caller stream
+    -> outer AG stream: [S, S] -> [R, S]
+    -> inner AG stream: [R, S] -> [R, R]
+    -> bind parameters and run mixed-precision post-unshard processing
+```
+
+When the streams differ, the outer stream first waits for the caller stream and
+the inner stream waits for the outer stream. If `[R, S]` is already valid, the
+outer stage is skipped and the inner stream waits directly for the caller.
+Parameter binding and post-unshard processing run on the last active axis stream.
+
+Gradient reduction follows the inverse dependency chain:
+
+```text
+caller stream
+    -> inner RS stream: [P, P] -> [P, S]
+    -> accumulate the microbatch result on the inner stream
+    -> outer RS/AR stream: [P, S] -> [S, S] or [R, S]
+```
+
+The final outer redistribution is invoked while the inner stream is current.
+Consequently, its outer stream waits for both the inner collective and the
+accumulation queued after it. `wait_stream()` supplies the CUDA event dependency;
+no additional explicit event is required between the two axis collectives.
+
 ### Concrete `3 x 4` reduction example
 
 Let the mesh shape be `(O, I) = (3, 4)`, with three outer-DP rows and four
