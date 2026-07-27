@@ -51,6 +51,7 @@ def test_activation_recompute_matches_eager_region(use_reentrant):
         num_warmup_iters=1,
         _input_output_aliases=({}, {0: (0, 0)}),
         _activation_recompute=True,
+        _activation_recompute_forward_grad_enabled=not use_reentrant,
         _activation_recompute_regions=(0, 0),
         _reuse_graph_input_output_buffers=True,
     )
@@ -73,6 +74,50 @@ def test_activation_recompute_matches_eager_region(use_reentrant):
     eager_params = tuple(eager_first.parameters()) + tuple(eager_second.parameters())
     for graph_param, eager_param in zip(graph_params, eager_params):
         torch.testing.assert_close(graph_param.grad, eager_param.grad, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires a GPU")
+def test_nonreentrant_forward_preserves_recorded_grad_mode(request):
+    """Capture non-reentrant F with autograd enabled.
+
+    :param request: Pytest request used for graph cleanup.
+    :type request: pytest.FixtureRequest
+    """
+
+    class GradModeModule(torch.nn.Module):
+        """Expose the forward grad mode in the numerical output."""
+
+        def forward(self, value):
+            """Scale the output according to the active grad mode.
+
+            :param value: Input tensor.
+            :type value: torch.Tensor
+            :return: Scaled tensor.
+            :rtype: torch.Tensor
+            """
+            return value * (2 if torch.is_grad_enabled() else 3)
+
+    module = GradModeModule().cuda()
+    eager_module = copy.deepcopy(module)
+    sample = torch.ones(2, 4, device="cuda", requires_grad=True)
+    graphed = make_graphed_callables(
+        module,
+        (sample,),
+        num_warmup_iters=1,
+        _activation_recompute=True,
+        _activation_recompute_forward_grad_enabled=True,
+    )
+    request.addfinalizer(graphed.reset)
+
+    graph_input = torch.randn_like(sample, requires_grad=True)
+    eager_input = graph_input.detach().clone().requires_grad_()
+    graph_output = _checkpoint(graphed, graph_input, use_reentrant=False)
+    eager_output = torch.utils.checkpoint.checkpoint(eager_module, eager_input, use_reentrant=False)
+    graph_output.sum().backward()
+    eager_output.sum().backward()
+
+    torch.testing.assert_close(graph_output, eager_output, rtol=0, atol=0)
+    torch.testing.assert_close(graph_input.grad, eager_input.grad, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires a GPU")

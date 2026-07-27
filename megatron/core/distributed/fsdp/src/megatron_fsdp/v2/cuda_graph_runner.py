@@ -1944,6 +1944,11 @@ class CudaGraphRunner:
             raise RuntimeError("CUDA graph capture requires one recorded CUDA autocast state")
         autocast_enabled, autocast_dtype, _ = next(iter(autocast_states))
         activation_recompute = self._activation_recompute
+        forward_grad_enabled = (
+            tuple(self._recorded_grad_enabled[id(module)] for module in modules)
+            if activation_recompute
+            else False
+        )
         root_context = getattr(root_module, "_fsdp_root_context", None)
         configured_recompute = getattr(
             root_context, "cuda_graph_activation_recompute", activation_recompute
@@ -2116,6 +2121,7 @@ class CudaGraphRunner:
         if activation_recompute:
             runtime_options["_activation_recompute"] = True
             runtime_options["_reuse_graph_input_output_buffers"] = True
+            runtime_options["_activation_recompute_forward_grad_enabled"] = forward_grad_enabled
             runtime_options["_activation_recompute_regions"] = module_regions
             if ordered_plan is not None:
                 runtime_options["_order"] = list(ordered_plan.order)

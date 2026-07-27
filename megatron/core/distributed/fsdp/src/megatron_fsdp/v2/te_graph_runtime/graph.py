@@ -28,6 +28,7 @@ _MFSDP_CAPTURE_CAPABILITIES = frozenset(
         "activation_recompute",
         "activation_recompute_argument_binding",
         "activation_recompute_backward_phase_dispatch",
+        "activation_recompute_forward_grad_mode",
         "activation_recompute_preflight",
         "activation_recompute_release_pending",
         "activation_recompute_region_schedule",
@@ -983,6 +984,33 @@ def _activation_recompute_capture_schedule(
     return tuple(schedule)
 
 
+def _activation_recompute_forward_grad_modes(
+    forward_grad_enabled: Union[bool, Sequence[bool]], callable_count: int
+) -> Tuple[bool, ...]:
+    """Return one original-forward grad mode per callable.
+
+    :param forward_grad_enabled: Shared mode or one mode per callable.
+    :type forward_grad_enabled: bool or Sequence[bool]
+    :param callable_count: Number of captured callables.
+    :type callable_count: int
+    :raises TypeError: If a mode is not boolean.
+    :raises ValueError: If the mode count does not match the callables.
+    :return: Original-forward grad modes in callable order.
+    :rtype: Tuple[bool, ...]
+    """
+    if isinstance(forward_grad_enabled, bool):
+        return (forward_grad_enabled,) * callable_count
+    if not isinstance(forward_grad_enabled, Sequence):
+        raise TypeError(
+            "_activation_recompute_forward_grad_enabled must be a bool or sequence of bool"
+        )
+    if len(forward_grad_enabled) != callable_count:
+        raise ValueError("Forward grad modes must match the number of callables")
+    if not all(isinstance(mode, bool) for mode in forward_grad_enabled):
+        raise TypeError("_activation_recompute_forward_grad_enabled must contain only bool values")
+    return tuple(forward_grad_enabled)
+
+
 def _make_graphed_callables(
     callables: SingleOrTuple[Callable],
     sample_args: SingleOrTuple[Tuple[torch.Tensor, ...]],
@@ -998,6 +1026,7 @@ def _make_graphed_callables(
     _clone_param_grads_on_return: bool = True,
     _input_output_aliases: Optional[Tuple[Dict[int, Tuple[int, int]], ...]] = None,
     _activation_recompute: bool = False,
+    _activation_recompute_forward_grad_enabled: Union[bool, Sequence[bool]] = False,
     _activation_recompute_regions: Optional[Sequence[int]] = None,
     _activation_recompute_order_slots: Optional[Sequence[int]] = None,
     pre_warmup_hook: Optional[Callable] = None,
@@ -1034,6 +1063,9 @@ def _make_graphed_callables(
     activation_recompute_region_groups = _activation_recompute_region_groups(
         _activation_recompute_regions, len(callables)
     )
+    activation_recompute_forward_grad_modes = _activation_recompute_forward_grad_modes(
+        _activation_recompute_forward_grad_enabled, len(callables)
+    )
 
     capture_time_hooks = _canonicalize_capture_time_hooks(len(callables), capture_time_hooks)
     if not isinstance(_activation_recompute, bool):
@@ -1043,6 +1075,8 @@ def _make_graphed_callables(
         )
     if _activation_recompute and num_warmup_iters < 1:
         raise ValueError("Activation recompute requires at least one warmup iteration")
+    if any(activation_recompute_forward_grad_modes) and not _activation_recompute:
+        raise ValueError("Grad-enabled forward capture requires activation recompute")
     if _activation_recompute_regions is not None and not _activation_recompute:
         raise ValueError("Checkpoint regions require activation recompute")
     if _activation_recompute_order_slots is not None and (
@@ -1447,6 +1481,27 @@ def _make_graphed_callables(
     # from ending up in any captures.
     callable_uses_default_rng = [False] * graph_count
 
+    def discard_capture_saved_tensor(tensor):
+        """Discard one tensor saved only by capture-time forward.
+
+        :param tensor: Tensor intercepted by the saved-tensor hook.
+        :type tensor: torch.Tensor
+        :return: Empty packed value.
+        :rtype: None
+        """
+        del tensor
+        return None
+
+    def reject_discarded_saved_tensor(packed):
+        """Reject backward through a discarded capture-time tape.
+
+        :param packed: Packed value returned by the save hook.
+        :type packed: Any
+        :raises RuntimeError: Always, because the tape is capture-only.
+        """
+        del packed
+        raise RuntimeError("Discarded capture-forward tensors cannot be unpacked")
+
     if _tracked_generators is None:
         discovered_generators = _get_tracked_cuda_generators(
             require_generators=_activation_recompute
@@ -1719,7 +1774,18 @@ def _make_graphed_callables(
                     )
                 outputs_by_producer = {}
                 for func_idx, func in zip(warmup_func_idx, warmup_func):
-                    with torch.no_grad():
+                    forward_grad_enabled = activation_recompute_forward_grad_modes[func_idx]
+                    forward_context = (
+                        torch.enable_grad() if forward_grad_enabled else torch.no_grad()
+                    )
+                    saved_tensor_context = (
+                        torch.autograd.graph.saved_tensors_hooks(
+                            discard_capture_saved_tensor, reject_discarded_saved_tensor
+                        )
+                        if forward_grad_enabled
+                        else contextlib.nullcontext()
+                    )
+                    with forward_context, saved_tensor_context:
                         outputs = _run_warmup_forward(
                             func_idx,
                             func,
@@ -1769,7 +1835,18 @@ def _make_graphed_callables(
                     )
                     func = callables[callable_idx]
                     if _activation_recompute:
-                        with torch.no_grad():
+                        forward_grad_enabled = activation_recompute_forward_grad_modes[callable_idx]
+                        forward_context = (
+                            torch.enable_grad() if forward_grad_enabled else torch.no_grad()
+                        )
+                        saved_tensor_context = (
+                            torch.autograd.graph.saved_tensors_hooks(
+                                discard_capture_saved_tensor, reject_discarded_saved_tensor
+                            )
+                            if forward_grad_enabled
+                            else contextlib.nullcontext()
+                        )
+                        with forward_context, saved_tensor_context:
                             outputs = _run_warmup_forward(
                                 per_callable_fwd_idx,
                                 func,
@@ -1919,10 +1996,21 @@ def _make_graphed_callables(
                     kwargs = sample_kwargs[per_callable_fwd_idx]
                     fwd_graph = fwd_graphs[per_callable_fwd_idx]
                     _call_capture_time_forward_pre_hooks(callable_idx, func, args, kwargs)
+                    forward_grad_enabled = activation_recompute_forward_grad_modes[callable_idx]
                     forward_context = (
-                        torch.no_grad() if _activation_recompute else contextlib.nullcontext()
+                        torch.enable_grad()
+                        if _activation_recompute and forward_grad_enabled
+                        else torch.no_grad() if _activation_recompute else contextlib.nullcontext()
+                    )
+                    saved_tensor_context = (
+                        torch.autograd.graph.saved_tensors_hooks(
+                            discard_capture_saved_tensor, reject_discarded_saved_tensor
+                        )
+                        if _activation_recompute and forward_grad_enabled
+                        else contextlib.nullcontext()
                     )
                     with (
+                        saved_tensor_context,
                         forward_context,
                         _graph_context_wrapper(fwd_graph, pool=mempool, stream=capture_stream),
                         _fp8_activation_recompute_phase(False if _activation_recompute else None),
@@ -2225,10 +2313,21 @@ def _make_graphed_callables(
             args, kwargs = _link_callable_inputs(func_idx, per_callable_static_outputs)
             _call_capture_time_forward_pre_hooks(func_idx, func, args, kwargs)
 
+            forward_grad_enabled = activation_recompute_forward_grad_modes[func_idx]
             forward_autograd_context = (
-                torch.no_grad() if _activation_recompute else contextlib.nullcontext()
+                torch.enable_grad()
+                if _activation_recompute and forward_grad_enabled
+                else torch.no_grad() if _activation_recompute else contextlib.nullcontext()
+            )
+            saved_tensor_context = (
+                torch.autograd.graph.saved_tensors_hooks(
+                    discard_capture_saved_tensor, reject_discarded_saved_tensor
+                )
+                if _activation_recompute and forward_grad_enabled
+                else contextlib.nullcontext()
             )
             with (
+                saved_tensor_context,
                 forward_autograd_context,
                 _graph_context_wrapper(fwd_graph, pool=mempool, stream=capture_stream),
                 _fp8_activation_recompute_phase(False if _activation_recompute else None),
@@ -3371,6 +3470,7 @@ def make_graphed_callables(
     _clone_param_grads_on_return: bool = True,
     _input_output_aliases: Optional[Tuple[Dict[int, Tuple[int, int]], ...]] = None,
     _activation_recompute: bool = False,
+    _activation_recompute_forward_grad_enabled: Union[bool, Sequence[bool]] = False,
     _activation_recompute_regions: Optional[Sequence[int]] = None,
     _activation_recompute_order_slots: Optional[Sequence[int]] = None,
     pre_warmup_hook: Optional[Callable] = None,
@@ -3429,8 +3529,11 @@ def make_graphed_callables(
         tensors. Only disable this when the caller consumes returned parameter
         gradients before any such overwrite can occur.
     _activation_recompute: bool, default = False
-        Capture no-grad forward, grad-enabled recompute forward, and backward
+        Capture original forward, grad-enabled recompute forward, and backward
         as separate CUDA Graphs.
+    _activation_recompute_forward_grad_enabled: bool or sequence of bool, default = False
+        Original-forward grad mode for each callable. Grad-enabled forward
+        capture discards its saved-tensor tape.
     _activation_recompute_regions: sequence of int, optional
         Checkpoint region index for each callable. Callables in one region must
         be contiguous in forward order. Recompute is captured in forward order
@@ -3709,6 +3812,7 @@ def make_graphed_callables(
             _clone_param_grads_on_return=_clone_param_grads_on_return,
             _input_output_aliases=_input_output_aliases,
             _activation_recompute=_activation_recompute,
+            _activation_recompute_forward_grad_enabled=(_activation_recompute_forward_grad_enabled),
             _activation_recompute_regions=_activation_recompute_regions,
             _activation_recompute_order_slots=_activation_recompute_order_slots,
             pre_warmup_hook=pre_warmup_hook,
