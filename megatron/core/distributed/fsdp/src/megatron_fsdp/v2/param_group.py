@@ -918,8 +918,8 @@ class ParameterGroup:
         for role in self.weight_buffers:
             self.state.weight_valid_by_role[role] = self.layout.main_weight
 
-    def begin_backward(self) -> DataParallelBuffer:
-        """Acquire uninitialized storage for the full local-gradient contribution."""
+    def acquire_full_grad_buffer(self) -> DataParallelBuffer:
+        """Acquire the full-size local gradient buffer used by backward."""
         self._ensure_grad_storage()
         if self.state.full_grad is None:
             self.state.full_grad = self._allocate_scratch(
@@ -929,7 +929,7 @@ class ParameterGroup:
 
     def get_main_grad(self, param: torch.nn.Parameter) -> torch.Tensor:
         """Return one parameter view in the current full-gradient contribution."""
-        full_grad = self.begin_backward()
+        full_grad = self.acquire_full_grad_buffer()
         item_id = self.param_idx[param]
         start, end = full_grad.buffer_index._get_item_global_range(item_id)
         shape = full_grad.buffer_index.item_index_map[item_id].shape
@@ -1005,7 +1005,7 @@ class ParameterGroup:
     ) -> torch.cuda.Stream:
         """Reduce one gradient contribution and return its completion stream."""
         if self.state.full_grad is None:
-            raise RuntimeError("begin_backward() must run before reduce_grad()")
+            raise RuntimeError("acquire_full_grad_buffer() must run before reduce_grad()")
         if self.state.grad_phase is GradientPhase.READY:
             raise RuntimeError("zero_grad() must run before starting another gradient")
 
