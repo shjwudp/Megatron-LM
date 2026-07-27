@@ -58,7 +58,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.allocator import TraceP
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import mfsdp_forward_pre_hook
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+    mfsdp_forward_pre_hook,
+    mfsdp_post_backward_final_callback,
+    mfsdp_post_backward_hook,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import (
     GradientPhase,
@@ -1230,6 +1234,34 @@ class TestIgnoredParams:
 
 
 class TestLifecycle:
+    def test_external_backward_callbacks_finalize_parameter_group_gradients(self):
+        """Delayed-wgrad callers may explicitly finalize gradients after backward."""
+        model = fully_shard(
+            SimpleMLP(16).to(_device()),
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+            skip_backward_callback=True,
+            skip_final_backward_callback=True,
+        )
+        model.set_is_last_backward(True)
+
+        model(torch.randn(2, 16, device=_device())).float().square().mean().backward()
+        for param_group in model._fsdp_param_groups:
+            assert param_group.state.grad_phase is GradientPhase.EMPTY
+
+        mfsdp_post_backward_hook(model)
+        mfsdp_post_backward_final_callback(model)
+
+        for param_group in model._fsdp_param_groups:
+            assert param_group.state.grad_phase is GradientPhase.READY
+            assert all(
+                optimizer_grad is not None
+                for optimizer_param, optimizer_grad in zip(
+                    param_group.optimizer_params, param_group.optimizer_grads
+                )
+                if optimizer_param.requires_grad
+            )
+
     def test_trace_pool_plans_and_reuses_parameter_group_scratch(self):
         """TracePoolAllocator plans the new parameter-group scratch lifecycle."""
         torch.manual_seed(42)
@@ -1805,19 +1837,6 @@ class TestActivationCheckpointing:
 
 
 class TestSafety:
-    @pytest.mark.parametrize(
-        "kwargs",
-        [
-            pytest.param({"skip_backward_callback": True}, id="delayed-wgrad"),
-            pytest.param({"skip_final_backward_callback": True}, id="external-final-callback"),
-        ],
-    )
-    def test_removed_parameter_group_features_are_rejected(self, kwargs):
-        """Features that depended on the removed implementation fail explicitly."""
-        model = SimpleMLP(64).to(_device())
-        with pytest.raises(NotImplementedError, match="ParameterGroup does not support"):
-            fully_shard(model, **kwargs)
-
     def test_double_shard_rejected(self):
         """Calling fully_shard on an already-wrapped module should raise ValueError."""
         torch.manual_seed(42)

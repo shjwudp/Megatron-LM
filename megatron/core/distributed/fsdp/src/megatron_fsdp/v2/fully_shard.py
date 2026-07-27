@@ -117,13 +117,6 @@ def fully_shard(
         mesh = _init_default_fully_shard_mesh()
         mesh = mesh[mesh.mesh_dim_names[-1]]
 
-    unsupported_options = {
-        "skip_backward_callback": skip_backward_callback,
-        "skip_final_backward_callback": skip_final_backward_callback,
-    }
-    enabled = [name for name, value in unsupported_options.items() if value]
-    if enabled:
-        raise NotImplementedError("ParameterGroup does not support: " + ", ".join(enabled))
     if mp_policy.fp8.enabled or mp_policy.nvfp4.enabled:
         raise NotImplementedError("ParameterGroup does not support quantized weights yet")
     if mesh.ndim == 2 and sharding_strategy != "optim_grads_params":
