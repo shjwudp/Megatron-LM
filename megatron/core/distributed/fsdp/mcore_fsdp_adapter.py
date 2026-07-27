@@ -312,6 +312,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
         kwargs = {
             "mp_policy": fully_shard_mp_policy,
             "enable_unshard_prefetch": ddp_config.overlap_param_gather,
+            "outer_dp_all_gather_prefetch_depth": (
+                ddp_config.fsdp_outer_dp_all_gather_prefetch_depth
+            ),
             "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
             "enable_trace_pool": ddp_config.fsdp_double_buffer or ddp_config.fsdp_trace_pool,
             "enable_full_iteration_cuda_graph": config.cuda_graph_impl == "full_iteration",
@@ -435,7 +438,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
         # wires it only for overlap=True), so the last-micro-batch signal reaches FSDP.
         if not ddp_config.overlap_grad_reduce and config.no_sync_func is None:
             config.no_sync_func = self.no_sync
-        self.start_param_sync = noop
+        self.start_param_sync = (
+            self.module.start_param_sync
+            if ddp_config.fsdp_all_gather_in_start_param_sync
+            else noop
+        )
         self.start_grad_sync = noop
 
         def synchronize_param_gather():

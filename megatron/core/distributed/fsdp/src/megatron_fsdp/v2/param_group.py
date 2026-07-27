@@ -168,12 +168,23 @@ class GradientPhase(enum.Enum):
     READY = enum.auto()
 
 
+@dataclass(frozen=True)
+class PendingWeightTransition:
+    """An asynchronously produced persistent weight placement."""
+
+    target: Placements
+    event: torch.cuda.Event
+
+
 @dataclass
 class ParameterGroupState:
     """Minimal value-validity and scratch-lease state."""
 
     weight_valid_by_role: dict[WeightBufferRole, Placements]
     full_weights: dict[WeightBufferRole, DataParallelBuffer] = field(default_factory=dict)
+    pending_weights: dict[WeightBufferRole, PendingWeightTransition] = field(
+        default_factory=dict
+    )
     grad_phase: GradientPhase = GradientPhase.EMPTY
     full_grad: DataParallelBuffer | None = None
     grad_comm: DataParallelBuffer | None = None
@@ -369,6 +380,7 @@ class ParameterGroup:
         self, *, pin_memory: bool = False, max_cpu_bytes: int | None = None
     ) -> tuple[int, int]:
         """Move persistent storage to CPU and return offloaded/skipped byte counts."""
+        self._join_pending_weights()
         self.reshard_weight()
         self.release_grad_buffer()
         offloaded_bytes = 0
@@ -608,6 +620,27 @@ class ParameterGroup:
             if role in required
         )
 
+    def _consume_pending_weights(
+        self, roles: tuple[WeightBufferRole, ...], stream: torch.cuda.Stream
+    ) -> None:
+        """Make one stream depend on pending persistent-weight transitions."""
+        waited_events: set[int] = set()
+        for role in roles:
+            pending = self.state.pending_weights.pop(role, None)
+            if pending is None:
+                continue
+            event_id = id(pending.event)
+            if event_id not in waited_events:
+                stream.wait_event(pending.event)
+                waited_events.add(event_id)
+            self.state.weight_valid_by_role[role] = pending.target
+
+    def _join_pending_weights(self) -> None:
+        """Join pending persistent-weight transitions on the caller stream."""
+        caller_stream = torch.cuda.current_stream()
+        roles = tuple(self.state.pending_weights)
+        self._consume_pending_weights(roles, caller_stream)
+
     def _bind_weight(self, buffer: DataParallelBuffer, role: WeightBufferRole) -> None:
         if buffer.data is None:
             raise RuntimeError("Cannot bind parameters from an unbound weight buffer")
@@ -659,6 +692,65 @@ class ParameterGroup:
 
     @staticmethod
     @torch.no_grad()
+    def prefetch_weight_storage(
+        param_groups: Sequence["ParameterGroup"],
+        *,
+        stream: torch.cuda.Stream,
+        bwd_pass: bool = False,
+    ) -> torch.cuda.Event | None:
+        """Asynchronously refresh pass-specific persistent weight storage.
+
+        For outer-optimizer HSDP this materializes ``[R, S]`` from the valid
+        optimizer-owned ``[S, S]`` view without allocating full ``[R, R]``
+        compute-weight storage.
+        """
+        plans = []
+        target_placements = None
+        for param_group in param_groups:
+            param_group.reload_to_gpu()
+            for role in param_group._required_weight_roles(bwd_pass=bwd_pass):
+                if role in param_group.state.pending_weights:
+                    continue
+                if param_group.compute_weight(role) is not None:
+                    continue
+                weight_buffer = param_group.weight_buffers[role]
+                target = tuple(weight_buffer.placements)
+                source_placements = param_group.state.weight_valid_by_role[role]
+                if source_placements == target:
+                    continue
+                if target_placements is None:
+                    target_placements = target
+                elif target_placements != target:
+                    raise ValueError("Prefetched parameter groups must share weight placements")
+                plans.append(
+                    (
+                        param_group,
+                        role,
+                        weight_buffer.view(list(source_placements)),
+                        weight_buffer,
+                        target,
+                    )
+                )
+
+        if not plans:
+            return None
+
+        DataParallelBuffer.redistribute_buffers(
+            [source for _, _, source, _, _ in plans],
+            list(target_placements),
+            output_buffers=[output for _, _, _, output, _ in plans],
+            stream=stream,
+            async_op=True,
+        )
+        event = stream.record_event()
+        for param_group, role, _, _, target in plans:
+            param_group.state.pending_weights[role] = PendingWeightTransition(
+                target=target, event=event
+            )
+        return event
+
+    @staticmethod
+    @torch.no_grad()
     def unshard_weights(
         param_groups: Sequence["ParameterGroup"],
         stream: torch.cuda.Stream | None = None,
@@ -689,6 +781,7 @@ class ParameterGroup:
                     raise ValueError("All parameter groups must use the same mesh dimensionality")
                 param_group.reload_to_gpu()
                 required_roles = param_group._required_weight_roles(bwd_pass=bwd_pass)
+                param_group._consume_pending_weights(required_roles, axis_streams[-1])
                 required_by_group.append(required_roles)
                 for role in required_roles:
                     compute_weight = param_group.compute_weight(role)
@@ -827,6 +920,7 @@ class ParameterGroup:
     def refresh_model_weight(self) -> None:
         """Install optimizer weights and record the optimizer placement as valid."""
         self.reload_to_gpu()
+        self._join_pending_weights()
         self.reshard_weight()
         if not self._main_weight_aliases_weight:
             self.mp_policy.copy_main_weights_to_model_weights(

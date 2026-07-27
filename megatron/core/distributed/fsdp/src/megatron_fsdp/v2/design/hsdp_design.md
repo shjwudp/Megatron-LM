@@ -104,6 +104,38 @@ the inner stream waits for the outer stream. If `[R, S]` is already valid, the
 outer stage is skipped and the inner stream waits directly for the caller.
 Parameter binding and post-unshard processing run on the last active axis stream.
 
+#### Optional outer-DP all-gather prefetch
+
+Outer optimizer sharding permits the persistent `[S, S] -> [R, S]` stage of a
+future module to run before that module leases `[R, R]` compute-weight storage.
+`outer_dp_all_gather_prefetch_depth=N` keeps at most `N` eligible future modules
+in this placement stage; zero disables it. `start_param_sync()` may prime the
+first module plus the configured future depth.
+
+Each module has its own completion event. The current module's inner-DP stream
+waits only for that module's outer event, never for the full lookahead window.
+The scheduler gives the critical inner stage priority and then refills the outer
+window:
+
+```text
+bootstrap:
+  outer AG L0
+        +--> inner AG L0
+        `--> outer AG L1
+
+steady state at L1:
+  consume prefetched [R,S] L1
+        +--> inner AG L1
+        `--> outer AG L2
+```
+
+Depth one produces this two-stage pipeline. Larger depths can hide longer outer
+latency, but are not universally faster: outer and inner collectives may contend
+for the same network links. The depth is therefore a performance-tuning choice,
+not a correctness requirement. When this pipeline is enabled, it replaces the
+generic full-unshard-next-module prefetch so future inner all-gathers are not
+launched ahead of the current module's progression.
+
 Gradient reduction follows the inverse dependency chain:
 
 ```text

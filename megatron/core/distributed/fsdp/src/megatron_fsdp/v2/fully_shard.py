@@ -43,6 +43,7 @@ def fully_shard(
     ignored_params: Optional[set[nn.Parameter]] = None,
     # --- Megatron-FSDP specific options ---
     enable_unshard_prefetch: bool = True,
+    outer_dp_all_gather_prefetch_depth: int = 0,
     enable_async_reduce_grad: bool = True,
     all_gather_streams: Sequence[torch.cuda.Stream | None] | None = None,
     reduce_scatter_streams: Sequence[torch.cuda.Stream | None] | None = None,
@@ -71,6 +72,9 @@ def fully_shard(
             optimizer gradient objects stable across full-iteration graph replay.
         all_gather_streams: Optional stream for each device-mesh axis. HSDP
             all-gathers execute in mesh order (outer DP, then inner DP).
+        outer_dp_all_gather_prefetch_depth: Number of future HSDP modules whose
+            outer-DP weight all-gather is prefetched. Zero disables this
+            placement-stage pipeline.
         reduce_scatter_streams: Optional stream for each device-mesh axis. HSDP
             gradient reduction executes in reverse mesh order (inner DP, then
             outer DP on the last backward).
@@ -119,6 +123,8 @@ def fully_shard(
 
     if mesh.ndim == 1 and outer_dp_sharding_strategy == "optim":
         raise ValueError("Outer-DP optimizer sharding requires a 2D DeviceMesh")
+    if outer_dp_all_gather_prefetch_depth < 0:
+        raise ValueError("outer_dp_all_gather_prefetch_depth must be non-negative")
 
     for name, streams in (
         ("all_gather_streams", all_gather_streams),
@@ -150,6 +156,7 @@ def fully_shard(
     )
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,
+        outer_dp_all_gather_prefetch_depth=outer_dp_all_gather_prefetch_depth,
         enable_async_reduce_grad=enable_async_reduce_grad,
         mesh_ndim=mesh.ndim,
         all_gather_streams=all_gather_streams,

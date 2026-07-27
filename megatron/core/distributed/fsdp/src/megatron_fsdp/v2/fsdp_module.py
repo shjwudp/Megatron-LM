@@ -95,6 +95,9 @@ class _FSDPRootContext:
     enable_unshard_prefetch: bool = True
     """Whether to prefetch (pipeline) parameter unshard for upcoming modules."""
 
+    outer_dp_all_gather_prefetch_depth: int = 0
+    """Number of future HSDP modules whose persistent outer-DP weight stage is prefetched."""
+
     # ------------------------------------------------------------------
     # Reduce-scatter (gradient sync) tracking
     # ------------------------------------------------------------------
@@ -192,6 +195,50 @@ class _FSDPRootContext:
                 return [module_order[module_index + 1]]
 
         raise AssertionError("Current module not found in forward module order")
+
+    @staticmethod
+    def _uses_outer_weight_all_gather(module: "FSDPModule") -> bool:
+        """Return whether a module has an optimizer-sharded outer weight axis."""
+        return any(
+            param_group.mesh.ndim == 2
+            and param_group.layout.main_weight[0] is not param_group.layout.weight[0]
+            for param_group in module._fsdp_param_groups
+        )
+
+    def get_outer_weight_prefetch_modules(
+        self, module: "FSDPModule" | None = None, bwd_pass: bool = False
+    ) -> List["FSDPModule"]:
+        """Return the eligible outer-DP prefetch window.
+
+        With a current ``module``, the window contains at most ``depth`` future
+        modules. Without one, it contains the first module plus ``depth`` future
+        modules and is used to prime the pipeline.
+        """
+        if self.outer_dp_all_gather_prefetch_depth <= 0:
+            return []
+        module_order = self._reversed_order if bwd_pass else self.forward_order
+        if module is None:
+            start = 0
+            limit = self.outer_dp_all_gather_prefetch_depth + 1
+        else:
+            try:
+                start = module_order.index(module) + 1
+            except ValueError as error:
+                raise AssertionError("Current module not found in forward module order") from error
+            limit = self.outer_dp_all_gather_prefetch_depth
+
+        eligible = (
+            candidate
+            for candidate in module_order[start:]
+            if self._uses_outer_weight_all_gather(candidate)
+            and (not bwd_pass or id(candidate) not in self.backward_done_modules)
+        )
+        modules = []
+        for candidate in eligible:
+            modules.append(candidate)
+            if len(modules) == limit:
+                break
+        return modules
 
     def get_root_module(self):
         """Return the root FSDP module associated with this context."""
@@ -465,6 +512,7 @@ class FSDPModule:
     def _init_fsdp_state(
         self,
         enable_unshard_prefetch,
+        outer_dp_all_gather_prefetch_depth,
         enable_async_reduce_grad,
         mesh_ndim: int,
         all_gather_streams: Sequence[torch.cuda.Stream | None] | None,
@@ -531,6 +579,7 @@ class FSDPModule:
             reduce_grad_buckets={id(module): [] for module in forward_order},
             unshard_done_events={id(module): None for module in forward_order},
             enable_unshard_prefetch=enable_unshard_prefetch,
+            outer_dp_all_gather_prefetch_depth=outer_dp_all_gather_prefetch_depth,
             enable_async_reduce_grad=enable_async_reduce_grad,
             _reversed_order=list(reversed(forward_order)),
             bucket_allocator=bucket_allocator,
@@ -583,6 +632,43 @@ class FSDPModule:
         if any(module._fsdp_state.enable_cuda_graph for module in forward_order):
             root_context.enable_cuda_graph = True
 
+    def _prefetch_outer_weights(
+        self, modules: Sequence["FSDPModule"], *, bwd_pass: bool
+    ) -> None:
+        """Queue one independently consumable outer-DP weight stage per module."""
+        outer_stream = self._fsdp_root_context.ag_streams[0]
+        for module in modules:
+            ParameterGroup.prefetch_weight_storage(
+                module._fsdp_param_groups,
+                stream=outer_stream,
+                bwd_pass=bwd_pass,
+            )
+
+    def start_param_sync(
+        self, *unused, force_sync: bool = False, force_dispatch: bool = False
+    ) -> None:
+        """Prime the first outer-DP weight prefetch window.
+
+        ``force_dispatch`` is accepted for compatibility with the DDP schedule.
+        """
+        del force_dispatch
+        ctx = self._fsdp_root_context
+        if (
+            not ctx.enable_unshard_prefetch
+            or ctx.outer_dp_all_gather_prefetch_depth <= 0
+        ):
+            return
+        root_module = ctx.get_root_module()
+        if root_module is None:
+            return
+        if ctx.model_weight_refresh_pending:
+            root_module._copy_main_weights_to_model_weights()
+        self._prefetch_outer_weights(
+            ctx.get_outer_weight_prefetch_modules(), bwd_pass=False
+        )
+        if force_sync:
+            torch.cuda.current_stream().wait_stream(ctx.ag_streams[0])
+
     def unshard(self, async_op: bool = False, bwd_pass: bool = False, prefetch: bool = True):
         """
         Unshard parameters by all-gathering from the sharded buffer.
@@ -594,8 +680,17 @@ class FSDPModule:
         torch.cuda.nvtx.range_push("MFSDP unshard")
         ctx = self._fsdp_root_context
         caller_stream = torch.cuda.current_stream()
-        # Unshard this module and optionally prefetch next modules in the forward/backward pass
-        if async_op and prefetch:
+        outer_prefetch = (
+            async_op
+            and prefetch
+            and ctx.outer_dp_all_gather_prefetch_depth > 0
+        )
+        if outer_prefetch:
+            # Bootstrap the current outer stage if start_param_sync() did not
+            # already do so. The current inner stage consumes only this event.
+            self._prefetch_outer_weights([self], bwd_pass=bwd_pass)
+            prefetch_modules = []
+        elif async_op and prefetch:
             prefetch_modules = ctx.get_prefetch_next_modules(self, bwd_pass=bwd_pass)
         else:
             prefetch_modules = []
@@ -632,6 +727,14 @@ class FSDPModule:
             if async_op:
                 event = ctx.ag_streams[-1].record_event()
                 ctx.unshard_done_events[id(module)] = event
+
+        if outer_prefetch:
+            # Refill after dispatching the critical inner stage. With depth
+            # one, the steady state is inner AG(current) || outer AG(next).
+            self._prefetch_outer_weights(
+                ctx.get_outer_weight_prefetch_modules(self, bwd_pass=bwd_pass),
+                bwd_pass=bwd_pass,
+            )
 
         # Ensure unshard is complete before forward.
         # The event is NOT cleared here — it persists as a "currently unsharded"

@@ -454,6 +454,70 @@ class TestFullyShardBasic:
             for param_group in model._fsdp_param_groups
         )
 
+    @pytest.mark.parametrize("depth,primed", [(0, 0), (1, 2), (2, 3)])
+    def test_hsdp_outer_weight_prefetch_window(self, depth, primed):
+        """Outer weight prefetch primes current+depth and advances after inner AG."""
+
+        class LayerStack(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = nn.ModuleList([SimpleMLP(16) for _ in range(4)])
+
+            def forward(self, x):
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+
+        mesh = _build_hsdp_mesh()
+        model = LayerStack().to(_device())
+        shard_kwargs = {
+            "mesh": mesh,
+            "sharding_strategy": "optim_grads_params",
+            "outer_dp_sharding_strategy": "optim",
+            "enable_unshard_prefetch": True,
+            "enable_async_reduce_grad": False,
+        }
+        for layer in model.layers:
+            fully_shard(layer, **shard_kwargs)
+        fully_shard(
+            model,
+            outer_dp_all_gather_prefetch_depth=depth,
+            **shard_kwargs,
+        )
+
+        # Model an optimizer update: only each [S, S] main-weight view is current.
+        model._copy_main_weights_to_model_weights()
+        model.start_param_sync()
+        pending = [
+            any(param_group.state.pending_weights for param_group in layer._fsdp_param_groups)
+            for layer in model.layers
+        ]
+        assert pending == [index < primed for index in range(4)]
+
+        if depth == 0:
+            return
+
+        # Consuming layer 0 launches its critical inner AG. The refill does not
+        # advance beyond layer 1 until the current layer advances.
+        model.layers[0].unshard(async_op=True)
+        assert not any(
+            param_group.state.pending_weights
+            for param_group in model.layers[0]._fsdp_param_groups
+        )
+        assert not any(
+            param_group.state.pending_weights
+            for param_group in model.layers[depth + 1]._fsdp_param_groups
+        )
+        model.layers[0].reshard()
+
+        # Advancing to layer 1 refills exactly one newly exposed window slot.
+        model.layers[1].unshard(async_op=True)
+        assert any(
+            param_group.state.pending_weights
+            for param_group in model.layers[depth + 1]._fsdp_param_groups
+        )
+        model.layers[1].reshard()
+
     def test_parameter_group_batches_module_unshard(self, monkeypatch):
         """One module unshard batches all compatible V2 parameter groups."""
         from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import DataParallelBuffer
