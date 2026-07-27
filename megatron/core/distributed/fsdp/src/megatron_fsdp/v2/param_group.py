@@ -624,8 +624,12 @@ class ParameterGroup:
     ) -> DataParallelBuffer | None:
         """Return one full compute-weight representation when available."""
         if self.state.weight_valid_by_role[role] == self.full_placements:
-            return self.weight_buffers[role]
-        return self.state.full_weights.get(role)
+            buffer = self.weight_buffers[role]
+        else:
+            buffer = self.state.full_weights.get(role)
+        if buffer is None or buffer.data is None or buffer.data.device != self.device:
+            return None
+        return buffer
 
     def weights_are_unsharded(self, bwd_pass: bool = False) -> bool:
         """Return whether all compute-weight representations for this pass are available."""

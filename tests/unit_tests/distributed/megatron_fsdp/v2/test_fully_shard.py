@@ -1250,14 +1250,16 @@ class TestIgnoredParams:
 
 
 class TestLifecycle:
-    def test_cpu_offload_rebinds_persistent_parameter_group_views(self):
-        """CPU offload and reload preserve optimizer-facing DTensor identities."""
+    @pytest.mark.parametrize("sharding_strategy", ["no_shard", "optim_grads_params"])
+    def test_cpu_offload_rebinds_persistent_parameter_group_views(self, sharding_strategy):
+        """CPU offload and automatic reload preserve optimizer DTensor identities."""
         model = fully_shard(
             SimpleMLP(16).to(_device(), dtype=torch.bfloat16),
             mp_policy=MixedPrecisionPolicy(
                 main_params_dtype=torch.float32,
                 main_grads_dtype=torch.float32,
             ),
+            sharding_strategy=sharding_strategy,
             enable_unshard_prefetch=False,
             enable_async_reduce_grad=False,
         )
@@ -1288,7 +1290,7 @@ class TestLifecycle:
                 for optimizer_param in param_group.optimizer_params
             )
 
-        model.reload_to_gpu()
+        model.unshard()
         assert optimizer_ids == [
             id(optimizer_param)
             for param_group in model._fsdp_param_groups
@@ -1307,6 +1309,7 @@ class TestLifecycle:
                 optimizer_param._local_tensor.device.type == "cuda"
                 for optimizer_param in param_group.optimizer_params
             )
+        model.reshard()
 
     def test_external_backward_callbacks_finalize_parameter_group_gradients(self):
         """Delayed-wgrad callers may explicitly finalize gradients after backward."""

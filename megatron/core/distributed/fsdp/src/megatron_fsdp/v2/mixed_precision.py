@@ -785,7 +785,7 @@ def quantize_main_weights_to_nvfp4(
     wbuf = model_weight_buffer
     sharded_placements = main_weight_buffer.placements
     main_weight_view = main_weight_buffer.view(sharded_placements)
-    if wbuf.placements[1] is not Placement.SHARD:
+    if wbuf.placements[-1] is not Placement.SHARD:
         raise RuntimeError("FIXME: implement non-distributed NVFP4 quantization path")
 
     for param in model_params:
