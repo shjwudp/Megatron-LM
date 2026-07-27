@@ -454,9 +454,9 @@ class TestFullyShardBasic:
             for param_group in model._fsdp_param_groups
         )
 
-    @pytest.mark.parametrize("depth,primed", [(0, 0), (1, 2), (2, 3)])
-    def test_hsdp_outer_weight_prefetch_window(self, depth, primed):
-        """Outer weight prefetch primes current+depth and advances after inner AG."""
+    @pytest.mark.parametrize("depth", [0, 1, 2])
+    def test_hsdp_outer_weight_prefetch_window(self, depth):
+        """The first unshard bootstraps and advances the outer prefetch window."""
 
         class LayerStack(nn.Module):
             def __init__(self):
@@ -487,28 +487,27 @@ class TestFullyShardBasic:
 
         # Model an optimizer update: only each [S, S] main-weight view is current.
         model._copy_main_weights_to_model_weights()
-        model.start_param_sync()
-        pending = [
-            any(param_group.state.pending_weights for param_group in layer._fsdp_param_groups)
-            for layer in model.layers
-        ]
-        assert pending == [index < primed for index in range(4)]
 
-        if depth == 0:
-            return
-
-        # Consuming layer 0 launches its critical inner AG. The refill does not
-        # advance beyond layer 1 until the current layer advances.
+        # Layer 0 performs its own outer then inner AG before refilling exactly
+        # the configured number of future outer stages.
         model.layers[0].unshard(async_op=True)
         assert not any(
             param_group.state.pending_weights
             for param_group in model.layers[0]._fsdp_param_groups
         )
-        assert not any(
-            param_group.state.pending_weights
-            for param_group in model.layers[depth + 1]._fsdp_param_groups
-        )
+        pending = [
+            any(param_group.state.pending_weights for param_group in layer._fsdp_param_groups)
+            for layer in model.layers
+        ]
+        assert pending == [
+            depth > 0 and 0 < index <= depth for index in range(4)
+        ]
         model.layers[0].reshard()
+
+        if depth == 0:
+            # The generic prefetch path fully unshards the immediate next module.
+            model.layers[1].reshard()
+            return
 
         # Advancing to layer 1 refills exactly one newly exposed window slot.
         model.layers[1].unshard(async_op=True)

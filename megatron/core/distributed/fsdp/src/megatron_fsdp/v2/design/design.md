@@ -160,7 +160,7 @@ module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
 
 ```python
 caller_stream = torch.cuda.current_stream()
-prefetch = _get_prefetch_next_modules(bwd_pass) if async_op else []
+prefetch = ctx.get_prefetch_modules(self, bwd_pass=bwd_pass) if async_op else []
 for module in [self] + prefetch:
     if all(pg.weights_are_unsharded() for pg in module._fsdp_param_groups):
         continue
@@ -215,15 +215,20 @@ owns the resulting `Work`; the async path calls
 `coalescing_event.wait()` while `ag_stream` is current before advancing to the next
 dimension or recording the module event.
 
-### `_get_prefetch_next_modules(bwd_pass)`
+### `get_prefetch_modules(module, bwd_pass, num_prefetch, require_outer_weight_all_gather)`
 
 ```python
 order = list(reversed(ctx.forward_order)) if bwd_pass else ctx.forward_order
-i = order.index(self)
-return [order[i + 1]] if i + 1 < len(order) else []
+i = order.index(module)
+candidates = order[i + 1 :]
+if require_outer_weight_all_gather:
+    candidates = [module for module in candidates if _uses_outer_weight_all_gather(module)]
+return candidates[:num_prefetch]
 ```
 
-Exactly one module is prefetched per step. Multi-module lookahead is a future extension.
+The generic full-unshard path requests one next module. The HSDP outer-stage path
+requests the configured number of eligible modules and only materializes their
+persistent `[R, S]` weight placement.
 
 ### `FSDPModule.reshard()`
 
@@ -819,10 +824,9 @@ fully-synchronized parameters and gradients.
 
 ## Known Gaps / Recommended Follow-ups
 
-1. **Single-module prefetch only.** `_get_prefetch_next_modules` returns at most one module.
-   For networks with many small modules, a size-aware multi-step lookahead
-   (analogous to `suggested_AG_prefetch_size` in the old `AllGatherPipeline`) would
-   yield better overlap.
+1. **Full compute-weight prefetch remains single-module.** HSDP outer-stage lookahead
+   is configurable, but the generic path still fully unshards at most one future
+   module. A size-aware policy may improve networks with many small modules.
 
 ---
 

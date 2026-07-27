@@ -438,11 +438,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         # wires it only for overlap=True), so the last-micro-batch signal reaches FSDP.
         if not ddp_config.overlap_grad_reduce and config.no_sync_func is None:
             config.no_sync_func = self.no_sync
-        self.start_param_sync = (
-            self.module.start_param_sync
-            if ddp_config.fsdp_all_gather_in_start_param_sync
-            else noop
-        )
+        self.start_param_sync = noop
         self.start_grad_sync = noop
 
         def synchronize_param_gather():

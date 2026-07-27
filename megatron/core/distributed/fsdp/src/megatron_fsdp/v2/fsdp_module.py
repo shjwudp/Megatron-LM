@@ -182,20 +182,6 @@ class _FSDPRootContext:
                 return
         self.backward_module = None
 
-    def get_prefetch_next_modules(
-        self, module: "FSDPModule", bwd_pass: bool = False
-    ) -> List["FSDPModule"]:
-        """Return the next FSDP module to prefetch in forward or backward order."""
-        module_order = list(reversed(self.forward_order)) if bwd_pass else self.forward_order
-
-        for module_index, candidate_module in enumerate(module_order):
-            if candidate_module is module:
-                if module_index + 1 >= len(module_order):
-                    return []
-                return [module_order[module_index + 1]]
-
-        raise AssertionError("Current module not found in forward module order")
-
     @staticmethod
     def _uses_outer_weight_all_gather(module: "FSDPModule") -> bool:
         """Return whether a module has an optimizer-sharded outer weight axis."""
@@ -205,38 +191,36 @@ class _FSDPRootContext:
             for param_group in module._fsdp_param_groups
         )
 
-    def get_outer_weight_prefetch_modules(
-        self, module: "FSDPModule" | None = None, bwd_pass: bool = False
+    def get_prefetch_modules(
+        self,
+        module: "FSDPModule",
+        *,
+        bwd_pass: bool = False,
+        num_prefetch: int = 1,
+        require_outer_weight_all_gather: bool = False,
     ) -> List["FSDPModule"]:
-        """Return the eligible outer-DP prefetch window.
-
-        With a current ``module``, the window contains at most ``depth`` future
-        modules. Without one, it contains the first module plus ``depth`` future
-        modules and is used to prime the pipeline.
-        """
-        if self.outer_dp_all_gather_prefetch_depth <= 0:
+        """Return the next eligible modules in forward or backward order."""
+        if num_prefetch <= 0:
             return []
         module_order = self._reversed_order if bwd_pass else self.forward_order
-        if module is None:
-            start = 0
-            limit = self.outer_dp_all_gather_prefetch_depth + 1
-        else:
-            try:
-                start = module_order.index(module) + 1
-            except ValueError as error:
-                raise AssertionError("Current module not found in forward module order") from error
-            limit = self.outer_dp_all_gather_prefetch_depth
+        try:
+            start = module_order.index(module) + 1
+        except ValueError as error:
+            raise AssertionError("Current module not found in forward module order") from error
 
         eligible = (
             candidate
             for candidate in module_order[start:]
-            if self._uses_outer_weight_all_gather(candidate)
+            if (
+                not require_outer_weight_all_gather
+                or self._uses_outer_weight_all_gather(candidate)
+            )
             and (not bwd_pass or id(candidate) not in self.backward_done_modules)
         )
         modules = []
         for candidate in eligible:
             modules.append(candidate)
-            if len(modules) == limit:
+            if len(modules) == num_prefetch:
                 break
         return modules
 
@@ -644,31 +628,6 @@ class FSDPModule:
                 bwd_pass=bwd_pass,
             )
 
-    def start_param_sync(
-        self, *unused, force_sync: bool = False, force_dispatch: bool = False
-    ) -> None:
-        """Prime the first outer-DP weight prefetch window.
-
-        ``force_dispatch`` is accepted for compatibility with the DDP schedule.
-        """
-        del force_dispatch
-        ctx = self._fsdp_root_context
-        if (
-            not ctx.enable_unshard_prefetch
-            or ctx.outer_dp_all_gather_prefetch_depth <= 0
-        ):
-            return
-        root_module = ctx.get_root_module()
-        if root_module is None:
-            return
-        if ctx.model_weight_refresh_pending:
-            root_module._copy_main_weights_to_model_weights()
-        self._prefetch_outer_weights(
-            ctx.get_outer_weight_prefetch_modules(), bwd_pass=False
-        )
-        if force_sync:
-            torch.cuda.current_stream().wait_stream(ctx.ag_streams[0])
-
     def unshard(self, async_op: bool = False, bwd_pass: bool = False, prefetch: bool = True):
         """
         Unshard parameters by all-gathering from the sharded buffer.
@@ -686,12 +645,12 @@ class FSDPModule:
             and ctx.outer_dp_all_gather_prefetch_depth > 0
         )
         if outer_prefetch:
-            # Bootstrap the current outer stage if start_param_sync() did not
-            # already do so. The current inner stage consumes only this event.
+            # Bootstrap the current outer stage. The current inner stage
+            # consumes only this module's event.
             self._prefetch_outer_weights([self], bwd_pass=bwd_pass)
             prefetch_modules = []
         elif async_op and prefetch:
-            prefetch_modules = ctx.get_prefetch_next_modules(self, bwd_pass=bwd_pass)
+            prefetch_modules = ctx.get_prefetch_modules(self, bwd_pass=bwd_pass)
         else:
             prefetch_modules = []
         for module in [self] + prefetch_modules:
@@ -732,7 +691,12 @@ class FSDPModule:
             # Refill after dispatching the critical inner stage. With depth
             # one, the steady state is inner AG(current) || outer AG(next).
             self._prefetch_outer_weights(
-                ctx.get_outer_weight_prefetch_modules(self, bwd_pass=bwd_pass),
+                ctx.get_prefetch_modules(
+                    self,
+                    bwd_pass=bwd_pass,
+                    num_prefetch=ctx.outer_dp_all_gather_prefetch_depth,
+                    require_outer_weight_all_gather=True,
+                ),
                 bwd_pass=bwd_pass,
             )
 
