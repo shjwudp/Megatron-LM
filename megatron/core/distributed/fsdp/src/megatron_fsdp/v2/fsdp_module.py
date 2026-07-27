@@ -83,6 +83,7 @@ class _FSDPState:
         self.enable_cuda_graph: bool = False
         self.enable_full_iteration_cuda_graph: bool = False
         self.cuda_graph_activation_recompute: bool = False
+        self.cuda_graph_max_pending_forwards: int = 1
 
 
 @dataclass
@@ -189,6 +190,9 @@ class _FSDPRootContext:
 
     cuda_graph_activation_recompute: bool = False
     """Whether forward, recompute forward, and backward use separate graphs."""
+
+    cuda_graph_max_pending_forwards: int = 1
+    """Maximum activation-recompute forwards awaiting backward per module."""
 
     cuda_graph_stream: Optional[torch.cuda.Stream] = None
     """Side stream for CUDA graph capture/replay.  Created lazily on the
@@ -311,7 +315,9 @@ class FSDPModule:
             self.__dict__["_mfsdp_cuda_graph_forward_impl"], *args, **kwargs
         )
 
-    def enable_cuda_graph(self, activation_recompute: bool = False) -> None:
+    def enable_cuda_graph(
+        self, activation_recompute: bool = False, max_pending_forwards: int = 1
+    ) -> None:
         """Enable CUDA graph capture for this FSDP module.
 
         Must be called while the module is resharded (before the first
@@ -331,23 +337,36 @@ class FSDPModule:
         :param activation_recompute: Capture forward, recompute forward, and
             backward as separate graphs.
         :type activation_recompute: bool
+        :param max_pending_forwards: Maximum forwards awaiting backward per module.
+            Values greater than one capture the observed microbatch order with
+            independent graph state and static buffers.
+        :type max_pending_forwards: int
         """
         if not isinstance(activation_recompute, bool):
             raise TypeError("activation_recompute must be a bool")
+        if not isinstance(max_pending_forwards, int) or isinstance(max_pending_forwards, bool):
+            raise TypeError("max_pending_forwards must be an int")
+        if max_pending_forwards < 1:
+            raise ValueError("max_pending_forwards must be at least 1")
+        if max_pending_forwards > 1 and not activation_recompute:
+            raise ValueError("max_pending_forwards > 1 requires activation_recompute=True")
         ctx = self._fsdp_root_context
         for module in ctx.forward_order:
             state = module._fsdp_state
-            if (
-                state.enable_cuda_graph
-                and state.cuda_graph_activation_recompute != activation_recompute
+            if state.enable_cuda_graph and (
+                state.cuda_graph_activation_recompute != activation_recompute
+                or state.cuda_graph_max_pending_forwards != max_pending_forwards
             ):
                 raise RuntimeError(
-                    "All M-FSDP CUDA Graph modules must use the same " "activation-recompute mode"
+                    "All M-FSDP CUDA Graph modules must use the same activation-recompute "
+                    "mode and max_pending_forwards value"
                 )
         self._fsdp_state.enable_cuda_graph = True
         self._fsdp_state.cuda_graph_activation_recompute = activation_recompute
+        self._fsdp_state.cuda_graph_max_pending_forwards = max_pending_forwards
         ctx.enable_cuda_graph = True
         ctx.cuda_graph_activation_recompute = activation_recompute
+        ctx.cuda_graph_max_pending_forwards = max_pending_forwards
         self._install_cuda_graph_forward_dispatch()
 
     def release_pending(self) -> bool:
@@ -713,6 +732,7 @@ class FSDPModule:
         enable_cuda_graph: bool = False,
         enable_full_iteration_cuda_graph: bool = False,
         cuda_graph_activation_recompute: bool = False,
+        cuda_graph_max_pending_forwards: int = 1,
     ):
         """Initialize FSDP state and mark nested FSDP modules as non-root.
 
@@ -813,13 +833,19 @@ class FSDPModule:
                     f"has FSDP children: {child_names}. "
                     f"Only leaf FSDP modules (no FSDP children) can use CUDA graph capture."
                 )
-            self.enable_cuda_graph(activation_recompute=cuda_graph_activation_recompute)
+            self.enable_cuda_graph(
+                activation_recompute=cuda_graph_activation_recompute,
+                max_pending_forwards=cuda_graph_max_pending_forwards,
+            )
 
         cuda_graph_modules = [
             module for module in forward_order if module._fsdp_state.enable_cuda_graph
         ]
         recompute_modes = {
             module._fsdp_state.cuda_graph_activation_recompute for module in cuda_graph_modules
+        }
+        max_pending_forwards_values = {
+            module._fsdp_state.cuda_graph_max_pending_forwards for module in cuda_graph_modules
         }
         if len(recompute_modes) > 1:
             raise RuntimeError(
@@ -828,6 +854,11 @@ class FSDPModule:
         if cuda_graph_modules:
             root_context.enable_cuda_graph = True
             root_context.cuda_graph_activation_recompute = recompute_modes.pop()
+            if len(max_pending_forwards_values) != 1:
+                raise RuntimeError(
+                    "All M-FSDP CUDA Graph modules must use the same max_pending_forwards value"
+                )
+            root_context.cuda_graph_max_pending_forwards = max_pending_forwards_values.pop()
 
     def unshard(self, async_op: bool = False, bwd_pass: bool = False, prefetch: bool = True):
         """

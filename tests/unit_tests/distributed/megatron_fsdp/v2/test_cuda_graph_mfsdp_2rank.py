@@ -206,3 +206,73 @@ def test_mfsdp_activation_recompute_updates_optimizer_parameters(request):
     model(retry).sum().backward()
     model.finish_grad_sync()
     assert retry.grad is not None
+
+
+def test_mfsdp_two_pending_microbatches(request):
+    """Replay two pending checkpoint invocations in reverse backward order.
+
+    :param request: Pytest request used for graph-pool cleanup.
+    :type request: pytest.FixtureRequest
+    """
+    if torch.distributed.get_world_size() != 2:
+        pytest.skip("This integration test requires two ranks")
+    device = torch.device(f"cuda:{torch.distributed.get_rank() % torch.cuda.device_count()}")
+    model = _TwoLayerRegion().to(device)
+    with torch.no_grad():
+        model.first.linear.weight.copy_(torch.eye(4, device=device))
+        model.second.linear.weight.copy_(torch.eye(4, device=device))
+    for layer in (model.first, model.second):
+        fully_shard(
+            layer,
+            sharding_strategy="optim_grads_params",
+            enable_unshard_prefetch=True,
+            enable_async_reduce_grad=True,
+            enable_cuda_graph=True,
+            cuda_graph_activation_recompute=True,
+            cuda_graph_max_pending_forwards=2,
+        )
+    fully_shard(model, sharding_strategy="optim_grads_params")
+
+    def release_graph_pool():
+        """Release ordered graphs after replay validation."""
+        if any(layer._fsdp_cg_pending_backwards for layer in (model.first, model.second)):
+            model.release_pending()
+        model.release_memory_pool()
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+
+    request.addfinalizer(release_graph_pool)
+    for step, (first_value, second_value) in enumerate(((1.0, 2.0), (3.0, 4.0), (5.0, 6.0))):
+        first = torch.full((2, 4), first_value, device=device, requires_grad=True)
+        second = torch.full((2, 4), second_value, device=device, requires_grad=True)
+        first_output = model(first)
+        second_output = model(second)
+        assert [layer._fsdp_cg_pending_backwards for layer in (model.first, model.second)] == [2, 2]
+
+        second_output.sum().backward()
+        first_output.sum().backward()
+        model.finish_grad_sync()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(first.grad, torch.ones_like(first))
+        torch.testing.assert_close(second.grad, torch.ones_like(second))
+        assert all(layer._fsdp_cg_pending_backwards == 0 for layer in (model.first, model.second))
+        if step == 2:
+            runner = model._fsdp_root_context.cuda_graph_runner
+            assert runner._captured
+            assert runner._ordered_replay_events
+        model.zero_grad(set_to_none=True)
+
+    runner = model._fsdp_root_context.cuda_graph_runner
+    assert not runner._active_backward_invocations
+    assert not runner._queued_backward_invocations
+    assert runner._ordered_armed_backward is None
+    assert not any(runner._ordered_replay_pending_backward_modules.values())
+    with torch.no_grad():
+        inference_input = torch.full((3, 4), 7.0, device=device)
+        inference_output = model(inference_input)
+        expected_output = inference_output.clone()
+        model(torch.full((3, 4), 8.0, device=device))
+    torch.testing.assert_close(inference_output, expected_output)
+    torch.testing.assert_close(inference_output, inference_input)
+    assert all(layer._fsdp_cg_pending_backwards == 0 for layer in (model.first, model.second))

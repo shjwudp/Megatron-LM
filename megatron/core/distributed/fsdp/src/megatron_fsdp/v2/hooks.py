@@ -254,6 +254,7 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
             ctx.cuda_graph_runner = CudaGraphRunner(
                 graph_pool=ctx.cuda_graph_pool,
                 activation_recompute=ctx.cuda_graph_activation_recompute,
+                max_pending_forwards=ctx.cuda_graph_max_pending_forwards,
             )
         ctx.cuda_graph_runner.preflight_record_module(target, replay_phase)
     if (

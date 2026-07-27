@@ -50,6 +50,7 @@ def fully_shard(
     enable_cuda_graph: bool = False,
     enable_full_iteration_cuda_graph: bool = False,
     cuda_graph_activation_recompute: bool = False,
+    cuda_graph_max_pending_forwards: int = 1,
     fine_grained_hooks: bool = False,
     skip_backward_callback: bool = False,  # Skip autograd RegisterFSDPBackwardFunction.
     skip_final_backward_callback: bool = False,
@@ -72,6 +73,9 @@ def fully_shard(
             forward, and backward as separate graphs. Requires the module to run
             inside a non-reentrant activation checkpoint and
             ``enable_cuda_graph=True``.
+        cuda_graph_max_pending_forwards: Maximum activation-recompute forwards awaiting
+            backward per module. Values greater than one capture the observed
+            microbatch order with independent graph state and static buffers.
         fine_grained_hooks: If ``True``, register pre-forward/backward hooks
             on every sub-module (for EP-overlap / 1F1B schedules).
         skip_backward_callback: If ``True``, skip the autograd post-backward
@@ -102,6 +106,16 @@ def fully_shard(
         )
     if cuda_graph_activation_recompute and not enable_cuda_graph:
         raise ValueError("cuda_graph_activation_recompute=True requires enable_cuda_graph=True")
+    if not isinstance(cuda_graph_max_pending_forwards, int) or isinstance(
+        cuda_graph_max_pending_forwards, bool
+    ):
+        raise TypeError("cuda_graph_max_pending_forwards must be an int")
+    if cuda_graph_max_pending_forwards < 1:
+        raise ValueError("cuda_graph_max_pending_forwards must be at least 1")
+    if cuda_graph_max_pending_forwards > 1 and not cuda_graph_activation_recompute:
+        raise ValueError(
+            "cuda_graph_max_pending_forwards > 1 requires cuda_graph_activation_recompute=True"
+        )
     mesh = _prepare_fsdp_mesh(mesh or _init_default_fully_shard_mesh())
 
     if mp_policy is None:
@@ -139,6 +153,7 @@ def fully_shard(
         enable_cuda_graph=enable_cuda_graph,
         enable_full_iteration_cuda_graph=enable_full_iteration_cuda_graph,
         cuda_graph_activation_recompute=cuda_graph_activation_recompute,
+        cuda_graph_max_pending_forwards=cuda_graph_max_pending_forwards,
     )
     if enable_cuda_graph:
         module._install_cuda_graph_forward_dispatch()

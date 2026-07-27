@@ -79,11 +79,15 @@ Microbatch 0: trace
   post-backward final callback calls plan()
   allocator phase becomes "optimized"
 
-Microbatch 1: record and capture
+Microbatch 1: record
   forward hooks unshard selected modules into stable trace-pool slots
   CudaGraphRunner records sample inputs and outputs
   backward runs eagerly
-  post-backward final callback calls capture_and_install()
+  post-backward final callback requests capture
+
+Microbatch 2 root forward pre-hook: capture
+  waits until the previous training schedule has left backward
+  calls capture_and_install() before the next parameter all-gather
   selected module forward methods are replaced with graphed callables
 
 Microbatch 2+: replay
@@ -92,6 +96,95 @@ Microbatch 2+: replay
   module forward/backward replay CUDA graphs
   post-backward hooks reshard and reduce gradients outside the graph
 ```
+
+## Activation recompute
+
+`cuda_graph_activation_recompute=True` captures three programs for each
+selected module:
+
+- `F`: the original forward program, whose module kernels are captured under
+  `no_grad` so their intermediate activations are not retained;
+- `RF`: the grad-enabled forward run by checkpoint recomputation;
+- `B`: backward, which consumes the autograd state produced by `RF`.
+
+The checkpoint scope may be larger than the CUDA Graph scope. For example,
+`checkpoint(A -> CG(B) -> C)` graphs only `B`. No checkpoint wrapper or phase
+marker is required. The M-FSDP pre-forward hook selects `F` during the normal
+forward phase and `RF` when the same module runs from an active autograd graph
+task during M-FSDP backward.
+
+Automatic phase discovery currently requires non-reentrant checkpointing. Its
+original forward is grad-enabled, while recomputation runs during M-FSDP
+backward. A reentrant original forward runs under `no_grad` and cannot be
+distinguished from a train-mode evaluation or probe without an explicit
+checkpoint marker.
+
+Every grad-disabled call is inference. It neither creates pending backward
+state nor changes an existing training invocation. A grad-enabled forward
+during backward is accepted as `RF` only when the selected invocation awaits
+recompute and the checkpoint runtime identifies an active autograd graph task.
+This also identifies recomputation from Transformer Engine checkpointing,
+which does not set the MCore checkpoint flag.
+Other side forwards are rejected before static inputs are overwritten. A
+grad-enabled call to the same module from inside that active task cannot be
+distinguished from its real recomputation and is unsupported.
+An original forward whose outputs are all detached is rejected and its pending
+state is released because no output can start the matching backward.
+
+```text
+normal forward:
+  all-gather B parameters -> replay F_B -> reshard
+
+checkpoint recompute:
+  all-gather B parameters -> replay RF_B -> reshard
+
+backward:
+  all-gather B parameters -> replay B_B -> reduce-scatter gradients -> reshard
+```
+
+Parameter communication, resharding, and gradient reduction stay outside the
+graphs. Only address-stable module computation is captured.
+
+Capture is deferred from the backward final callback to the next root forward
+pre-hook. This avoids synchronizing CUDA while a pipeline stage may still have
+point-to-point communication in flight. Evaluation and grad-disabled forwards
+leave the request pending until the next grad-enabled training forward.
+
+The runner records the observed `F`, `RF`, and `B` order before capture and
+infers serial checkpoint regions from that trace. A region runs `RF` in forward
+module order and `B` in reverse module order. With multiple pending forwards,
+the runner encodes the observed region and microbatch schedule in the runtime
+`_order` argument and assigns one static input/output lane per pending
+invocation. `_reuse_graph_input_output_buffers` reuses compatible storage when
+the recorded lifetimes do not overlap.
+
+The root output hook records the graph invocations reached by each forward.
+Backward validates this internal token before selecting its static lane.
+`release_pending()` and runner reset advance the token epoch, so an abandoned
+or pre-reset output cannot later replay against newer static buffers.
+When more than one forward is pending, backward must start from an instrumented
+root output so the runner can select the corresponding lane; there is no
+default lane when the token is missing. A lane becomes reusable as soon as its
+own backward finishes, including non-FIFO schedules where an older lane remains
+pending. If all lanes are occupied, the runner asks the caller to finish
+backward or call `release_pending()`.
+
+Multi-lane inference is allowed only when the recorded training schedule is
+idle. It does not advance the training replay cursor. If inference input
+metadata does not match a captured static surface, the module runs its original
+eager forward.
+
+Activation-recompute graphs currently reject RNG-consuming callables. CUDA
+Graph replay advances graph-safe generators but cannot restore the original
+forward RNG state before `RF`, so accepting RNG would silently change dropout
+or other stochastic results.
+
+The observed schedule must remain stable across replay. Each checkpoint region
+must be serial and contain a contiguous set of captured modules. Branched
+regions and custom backward orders are rejected. The number of simultaneous
+forwards awaiting backward is limited by
+`cuda_graph_max_pending_forwards`; each additional lane has separate static
+I/O and autograd state.
 
 ## Runtime pieces
 
@@ -163,7 +256,7 @@ Gradient reduction remains outside the graph in both cases.
 | File | Role |
 | --- | --- |
 | `fully_shard.py` | Selects `TracePoolAllocator` and records `enable_cuda_graph` in FSDP state. |
-| `hooks.py` | Records sample inputs/outputs and triggers batch capture after backward. |
+| `hooks.py` | Records samples, requests capture after backward, and captures at the next root forward. |
 | `cuda_graph_runner.py` | Orchestrates hook save/restore and `make_graphed_callables()` invocation. |
 | `te_graph_runtime/` | Vendored graph runtime used for capture and replay. |
 | `trace_pool_allocator_design.md` | Details the stable-address allocator used by this path. |
