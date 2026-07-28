@@ -4,6 +4,54 @@ Example scripts for training and checkpoint conversion using [Megatron-FSDP](../
 
 ## Scripts
 
+### `train_toy_model_experimental.py`
+
+A self-contained toy-model comparison between current experimental
+Megatron-FSDP (`--backend mfsdpv2`) and PyTorch FSDP2 (`--backend fsdp2`).
+It is based on the `mfsdp_refactor` `fsdp_toy.py` example and retains its gated
+MLP, activation checkpointing, deterministic teacher/student convergence task,
+distributed-checkpoint save/resume, memory snapshots, and one- or
+two-dimensional data-parallel layouts.
+
+Run the teacher/student convergence example with Megatron-FSDP:
+
+```bash
+torchrun --nproc-per-node 4 \
+  examples/megatron_fsdp/train_toy_model_experimental.py \
+  --backend mfsdpv2 \
+  --use-real-data
+```
+
+Change only the backend for a PyTorch FSDP2 comparison:
+
+```bash
+torchrun --nproc-per-node 4 \
+  examples/megatron_fsdp/train_toy_model_experimental.py \
+  --backend fsdp2 \
+  --use-real-data
+```
+
+On an even world size of at least four, `--enable-hsdp` creates a `2 × N`
+mesh. Megatron-FSDP uses `[Replicate, Flat]` compute weights,
+`[Partial(AVG), Flat]` accumulating gradients, and `[Flat, Flat]` optimizer
+weights, so the outer dimension performs optimizer sharding:
+
+```bash
+torchrun --nproc-per-node 8 \
+  examples/megatron_fsdp/train_toy_model_experimental.py \
+  --backend mfsdpv2 \
+  --enable-hsdp \
+  --use-real-data
+```
+
+Add `--ckpt-dir /path/to/checkpoints` to save and resume PyTorch distributed
+checkpoints, `--activation-checkpoint` to checkpoint each repeated block, or
+`--record-memory-history /path/to/snapshots` for per-rank allocator snapshots.
+The original `--use-megatron-fsdp` flag remains as an alias for
+`--backend mfsdpv2`. Trace-pool, memory-pool release, and per-module CUDA-graph
+flags are not included because current main's experimental API does not expose
+those controls.
+
 ### `train_qwen_image_experimental.py`
 
 A benchmark and convergence comparison for the official
