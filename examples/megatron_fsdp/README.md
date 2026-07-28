@@ -1,8 +1,137 @@
 # Megatron-FSDP Examples
 
-Example scripts for training and checkpoint conversion using [Megatron-FSDP](../../docs/user-guide/features/megatron_fsdp.md). These demonstrate recommended configurations for Llama 3 8B and DeepSeek-V3 671B models, as well as checkpoint format conversion between `torch_dist` (N-D parallel) and `fsdp_dtensor` formats.
+Example scripts for training and checkpoint conversion using [Megatron-FSDP](../../docs/user-guide/features/megatron_fsdp.md). These demonstrate recommended configurations for Llama 3 8B and DeepSeek-V3 671B models, experimental `fully_shard` integration with QwenImage, and checkpoint format conversion between `torch_dist` (N-D parallel) and `fsdp_dtensor` formats.
 
 ## Scripts
+
+### `train_qwen_image_experimental.py`
+
+A benchmark and convergence comparison for the official
+[Diffusers QwenImageTransformer2DModel](https://huggingface.co/docs/diffusers/api/models/qwenimage_transformer2d)
+using the experimental Megatron-FSDP `fully_shard` API and PyTorch FSDP1 as a
+reference backend. Megatron-FSDP applies FSDP bottom-up to every QwenImage
+transformer block and then to the transformer root, enabling per-block
+all-gather prefetch and reduce-scatter overlap. FSDP1 uses the same block type
+as its auto-wrap unit.
+
+The example trains only the diffusion transformer. It creates synthetic packed
+latents and text embeddings that follow QwenImage's flow-matching forward
+contract, making it useful for distributed bring-up, profiling, and fixed-batch
+convergence testing without loading the VAE, text encoder, or a dataset.
+
+The harness is based on the QwenImage benchmark developed on the
+`mfsdp_refactor` branch. Its current-main version provides:
+
+- per-block `torch.compile`;
+- Diffusers attention-backend selection, including native, FA2, and FA3 when installed;
+- warmup and measured step timing;
+- peak CUDA memory reporting and optional allocator snapshots;
+- fixed-batch flow-matching convergence checks;
+- optional global gradient and parameter statistics;
+- Nsight capture ranges and optional `cudaProfilerStart`/`cudaProfilerStop`;
+- BF16 or FP32 sharded optimizer weights, gradient accumulation, gradient
+  checkpointing, and experimental NCCL symmetric memory.
+
+The refactor branch's trace-pool and per-module CUDA-graph options are not
+exposed by the current experimental API, so they are not command-line options
+in this example.
+
+Diffusers is an example-only dependency and is intentionally not added to
+Megatron-LM's package dependencies. Run inside the Megatron-LM development
+container and provide a current Diffusers build:
+
+```bash
+HF_ENABLE_PARALLEL_LOADING=yes \
+uv run --with 'diffusers @ git+https://github.com/huggingface/diffusers.git' \
+  python -m torch.distributed.run \
+  --nproc-per-node 8 \
+  examples/megatron_fsdp/train_qwen_image_experimental.py \
+  --backend mfsdpv2 \
+  --model-id Qwen/Qwen-Image \
+  --batch-size 4 \
+  --height 512 \
+  --width 512 \
+  --attention flash \
+  --compile \
+  --benchmark-steps 20
+```
+
+Run the identical benchmark with PyTorch FSDP1 by changing only the backend:
+
+```bash
+HF_ENABLE_PARALLEL_LOADING=yes \
+uv run --with 'diffusers @ git+https://github.com/huggingface/diffusers.git' \
+  python -m torch.distributed.run \
+  --nproc-per-node 8 \
+  examples/megatron_fsdp/train_qwen_image_experimental.py \
+  --backend fsdp1 \
+  --model-id Qwen/Qwen-Image \
+  --batch-size 4 \
+  --height 512 \
+  --width 512 \
+  --attention flash \
+  --compile \
+  --benchmark-steps 20
+```
+
+Both backends use one-dimensional full sharding, BF16 compute and gradient
+reduction, the same FSDP unit boundaries, seeds, batches, optimizer, and
+measurement loop. This makes their reported step time and peak allocated
+memory directly comparable.
+
+The original `mfsdp_refactor` option names remain accepted. For example:
+
+```bash
+torchrun --nproc_per_node=4 --master_port=29501 \
+  examples/megatron_fsdp/train_qwen_image_experimental.py \
+  --sharding full --cuda_profiler_capture \
+  --pretrained_model_name_or_path /tmp/qwen-image \
+  --num_gpus_per_node 4 --batch_size 4 --height 512 --width 512 \
+  --attention flash --bench_steps 20 --warmup_steps 3 \
+  --compile --real-data
+```
+
+This defaults to `--backend mfsdpv2`. Add `--backend fsdp1` to run the same
+command with the PyTorch reference backend. `--real-data` is retained as a
+compatibility alias for `--check-convergence`; the batch is fixed synthetic
+flow-matching data rather than a dataset-backed batch. Startup, per-step,
+memory, verification, final performance, and convergence logs retain the
+original harness format so existing comparison scripts can parse both.
+
+To run a fixed-batch convergence check:
+
+```bash
+HF_ENABLE_PARALLEL_LOADING=yes \
+uv run --with 'diffusers @ git+https://github.com/huggingface/diffusers.git' \
+  python -m torch.distributed.run \
+  --nproc-per-node 8 \
+  examples/megatron_fsdp/train_qwen_image_experimental.py \
+  --backend mfsdpv2 \
+  --model-id Qwen/Qwen-Image \
+  --check-convergence \
+  --convergence-threshold 0.7 \
+  --benchmark-steps 20
+```
+
+For profiling and memory diagnosis, add:
+
+```bash
+--cuda-profiler-capture \
+--record-memory-history /path/to/snapshots
+```
+
+Use `--verify` only for numerical investigation because its additional
+collectives invalidate performance measurements. To use an existing Hugging
+Face cache without network access, pass a local `--model-id` together with
+`--local-files-only`.
+
+The script loads checkpoint shards one local rank per node at a time to reduce
+filesystem contention. It uses BF16 compute and gradients, defaults to BF16
+optimizer weights to match the original benchmark, adapts AdamW through
+`fully_shard_optimizer`, and supports FP32 optimizer weights through
+`--main-params-dtype fp32`. FP32 optimizer weights and `--use-symm-mem` are
+Megatron-FSDP-only options; the FSDP1 comparison currently requires the default
+BF16 setting.
 
 ### `train_llama3_8b_fsdp_h100_fp8.sh`
 
