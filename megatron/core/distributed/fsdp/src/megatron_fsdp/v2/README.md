@@ -167,10 +167,13 @@ for the full per-module architecture.
 
 Flat buffer managing (a shard of) parameter/gradient data:
 
-- `unshard()` — all-gather to full tensor
-- `reshard()` — free temporary buffer
-- `reduce_grad()` — all-reduce no-shard grads or reduce-scatter ZeRO grads
-- Uses `BufferIndex` to track parameter layout within the buffer
+- `redistribute()` — move one mesh axis between `FLAT`, `REPLICATE`,
+  `PARTIAL`, and `DIRTY` placements
+- `commit_comm_output()` — copy or accumulate a redistribution result into
+  persistent storage
+- `bind_params()` — bind parameters to a fully replicated weight buffer
+- `release_unsharded_buffer()` — release temporary replicated storage
+- Uses `BufferIndex` to track parameter layout and shard ownership
 
 ### ParameterGroup
 
