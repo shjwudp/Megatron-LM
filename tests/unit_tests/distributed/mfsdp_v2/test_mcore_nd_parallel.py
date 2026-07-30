@@ -174,6 +174,7 @@ class TestMegatronFSDPE2E:
                     data_parallel_sharding_strategy="optim_grads_params",
                     recompute_granularity="full",
                     recompute_method="uniform",
+                    recompute_num_layers=1,
                     overlap_param_gather=True,
                     overlap_grad_reduce=True,
                     use_megatron_fsdp=True,
