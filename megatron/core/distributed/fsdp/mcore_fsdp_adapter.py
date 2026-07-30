@@ -46,6 +46,7 @@ from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
+from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import (
@@ -540,6 +541,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if fsdp_unit_modules is None:
             fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+        moe_fsdp_unit_modules = [SequentialMLP, TEGroupedMLP]
 
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
@@ -559,7 +561,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         dp_group = pg_collection.dp_cp
         device_type = device.type if device is not None else "cuda"
         mesh = DeviceMesh.from_group(dp_group, device_type=device_type, mesh_dim_names=("dp",))
+        moe_mesh = DeviceMesh.from_group(
+            pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("edp",)
+        )
         placements = Placements(
+            dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
+        )
+        moe_placements = Placements(
             dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
         )
         for submodule in reversed(list(module.modules())):
@@ -572,6 +580,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     submodule,
                     mesh=mesh,
                     placements=placements,
+                    mixed_precision_policy=self.mp_policy,
+                )
+            elif any(isinstance(submodule, module_type) for module_type in moe_fsdp_unit_modules):
+                fully_shard(
+                    submodule,
+                    mesh=moe_mesh,
+                    placements=moe_placements,
                     mixed_precision_policy=self.mp_policy,
                 )
         fully_shard(module, mesh=mesh, placements=placements, mixed_precision_policy=self.mp_policy)
@@ -608,7 +623,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             "tensor_model_parallel_size",
             "pipeline_model_parallel_size",
             "context_parallel_size",
-            "expert_model_parallel_size",
         ]
         if any(getattr(config, parallelism) != 1 for parallelism in unsupported_parallelisms):
             raise ValueError(
@@ -621,7 +635,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         # The config validates the requested topology, while these checks validate the
         # materialized topology supplied by the caller's process-group collection.
-        for group_name in ("tp", "pp", "cp", "ep"):
+        for group_name in ("tp", "pp", "cp"):
             group = getattr(pg_collection, group_name, None)
             if group is not None and group.size() != 1:
                 raise ValueError(
@@ -629,10 +643,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     f"got {group.size()}."
                 )
 
-        if getattr(config, "num_moe_experts", None) is not None or any(
-            not getattr(parameter, "allreduce", True) for parameter in module.parameters()
-        ):
-            raise ValueError("MFSDP v2 does not currently support expert parameters.")
         if ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
             raise ValueError(
                 "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."

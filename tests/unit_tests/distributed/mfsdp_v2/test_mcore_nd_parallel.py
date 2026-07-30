@@ -175,12 +175,9 @@ class TestMegatronFSDPE2E:
                     recompute_granularity="full",
                     recompute_method="uniform",
                     recompute_num_layers=1,
-                    overlap_param_gather=True,
-                    overlap_grad_reduce=True,
-                    use_megatron_fsdp=True,
                     gradient_accumulation_fusion=True,
                 ),
-                id="optim_grads_params_double_buffer",
+                id="optim_grads_params_recompute",
             ),
             pytest.param(
                 dict(
@@ -190,9 +187,6 @@ class TestMegatronFSDPE2E:
                     fp8_param_gather=True,
                     fp8_recipe="mxfp8",
                     moe_grouped_gemm=True,
-                    overlap_param_gather=True,
-                    overlap_grad_reduce=True,
-                    use_megatron_fsdp=True,
                 ),
                 id="optim_grads_params_mxfp8_param_gather",
             ),
@@ -204,7 +198,6 @@ class TestMegatronFSDPE2E:
                     fp8_param_gather=True,
                     fp8_recipe="mxfp8",
                     moe_grouped_gemm=True,
-                    use_megatron_fsdp=True,
                     moe_token_dispatcher_type="alltoall",
                     overlap_moe_expert_parallel_comm=True,
                     delay_wgrad_compute=True,
@@ -236,6 +229,7 @@ class TestMegatronFSDPE2E:
         if ref_cache_key not in ref_cache:
             reference_spec_configs = copy.deepcopy(spec_configs)
             reference_spec_configs["use_megatron_fsdp"] = False
+            reference_spec_configs["megatron_fsdp_version"] = 1
             reference_spec_configs["gradient_accumulation_fusion"] = False
             reference_spec_configs["fp8_param_gather"] = False
             ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
@@ -244,8 +238,12 @@ class TestMegatronFSDPE2E:
 
         fsdp_spec_configs = copy.deepcopy(spec_configs)
         fsdp_spec_configs.setdefault("gradient_accumulation_fusion", False)
+        assert "use_distributed_optimizer" not in fsdp_spec_configs
+        assert "use_distributed_optimizer" not in nd_topology
         outputs = TestMegatronFSDPE2E._training_loop(
             use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
             init_model_with_meta_device=True,
             ckpt_format="fsdp_dtensor",
             **nd_topology,
@@ -368,7 +366,6 @@ class TestMegatronFSDPE2E:
             )
 
         fsdp_configs = copy.deepcopy(common_configs)
-        fsdp_configs["use_megatron_fsdp"] = True
         actual = TestMegatronFSDPE2E._training_loop(
             use_megatron_fsdp=True,
             ckpt_format="fsdp_dtensor",
