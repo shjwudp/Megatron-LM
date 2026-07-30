@@ -229,7 +229,9 @@ class TestMcoreAdapter:
         reference_losses = torch.stack(reference_losses)
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
-        torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
+        # DP reduce-scatter and the unsharded reference accumulate BF16 gradients
+        # in different orders, so their losses may differ by roughly one BF16 ULP.
+        torch.testing.assert_close(losses, reference_losses, rtol=1e-2, atol=0)
 
 
 class TestMcoreAdapterPipelineParallel:
