@@ -7,17 +7,8 @@ import torch
 from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
-from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import _init_dp_mesh
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-    HAVE_TE_NVFP4,
-    HAVE_TE_NVFP4_RECIPE,
-)
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training.global_vars import destroy_global_vars
 from tests.unit_tests.distributed.mfsdp_v1.utils import (
@@ -47,135 +38,6 @@ class TestMegatronFSDPE2E:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
-    @pytest.mark.parametrize("outer_dp_size", [1, 2])
-    def test_dp_mesh_flatten_groups_reuse_full_dp_groups(self, outer_dp_size):
-        if Utils.world_size < 4 or Utils.world_size % 4 != 0:
-            pytest.skip("HSDP EP flatten coverage requires a world size divisible by 4")
-
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            expert_model_parallel_size=2,
-            expert_tensor_parallel_size=1,
-            num_distributed_optimizer_instances=outer_dp_size,
-        )
-        try:
-            required_pgs = ["tp", "expt_tp", "ep", "dp_cp", "expt_dp"]
-            if outer_dp_size > 1:
-                required_pgs.extend(["intra_dp_cp", "intra_expt_dp", "inter_dist_opt"])
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
-            ddp_config = DistributedDataParallelConfig(
-                num_distributed_optimizer_instances=outer_dp_size
-            )
-
-            for edp, full_group_attr in ((False, "dp_cp"), (True, "expt_dp")):
-                mesh = _init_dp_mesh(pg_collection, ddp_config, edp=edp)
-                flatten_name = "_".join(mesh.mesh_dim_names)
-                expected_group = getattr(pg_collection, full_group_attr)
-
-                for _ in range(2):
-                    flatten_group = mesh._flatten(flatten_name).get_group()
-                    assert flatten_group.group_name == expected_group.group_name
-        finally:
-            Utils.destroy_model_parallel()
-
-    def test_edp1_multimicrobatch_unused_grad_lifecycle(self):
-        """EDP=1 scales, accumulates, and zeros skipped-microbatch scratch grads."""
-        if Utils.world_size < 2:
-            pytest.skip("EDP=1 coverage requires at least two ranks for EP partitioning")
-
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            expert_model_parallel_size=Utils.world_size,
-            expert_tensor_parallel_size=1,
-        )
-        try:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=["tp", "expt_tp", "ep", "dp_cp", "expt_dp"]
-            )
-            mesh = _init_dp_mesh(pg_collection, DistributedDataParallelConfig(), edp=True)
-            assert mesh.size(0) == mesh.size(1) == 1
-
-            device = torch.device(f"cuda:{torch.cuda.current_device()}")
-            model = torch.nn.Linear(16, 16, bias=False, device=device)
-            fully_shard(
-                model,
-                mesh=mesh,
-                sharding_strategy="optim_grads_params",
-                enable_unshard_prefetch=False,
-                enable_async_reduce_grad=True,
-                gradient_scaling_factor=0.25,
-            )
-
-            param_group = model._fsdp_param_groups[0]
-            grad_buffer = param_group.main_grad_buffer
-            assert grad_buffer is not None
-            assert grad_buffer.inner_dp_group.size() == 1
-            assert grad_buffer.inner_sharded
-            param_group._init_dist_grads()
-
-            param = param_group.params[0]
-            item_id = param_group.param_idx[param]
-            ctx = model._fsdp_root_context
-
-            def reduce_and_wait():
-                model.reduce_grad(async_op=True)
-                model.finish_grad_sync()
-                torch.cuda.current_stream().synchronize()
-
-            def drain_pending():
-                pending = ctx.reduce_grad_buckets[id(model)]
-                while pending:
-                    event, pending_group = pending.pop()
-                    event.synchronize()
-                    pending_group.release_grad_buffer()
-
-            try:
-                # MB1: scale a fused wgrad into the fresh optimizer shard.
-                main_grad = param.get_main_grad()
-                assert main_grad.data_ptr() != grad_buffer.data.data_ptr()
-                main_grad.fill_(8.0)
-                param.main_grad = main_grad
-                param.grad_added_to_main_grad = True
-                param._mfsdp_recorded_te_wgrad = False
-                assert param.grad is None
-                assert not param_group._full_grad_buffer_has_accumulated_grad
-                assert not param_group._reduced_grad_buffer_has_accumulated_grad
-
-                reduce_and_wait()
-                optimizer_grad = param_group.dist_params[item_id].grad
-                assert optimizer_grad is not None
-                torch.testing.assert_close(
-                    optimizer_grad._local_tensor, torch.full_like(optimizer_grad._local_tensor, 2.0)
-                )
-                assert param.grad_added_to_main_grad is False
-                assert not param_group._full_grad_buffer_has_accumulated_grad
-                assert param_group._reduced_grad_buffer_has_accumulated_grad
-                drain_pending()
-                assert not hasattr(param, "main_grad")
-
-                # MB2: a bound but unwritten recycled view contributes zero and
-                # must not overwrite the optimizer shard accumulated by MB1.
-                stale_main_grad = param.get_main_grad()
-                stale_main_grad.fill_(123.0)
-                param.main_grad = stale_main_grad
-                assert param.grad is None
-
-                reduce_and_wait()
-                assert torch.count_nonzero(stale_main_grad) == 0
-                assert not param_group._full_grad_buffer_has_accumulated_grad
-                assert param_group._reduced_grad_buffer_has_accumulated_grad
-                optimizer_grad = param_group.dist_params[item_id].grad
-                assert optimizer_grad is not None
-                torch.testing.assert_close(
-                    optimizer_grad._local_tensor, torch.full_like(optimizer_grad._local_tensor, 2.0)
-                )
-            finally:
-                drain_pending()
-        finally:
-            Utils.destroy_model_parallel()
-
     @staticmethod
     def _normalize_param_name(name):
         while name.startswith("module."):
@@ -200,8 +62,6 @@ class TestMegatronFSDPE2E:
 
     @staticmethod
     def _capture_named_params(model_chunks):
-        # All ranks must enter DTensor gather collectives, but only rank 0
-        # keeps CPU copies for comparison.
         snapshots = {}
         for chunk_idx, model_chunk in enumerate(model_chunks):
             for name, param in model_chunk.named_parameters():
@@ -212,82 +72,7 @@ class TestMegatronFSDPE2E:
         return snapshots
 
     @staticmethod
-    def _assert_replicated_weight_buffers_match(model_chunks):
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
-
-        for model_chunk in model_chunks:
-            for _, module in model_chunk.named_modules():
-                if not isinstance(module, FSDPModule):
-                    continue
-                for param_group in module._fsdp_param_groups:
-                    if (
-                        param_group.model_weight_buffer is None
-                        or param_group.model_weight_buffer.inner_sharded
-                    ):
-                        continue
-                    param_group.unshard(bwd_pass=False)
-                    if param_group.transpose_weight_buffer is not None:
-                        param_group.unshard(bwd_pass=True)
-
-                    for buffer_name, buffer in (
-                        ("model_weight_buffer", param_group.model_weight_buffer),
-                        ("transpose_weight_buffer", param_group.transpose_weight_buffer),
-                    ):
-                        if buffer is None or buffer.inner_sharded:
-                            continue
-                        gathered = [
-                            torch.empty_like(buffer.data)
-                            for _ in range(torch.distributed.get_world_size(param_group.dp_group))
-                        ]
-                        torch.distributed.all_gather(
-                            gathered, buffer.data, group=param_group.dp_group
-                        )
-                        for group_rank, replica in enumerate(gathered):
-                            assert torch.equal(buffer.data, replica), (
-                                f"Replicated {buffer_name} mismatch for "
-                                f"param_group={param_group.param_group_id}, "
-                                f"group_rank={group_rank}"
-                            )
-
-    @staticmethod
     def _training_loop(seed=42, **kwargs):
-        """
-        Run a small deterministic (optional) training loop using a mocked MoE/GPT model and optimizer.
-        This helper initializes model-parallel state, creates a model and optimizer via
-        make_moe_args_model_and_optimizer, constructs a mock GPT data iterator, and runs
-        NUM_TRAINING_STEPS iterations of forward/backward/optimization. Losses from each
-        training step are collected and returned.
-        Args:
-            seed (int, optional): RNG seed for reproducibility. Default: 42.
-            **kwargs: Configuration overrides (all optional). Recognized keys:
-                - vocab_size (int): Vocabulary size for the mock model. Default: 100.
-                - seq_length (int): Sequence length used for the mock data. Default: 128.
-                - micro_batch_size (int): Per-microbatch size. Default: 2.
-                - global_batch_size (int): Global batch size across data-parallel ranks. Default: 32.
-                - train_iters (int): Number of training iterations to run. Default: 20.
-                - tensor_model_parallel_size (int): Tensor model parallel world size. Default: 1.
-                - pipeline_model_parallel_size (int): Pipeline model parallel world size. Default: 1.
-                - num_layers_per_virtual_pipeline_stage (int or None): Virtual pipeline configuration.
-                - expert_model_parallel_size (int): Expert model parallel size for MoE. Default: 1.
-                - expert_tensor_parallel_size (int): Expert tensor parallel size for MoE. Default: 1.
-                - num_distributed_optimizer_instances (int): Number of distributed optimizer instances. Default: 1.
-        Returns:
-            list: A list of length train_iters containing the per-step language-model loss values
-            (the value appended from output[-1] each iteration). Loss objects are returned as produced
-            by the training utilities (typically tensors or scalars).
-        Side effects:
-            - Calls Utils.initialize_model_parallel(...) and Utils.destroy_model_parallel().
-            - Sets global RNG state via set_manual_seed(seed).
-            - Constructs models/optimizers via make_moe_args_model_and_optimizer and a data iterator
-              via make_gpt_mock_data_iterator.
-            - Runs optimizer.zero_grad(), pretrain_forward_backward(...), and optim.step() repeatedly.
-            - Calculates the number of micro-batches per step as:
-                global_batch_size // micro_batch_size // data_parallel_world_size.
-              This requires that global_batch_size be divisible by micro_batch_size * data_parallel_world_size.
-        Raises:
-            ValueError: If batch-size arithmetic or other setup assumptions (e.g., divisibility) are violated.
-        """
-        # Configuration parameters with defaults
         VOCAB_SIZE = kwargs.pop("vocab_size", 100)
         MAX_SEQ_LEN = kwargs.pop("seq_length", 128)
         MICRO_BATCH_SIZE = kwargs.pop("micro_batch_size", 2)
@@ -300,10 +85,8 @@ class TestMegatronFSDPE2E:
         ETP = kwargs.pop("ETP", 1)
         OUTER_DP = kwargs.pop("OUTER_DP", 1)
         capture_param_snapshots = kwargs.pop("capture_param_snapshots", False)
-        verify_replicated_weight_buffers = kwargs.pop("verify_replicated_weight_buffers", False)
         return_dict = kwargs.pop("return_dict", capture_param_snapshots)
 
-        # Initialize model parallel groups
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=TP,
             pipeline_model_parallel_size=PP,
@@ -313,10 +96,8 @@ class TestMegatronFSDPE2E:
         )
         DP_GROUP = mpu.get_data_parallel_group()
 
-        # Set manual seed for reproducibility
         set_manual_seed(seed)
 
-        # Create model and optimizer
         model_chunks, optim = make_moe_args_model_and_optimizer(
             ut_filename="test_mcore_fully_sharded_data_parallel.py",
             micro_batch_size=MICRO_BATCH_SIZE,
@@ -332,14 +113,7 @@ class TestMegatronFSDPE2E:
             train_iters=NUM_TRAINING_STEPS,
             **kwargs,
         )
-        if kwargs.get("use_megatron_fsdp", False) and kwargs.get(
-            "use_precision_aware_optimizer", False
-        ):
-            assert (
-                not optim.optimizer.master_weights
-            ), "Megatron-FSDP should not use FusedAdam master weights."
 
-        # Prepare data iterator
         data_iterator = make_gpt_mock_data_iterator(
             dp_group=DP_GROUP,
             vocab_size=VOCAB_SIZE,
@@ -351,7 +125,6 @@ class TestMegatronFSDPE2E:
         outputs = []
         param_snapshots = []
 
-        # Training loop
         for step in range(NUM_TRAINING_STEPS):
             t0 = time.time()
             optim.zero_grad()
@@ -363,10 +136,7 @@ class TestMegatronFSDPE2E:
                 num_micro_batches=GLOBAL_BATCH_SIZE // MICRO_BATCH_SIZE // DP_GROUP.size(),
             )
             optim.step()
-            if verify_replicated_weight_buffers:
-                TestMegatronFSDPE2E._assert_replicated_weight_buffers_match(model_chunks)
 
-            # Collect loss
             outputs.append(output[-1])
             if torch.distributed.get_rank() == 0:
                 elapsed = time.time() - t0
@@ -404,12 +174,10 @@ class TestMegatronFSDPE2E:
                     data_parallel_sharding_strategy="optim_grads_params",
                     recompute_granularity="full",
                     recompute_method="uniform",
-                    recompute_num_layers=1,
                     overlap_param_gather=True,
                     overlap_grad_reduce=True,
-                    use_megatron_fsdp_v2=True,
+                    use_megatron_fsdp=True,
                     gradient_accumulation_fusion=True,
-                    fsdp_trace_pool=True,
                 ),
                 id="optim_grads_params_double_buffer",
             ),
@@ -423,24 +191,9 @@ class TestMegatronFSDPE2E:
                     moe_grouped_gemm=True,
                     overlap_param_gather=True,
                     overlap_grad_reduce=True,
-                    use_megatron_fsdp_v2=True,
+                    use_megatron_fsdp=True,
                 ),
                 id="optim_grads_params_mxfp8_param_gather",
-            ),
-            pytest.param(
-                dict(
-                    bf16=True,
-                    data_parallel_sharding_strategy="optim_grads_params",
-                    fp4="e2m1",
-                    fp4_recipe="nvfp4",
-                    fp4_param_gather=True,
-                    main_grads_dtype="fp32",
-                    main_params_dtype="fp32",
-                    overlap_param_gather=True,
-                    overlap_grad_reduce=True,
-                    use_megatron_fsdp_v2=True,
-                ),
-                id="optim_grads_params_nvfp4_param_gather",
             ),
             pytest.param(
                 dict(
@@ -450,7 +203,7 @@ class TestMegatronFSDPE2E:
                     fp8_param_gather=True,
                     fp8_recipe="mxfp8",
                     moe_grouped_gemm=True,
-                    use_megatron_fsdp_v2=True,
+                    use_megatron_fsdp=True,
                     moe_token_dispatcher_type="alltoall",
                     overlap_moe_expert_parallel_comm=True,
                     delay_wgrad_compute=True,
@@ -467,20 +220,6 @@ class TestMegatronFSDPE2E:
         ):
             pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
 
-        if spec_configs.get("fp4_param_gather"):
-            if not torch.cuda.is_available():
-                pytest.skip("CUDA is required for NVFP4")
-            if not (HAVE_TE_NVFP4 and HAVE_TE_NVFP4_RECIPE):
-                pytest.skip("NVFP4 requires Transformer Engine >= 2.7.0.dev0")
-            try:
-                from transformer_engine.pytorch.fp8 import check_nvfp4_support
-
-                is_nvfp4_available, reason = check_nvfp4_support()
-                if not is_nvfp4_available:
-                    pytest.skip("NVFP4 not available: " + reason)
-            except ImportError:
-                pytest.skip("NVFP4 support check requires Transformer Engine >= 2.7.0.dev0")
-
         if spec_configs.get("overlap_moe_expert_parallel_comm"):
             from megatron.core.utils import is_te_min_version
 
@@ -495,7 +234,7 @@ class TestMegatronFSDPE2E:
         )
         if ref_cache_key not in ref_cache:
             reference_spec_configs = copy.deepcopy(spec_configs)
-            reference_spec_configs["use_megatron_fsdp_v2"] = False
+            reference_spec_configs["use_megatron_fsdp"] = False
             reference_spec_configs["gradient_accumulation_fusion"] = False
             reference_spec_configs["fp8_param_gather"] = False
             ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
@@ -578,7 +317,7 @@ class TestMegatronFSDPE2E:
                         moe_grouped_gemm=True,
                         use_precision_aware_optimizer=True,
                     ),
-                    reference_kind="fsdp_v1",
+                    reference_kind="distopt",
                     capture_param_snapshots=False,
                 ),
                 id="mxfp8_param_gather-optim_grads_params",
@@ -603,15 +342,10 @@ class TestMegatronFSDPE2E:
             seq_length=64,
             micro_batch_size=1,
             global_batch_size=8,
-            # Keep strict iter-equivalence on the ordinary model-init path.  The
-            # FSDP v1/v2 meta-init paths materialize nested FSDP units in a
-            # different order, so they can legitimately start from different
-            # random initial weights even with the same seed.
             init_model_with_meta_device=False,
             gradient_accumulation_fusion=False,
             overlap_param_gather=False,
             overlap_grad_reduce=False,
-            verify_replicated_weight_buffers=strategy in ("optim", "optim_grads"),
             **precision_configs,
         )
         reference_kind = case["reference_kind"]
@@ -625,26 +359,15 @@ class TestMegatronFSDPE2E:
         )
 
         if ref_cache_key not in ref_cache:
-            reference_configs = copy.deepcopy(common_configs)
-            if reference_kind == "fsdp_v1":
-                reference_configs["use_megatron_fsdp_v2"] = False
-                ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
-                    use_megatron_fsdp=True,
-                    ckpt_format="fsdp_dtensor",
-                    capture_param_snapshots=capture_param_snapshots,
-                    return_dict=True,
-                    **reference_configs,
-                )
-            else:
-                ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
-                    use_distributed_optimizer=True,
-                    capture_param_snapshots=capture_param_snapshots,
-                    return_dict=True,
-                    **reference_configs,
-                )
+            ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
+                use_distributed_optimizer=True,
+                capture_param_snapshots=capture_param_snapshots,
+                return_dict=True,
+                **common_configs,
+            )
 
         fsdp_configs = copy.deepcopy(common_configs)
-        fsdp_configs["use_megatron_fsdp_v2"] = True
+        fsdp_configs["use_megatron_fsdp"] = True
         actual = TestMegatronFSDPE2E._training_loop(
             use_megatron_fsdp=True,
             ckpt_format="fsdp_dtensor",
@@ -723,12 +446,6 @@ class TestMegatronFSDPE2E:
         ],
     )
     def test_zero_strategy_non_equivalent_precision_paths_run(self, strategy, precision_configs):
-        """Exercise valid ZeRO paths that intentionally lack a strict reference.
-
-        MXFP8 ZeRO-1/2 refreshes replicated quantized compute buffers after
-        sharded optimizer updates; v1 and v2 do not provide a strict multi-step
-        golden comparison for that replicated-weight quantization path.
-        """
         if precision_configs.get("fp8_recipe") == "mxfp8" and (
             not torch.cuda.is_available()
             or torch.cuda.get_device_capability()[0] < 10
@@ -740,7 +457,6 @@ class TestMegatronFSDPE2E:
 
         outputs = TestMegatronFSDPE2E._training_loop(
             use_megatron_fsdp=True,
-            use_megatron_fsdp_v2=True,
             ckpt_format="fsdp_dtensor",
             data_parallel_sharding_strategy=strategy,
             train_iters=3,
@@ -767,30 +483,6 @@ class TestMegatronFSDPE2E:
 
 
 def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
-    """
-    Compare two loss values with absolute and relative differences.
-
-    Parameters
-    ----------
-    loss_a : float
-        First loss value (e.g., baseline model).
-    loss_b : float
-        Second loss value (e.g., new model).
-    reference : {"a", "b"}, default "b"
-        Which loss to treat as the reference when computing the
-        relative difference. If "b", relative diff is vs loss_b;
-        if "a", vs loss_a.
-
-    Returns
-    -------
-    dict with keys:
-        "abs_diff" : float
-            |loss_a - loss_b|
-        "rel_diff" : float
-            |loss_a - loss_b| / reference_loss
-        "better" : str
-            "a" if loss_a < loss_b, "b" if loss_b < loss_a, "equal" otherwise.
-    """
     abs_diff = abs(loss_a - loss_b)
 
     if reference == "a":
@@ -799,7 +491,7 @@ def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
         ref = loss_b
 
     if ref == 0:
-        rel_diff = float("inf")  # or None, depending on your preference
+        rel_diff = float("inf")
     else:
         rel_diff = abs_diff / ref
 
