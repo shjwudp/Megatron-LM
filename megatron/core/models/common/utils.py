@@ -266,8 +266,10 @@ class TransformerLayerNode(ScheduleNode):
         self.is_last_layer = extra_args.get("is_last_layer", False)
 
         # Whether this slot is the first/last node of its TransformerLayer in
-        # forward / backward order. Set by ``set_post_*_hook``; used to decide
-        # when to invoke the layer-level FSDP reshard hooks.
+        # forward / backward order. Used to invoke layer-level FSDP lifecycle
+        # hooks when the combined schedule bypasses TransformerLayer.__call__.
+        self.is_layer_first_forward_node = None
+        self.is_layer_first_backward_node = None
         self.is_layer_first_node = None
         self.is_layer_last_node = None
 
@@ -304,6 +306,8 @@ class TransformerLayerNode(ScheduleNode):
 
     def forward(self, *inputs):
         """Execute forward and fire the per-layer post-forward hook on the last slot."""
+        if self.is_layer_first_forward_node:
+            self._pre_forward_hook()
         output = super().forward(*inputs)
         if self.is_layer_last_node:
             self._post_forward_hook()
@@ -315,6 +319,8 @@ class TransformerLayerNode(ScheduleNode):
         When ``delay_wgrad_compute`` is set, the hook fires after ``backward_dw``
         instead, because the wgrad work has not yet run when ``backward`` returns.
         """
+        if self.is_layer_first_backward_node:
+            self._pre_backward_hook()
         grads = super().backward(*output_grad)
         if not self.delay_wgrad_compute and self.is_layer_first_node:
             self._post_backward_hook()
@@ -361,6 +367,16 @@ class TransformerLayerNode(ScheduleNode):
         """Mark this slot as the layer's last fwd node and register the hook."""
         self.is_layer_last_node = True
         self._post_forward_hook = hook
+
+    def set_pre_forward_hook(self, hook):
+        """Mark this slot as the layer's first fwd node and register the hook."""
+        self.is_layer_first_forward_node = True
+        self._pre_forward_hook = hook
+
+    def set_pre_backward_hook(self, hook):
+        """Mark this slot as the layer's first bwd node and register the hook."""
+        self.is_layer_first_backward_node = True
+        self._pre_backward_hook = hook
 
     def set_post_backward_hook(self, hook):
         """Mark this slot as the layer's first bwd node and register the hook."""

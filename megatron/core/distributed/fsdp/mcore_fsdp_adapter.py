@@ -58,6 +58,7 @@ try:
         Placements,
         fully_shard,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -541,6 +542,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if fsdp_unit_modules is None:
             fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
 
+        from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
+
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
         )
@@ -558,7 +561,17 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         dp_group = pg_collection.dp_cp
         device_type = device.type if device is not None else "cuda"
-        mesh = DeviceMesh.from_group(dp_group, device_type=device_type, mesh_dim_names=("dp",))
+        dp_mesh = DeviceMesh.from_group(
+            dp_group, device_type=device_type, mesh_dim_names=("dp",)
+        )
+        expert_dp_group = getattr(pg_collection, "expt_dp", None)
+        expert_mesh = (
+            DeviceMesh.from_group(
+                expert_dp_group, device_type=device_type, mesh_dim_names=("expert_dp",)
+            )
+            if getattr(config, "num_moe_experts", None) is not None
+            else None
+        )
         placements = Placements(
             dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
         )
@@ -567,14 +580,49 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 # The root is always sharded after selected child units so it is not
                 # wrapped twice when its type also appears in fsdp_unit_modules.
                 continue
-            if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
-                fully_shard(
-                    submodule,
-                    mesh=mesh,
-                    placements=placements,
-                    mixed_precision_policy=self.mp_policy,
-                )
-        fully_shard(module, mesh=mesh, placements=placements, mixed_precision_policy=self.mp_policy)
+            if isinstance(submodule, (TEGroupedMLP, SequentialMLP)):
+                assert expert_mesh is not None
+                mesh = expert_mesh
+            elif any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
+                mesh = dp_mesh
+            else:
+                continue
+            fully_shard(
+                submodule,
+                mesh=mesh,
+                placements=placements,
+                mixed_precision_policy=self.mp_policy,
+            )
+        fully_shard(
+            module,
+            mesh=dp_mesh,
+            placements=placements,
+            mixed_precision_policy=self.mp_policy,
+        )
+
+        # Optimizer grouping still uses the original MCore parameter annotations.
+        # Preserve them on the optimizer-facing sharded Parameters.
+        for child in module.modules():
+            if not isinstance(child, FsdpModule):
+                continue
+            for parameter_group in child.parameter_groups:
+                for parameter, sharded_parameter in zip(
+                    parameter_group.unsharded_parameters,
+                    parameter_group.sharded_parameters,
+                    strict=True,
+                ):
+                    for attribute in (
+                        "allreduce",
+                        "sequence_parallel",
+                        "shared",
+                        "tensor_model_parallel",
+                        "partition_dim",
+                        "partition_stride",
+                        "is_embedding_or_output_parameter",
+                        "is_embedding_parameter",
+                    ):
+                        if hasattr(parameter, attribute):
+                            setattr(sharded_parameter, attribute, getattr(parameter, attribute))
         super().__init__(config=config, module=module)
 
     @staticmethod
@@ -607,7 +655,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         unsupported_parallelisms = [
             "tensor_model_parallel_size",
             "context_parallel_size",
-            "expert_model_parallel_size",
         ]
         if any(getattr(config, parallelism) != 1 for parallelism in unsupported_parallelisms):
             raise ValueError(
@@ -620,7 +667,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         # The config validates the requested topology, while these checks validate the
         # materialized topology supplied by the caller's process-group collection.
-        for group_name in ("tp", "cp", "ep"):
+        for group_name in ("tp", "cp"):
             group = getattr(pg_collection, group_name, None)
             if group is not None and group.size() != 1:
                 raise ValueError(
@@ -628,10 +675,23 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     f"got {group.size()}."
                 )
 
-        if getattr(config, "num_moe_experts", None) is not None or any(
+        has_expert_parameters = any(
             not getattr(parameter, "allreduce", True) for parameter in module.parameters()
-        ):
-            raise ValueError("MFSDP v2 does not currently support expert parameters.")
+        )
+        if has_expert_parameters and getattr(config, "num_moe_experts", None) is None:
+            raise ValueError("MFSDP v2 found expert parameters without a configured MoE model.")
+        if getattr(config, "num_moe_experts", None) is not None:
+            expert_dp_group = getattr(pg_collection, "expt_dp", None)
+            if expert_dp_group is None:
+                raise ValueError("MFSDP v2 MoE requires an explicit expt_dp process group.")
+            ep_group = getattr(pg_collection, "ep", None)
+            if ep_group is None or ep_group.size() != config.expert_model_parallel_size:
+                actual_ep_size = ep_group.size() if ep_group is not None else None
+                raise ValueError(
+                    "MFSDP v2 expert process-group size must match "
+                    f"expert_model_parallel_size={config.expert_model_parallel_size}, "
+                    f"got {actual_ep_size}."
+                )
         if ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
             raise ValueError(
                 "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."
@@ -665,6 +725,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
         if ddp_config.delay_wgrad_compute:
             raise ValueError("MFSDP v2 does not support delay_wgrad_compute.")
+        if config.delay_wgrad_compute:
+            raise ValueError(
+                "MFSDP v2 combined 1F1B does not yet support delay_wgrad_compute."
+            )
         if ddp_config.suggested_communication_unit_size is not None:
             raise ValueError("MFSDP v2 does not support suggested_communication_unit_size.")
         if ddp_config.num_buckets is not None:

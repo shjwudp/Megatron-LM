@@ -87,6 +87,7 @@ class FsdpModule:
     _context: FsdpContext | None
     _ready_grad_parameters: set[nn.Parameter]
     _num_trainable_parameters: int
+    _backward_active: bool
     # Event recorded after this FsdpModule's full parameters are materialized.
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
     # already prefetched this module.
@@ -121,6 +122,7 @@ class FsdpModule:
         ]
         self._parameter_groups = tuple(parameter_groups)
         self._ready_grad_parameters = set()
+        self._backward_active = False
         self._num_trainable_parameters = sum(
             len(group.sharded_parameters) for group in self._parameter_groups if group.requires_grad
         )
@@ -231,6 +233,16 @@ class FsdpModule:
         self._lazy_init_context()
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
         self._ready_grad_parameters.clear()
+        self._prepare_forward_parameters()
+
+    def _prepare_forward_parameters(self) -> None:
+        """Materialize parameters for a forward that bypasses this module's ``__call__``.
+
+        The combined 1F1B schedule invokes the sub-operations of an FSDP unit
+        directly. Its compatibility adapter uses this helper for the root module,
+        whose normal forward pre-hook therefore does not run.
+        """
+        self._lazy_init_context()
         context = self.context
         allgather_stream = context.allgather_stream
         current_stream = context.current_stream()
@@ -267,7 +279,11 @@ class FsdpModule:
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
-        self._reshard_parameter_groups()
+        # Combined 1F1B may execute this module's next forward before the previous
+        # microbatch has finished backward. Keep the shared materialization alive
+        # until post_backward reduces that microbatch's gradients.
+        if not self._backward_active:
+            self._reshard_parameter_groups()
         torch.cuda.nvtx.range_pop()
 
     def _reshard_parameter_groups(self) -> None:
@@ -290,6 +306,9 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
+        if self._backward_active:
+            return
+        self._backward_active = True
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
@@ -317,6 +336,7 @@ class FsdpModule:
         self._reduce_gradient_groups()
         self._reshard_parameter_groups()
         self._ready_grad_parameters.clear()
+        self._backward_active = False
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:

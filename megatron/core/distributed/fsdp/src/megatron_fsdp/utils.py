@@ -20,6 +20,7 @@ import os
 from contextlib import nullcontext
 from functools import reduce
 from importlib.metadata import version
+from types import SimpleNamespace
 from typing import Callable, Optional, Sequence, Union
 
 try:
@@ -106,21 +107,88 @@ def is_submodule(module, parent_module, strict=True):
     return False
 
 
+class _ExperimentalFsdpOverlapProxy:
+    """Expose the combined-1F1B lifecycle contract for experimental FSDP."""
+
+    def __init__(self, root_module):
+        self.root_module = root_module
+        self.ddp_config = SimpleNamespace(data_parallel_sharding_strategy="optim_grads_params")
+
+    def _replace_param_with_raw_if_needed(self):
+        """Experimental FSDP installs its full parameters during unshard."""
+
+    def pre_forward(self):
+        """Materialize root-owned parameters for a schedule-driven forward."""
+        self.root_module._prepare_forward_parameters()
+
+    def pre_backward(self):
+        """Materialize root-owned parameters and initialize backward streams."""
+        self.root_module.pre_backward()
+
+    def post_backward(self):
+        """Order the schedule stream after all experimental reduce-scatters."""
+        context = self.root_module.context
+        context.current_stream().wait_stream(context.reduce_scatter_stream)
+
+    @staticmethod
+    def pre_forward_module(module):
+        """Materialize one schedule-driven layer for forward."""
+        module.pre_forward()
+
+    @staticmethod
+    def pre_backward_module(module):
+        """Materialize one schedule-driven layer for backward."""
+        module.pre_backward()
+
+    @staticmethod
+    def post_forward_release_module(module):
+        """Release a layer after its schedule-driven forward when safe."""
+        module.post_forward()
+
+    @staticmethod
+    def post_backward_release_module(module):
+        """Parameter-completion hooks reduce and release trainable layers."""
+
+
+def _find_experimental_fsdp_root(model):
+    """Walk a wrapper chain and return an experimental FSDP root, if present."""
+    try:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+    except (ImportError, ModuleNotFoundError):
+        return None
+
+    module = model
+    while module is not None:
+        if isinstance(module, FsdpModule):
+            module._lazy_init_context()
+            return module.context.root_module
+        module = getattr(module, 'module', None)
+    return None
+
+
 def find_megatron_fsdp(model):
-    """Walk the model wrapper chain to find a MegatronFSDP instance, if any."""
+    """Find a Megatron FSDP wrapper or a compatible experimental-FSDP proxy."""
     # Lazy import to avoid a circular import: megatron_fsdp.py transitively imports
     # this module during its own initialization, so a top-level import of
     # MegatronFSDP here would fail with a partially-initialized module error.
     try:
         from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
     except (ImportError, ModuleNotFoundError):
-        return None
+        MegatronFSDP = ()
     m = model
     while m is not None:
         if isinstance(m, MegatronFSDP):
             return m
         m = getattr(m, 'module', None)
-    return None
+
+    root = _find_experimental_fsdp_root(model)
+    if root is None:
+        return None
+    proxy = getattr(root, "_combined_1f1b_compat_proxy", None)
+    if proxy is None:
+        proxy = _ExperimentalFsdpOverlapProxy(root)
+        root._combined_1f1b_compat_proxy = proxy
+    return proxy
 
 
 def get_mesh_names(

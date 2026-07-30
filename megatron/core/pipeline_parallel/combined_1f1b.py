@@ -348,6 +348,10 @@ def combined_forward_backward_step(
 
     if fsdp_wrapper is not None and b_model is not None:
         fsdp_wrapper.pre_backward()
+    if f_model is not None:
+        forward_fsdp_wrapper = find_megatron_fsdp(f_model)
+        if forward_fsdp_wrapper is not None and hasattr(forward_fsdp_wrapper, "pre_forward"):
+            forward_fsdp_wrapper.pre_forward()
 
     if f_model is not None and config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
@@ -406,6 +410,11 @@ def combined_forward_backward_step(
                     forward_fsdp_wrapper.post_forward_release_module,
                     forward_fsdp_wrapper.post_backward_release_module,
                 )
+                if hasattr(forward_fsdp_wrapper, "pre_forward_module"):
+                    layer_plan.set_fsdp_unshard_hooks(
+                        forward_fsdp_wrapper.pre_forward_module,
+                        forward_fsdp_wrapper.pre_backward_module,
+                    )
 
     # backward preprocess, the same as the backward_step()
     unwrap_input_tensor_grad = False

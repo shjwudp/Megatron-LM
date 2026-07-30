@@ -219,6 +219,34 @@ class TransformerLayerSchedulePlan:
         # After the last forward op, release forward-pass params.
         last_fwd_node.set_post_forward_hook(lambda: post_forward_hook(hook_module))
 
+    def set_fsdp_unshard_hooks(self, pre_forward_hook, pre_backward_hook):
+        """Wire explicit FSDP materialization callbacks for the overlap schedule."""
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        assert isinstance(self.layer, (TransformerLayer, HybridStack, MultiTokenPredictionLayer)), (
+            f"Megatron FSDP with EP Overlap only supports TransformerLayer, "
+            f"HybridStack and MultiTokenPredictionLayer, "
+            f"but got {type(self.layer).__name__}."
+        )
+        if isinstance(self.layer, (TransformerLayer, HybridStack)):
+            hook_module = self.layer
+        else:
+            hook_module = self.layer.mtp_model_layer
+
+        self.pre_dispatch_computation.set_pre_forward_hook(
+            lambda: pre_forward_hook(hook_module)
+        )
+
+        if not isinstance(self.mtp_post_process, NoopScheduleNode):
+            first_bwd_node = self.mtp_post_process
+        elif not isinstance(self.moe_combine, NoopScheduleNode):
+            first_bwd_node = self.moe_combine
+        else:
+            first_bwd_node = self.mlp
+        first_bwd_node.set_pre_backward_hook(lambda: pre_backward_hook(hook_module))
+
     def get_fp8_context(self):
         """
         Get the fp8 context for the transformer layer.
