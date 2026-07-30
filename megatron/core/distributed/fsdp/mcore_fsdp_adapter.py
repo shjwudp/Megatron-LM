@@ -517,7 +517,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             device: Device whose type is used to construct the data-parallel mesh.
                 Defaults to CUDA.
             pg_collection: Explicit process groups. The ``dp_cp`` group defines the
-                data-parallel mesh.
+                data-parallel mesh local to this pipeline stage.
 
         Raises:
             ImportError: If the Megatron FSDP implementation is unavailable.
@@ -606,7 +606,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         unsupported_parallelisms = [
             "tensor_model_parallel_size",
-            "pipeline_model_parallel_size",
             "context_parallel_size",
             "expert_model_parallel_size",
         ]
@@ -621,7 +620,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         # The config validates the requested topology, while these checks validate the
         # materialized topology supplied by the caller's process-group collection.
-        for group_name in ("tp", "pp", "cp", "ep"):
+        for group_name in ("tp", "cp", "ep"):
             group = getattr(pg_collection, group_name, None)
             if group is not None and group.size() != 1:
                 raise ValueError(
