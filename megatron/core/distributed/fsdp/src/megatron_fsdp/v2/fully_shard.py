@@ -49,6 +49,7 @@ def fully_shard(
     outer_dp_sharding_strategy: str = "no_shard",
     enable_cuda_graph: bool = False,
     enable_full_iteration_cuda_graph: bool = False,
+    cuda_graph_activation_recompute: bool = False,
     fine_grained_hooks: bool = False,
     skip_backward_callback: bool = False,  # Skip autograd RegisterFSDPBackwardFunction.
     skip_final_backward_callback: bool = False,
@@ -66,6 +67,11 @@ def fully_shard(
     Args:
         enable_full_iteration_cuda_graph: If ``True``, keep graph-visible FSDP
             optimizer gradient objects stable across full-iteration graph replay.
+        enable_cuda_graph: Capture supported FSDP modules as CUDA graphs.
+        cuda_graph_activation_recompute: Capture the original forward, recompute
+            forward, and backward as separate graphs. Requires the module to run
+            inside a non-reentrant activation checkpoint and
+            ``enable_cuda_graph=True``.
         fine_grained_hooks: If ``True``, register pre-forward/backward hooks
             on every sub-module (for EP-overlap / 1F1B schedules).
         skip_backward_callback: If ``True``, skip the autograd post-backward
@@ -94,6 +100,20 @@ def fully_shard(
             "The input module has already been fully sharded. "
             "Please do not call fully_shard on the same module more than once."
         )
+    if cuda_graph_activation_recompute and not enable_cuda_graph:
+        raise ValueError("cuda_graph_activation_recompute=True requires enable_cuda_graph=True")
+    if cuda_graph_activation_recompute:
+        if sharding_strategy != "optim_grads_params" or outer_dp_sharding_strategy != "no_shard":
+            raise ValueError(
+                "Activation-recompute CUDA graphs currently require full M-FSDP sharding "
+                "(sharding_strategy='optim_grads_params', "
+                "outer_dp_sharding_strategy='no_shard')"
+            )
+        if fine_grained_hooks or skip_backward_callback or skip_final_backward_callback:
+            raise ValueError(
+                "Activation-recompute CUDA graphs do not support fine-grained hooks, "
+                "delayed backward callbacks, or pipeline schedules"
+            )
     mesh = _prepare_fsdp_mesh(mesh or _init_default_fully_shard_mesh())
 
     if mp_policy is None:
@@ -130,6 +150,7 @@ def fully_shard(
         bucket_allocator=bucket_allocator,
         enable_cuda_graph=enable_cuda_graph,
         enable_full_iteration_cuda_graph=enable_full_iteration_cuda_graph,
+        cuda_graph_activation_recompute=cuda_graph_activation_recompute,
     )
     module._init_param_main_grad_func()
 
