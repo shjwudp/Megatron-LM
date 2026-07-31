@@ -95,6 +95,7 @@ class FsdpModule:
     _context: FsdpContext | None
     _num_ready_grad_parameters: int
     _num_trainable_parameters: int
+    _post_backward_issued: bool
     # Event recorded after this FsdpModule's full parameters are materialized.
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
     # already prefetched this module.
@@ -156,6 +157,7 @@ class FsdpModule:
         self._num_trainable_parameters = sum(
             len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
         )
+        self._post_backward_issued = False
         self._register_hooks(
             fine_grained=fine_grained, skip_backward_callback=skip_backward_callback
         )
@@ -175,8 +177,10 @@ class FsdpModule:
 
         Matching the v1 contract: takes an optional hook_module argument
         (ignored — this FsdpModule manages its own parameters)."""
-        self.reshard_parameters()
-        self.reduce_grad()
+        modules = cast(nn.Module, self).modules()
+        for module in reversed(list(modules)):
+            if isinstance(module, FsdpModule):
+                module._issue_post_backward()
 
     def _lazy_init_context(self) -> None:
         """Initialize one shared runtime context for this FSDP root subtree.
@@ -398,6 +402,8 @@ class FsdpModule:
         current_stream = context.current_stream()
         if self.is_root():
             context.backward_phase = True
+            for module in context.forward_order:
+                module._post_backward_issued = False
             if register_final_callback:
                 context.register_post_backward_final_callback()
             # Fork the reduce-scatter stream from the current stream once, at the
@@ -423,12 +429,23 @@ class FsdpModule:
         Args:
             finalize_context: Whether to finalize the root context synchronously.
         """
-        self._reduce_gradient_groups()
-        self._reshard_parameter_groups()
         if finalize_context:
             assert self.is_root()
+            for module in reversed(list(self.context.forward_order)):
+                module._issue_post_backward()
             self.context.finalize_backward()
+        else:
+            self._issue_post_backward()
         torch.cuda.nvtx.range_pop()
+
+    def _issue_post_backward(self) -> None:
+        """Reshard and reduce this module's gradients at most once per backward."""
+        if self._post_backward_issued:
+            return
+        self.reshard_parameters()
+        self.reduce_grad()
+        self._num_ready_grad_parameters = 0
+        self._post_backward_issued = True
 
     def _reduce_gradient_groups(self) -> None:
         """Pack gradients and immediately launch their reduce-scatters."""
