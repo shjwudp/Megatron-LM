@@ -109,6 +109,21 @@ def test_two_child_subtrees_then_parent_collapse_to_one_context(distributed_setu
     assert model.layers[1].context is model.context
 
 
+def test_fine_grained_hooks_preserve_registered_module_hierarchy(distributed_setup):
+    """Fine-grained parent references must not become registered child modules."""
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+    module_names = tuple(name for name, _ in model.named_modules())
+    layer_keys = tuple(model.layers._modules)
+
+    fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    assert tuple(name for name, _ in model.named_modules()) == module_names
+    assert tuple(model.layers._modules) == layer_keys
+
+
 def test_sibling_roots_without_parent_keep_separate_contexts(distributed_setup):
     """Independent FSDP roots should not share runtime scheduling state."""
     device = distributed_setup.device

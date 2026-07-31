@@ -14,6 +14,7 @@
 
 """Module mixin for the minimal Megatron-FSDP path."""
 
+import weakref
 from collections.abc import Callable
 from contextlib import nullcontext
 from functools import partial
@@ -76,12 +77,12 @@ class FsdpContext:
         run at all when the root owns no trainable parameters. Waiting at
         autograd completion orders consumers after every descendant reduction.
         """
+        torch.autograd.Variable._execution_engine.queue_callback(self.finalize_backward)
 
-        def post_backward_final_callback() -> None:
-            self.current_stream().wait_stream(self.reduce_scatter_stream)
-            self.backward_phase = False
-
-        torch.autograd.Variable._execution_engine.queue_callback(post_backward_final_callback)
+    def finalize_backward(self) -> None:
+        """Order the current stream after reductions and leave the backward phase."""
+        self.current_stream().wait_stream(self.reduce_scatter_stream)
+        self.backward_phase = False
 
 
 class FsdpModule:
@@ -385,14 +386,20 @@ class FsdpModule:
                 group.release_unsharded_storage()
             self._unshard_event = None
 
-    def pre_backward(self) -> None:
-        """Prepare full parameters and prefetch the next FsdpModule in backward order."""
+    def pre_backward(self, register_final_callback: bool = True) -> None:
+        """Prepare full parameters and prefetch the next FsdpModule in backward order.
+
+        Args:
+            register_final_callback: Whether to finalize through the autograd engine.
+                Manual backward schedules finalize explicitly in ``post_backward()``.
+        """
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
             context.backward_phase = True
-            context.register_post_backward_final_callback()
+            if register_final_callback:
+                context.register_post_backward_final_callback()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
             # part of any active CUDA-graph capture. A stream only joins the
@@ -410,10 +417,17 @@ class FsdpModule:
         if next_module is not None:
             next_module._unshard_parameter_groups()
 
-    def post_backward(self) -> None:
-        """Reduce gradients and return parameters to their sharded resting state."""
+    def post_backward(self, finalize_context: bool = False) -> None:
+        """Reduce gradients and return parameters to their sharded resting state.
+
+        Args:
+            finalize_context: Whether to finalize the root context synchronously.
+        """
         self._reduce_gradient_groups()
         self._reshard_parameter_groups()
+        if finalize_context:
+            assert self.is_root()
+            self.context.finalize_backward()
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
@@ -542,14 +556,15 @@ def _materialize_meta_params(
 # Fine-grained hook registration for 1F1B EP overlap support
 # ---------------------------------------------------------------------------
 
-_FSDP_PARENT_MODULE_ATTR = "_fsdp_parent_module"
+_FSDP_PARENT_MODULE_REF_ATTR = "_fsdp_parent_module_ref"
 
 
 def _find_fsdp_target(submodule: nn.Module) -> FsdpModule | None:
     """Return the nearest parent FsdpModule for *submodule*, if any."""
     if isinstance(submodule, FsdpModule):
         return submodule
-    return getattr(submodule, _FSDP_PARENT_MODULE_ATTR, None)
+    parent_ref = getattr(submodule, _FSDP_PARENT_MODULE_REF_ATTR, None)
+    return parent_ref() if parent_ref is not None else None
 
 
 def _register_fine_grained_forward_hooks(fsdp_module: FsdpModule) -> None:
@@ -565,7 +580,9 @@ def _register_fine_grained_forward_hooks(fsdp_module: FsdpModule) -> None:
         target = _find_fsdp_target(submodule)
         if target is not None and target is not fsdp_module:
             continue
-        submodule._fsdp_parent_module = fsdp_module
+        object.__setattr__(
+            submodule, _FSDP_PARENT_MODULE_REF_ATTR, weakref.ref(fsdp_module)
+        )
         submodule.register_forward_pre_hook(
             _fine_grained_pre_forward_hook, prepend=True, with_kwargs=True
         )
