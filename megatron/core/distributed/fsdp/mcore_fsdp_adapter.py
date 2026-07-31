@@ -617,9 +617,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     "MFSDP v2 combined 1F1B callbacks require an experimental FsdpModule, "
                     f"got {type(module).__name__}."
                 )
-            module.reshard_parameters()
             if reduce_grad:
-                module.reduce_grad()
+                module.post_backward_release_module()
+            else:
+                module.reshard_parameters()
 
         self._replace_param_with_raw_if_needed = self.module._replace_param_with_raw_if_needed
         self.post_forward_release_module = partial(release_module, reduce_grad=False)

@@ -160,3 +160,32 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
     context = model.context
     assert list(context.forward_order) == [model, model.left, model.left.inner, model.right]
     assert list(context.backward_order) == [model, model.right, model.left, model.left.inner]
+
+
+def test_post_backward_release_processes_nested_fsdp_modules_once(distributed_setup, monkeypatch):
+    """Manual 1F1B release should include nested units without reducing twice."""
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedModel().to(device)
+
+    fully_shard(model.inner, mesh=mesh, placements=_flat_placements(), skip_backward_callback=True)
+    fully_shard(model, mesh=mesh, placements=_flat_placements(), skip_backward_callback=True)
+    model._lazy_init_context()
+
+    calls = []
+    for name, module in (("root", model), ("inner", model.inner)):
+        monkeypatch.setattr(
+            module, "reshard_parameters", lambda name=name: calls.append((name, "reshard"))
+        )
+        monkeypatch.setattr(module, "reduce_grad", lambda name=name: calls.append((name, "reduce")))
+
+    model.post_backward_release_module()
+    model.post_backward_release_module()
+
+    assert calls == [
+        ("inner", "reshard"),
+        ("inner", "reduce"),
+        ("root", "reshard"),
+        ("root", "reduce"),
+    ]
