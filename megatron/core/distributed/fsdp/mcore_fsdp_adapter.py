@@ -15,6 +15,7 @@
 import logging
 import random
 from contextlib import contextmanager
+from functools import partial
 from typing import Dict, List, Optional, Tuple, Type
 
 __all__ = ["FullyShardedDataParallel"]
@@ -60,6 +61,7 @@ try:
         Placements,
         fully_shard,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -603,6 +605,27 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             skip_backward_callback=skip_backward_cb,
         )
         super().__init__(config=config, module=module)
+        if fine_grained:
+            self._setup_1f1b_overlap_interface()
+
+    def _setup_1f1b_overlap_interface(self) -> None:
+        """Expose the parameter lifecycle callbacks used by combined 1F1B."""
+
+        def release_module(module: torch.nn.Module, *, reduce_grad: bool) -> None:
+            if not isinstance(module, FsdpModule):
+                raise TypeError(
+                    "MFSDP v2 combined 1F1B callbacks require an experimental FsdpModule, "
+                    f"got {type(module).__name__}."
+                )
+            module.reshard_parameters()
+            if reduce_grad:
+                module.reduce_grad()
+
+        self._replace_param_with_raw_if_needed = self.module._replace_param_with_raw_if_needed
+        self.post_forward_release_module = partial(release_module, reduce_grad=False)
+        self.post_backward_release_module = partial(release_module, reduce_grad=True)
+        self.pre_backward = partial(self.module.pre_backward, register_final_callback=False)
+        self.post_backward = partial(self.module.post_backward, finalize_context=True)
 
     @staticmethod
     def _validate_config(
@@ -704,8 +727,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         than finalizing on every backward.  Called by the training loop via
         ``config.no_sync_func`` and the 1F1B overlap schedule.
         """
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-
         roots = [
             m
             for m in self.module.modules()
