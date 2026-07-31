@@ -63,7 +63,9 @@ class FsdpParameterGroup:
 
         Args:
             owning_module: Closest FSDP root module that owns this parameter group.
-            parameters: Root-module-relative FQNs and their parameters.
+            parameters: Root-module-relative FQNs and their parameters.  Must be
+                on a real (non-meta) device — the caller is responsible for
+                materializing meta parameters before constructing this group.
             mesh: Device mesh used for all DBuffer storage in this version.
             placements: Parameter, gradient, and optimizer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
@@ -77,8 +79,6 @@ class FsdpParameterGroup:
         main_grad_placements = tuple(placements.gradient)
         main_weight_placements = tuple(placements.optimizer)
 
-        # Python dicts preserve insertion order, so parameter_names and
-        # parameters.values() define the same stable DBuffer tensor order.
         self.owning_module = owning_module
         self.mesh = mesh
         self.parameter_names = tuple(parameters)
@@ -101,12 +101,11 @@ class FsdpParameterGroup:
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
             (parameter.to(dtype=main_weight_dtype) for parameter in parameters.values()),
-            mesh=self.mesh,
+            mesh=mesh,
             placements=main_weight_placements,
         )
 
         if use_symm_mem:
-            # PyTorch caches this in C++ and returns early when the backend is already NCCL.
             symm_mem.set_backend("NCCL")
             self._symm_mem_pool = symm_mem.get_mem_pool(self.main_weight.device)
         else:
@@ -114,8 +113,8 @@ class FsdpParameterGroup:
 
         with self._symmetric_memory_context():
             self._unsharded_model_weight = DBuffer(
-                mesh=self.mesh,
-                placements=[Replicate()] * self.mesh.ndim,
+                mesh=mesh,
+                placements=[Replicate()] * mesh.ndim,
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
                 device=self.main_weight.device,
@@ -124,7 +123,7 @@ class FsdpParameterGroup:
             self.model_weight = self.main_weight
         else:
             self.model_weight = DBuffer(
-                mesh=self.mesh,
+                mesh=mesh,
                 placements=model_weight_placements,
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
@@ -134,13 +133,8 @@ class FsdpParameterGroup:
         self.main_grad = None
         if self.requires_grad:
             grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
-            # Keep main_grad persistent for the initial implementation. For micro-batch
-            # size 1, this allocation could be delayed until post_backward and then
-            # eagerly deallocated right after optimizer.step(), avoiding main_grad
-            # storage during forward. That requires a separate lifetime contract with
-            # the optimizer, so this version keeps the simpler persistent buffer.
             self.main_grad = DBuffer(
-                mesh=self.mesh,
+                mesh=mesh,
                 placements=main_grad_placements,
                 tensor_shapes=self.main_weight.layout.tensor_shapes,
                 dtype=grad_dtype,
@@ -150,8 +144,6 @@ class FsdpParameterGroup:
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
             )
-            # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
-            # is finalized to main_weight's placements after the last microbatch.
             self._accumulation_placements = main_grad_placements
         sharded_parameters: list[nn.Parameter] = []
         unsharded_parameters: list[nn.Parameter] = []
@@ -165,6 +157,7 @@ class FsdpParameterGroup:
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
+            sharded_parameter.__fsdp_param__ = True
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
             setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
@@ -172,8 +165,6 @@ class FsdpParameterGroup:
         self.sharded_parameters = tuple(sharded_parameters)
         self.unsharded_parameters = tuple(unsharded_parameters)
 
-        # Compute weights must be initialized before the first forward; subsequent
-        # refreshes happen from the FSDP optimizer's post-step hook.
         self.sync_model_weight_from_main_weight()
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
@@ -203,9 +194,6 @@ class FsdpParameterGroup:
             self.main_weight.cast(self.model_weight.dtype, out=self.model_weight)
             return
 
-        # main_weight is typically the higher-precision optimizer dtype, while
-        # model_weight is the lower-precision compute dtype. Cast before redistributing
-        # so cross-rank communication moves the smaller compute-dtype payload.
         self.main_weight.cast(self.model_weight.dtype).redistribute(
             self.model_weight.placements, out=self.model_weight
         )
@@ -214,11 +202,6 @@ class FsdpParameterGroup:
         """Install full parameters for local compute."""
         with self._symmetric_memory_context():
             self._unsharded_model_weight.reallocate_storage()
-        # This buffer backs unsharded Parameters whose views may be saved by autograd.
-        # Autograd records a tensor's version counter when saving it for backward, and
-        # in-place writes like the out= redistribution below increment that counter even
-        # under no_grad. Without preserving it, backward can fail with "modified by an
-        # inplace operation" even though FSDP only materialized internal storage.
         gather_axis = changed_mesh_axis(
             self.model_weight.placements, self._unsharded_model_weight.placements
         )
@@ -240,28 +223,18 @@ class FsdpParameterGroup:
 
     def release_unsharded_storage(self) -> None:
         """Release this group's full-parameter storage."""
-        # This method is shared by the post-forward and post-backward release
-        # paths. Post-forward must release storage because autograd may have
-        # saved forward views into the unsharded parameters. Post-backward could
-        # replace unsharded parameter .data with size-0 empty tensors, instead
-        # of releasing storage, because autograd has consumed those saved views.
-        # That alternative is not much cleaner, and splitting post-forward and
-        # post-backward reshard behavior would make the caller code less clean,
-        # so keep the shared storage-release path.
         self._unsharded_model_weight.release_storage()
 
     def _install_sharded_grads(self) -> None:
         """Point each sharded parameter's grad at main_grad's current DTensor view."""
-        assert self.main_grad is not None
         for index, sharded_parameter in enumerate(self.sharded_parameters):
+            assert self.main_grad.get_dtensor(index) is not None
             sharded_parameter.grad = self.main_grad.get_dtensor(index)
 
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
 
-        # NCCL symmetric-memory reduce-scatter only selects the symmetric kernel for SUM today.
-        # Preserve AVG semantics by reducing SUM and scaling the output below.
         partial_op = dist.ReduceOp.AVG if self._symm_mem_pool is None else dist.ReduceOp.SUM
         grads: list[torch.Tensor] = []
         for name, parameter in zip(self.parameter_names, self.unsharded_parameters, strict=True):
@@ -279,7 +252,6 @@ class FsdpParameterGroup:
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
-        # A future fused-wgrad path can write directly into these buffer views.
         for index, parameter in enumerate(self.unsharded_parameters):
             partial_grad.get_local_tensor(index).copy_(parameter.grad)
             parameter.grad = None
@@ -310,15 +282,8 @@ class FsdpParameterGroup:
                 raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
             return has_any_grad
 
-        # zero_grad(set_to_none=True) clears sharded parameter grads, so this
-        # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
-        # leaves sharded grads installed, so this backward accumulates into main_grad.
         has_sharded_grads = has_grad(self.sharded_parameters)
 
-        # A non-accumulation main_grad means the previous step finalized it; this
-        # only happens on the first microbatch. Redistribute it back to the
-        # DP-outer-Partial accumulation placement -- a metadata relabel for HSDP,
-        # and a fresh reduce-scattered buffer for HFSDP in the future.
         if self.main_grad.placements != self._accumulation_placements:
             self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
             if has_sharded_grads:
@@ -350,8 +315,6 @@ class FsdpParameterGroup:
             self._install_sharded_grads()
 
         if is_last_microbatch:
-            # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
-            # reduce-scatter for HFSDP) and install the sharded parameter gradients.
             self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
             self._install_sharded_grads()
 

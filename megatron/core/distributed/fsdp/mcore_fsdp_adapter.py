@@ -14,6 +14,7 @@
 
 import logging
 import random
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple, Type
 
 __all__ = ["FullyShardedDataParallel"]
@@ -43,10 +44,10 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
-from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import (
@@ -560,8 +561,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         dp_group = pg_collection.dp_cp
         device_type = device.type if device is not None else "cuda"
-        mesh = DeviceMesh.from_group(dp_group, device_type=device_type, mesh_dim_names=("dp",))
-        moe_mesh = DeviceMesh.from_group(
+        self.mesh = DeviceMesh.from_group(dp_group, device_type=device_type, mesh_dim_names=("dp",))
+        self.moe_mesh = DeviceMesh.from_group(
             pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("edp",)
         )
         placements = Placements(
@@ -570,26 +571,37 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         moe_placements = Placements(
             dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
         )
+        fine_grained = config.overlap_moe_expert_parallel_comm
+        skip_backward_cb = ddp_config.delay_wgrad_compute
         for submodule in reversed(list(module.modules())):
             if submodule is module:
-                # The root is always sharded after selected child units so it is not
-                # wrapped twice when its type also appears in fsdp_unit_modules.
                 continue
             if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
                 fully_shard(
                     submodule,
-                    mesh=mesh,
+                    mesh=self.mesh,
                     placements=placements,
                     mixed_precision_policy=self.mp_policy,
+                    fine_grained=fine_grained,
+                    skip_backward_callback=skip_backward_cb,
                 )
             elif any(isinstance(submodule, module_type) for module_type in moe_fsdp_unit_modules):
                 fully_shard(
                     submodule,
-                    mesh=moe_mesh,
+                    mesh=self.moe_mesh,
                     placements=moe_placements,
                     mixed_precision_policy=self.mp_policy,
+                    fine_grained=fine_grained,
+                    skip_backward_callback=skip_backward_cb,
                 )
-        fully_shard(module, mesh=mesh, placements=placements, mixed_precision_policy=self.mp_policy)
+        fully_shard(
+            module,
+            mesh=self.mesh,
+            placements=placements,
+            mixed_precision_policy=self.mp_policy,
+            fine_grained=fine_grained,
+            skip_backward_callback=skip_backward_cb,
+        )
         super().__init__(config=config, module=module)
 
     @staticmethod
@@ -674,20 +686,41 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not support disable_symmetric_registration.")
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
-        if ddp_config.delay_wgrad_compute:
-            raise ValueError("MFSDP v2 does not support delay_wgrad_compute.")
         if ddp_config.suggested_communication_unit_size is not None:
             raise ValueError("MFSDP v2 does not support suggested_communication_unit_size.")
         if ddp_config.num_buckets is not None:
             raise ValueError("MFSDP v2 does not support num_buckets.")
         if ddp_config.megatron_fsdp_use_decoupled_grad:
             raise ValueError("MFSDP v2 does not support megatron_fsdp_use_decoupled_grad.")
-        if ddp_config.megatron_fsdp_enable_fine_grained_param_gather:
-            raise ValueError(
-                "MFSDP v2 does not support megatron_fsdp_enable_fine_grained_param_gather."
-            )
         if ddp_config.megatron_fsdp_max_pool_double_buffer:
             raise ValueError("MFSDP v2 does not support megatron_fsdp_max_pool_double_buffer.")
+
+    @contextmanager
+    def no_sync(self):
+        """Suppress gradient finalization for non-final microbatches.
+
+        Toggles ``is_last_microbatch`` on all root ``FsdpContext`` instances
+        so gradient reduce-scatters accumulate between microbatches rather
+        than finalizing on every backward.  Called by the training loop via
+        ``config.no_sync_func`` and the 1F1B overlap schedule.
+        """
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+
+        roots = [
+            m
+            for m in self.module.modules()
+            if isinstance(m, FsdpModule) and m._context is not None and m.is_root()
+        ]
+        if not roots:
+            yield
+            return
+        for root in roots:
+            root.context.is_last_microbatch = False
+        try:
+            yield
+        finally:
+            for root in roots:
+                root.context.is_last_microbatch = True
 
     def start_param_sync(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 gathers parameters from its forward pre-hook."""

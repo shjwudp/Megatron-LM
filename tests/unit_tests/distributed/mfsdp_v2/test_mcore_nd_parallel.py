@@ -175,7 +175,6 @@ class TestMegatronFSDPE2E:
                     recompute_granularity="full",
                     recompute_method="uniform",
                     recompute_num_layers=1,
-                    gradient_accumulation_fusion=True,
                 ),
                 id="optim_grads_params_recompute",
             ),
