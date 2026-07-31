@@ -189,22 +189,19 @@ def test_module_compile_is_converted_to_compiled_forward_for_capture():
     assert module.forward == original_forward
 
 
-def test_module_compile_is_normalized_when_first_forward_is_recorded():
+def test_module_compile_normalization_is_deferred_until_capture():
     module = torch.nn.Linear(2, 2)
-    module._compiled_call_impl = object()
-
-    def compiled_forward(input):
-        return input
+    original_forward = module.forward
+    compiled_call_impl = object()
+    module._compiled_call_impl = compiled_call_impl
 
     runner = CudaGraphRunner(graph_pool=None)
     sample = torch.ones(1, 2)
+    runner.record_module(module, (sample,), {})
 
-    with patch.object(torch, "compile", return_value=compiled_forward):
-        runner.record_module(module, (sample,), {})
-
-    assert module._compiled_call_impl is None
-    assert module.forward is compiled_forward
-    assert len(runner._compiled_module_state) == 1
+    assert module._compiled_call_impl is compiled_call_impl
+    assert module.forward == original_forward
+    assert runner._compiled_module_state == []
 
 
 def test_parameter_surface_refresh_uses_current_registered_parameters():
@@ -307,6 +304,7 @@ def test_capture_backward_pre_hook_prefetches_only_te_fused_wgrad():
     regular_fetch_calls = []
     fused_group = SimpleNamespace(
         params=(fused_param,),
+        sharding_strategy="optim_grads_params",
         main_grad_buffer=SimpleNamespace(
             fetch_buffer=lambda _placements: fused_fetch_calls.append(True)
         ),
@@ -314,6 +312,7 @@ def test_capture_backward_pre_hook_prefetches_only_te_fused_wgrad():
     )
     regular_group = SimpleNamespace(
         params=(regular_param,),
+        sharding_strategy="optim_grads_params",
         main_grad_buffer=SimpleNamespace(
             fetch_buffer=lambda _placements: regular_fetch_calls.append(True)
         ),
@@ -350,7 +349,9 @@ def test_trace_prefetches_static_main_grad_before_backward():
         _init_dist_grads=lambda: init_calls.append(True),
     )
     module = SimpleNamespace(
-        _fsdp_root_context=SimpleNamespace(cuda_graph_active=False, enable_unshard_prefetch=False),
+        _fsdp_root_context=SimpleNamespace(
+            cuda_graph_active=False, enable_unshard_prefetch=False, cuda_graph_runner=None
+        ),
         _fsdp_state=SimpleNamespace(
             _is_root=False, enable_cuda_graph=True, enable_full_iteration_cuda_graph=False
         ),
@@ -533,7 +534,7 @@ def test_cuda_graph_replay_restores_leaf_grad_and_reuses_main_grad(dtype):
     sample = torch.ones(2, 4, device="cuda", dtype=dtype)
 
     graphed = make_graphed_callables(
-        module, (), sample_kwargs={"input": sample}, num_warmup_iters=1
+        module, (), sample_kwargs={"input": sample}, num_warmup_iters=1, use_main_grad=True
     )
 
     assert module.weight.grad is None
