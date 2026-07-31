@@ -31,7 +31,13 @@ class _LinearBlock(nn.Module):
         self.linear = nn.Linear(4, 4)
 
     def forward(self, value):
-        """Apply the linear layer."""
+        """Apply the linear layer.
+
+        :param value: Input tensor.
+        :type value: torch.Tensor
+        :return: Linear-layer output.
+        :rtype: torch.Tensor
+        """
         return self.linear(value)
 
 
@@ -44,12 +50,22 @@ class _CheckpointedModel(nn.Module):
         self.graphed = _LinearBlock()
 
     def forward(self, value):
-        """Run the non-reentrant checkpoint."""
+        """Run the non-reentrant checkpoint.
+
+        :param value: Input tensor.
+        :type value: torch.Tensor
+        :return: Checkpointed block output.
+        :rtype: torch.Tensor
+        """
         return checkpoint(self.graphed, value, use_reentrant=False)
 
 
 def test_mfsdp_activation_recompute_updates_optimizer_parameters(request):
-    """Capture three graphs and update parameters held by a prebuilt optimizer."""
+    """Capture three graphs and update parameters held by a prebuilt optimizer.
+
+    :param request: Pytest request used to register graph-pool cleanup.
+    :type request: pytest.FixtureRequest
+    """
     if torch.distributed.get_world_size() != 2:
         pytest.skip("This integration test requires two ranks")
     device = torch.device(f"cuda:{torch.distributed.get_rank() % torch.cuda.device_count()}")

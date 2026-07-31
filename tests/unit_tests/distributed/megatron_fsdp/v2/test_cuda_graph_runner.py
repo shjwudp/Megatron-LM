@@ -190,6 +190,7 @@ def test_module_compile_is_converted_to_compiled_forward_for_capture():
 
 
 def test_module_compile_normalization_is_deferred_until_capture():
+    """Defer compile-wrapper normalization until CUDA Graph capture begins."""
     module = torch.nn.Linear(2, 2)
     original_forward = module.forward
     compiled_call_impl = object()

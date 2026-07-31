@@ -293,13 +293,32 @@ class FSDPModule:
 
         @torch.compiler.disable
         def dispatch(*args, **kwargs):
+            """Call the current CUDA-graph-owned forward implementation.
+
+            :param args: Positional forward arguments.
+            :type args: Any
+            :param kwargs: Keyword forward arguments.
+            :type kwargs: Any
+            :return: Forward outputs.
+            :rtype: Any
+            """
             return self.__dict__["_mfsdp_cuda_graph_forward_impl"](*args, **kwargs)
 
         self._mfsdp_cuda_graph_forward_dispatch = dispatch
         self.forward = dispatch
 
     def compile(self, *args, **kwargs) -> None:
-        """Compile the forward body while preserving CUDA Graph dispatch."""
+        """Compile the forward body while preserving CUDA Graph dispatch.
+
+        .. code-block:: python
+
+           module.compile(dynamic=False)
+
+        :param args: Positional arguments forwarded to :func:`torch.compile`.
+        :type args: Any
+        :param kwargs: Keyword arguments forwarded to :func:`torch.compile`.
+        :type kwargs: Any
+        """
         if "_mfsdp_cuda_graph_forward_impl" not in self.__dict__:
             return super().compile(*args, **kwargs)
         self._mfsdp_cuda_graph_forward_impl = torch.compile(
@@ -528,10 +547,22 @@ class FSDPModule:
         """
 
         def make_main_grad_getter(param_group):
-            """Build a lazy main-gradient accessor for one parameter group."""
+            """Build a lazy main-gradient accessor for one parameter group.
+
+            :param param_group: Parameter group that owns the gradient buffer.
+            :type param_group: ParameterGroup
+            :return: Lazy main-gradient accessor.
+            :rtype: Callable[[torch.nn.Parameter], torch.Tensor]
+            """
 
             def main_grad_getter(p):
-                """Return the caller parameter's main-gradient view."""
+                """Return the caller parameter's main-gradient view.
+
+                :param p: Parameter whose main-gradient view is requested.
+                :type p: torch.nn.Parameter
+                :return: Main-gradient view for the parameter.
+                :rtype: torch.Tensor
+                """
                 gbuf = p._gbuf
                 if gbuf.data is None:
                     param_group._init_dist_grads()
@@ -641,6 +672,19 @@ class FSDPModule:
         Re-initializing while child FSDPModules are actively unsharded
         (mid-forward or mid-backward) will corrupt their state.  The safety
         check below enforces that constraint.
+
+        :param enable_unshard_prefetch: Whether to prefetch the next parameter unshard.
+        :type enable_unshard_prefetch: bool
+        :param enable_async_reduce_grad: Whether to reduce gradients asynchronously.
+        :type enable_async_reduce_grad: bool
+        :param bucket_allocator: Allocator for persistent FSDP buffers.
+        :type bucket_allocator: BucketAllocator
+        :param enable_cuda_graph: Whether to enable partial CUDA Graph capture.
+        :type enable_cuda_graph: bool, optional
+        :param enable_full_iteration_cuda_graph: Whether full-iteration capture is enabled.
+        :type enable_full_iteration_cuda_graph: bool, optional
+        :param cuda_graph_activation_recompute: Whether to capture separate F, RF, and B graphs.
+        :type cuda_graph_activation_recompute: bool, optional
         """
         named_forward_modules = [
             (name, child) for name, child in self.named_modules() if isinstance(child, FSDPModule)

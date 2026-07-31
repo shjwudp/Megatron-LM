@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 def _is_activation_recompute(module: FSDPModule) -> bool:
-    """Return whether ``module`` is running checkpoint recompute."""
+    """Return whether ``module`` is running activation recompute."""
     ctx = module._fsdp_root_context
     if not module.training or not torch.is_grad_enabled() or not ctx.backward_phase:
         return False
@@ -46,13 +46,21 @@ def _is_activation_recompute(module: FSDPModule) -> bool:
 
 
 def _cuda_graph_replay_phase(module: FSDPModule) -> str:
-    """Return the graph program selected by the M-FSDP execution phase."""
+    """Return the graph program selected by the M-FSDP execution phase.
+
+    :param module: M-FSDP module entering its forward pre-hook.
+    :type module: FSDPModule
+    :raises RuntimeError: If a grad-enabled non-recompute forward runs during backward.
+    :return: ``forward``, ``recompute``, or ``inference``.
+    :rtype: str
+    """
     ctx = module._fsdp_root_context
     if not module.training or not torch.is_grad_enabled():
         return "inference"
     if _is_activation_recompute(module):
         return "recompute"
     if ctx.backward_phase and ctx.cuda_graph_activation_recompute:
+        # Treating an unrelated backward-time forward as RF would corrupt replay state.
         raise RuntimeError(
             "A grad-enabled M-FSDP forward ran during backward outside checkpoint "
             "recomputation. If the previous backward was aborted (OOM, exception), "

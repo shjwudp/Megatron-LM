@@ -100,6 +100,12 @@ def fully_shard(
             "The input module has already been fully sharded. "
             "Please do not call fully_shard on the same module more than once."
         )
+    # Reject truthy non-bools before they silently enable recompute capture.
+    if not isinstance(cuda_graph_activation_recompute, bool):
+        raise TypeError(
+            "cuda_graph_activation_recompute must be a bool, "
+            f"but got {type(cuda_graph_activation_recompute).__name__}"
+        )
     if cuda_graph_activation_recompute and not enable_cuda_graph:
         raise ValueError("cuda_graph_activation_recompute=True requires enable_cuda_graph=True")
     if cuda_graph_activation_recompute:

@@ -13,12 +13,26 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.te_graph_runtime.graph 
 
 
 def _checkpoint(function, *args):
-    """Run one checkpoint while selecting the low-level graph phase."""
+    """Run one checkpoint while selecting the low-level graph phase.
+
+    :param function: Graphed callable or ordered tuple of graphed callables.
+    :type function: Callable or Tuple[Callable, ...]
+    :param args: Positional checkpoint inputs.
+    :type args: Any
+    :return: Checkpoint output.
+    :rtype: Any
+    """
     functions = function if isinstance(function, tuple) else (function,)
     call_count = 0
 
     def run(value):
-        """Dispatch the original or recompute forward."""
+        """Dispatch the original or recompute forward.
+
+        :param value: Current checkpoint tensor.
+        :type value: torch.Tensor
+        :return: Output of the selected graph sequence.
+        :rtype: torch.Tensor
+        """
         nonlocal call_count
         phase = "forward" if call_count == 0 else "recompute"
         call_count += 1
@@ -68,7 +82,13 @@ def test_nonreentrant_forward_preserves_grad_mode():
         """Expose the grad mode used by forward capture."""
 
         def forward(self, value):
-            """Return a grad-mode-dependent value."""
+            """Return a grad-mode-dependent value.
+
+            :param value: Input tensor.
+            :type value: torch.Tensor
+            :return: Grad-mode-dependent output tensor.
+            :rtype: torch.Tensor
+            """
             offset = 1.0 if torch.is_grad_enabled() else -1.0
             return value.sin() + offset
 

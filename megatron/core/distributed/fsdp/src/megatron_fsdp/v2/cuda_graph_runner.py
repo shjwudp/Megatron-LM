@@ -59,6 +59,11 @@ def _renew_fsdp_compute_parameter_leaves(
     identity and AccumulateGrad node. This keeps graph addresses stable while
     preventing eager-trace autograd state from entering the captured backward.
 
+    :param modules: M-FSDP modules whose compute leaves are renewed.
+    :type modules: Tuple[torch.nn.Module, ...]
+    :raises RuntimeError: If registered and compute parameter identities are inconsistent.
+    :return: Replacement leaves paired with gradients that must be restored.
+    :rtype: List[Tuple[torch.nn.Parameter, torch.Tensor]]
     """
     pending_gradients = []
     for module in modules:
@@ -116,7 +121,11 @@ def _renew_fsdp_compute_parameter_leaves(
 def _restore_pending_compute_gradients(
     pending_gradients: List[Tuple[torch.nn.Parameter, torch.Tensor]]
 ) -> None:
-    """Attach pre-capture gradients to replacement compute leaves."""
+    """Attach pre-capture gradients to replacement compute leaves.
+
+    :param pending_gradients: Replacement leaves and their saved gradients.
+    :type pending_gradients: List[Tuple[torch.nn.Parameter, torch.Tensor]]
+    """
     for parameter, gradient in pending_gradients:
         parameter.grad = gradient
     pending_gradients.clear()
@@ -128,6 +137,9 @@ def _cuda_autocast_state() -> Tuple[bool, Optional[torch.dtype]]:
     The autocast cache state is deliberately excluded: capture always pins
     ``cache_enabled=False``, so recording it would only reject captures for a
     difference that cannot affect the graphs.
+
+    :return: CUDA autocast enabled state and active dtype.
+    :rtype: Tuple[bool, Optional[torch.dtype]]
     """
     try:
         enabled = torch.is_autocast_enabled("cuda")
@@ -145,7 +157,18 @@ def _cuda_autocast_state() -> Tuple[bool, Optional[torch.dtype]]:
 def _normalize_forward_call(
     module: torch.nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]
 ) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
-    """Rebuild a recorded forward call without nesting variadic arguments."""
+    """Rebuild a recorded forward call without nesting variadic arguments.
+
+    :param module: Module whose forward signature defines argument binding.
+    :type module: torch.nn.Module
+    :param args: Recorded positional arguments.
+    :type args: Tuple[Any, ...]
+    :param kwargs: Recorded keyword arguments.
+    :type kwargs: Dict[str, Any]
+    :raises TypeError: If the recorded arguments do not match the forward signature.
+    :return: Normalized positional and keyword arguments.
+    :rtype: Tuple[Tuple[Any, ...], Dict[str, Any]]
+    """
     signature = inspect.signature(_get_cuda_graph_forward_impl(module))
     has_self = "self" in signature.parameters
     bound = signature.bind(module, *args, **kwargs) if has_self else signature.bind(*args, **kwargs)
@@ -183,14 +206,26 @@ def _normalize_forward_call(
 
 
 def _requires_grad_surface(value: Any) -> Any:
-    """Replace tensor leaves with their ``requires_grad`` flags."""
+    """Replace tensor leaves with their ``requires_grad`` flags.
+
+    :param value: Tensor pytree whose gradient surface is recorded.
+    :type value: Any
+    :return: Matching pytree containing booleans for tensor leaves.
+    :rtype: Any
+    """
     return tree_map(
         lambda leaf: bool(leaf.requires_grad) if isinstance(leaf, torch.Tensor) else None, value
     )
 
 
 def _tensor_storage_key(tensor: torch.Tensor) -> Tuple[Any, ...]:
-    """Identify a tensor storage view."""
+    """Identify a tensor storage view.
+
+    :param tensor: Tensor to identify.
+    :type tensor: torch.Tensor
+    :return: Storage address and view metadata.
+    :rtype: Tuple[Any, ...]
+    """
     return (
         tensor.untyped_storage().data_ptr(),
         tensor.storage_offset(),
@@ -205,7 +240,15 @@ def _tensor_storage_key(tensor: torch.Tensor) -> Tuple[Any, ...]:
 
 
 def _is_direct_autograd_alias(input_tensor: torch.Tensor, output_tensor: torch.Tensor) -> bool:
-    """Return whether an input is the producer output or its direct autograd view."""
+    """Return whether an input is the producer output or its direct autograd view.
+
+    :param input_tensor: Candidate consumer input.
+    :type input_tensor: torch.Tensor
+    :param output_tensor: Candidate producer output.
+    :type output_tensor: torch.Tensor
+    :return: Whether the tensors are identical or connected by one autograd view.
+    :rtype: bool
+    """
     if input_tensor.numel() == 0 or output_tensor.numel() == 0:
         return False
     if input_tensor is output_tensor:
@@ -222,7 +265,14 @@ def _is_direct_autograd_alias(input_tensor: torch.Tensor, output_tensor: torch.T
 def _validate_activation_recompute_lifetime(
     lifetime_events: List[Tuple[str, int]], module_count: int
 ) -> None:
-    """Require one complete F, RF, and B sequence per captured module."""
+    """Require one complete F, RF, and B sequence per captured module.
+
+    :param lifetime_events: Recorded phase and module-index events.
+    :type lifetime_events: List[Tuple[str, int]]
+    :param module_count: Number of captured modules.
+    :type module_count: int
+    :raises RuntimeError: If the observed execution order is unsupported.
+    """
     expected = [("forward", module_idx) for module_idx in range(module_count)]
     for module_idx in reversed(range(module_count)):
         expected.extend((("recompute", module_idx), ("backward", module_idx)))
@@ -270,12 +320,24 @@ def _restore_all_hooks(saved):
 
 
 def _get_cuda_graph_forward_impl(module: torch.nn.Module) -> Callable:
-    """Return the replaceable forward behind the stable compile boundary."""
+    """Return the replaceable forward behind the stable compile boundary.
+
+    :param module: Module that may have CUDA Graph dispatch installed.
+    :type module: torch.nn.Module
+    :return: Current forward implementation owned by the runner.
+    :rtype: Callable
+    """
     return module.__dict__.get("_mfsdp_cuda_graph_forward_impl", module.forward)
 
 
 def _set_cuda_graph_forward_impl(module: torch.nn.Module, forward: Callable) -> None:
-    """Replace a forward without invalidating a compiled parent module."""
+    """Replace a forward without invalidating a compiled parent module.
+
+    :param module: Module whose forward implementation is replaced.
+    :type module: torch.nn.Module
+    :param forward: Replacement forward callable.
+    :type forward: Callable
+    """
     if "_mfsdp_cuda_graph_forward_impl" in module.__dict__:
         module._mfsdp_cuda_graph_forward_impl = forward
     else:
@@ -332,7 +394,19 @@ def _build_input_output_aliases(
     sample_args: Dict[int, Tuple[Any, ...]],
     sample_kwargs: Dict[int, Dict[str, Any]],
 ) -> Tuple[Dict[int, Tuple[int, int]], ...]:
-    """Match consumer inputs to an unambiguous earlier autograd output."""
+    """Match consumer inputs to an unambiguous earlier autograd output.
+
+    :param modules: Captured modules in forward order.
+    :type modules: Tuple[torch.nn.Module, ...]
+    :param sample_outputs: Recorded eager outputs keyed by module identity.
+    :type sample_outputs: Dict[int, Any]
+    :param sample_args: Recorded positional inputs keyed by module identity.
+    :type sample_args: Dict[int, Tuple[Any, ...]]
+    :param sample_kwargs: Recorded keyword inputs keyed by module identity.
+    :type sample_kwargs: Dict[int, Dict[str, Any]]
+    :return: Consumer-input mappings to producer module and output indices.
+    :rtype: Tuple[Dict[int, Tuple[int, int]], ...]
+    """
     producer_outputs: Dict[Tuple[Any, ...], List[Tuple[int, int, torch.Tensor]]] = {}
     aliases_by_consumer = []
     for consumer_idx, module in enumerate(modules):
@@ -379,13 +453,18 @@ class CudaGraphRunner:
 
     Created once by the root forward pre-hook and stored on
     ``ctx.cuda_graph_runner``.
+
+    :param graph_pool: CUDA graph memory-pool handle, or None.
+    :type graph_pool: Any
+    :param num_warmup_iters: Number of warmup iterations, defaults to 3.
+    :type num_warmup_iters: int, optional
+    :param activation_recompute: Whether to capture separate F, RF, and B programs.
+    :type activation_recompute: bool, optional
     """
 
     def __init__(
         self, graph_pool: Any, num_warmup_iters: int = 3, activation_recompute: bool = False
     ):
-        if not isinstance(activation_recompute, bool):
-            raise TypeError("activation_recompute must be a bool")
         self._graph_pool = graph_pool
         self._num_warmup = num_warmup_iters
         self._captured = False
@@ -407,7 +486,11 @@ class CudaGraphRunner:
     # ---- called from hooks ------------------------------------------------
     @property
     def captured(self) -> bool:
-        """Return whether graph programs have been captured and installed."""
+        """Return whether graph programs have been captured and installed.
+
+        :return: Whether capture and module installation have completed.
+        :rtype: bool
+        """
         return self._captured
 
     def preflight_record_module(self, module: torch.nn.Module) -> None:
@@ -415,6 +498,10 @@ class CudaGraphRunner:
 
         Only called for normal training forwards (the hook gates on
         ``replay_phase == "forward"``).
+
+        :param module: Module about to begin a recorded forward.
+        :type module: torch.nn.Module
+        :raises RuntimeError: If its previous forward has not completed backward.
         """
         if self._captured or not self._activation_recompute:
             return
@@ -422,6 +509,7 @@ class CudaGraphRunner:
         if mid not in self._sample_args:
             return
         module_idx = self._module_indices[mid]
+        # A second F would overwrite the static inputs still needed by RF and B.
         if ("backward", module_idx) not in self._lifetime_events:
             raise RuntimeError(
                 "Activation-recompute CUDA graphs require backward to finish "
@@ -432,11 +520,6 @@ class CudaGraphRunner:
         """Record one module call during the first optimized forward."""
         if self._captured:
             return
-        if self._activation_recompute and not torch.is_grad_enabled():
-            raise RuntimeError(
-                "M-FSDP CUDA Graph activation recompute currently supports only "
-                "non-reentrant checkpointing"
-            )
         mid = id(module)
         if mid in self._sample_args:
             return
@@ -473,7 +556,15 @@ class CudaGraphRunner:
         args: Optional[Tuple[Any, ...]] = None,
         kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Record one module call during checkpoint recomputation."""
+        """Record one module call during checkpoint recomputation.
+
+        :param module: Module observed during recomputation.
+        :type module: torch.nn.Module
+        :param args: Recompute positional arguments, defaults to None.
+        :type args: Tuple[Any, ...], optional
+        :param kwargs: Recompute keyword arguments, defaults to None.
+        :type kwargs: Dict[str, Any], optional
+        """
         if self._captured or not self._activation_recompute:
             return
         mid = id(module)
@@ -492,15 +583,26 @@ class CudaGraphRunner:
         self._lifetime_events.append(("recompute", module_idx))
 
     def owns_module(self, module: torch.nn.Module) -> bool:
-        """Return whether this runner recorded ``module`` for replay."""
+        """Return whether this runner recorded ``module`` for replay.
+
+        :param module: Module whose ownership is queried.
+        :type module: torch.nn.Module
+        :return: Whether this runner owns the module.
+        :rtype: bool
+        """
         return id(module) in self._module_indices
 
     def prepare_module_replay(self, module: torch.nn.Module, replay_phase: str) -> None:
-        """Select and validate the next F or RF replay."""
+        """Select and validate the next F or RF replay.
+
+        :param module: Captured module about to replay.
+        :type module: torch.nn.Module
+        :param replay_phase: Program to select, either ``forward`` or ``recompute``.
+        :type replay_phase: str
+        :raises RuntimeError: If replay selection or preflight is unavailable.
+        """
         if not self._activation_recompute or not self._captured or not self.owns_module(module):
             return
-        if replay_phase not in ("forward", "recompute"):
-            raise ValueError(f"Unknown CUDA graph replay phase {replay_phase!r}")
         setter = module.__dict__.get("_cuda_graph_set_replay_phase")
         if not callable(setter):
             raise RuntimeError("Captured activation-recompute module has no replay selector")
@@ -511,7 +613,13 @@ class CudaGraphRunner:
         preflight()
 
     def record_module_output(self, module: torch.nn.Module, output: Any) -> None:
-        """Record an eager output for static graph linking."""
+        """Record an eager output for static graph linking.
+
+        :param module: Recorded M-FSDP module.
+        :type module: torch.nn.Module
+        :param output: Output from the eager sample forward.
+        :type output: Any
+        """
         mid = id(module)
         if self._captured:
             return
@@ -570,24 +678,27 @@ class CudaGraphRunner:
 
         Caller contract (mfsdp_post_backward_hook): only invoked for
         activation-recompute runners on modules this runner owns.
-        """
-        backward_prepared = bool(getattr(module, "_fsdp_pre_backward_done", False))
-        backward_complete = bool(getattr(module, "post_backward_issued", False))
 
-        if not self._captured:
-            module_idx = self._module_indices[id(module)]
-            if ("recompute", module_idx) not in self._lifetime_events:
-                raise RuntimeError(
-                    "Activation-recompute CUDA graphs did not observe checkpoint "
-                    "recomputation before backward; use non-reentrant activation "
-                    "checkpointing or disable cuda_graph_activation_recompute"
-                )
-            if ("backward", module_idx) in self._lifetime_events:
-                return True
-            self._lifetime_events.append(("backward", module_idx))
+        :param module: Module whose backward event completed.
+        :type module: torch.nn.Module
+        :raises RuntimeError: If recompute was not observed before backward.
+        :return: Whether this runner consumed the backward event.
+        :rtype: bool
+        """
+        if self._captured:
             return True
-        if not backward_prepared or backward_complete:
-            raise RuntimeError("M-FSDP backward completion arrived before backward preparation")
+
+        module_idx = self._module_indices[id(module)]
+        # Capturing B without an observed RF would bind an invalid autograd tape.
+        if ("recompute", module_idx) not in self._lifetime_events:
+            raise RuntimeError(
+                "Activation-recompute CUDA graphs did not observe checkpoint "
+                "recomputation before backward; use non-reentrant activation "
+                "checkpointing or disable cuda_graph_activation_recompute"
+            )
+        if ("backward", module_idx) in self._lifetime_events:
+            return True
+        self._lifetime_events.append(("backward", module_idx))
         return True
 
     def capture_and_install(
@@ -600,6 +711,7 @@ class CudaGraphRunner:
         modules = tuple(self._modules_ordered)
         n = len(modules)
         autocast_states = {self._autocast_states[id(module)] for module in modules}
+        # One capture context cannot reproduce mixed per-module autocast states.
         if len(autocast_states) != 1:
             raise RuntimeError("CUDA graph capture requires one recorded CUDA autocast state")
         autocast_enabled, autocast_dtype = next(iter(autocast_states))
@@ -622,6 +734,7 @@ class CudaGraphRunner:
         if activation_recompute:
             for module in modules:
                 for param_group in module._fsdp_param_groups:
+                    # Stale distributed grads would be captured as live accumulation state.
                     if any(param.grad is not None for param in param_group.dist_params):
                         _restore_pending_compute_gradients(pending_compute_gradients)
                         self.reset()
@@ -640,30 +753,21 @@ class CudaGraphRunner:
             try:
                 from te_graph_runtime import make_graphed_callables
                 from te_graph_runtime.graph import (
-                    _MFSDP_CAPTURE_CAPABILITIES as _installed_mfsdp_capabilities,
-                )
-                from te_graph_runtime.graph import (
                     _get_compatible_main_grad_buffer as _installed_static_grad_support,
                 )
                 from te_graph_runtime.graph import (
                     _refresh_module_parameter_surface as _installed_parameter_refresh,
                 )
 
-                # Single source of truth: the vendored runtime declares what
-                # M-FSDP requires; an installed package must match it.
-                from .te_graph_runtime.graph import (
-                    _MFSDP_CAPTURE_CAPABILITIES as required_capabilities,
-                )
-
-                if (
-                    not all(
+                installed_runtime_supported = (
+                    all(
                         callable(helper)
                         for helper in (_installed_static_grad_support, _installed_parameter_refresh)
                     )
-                    or not required_capabilities.issubset(_installed_mfsdp_capabilities)
-                    or "use_main_grad" not in inspect.signature(make_graphed_callables).parameters
-                ):
-                    raise ImportError("Installed te-graph-runtime lacks M-FSDP CUDA graph support")
+                    and "use_main_grad" in inspect.signature(make_graphed_callables).parameters
+                )
+                if not installed_runtime_supported:
+                    from .te_graph_runtime import make_graphed_callables
             except ImportError:
                 from .te_graph_runtime import make_graphed_callables
 
@@ -698,6 +802,7 @@ class CudaGraphRunner:
         for m in modules:
             mid = id(m)
             recompute_requires_grad = self._recompute_requires_grad.get(mid)
+            # RF input grad metadata defines the leaves consumed by captured B.
             if activation_recompute and recompute_requires_grad is None:
                 raise RuntimeError(
                     "Activation-recompute CUDA graph capture is missing RF input metadata"
@@ -753,7 +858,7 @@ class CudaGraphRunner:
                 if autocast_enabled:
                     autocast_kwargs["dtype"] = autocast_dtype
                 with torch.amp.autocast("cuda", **autocast_kwargs):
-                    graphed = make_graphed_callables(
+                    make_graphed_callables(
                         tuple(modules),
                         sample_args_list,
                         num_warmup_iters=self._num_warmup,
@@ -777,9 +882,6 @@ class CudaGraphRunner:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info("CudaGraphRunner: captured %d modules", n)
 
-        if not isinstance(graphed, tuple):
-            graphed = (graphed,)
-
         # make_graphed_callables already replaced module.forward with
         # the graphed version that handles kwargs natively.
         for module in modules:
@@ -796,7 +898,16 @@ class CudaGraphRunner:
 
 
 def _clone_capture_sample(value: Any, requires_grad_surface: Any = None) -> Any:
-    """Clone tensor leaves using recompute-forward gradient metadata."""
+    """Clone tensor leaves using recompute-forward gradient metadata.
+
+    :param value: Recorded input pytree to clone.
+    :type value: Any
+    :param requires_grad_surface: Matching gradient-flag pytree, defaults to None.
+    :type requires_grad_surface: Any, optional
+    :raises RuntimeError: If the value and gradient pytrees differ.
+    :return: Cloned input pytree.
+    :rtype: Any
+    """
 
     if requires_grad_surface is None:
         requires_grad_surface = _requires_grad_surface(value)
@@ -806,6 +917,15 @@ def _clone_capture_sample(value: Any, requires_grad_surface: Any = None) -> Any:
         raise RuntimeError("Recompute-forward input structure changed before CUDA graph capture")
 
     def clone_tensor(leaf, requires_grad):
+        """Clone one tensor leaf and preserve non-tensor leaves.
+
+        :param leaf: Input pytree leaf.
+        :type leaf: Any
+        :param requires_grad: Gradient requirement for a tensor leaf.
+        :type requires_grad: bool
+        :return: Cloned tensor or the unchanged non-tensor leaf.
+        :rtype: Any
+        """
         if not isinstance(leaf, torch.Tensor):
             return leaf
         return leaf.detach().clone().requires_grad_(requires_grad)
@@ -834,7 +954,15 @@ def _make_fwd_post_hook(module):
 
 
 def _make_bwd_pre_hook(module, activation_recompute=False):
-    """Build the capture-time backward unshard hook."""
+    """Build the capture-time backward unshard hook.
+
+    :param module: M-FSDP module unsharded by the returned hook.
+    :type module: torch.nn.Module
+    :param activation_recompute: Whether RF parameters must also be unsharded.
+    :type activation_recompute: bool, optional
+    :return: Capture-time backward pre-hook.
+    :rtype: Callable
+    """
 
     def hook(mod, grad_output):
         module.unshard(bwd_pass=True)

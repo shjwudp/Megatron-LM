@@ -21,9 +21,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 UPSTREAM_TE_VERSION = "v2.16"
 UPSTREAM_TE_COMMIT = "4220403e831d29e93868f7793693ea83f6b8b05b"
 UPSTREAM_TE_GRAPH_PATH = "transformer_engine/pytorch/graph.py"
-_MFSDP_CAPTURE_CAPABILITIES = frozenset(
-    {"capture_grad_buffer_release", "parameter_surface_refresh", "static_grad_binding"}
-)
 
 __all__ = [
     "UPSTREAM_TE_COMMIT",
@@ -422,7 +419,13 @@ def _none_grad_context_wrapper(inputs):
 
 @contextlib.contextmanager
 def _static_grad_context_wrapper(inputs, grad_buffers):
-    """Bind leaf gradients to static buffers during capture."""
+    """Bind leaf gradients to static buffers during capture.
+
+    :param inputs: Captured backward leaves.
+    :type inputs: Tuple[torch.Tensor, ...]
+    :param grad_buffers: Static buffer for each leaf, or None.
+    :type grad_buffers: Tuple[Optional[torch.Tensor], ...]
+    """
     torch_module = _require_torch()
     if len(inputs) != len(grad_buffers):
         raise ValueError("Static gradient buffers must match backward inputs")
@@ -440,7 +443,13 @@ def _static_grad_context_wrapper(inputs, grad_buffers):
 
 
 def _get_compatible_main_grad_buffer(input_tensor):
-    """Get a compatible main-grad buffer."""
+    """Get a compatible main-grad buffer.
+
+    :param input_tensor: Candidate parameter leaf.
+    :type input_tensor: torch.Tensor
+    :return: Compatible buffer, or None.
+    :rtype: Optional[torch.Tensor]
+    """
     torch_module = _require_torch()
     if getattr(input_tensor, "_mfsdp_recorded_te_wgrad", False):
         return None
@@ -476,7 +485,13 @@ def _get_compatible_main_grad_buffer(input_tensor):
 
 
 def _get_static_grad_buffers(inputs):
-    """Get static gradient buffers for captured leaves."""
+    """Get static gradient buffers for captured leaves.
+
+    :param inputs: Captured backward leaves.
+    :type inputs: Tuple[torch.Tensor, ...]
+    :return: Compatible buffer or None for each leaf.
+    :rtype: Tuple[Optional[torch.Tensor], ...]
+    """
     return tuple(_get_compatible_main_grad_buffer(input_tensor) for input_tensor in inputs)
 
 
@@ -515,7 +530,13 @@ def _returned_param_grad_clone_slots(
 
 
 def _static_dgrad_metadata(tensor):
-    """Return metadata for a safe reusable user-input gradient buffer."""
+    """Return metadata for a safe reusable user-input gradient buffer.
+
+    :param tensor: Candidate static input or output tensor.
+    :type tensor: torch.Tensor
+    :return: Storage-independent tensor metadata, or None when reuse is unsafe.
+    :rtype: Optional[Tuple[Any, ...]]
+    """
     torch_module = _require_torch()
     if not isinstance(tensor, torch_module.Tensor) or tensor.layout != torch_module.strided:
         return None
@@ -536,7 +557,21 @@ def _allocate_static_dgrad_reuse_buffers(
     user_grad_indices,
     output_requires_grad,
 ):
-    """Allocate two alternating dgrad slots for safe adjacent aliases."""
+    """Allocate two alternating dgrad slots for safe adjacent aliases.
+
+    :param static_input_surfaces: Static input tensors for each callable.
+    :type static_input_surfaces: Sequence[Tuple[Any, ...]]
+    :param static_outputs: Static output tensors for each callable.
+    :type static_outputs: Sequence[Tuple[Any, ...]]
+    :param input_output_aliases: Consumer-input mappings to producer outputs.
+    :type input_output_aliases: Sequence[Dict[int, Tuple[int, int]]]
+    :param user_grad_indices: User-input indices that receive gradients.
+    :type user_grad_indices: Sequence[Optional[Sequence[int]]]
+    :param output_requires_grad: Output gradient flags for each callable.
+    :type output_requires_grad: Sequence[Optional[Tuple[bool, ...]]]
+    :return: Reusable gradient buffers keyed by user-input index for each callable.
+    :rtype: Tuple[Dict[int, torch.Tensor], ...]
+    """
     torch_module = _require_torch()
     consumers_by_output = {}
     for consumer_idx, aliases in enumerate(input_output_aliases):
@@ -599,7 +634,18 @@ def _allocate_static_dgrad_reuse_buffers(
 
 
 def _refresh_module_parameter_surface(func, user_inputs, parameter_indices=None):
-    """Refresh parameters after capture-time replacement hooks."""
+    """Refresh parameters after capture-time replacement hooks.
+
+    :param func: Captured callable.
+    :type func: Callable
+    :param user_inputs: Flattened user inputs.
+    :type user_inputs: Tuple[torch.Tensor, ...]
+    :param parameter_indices: Retained parameter positions, defaults to None.
+    :type parameter_indices: Optional[Tuple[int, ...]]
+    :raises RuntimeError: If a retained position no longer exists.
+    :return: Live parameters and the full static input surface.
+    :rtype: Tuple[Tuple[torch.nn.Parameter, ...], Tuple[torch.Tensor, ...]]
+    """
     torch_module = _require_torch()
     module_params = tuple(func.parameters()) if isinstance(func, torch_module.nn.Module) else ()
     if parameter_indices is not None:
@@ -680,11 +726,7 @@ def _make_graphed_callables(
         sample_args = (sample_args,)
         sample_kwargs = (sample_kwargs,)
     capture_time_hooks = _canonicalize_capture_time_hooks(len(callables), capture_time_hooks)
-    if not isinstance(_activation_recompute, bool):
-        raise TypeError(
-            "_activation_recompute must be a bool, "
-            f"but got {type(_activation_recompute).__name__}"
-        )
+    # Warmup discovers RF metadata and whether the callable consumes RNG.
     if _activation_recompute and num_warmup_iters < 1:
         raise ValueError("Activation recompute requires at least one warmup iteration")
     if _input_output_aliases is None:
@@ -709,6 +751,7 @@ def _make_graphed_callables(
             "make_graphed_callables only supports when modules are all in training or all in"
             " inference mode."
         )
+    # The current scheduler captures F, RF, and B without an external order tape.
     if _activation_recompute and _order is not None:
         raise ValueError("Activation recompute does not support a custom order")
 
@@ -982,7 +1025,15 @@ def _make_graphed_callables(
         ]
 
     def _link_callable_inputs(func_idx, outputs_by_producer):
-        """Link consumer inputs to captured producer outputs."""
+        """Link consumer inputs to captured producer outputs.
+
+        :param func_idx: Consumer index.
+        :type func_idx: int
+        :param outputs_by_producer: Outputs keyed by producer index.
+        :type outputs_by_producer: Dict[int, Sequence[torch.Tensor]]
+        :return: Linked positional and keyword arguments.
+        :rtype: Tuple[Tuple[Any, ...], Dict[str, Any]]
+        """
         aliases = _input_output_aliases[func_idx]
         if not aliases:
             return sample_args[func_idx], sample_kwargs[func_idx]
@@ -1044,12 +1095,23 @@ def _make_graphed_callables(
     callable_uses_default_rng = [False] * graph_count
 
     def discard_capture_saved_tensor(tensor):
-        """Discard tensors saved only by the original checkpoint forward."""
+        """Discard tensors saved only by the original checkpoint forward.
+
+        :param tensor: Tensor requested by the original forward's autograd tape.
+        :type tensor: torch.Tensor
+        :return: Placeholder stored in the discarded tape.
+        :rtype: None
+        """
         del tensor
         return None
 
     def reject_discarded_saved_tensor(packed):
-        """Reject backward through the discarded original-forward tape."""
+        """Reject backward through the discarded original-forward tape.
+
+        :param packed: Placeholder produced by the saved-tensor pack hook.
+        :type packed: Any
+        :raises RuntimeError: Always, because only RF may provide backward state.
+        """
         del packed
         raise RuntimeError("Discarded capture-forward tensors cannot be unpacked")
 
@@ -1392,10 +1454,12 @@ def _make_graphed_callables(
             post_warmup_hook()
     torch.cuda.synchronize()
 
+    # Delayed wgrad would outlive the RF tape consumed by the captured B program.
     if _activation_recompute and any(need_bwd_dw_graph.values()):
         raise RuntimeError(
             "Activation recompute does not yet support delayed backward-wgrad graphs"
         )
+    # Graph-safe generators cannot restore F's offset before RF replay.
     if _activation_recompute and any(callable_uses_default_rng):
         raise RuntimeError(
             "Activation-recompute CUDA graphs do not support RNG-consuming callables; "
@@ -2075,7 +2139,27 @@ def _make_graphed_callables(
                 cuda_graph_event,
                 *inputs,
             ):
-                # pylint: disable=missing-function-docstring
+                """Dispatch one original-forward or recompute-forward replay.
+
+                :param ctx: Autograd context that owns replay state.
+                :type ctx: Any
+                :param replay_phase: Graph program to replay.
+                :type replay_phase: str
+                :param forward_builds_autograd: Whether this node owns backward.
+                :type forward_builds_autograd: bool
+                :param skip_fp8_weight_update: Whether to reuse cached FP8 weights.
+                :type skip_fp8_weight_update: Optional[bool]
+                :param cuda_graph_stream: Stream used for graph replay.
+                :type cuda_graph_stream: torch.cuda.Stream
+                :param cuda_graph_event: Optional event that synchronizes replay.
+                :type cuda_graph_event: Optional[torch.cuda.Event]
+                :param inputs: User inputs followed by captured module parameters.
+                :type inputs: torch.Tensor
+                :raises ValueError: If the replay phase is unknown.
+                :raises RuntimeError: If the replay phase violates the recorded state.
+                :return: Detached static graph outputs.
+                :rtype: Tuple[Any, ...]
+                """
                 if activation_recompute:
                     current_phase = graph_replay_state["phase"]
                     if replay_phase == "forward":
@@ -2095,8 +2179,6 @@ def _make_graphed_callables(
                             )
                         graph_replay_state["phase"] = "recomputed"
                         ctx.owns_backward = False
-                    else:
-                        raise ValueError(f"Unknown CUDA graph replay phase {replay_phase!r}")
                 else:
                     ctx.owns_backward = True
                 try:
@@ -2125,7 +2207,25 @@ def _make_graphed_callables(
                 cuda_graph_event,
                 *inputs,
             ):
-                # pylint: disable=missing-function-docstring
+                """Perform forward replay after phase validation.
+
+                :param ctx: Autograd context that owns replay state.
+                :type ctx: Any
+                :param replay_phase: Graph program to replay.
+                :type replay_phase: str
+                :param forward_builds_autograd: Whether this node owns backward.
+                :type forward_builds_autograd: bool
+                :param skip_fp8_weight_update: Whether to reuse cached FP8 weights.
+                :type skip_fp8_weight_update: Optional[bool]
+                :param cuda_graph_stream: Stream used for graph replay.
+                :type cuda_graph_stream: torch.cuda.Stream
+                :param cuda_graph_event: Optional event that synchronizes replay.
+                :type cuda_graph_event: Optional[torch.cuda.Event]
+                :param inputs: User inputs followed by captured module parameters.
+                :type inputs: torch.Tensor
+                :return: Detached static graph outputs.
+                :rtype: Tuple[Any, ...]
+                """
                 ctx.replay_phase = replay_phase
                 # Set flag for whether to update FP8 weight updates
                 ctx.is_first_module = FP8GlobalStateManager.is_first_fp8_module()
@@ -2191,7 +2291,17 @@ def _make_graphed_callables(
 
             @staticmethod
             def _backward_impl(ctx, *grads):
-                # pylint: disable=missing-function-docstring
+                """Replay backward and return gradients for autograd inputs.
+
+                :param ctx: Autograd context populated by forward replay.
+                :type ctx: Any
+                :param grads: Output gradients supplied by autograd.
+                :type grads: torch.Tensor
+                :raises ValueError: If the output-gradient count changed.
+                :raises RuntimeError: If RF did not prepare backward state.
+                :return: Gradients corresponding to ``Graphed.apply`` inputs.
+                :rtype: Tuple[Optional[torch.Tensor], ...]
+                """
 
                 if activation_recompute and ctx.has_checkpoint_sentinel:
                     # Trigger non-reentrant checkpoint recomputation before B.
@@ -2273,9 +2383,11 @@ def _make_graphed_callables(
                     )
             elif replay_phase is None:
                 replay_phase = "forward"
+            # Direct callers can bypass set_replay_phase via the private kwarg.
             if replay_phase not in ("forward", "recompute"):
                 raise ValueError(f"Unknown CUDA graph replay phase {replay_phase!r}")
             for param, expected_ptr in zip(module_params, expected_param_ptrs):
+                # Replaying with a new parameter address would read stale captured storage.
                 if param.data_ptr() != expected_ptr:
                     raise RuntimeError("CUDA graph parameter address changed after capture")
 
@@ -2413,13 +2525,24 @@ def _make_graphed_callables(
             return _tree_unflatten(out, output_unflatten_spec)
 
         def set_replay_phase(replay_phase):
+            """Select the next original-forward or recompute-forward graph.
+
+            :param replay_phase: Program to select.
+            :type replay_phase: str
+            :raises ValueError: If the requested program is unknown.
+            """
             # Inference forwards bypass the runner entirely; only the two
             # graph programs are selectable here.
+            # Reject unknown names before they enter persistent replay state.
             if replay_phase not in ("forward", "recompute"):
                 raise ValueError(f"Unknown CUDA graph replay phase {replay_phase!r}")
             graph_replay_state["next_replay_phase"] = replay_phase
 
         def preflight():
+            """Validate the selected replay against the current graph state.
+
+            :raises RuntimeError: If no phase was selected or an invocation is pending.
+            """
             if activation_recompute:
                 replay_phase = graph_replay_state["next_replay_phase"]
                 if replay_phase is None:
