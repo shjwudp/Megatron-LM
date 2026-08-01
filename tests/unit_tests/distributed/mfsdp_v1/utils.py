@@ -213,11 +213,7 @@ def _forward_step_func(data_iterator, model, device="cuda", return_schedule_plan
 
     if return_schedule_plan:
         schedule_plan = model.build_schedule_plan(
-            tokens,
-            position_ids,
-            attention_mask,
-            labels=labels,
-            loss_mask=loss_mask,
+            tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
         )
         return schedule_plan, partial(loss_func, loss_mask)
 

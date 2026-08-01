@@ -111,9 +111,7 @@ class TestMegatronFSDPE2E:
                 losses.append(loss)
                 parameter_snapshots.append(cls._capture_parameters(model))
                 if torch.distributed.get_rank() == 0:
-                    grad_norm_text = (
-                        "None" if grad_norm is None else f"{float(grad_norm):.8f}"
-                    )
+                    grad_norm_text = "None" if grad_norm is None else f"{float(grad_norm):.8f}"
                     print(
                         f"[{case['name']}][{run_name}] "
                         f"step={step + 1}/{cls.NUM_STEPS} "

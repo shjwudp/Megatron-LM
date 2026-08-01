@@ -597,9 +597,7 @@ def _register_fine_grained_forward_hooks(fsdp_module: FsdpModule) -> None:
         target = _find_fsdp_target(submodule)
         if target is not None and target is not fsdp_module:
             continue
-        object.__setattr__(
-            submodule, _FSDP_PARENT_MODULE_REF_ATTR, weakref.ref(fsdp_module)
-        )
+        object.__setattr__(submodule, _FSDP_PARENT_MODULE_REF_ATTR, weakref.ref(fsdp_module))
         submodule.register_forward_pre_hook(
             _fine_grained_pre_forward_hook, prepend=True, with_kwargs=True
         )
