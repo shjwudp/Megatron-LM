@@ -250,13 +250,15 @@ def _allreduce_embedding_grad(
         grad_attr = _get_main_grad_attr(weight)
         orig_grad = getattr(weight, grad_attr)
         if ddp_config.use_megatron_fsdp:
-            orig_grad = orig_grad._local_tensor if orig_grad is not None else None
-        grad = _unshard_if_dtensor(orig_grad)
+            grad = orig_grad._local_tensor if orig_grad is not None else None
+        else:
+            grad = _unshard_if_dtensor(orig_grad)
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
         torch.distributed.all_reduce(grad, group=embd_group)
-        setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+        if not ddp_config.use_megatron_fsdp:
+            setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
 def _allreduce_position_embedding_grads(
