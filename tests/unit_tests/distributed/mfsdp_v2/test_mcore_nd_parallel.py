@@ -83,14 +83,18 @@ class TestMegatronFSDPE2E:
                 **case["model_config"],
                 **fsdp_args,
             )
-            data_iterator = make_gpt_mock_data_iterator(
-                dp_group=data_parallel_group,
-                num_samples=cls.GLOBAL_BATCH_SIZE * cls.NUM_STEPS,
-                vocab_size=cls.VOCAB_SIZE,
-                sequence_length=cls.SEQUENCE_LENGTH,
-                batch_size=cls.MICRO_BATCH_SIZE,
-                seed=42,
-            )
+            data_iterators = [
+                make_gpt_mock_data_iterator(
+                    dp_group=data_parallel_group,
+                    num_samples=cls.GLOBAL_BATCH_SIZE * cls.NUM_STEPS,
+                    vocab_size=cls.VOCAB_SIZE,
+                    sequence_length=cls.SEQUENCE_LENGTH,
+                    batch_size=cls.MICRO_BATCH_SIZE,
+                    seed=42,
+                )
+                for _ in model
+            ]
+            data_iterator = data_iterators if len(model) > 1 else data_iterators[0]
             losses = []
             parameter_snapshots = []
             run_name = "MFSDP v2" if use_mfsdp_v2 else "Reference"
@@ -107,7 +111,19 @@ class TestMegatronFSDPE2E:
                     // data_parallel_group.size(),
                 )
                 update_successful, grad_norm, _ = optimizer.step()
-                loss = output[-1]["lm loss"].detach().cpu()
+                if model_parallel_config.get("pipeline_model_parallel_size", 1) > 1:
+                    if mpu.is_pipeline_last_stage():
+                        loss = output[-1]["lm loss"].detach().float()
+                    else:
+                        loss = torch.zeros((), device="cuda")
+                    torch.distributed.broadcast(
+                        loss,
+                        src=mpu.get_pipeline_model_parallel_last_rank(),
+                        group=mpu.get_pipeline_model_parallel_group(),
+                    )
+                    loss = loss.cpu()
+                else:
+                    loss = output[-1]["lm loss"].detach().cpu()
                 losses.append(loss)
                 parameter_snapshots.append(cls._capture_parameters(model))
                 if torch.distributed.get_rank() == 0:
@@ -164,6 +180,30 @@ class TestMegatronFSDPE2E:
                     "parameter_tolerance": {"atol": 5e-3, "rtol": 1e-3},
                 },
                 id="ep2-optim_grads_params-1f1b-overlap",
+            ),
+            pytest.param(
+                {
+                    "name": "PP2 VPP2 EP2 optim_grads_params 1F1B overlap",
+                    "model_family": "gpt",
+                    "model_parallel_config": {
+                        "pipeline_model_parallel_size": 2,
+                        "virtual_pipeline_model_parallel_size": 2,
+                        "expert_model_parallel_size": 2,
+                    },
+                    "model_config": {
+                        "bf16": True,
+                        "data_parallel_sharding_strategy": "optim_grads_params",
+                        "megatron_fsdp_main_grads_dtype": torch.float32,
+                        "moe_grouped_gemm": True,
+                        "moe_token_dispatcher_type": "alltoall",
+                        "num_layers_per_virtual_pipeline_stage": 1,
+                        "overlap_moe_expert_parallel_comm": True,
+                        "delay_wgrad_compute": True,
+                    },
+                    "loss_tolerance": {"atol": 0, "rtol": 0.05},
+                    "parameter_tolerance": {"atol": 5e-3, "rtol": 1e-3},
+                },
+                id="pp2-vpp2-ep2-optim_grads_params-1f1b-overlap",
             ),
         ],
     )
