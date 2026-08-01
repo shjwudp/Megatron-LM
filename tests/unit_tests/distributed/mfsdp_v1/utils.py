@@ -193,7 +193,7 @@ def _forward_step_func(data_iterator, model, device="cuda", return_schedule_plan
         # If you have data parallel reduce loss across data parallel groups.
         # If pipeline parallel, loss computation is done only in last stage.
 
-        return loss, {'lm loss': loss}
+        return loss, {'lm loss': loss.detach().clone()}
 
     vp_stage = get_attr_wrapped_model(model, "vp_stage")
 
