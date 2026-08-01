@@ -125,7 +125,6 @@ class TestMegatronFSDPE2E:
                     loss = output[-1]["lm loss"].detach().cpu()
                 update_successful, grad_norm, _ = optimizer.step()
                 losses.append(loss)
-                parameter_snapshots.append(cls._capture_parameters(model))
                 if torch.distributed.get_rank() == 0:
                     grad_norm_text = "None" if grad_norm is None else f"{float(grad_norm):.8f}"
                     print(
@@ -135,6 +134,7 @@ class TestMegatronFSDPE2E:
                         f"update_successful={update_successful}",
                         flush=True,
                     )
+                parameter_snapshots.append(cls._capture_parameters(model))
 
             return {"losses": losses, "parameters": parameter_snapshots}
         finally:
