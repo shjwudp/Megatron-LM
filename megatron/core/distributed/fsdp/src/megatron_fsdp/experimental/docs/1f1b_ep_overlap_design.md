@@ -140,7 +140,7 @@ auto-enqueue the post-backward final callback — the schedule calls it manually
 # On FsdpModule (module.py)
 def pre_backward(self) -> None:
     """Prepare all FSDP parameter groups for backward compute.
-    
+
     - Unshards parameters (all-gather).
     - If root: registers post_backward_final_callback.
     - Resets post_backward_issued flags.
@@ -209,7 +209,7 @@ and transitions the bucket allocator from trace → optimized plan.
 # On FsdpModule (module.py)
 def post_backward(self) -> None:
     """Finalise the backward pass.
-    
+
     - Handles any parameter groups with pending gradients.
     - Drains async reduce-scatter events.
     - Resets root phase state.
