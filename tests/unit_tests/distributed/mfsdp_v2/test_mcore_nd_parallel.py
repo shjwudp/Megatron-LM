@@ -110,10 +110,9 @@ class TestMegatronFSDPE2E:
                     // cls.MICRO_BATCH_SIZE
                     // data_parallel_group.size(),
                 )
-                update_successful, grad_norm, _ = optimizer.step()
                 if model_parallel_config.get("pipeline_model_parallel_size", 1) > 1:
                     if mpu.is_pipeline_last_stage():
-                        loss = output[-1]["lm loss"].detach().float()
+                        loss = output[-1]["lm loss"].detach().float().clone()
                     else:
                         loss = torch.zeros((), device="cuda")
                     torch.distributed.broadcast(
@@ -124,6 +123,7 @@ class TestMegatronFSDPE2E:
                     loss = loss.cpu()
                 else:
                     loss = output[-1]["lm loss"].detach().cpu()
+                update_successful, grad_norm, _ = optimizer.step()
                 losses.append(loss)
                 parameter_snapshots.append(cls._capture_parameters(model))
                 if torch.distributed.get_rank() == 0:
