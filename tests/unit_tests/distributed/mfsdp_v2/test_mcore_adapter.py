@@ -10,6 +10,7 @@ import torch
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
@@ -49,7 +50,7 @@ class TestMcoreAdapter:
     def teardown_method(self):
         Utils.destroy_model_parallel()
 
-    def test_wraps_fsdp_unit_modules_before_root(self):
+    def test_wraps_fsdp_unit_modules_before_root(self, monkeypatch):
         config = TransformerConfig(
             num_layers=1,
             hidden_size=16,
@@ -82,6 +83,9 @@ class TestMcoreAdapter:
 
         assert isinstance(wrapped.module, FsdpModule)
         assert isinstance(wrapped.module[0], FsdpModule)
+        assert all(
+            getattr(parameter, "__fsdp_param__", False) for parameter in wrapped.parameters()
+        )
 
         # Post-order wrapping gives the selected TransformerLayer its own parameter group;
         # the root FSDP unit should own only the parameters of the remaining Linear module.
@@ -94,7 +98,37 @@ class TestMcoreAdapter:
         assert child_parameter_names
         assert root_parameter_names == {"1.weight", "1.bias"}
 
-    def test_build_train_and_step(self):
+        root_calls = []
+        monkeypatch.setattr(
+            wrapped.module,
+            "pre_backward",
+            lambda *, register_final_callback: root_calls.append(
+                ("pre_backward", register_final_callback)
+            ),
+        )
+        monkeypatch.setattr(
+            wrapped.module,
+            "post_backward",
+            lambda *, finalize_context: root_calls.append(("post_backward", finalize_context)),
+        )
+        wrapped._setup_1f1b_overlap_interface()
+        assert find_megatron_fsdp(wrapped) is wrapped
+
+        release_calls = []
+        monkeypatch.setattr(
+            wrapped.module[0], "reshard_parameters", lambda: release_calls.append("reshard")
+        )
+        monkeypatch.setattr(
+            wrapped.module[0], "reduce_grad", lambda: release_calls.append("reduce_grad")
+        )
+        wrapped.post_forward_release_module(wrapped.module[0])
+        wrapped.post_backward_release_module(wrapped.module[0])
+        assert release_calls == ["reshard", "reshard", "reduce_grad"]
+        wrapped.pre_backward()
+        wrapped.post_backward()
+        assert root_calls == [("pre_backward", False), ("post_backward", True)]
+
+    def test_build_train_and_step(self, monkeypatch):
         config = TransformerConfig(
             num_layers=2,
             hidden_size=16,
@@ -153,6 +187,23 @@ class TestMcoreAdapter:
         assert isinstance(optimizer, FullyShardedOptimizer)
         optimizer.reload_model_params()
 
+        parameter_groups = [
+            parameter_group
+            for module in model.modules()
+            if isinstance(module, FsdpModule)
+            for parameter_group in module.parameter_groups
+        ]
+        assert parameter_groups
+        sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
+        for parameter_group in parameter_groups:
+            sync_model_weight = parameter_group.sync_model_weight_from_main_weight
+
+            def count_sync(parameter_group=parameter_group, sync_model_weight=sync_model_weight):
+                sync_counts[parameter_group] += 1
+                sync_model_weight()
+
+            monkeypatch.setattr(parameter_group, "sync_model_weight_from_main_weight", count_sync)
+
         steps = [
             [
                 torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
@@ -193,3 +244,4 @@ class TestMcoreAdapter:
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
         torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
+        assert all(sync_count == len(steps) for sync_count in sync_counts.values())
