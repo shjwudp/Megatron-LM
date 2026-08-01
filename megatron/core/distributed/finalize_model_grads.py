@@ -257,6 +257,10 @@ def _allreduce_embedding_grad(
         if grad is None and skip_if_none:
             return
         torch.distributed.all_reduce(grad, group=embd_group)
+        if ddp_config.use_megatron_fsdp:
+            # The MFSDP optimizer immediately enters data-parallel gradient-stat collectives.
+            # Finish this pipeline-parallel collective first to keep communicator ordering aligned.
+            torch.cuda.current_stream().synchronize()
         if not ddp_config.use_megatron_fsdp:
             setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
