@@ -663,6 +663,7 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
         raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
     return dim_names.index(axis)
 
+
 def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]:
     parameters: dict[str, nn.Parameter] = {}
 
