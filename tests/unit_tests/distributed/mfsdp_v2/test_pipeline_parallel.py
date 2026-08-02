@@ -2,6 +2,8 @@
 
 """Pipeline-parallel integration tests for experimental Megatron-FSDP v2."""
 
+from contextlib import contextmanager
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -18,10 +20,54 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_optimizer,
 )
 from megatron.core.enums import ModelType
+from megatron.core.models.common import utils as model_utils
+from megatron.core.models.common.utils import TransformerLayerNode
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_delayed_wgrad_post_backward_hook_uses_wgrad_stream(monkeypatch):
+    """Keep FSDP gradient consumption ordered after delayed weight gradients."""
+    default_stream = object()
+    wgrad_stream = object()
+    current_stream = default_stream
+    calls = []
+
+    @contextmanager
+    def use_stream(stream):
+        nonlocal current_stream
+        previous_stream = current_stream
+        current_stream = stream
+        try:
+            yield
+        finally:
+            current_stream = previous_stream
+
+    class DelayedWgrad:
+        def backward_dw(self):
+            calls.append(("wgrad", current_stream))
+
+        def parameters(self):
+            return ()
+
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(model_utils, "nvtx_range_push", lambda _name: None)
+    monkeypatch.setattr(model_utils, "nvtx_range_pop", lambda _name: None)
+
+    node = object.__new__(TransformerLayerNode)
+    node.name = "test"
+    node.delay_wgrad_compute = True
+    node.stream = wgrad_stream
+    node.bwd_dw_callables = [DelayedWgrad()]
+    node.post_wgrad_grad_acc_hooks = []
+    node.is_layer_first_node = True
+    node._post_backward_hook = lambda: calls.append(("post_backward", current_stream))
+
+    node.backward_dw()
+
+    assert calls == [("wgrad", wgrad_stream), ("post_backward", wgrad_stream)]
 
 
 class PipelineStage(nn.Module):

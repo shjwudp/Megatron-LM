@@ -348,13 +348,13 @@ class TransformerLayerNode(ScheduleNode):
                     ):
                         self.post_wgrad_grad_acc_hooks.append(param.post_wgrad_grad_acc_hook)
 
-        if self.post_wgrad_grad_acc_hooks:
-            with torch.cuda.stream(self.stream):
+        with torch.cuda.stream(self.stream):
+            if self.post_wgrad_grad_acc_hooks:
                 for hook in self.post_wgrad_grad_acc_hooks:
                     hook()
 
-        if self.is_layer_first_node:
-            self._post_backward_hook()
+            if self.is_layer_first_node:
+                self._post_backward_hook()
         self.bwd_dw_callables = None
 
     def set_post_forward_hook(self, hook):
