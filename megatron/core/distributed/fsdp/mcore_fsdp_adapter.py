@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 import random
 from contextlib import contextmanager
 from functools import partial
@@ -758,7 +759,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         current stream after them releases those buffers for reuse.
         """
         self.module._lazy_init_context()
-        self.module.context.finish_grad_sync()
+        context = self.module.context
+        context.finish_grad_sync()
+        if os.environ.get("MFSDP_DEBUG_GRAD_GROUPS"):
+            _dump_mfsdp_grad_groups(self.module)
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""
@@ -771,6 +775,38 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     def stop_communication(self) -> None:
         """MFSDP v2 communication is complete when backward returns."""
+
+
+def _dump_mfsdp_grad_groups(module: torch.nn.Module) -> None:
+    """Debug: log per-FSDP-group local gradient norms on every rank.
+
+    Gated by ``MFSDP_DEBUG_GRAD_GROUPS=1``. The intermittent corruption shows
+    up as one parameter group whose local norm explodes; this pinpoints the
+    owning layer/module. Also reports how many reduce-scatter staging buffers
+    were still pending at the sync point (should be 0).
+    """
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
+        FsdpModule,
+    )
+
+    norms = []
+    for submodule in module.modules():
+        if not isinstance(submodule, FsdpModule):
+            continue
+        for group in submodule.parameter_groups:
+            if group.main_grad is None:
+                continue
+            owner = group.owning_module.__class__.__name__
+            norms.append((owner, torch.norm(group.main_grad.local_buffer).item()))
+    total = sum(n for _, n in norms)
+    top = sorted(norms, key=lambda x: -x[1])[:3]
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    pending = len(module.context.pending_reduce_buffers)
+    print(
+        f"[MFSDP_DEBUG rank {rank}] grad-group norms: total={total:.3f} "
+        f"pending_buffers={pending} top={[(n, round(v, 3)) for n, v in top]}",
+        flush=True,
+    )
 
 
 def FullyShardedDataParallel(
