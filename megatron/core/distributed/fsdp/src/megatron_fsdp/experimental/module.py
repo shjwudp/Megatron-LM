@@ -41,6 +41,12 @@ class FsdpContext:
     # True from the root pre-backward hook until autograd completes. Forward
     # hooks use this to identify activation recomputation inside backward.
     backward_phase: bool
+    # Staging buffers of in-flight gradient reduce-scatters. Reductions run
+    # asynchronously on ``reduce_scatter_stream``; keeping their input buffers
+    # referenced here — and releasing them at a sync point (``finalize_backward``
+    # / ``finish_grad_sync``) — stops the caching allocator from recycling a
+    # block while its collective still reads it.
+    pending_reduce_buffers: list
     root_module: "FsdpModule"
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
@@ -58,6 +64,7 @@ class FsdpContext:
         self.root_module = root_module
         self.is_last_microbatch = True
         self.backward_phase = False
+        self.pending_reduce_buffers = []
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         with torch.cuda.device(device):
@@ -81,7 +88,19 @@ class FsdpContext:
     def finalize_backward(self) -> None:
         """Order the current stream after reductions and leave the backward phase."""
         self.current_stream().wait_stream(self.reduce_scatter_stream)
+        self.pending_reduce_buffers.clear()
         self.backward_phase = False
+
+    def finish_grad_sync(self) -> None:
+        """Order the current stream after in-flight gradient reductions.
+
+        Called by the training loop before ``optimizer.step()`` (via
+        ``FullyShardedDataParallelV2.finish_grad_sync``). Waits for every
+        pending reduce-scatter and releases its staging buffers, so the
+        allocator can recycle them once the collectives complete.
+        """
+        self.current_stream().wait_stream(self.reduce_scatter_stream)
+        self.pending_reduce_buffers.clear()
 
 
 class FsdpModule:
@@ -466,6 +485,14 @@ class FsdpModule:
             reduce_scatter_stream.wait_stream(current_stream)
             with torch.cuda.stream(reduce_scatter_stream):
                 group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
+            # The reduce-scatter is asynchronous on reduce_scatter_stream, but
+            # this local goes out of scope immediately after the loop iteration.
+            # Dropping it here would let the caching allocator recycle the block
+            # (the free event on the current stream completes long before the
+            # in-flight collective drains) while the collective still reads it,
+            # corrupting one step's gradients. Keep it referenced until a sync
+            # point (finalize_backward / finish_grad_sync) drains the stream.
+            context.pending_reduce_buffers.append(partial_grad)
 
     def reduce_grad(self) -> None:
         """Public API: pack gradients and launch their reduce-scatters.
