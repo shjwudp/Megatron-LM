@@ -7,6 +7,7 @@ from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    gather_and_compute_chunk_metadata,
     uneven_dtensor_to_full_tensor,
 )
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
@@ -46,13 +47,32 @@ class TestMegatronFSDPE2E:
                 tensor = parameter.detach()
                 if isinstance(tensor, DTensor):
                     tensor = uneven_dtensor_to_full_tensor(tensor)
-                if torch.distributed.get_rank() == 0:
-                    name = cls._normalize_parameter_name(name)
-                    parameters[f"{chunk_index}.{name}"] = tensor.float().cpu()
+                name = cls._normalize_parameter_name(name)
+                parameters[f"{chunk_index}.{name}"] = tensor.float().cpu()
         return parameters
 
     @classmethod
-    def _run_training(cls, use_mfsdp_v2, case):
+    def _load_parameters(cls, model, reference_parameters):
+        with torch.no_grad():
+            for chunk_index, model_chunk in enumerate(model):
+                for name, parameter in model_chunk.named_parameters():
+                    name = cls._normalize_parameter_name(name)
+                    reference = reference_parameters[f"{chunk_index}.{name}"].to(
+                        device=parameter.device, dtype=parameter.dtype
+                    )
+                    tensor = parameter.detach()
+                    if isinstance(tensor, DTensor):
+                        chunk = gather_and_compute_chunk_metadata(tensor)
+                        local_slice = tuple(
+                            slice(offset, offset + size)
+                            for offset, size in zip(chunk.offsets, chunk.sizes)
+                        )
+                        tensor._local_tensor.copy_(reference[local_slice])
+                    else:
+                        tensor.copy_(reference)
+
+    @classmethod
+    def _run_training(cls, use_mfsdp_v2, case, initial_parameters=None):
         model_parallel_config = case["model_parallel_config"]
         Utils.initialize_model_parallel(**model_parallel_config)
         data_parallel_group = mpu.get_data_parallel_group()
@@ -83,14 +103,24 @@ class TestMegatronFSDPE2E:
                 **case["model_config"],
                 **fsdp_args,
             )
-            data_iterator = make_gpt_mock_data_iterator(
-                dp_group=data_parallel_group,
-                num_samples=cls.GLOBAL_BATCH_SIZE * cls.NUM_STEPS,
-                vocab_size=cls.VOCAB_SIZE,
-                sequence_length=cls.SEQUENCE_LENGTH,
-                batch_size=cls.MICRO_BATCH_SIZE,
-                seed=42,
-            )
+            if initial_parameters is not None:
+                cls._load_parameters(model, initial_parameters)
+                for sub_optimizer in getattr(optimizer, "chained_optimizers", [optimizer]):
+                    sub_optimizer._copy_main_params_to_model_params()
+
+            captured_initial_parameters = cls._capture_parameters(model)
+            data_iterators = [
+                make_gpt_mock_data_iterator(
+                    dp_group=data_parallel_group,
+                    num_samples=cls.GLOBAL_BATCH_SIZE * cls.NUM_STEPS,
+                    vocab_size=cls.VOCAB_SIZE,
+                    sequence_length=cls.SEQUENCE_LENGTH,
+                    batch_size=cls.MICRO_BATCH_SIZE,
+                    seed=42,
+                )
+                for _ in model
+            ]
+            data_iterator = data_iterators if len(model) > 1 else data_iterators[0]
             losses = []
             parameter_snapshots = []
             run_name = "MFSDP v2" if use_mfsdp_v2 else "Reference"
@@ -106,10 +136,23 @@ class TestMegatronFSDPE2E:
                     // cls.MICRO_BATCH_SIZE
                     // data_parallel_group.size(),
                 )
+                pipeline_parallel = model_parallel_config.get("pipeline_model_parallel_size", 1) > 1
+                if pipeline_parallel:
+                    if mpu.is_pipeline_last_stage():
+                        loss = output[-1]["lm loss"].detach().float().clone()
+                    else:
+                        loss = torch.zeros((), device="cuda")
+                else:
+                    loss = output[-1]["lm loss"].detach().cpu()
                 update_successful, grad_norm, _ = optimizer.step()
-                loss = output[-1]["lm loss"].detach().cpu()
+                if pipeline_parallel:
+                    torch.distributed.broadcast(
+                        loss,
+                        src=mpu.get_pipeline_model_parallel_last_rank(),
+                        group=mpu.get_pipeline_model_parallel_group(),
+                    )
+                    loss = loss.cpu()
                 losses.append(loss)
-                parameter_snapshots.append(cls._capture_parameters(model))
                 if torch.distributed.get_rank() == 0:
                     grad_norm_text = "None" if grad_norm is None else f"{float(grad_norm):.8f}"
                     print(
@@ -119,8 +162,13 @@ class TestMegatronFSDPE2E:
                         f"update_successful={update_successful}",
                         flush=True,
                     )
+                parameter_snapshots.append(cls._capture_parameters(model))
 
-            return {"losses": losses, "parameters": parameter_snapshots}
+            return {
+                "initial_parameters": captured_initial_parameters,
+                "losses": losses,
+                "parameters": parameter_snapshots,
+            }
         finally:
             Utils.destroy_model_parallel()
 
@@ -165,6 +213,30 @@ class TestMegatronFSDPE2E:
                 },
                 id="ep2-optim_grads_params-1f1b-overlap",
             ),
+            pytest.param(
+                {
+                    "name": "PP2 VPP2 EP2 optim_grads_params 1F1B overlap",
+                    "model_family": "gpt",
+                    "model_parallel_config": {
+                        "pipeline_model_parallel_size": 2,
+                        "virtual_pipeline_model_parallel_size": 2,
+                        "expert_model_parallel_size": 2,
+                    },
+                    "model_config": {
+                        "bf16": True,
+                        "data_parallel_sharding_strategy": "optim_grads_params",
+                        "megatron_fsdp_main_grads_dtype": torch.float32,
+                        "moe_grouped_gemm": True,
+                        "moe_token_dispatcher_type": "alltoall",
+                        "num_layers_per_virtual_pipeline_stage": 1,
+                        "overlap_moe_expert_parallel_comm": True,
+                        "delay_wgrad_compute": True,
+                    },
+                    "loss_tolerance": {"atol": 0, "rtol": 0.05},
+                    "parameter_tolerance": {"atol": 5e-3, "rtol": 1e-3},
+                },
+                id="pp2-vpp2-ep2-optim_grads_params-1f1b-overlap",
+            ),
         ],
     )
     def test_compatible_with_nd_parallel(self, case):
@@ -178,12 +250,11 @@ class TestMegatronFSDPE2E:
         if torch.distributed.get_rank() == 0:
             print(f"[{case['name']}] Reference run completed successfully.", flush=True)
 
-        actual = self._run_training(use_mfsdp_v2=True, case=case)
+        actual = self._run_training(
+            use_mfsdp_v2=True, case=case, initial_parameters=reference["initial_parameters"]
+        )
         if torch.distributed.get_rank() == 0:
             print(f"[{case['name']}] MFSDP v2 run completed successfully.", flush=True)
-
-        if torch.distributed.get_rank() != 0:
-            return
 
         assert len(actual["losses"]) == len(reference["losses"])
         for step, (loss, reference_loss) in enumerate(zip(actual["losses"], reference["losses"])):
@@ -193,3 +264,16 @@ class TestMegatronFSDPE2E:
                 **case["loss_tolerance"],
                 msg=lambda msg: f"Loss mismatch at step {step}: {msg}",
             )
+
+        assert len(actual["parameters"]) == len(reference["parameters"])
+        for step, (parameters, reference_parameters) in enumerate(
+            zip(actual["parameters"], reference["parameters"])
+        ):
+            assert parameters.keys() == reference_parameters.keys()
+            for name in parameters:
+                assert_close(
+                    parameters[name],
+                    reference_parameters[name],
+                    **case["parameter_tolerance"],
+                    msg=lambda msg: f"Parameter {name!r} mismatch at step {step}: {msg}",
+                )
