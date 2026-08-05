@@ -963,6 +963,52 @@ class TestMixedPrecision:
         loss.backward()
         assert not torch.isnan(torch.tensor(loss.item()))
 
+    @pytest.mark.parametrize(
+        ("grad_comm_dtype", "expected_record_stream_calls"),
+        [pytest.param(None, 0, id="same-dtype"), pytest.param(torch.float32, 1, id="cast-buffer")],
+    )
+    def test_grad_reduce_records_only_temporary_comm_input(
+        self, grad_comm_dtype, expected_record_stream_calls, monkeypatch
+    ):
+        """Track only temporary cast buffers on the reduce-scatter stream.
+
+        :param grad_comm_dtype: Gradient communication dtype, or None to use the
+            persistent main-gradient buffer directly.
+        :type grad_comm_dtype: Optional[torch.dtype]
+        :param expected_record_stream_calls: Expected allocator stream-tracking calls.
+        :type expected_record_stream_calls: int
+        :param monkeypatch: Pytest attribute patching fixture.
+        :type monkeypatch: pytest.MonkeyPatch
+        """
+        torch.manual_seed(42)
+        model = SimpleMLP(64).to(_device(), dtype=torch.bfloat16)
+        fully_shard(
+            model,
+            sharding_strategy="optim_grads_params",
+            mp_policy=MixedPrecisionPolicy(
+                main_grads_dtype=torch.bfloat16, grad_comm_dtype=grad_comm_dtype
+            ),
+            enable_async_reduce_grad=True,
+        )
+
+        record_stream_calls = []
+        original_record_stream = torch.Tensor.record_stream
+        monkeypatch.setattr(
+            torch.Tensor,
+            "record_stream",
+            lambda tensor, stream: (
+                record_stream_calls.append(tensor.data_ptr()),
+                original_record_stream(tensor, stream),
+            )[1],
+        )
+
+        model.set_is_last_backward(True)
+        x = torch.randn(2, 64, device=_device(), dtype=torch.bfloat16)
+        model(x).sum().backward()
+        model.finish_grad_sync()
+
+        assert len(record_stream_calls) == expected_record_stream_calls
+
 
 # ------------------------------------------------------------------ #
 #  6. ignored_params
