@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CUDA graph capture / replay for individual FSDP v2 modules.
+"""CUDA graph capture and replay for M-FSDP v2 modules.
 
 Built on ``te_graph_runtime.make_graphed_callables`` which supports
 ``capture_time_hooks`` — hooks that run outside CUDA graph capture (for
@@ -28,17 +28,194 @@ orchestrates:
      ``capture_time_hooks`` that perform unshard / reshard.
 """  # noqa: E501
 
+import contextlib
+import gc
 import inspect
 import logging
-from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple
+from collections import OrderedDict, defaultdict
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
-from torch.utils._pytree import tree_flatten
+from torch.utils._pytree import tree_flatten, tree_map
 
 from .dp_buffer import Placement
 
 logger = logging.getLogger(__name__)
+
+_CUDA_GRAPH_RUNTIME_ATTRS = (
+    "backward_dw",
+    "reset",
+    "_cuda_graph_preflight",
+    "_cuda_graph_set_replay_phase",
+)
+
+
+def _renew_fsdp_compute_parameter_leaves(
+    modules: Tuple[torch.nn.Module, ...]
+) -> List[Tuple[torch.nn.Parameter, torch.Tensor]]:
+    """Create fresh compute leaves before recompute backward-graph capture.
+
+    Each replacement shares the original CUDA storage but has a new Parameter
+    identity and AccumulateGrad node. This keeps graph addresses stable while
+    preventing eager-trace autograd state from entering the captured backward.
+
+    :param modules: M-FSDP modules whose compute leaves are renewed.
+    :type modules: Tuple[torch.nn.Module, ...]
+    :raises RuntimeError: If registered and compute parameter identities are inconsistent.
+    :return: Replacement leaves paired with gradients that must be restored.
+    :rtype: List[Tuple[torch.nn.Parameter, torch.Tensor]]
+    """
+    pending_gradients = []
+    for module in modules:
+        named_param_groups = getattr(module, "_named_param_groups", ())
+        if not named_param_groups:
+            continue
+        for param_names, param_group in named_param_groups:
+            dist_params = tuple(getattr(param_group, "dist_params", ()))
+            if len(dist_params) != len(param_group.params):
+                raise RuntimeError(
+                    "CUDA graph capture requires one optimizer-facing distributed "
+                    "parameter for each compute parameter"
+                )
+            for name, compute_parameter, dist_parameter in zip(
+                param_names, param_group.params, dist_params
+            ):
+                registered_parameter = module.get_parameter(name)
+                if registered_parameter is compute_parameter:
+                    raise RuntimeError(
+                        "CUDA graph capture must renew compute leaves after M-FSDP reshard"
+                    )
+                if registered_parameter is not dist_parameter:
+                    raise RuntimeError(
+                        "CUDA graph capture found an unexpected registered parameter identity"
+                    )
+
+            replacements = []
+            for parameter in param_group.params:
+                replacement = torch.nn.Parameter(
+                    parameter.detach(), requires_grad=parameter.requires_grad
+                )
+                replacement.__dict__.update(parameter.__dict__)
+                replacement.__dict__.pop("main_grad", None)
+                replacements.append(replacement)
+                if parameter.grad is not None:
+                    pending_gradients.append((replacement, parameter.grad))
+
+            param_group.params = replacements
+            param_group.param_idx = {
+                parameter: index for index, parameter in enumerate(replacements)
+            }
+            for buffer in (
+                param_group.model_weight_buffer,
+                param_group.transpose_weight_buffer,
+                param_group.main_weight_buffer,
+                param_group.main_grad_buffer,
+            ):
+                if buffer is not None:
+                    buffer.params = replacements
+                    buffer.param_idx = param_group.param_idx
+        module._init_param_main_grad_func()
+    return pending_gradients
+
+
+def _restore_pending_compute_gradients(
+    pending_gradients: List[Tuple[torch.nn.Parameter, torch.Tensor]]
+) -> None:
+    """Attach pre-capture gradients to replacement compute leaves.
+
+    :param pending_gradients: Replacement leaves and their saved gradients.
+    :type pending_gradients: List[Tuple[torch.nn.Parameter, torch.Tensor]]
+    """
+    for parameter, gradient in pending_gradients:
+        parameter.grad = gradient
+    pending_gradients.clear()
+
+
+def _cuda_autocast_state() -> Tuple[bool, Optional[torch.dtype]]:
+    """Return the CUDA autocast enabled flag and dtype.
+
+    The autocast cache state is deliberately excluded: capture always pins
+    ``cache_enabled=False``, so recording it would only reject captures for a
+    difference that cannot affect the graphs.
+
+    :return: CUDA autocast enabled state and active dtype.
+    :rtype: Tuple[bool, Optional[torch.dtype]]
+    """
+    try:
+        enabled = torch.is_autocast_enabled("cuda")
+    except TypeError:
+        enabled = torch.is_autocast_enabled()
+    if not enabled:
+        return False, None
+    try:
+        dtype = torch.get_autocast_dtype("cuda")
+    except AttributeError:
+        dtype = torch.get_autocast_gpu_dtype()
+    return True, dtype
+
+
+def _normalize_forward_call(
+    module: torch.nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]
+) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+    """Rebuild a recorded forward call without nesting variadic arguments.
+
+    :param module: Module whose forward signature defines argument binding.
+    :type module: torch.nn.Module
+    :param args: Recorded positional arguments.
+    :type args: Tuple[Any, ...]
+    :param kwargs: Recorded keyword arguments.
+    :type kwargs: Dict[str, Any]
+    :raises TypeError: If the recorded arguments do not match the forward signature.
+    :return: Normalized positional and keyword arguments.
+    :rtype: Tuple[Tuple[Any, ...], Dict[str, Any]]
+    """
+    signature = inspect.signature(_get_cuda_graph_forward_impl(module))
+    has_self = "self" in signature.parameters
+    bound = signature.bind(module, *args, **kwargs) if has_self else signature.bind(*args, **kwargs)
+    normalized_args = []
+    normalized_kwargs = {}
+    positional_remaining = len(args)
+    has_varargs = any(
+        parameter.kind is inspect.Parameter.VAR_POSITIONAL and bool(bound.arguments.get(name))
+        for name, parameter in signature.parameters.items()
+    )
+    for name, parameter in signature.parameters.items():
+        if has_self and name == "self":
+            continue
+        if name not in bound.arguments:
+            continue
+        value = bound.arguments[name]
+        if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+            normalized_args.append(value)
+            positional_remaining -= 1
+        elif (
+            parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+            and has_varargs
+            and positional_remaining
+        ):
+            normalized_args.append(value)
+            positional_remaining -= 1
+        elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            normalized_args.extend(value)
+            positional_remaining = 0
+        elif parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            normalized_kwargs.update(value)
+        else:
+            normalized_kwargs[name] = value
+    return tuple(normalized_args), normalized_kwargs
+
+
+def _requires_grad_surface(value: Any) -> Any:
+    """Replace tensor leaves with their ``requires_grad`` flags.
+
+    :param value: Tensor pytree whose gradient surface is recorded.
+    :type value: Any
+    :return: Matching pytree containing booleans for tensor leaves.
+    :rtype: Any
+    """
+    return tree_map(
+        lambda leaf: bool(leaf.requires_grad) if isinstance(leaf, torch.Tensor) else None, value
+    )
 
 
 def _tensor_storage_key(tensor: torch.Tensor) -> Tuple[Any, ...]:
@@ -55,63 +232,55 @@ def _tensor_storage_key(tensor: torch.Tensor) -> Tuple[Any, ...]:
         tuple(tensor.shape),
         tensor.stride(),
         tensor.dtype,
+        tensor.layout,
         tensor.device,
+        tensor.is_conj(),
+        tensor.is_neg(),
     )
 
 
-# ---------------------------------------------------------------------------
-# NVML memory helper (real GPU memory, not just torch allocator view)
-# ---------------------------------------------------------------------------
+def _is_direct_autograd_alias(input_tensor: torch.Tensor, output_tensor: torch.Tensor) -> bool:
+    """Return whether an input is the producer output or its direct autograd view.
+
+    :param input_tensor: Candidate consumer input.
+    :type input_tensor: torch.Tensor
+    :param output_tensor: Candidate producer output.
+    :type output_tensor: torch.Tensor
+    :return: Whether the tensors are identical or connected by one autograd view.
+    :rtype: bool
+    """
+    if input_tensor.numel() == 0 or output_tensor.numel() == 0:
+        return False
+    if input_tensor is output_tensor:
+        return True
+    if input_tensor.requires_grad != output_tensor.requires_grad:
+        return False
+    input_grad_fn = input_tensor.grad_fn
+    output_grad_fn = output_tensor.grad_fn
+    if input_grad_fn is None or output_grad_fn is None:
+        return False
+    return any(next_fn is output_grad_fn for next_fn, _ in input_grad_fn.next_functions)
 
 
-def _nvml_device_memory(device: Optional[int] = None) -> Optional[Tuple[int, int]]:
-    """Return (used_MiB, total_MiB) from NVML, or None if unavailable."""
-    try:
-        import pynvml
-    except ImportError:
-        return None
-    try:
-        pynvml.nvmlInit()
-    except pynvml.NVMLError:
-        return None
-    try:
-        if device is None:
-            device = torch.cuda.current_device()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device)
-        info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        return (info.used // (1024 * 1024), info.total // (1024 * 1024))
-    except Exception:
-        return None
+def _validate_activation_recompute_lifetime(
+    lifetime_events: List[Tuple[str, int]], module_count: int
+) -> None:
+    """Require one complete F, RF, and B sequence per captured module.
 
-
-def _mem_snapshot() -> Dict[str, int]:
-    """Capture a snapshot of memory counters across torch and NVML."""
-    snap = {
-        "torch_alloc": torch.cuda.memory_allocated() // 1_000_000,
-        "torch_reserved": torch.cuda.memory_reserved() // 1_000_000,
-    }
-    nvml = _nvml_device_memory()
-    if nvml is not None:
-        snap["nvml_used"] = nvml[0]
-        snap["nvml_total"] = nvml[1]
-    return snap
-
-
-def _fmt_mem_snapshot(before: Dict[str, int], after: Dict[str, int], peak_alloc: int) -> str:
-    """Format memory diff as a human-readable string."""
-    parts = [
-        f"torch_alloc {before['torch_alloc']}→{after['torch_alloc']} MB "
-        f"(Δ{after['torch_alloc'] - before['torch_alloc']:+d})",
-        f"torch_reserved {before['torch_reserved']}→{after['torch_reserved']} MB "
-        f"(Δ{after['torch_reserved'] - before['torch_reserved']:+d})",
-        f"peak_alloc {peak_alloc // 1_000_000} MB",
-    ]
-    if "nvml_used" in before:
-        parts.append(
-            f"nvml_used {before['nvml_used']}→{after['nvml_used']} MB "
-            f"(Δ{after['nvml_used'] - before['nvml_used']:+d})"
+    :param lifetime_events: Recorded phase and module-index events.
+    :type lifetime_events: List[Tuple[str, int]]
+    :param module_count: Number of captured modules.
+    :type module_count: int
+    :raises RuntimeError: If the observed execution order is unsupported.
+    """
+    expected = [("forward", module_idx) for module_idx in range(module_count)]
+    for module_idx in reversed(range(module_count)):
+        expected.extend((("recompute", module_idx), ("backward", module_idx)))
+    if lifetime_events != expected:
+        raise RuntimeError(
+            "Activation-recompute CUDA graphs require one captured module per "
+            "checkpoint region and reverse F/RF/B execution order"
         )
-    return "  ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +317,31 @@ def _restore_all_hooks(saved):
         for name, value in snap.items():
             if value is not None:
                 setattr(sub, name, value)
+
+
+def _get_cuda_graph_forward_impl(module: torch.nn.Module) -> Callable:
+    """Return the replaceable forward behind the stable compile boundary.
+
+    :param module: Module that may have CUDA Graph dispatch installed.
+    :type module: torch.nn.Module
+    :return: Current forward implementation owned by the runner.
+    :rtype: Callable
+    """
+    return module.__dict__.get("_mfsdp_cuda_graph_forward_impl", module.forward)
+
+
+def _set_cuda_graph_forward_impl(module: torch.nn.Module, forward: Callable) -> None:
+    """Replace a forward without invalidating a compiled parent module.
+
+    :param module: Module whose forward implementation is replaced.
+    :type module: torch.nn.Module
+    :param forward: Replacement forward callable.
+    :type forward: Callable
+    """
+    if "_mfsdp_cuda_graph_forward_impl" in module.__dict__:
+        module._mfsdp_cuda_graph_forward_impl = forward
+    else:
+        module.forward = forward
 
 
 def _prepare_compiled_modules_for_capture(modules):
@@ -194,72 +388,318 @@ def _restore_compiled_modules_after_capture_failure(saved):
         module._compiled_call_impl = compiled_call_impl
 
 
+def _build_input_output_aliases(
+    modules: Tuple[torch.nn.Module, ...],
+    sample_outputs: Dict[int, Any],
+    sample_args: Dict[int, Tuple[Any, ...]],
+    sample_kwargs: Dict[int, Dict[str, Any]],
+) -> Tuple[Dict[int, Tuple[int, int]], ...]:
+    """Match consumer inputs to an unambiguous earlier autograd output.
+
+    :param modules: Captured modules in forward order.
+    :type modules: Tuple[torch.nn.Module, ...]
+    :param sample_outputs: Recorded eager outputs keyed by module identity.
+    :type sample_outputs: Dict[int, Any]
+    :param sample_args: Recorded positional inputs keyed by module identity.
+    :type sample_args: Dict[int, Tuple[Any, ...]]
+    :param sample_kwargs: Recorded keyword inputs keyed by module identity.
+    :type sample_kwargs: Dict[int, Dict[str, Any]]
+    :return: Consumer-input mappings to producer module and output indices.
+    :rtype: Tuple[Dict[int, Tuple[int, int]], ...]
+    """
+    producer_outputs: Dict[Tuple[Any, ...], List[Tuple[int, int, torch.Tensor]]] = {}
+    aliases_by_consumer = []
+    for consumer_idx, module in enumerate(modules):
+        mid = id(module)
+        flat_args, _ = tree_flatten(sample_args[mid])
+        flat_kwargs, _ = tree_flatten(list(sample_kwargs[mid].values()))
+        aliases = {}
+        for input_idx, input_tensor in enumerate(flat_args + flat_kwargs):
+            if not isinstance(input_tensor, torch.Tensor) or input_tensor.numel() == 0:
+                continue
+            candidates = producer_outputs.get(_tensor_storage_key(input_tensor), ())
+            producer = None
+            exact_matches = [candidate for candidate in candidates if input_tensor is candidate[2]]
+            if len(exact_matches) == 1:
+                producer = exact_matches[0][:2]
+            elif not exact_matches:
+                direct_matches = [
+                    candidate
+                    for candidate in candidates
+                    if _is_direct_autograd_alias(input_tensor, candidate[2])
+                ]
+                if len(direct_matches) == 1:
+                    producer = direct_matches[0][:2]
+            if producer is not None and producer[0] < consumer_idx:
+                aliases[input_idx] = producer
+        aliases_by_consumer.append(aliases)
+
+        # Address reuse does not identify the autograd edge. Keep every
+        # same-storage output from the latest producer, then link only one
+        # unambiguous object or direct view.
+        flat_outputs, _ = tree_flatten(sample_outputs.get(mid, ()))
+        current_outputs = defaultdict(list)
+        for output_idx, output in enumerate(flat_outputs):
+            if isinstance(output, torch.Tensor) and output.numel() != 0:
+                current_outputs[_tensor_storage_key(output)].append(
+                    (consumer_idx, output_idx, output)
+                )
+        producer_outputs.update(current_outputs)
+    return tuple(aliases_by_consumer)
+
+
 class CudaGraphRunner:
     """Orchestrates per-module sample-arg recording and batch graph capture.
 
     Created once by the root forward pre-hook and stored on
     ``ctx.cuda_graph_runner``.
+
+    :param graph_pool: CUDA graph memory-pool handle, or None.
+    :type graph_pool: Any
+    :param num_warmup_iters: Number of warmup iterations, defaults to 3.
+    :type num_warmup_iters: int, optional
+    :param activation_recompute: Whether to capture separate F, RF, and B programs.
+    :type activation_recompute: bool, optional
     """
 
-    def __init__(self, graph_pool: Any, num_warmup_iters: int = 3):
+    def __init__(
+        self, graph_pool: Any, num_warmup_iters: int = 3, activation_recompute: bool = False
+    ):
         self._graph_pool = graph_pool
         self._num_warmup = num_warmup_iters
         self._captured = False
+        self._activation_recompute = activation_recompute
 
         # Per-module state recorded during the first optimized forward.
         self._sample_args: Dict[int, Tuple] = {}
         self._sample_kwargs: Dict[int, Dict[str, Any]] = {}
         self._sample_outputs: Dict[int, Any] = {}
         self._modules_ordered: List[torch.nn.Module] = []
+        self._module_indices: Dict[int, int] = {}
+        self._original_forwards: Dict[int, Callable] = {}
+        self._original_graph_attrs: Dict[int, Dict[str, Any]] = {}
         self._compiled_module_state = []
+        self._autocast_states: Dict[int, Tuple[bool, Optional[torch.dtype], bool]] = {}
+        self._recompute_requires_grad: Dict[int, Tuple[Any, Any]] = {}
+        self._lifetime_events: List[Tuple[str, int]] = []
 
     # ---- called from hooks ------------------------------------------------
+    @property
+    def captured(self) -> bool:
+        """Return whether graph programs have been captured and installed.
+
+        :return: Whether capture and module installation have completed.
+        :rtype: bool
+        """
+        return self._captured
+
+    def preflight_record_module(self, module: torch.nn.Module) -> None:
+        """Reject a second forward of a recorded module before its backward.
+
+        Only called for normal training forwards (the hook gates on
+        ``replay_phase == "forward"``).
+
+        :param module: Module about to begin a recorded forward.
+        :type module: torch.nn.Module
+        :raises RuntimeError: If its previous forward has not completed backward.
+        """
+        if self._captured or not self._activation_recompute:
+            return
+        mid = id(module)
+        if mid not in self._sample_args:
+            return
+        module_idx = self._module_indices[mid]
+        # A second F would overwrite the static inputs still needed by RF and B.
+        if ("backward", module_idx) not in self._lifetime_events:
+            raise RuntimeError(
+                "Activation-recompute CUDA graphs require backward to finish "
+                "before the next forward of the same module"
+            )
 
     def record_module(self, module: torch.nn.Module, args: Tuple, kwargs: Dict[str, Any]) -> None:
-        """Record sample args for *module* during the first optimized forward."""
+        """Record one module call during the first optimized forward."""
         if self._captured:
             return
         mid = id(module)
         if mid in self._sample_args:
             return
-
-        # Normalize Module.compile() before capture setup. te-graph-runtime
-        # detects this compiled forward body and warms the capture-equivalent
-        # hook specialization before entering torch.cuda.graph.
-        self._compiled_module_state.extend(_prepare_compiled_modules_for_capture([module]))
-
-        sig = inspect.signature(module.forward)
-        has_self = "self" in sig.parameters
-        bound = sig.bind(module, *args, **kwargs) if has_self else sig.bind(*args, **kwargs)
-        all_kwargs = {
-            n: bound.arguments[n] for n in bound.arguments if not (has_self and n == "self")
+        self._original_forwards[mid] = _get_cuda_graph_forward_impl(module)
+        self._original_graph_attrs[mid] = {
+            name: module.__dict__[name]
+            for name in _CUDA_GRAPH_RUNTIME_ATTRS
+            if name in module.__dict__
         }
-        self._sample_args[mid] = tuple()  # all via kwargs
-        self._sample_kwargs[mid] = all_kwargs
-        self._modules_ordered.append(module)
 
-        n_tensor = sum(1 for v in all_kwargs.values() if isinstance(v, torch.Tensor))
+        normalized_args, normalized_kwargs = _normalize_forward_call(module, args, kwargs)
+        self._sample_args[mid] = normalized_args
+        self._sample_kwargs[mid] = normalized_kwargs
+        self._autocast_states[mid] = _cuda_autocast_state()
+        module_idx = len(self._modules_ordered)
+        self._module_indices[mid] = module_idx
+        self._modules_ordered.append(module)
+        self._lifetime_events.append(("forward", module_idx))
+        flat_args, _ = tree_flatten(normalized_args)
+        flat_kwargs, _ = tree_flatten(normalized_kwargs)
+        n_tensor = sum(isinstance(value, torch.Tensor) for value in (*flat_args, *flat_kwargs))
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info(
-                "CudaGraphRunner: recorded module %s (id=%s), " "%d kwargs (%d tensor)",
+                "CudaGraphRunner: recorded module %s (id=%s), %d kwargs (%d tensor)",
                 getattr(module, "_fsdp_module_name", module.__class__.__name__),
                 id(module),
-                len(all_kwargs),
+                len(normalized_kwargs),
                 n_tensor,
             )
+
+    def record_module_recompute(
+        self,
+        module: torch.nn.Module,
+        args: Optional[Tuple[Any, ...]] = None,
+        kwargs: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record one module call during checkpoint recomputation.
+
+        :param module: Module observed during recomputation.
+        :type module: torch.nn.Module
+        :param args: Recompute positional arguments, defaults to None.
+        :type args: Tuple[Any, ...], optional
+        :param kwargs: Recompute keyword arguments, defaults to None.
+        :type kwargs: Dict[str, Any], optional
+        """
+        if self._captured or not self._activation_recompute:
+            return
+        mid = id(module)
+        module_idx = self._module_indices.get(mid)
+        if module_idx is None or ("recompute", module_idx) in self._lifetime_events:
+            return
+        recompute_requires_grad = None
+        if args is not None:
+            normalized_args, normalized_kwargs = _normalize_forward_call(module, args, kwargs or {})
+            recompute_requires_grad = (
+                _requires_grad_surface(normalized_args),
+                _requires_grad_surface(normalized_kwargs),
+            )
+        if recompute_requires_grad is not None:
+            self._recompute_requires_grad[mid] = recompute_requires_grad
+        self._lifetime_events.append(("recompute", module_idx))
+
+    def owns_module(self, module: torch.nn.Module) -> bool:
+        """Return whether this runner recorded ``module`` for replay.
+
+        :param module: Module whose ownership is queried.
+        :type module: torch.nn.Module
+        :return: Whether this runner owns the module.
+        :rtype: bool
+        """
+        return id(module) in self._module_indices
+
+    def prepare_module_replay(self, module: torch.nn.Module, replay_phase: str) -> None:
+        """Select and validate the next F or RF replay.
+
+        :param module: Captured module about to replay.
+        :type module: torch.nn.Module
+        :param replay_phase: Program to select, either ``forward`` or ``recompute``.
+        :type replay_phase: str
+        :raises RuntimeError: If replay selection or preflight is unavailable.
+        """
+        if not self._activation_recompute or not self._captured or not self.owns_module(module):
+            return
+        setter = module.__dict__.get("_cuda_graph_set_replay_phase")
+        if not callable(setter):
+            raise RuntimeError("Captured activation-recompute module has no replay selector")
+        setter(replay_phase)
+        preflight = module.__dict__.get("_cuda_graph_preflight")
+        if not callable(preflight):
+            raise RuntimeError("Captured activation-recompute module has no replay preflight")
+        preflight()
 
     def record_module_output(self, module: torch.nn.Module, output: Any) -> None:
         """Record an eager output for static graph linking.
 
-        :param module: Recorded FSDP module.
+        :param module: Recorded M-FSDP module.
         :type module: torch.nn.Module
         :param output: Output from the eager sample forward.
         :type output: Any
         """
         mid = id(module)
-        if self._captured or mid not in self._sample_args or mid in self._sample_outputs:
+        if self._captured:
+            return
+        if mid not in self._sample_args or mid in self._sample_outputs:
             return
         self._sample_outputs[mid] = output
+
+    def reset(self) -> None:
+        """Destroy captured graphs and restore the original module callables."""
+        reset_function_ids = set()
+        for module in self._modules_ordered:
+            original_attrs = self._original_graph_attrs.get(id(module), {})
+            graph_reset = module.__dict__.get("reset")
+            if (
+                self._captured
+                and callable(graph_reset)
+                and graph_reset is not original_attrs.get("reset")
+                and id(graph_reset) not in reset_function_ids
+            ):
+                reset_function_ids.add(id(graph_reset))
+                graph_reset()
+            original_forward = self._original_forwards.get(id(module))
+            if original_forward is not None:
+                _set_cuda_graph_forward_impl(module, original_forward)
+            for name in _CUDA_GRAPH_RUNTIME_ATTRS:
+                if name in original_attrs:
+                    setattr(module, name, original_attrs[name])
+                else:
+                    module.__dict__.pop(name, None)
+            module.__dict__.pop("_fsdp_cg_installed", None)
+            for param_group in getattr(module, "_fsdp_param_groups", ()):
+                for param in param_group.params:
+                    param.__dict__.pop("_mfsdp_recorded_te_wgrad", None)
+                release_grad_storage = getattr(param_group, "_release_grad_storage_if_unused", None)
+                if callable(release_grad_storage):
+                    release_grad_storage()
+
+        if not self._captured:
+            _restore_compiled_modules_after_capture_failure(self._compiled_module_state)
+
+        self._sample_args.clear()
+        self._sample_kwargs.clear()
+        self._sample_outputs.clear()
+        self._modules_ordered.clear()
+        self._module_indices.clear()
+        self._original_forwards.clear()
+        self._original_graph_attrs.clear()
+        self._compiled_module_state.clear()
+        self._autocast_states.clear()
+        self._recompute_requires_grad.clear()
+        self._lifetime_events.clear()
+        self._captured = False
+
+    def complete_module_backward(self, module: torch.nn.Module) -> bool:
+        """Consume one backward event owned by this runner.
+
+        Caller contract (mfsdp_post_backward_hook): only invoked for
+        activation-recompute runners on modules this runner owns.
+
+        :param module: Module whose backward event completed.
+        :type module: torch.nn.Module
+        :raises RuntimeError: If recompute was not observed before backward.
+        :return: Whether this runner consumed the backward event.
+        :rtype: bool
+        """
+        if self._captured:
+            return True
+
+        module_idx = self._module_indices[id(module)]
+        # Capturing B without an observed RF would bind an invalid autograd tape.
+        if ("recompute", module_idx) not in self._lifetime_events:
+            raise RuntimeError(
+                "Activation-recompute CUDA graphs did not observe checkpoint "
+                "recomputation before backward; use non-reentrant activation "
+                "checkpointing or disable cuda_graph_activation_recompute"
+            )
+        if ("backward", module_idx) in self._lifetime_events:
+            return True
+        self._lifetime_events.append(("backward", module_idx))
+        return True
 
     def capture_and_install(
         self, root_module: torch.nn.Module, capture_stream: Optional[torch.cuda.Stream] = None
@@ -267,62 +707,77 @@ class CudaGraphRunner:
         """Capture all graphs + install wrappers on recorded modules."""
         if self._captured or not self._modules_ordered:
             return
-        self._captured = True
 
-        modules = self._modules_ordered
+        modules = tuple(self._modules_ordered)
         n = len(modules)
-        saved_parameter_grads = tuple(
-            (param, param.grad)
-            for module in modules
-            for param_group in module._fsdp_param_groups
-            for param in param_group.params
-        )
+        autocast_states = {self._autocast_states[id(module)] for module in modules}
+        # One capture context cannot reproduce mixed per-module autocast states.
+        if len(autocast_states) != 1:
+            raise RuntimeError("CUDA graph capture requires one recorded CUDA autocast state")
+        autocast_enabled, autocast_dtype = next(iter(autocast_states))
+        activation_recompute = self._activation_recompute
+        if activation_recompute:
+            _validate_activation_recompute_lifetime(self._lifetime_events, len(modules))
+
+        # Recording must finish before replacing Module.compile()'s callable.
+        # Otherwise one checkpoint invocation can run F and RF through
+        # different compiled specializations.
+        self._compiled_module_state.extend(_prepare_compiled_modules_for_capture(modules))
+        for module in modules:
+            self._original_forwards[id(module)] = _get_cuda_graph_forward_impl(module)
+
+        if activation_recompute:
+            pending_compute_gradients = _renew_fsdp_compute_parameter_leaves(modules)
+            gc.collect()
+        else:
+            pending_compute_gradients = []
+        if activation_recompute:
+            for module in modules:
+                for param_group in module._fsdp_param_groups:
+                    # Stale distributed grads would be captured as live accumulation state.
+                    if any(param.grad is not None for param in param_group.dist_params):
+                        _restore_pending_compute_gradients(pending_compute_gradients)
+                        self.reset()
+                        raise RuntimeError(
+                            "Activation-recompute CUDA graph capture requires gradients "
+                            "to be cleared before the next forward"
+                        )
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info("CudaGraphRunner: capturing %d modules", n)
 
-        # Use the installed runtime only when it supports M-FSDP capture.
-        try:
-            from te_graph_runtime import make_graphed_callables
-            from te_graph_runtime.graph import (
-                _get_compatible_main_grad_buffer as _installed_static_grad_support,
-            )
-            from te_graph_runtime.graph import (
-                _refresh_module_parameter_surface as _installed_parameter_refresh,
-            )
-
-            if not all(
-                callable(helper)
-                for helper in (_installed_static_grad_support, _installed_parameter_refresh)
-            ):
-                raise ImportError("Installed te-graph-runtime lacks M-FSDP CUDA graph support")
-        except ImportError:
+        # Activation recompute requires the vendored three-program runtime.
+        if activation_recompute:
             from .te_graph_runtime import make_graphed_callables
+        else:
+            try:
+                from te_graph_runtime import make_graphed_callables
+                from te_graph_runtime.graph import (
+                    _get_compatible_main_grad_buffer as _installed_static_grad_support,
+                )
+                from te_graph_runtime.graph import (
+                    _refresh_module_parameter_surface as _installed_parameter_refresh,
+                )
+
+                installed_runtime_supported = (
+                    all(
+                        callable(helper)
+                        for helper in (_installed_static_grad_support, _installed_parameter_refresh)
+                    )
+                    and "use_main_grad" in inspect.signature(make_graphed_callables).parameters
+                )
+                if not installed_runtime_supported:
+                    from .te_graph_runtime import make_graphed_callables
+            except ImportError:
+                from .te_graph_runtime import make_graphed_callables
 
         sample_args_list: List[Tuple] = []
         sample_kwargs_list: List[Dict[str, Any]] = []
         capture_hooks: List[Dict] = []
 
-        producer_outputs: Dict[Tuple[Any, ...], Tuple[int, int]] = {}
-        input_output_aliases: List[Dict[int, Tuple[int, int]]] = []
-        for producer_idx, module in enumerate(modules):
-            flat_outputs, _ = tree_flatten(self._sample_outputs.get(id(module), ()))
-            for output_idx, output in enumerate(flat_outputs):
-                if isinstance(output, torch.Tensor):
-                    producer_outputs[_tensor_storage_key(output)] = (producer_idx, output_idx)
-
-        for consumer_idx, module in enumerate(modules):
-            mid = id(module)
-            flat_args, _ = tree_flatten(self._sample_args[mid])
-            flat_kwargs, _ = tree_flatten(list(self._sample_kwargs[mid].values()))
-            aliases = {}
-            for input_idx, input_tensor in enumerate(flat_args + flat_kwargs):
-                if not isinstance(input_tensor, torch.Tensor):
-                    continue
-                producer = producer_outputs.get(_tensor_storage_key(input_tensor))
-                if producer is not None and producer[0] < consumer_idx:
-                    aliases[input_idx] = producer
-            input_output_aliases.append(aliases)
+        input_output_aliases = _build_input_output_aliases(
+            modules, self._sample_outputs, self._sample_args, self._sample_kwargs
+        )
 
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             logger.info(
@@ -331,44 +786,38 @@ class CudaGraphRunner:
             )
 
         for m in modules:
-            mid = id(m)
-            # Clone tensor values so warmup gets fresh leaves without
-            # residual autograd state from the first forward+backward.
-            args = tuple(
-                (
-                    v.detach().clone().requires_grad_(v.requires_grad)
-                    if isinstance(v, torch.Tensor)
-                    else v
-                )
-                for v in self._sample_args[mid]
-            )
-            kw = {
-                k: (
-                    v.detach().clone().requires_grad_(v.requires_grad)
-                    if isinstance(v, torch.Tensor)
-                    else v
-                )
-                for k, v in self._sample_kwargs[mid].items()
-            }
-            sample_args_list.append(args)
-            sample_kwargs_list.append(kw)
-
             capture_hooks.append(
                 {
                     "forward_pre_hooks": {0: _make_fwd_pre_hook(m)},
                     "forward_pre_hooks_with_kwargs": {0: True},
                     "forward_hooks": {0: _make_fwd_post_hook(m)},
                     "forward_hooks_with_kwargs": {0: True},
-                    "backward_pre_hooks": {0: _make_bwd_pre_hook(m)},
+                    "backward_pre_hooks": {
+                        0: _make_bwd_pre_hook(m, activation_recompute=activation_recompute)
+                    },
                     "backward_hooks": {0: _make_bwd_post_hook(m)},
                 }
             )
 
-        self._sample_args.clear()
-        self._sample_kwargs.clear()
-        self._sample_outputs.clear()
+        for m in modules:
+            mid = id(m)
+            recompute_requires_grad = self._recompute_requires_grad.get(mid)
+            # RF input grad metadata defines the leaves consumed by captured B.
+            if activation_recompute and recompute_requires_grad is None:
+                raise RuntimeError(
+                    "Activation-recompute CUDA graph capture is missing RF input metadata"
+                )
+            args_requires_grad, kwargs_requires_grad = (
+                recompute_requires_grad if recompute_requires_grad is not None else (None, None)
+            )
+            # Clone tensor values so warmup gets fresh leaves without
+            # residual autograd state from the first forward+backward.
+            args = _clone_capture_sample(self._sample_args[mid], args_requires_grad)
+            kw = _clone_capture_sample(self._sample_kwargs[mid], kwargs_requires_grad)
+            sample_args_list.append(args)
+            sample_kwargs_list.append(kw)
 
-        compiled_module_state = self._compiled_module_state
+        compiled_module_state = list(self._compiled_module_state)
         if compiled_module_state and (
             not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
         ):
@@ -378,11 +827,10 @@ class CudaGraphRunner:
                 len(compiled_module_state),
             )
 
-        # Pop real FSDP hooks so make_graphed_callables passes its assertion.
-        # capture_time_hooks handle unshard/reshard during warmup + capture.
-        saved_hooks = _pop_all_hooks(root_module)
-
         runtime_options = {}
+        if activation_recompute:
+            runtime_options["_activation_recompute"] = True
+            runtime_options["_reuse_graph_input_output_buffers"] = True
         supports_input_output_aliases = (
             "_input_output_aliases" in inspect.signature(make_graphed_callables).parameters
         )
@@ -393,40 +841,46 @@ class CudaGraphRunner:
                 supports_input_output_aliases = True
             runtime_options["_input_output_aliases"] = tuple(input_output_aliases)
 
+        # Pop real FSDP hooks so make_graphed_callables passes its assertion.
+        # capture_time_hooks handle unshard/reshard during warmup + capture.
+        saved_hooks = _pop_all_hooks(root_module)
+        self._sample_args.clear()
+        self._sample_kwargs.clear()
+        self._sample_outputs.clear()
+        gc.collect()
+
         try:
-            torch.cuda.reset_peak_memory_stats()
-            _mem_before = _mem_snapshot()
+            with contextlib.ExitStack() as cleanup:
+                cleanup.callback(_restore_pending_compute_gradients, pending_compute_gradients)
+                cleanup.callback(_restore_all_hooks, saved_hooks)
 
-            graphed = make_graphed_callables(
-                tuple(modules),
-                sample_args_list,
-                num_warmup_iters=self._num_warmup,
-                sample_kwargs=sample_kwargs_list,
-                pool=self._graph_pool,
-                capture_time_hooks=capture_hooks,
-                capture_stream=capture_stream,
-                **runtime_options,
-            )
+                autocast_kwargs = {"enabled": autocast_enabled, "cache_enabled": False}
+                if autocast_enabled:
+                    autocast_kwargs["dtype"] = autocast_dtype
+                with torch.amp.autocast("cuda", **autocast_kwargs):
+                    make_graphed_callables(
+                        tuple(modules),
+                        sample_args_list,
+                        num_warmup_iters=self._num_warmup,
+                        sample_kwargs=sample_kwargs_list,
+                        pool=self._graph_pool,
+                        capture_time_hooks=capture_hooks,
+                        capture_stream=capture_stream,
+                        use_main_grad=True,
+                        **runtime_options,
+                    )
         except Exception:
-            _restore_compiled_modules_after_capture_failure(compiled_module_state)
+            for module in modules:
+                try:
+                    module.reshard()
+                except Exception:
+                    logger.exception("Failed to reshard after CUDA graph capture error")
+            self.reset()
             raise
-        finally:
-            _restore_all_hooks(saved_hooks)
-            for param, grad in saved_parameter_grads:
-                param.grad = grad
-
-        _mem_after = _mem_snapshot()
-        _peak_alloc = torch.cuda.max_memory_allocated()
+        self._captured = True
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            logger.info(
-                "CudaGraphRunner: %d modules captured  %s",
-                n,
-                _fmt_mem_snapshot(_mem_before, _mem_after, _peak_alloc),
-            )
-
-        if not isinstance(graphed, tuple):
-            graphed = (graphed,)
+            logger.info("CudaGraphRunner: captured %d modules", n)
 
         # make_graphed_callables already replaced module.forward with
         # the graphed version that handles kwargs natively.
@@ -443,7 +897,49 @@ class CudaGraphRunner:
 # ---------------------------------------------------------------------------
 
 
+def _clone_capture_sample(value: Any, requires_grad_surface: Any = None) -> Any:
+    """Clone tensor leaves using recompute-forward gradient metadata.
+
+    :param value: Recorded input pytree to clone.
+    :type value: Any
+    :param requires_grad_surface: Matching gradient-flag pytree, defaults to None.
+    :type requires_grad_surface: Any, optional
+    :raises RuntimeError: If the value and gradient pytrees differ.
+    :return: Cloned input pytree.
+    :rtype: Any
+    """
+
+    if requires_grad_surface is None:
+        requires_grad_surface = _requires_grad_surface(value)
+    flat_values, value_spec = tree_flatten(value)
+    flat_requires_grad, requires_grad_spec = tree_flatten(requires_grad_surface)
+    if requires_grad_spec != value_spec:
+        raise RuntimeError("Recompute-forward input structure changed before CUDA graph capture")
+
+    def clone_tensor(leaf, requires_grad):
+        """Clone one tensor leaf and preserve non-tensor leaves.
+
+        :param leaf: Input pytree leaf.
+        :type leaf: Any
+        :param requires_grad: Gradient requirement for a tensor leaf.
+        :type requires_grad: bool
+        :return: Cloned tensor or the unchanged non-tensor leaf.
+        :rtype: Any
+        """
+        if not isinstance(leaf, torch.Tensor):
+            return leaf
+        return leaf.detach().clone().requires_grad_(requires_grad)
+
+    cloned = tuple(
+        clone_tensor(leaf, requires_grad)
+        for leaf, requires_grad in zip(flat_values, flat_requires_grad)
+    )
+    return torch.utils._pytree.tree_unflatten(cloned, value_spec)
+
+
 def _make_fwd_pre_hook(module):
+    """Build the capture-time forward unshard hook."""
+
     def hook(mod, args, kwargs):
         module.unshard()
 
@@ -457,13 +953,31 @@ def _make_fwd_post_hook(module):
     return hook
 
 
-def _make_bwd_pre_hook(module):
+def _make_bwd_pre_hook(module, activation_recompute=False):
+    """Build the capture-time backward unshard hook.
+
+    :param module: M-FSDP module unsharded by the returned hook.
+    :type module: torch.nn.Module
+    :param activation_recompute: Whether RF parameters must also be unsharded.
+    :type activation_recompute: bool, optional
+    :return: Capture-time backward pre-hook.
+    :rtype: Callable
+    """
+
     def hook(mod, grad_output):
         module.unshard(bwd_pass=True)
+        if activation_recompute:
+            module.unshard(async_op=False, bwd_pass=False)
         for param_group in module._fsdp_param_groups:
             has_fused_wgrad = any(
                 getattr(param, "_mfsdp_recorded_te_wgrad", False) for param in param_group.params
             )
+            overwrite_main_grad = param_group.sharding_strategy in (
+                "optim_grads_params",
+                "optim_grads",
+            )
+            for param in param_group.params:
+                param.overwrite_main_grad = overwrite_main_grad
             if has_fused_wgrad and param_group.main_grad_buffer is not None:
                 param_group._init_dist_grads()
                 param_group.main_grad_buffer.fetch_buffer(

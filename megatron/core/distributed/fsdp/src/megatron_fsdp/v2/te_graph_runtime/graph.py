@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import inspect
 import warnings
 from collections.abc import Iterable, Sequence
 from math import ceil, prod
@@ -409,9 +410,11 @@ def _none_grad_context_wrapper(inputs):
     for input_tensor in inputs:
         original_input_grads.append(input_tensor.grad)
         input_tensor.grad = None
-    yield
-    for input_tensor, original_grad in zip(inputs, original_input_grads):
-        input_tensor.grad = original_grad
+    try:
+        yield
+    finally:
+        for input_tensor, original_grad in zip(inputs, original_input_grads):
+            input_tensor.grad = original_grad
 
 
 @contextlib.contextmanager
@@ -526,6 +529,110 @@ def _returned_param_grad_clone_slots(
     return tuple(clone_slots)
 
 
+def _static_dgrad_metadata(tensor):
+    """Return metadata for a safe reusable user-input gradient buffer.
+
+    :param tensor: Candidate static input or output tensor.
+    :type tensor: torch.Tensor
+    :return: Storage-independent tensor metadata, or None when reuse is unsafe.
+    :rtype: Optional[Tuple[Any, ...]]
+    """
+    torch_module = _require_torch()
+    if not isinstance(tensor, torch_module.Tensor) or tensor.layout != torch_module.strided:
+        return None
+    if not tensor.is_cuda or tensor.is_conj() or tensor.is_neg():
+        return None
+    if tensor.storage_offset() != 0 or getattr(tensor, "_base", None) is not None:
+        return None
+    overlap_check = getattr(torch_module, "_debug_has_internal_overlap", None)
+    if not callable(overlap_check) or int(overlap_check(tensor)) != 0:
+        return None
+    return (tuple(tensor.shape), tensor.stride(), tensor.dtype, tensor.device, tensor.layout)
+
+
+def _allocate_static_dgrad_reuse_buffers(
+    static_input_surfaces,
+    static_outputs,
+    input_output_aliases,
+    user_grad_indices,
+    output_requires_grad,
+):
+    """Allocate two alternating dgrad slots for safe adjacent aliases.
+
+    :param static_input_surfaces: Static input tensors for each callable.
+    :type static_input_surfaces: Sequence[Tuple[Any, ...]]
+    :param static_outputs: Static output tensors for each callable.
+    :type static_outputs: Sequence[Tuple[Any, ...]]
+    :param input_output_aliases: Consumer-input mappings to producer outputs.
+    :type input_output_aliases: Sequence[Dict[int, Tuple[int, int]]]
+    :param user_grad_indices: User-input indices that receive gradients.
+    :type user_grad_indices: Sequence[Optional[Sequence[int]]]
+    :param output_requires_grad: Output gradient flags for each callable.
+    :type output_requires_grad: Sequence[Optional[Tuple[bool, ...]]]
+    :return: Reusable gradient buffers keyed by user-input index for each callable.
+    :rtype: Tuple[Dict[int, torch.Tensor], ...]
+    """
+    torch_module = _require_torch()
+    consumers_by_output = {}
+    for consumer_idx, aliases in enumerate(input_output_aliases):
+        for input_idx, producer in aliases.items():
+            consumers_by_output.setdefault(producer, []).append((consumer_idx, input_idx))
+
+    component_by_callable = list(range(len(input_output_aliases)))
+    for consumer_idx, aliases in enumerate(input_output_aliases):
+        for producer in aliases.values():
+            producer_idx, _ = producer
+            if producer_idx + 1 == consumer_idx and len(consumers_by_output.get(producer, ())) == 1:
+                component_by_callable[consumer_idx] = component_by_callable[producer_idx]
+                break
+
+    reused_buffers = {}
+    buffers_by_callable = []
+    for consumer_idx, aliases in enumerate(input_output_aliases):
+        callable_buffers = {}
+        lanes_by_metadata = {}
+        for input_idx in sorted(user_grad_indices[consumer_idx] or ()):
+            producer = aliases.get(input_idx)
+            if producer is None:
+                continue
+            producer_idx, output_idx = producer
+            if producer_idx + 1 != consumer_idx:
+                continue
+            if len(consumers_by_output.get(producer, ())) != 1:
+                continue
+            if output_idx >= len(static_outputs[producer_idx]):
+                continue
+            producer_grad_flags = output_requires_grad[producer_idx]
+            if producer_grad_flags is None or not producer_grad_flags[output_idx]:
+                continue
+            input_tensor = static_input_surfaces[consumer_idx][input_idx]
+            output_tensor = static_outputs[producer_idx][output_idx]
+            input_metadata = _static_dgrad_metadata(input_tensor)
+            if input_metadata is None or input_metadata != _static_dgrad_metadata(output_tensor):
+                continue
+
+            lane = lanes_by_metadata.get(input_metadata, 0)
+            lanes_by_metadata[input_metadata] = lane + 1
+            buffer_key = (
+                component_by_callable[consumer_idx],
+                input_metadata,
+                consumer_idx % 2,
+                lane,
+            )
+            grad_buffer = reused_buffers.get(buffer_key)
+            if grad_buffer is None:
+                grad_buffer = torch_module.empty_strided(
+                    input_tensor.shape,
+                    input_tensor.stride(),
+                    dtype=input_tensor.dtype,
+                    device=input_tensor.device,
+                )
+                reused_buffers[buffer_key] = grad_buffer
+            callable_buffers[input_idx] = grad_buffer
+        buffers_by_callable.append(callable_buffers)
+    return tuple(buffers_by_callable)
+
+
 def _refresh_module_parameter_surface(func, user_inputs, parameter_indices=None):
     """Refresh parameters after capture-time replacement hooks.
 
@@ -561,13 +668,16 @@ def _graph_context_wrapper(*args, **kwargs):
     https://github.com/pytorch/pytorch/pull/161037.
 
     """
+    torch_module = _require_torch()
     gc_is_enabled = gc.isenabled()
     if gc_is_enabled:
         gc.disable()
-    with torch.cuda.graph(*args, **kwargs):
-        yield
-    if gc_is_enabled:
-        gc.enable()
+    try:
+        with torch_module.cuda.graph(*args, **kwargs):
+            yield
+    finally:
+        if gc_is_enabled:
+            gc.enable()
 
 
 def _make_graphed_callables(
@@ -584,10 +694,12 @@ def _make_graphed_callables(
     _reuse_graph_input_output_buffers: bool = False,
     _clone_param_grads_on_return: bool = True,
     _input_output_aliases: Optional[Tuple[Dict[int, Tuple[int, int]], ...]] = None,
+    _activation_recompute: bool = False,
     pre_warmup_hook: Optional[Callable] = None,
     post_warmup_hook: Optional[Callable] = None,
     capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]] = None,
     capture_stream: Optional[torch.cuda.Stream] = None,
+    use_main_grad: bool = False,
 ) -> SingleOrTuple[Callable]:
     """
     Helper method for `make_graphed_callables`
@@ -613,14 +725,19 @@ def _make_graphed_callables(
         callables = (callables,)
         sample_args = (sample_args,)
         sample_kwargs = (sample_kwargs,)
-
     capture_time_hooks = _canonicalize_capture_time_hooks(len(callables), capture_time_hooks)
+    # Warmup discovers RF metadata and whether the callable consumes RNG.
+    if _activation_recompute and num_warmup_iters < 1:
+        raise ValueError("Activation recompute requires at least one warmup iteration")
     if _input_output_aliases is None:
-        _input_output_aliases = tuple({} for _ in callables)
+        alias_count = len(sample_args) if _order is not None else len(callables)
+        _input_output_aliases = tuple({} for _ in range(alias_count))
+    elif _order is not None:
+        if any(_input_output_aliases):
+            raise ValueError("Input/output aliases are only supported without a custom order")
+        _input_output_aliases = tuple({} for _ in sample_args)
     elif len(_input_output_aliases) != len(callables):
         raise ValueError("Input/output aliases must match the number of callables")
-    if _order is not None and any(_input_output_aliases):
-        raise ValueError("Input/output aliases are only supported without a custom order")
     if any(_input_output_aliases):
         if isinstance(sample_args, tuple):
             sample_args = list(sample_args)
@@ -634,6 +751,9 @@ def _make_graphed_callables(
             "make_graphed_callables only supports when modules are all in training or all in"
             " inference mode."
         )
+    # The current scheduler captures F, RF, and B without an external order tape.
+    if _activation_recompute and _order is not None:
+        raise ValueError("Activation recompute does not support a custom order")
 
     # Check sizes of args
     _order_without_wgrad = None
@@ -728,7 +848,6 @@ def _make_graphed_callables(
                 f"Expected {total_num_layers * num_microbatches} "
                 + f"args tuple, but got {len(sample_args)}."
             )
-
         # Calculate the starting index of each chunk in callables for future use.
         _prefix_num_layers = [0]
         for m_chunk in range(num_model_chunks):
@@ -746,15 +865,16 @@ def _make_graphed_callables(
     # Note: When capturing a graph, we hold onto the args and kwargs so we have static buffers
     # when the graph is replayed. If two model chunk microbatches have no overlap between their
     # forward and backward, then we can reduce memory usage by reusing the same static buffers.
-    if _reuse_graph_input_output_buffers:
-        if _order is None:
-            raise ValueError(
-                "`_order` must be provided when `_reuse_graph_input_output_buffers` is True."
-            )
-        if not is_training:
-            raise RuntimeError(
-                "`_reuse_graph_input_output_buffers` is only available in training mode."
-            )
+    if _reuse_graph_input_output_buffers and _order is None and not _activation_recompute:
+        raise ValueError(
+            "`_reuse_graph_input_output_buffers` requires either `_order` or "
+            "activation recompute."
+        )
+    if _reuse_graph_input_output_buffers and not is_training:
+        raise RuntimeError(
+            "`_reuse_graph_input_output_buffers` is only available in training mode."
+        )
+    if _reuse_graph_input_output_buffers and _order is not None:
         if isinstance(sample_args, tuple):
             sample_args = list(sample_args)
         if isinstance(sample_kwargs, tuple):
@@ -871,7 +991,9 @@ def _make_graphed_callables(
     # The names are kept for consistency with
     # PyTorch make_graphed_callables.
     per_callable_len_user_args = [len(args) for args in flatten_sample_args]
+    per_callable_user_grad_indices = [None] * len(flatten_sample_args)
     per_callable_parameter_grad_indices = [None] * len(flatten_sample_args)
+    per_callable_output_requires_grad = [None] * len(flatten_sample_args)
     if _order is None:
         per_callable_module_params = [
             tuple(c.parameters()) if isinstance(c, torch.nn.Module) else () for c in callables
@@ -926,9 +1048,13 @@ def _make_graphed_callables(
             producer_output = producer_outputs[output_idx]
             if not isinstance(producer_output, torch.Tensor):
                 raise TypeError("Static input aliases must reference tensor outputs")
-            linked_inputs[input_idx] = producer_output.detach().requires_grad_(
-                producer_output.requires_grad
-            )
+            output_requires_grad = producer_output.requires_grad
+            if _activation_recompute:
+                logical_requires_grad = per_callable_output_requires_grad[producer_idx]
+                if logical_requires_grad is None:
+                    raise RuntimeError("Missing logical output gradient metadata")
+                output_requires_grad = logical_requires_grad[output_idx]
+            linked_inputs[input_idx] = producer_output.detach().requires_grad_(output_requires_grad)
 
         flat_args_len = per_callable_flat_args_len[func_idx]
         args = _tree_unflatten(linked_inputs[:flat_args_len], per_callable_args_spec[func_idx])
@@ -944,14 +1070,18 @@ def _make_graphed_callables(
         )
         return args, kwargs
 
-    fwd_graphs = [torch.cuda.CUDAGraph() for _ in range(len(flatten_sample_args))]
-    bwd_graphs = [torch.cuda.CUDAGraph() for _ in range(len(flatten_sample_args))]
-    bwd_dw_graphs = [torch.cuda.CUDAGraph() for _ in range(len(flatten_sample_args))]
-    graph_callables = [None for _ in range(len(flatten_sample_args))]
-
-    # For cases with multiple active RNG states, e.g. TP.
-    if graph_safe_rng_available():
-        for _, state in _ensure_graph_safe_rng_states().items():
+    graph_count = len(flatten_sample_args)
+    fwd_graphs = [torch.cuda.CUDAGraph() for _ in range(graph_count)]
+    recompute_graphs = [
+        torch.cuda.CUDAGraph() if _activation_recompute else None for _ in range(graph_count)
+    ]
+    per_callable_recompute_outputs = [None] * graph_count
+    bwd_graphs = [torch.cuda.CUDAGraph() for _ in range(graph_count)]
+    bwd_dw_graphs = [torch.cuda.CUDAGraph() for _ in range(graph_count)]
+    graph_replay_states = [{"phase": "idle", "next_replay_phase": None} for _ in range(graph_count)]
+    graph_callables = [None for _ in range(graph_count)]
+    if graph_safe_rng_available() and not _activation_recompute:
+        for state in _ensure_graph_safe_rng_states().values():
             for fwd_graph, bwd_graph, bwd_dw_graph in zip(fwd_graphs, bwd_graphs, bwd_dw_graphs):
                 fwd_graph.register_generator_state(state)
                 bwd_graph.register_generator_state(state)
@@ -962,6 +1092,29 @@ def _make_graphed_callables(
     # Warmup
     # Hopefully prevents cudnn benchmarking and other lazy-initialization cuda work
     # from ending up in any captures.
+    callable_uses_default_rng = [False] * graph_count
+
+    def discard_capture_saved_tensor(tensor):
+        """Discard tensors saved only by the original checkpoint forward.
+
+        :param tensor: Tensor requested by the original forward's autograd tape.
+        :type tensor: torch.Tensor
+        :return: Placeholder stored in the discarded tape.
+        :rtype: None
+        """
+        del tensor
+        return None
+
+    def reject_discarded_saved_tensor(packed):
+        """Reject backward through the discarded original-forward tape.
+
+        :param packed: Placeholder produced by the saved-tensor pack hook.
+        :type packed: Any
+        :raises RuntimeError: Always, because only RF may provide backward state.
+        """
+        del packed
+        raise RuntimeError("Discarded capture-forward tensors cannot be unpacked")
+
     torch.cuda.synchronize()
 
     # Get warmup func and func_idx.
@@ -1037,7 +1190,12 @@ def _make_graphed_callables(
         )
 
     def _run_warmup_forward(
-        func_idx, func, callable_idx, outputs_by_producer, register_discovery_hooks=True
+        func_idx,
+        func,
+        callable_idx,
+        outputs_by_producer,
+        register_discovery_hooks=True,
+        record_output_requires_grad=True,
     ):
         args, kwargs = _link_callable_inputs(func_idx, outputs_by_producer)
 
@@ -1071,11 +1229,26 @@ def _make_graphed_callables(
         if register_discovery_hooks and isinstance(func, torch.nn.Module):
             for module in func.modules():
                 hooks.append(module.register_forward_hook(hook_fn))
+        rng_state = torch.cuda.get_rng_state() if _activation_recompute else None
         outputs = func(*args, **kwargs)
+        if rng_state is not None and not torch.equal(rng_state, torch.cuda.get_rng_state()):
+            callable_uses_default_rng[func_idx] = True
         for hook in hooks:
             hook.remove()
         _call_capture_time_forward_hooks(callable_idx, func, args, kwargs, outputs)
         flatten_outputs, _ = _tree_flatten(outputs)
+        if record_output_requires_grad:
+            output_requires_grad = tuple(
+                isinstance(output, torch.Tensor) and output.requires_grad
+                for output in flatten_outputs
+            )
+            recorded_output_requires_grad = per_callable_output_requires_grad[func_idx]
+            if recorded_output_requires_grad is None:
+                per_callable_output_requires_grad[func_idx] = output_requires_grad
+            elif recorded_output_requires_grad != output_requires_grad:
+                raise RuntimeError(
+                    "Callable output gradient metadata changed across CUDA graph warmup"
+                )
         return flatten_outputs
 
     def _run_warmup_backward(func_idx, func, outputs, warmup_iter, callable_idx) -> None:
@@ -1087,7 +1260,12 @@ def _make_graphed_callables(
             func, flatten_sample_args[func_idx]
         )
         inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
-        with _none_grad_context_wrapper(inputs):
+        backward_autocast_context = (
+            torch.amp.autocast("cuda", enabled=False)
+            if _activation_recompute
+            else contextlib.nullcontext()
+        )
+        with _none_grad_context_wrapper(inputs), backward_autocast_context:
             torch.autograd.backward(
                 outputs_requiring_grad, grad_tensors=tuple(o for o in grad_outputs if o is not None)
             )
@@ -1104,6 +1282,20 @@ def _make_graphed_callables(
         ]
         grad_by_surface_index = dict(zip(required_grad_input_indices, grad_inputs))
         user_input_count = len(flatten_sample_args[func_idx])
+        user_grad_indices = tuple(
+            surface_idx
+            for surface_idx in required_grad_input_indices
+            if surface_idx < user_input_count and grad_by_surface_index[surface_idx] is not None
+        )
+        recorded_user_indices = per_callable_user_grad_indices[func_idx]
+        if recorded_user_indices is None:
+            per_callable_user_grad_indices[func_idx] = user_grad_indices
+        elif recorded_user_indices != user_grad_indices:
+            raise RuntimeError(
+                "User inputs producing gradients changed across CUDA graph warmup "
+                f"iterations: expected {recorded_user_indices}, found {user_grad_indices} "
+                f"at iteration {warmup_iter}"
+            )
         for surface_idx in required_grad_input_indices:
             if surface_idx < user_input_count and grad_by_surface_index[surface_idx] is None:
                 if not allow_unused_input:
@@ -1145,6 +1337,45 @@ def _make_graphed_callables(
 
     def _run_warmup_iteration(warmup_iter, register_discovery_hooks):
         if _order is None:
+            if _activation_recompute:
+                outputs_by_producer = {}
+                for func_idx, func in zip(warmup_func_idx, warmup_func):
+                    outputs = _run_warmup_forward(
+                        func_idx,
+                        func,
+                        func_idx,
+                        outputs_by_producer,
+                        register_discovery_hooks=register_discovery_hooks,
+                    )
+                    if is_training:
+                        _run_warmup_backward(func_idx, func, outputs, warmup_iter, func_idx)
+                    outputs_by_producer[func_idx] = tuple(
+                        (
+                            output.detach().requires_grad_(output.requires_grad)
+                            if isinstance(output, torch.Tensor)
+                            else output
+                        )
+                        for output in outputs
+                    )
+                outputs_by_producer = {}
+                for func_idx, func in zip(warmup_func_idx, warmup_func):
+                    with torch.autograd.graph.saved_tensors_hooks(
+                        discard_capture_saved_tensor, reject_discarded_saved_tensor
+                    ):
+                        outputs = _run_warmup_forward(
+                            func_idx,
+                            func,
+                            func_idx,
+                            outputs_by_producer,
+                            register_discovery_hooks=False,
+                            record_output_requires_grad=False,
+                        )
+                    outputs_by_producer[func_idx] = tuple(
+                        output.detach() if isinstance(output, torch.Tensor) else output
+                        for output in outputs
+                    )
+                return
+
             warmup_outputs = []
             outputs_by_producer = {}
             for func_idx, func in zip(warmup_func_idx, warmup_func):
@@ -1223,16 +1454,24 @@ def _make_graphed_callables(
             post_warmup_hook()
     torch.cuda.synchronize()
 
+    # Delayed wgrad would outlive the RF tape consumed by the captured B program.
+    if _activation_recompute and any(need_bwd_dw_graph.values()):
+        raise RuntimeError(
+            "Activation recompute does not yet support delayed backward-wgrad graphs"
+        )
+    # Graph-safe generators cannot restore F's offset before RF replay.
+    if _activation_recompute and any(callable_uses_default_rng):
+        raise RuntimeError(
+            "Activation-recompute CUDA graphs do not support RNG-consuming callables; "
+            "captured recompute cannot restore the original forward RNG offset reliably"
+        )
+
     import gc
 
     gc.collect()
     torch.cuda.empty_cache()
     gc.collect()
     torch.cuda.empty_cache()
-
-    # All captures here share a mempool. To avoid replays corrupting each other's memory,
-    # the safest approach is to capture all passes in the same order they'll run:
-    # fwd 1, fwd 2, ... fwd N, then bwd N, bwd N-1, ... bwd 1.
 
     if _order is not None:  # pylint: disable=too-many-nested-blocks
         per_callable_static_outputs = [None] * len(flatten_sample_args)
@@ -1316,8 +1555,7 @@ def _make_graphed_callables(
                         if not is_training:
                             raise RuntimeError("Only training mode supports backward_dw.")
                         # If no one module needs the backward_dw, the bwd_dw_graph will be empty.
-                        # So skip capturing it. For backward_dw, the order value is c_id - 0.5 to indicate
-                        # the specific order of backward_dw.
+                        # Skip empty backward_dw graphs. Its order value is c_id - 0.5.
                         if ceil(c_id) - c_id != 0.5:
                             raise ValueError(
                                 "The order diff of wgrad and dgrad must be 0.5, "
@@ -1433,10 +1671,8 @@ def _make_graphed_callables(
                     # mempool, so we just deallocate them and let PyTorch's memory allocator
                     # reuse them elsewhere.
                     if _reuse_graph_input_output_buffers:
-                        # Weak ref the static outputs of the forward pass of this backward. It's
-                        # no longer needed after the corresponding backward graph is built up.
                         per_callable_static_outputs[per_callable_bwd_idx] = make_weak_ref(
-                            static_outputs
+                            per_callable_static_outputs[per_callable_bwd_idx]
                         )
 
                         # Parameter grads can be weak-refed immediately only when Graphed.backward
@@ -1483,8 +1719,28 @@ def _make_graphed_callables(
         ):
             args, kwargs = _link_callable_inputs(func_idx, per_callable_static_outputs)
             _call_capture_time_forward_pre_hooks(func_idx, func, args, kwargs)
-            with _graph_context_wrapper(fwd_graph, pool=mempool, stream=capture_stream):
+
+            saved_tensor_context = (
+                torch.autograd.graph.saved_tensors_hooks(
+                    discard_capture_saved_tensor, reject_discarded_saved_tensor
+                )
+                if _activation_recompute
+                else contextlib.nullcontext()
+            )
+            with (
+                saved_tensor_context,
+                _graph_context_wrapper(fwd_graph, pool=mempool, stream=capture_stream),
+            ):
                 outputs = func(*args, **kwargs)
+                if _activation_recompute:
+                    flat_outputs_with_history, output_spec = _tree_flatten(outputs)
+                    outputs = _tree_unflatten(
+                        tuple(
+                            output.detach() if isinstance(output, torch.Tensor) else output
+                            for output in flat_outputs_with_history
+                        ),
+                        output_spec,
+                    )
             _call_capture_time_forward_hooks(func_idx, func, args, kwargs, outputs)
             graph_callables[func_idx] = func
 
@@ -1492,28 +1748,41 @@ def _make_graphed_callables(
             per_callable_static_outputs.append(tuple(flatten_outputs))
             per_callable_output_unflatten_spec.append(spec)
 
-        # Capture backward graphs in reverse order
-        per_callable_static_grad_outputs = []
-        per_callable_static_grad_inputs = []
-        per_callable_returned_param_grad_clone_slots = []
+        args = kwargs = outputs = flatten_outputs = None
+
+        per_callable_static_user_grad_buffers = (
+            _allocate_static_dgrad_reuse_buffers(
+                per_callable_static_input_surfaces,
+                per_callable_static_outputs,
+                _input_output_aliases,
+                per_callable_user_grad_indices,
+                per_callable_output_requires_grad,
+            )
+            if _activation_recompute
+            else tuple({} for _ in flatten_sample_args)
+        )
+
+        # Capture each checkpoint region in replay order: RF forward,
+        # followed by backward in reverse.
+        per_callable_static_grad_outputs = [None] * len(flatten_sample_args)
+        per_callable_static_grad_inputs = [None] * len(flatten_sample_args)
+        per_callable_returned_param_grad_clone_slots = [None] * len(flatten_sample_args)
         # Reuse consumer dgrad as the producer grad output when possible.
         captured_grad_inputs = {}
         consumers_by_output = {}
         for consumer_idx, aliases in enumerate(_input_output_aliases):
             for input_idx, producer in aliases.items():
                 consumers_by_output.setdefault(producer, []).append((consumer_idx, input_idx))
-        for static_input_surface, static_outputs, bwd_graph, bwd_dw_graph, bwd_idx in zip(
-            reversed(per_callable_static_input_surfaces),
-            reversed(per_callable_static_outputs),
-            reversed(bwd_graphs),
-            reversed(bwd_dw_graphs),
-            reversed(range(len(per_callable_static_input_surfaces))),
-        ):
-            # For now, assumes all static_outputs require grad
-            static_grad_outputs = []
-            for output_idx, output in enumerate(static_outputs):
+
+        def _prepare_static_grad_outputs(callable_idx):
+            """Allocate or reuse the captured grad-output surface."""
+            prepared = per_callable_static_grad_outputs[callable_idx]
+            if prepared is not None:
+                return prepared
+            prepared = []
+            for output_idx, output in enumerate(per_callable_static_outputs[callable_idx]):
                 grad_output = None
-                consumers = consumers_by_output.get((bwd_idx, output_idx), ())
+                consumers = consumers_by_output.get((callable_idx, output_idx), ())
                 if len(consumers) == 1:
                     consumer_idx, input_idx = consumers[0]
                     consumer_grad_inputs = captured_grad_inputs.get(consumer_idx)
@@ -1528,32 +1797,170 @@ def _make_graphed_callables(
                             and candidate.stride() == output.stride()
                         ):
                             grad_output = candidate
-                if grad_output is None and output is not None and output.requires_grad:
+                logical_output_grads = per_callable_output_requires_grad[callable_idx]
+                output_requires_grad = (
+                    output is not None and output.requires_grad
+                    if logical_output_grads is None
+                    else logical_output_grads[output_idx]
+                )
+                if grad_output is None and output is not None and output_requires_grad:
                     grad_output = torch.empty_like(output)
-                static_grad_outputs.append(grad_output)
-            static_grad_outputs = tuple(static_grad_outputs)
-            if is_training:
-                func = graph_callables[bwd_idx]
-                _call_capture_time_backward_pre_hooks(bwd_idx, func, static_grad_outputs)
+                prepared.append(grad_output)
+            prepared = tuple(prepared)
+            per_callable_static_grad_outputs[callable_idx] = prepared
+            return prepared
+
+        capture_schedule = []
+        if _activation_recompute:
+            capture_schedule.extend(
+                event
+                for callable_idx in reversed(range(len(callables)))
+                for event in (("recompute", callable_idx, True), ("backward", callable_idx, True))
+            )
+        else:
+            capture_schedule.extend(
+                ("backward", callable_idx, False)
+                for callable_idx in reversed(range(len(per_callable_static_input_surfaces)))
+            )
+
+        backward_prepared = set()
+        for capture_phase, bwd_idx, keep_unsharded in capture_schedule:
+            static_input_surface = per_callable_static_input_surfaces[bwd_idx]
+            static_outputs = per_callable_static_outputs[bwd_idx]
+            recompute_graph = recompute_graphs[bwd_idx]
+            bwd_graph = bwd_graphs[bwd_idx]
+            bwd_dw_graph = bwd_dw_graphs[bwd_idx]
+            func = graph_callables[bwd_idx]
+
+            if capture_phase == "recompute":
+                if recompute_graph is None:
+                    raise RuntimeError("Activation recompute requires a recompute-forward graph")
+                if keep_unsharded:
+                    static_grad_outputs = _prepare_static_grad_outputs(bwd_idx)
+                    _call_capture_time_backward_pre_hooks(bwd_idx, func, static_grad_outputs)
+                    backward_prepared.add(bwd_idx)
+                else:
+                    _call_capture_time_forward_pre_hooks(
+                        bwd_idx, func, sample_args[bwd_idx], sample_kwargs[bwd_idx]
+                    )
                 module_params, static_input_surface = _refresh_module_parameter_surface(
                     func, flatten_sample_args[bwd_idx], per_callable_parameter_grad_indices[bwd_idx]
                 )
                 per_callable_module_params[bwd_idx] = module_params
                 per_callable_static_input_surfaces[bwd_idx] = static_input_surface
-                inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
-                input_grad_buffers = _get_static_grad_buffers(inputs)
-                # Enter graph capture first so buffer zeroing is recorded.
                 with (
-                    _graph_context_wrapper(bwd_graph, pool=mempool),
-                    _static_grad_context_wrapper(inputs, input_grad_buffers),
+                    _graph_context_wrapper(recompute_graph, pool=mempool, stream=capture_stream),
                 ):
-                    torch.autograd.backward(
-                        tuple(o for o in static_outputs if o is not None and o.requires_grad),
-                        grad_tensors=tuple(o for o in static_grad_outputs if o is not None),
-                        retain_graph=retain_graph_in_backward,
+                    recompute_outputs = func(*sample_args[bwd_idx], **sample_kwargs[bwd_idx])
+                recompute_flat_outputs, _ = _tree_flatten(recompute_outputs)
+                per_callable_recompute_outputs[bwd_idx] = tuple(recompute_flat_outputs)
+                if not keep_unsharded:
+                    _call_capture_time_forward_hooks(
+                        bwd_idx,
+                        func,
+                        sample_args[bwd_idx],
+                        sample_kwargs[bwd_idx],
+                        recompute_outputs,
                     )
+                del recompute_flat_outputs
+                del recompute_outputs
+                continue
+
+            static_grad_outputs = _prepare_static_grad_outputs(bwd_idx)
+            input_grad_buffers = ()
+            if is_training:
+                if bwd_idx not in backward_prepared:
+                    _call_capture_time_backward_pre_hooks(bwd_idx, func, static_grad_outputs)
+                    module_params, static_input_surface = _refresh_module_parameter_surface(
+                        func,
+                        flatten_sample_args[bwd_idx],
+                        per_callable_parameter_grad_indices[bwd_idx],
+                    )
+                    per_callable_module_params[bwd_idx] = module_params
+                    per_callable_static_input_surfaces[bwd_idx] = static_input_surface
+                else:
+                    backward_prepared.remove(bwd_idx)
+                    module_params = per_callable_module_params[bwd_idx]
+                    static_input_surface = per_callable_static_input_surfaces[bwd_idx]
+                input_surface_indices = tuple(
+                    surface_idx
+                    for surface_idx, input_tensor in enumerate(static_input_surface)
+                    if input_tensor is not None and input_tensor.requires_grad
+                )
+                inputs = tuple(static_input_surface[idx] for idx in input_surface_indices)
+                main_grad_buffers = (
+                    _get_static_grad_buffers(inputs) if use_main_grad else (None,) * len(inputs)
+                )
+                static_user_grad_buffers = per_callable_static_user_grad_buffers[bwd_idx]
+                input_grad_buffers = tuple(
+                    static_user_grad_buffers.get(surface_idx, main_grad_buffer)
+                    for surface_idx, main_grad_buffer in zip(
+                        input_surface_indices, main_grad_buffers
+                    )
+                )
+                recompute_flat_outputs = None
+                if _activation_recompute:
+                    recompute_flat_outputs = per_callable_recompute_outputs[bwd_idx]
+                    if recompute_flat_outputs is None:
+                        raise RuntimeError("Missing captured recompute-forward outputs")
+                # Enter graph capture first so buffer zeroing is recorded.
+                backward_autocast_context = (
+                    torch.amp.autocast("cuda", enabled=False)
+                    if _activation_recompute
+                    else contextlib.nullcontext()
+                )
+                with (
+                    _graph_context_wrapper(bwd_graph, pool=mempool, stream=capture_stream),
+                    _static_grad_context_wrapper(inputs, input_grad_buffers),
+                    backward_autocast_context,
+                ):
+                    if _activation_recompute:
+                        if len(recompute_flat_outputs) != len(static_outputs):
+                            raise RuntimeError(
+                                "Recomputed output count does not match normal forward"
+                            )
+                        for normal_output, recompute_output in zip(
+                            static_outputs, recompute_flat_outputs
+                        ):
+                            if isinstance(normal_output, torch.Tensor) and (
+                                not isinstance(recompute_output, torch.Tensor)
+                                or normal_output.shape != recompute_output.shape
+                                or normal_output.stride() != recompute_output.stride()
+                                or normal_output.dtype != recompute_output.dtype
+                                or normal_output.device != recompute_output.device
+                            ):
+                                raise RuntimeError(
+                                    "Recomputed output metadata does not match normal forward"
+                                )
+                        output_requires_grad = per_callable_output_requires_grad[bwd_idx]
+                        torch.autograd.backward(
+                            tuple(
+                                output
+                                for output, requires_grad in zip(
+                                    recompute_flat_outputs, output_requires_grad
+                                )
+                                if requires_grad
+                            ),
+                            grad_tensors=tuple(
+                                grad
+                                for grad, requires_grad in zip(
+                                    static_grad_outputs, output_requires_grad
+                                )
+                                if requires_grad
+                            ),
+                            retain_graph=retain_graph_in_backward,
+                        )
+                    else:
+                        torch.autograd.backward(
+                            tuple(o for o in static_outputs if o is not None and o.requires_grad),
+                            grad_tensors=tuple(o for o in static_grad_outputs if o is not None),
+                            retain_graph=retain_graph_in_backward,
+                        )
                     grad_inputs = tuple(input.grad for input in inputs)
                 _call_capture_time_backward_hooks(bwd_idx, func, grad_inputs, static_grad_outputs)
+                if _activation_recompute:
+                    del recompute_flat_outputs
+                    gc.collect()
 
                 if need_bwd_dw_graph.get(bwd_idx, False):
                     with _graph_context_wrapper(bwd_dw_graph, pool=mempool, stream=capture_stream):
@@ -1576,11 +1983,20 @@ def _make_graphed_callables(
                     static_grad_buffers.append(None)
             static_grad_inputs = tuple(static_grad_inputs)  # type: ignore[assignment]
             static_grad_buffers = tuple(static_grad_buffers)
+            for surface_idx, expected_buffer in per_callable_static_user_grad_buffers[
+                bwd_idx
+            ].items():
+                captured_buffer = static_grad_inputs[surface_idx]
+                if (
+                    captured_buffer is None
+                    or captured_buffer.data_ptr() != expected_buffer.data_ptr()
+                ):
+                    raise RuntimeError("Autograd did not preserve the static user-dgrad buffer")
             captured_grad_inputs[bwd_idx] = static_grad_inputs
 
-            per_callable_static_grad_outputs.append(static_grad_outputs)
-            per_callable_static_grad_inputs.append(static_grad_inputs)
-            per_callable_returned_param_grad_clone_slots.append(
+            per_callable_static_grad_outputs[bwd_idx] = static_grad_outputs
+            per_callable_static_grad_inputs[bwd_idx] = static_grad_inputs
+            per_callable_returned_param_grad_clone_slots[bwd_idx] = (
                 _returned_param_grad_clone_slots(
                     static_grad_inputs,
                     per_callable_module_params[bwd_idx],
@@ -1589,34 +2005,228 @@ def _make_graphed_callables(
                 )
             )
 
-        # Reverse the most recent per-callable lists.
-        per_callable_static_grad_outputs = list(reversed(per_callable_static_grad_outputs))
-        per_callable_static_grad_inputs = list(reversed(per_callable_static_grad_inputs))
-        per_callable_returned_param_grad_clone_slots = list(
-            reversed(per_callable_returned_param_grad_clone_slots)
-        )
+            if _reuse_graph_input_output_buffers and _activation_recompute:
+                recompute_outputs = per_callable_recompute_outputs[bwd_idx]
+                per_callable_recompute_outputs[bwd_idx] = tuple(
+                    (
+                        make_weak_ref(output).requires_grad_(output.requires_grad)
+                        if isinstance(output, torch.Tensor)
+                        and output.is_cuda
+                        and output.is_contiguous()
+                        else output
+                    )
+                    for output in recompute_outputs
+                )
+                recompute_outputs = None
+
+            if _reuse_graph_input_output_buffers and _activation_recompute:
+                linked_inputs = list(flatten_sample_args[bwd_idx])
+                static_surface = list(per_callable_static_input_surfaces[bwd_idx])
+                replaced_input = False
+                for input_idx, producer in _input_output_aliases[bwd_idx].items():
+                    producer_idx, output_idx = producer
+                    if producer_idx + 1 != bwd_idx:
+                        continue
+                    if len(consumers_by_output.get(producer, ())) != 1:
+                        continue
+                    producer_outputs = list(per_callable_static_outputs[producer_idx])
+                    producer_output = producer_outputs[output_idx]
+                    consumer_input = static_surface[input_idx]
+                    if not (
+                        isinstance(producer_output, torch.Tensor)
+                        and isinstance(consumer_input, torch.Tensor)
+                        and producer_output.data_ptr() == consumer_input.data_ptr()
+                        and producer_output.is_contiguous()
+                        and consumer_input.is_contiguous()
+                        and _static_dgrad_metadata(producer_output)
+                        == _static_dgrad_metadata(consumer_input)
+                    ):
+                        continue
+                    producer_storage = producer_output.untyped_storage()
+                    consumer_storage = consumer_input.untyped_storage()
+                    storage_nbytes = producer_storage.nbytes()
+                    if (
+                        producer_storage.data_ptr() != consumer_storage.data_ptr()
+                        or storage_nbytes
+                        != producer_output.numel() * producer_output.element_size()
+                        or sum(
+                            isinstance(output, torch.Tensor)
+                            and output.untyped_storage().data_ptr() == producer_storage.data_ptr()
+                            for output in producer_outputs
+                        )
+                        != 1
+                        or sum(
+                            isinstance(value, torch.Tensor)
+                            and value.untyped_storage().data_ptr() == producer_storage.data_ptr()
+                            for value in linked_inputs
+                        )
+                        != 1
+                    ):
+                        continue
+
+                    producer_outputs[output_idx] = make_weak_ref(producer_output).requires_grad_(
+                        producer_output.requires_grad
+                    )
+                    linked_inputs[input_idx] = make_weak_ref(consumer_input).requires_grad_(
+                        consumer_input.requires_grad
+                    )
+                    static_surface[input_idx] = linked_inputs[input_idx]
+                    per_callable_static_outputs[producer_idx] = tuple(producer_outputs)
+                    replaced_input = True
+
+                if replaced_input:
+                    flatten_sample_args[bwd_idx] = tuple(linked_inputs)
+                    per_callable_static_input_surfaces[bwd_idx] = tuple(static_surface)
+                    flat_args_len = per_callable_flat_args_len[bwd_idx]
+                    sample_args[bwd_idx] = _tree_unflatten(
+                        linked_inputs[:flat_args_len], per_callable_args_spec[bwd_idx]
+                    )
+                    kwarg_values = _tree_unflatten(
+                        linked_inputs[flat_args_len:], per_callable_kwargs_spec[bwd_idx]
+                    )
+                    sample_kwargs[bwd_idx] = dict(
+                        zip(per_callable_kwargs_keys[bwd_idx], kwarg_values)
+                    )
+                    static_input_surface = per_callable_static_input_surfaces[bwd_idx]
+                producer_output = consumer_input = None
+                producer_storage = consumer_storage = None
+                inputs = ()
+
+        if backward_prepared:
+            raise RuntimeError("Recompute capture left a module prepared for backward")
+
     # Now for every per_callable list, per_callable_*[i] holds the stuff for the ith callable.
+    per_callable_expected_param_ptrs = [
+        tuple(param.data_ptr() for param in module_params)
+        for module_params in per_callable_module_params
+    ]
 
     def make_graphed_autograd_function(
         fwd_graph,
+        recompute_graph,
         bwd_graph,
         module_params,
         kwargs_keys,
+        expected_args_spec,
+        expected_kwargs_spec,
+        flat_args_len,
+        num_positional_args,
+        call_signature,
+        captured_static_arguments,
         len_user_args,
         output_unflatten_spec,
         static_input_surface,
         static_outputs,
+        static_recompute_outputs,
         static_grad_outputs,
         static_grad_inputs,
         returned_param_grad_clone_slots,
+        expected_param_ptrs,
+        graph_replay_state,
+        output_requires_grad,
+        activation_recompute,
     ):
         class Graphed(torch.autograd.Function):
             """Autograd function for graph replay."""
 
             @staticmethod
-            def forward(ctx, skip_fp8_weight_update, cuda_graph_stream, cuda_graph_event, *inputs):
-                # pylint: disable=missing-function-docstring
+            def forward(
+                ctx,
+                replay_phase,
+                forward_builds_autograd,
+                skip_fp8_weight_update,
+                cuda_graph_stream,
+                cuda_graph_event,
+                *inputs,
+            ):
+                """Dispatch one original-forward or recompute-forward replay.
 
+                :param ctx: Autograd context that owns replay state.
+                :type ctx: Any
+                :param replay_phase: Graph program to replay.
+                :type replay_phase: str
+                :param forward_builds_autograd: Whether this node owns backward.
+                :type forward_builds_autograd: bool
+                :param skip_fp8_weight_update: Whether to reuse cached FP8 weights.
+                :type skip_fp8_weight_update: Optional[bool]
+                :param cuda_graph_stream: Stream used for graph replay.
+                :type cuda_graph_stream: torch.cuda.Stream
+                :param cuda_graph_event: Optional event that synchronizes replay.
+                :type cuda_graph_event: Optional[torch.cuda.Event]
+                :param inputs: User inputs followed by captured module parameters.
+                :type inputs: torch.Tensor
+                :raises ValueError: If the replay phase is unknown.
+                :raises RuntimeError: If the replay phase violates the recorded state.
+                :return: Detached static graph outputs.
+                :rtype: Tuple[Any, ...]
+                """
+                if activation_recompute:
+                    current_phase = graph_replay_state["phase"]
+                    if replay_phase == "forward":
+                        if current_phase != "idle":
+                            raise RuntimeError(
+                                "Activation-recompute CUDA graph expected idle "
+                                f"before forward, found {current_phase}"
+                            )
+                        graph_replay_state["phase"] = "forward_done"
+                        ctx.owns_backward = True
+                    elif replay_phase == "recompute":
+                        if current_phase != "forward_done":
+                            raise RuntimeError(
+                                "Activation-recompute CUDA graph expected "
+                                "forward_done before recompute, found "
+                                f"{current_phase}"
+                            )
+                        graph_replay_state["phase"] = "recomputed"
+                        ctx.owns_backward = False
+                else:
+                    ctx.owns_backward = True
+                try:
+                    return Graphed._forward_impl(
+                        ctx,
+                        replay_phase,
+                        forward_builds_autograd,
+                        skip_fp8_weight_update,
+                        cuda_graph_stream,
+                        cuda_graph_event,
+                        *inputs,
+                    )
+                except Exception:
+                    if activation_recompute:
+                        graph_replay_state["phase"] = "idle"
+                        graph_replay_state["next_replay_phase"] = None
+                    raise
+
+            @staticmethod
+            def _forward_impl(
+                ctx,
+                replay_phase,
+                forward_builds_autograd,
+                skip_fp8_weight_update,
+                cuda_graph_stream,
+                cuda_graph_event,
+                *inputs,
+            ):
+                """Perform forward replay after phase validation.
+
+                :param ctx: Autograd context that owns replay state.
+                :type ctx: Any
+                :param replay_phase: Graph program to replay.
+                :type replay_phase: str
+                :param forward_builds_autograd: Whether this node owns backward.
+                :type forward_builds_autograd: bool
+                :param skip_fp8_weight_update: Whether to reuse cached FP8 weights.
+                :type skip_fp8_weight_update: Optional[bool]
+                :param cuda_graph_stream: Stream used for graph replay.
+                :type cuda_graph_stream: torch.cuda.Stream
+                :param cuda_graph_event: Optional event that synchronizes replay.
+                :type cuda_graph_event: Optional[torch.cuda.Event]
+                :param inputs: User inputs followed by captured module parameters.
+                :type inputs: torch.Tensor
+                :return: Detached static graph outputs.
+                :rtype: Tuple[Any, ...]
+                """
+                ctx.replay_phase = replay_phase
                 # Set flag for whether to update FP8 weight updates
                 ctx.is_first_module = FP8GlobalStateManager.is_first_fp8_module()
                 if ctx.is_first_module and skip_fp8_weight_update is not None:
@@ -1625,6 +2235,15 @@ def _make_graphed_callables(
                     )
                 ctx.cuda_graph_stream = cuda_graph_stream
                 ctx.cuda_graph_event = cuda_graph_event
+                ctx.has_checkpoint_sentinel = False
+                if activation_recompute and forward_builds_autograd:
+                    sentinel = next(
+                        (value for value in reversed(inputs) if isinstance(value, torch.Tensor)),
+                        None,
+                    )
+                    if sentinel is not None:
+                        ctx.save_for_backward(sentinel)
+                        ctx.has_checkpoint_sentinel = True
                 # Copy values from new tensors into static tensors
                 for i in range(len_user_args):
                     if (
@@ -1634,29 +2253,61 @@ def _make_graphed_callables(
                     ):
                         static_input_surface[i].copy_(inputs[i])
 
-                # Replay forward graph
+                replay_graph = fwd_graph
+                replay_outputs = static_outputs
+                if replay_phase == "recompute":
+                    if recompute_graph is None or static_recompute_outputs is None:
+                        raise RuntimeError("Recompute replay requires a captured recompute graph")
+                    replay_graph = recompute_graph
+                    replay_outputs = static_recompute_outputs
+
                 if cuda_graph_stream != torch.cuda.current_stream():
                     cuda_graph_stream.wait_stream(torch.cuda.current_stream())
                     with cuda_graph_stream:
-                        fwd_graph.replay()
+                        replay_graph.replay()
                     if cuda_graph_event is not None:
                         torch.cuda.current_stream().wait_event(cuda_graph_event)
                     else:
                         torch.cuda.current_stream().wait_stream(cuda_graph_stream)
                 else:
-                    fwd_graph.replay()
-                if not isinstance(static_outputs, tuple):
+                    replay_graph.replay()
+                if not isinstance(replay_outputs, tuple):
                     raise TypeError(
-                        "Expected static_outputs to be a tuple, but got"
-                        f" {type(static_outputs).__name__}"
+                        "Expected replay outputs to be a tuple, but got"
+                        f" {type(replay_outputs).__name__}"
                     )
-                return tuple(o.detach() if o is not None else o for o in static_outputs)
+                returned_outputs = tuple(
+                    o.detach() if isinstance(o, torch.Tensor) else o for o in replay_outputs
+                )
+                if activation_recompute:
+                    non_differentiable = tuple(
+                        output
+                        for output, requires_grad in zip(returned_outputs, output_requires_grad)
+                        if isinstance(output, torch.Tensor) and not requires_grad
+                    )
+                    if non_differentiable:
+                        ctx.mark_non_differentiable(*non_differentiable)
+                return returned_outputs
 
             @staticmethod
-            @torch.autograd.function.once_differentiable
-            def backward(ctx, *grads):
-                # pylint: disable=missing-function-docstring
+            def _backward_impl(ctx, *grads):
+                """Replay backward and return gradients for autograd inputs.
 
+                :param ctx: Autograd context populated by forward replay.
+                :type ctx: Any
+                :param grads: Output gradients supplied by autograd.
+                :type grads: torch.Tensor
+                :raises ValueError: If the output-gradient count changed.
+                :raises RuntimeError: If RF did not prepare backward state.
+                :return: Gradients corresponding to ``Graphed.apply`` inputs.
+                :rtype: Tuple[Optional[torch.Tensor], ...]
+                """
+
+                if activation_recompute and ctx.has_checkpoint_sentinel:
+                    # Trigger non-reentrant checkpoint recomputation before B.
+                    _ = ctx.saved_tensors
+                if activation_recompute and not ctx.owns_backward:
+                    raise RuntimeError("Activation-recompute forward node does not own backward")
                 # Replay backward graph
                 if len(grads) != len(static_grad_outputs):
                     raise ValueError(
@@ -1666,10 +2317,15 @@ def _make_graphed_callables(
                     )
                 for g, grad in zip(static_grad_outputs, grads):
                     if g is not None:
-                        # don't copy if autograd gods have been kind and the
-                        # incoming grad is already in the right place
                         if g.data_ptr() != grad.data_ptr():
                             g.copy_(grad)
+                if activation_recompute:
+                    current_phase = graph_replay_state["phase"]
+                    if current_phase != "recomputed":
+                        raise RuntimeError(
+                            "Activation-recompute CUDA graph expected recomputed "
+                            f"before backward, found {current_phase}"
+                        )
                 if ctx.cuda_graph_stream != torch.cuda.current_stream():
                     ctx.cuda_graph_stream.wait_stream(torch.cuda.current_stream())
                     with ctx.cuda_graph_stream:
@@ -1696,14 +2352,44 @@ def _make_graphed_callables(
                     if grad_input is None:
                         grad_inputs.append(None)
                     elif returned_param_grad_clone_slots[idx]:
-                        # Returned parameter grads may be installed directly as param.grad.
-                        # Clone to avoid exposing CUDA graph static buffers to autograd users.
                         grad_inputs.append(grad_input.detach().clone())
                     else:
                         grad_inputs.append(grad_input.detach())
-                return (None, None, None) + tuple(grad_inputs)
+                return (None, None, None, None, None) + tuple(grad_inputs)
 
+            @staticmethod
+            @torch.autograd.function.once_differentiable
+            def backward(ctx, *grads):
+                # pylint: disable=missing-function-docstring
+                try:
+                    return Graphed._backward_impl(ctx, *grads)
+                finally:
+                    if activation_recompute:
+                        if ctx.owns_backward:
+                            graph_replay_state["phase"] = "idle"
+                            graph_replay_state["next_replay_phase"] = None
+
+        @torch.compiler.disable
         def functionalized(*user_args, **user_kwargs):
+            replay_phase = user_kwargs.pop("_cuda_graph_replay_phase", None)
+            if activation_recompute:
+                if replay_phase is None:
+                    replay_phase = graph_replay_state["next_replay_phase"]
+                graph_replay_state["next_replay_phase"] = None
+                if replay_phase is None:
+                    raise RuntimeError(
+                        "Activation-recompute CUDA graph replay phase was not selected "
+                        "before the module call"
+                    )
+            elif replay_phase is None:
+                replay_phase = "forward"
+            # Direct callers can bypass set_replay_phase via the private kwarg.
+            if replay_phase not in ("forward", "recompute"):
+                raise ValueError(f"Unknown CUDA graph replay phase {replay_phase!r}")
+            for param, expected_ptr in zip(module_params, expected_param_ptrs):
+                # Replaying with a new parameter address would read stale captured storage.
+                if param.data_ptr() != expected_ptr:
+                    raise RuntimeError("CUDA graph parameter address changed after capture")
 
             # Decide whether to update FP8 weights
             skip_fp8_weight_update = None
@@ -1739,32 +2425,153 @@ def _make_graphed_callables(
             # the graph that might require grad (explicit user args +
             # module parameters)
             # Assumes module params didn't change since capture.
-            # Reconstruct the same flattened arg order as capture time.
-            # User may pass some recorded kwargs as positional args, so
-            # check user_args first (by position), then user_kwargs.
-            user_pos_args = list(user_args)
+            # Reconstruct the same flattened arg order as capture time. A compiled
+            # module may pass recorded kwargs positionally, including static defaults
+            # interleaved with tensor inputs, so bind by parameter name when possible.
+            arg_values = ()
             kwarg_values = []
-            for key in kwargs_keys:
-                if key in user_kwargs:
-                    kwarg_values.append(user_kwargs[key])
-                elif user_pos_args:
-                    kwarg_values.append(user_pos_args.pop(0))
-                # else: key was a default not passed — skip (not a tensor)
-            flatten_user_kwargs, _ = _tree_flatten(kwarg_values)
-            func_args = tuple(flatten_user_kwargs) + module_params
+            if call_signature is not None:
+                try:
+                    runtime_arguments = call_signature.bind_partial(*user_args, **user_kwargs)
+                    runtime_arguments.apply_defaults()
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "CUDA graph call arguments no longer match the captured signature"
+                    ) from exc
+                arg_values = runtime_arguments.args[:num_positional_args]
+                for key in kwargs_keys:
+                    if key in runtime_arguments.arguments:
+                        kwarg_values.append(runtime_arguments.arguments[key])
+                    elif key in user_kwargs:
+                        kwarg_values.append(user_kwargs[key])
+                    else:
+                        raise RuntimeError(f"CUDA graph input {key!r} is missing at replay")
+                for key, captured_value in captured_static_arguments.items():
+                    runtime_value = runtime_arguments.arguments.get(key, object())
+                    if (
+                        type(runtime_value) is not type(captured_value)
+                        or runtime_value != captured_value
+                    ):
+                        raise RuntimeError(
+                            "CUDA graph input structure or static metadata changed " "after capture"
+                        )
+            else:
+                # Some extension callables do not expose an inspectable signature.
+                # Preserve the legacy positional fallback for those callables.
+                arg_values = user_args[:num_positional_args]
+                user_pos_args = list(user_args[num_positional_args:])
+                for key in kwargs_keys:
+                    if key in user_kwargs:
+                        kwarg_values.append(user_kwargs[key])
+                    elif user_pos_args:
+                        kwarg_values.append(user_pos_args.pop(0))
+                    # else: key was a default not passed — skip (not a tensor)
+            flatten_user_args, args_spec = _tree_flatten(arg_values)
+            if args_spec != expected_args_spec or len(flatten_user_args) != flat_args_len:
+                raise RuntimeError("CUDA graph positional input structure changed after capture")
+            flatten_user_kwargs, kwargs_spec = _tree_flatten(kwarg_values)
+            if kwargs_spec != expected_kwargs_spec:
+                raise RuntimeError(
+                    "CUDA graph input structure or static metadata changed after capture"
+                )
+            flatten_user_inputs = tuple(flatten_user_args) + tuple(flatten_user_kwargs)
+            if len(flatten_user_inputs) != len_user_args:
+                raise RuntimeError("CUDA graph flattened input count changed after capture")
+            for input_idx, (static_input, runtime_input) in enumerate(
+                zip(static_input_surface[:len_user_args], flatten_user_inputs)
+            ):
+                static_is_tensor = isinstance(static_input, torch.Tensor)
+                runtime_is_tensor = isinstance(runtime_input, torch.Tensor)
+                if not static_is_tensor and not runtime_is_tensor:
+                    if (
+                        type(static_input) is not type(runtime_input)
+                        or static_input != runtime_input
+                    ):
+                        raise RuntimeError(
+                            "CUDA graph input structure or static metadata changed " "after capture"
+                        )
+                    continue
+                if static_is_tensor != runtime_is_tensor:
+                    raise RuntimeError(
+                        "CUDA graph input structure or static metadata changed after capture: "
+                        f"leaf {input_idx} captured {type(static_input).__name__}, "
+                        f"replayed {type(runtime_input).__name__}"
+                    )
+                if (
+                    static_input.shape != runtime_input.shape
+                    or static_input.dtype != runtime_input.dtype
+                    or static_input.device != runtime_input.device
+                    or static_input.layout != runtime_input.layout
+                    or static_input.stride() != runtime_input.stride()
+                    or (
+                        (
+                            replay_phase == "recompute"
+                            if activation_recompute
+                            else torch.is_grad_enabled()
+                        )
+                        and static_input.requires_grad != runtime_input.requires_grad
+                    )
+                ):
+                    raise RuntimeError("CUDA graph input tensor metadata changed after capture")
+            func_args = flatten_user_inputs + module_params
             out = Graphed.apply(
-                skip_fp8_weight_update, cuda_graph_stream, cuda_graph_event, *func_args
+                replay_phase,
+                torch.is_grad_enabled(),
+                skip_fp8_weight_update,
+                cuda_graph_stream,
+                cuda_graph_event,
+                *func_args,
             )
             return _tree_unflatten(out, output_unflatten_spec)
 
+        def set_replay_phase(replay_phase):
+            """Select the next original-forward or recompute-forward graph.
+
+            :param replay_phase: Program to select.
+            :type replay_phase: str
+            :raises ValueError: If the requested program is unknown.
+            """
+            # Inference forwards bypass the runner entirely; only the two
+            # graph programs are selectable here.
+            # Reject unknown names before they enter persistent replay state.
+            if replay_phase not in ("forward", "recompute"):
+                raise ValueError(f"Unknown CUDA graph replay phase {replay_phase!r}")
+            graph_replay_state["next_replay_phase"] = replay_phase
+
+        def preflight():
+            """Validate the selected replay against the current graph state.
+
+            :raises RuntimeError: If no phase was selected or an invocation is pending.
+            """
+            if activation_recompute:
+                replay_phase = graph_replay_state["next_replay_phase"]
+                if replay_phase is None:
+                    raise RuntimeError(
+                        "Activation-recompute CUDA graph replay phase was not selected "
+                        "before preflight"
+                    )
+                current_phase = graph_replay_state["phase"]
+                if replay_phase == "recompute" and current_phase == "forward_done":
+                    return
+                if current_phase != "idle":
+                    raise RuntimeError(
+                        "Activation-recompute CUDA graph state is "
+                        f"{current_phase}; next phase is {replay_phase}"
+                    )
+
+        functionalized._cuda_graph_set_replay_phase = set_replay_phase
+        functionalized._cuda_graph_preflight = preflight
         return functionalized
 
     def make_graphed_attribute_functions(graph_idx):
+        """Create lifecycle functions for one callable."""
         # Get te modules for current graph
         te_modules = visited_te_modules.get(graph_idx, set())
+        reset_done = False
 
         # Attach backward_dw as an attribute to the graphed callable.
         def backward_dw():
+            """Replay the delayed backward-wgrad graph when present."""
             if need_bwd_dw_graph.get(graph_idx, False):
                 bwd_dw_graphs[graph_idx].replay()
 
@@ -1778,38 +2585,100 @@ def _make_graphed_callables(
 
         # Attach reset as an attribute to the graphed callable.
         def reset():
+            """Reset all CUDA graph objects for this callable."""
+            nonlocal reset_done
+            if reset_done:
+                return
+            graph_replay_states[graph_idx]["phase"] = "idle"
+            graph_replay_states[graph_idx]["next_replay_phase"] = None
             fwd_graphs[graph_idx].reset()
+            if recompute_graphs[graph_idx] is not None:
+                recompute_graphs[graph_idx].reset()
             bwd_graphs[graph_idx].reset()
             bwd_dw_graphs[graph_idx].reset()
+            reset_done = True
 
         return backward_dw, reset
 
     # Put together the final graphed callables
     ret = []
     for i in range(len(sample_args)):
+        func = graph_callables[i]
+        signature_target = (
+            func.__dict__.get("_mfsdp_cuda_graph_forward_impl", func.forward)
+            if isinstance(func, torch.nn.Module)
+            else func
+        )
+        try:
+            call_signature = inspect.signature(signature_target)
+            captured_arguments = call_signature.bind_partial(*sample_args[i], **sample_kwargs[i])
+            captured_arguments.apply_defaults()
+        except (TypeError, ValueError):
+            call_signature = None
+            captured_arguments = None
+        captured_static_arguments = {}
+        if captured_arguments is not None:
+            captured_static_arguments = {
+                key: value
+                for key, value in captured_arguments.arguments.items()
+                if key not in per_callable_kwargs_keys[i]
+                and not any(isinstance(leaf, torch.Tensor) for leaf in _tree_flatten(value)[0])
+            }
         graphed = make_graphed_autograd_function(
             fwd_graphs[i],
+            recompute_graphs[i],
             bwd_graphs[i],
             per_callable_module_params[i],
             per_callable_kwargs_keys[i],
+            per_callable_args_spec[i],
+            per_callable_kwargs_spec[i],
+            per_callable_flat_args_len[i],
+            len(sample_args[i]),
+            call_signature,
+            captured_static_arguments,
             per_callable_len_user_args[i],
             per_callable_output_unflatten_spec[i],
             per_callable_static_input_surfaces[i],
             per_callable_static_outputs[i],
+            per_callable_recompute_outputs[i],
             per_callable_static_grad_outputs[i],
             per_callable_static_grad_inputs[i],
             per_callable_returned_param_grad_clone_slots[i],
+            per_callable_expected_param_ptrs[i],
+            graph_replay_states[i],
+            per_callable_output_requires_grad[i],
+            _activation_recompute,
         )
 
-        func = graph_callables[i]
         te_modules = visited_te_modules.get(i, set())
         if isinstance(func, torch.nn.Module):
 
-            def make_graphed_forward(func, graph_training_state, graphed, orig_fwd, te_modules):
+            def make_graphed_forward(
+                func,
+                graph_training_state,
+                graphed,
+                orig_fwd,
+                te_modules,
+                activation_recompute,
+                graph_replay_state,
+            ):
+                """Wrap one module forward with runtime compatibility checks."""
+
+                @torch.compiler.disable
                 def new_fwd(*user_args, **user_kwargs):
                     # If the module's training-or-eval state matches what we graphed,
                     # run the graph, otherwise run the original forward method
                     if func.training == graph_training_state:
+                        replay_phase = graph_replay_state["next_replay_phase"]
+                        # A no-grad forward always runs eagerly — with or
+                        # without a prepared phase. The M-FSDP hooks skip
+                        # prepare/preflight entirely for inference forwards,
+                        # so this bypass must not rely on prepared state.
+                        if activation_recompute and (
+                            replay_phase == "inference" or not torch.is_grad_enabled()
+                        ):
+                            graph_replay_state["next_replay_phase"] = None
+                            return orig_fwd(*user_args, **user_kwargs)
                         # Set the FP8 group from global amax reduction.
                         if FP8GlobalStateManager.is_fp8_enabled():
                             fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
@@ -1818,6 +2687,7 @@ def _make_graphed_callables(
                                     # Only Set the FP8 meta for the modules included by forward
                                     continue
                                 if isinstance(m, TransformerEngineBaseModule):
+                                    # pylint: disable-next=line-too-long
                                     from transformer_engine.pytorch.attention.dot_product_attention import (
                                         DotProductAttention,
                                     )
@@ -1847,13 +2717,26 @@ def _make_graphed_callables(
                                                 m._fp8_metas[mode]
                                             )
                         return graphed(*user_args, **user_kwargs)
+                    graph_replay_state["next_replay_phase"] = None
                     return orig_fwd(*user_args, **user_kwargs)
 
                 return new_fwd
 
-            forward = make_graphed_forward(func, func.training, graphed, func.forward, te_modules)
+            original_forward = func.__dict__.get("_mfsdp_cuda_graph_forward_impl", func.forward)
+            forward = make_graphed_forward(
+                func,
+                func.training,
+                graphed,
+                original_forward,
+                te_modules,
+                _activation_recompute,
+                graph_replay_states[i],
+            )
             if _order is None:
-                func.forward = forward
+                if "_mfsdp_cuda_graph_forward_impl" in func.__dict__:
+                    func._mfsdp_cuda_graph_forward_impl = forward
+                else:
+                    func.forward = forward
                 ret.append(func)
             else:
                 ret.append(forward)
@@ -1863,7 +2746,12 @@ def _make_graphed_callables(
         backward_dw_func, reset_func = make_graphed_attribute_functions(i)
         setattr(ret[-1], "backward_dw", backward_dw_func)
         setattr(ret[-1], "reset", reset_func)
-
+        preflight = getattr(graphed, "_cuda_graph_preflight", None)
+        if callable(preflight):
+            setattr(ret[-1], "_cuda_graph_preflight", preflight)
+        set_replay_phase = getattr(graphed, "_cuda_graph_set_replay_phase", None)
+        if callable(set_replay_phase):
+            setattr(ret[-1], "_cuda_graph_set_replay_phase", set_replay_phase)
     if just_one_callable:
         return ret[0]
 
@@ -1941,10 +2829,12 @@ def make_graphed_callables(
     _reuse_graph_input_output_buffers: bool = False,
     _clone_param_grads_on_return: bool = True,
     _input_output_aliases: Optional[Tuple[Dict[int, Tuple[int, int]], ...]] = None,
+    _activation_recompute: bool = False,
     pre_warmup_hook: Optional[Callable] = None,
     post_warmup_hook: Optional[Callable] = None,
     capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]] = None,
     capture_stream: Optional[torch.cuda.Stream] = None,
+    use_main_grad: bool = False,
 ) -> Union[Callable, Tuple[Callable, ...]]:
     """
     Make CUDA graph version of Transformer Engine modules
@@ -1956,8 +2846,9 @@ def make_graphed_callables(
 
     .. warning::
 
-       Arguments 'fp8_enabled', 'fp8_calibrating', 'fp8_recipe', 'fp8_group', and 'fp8_weight_caching' are deprecated.
-       Use arguments 'enabled', 'calibrating', 'recipe', 'amax_reduction_group', and 'cache_quantized_params' instead.
+       Arguments 'fp8_enabled', 'fp8_calibrating', 'fp8_recipe', 'fp8_group', and
+       'fp8_weight_caching' are deprecated. Use 'enabled', 'calibrating', 'recipe',
+       'amax_reduction_group', and 'cache_quantized_params' instead.
 
     Graphing parameters
     ===================
@@ -1970,6 +2861,9 @@ def make_graphed_callables(
     allow_unused_input: bool, default = False
                         Whether to handle case where callable inputs
                         and outputs are disconnected in compute graph.
+    use_main_grad: bool, default = False
+                   Whether to bind compatible leaf gradients directly to
+                   caller-owned main-grad buffers during backward capture.
     sample_kwargs: (tuple of) dict, optional
                    Keyword arguments to callable(s)
     pool: (tuple of) int, default = None, optional
@@ -1979,9 +2873,9 @@ def make_graphed_callables(
                               Whether to set retain_graph=True in backward graph capture.
     _reuse_graph_input_output_buffers: bool, default = False
         Reduce memory usage by reusing input/output data buffers between
-        graphs. Only supported with Mcore interleaved pipeline parallelism, i.e.
-        when `_order` is provided. All callables in `modules` are assumed to have
-        inputs and outputs with the same dtype and shape.
+        graphs. MCore pipeline capture uses `_order`; activation recompute weakens
+        contiguous, uniquely consumed internal forward boundaries after their
+        backward capture. Other inputs and outputs retain their own storage.
     _clone_param_grads_on_return: bool, default = True
         Clone parameter gradients before returning them from CUDA graph replay.
         Disabling this avoids the extra clone/copy and may improve performance,
@@ -1991,6 +2885,10 @@ def make_graphed_callables(
         replay of another callable, may overwrite retained hook or `.grad`
         tensors. Only disable this when the caller consumes returned parameter
         gradients before any such overwrite can occur.
+    _activation_recompute: bool, default = False
+        Capture grad-enabled forward with discarded saved tensors,
+        grad-enabled recompute forward, and backward as separate CUDA Graphs,
+        with one callable per checkpoint region.
     pre_warmup_hook: callable, default = None
                       A hook function that will be called once before all warmup iterations
                       (not once per callable).
@@ -2030,14 +2928,16 @@ def make_graphed_callables(
                           distributed group over which amaxes for the quantized tensors
                           are reduced at the end of each training step.
     cache_quantized_params: bool, default = False
-                            Whether or not to cache quantized weights across microbatches. if set to `True`,
-                            the `is_first_microbatch` boolean argument must be passed into the forward
-                            method for TransformerEngine modules. When storing primary weights in low precision
-                            using TE's `quantized_model_init` API and using an quantization aware optimizer,
-                            this arg must be set to `False` if calculating weight transposes' outside TE, e.g.,
-                            in the optimizer step.
+                            Whether to cache quantized weights across microbatches. If set to
+                            `True`, pass `is_first_microbatch` to TransformerEngine modules.
+                            When primary weights use TE's `quantized_model_init` API with a
+                            quantization-aware optimizer, set this to `False` if weight
+                            transposes are calculated outside TE, for example by the optimizer.
 
     """
+
+    if not isinstance(use_main_grad, bool):
+        raise TypeError(f"use_main_grad must be a bool, but got {type(use_main_grad).__name__}")
 
     te_available = _prepare_runtime()
 
@@ -2134,11 +3034,10 @@ def make_graphed_callables(
                 f"enabled must be a bool or a tuple of bools, but got {type(enabled).__name__}"
             )
         enabled = (enabled,) * len(modules)
-    else:
-        if len(enabled) != len(modules):
-            raise ValueError(
-                f"enabled length ({len(enabled)}) must match modules length ({len(modules)})"
-            )
+    elif len(enabled) != len(modules):
+        raise ValueError(
+            f"enabled length ({len(enabled)}) must match modules length ({len(modules)})"
+        )
     if not te_available and (
         any(enabled)
         or calibrating
@@ -2147,6 +3046,10 @@ def make_graphed_callables(
         or cache_quantized_params
     ):
         raise _te_required_error("FP8/TE-specific graph capture")
+    if _activation_recompute and any(enabled):
+        raise RuntimeError("Activation-recompute CUDA graphs do not support FP8")
+    if _activation_recompute and get_all_rng_states():
+        raise RuntimeError("Activation-recompute CUDA graphs do not support tracked RNG states")
     if any(enabled) and recipe is None:
         recipe = get_default_fp8_recipe()
     elif not any(enabled):
@@ -2192,49 +3095,47 @@ def make_graphed_callables(
     else:
         forward_funcs = tuple(forward_funcs)
 
-    # Save RNG state.
+    # Save RNG state and restore it even if warmup or capture fails.
     if graph_safe_rng_available():
         generators = [
             torch.cuda.default_generators[torch.cuda.current_device()],
-            *_ensure_graph_safe_rng_states().values(),
+            *(() if _activation_recompute else _ensure_graph_safe_rng_states().values()),
         ]
-        original_rng_states = [state.get_state() for state in generators]
+        original_rng_states = [generator.get_state() for generator in generators]
     else:
-        original_rng_states = torch.cuda.get_rng_state()
+        original_rng_state = torch.cuda.get_rng_state()
 
-    graphed_callables = _make_graphed_callables(
-        forward_funcs,
-        sample_args,
-        num_warmup_iters=num_warmup_iters,
-        allow_unused_input=allow_unused_input,
-        cache_quantized_params=cache_quantized_params,
-        sample_kwargs=sample_kwargs,
-        _order=_order,
-        _num_layers_per_chunk=_num_layers_per_chunk,
-        pool=pool,
-        retain_graph_in_backward=retain_graph_in_backward,
-        _reuse_graph_input_output_buffers=_reuse_graph_input_output_buffers,
-        _clone_param_grads_on_return=_clone_param_grads_on_return,
-        _input_output_aliases=_input_output_aliases,
-        pre_warmup_hook=pre_warmup_hook,
-        post_warmup_hook=post_warmup_hook,
-        capture_time_hooks=capture_time_hooks,
-        capture_stream=capture_stream,
-    )
+    try:
+        graphed_callables = _make_graphed_callables(
+            forward_funcs,
+            sample_args,
+            num_warmup_iters=num_warmup_iters,
+            allow_unused_input=allow_unused_input,
+            cache_quantized_params=cache_quantized_params,
+            sample_kwargs=sample_kwargs,
+            _order=_order,
+            _num_layers_per_chunk=_num_layers_per_chunk,
+            pool=pool,
+            retain_graph_in_backward=retain_graph_in_backward,
+            _reuse_graph_input_output_buffers=_reuse_graph_input_output_buffers,
+            _clone_param_grads_on_return=_clone_param_grads_on_return,
+            _input_output_aliases=_input_output_aliases,
+            _activation_recompute=_activation_recompute,
+            pre_warmup_hook=pre_warmup_hook,
+            post_warmup_hook=post_warmup_hook,
+            capture_time_hooks=capture_time_hooks,
+            capture_stream=capture_stream,
+            use_main_grad=use_main_grad,
+        )
+    finally:
+        if graph_safe_rng_available():
+            for generator, state in zip(generators, original_rng_states):
+                generator.set_state(state)
+        else:
+            torch.cuda.set_rng_state(original_rng_state)
+        for module_cls, old_call in old_call_funcs.items():
+            module_cls.__call__ = old_call
+        restore_fp8_tensors(modules, saved_fp8_tensors)
+        set_capture_end()
 
-    # Ensures warmup does not affect numerics for ops such as dropout.
-    if graph_safe_rng_available():
-        for gen, state in zip(generators, original_rng_states):
-            gen.set_state(state)
-    else:
-        torch.cuda.set_rng_state(original_rng_states)
-
-    # Remove FP8 wrapper.
-    for module_cls, old_call in old_call_funcs.items():
-        module_cls.__call__ = old_call
-
-    # Restore FP8 state.
-    restore_fp8_tensors(modules, saved_fp8_tensors)
-
-    set_capture_end()
     return graphed_callables
