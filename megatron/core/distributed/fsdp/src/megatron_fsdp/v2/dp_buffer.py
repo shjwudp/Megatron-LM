@@ -266,7 +266,8 @@ class DataParallelBuffer:
                     dtype=self.grad_comm_dtype,
                     device=self.device,
                 ).data
-            if comm_input.is_cuda:
+            # Only temporary cast storage needs allocator-side stream tracking.
+            if comm_input is not input_buffer and comm_input.is_cuda:
                 comm_input.record_stream(stream)
 
             with torch.cuda.stream(stream):

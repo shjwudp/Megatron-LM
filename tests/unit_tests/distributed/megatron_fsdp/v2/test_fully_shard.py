@@ -963,6 +963,76 @@ class TestMixedPrecision:
         loss.backward()
         assert not torch.isnan(torch.tensor(loss.item()))
 
+    @pytest.mark.parametrize(
+        ("grad_comm_dtype", "expects_cast_buffer"),
+        [
+            pytest.param(None, False, id="same-dtype"),
+            pytest.param(torch.float32, True, id="cast-buffer"),
+        ],
+    )
+    def test_grad_reduce_tracks_only_separate_cast_buffer(
+        self, grad_comm_dtype, expects_cast_buffer, monkeypatch
+    ):
+        """Track the separate cast buffer, not the main gradient input.
+
+        :param grad_comm_dtype: Gradient communication dtype, or None to reuse
+            the full main-gradient input.
+        :type grad_comm_dtype: Optional[torch.dtype]
+        :param expects_cast_buffer: Whether gradient reduction allocates a dtype-conversion buffer.
+        :type expects_cast_buffer: bool
+        :param monkeypatch: Pytest attribute patching fixture.
+        :type monkeypatch: pytest.MonkeyPatch
+        """
+        torch.manual_seed(42)
+        model = SimpleMLP(64).to(_device(), dtype=torch.bfloat16)
+        fully_shard(
+            model,
+            sharding_strategy="optim_grads_params",
+            mp_policy=MixedPrecisionPolicy(
+                main_grads_dtype=torch.bfloat16, grad_comm_dtype=grad_comm_dtype
+            ),
+            enable_async_reduce_grad=True,
+        )
+
+        x = torch.randn(2, 64, device=_device(), dtype=torch.bfloat16)
+        out = model(x)
+
+        param_group = model._fsdp_param_groups[0]
+        param_group._init_dist_grads()
+        grad_input = param_group.main_grad_buffer.fetch_buffer(
+            [Placement.REPLICATE, Placement.REPLICATE]
+        )
+        grad_input_ptr = grad_input.data_ptr()
+        grad_input_numel = grad_input.numel()
+        del grad_input
+
+        record_stream_calls = []
+        original_record_stream = torch.Tensor.record_stream
+        monkeypatch.setattr(
+            torch.Tensor,
+            "record_stream",
+            lambda tensor, stream: (
+                record_stream_calls.append(
+                    (tensor.data_ptr(), tensor.dtype, tensor.numel(), stream)
+                ),
+                original_record_stream(tensor, stream),
+            )[1],
+        )
+
+        model.set_is_last_backward(True)
+        out.sum().backward()
+        model.finish_grad_sync()
+
+        assert grad_input_ptr not in {call[0] for call in record_stream_calls}
+        cast_buffer_calls = [
+            call
+            for call in record_stream_calls
+            if call[1] == grad_comm_dtype
+            and call[2] == grad_input_numel
+            and call[3] == model._fsdp_root_context.rs_stream
+        ]
+        assert len(cast_buffer_calls) == int(expects_cast_buffer)
+
 
 # ------------------------------------------------------------------ #
 #  6. ignored_params
