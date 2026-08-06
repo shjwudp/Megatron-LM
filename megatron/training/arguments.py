@@ -3568,6 +3568,13 @@ def _add_experimental_args(parser):
                              "the FixedPoolAllocator to support asymmetrical FSDP unit configurations. Will "
                              "increase memory overhead to recycle buffers that fit all FSDP units. Enables "
                              "NCCL user buffer registration and CUDA graph replay for mixed-arch models.")
+    group.add_argument("--megatron-fsdp-prefetch-depth", type=int, default=1,
+                        help="Number of successor FSDP units whose parameter all-gather is issued ahead of "
+                             "compute (prefetch depth). Depth 1 prefetches only the next FSDP unit; larger "
+                             "depths issue more all-gathers earlier on the all-gather stream, hiding unshard "
+                             "communication behind more forward/backward compute at the cost of more "
+                             "concurrently materialized parameter storage. Only used by Megatron-FSDP v2 "
+                             "with the experimental path.")
     group.add_argument("--fsdp-db-use-persist-buf-on-alloc-fail", action='store_true',
                         help="When using Megatron-FSDP double buffering, persist non-unit modules that "
                              "are not included in the symmetric buffer pool. May be necessary for NCCL "

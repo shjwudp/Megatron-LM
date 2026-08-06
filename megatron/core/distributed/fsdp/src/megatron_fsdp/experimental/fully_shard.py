@@ -35,6 +35,7 @@ def fully_shard(
     fine_grained: bool = False,
     skip_backward_callback: bool = False,
     grad_divisor: int = 1,
+    prefetch_depth: int = 1,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -65,6 +66,11 @@ def fully_shard(
             the expert-data-parallel mesh alone therefore divides by too little, and
             ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
             their own rank's tokens and need no divisor.
+        prefetch_depth: Number of successor FsdpModules whose all-gather is
+            issued ahead of compute.  Depth 1 prefetches only the immediate
+            successor; larger depths issue more all-gathers earlier on the
+            all-gather stream, hiding unshard latency behind more compute at
+            the cost of more concurrently materialized parameter storage.
 
         Parameters that are TE MXFP8 primary weights (detected via
         ``is_float8tensor`` + ``fp8_need_transpose_data``) are grouped into
@@ -88,6 +94,7 @@ def fully_shard(
             fine_grained=fine_grained,
             skip_backward_callback=skip_backward_callback,
             grad_divisor=grad_divisor,
+            prefetch_depth=prefetch_depth,
         )
     except Exception:
         module.__class__ = original_cls

@@ -52,19 +52,32 @@ class FsdpContext:
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder["FsdpModule"]
     backward_order: IndexedOrder["FsdpModule"]
+    # Number of successor FsdpModules whose all-gather is issued ahead of
+    # compute.  Depth 1 (default) prefetches only the immediate successor;
+    # larger depths issue more all-gathers earlier on the all-gather stream,
+    # hiding unshard latency behind more compute at the cost of more
+    # concurrently materialized parameter storage.
+    prefetch_depth: int
 
-    def __init__(self, device: torch.device, root_module: "FsdpModule") -> None:
+    def __init__(
+        self, device: torch.device, root_module: "FsdpModule", prefetch_depth: int = 1
+    ) -> None:
         """Create rank-local runtime state for a root FSDP subtree.
 
         Args:
             device: Device on which this context schedules communication.
             root_module: Outermost module that owns this context.
+            prefetch_depth: Number of successor FsdpModules prefetched per
+                forward/backward pre-hook.  Must be at least 1.
         """
         self.root_module = root_module
         self.is_last_microbatch = True
         self.backward_phase = False
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
+        if prefetch_depth < 1:
+            raise ValueError(f"prefetch_depth must be at least 1, got {prefetch_depth}.")
+        self.prefetch_depth = prefetch_depth
         with torch.cuda.device(device):
             self.allgather_stream = torch.cuda.Stream()
             self.reduce_scatter_stream = torch.cuda.Stream()
@@ -97,6 +110,7 @@ class FsdpModule:
     _name: str | None
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext | None
+    _prefetch_depth: int
     _num_ready_grad_parameters: int
     _num_trainable_parameters: int
     _post_backward_issued: bool
@@ -114,11 +128,13 @@ class FsdpModule:
         fine_grained: bool = False,
         skip_backward_callback: bool = False,
         grad_divisor: int = 1,
+        prefetch_depth: int = 1,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = None
         self._name = None
         self._unshard_event = None
+        self._prefetch_depth = prefetch_depth
         owned_parameters = _collect_owned_parameters(self)
         axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
         assert axis_indices == tuple(
@@ -232,7 +248,9 @@ class FsdpModule:
         if first_parameter is None:
             raise RuntimeError("FSDP root module requires at least one parameter in its subtree.")
 
-        context = FsdpContext(device=first_parameter.device, root_module=self)
+        context = FsdpContext(
+            device=first_parameter.device, root_module=self, prefetch_depth=self._prefetch_depth
+        )
         # named_modules() yields FsdpModules in registration order, which is the static
         # forward execution order used to prefetch the next FsdpModule's all-gather.
         for submodule_name, submodule in root_module.named_modules():
@@ -331,12 +349,10 @@ class FsdpModule:
         current_stream.wait_event(self._unshard_event)
 
         # Activation recomputation runs forward hooks inside backward. Do not
-        # prefetch the next module in forward order: its backward may already
-        # be complete, so no later backward hook would reshard it.
+        # prefetch the next modules in forward order: their backward may already
+        # be complete, so no later backward hook would reshard them.
         if not context.backward_phase:
-            next_module = context.forward_order.next_item(self)
-            if next_module is not None:
-                next_module._unshard_parameter_groups()
+            self._prefetch_successors(context.forward_order, "rowwise")
 
     def _unshard_parameter_groups(self, orientation: str = "rowwise") -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
@@ -360,6 +376,27 @@ class FsdpModule:
                 group.unshard_parameters(orientation)
             self._unshard_event = allgather_stream.record_event()
 
+    def _prefetch_successors(self, order: IndexedOrder["FsdpModule"], orientation: str) -> None:
+        """Issue all-gathers for the next ``prefetch_depth`` modules in ``order``.
+
+        All-gathers are enqueued on the shared all-gather stream immediately
+        after this module's own unshard, so they overlap with this module's
+        compute.  Each successor's ``_unshard_event`` guards idempotency, so
+        modules already unsharded (e.g. by an earlier prefetch or by the
+        fine-grained schedule) are skipped.
+
+        Args:
+            order: Forward or backward execution order to walk.
+            orientation: Payload orientation to gather for MXFP8 groups.
+        """
+        module = self
+        for _ in range(self.context.prefetch_depth):
+            next_module = order.next_item(module)
+            if next_module is None:
+                return
+            next_module._unshard_parameter_groups(orientation)
+            module = next_module
+
     def unshard_parameters(self, orientation: str = "rowwise") -> None:
         """Public API: all-gather full parameter storage for compute.
 
@@ -375,6 +412,11 @@ class FsdpModule:
         self._unshard_parameter_groups(orientation)
         if self._unshard_event is not None:
             self.context.current_stream().wait_event(self._unshard_event)
+        # The fine-grained 1F1B EP overlap schedule drives unshard on demand
+        # from sub-module hooks; prefetch successors here so their all-gathers
+        # overlap with this module's compute instead of stalling the schedule.
+        if not self.context.backward_phase:
+            self._prefetch_successors(self.context.forward_order, orientation)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute.
@@ -449,9 +491,7 @@ class FsdpModule:
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
 
-        next_module = context.backward_order.next_item(self)
-        if next_module is not None:
-            next_module._unshard_parameter_groups("colwise")
+        self._prefetch_successors(context.backward_order, "colwise")
 
     def post_backward(self, finalize_context: bool = False) -> None:
         """Reduce gradients and return parameters to their sharded resting state.

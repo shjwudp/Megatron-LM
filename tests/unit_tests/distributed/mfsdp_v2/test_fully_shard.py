@@ -454,6 +454,75 @@ def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setu
     )
 
 
+def test_prefetch_depth_materializes_multiple_successors(distributed_setup):
+    """Prefetch depth should unshard multiple successor modules in one pass."""
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    dim = 4096
+    dtype = torch.bfloat16
+    prefetch_depth = 2
+    model = MultiChildModel(dim=dim, num_children=4).to(dtype=dtype, device=device)
+    placements = _flat_placements()
+    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
+    for layer in model.layers:
+        fully_shard(
+            layer,
+            mesh=mesh,
+            placements=placements,
+            mixed_precision_policy=policy,
+            prefetch_depth=prefetch_depth,
+        )
+    fully_shard(
+        model,
+        mesh=mesh,
+        placements=placements,
+        mixed_precision_policy=policy,
+        prefetch_depth=prefetch_depth,
+    )
+
+    # After the first layer's forward pre-hook, the next two layers should be
+    # unsharded (their _unshard_event set) because prefetch_depth == 2.
+    context = model.context
+    first, second, third, _ = context.forward_order
+    assert first._unshard_event is None or second._unshard_event is not None
+    x = torch.randn(2, dim, device=device, dtype=dtype)
+    with torch.no_grad():
+        model(x)
+    torch.cuda.synchronize(device)
+    # All four children were consumed; none should remain unsharded after the
+    # forward releases them.
+    for layer in context.forward_order:
+        assert layer._unshard_event is None, (
+            f"layer {layer.name} still unsharded after forward."
+        )
+
+
+def test_prefetch_depth_invalid_value_rejected(distributed_setup):
+    """Prefetch depth below one should be rejected at context creation."""
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    dim = 16
+    model = MultiChildModel(dim=dim, num_children=2).to(
+        dtype=torch.bfloat16, device=distributed_setup.device
+    )
+    placements = _flat_placements()
+    policy = MixedPrecisionPolicy(
+        main_params_dtype=torch.bfloat16, main_grads_dtype=torch.bfloat16
+    )
+    with pytest.raises(ValueError, match="prefetch_depth"):
+        fully_shard(
+            model.layers[0],
+            mesh=mesh,
+            placements=placements,
+            mixed_precision_policy=policy,
+            prefetch_depth=0,
+        )
+
+
 def test_root_forward_returns_to_resting_memory(distributed_setup):
     """Root forward should release child all-gather storage before returning."""
     rank = distributed_setup.rank

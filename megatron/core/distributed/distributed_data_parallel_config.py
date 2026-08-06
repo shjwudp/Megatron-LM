@@ -240,6 +240,15 @@ class DistributedDataParallelConfig:
       will be unsharded.
     """
 
+    megatron_fsdp_prefetch_depth: int = 1
+    """Number of successor FSDP units whose parameter all-gather is issued ahead
+      of compute (prefetch depth).  Depth 1 prefetches only the next FSDP unit;
+      larger depths issue more all-gathers earlier on the all-gather stream,
+      hiding unshard communication behind more forward/backward compute at the
+      cost of more concurrently materialized parameter storage.  Only used by
+      Megatron-FSDP v2 (experimental path).
+    """
+
     megatron_fsdp_max_pool_double_buffer: bool = False
     """
     Builds a double buffer maxpool that can be recycled across asymmetric / hybrid

@@ -2022,6 +2022,7 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
         kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
         kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
+        kwargs["megatron_fsdp_prefetch_depth"] = args.megatron_fsdp_prefetch_depth
         if args.use_megatron_fsdp and args.megatron_fsdp_version == 2:
             # MFSDP v2 gathers parameters from module hooks rather than the V1
             # start_param_sync path, so disable the V1-only startup all-gather knob.
