@@ -752,7 +752,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """MFSDP v2 reduces gradients during backward."""
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
-        """MFSDP v2 gradient reduction is complete when backward returns."""
+        """Wait for in-flight gradient reduce-scatters before the optimizer step.
+
+        Reductions are asynchronous on the context's reduce-scatter stream and
+        their staging buffers stay referenced until this point; ordering the
+        current stream after them releases those buffers for reuse.
+        """
+        self.module._lazy_init_context()
+        self.module.context.finish_grad_sync()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""
