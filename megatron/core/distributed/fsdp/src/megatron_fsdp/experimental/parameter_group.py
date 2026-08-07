@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+import torch.distributed.tensor as dist_tensor
 from torch import nn
 from torch.distributed import DeviceMesh
 
@@ -69,6 +70,17 @@ class FsdpParameterGroup:
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
     _model_weight_placements: tuple[Placement, ...]
+    # Cached sharded-gradient DTensors keyed by the main_grad DBuffer identity.
+    # Rebuilding DTensors every backward costs O(params) ``_FromTorchTensor``
+    # calls on the host; when main_grad storage is reused we rebind the cached
+    # DTensor's local storage in place instead. Invalidation: cleared whenever
+    # ``_main_grad`` is replaced (redistribute) or ``main_grad`` changes dtype.
+    _grad_dtensor_cache: list[dist_tensor.DTensor | None]
+    _grad_dtensor_cache_main_grad_id: int | None
+    # Cached reduce-scatter input (partial) buffer, reused across microbatches
+    # when parameter shapes and dtype are unchanged.  Avoids a fresh DBuffer
+    # allocation + storage release per backward.
+    _partial_grad_buffer: DBuffer | None
 
     def __init__(
         self,
@@ -153,6 +165,9 @@ class FsdpParameterGroup:
         self._main_grad = None
         self._main_grad_placements = None
         self._main_grad_dtype = None
+        self._grad_dtensor_cache = []
+        self._grad_dtensor_cache_main_grad_id = None
+        self._partial_grad_buffer = None
         if self.requires_grad:
             # main_grad itself is materialized lazily by the property below; only its
             # shape metadata is recorded here. See that property for why.
@@ -362,7 +377,15 @@ class FsdpParameterGroup:
         return self._main_grad
 
     def allocate_partial_grad_buffer(self) -> DBuffer:
-        """Allocate the unreduced reduce-scatter input buffer."""
+        """Allocate (or reuse) the unreduced reduce-scatter input buffer.
+
+        The buffer is cached on the group and reused while parameter shapes and
+        dtype are unchanged, avoiding a fresh DBuffer allocation + storage
+        release per backward.  Callers must keep the stream-ordering invariant:
+        the previous reduce-scatter reading this buffer must have completed
+        before ``copy_gradients_to_partial_buffer`` overwrites it (the
+        ``wait_stream`` edge in ``_reduce_gradient_groups`` guarantees this).
+        """
         assert self.requires_grad
 
         # NCCL symmetric-memory reduce-scatter only selects the symmetric kernel for SUM today.
@@ -374,14 +397,26 @@ class FsdpParameterGroup:
             if grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
             grads.append(grad)
+        tensor_shapes = tuple(grad.shape for grad in grads)
+        dtype = grads[0].dtype
+
+        cached = self._partial_grad_buffer
+        if (
+            cached is not None
+            and cached.layout.tensor_shapes == tensor_shapes
+            and cached.dtype == dtype
+        ):
+            return cached
+
         with self._symmetric_memory_context():
-            return DBuffer(
+            self._partial_grad_buffer = DBuffer(
                 mesh=self.mesh,
                 placements=[Partial(partial_op)] * self.mesh.ndim,
-                tensor_shapes=tuple(grad.shape for grad in grads),
-                dtype=grads[0].dtype,
+                tensor_shapes=tensor_shapes,
+                dtype=dtype,
                 device=grads[0].device,
             )
+        return self._partial_grad_buffer
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
@@ -468,8 +503,39 @@ class FsdpParameterGroup:
             self._main_grad = self.main_grad.redistribute(self.main_weight.placements)
 
         # Make each sharded parameter's .grad consistent with the final main_grad.
+        # Reuse cached DTensors where possible: rebinding storage in place avoids
+        # O(params) ``DTensor.from_local`` (``_FromTorchTensor``) host cost per
+        # backward.  The cache is keyed on the main_grad DBuffer identity so a
+        # fresh buffer (redistribute replacement, dtype change) rebuilds it.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.sharded.grad = self.main_grad.get_dtensor(index)
+            fsdp_parameter.sharded.grad = self._get_sharded_grad_dtensor(index)
+
+    def _get_sharded_grad_dtensor(self, index: int) -> dist_tensor.DTensor:
+        """Return the sharded-gradient DTensor for parameter ``index``, cached.
+
+        The first call for a given ``main_grad`` storage builds DTensors via
+        ``get_dtensor``; later calls with the same storage rebind the cached
+        DTensor's local tensor in place, skipping ``DTensor.from_local``.
+        """
+        main_grad = self.main_grad
+        assert main_grad is not None
+        cache_id = self._grad_dtensor_cache_main_grad_id
+        if cache_id != id(main_grad):
+            self._grad_dtensor_cache = [None] * len(self.fsdp_parameters)
+            self._grad_dtensor_cache_main_grad_id = id(main_grad)
+
+        cached = self._grad_dtensor_cache[index]
+        if cached is not None:
+            new_local = main_grad.get_local_tensor(index)
+            # Even-DTensor (Shard(0)): rebinding the private local-tensor field
+            # in place avoids DTensor.from_local host cost per backward.  This
+            # mirrors the v2 path's rebind_uneven_dtensor_local_tensor pattern.
+            cached._local_tensor = new_local
+            return cached
+
+        dtensor = main_grad.get_dtensor(index)
+        self._grad_dtensor_cache[index] = dtensor
+        return dtensor
 
 
 class Fp8ParameterGroup(FsdpParameterGroup):
