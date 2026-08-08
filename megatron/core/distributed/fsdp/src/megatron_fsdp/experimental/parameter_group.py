@@ -182,12 +182,12 @@ class FsdpParameterGroup:
             # getter that TE's wgrad GEMM writes into directly.  The partial
             # buffer is allocated lazily on first access so the fused wgrad
             # lands in the reduce-scatter input buffer without a copy_.
-            # Fp8ParameterGroup is excluded: its backward writes the colwise
-            # orientation through a different path, and the fused-wgrad GEMM
-            # target view would not match.
-            if not isinstance(self, Fp8ParameterGroup):
-                parameter.__fsdp_param__ = True
-                parameter.get_main_grad = self._make_main_grad_getter(index)
+            # Also pre-create the ``main_grad`` attribute: TE's backward sets
+            # ``weight.main_grad = ctx.main_grad`` unconditionally when fusion
+            # is enabled, and MXFP8Tensor rejects setting unknown attributes.
+            parameter.__fsdp_param__ = True
+            parameter.get_main_grad = self._make_main_grad_getter(index)
+            parameter.main_grad = None
 
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
@@ -404,6 +404,8 @@ class FsdpParameterGroup:
         Shapes come from the unsharded parameters themselves (not ``.grad``),
         because with gradient-accumulation fusion the wgrad is written directly
         into this buffer and ``parameter.grad`` is never populated.
+        The buffer dtype is the main-grad dtype (the wgrad dtype TE produces),
+        which differs from the compute dtype for MXFP8 groups (uint8 payloads).
         """
         if self._partial_grad_buffer is not None:
             return self._partial_grad_buffer
@@ -412,12 +414,13 @@ class FsdpParameterGroup:
         unsharded = [
             self._get_unsharded_parameter(index) for index in range(len(self.fsdp_parameters))
         ]
+        dtype = self._main_grad_dtype or unsharded[0].dtype
         with self._symmetric_memory_context():
             self._partial_grad_buffer = DBuffer(
                 mesh=self.mesh,
                 placements=[Partial(partial_op)] * self.mesh.ndim,
                 tensor_shapes=tuple(parameter.shape for parameter in unsharded),
-                dtype=unsharded[0].dtype,
+                dtype=dtype,
                 device=unsharded[0].device,
             )
         return self._partial_grad_buffer
