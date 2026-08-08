@@ -188,6 +188,11 @@ class FsdpParameterGroup:
             parameter.__fsdp_param__ = True
             parameter.get_main_grad = self._make_main_grad_getter(index)
             parameter.main_grad = None
+            # TE's fused-wgrad backward (layers.py) only sets
+            # ``grad_added_to_main_grad`` when the attribute exists (line 692);
+            # pre-create it so the flag is reported and copy_ is skipped.
+            parameter.grad_added_to_main_grad = False
+            parameter.zero_out_wgrad = False
 
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
