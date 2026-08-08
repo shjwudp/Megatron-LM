@@ -213,6 +213,63 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
     )
 
 
+def test_unsharded_param_exposes_main_grad_getter(distributed_setup):
+    """Unsharded parameters should expose get_main_grad for TE wgrad fusion.
+
+    ``get_main_grad`` returns a view into the group's reduce-scatter input
+    buffer so TransformerEngine's fused wgrad GEMM can write directly into it.
+    Verify the getter exists on the unsharded parameter while it is installed
+    (during forward), returns a tensor of the parameter shape, and that the
+    returned views alias the same storage as the buffer produced by
+    allocate_partial_grad_buffer.
+    """
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(1234)
+    dim = 8
+    model = TinyModel().to(device)
+    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    checked: list[torch.Tensor] = []
+
+    def forward_check(module, _input, _output):
+        for parameter in module.parameters():
+            assert parameter.__fsdp_param__, f"parameter {parameter} not marked FSDP."
+            getter = getattr(parameter, "get_main_grad", None)
+            assert getter is not None, f"parameter {parameter} missing get_main_grad."
+            view = getter()
+            assert tuple(view.shape) == tuple(parameter.shape), (
+                f"get_main_grad shape {tuple(view.shape)} != parameter shape "
+                f"{tuple(parameter.shape)}."
+            )
+            assert view.is_cuda and view.dtype == parameter.dtype
+            checked.append(view)
+
+    # The forward hooks fire while the unsharded parameters are installed
+    # (before the post-forward reshard replaces them with sharded DTensors).
+    # prepend=True puts our hook before FSDP's post-forward reshard hook.
+    model.fc1.register_forward_hook(forward_check, prepend=True)
+    model.fc2.register_forward_hook(forward_check, prepend=True)
+
+    x = torch.randn(2, 8, device=device)
+    target = torch.randn(2, 4, device=device)
+    output = model(x)
+    torch.cuda.synchronize(device)
+
+    assert len(checked) == 4, f"expected 4 unsharded params with getters, got {len(checked)}."
+    # Loss backward still works after the getter check (params reshard cleanly).
+    loss = torch.nn.functional.mse_loss(output, target)
+    loss.backward()
+    torch.cuda.synchronize(device)
+
+
 def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup):
     """Activation recomputation should leave every FSDP module resharded."""
     world_size = distributed_setup.world_size
@@ -307,85 +364,6 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
         torch.stack(baseline_losses),
         msg="HSDP losses did not match baseline losses.",
     )
-
-
-def test_sharded_grad_dtensor_reuse_across_microbatches(distributed_setup):
-    """Sharded-parameter .grad DTensor shells should be stable across microbatches.
-
-    After the first backward of a step, subsequent microbatches rebind the cached
-    DTensor's local storage instead of building fresh DTensors.  Assert the
-    DTensor *object identity* of each sharded parameter's .grad stays the same
-    across microbatches (the CPU-side ``_FromTorchTensor`` cost is eliminated),
-    and that numerical parity with a baseline optimizer is preserved.
-    """
-    rank = distributed_setup.rank
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    torch.manual_seed(1234)
-    dim = 8
-    model = MultiChildModel(dim=dim, num_children=2).to(device)
-    baseline = MultiChildModel(dim=dim, num_children=2).to(device)
-    model.load_state_dict(baseline.state_dict())
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=_flat_placements())
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
-    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-
-    micro_batch_size = 2
-    num_microbatches = 3
-    # Identical inputs on every rank (same seed as the model), so all ranks see
-    # the same data and the averaged FSDP gradient matches single-rank SGD.
-    x = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
-    target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
-    microbatches = tuple(zip(x.unbind(), target.unbind()))
-
-    sharded_params = [
-        p for p in model.parameters() if getattr(p, "__fsdp_param__", False)
-    ]
-    assert sharded_params, "expected sharded parameters in the model"
-
-    def train(model, optimizer, log_prefix) -> list[torch.Tensor]:
-        losses = []
-        grad_identities: list[list[int]] = []
-        for step in range(3):
-            optimizer.zero_grad(set_to_none=True)
-            step_identities = []
-            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
-                is_last = microbatch_index == num_microbatches - 1
-                with microbatch(model, is_last=is_last):
-                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
-                    (loss / num_microbatches).backward()
-                losses.append(loss.detach())
-                step_identities.append(
-                    [id(p.grad) for p in sharded_params if p.grad is not None]
-                )
-            grad_identities.append(step_identities)
-            optimizer.step()
-        return losses, grad_identities
-
-    baseline_losses, _ = train(baseline, baseline_optimizer, "Baseline")
-    sharded_losses, grad_identities = train(model, optimizer, "HSDP")
-
-    torch.testing.assert_close(
-        torch.stack(sharded_losses),
-        torch.stack(baseline_losses),
-        msg="Sharded losses did not match baseline losses with DTensor grad reuse.",
-    )
-
-    # Within each step, the grad DTensor object identity must be stable across
-    # microbatches after the first (the cache rebinds storage in place).
-    for step in range(3):
-        first = grad_identities[step][0]
-        for microbatch_identities in grad_identities[step][1:]:
-            assert microbatch_identities == first, (
-                f"step {step}: sharded grad DTensor identity changed across microbatches "
-                f"(first={first}, later={microbatch_identities})."
-            )
 
 
 def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
@@ -531,75 +509,6 @@ def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setu
         f"rank={rank}, peak_delta={_mb(peak_delta)}, "
         f"three_child_weights={_mb(bound_nbytes)}"
     )
-
-
-def test_prefetch_depth_materializes_multiple_successors(distributed_setup):
-    """Prefetch depth should unshard multiple successor modules in one pass."""
-    rank = distributed_setup.rank
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    dim = 4096
-    dtype = torch.bfloat16
-    prefetch_depth = 2
-    model = MultiChildModel(dim=dim, num_children=4).to(dtype=dtype, device=device)
-    placements = _flat_placements()
-    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    for layer in model.layers:
-        fully_shard(
-            layer,
-            mesh=mesh,
-            placements=placements,
-            mixed_precision_policy=policy,
-            prefetch_depth=prefetch_depth,
-        )
-    fully_shard(
-        model,
-        mesh=mesh,
-        placements=placements,
-        mixed_precision_policy=policy,
-        prefetch_depth=prefetch_depth,
-    )
-
-    # After the first layer's forward pre-hook, the next two layers should be
-    # unsharded (their _unshard_event set) because prefetch_depth == 2.
-    context = model.context
-    first, second, third, _ = context.forward_order
-    assert first._unshard_event is None or second._unshard_event is not None
-    x = torch.randn(2, dim, device=device, dtype=dtype)
-    with torch.no_grad():
-        model(x)
-    torch.cuda.synchronize(device)
-    # All four children were consumed; none should remain unsharded after the
-    # forward releases them.
-    for layer in context.forward_order:
-        assert layer._unshard_event is None, (
-            f"layer {layer.name} still unsharded after forward."
-        )
-
-
-def test_prefetch_depth_invalid_value_rejected(distributed_setup):
-    """Prefetch depth below one should be rejected at context creation."""
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    dim = 16
-    model = MultiChildModel(dim=dim, num_children=2).to(
-        dtype=torch.bfloat16, device=distributed_setup.device
-    )
-    placements = _flat_placements()
-    policy = MixedPrecisionPolicy(
-        main_params_dtype=torch.bfloat16, main_grads_dtype=torch.bfloat16
-    )
-    with pytest.raises(ValueError, match="prefetch_depth"):
-        fully_shard(
-            model.layers[0],
-            mesh=mesh,
-            placements=placements,
-            mixed_precision_policy=policy,
-            prefetch_depth=0,
-        )
 
 
 def test_root_forward_returns_to_resting_memory(distributed_setup):

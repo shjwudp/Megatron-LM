@@ -14,13 +14,13 @@
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-import torch.distributed.tensor as dist_tensor
 from torch import nn
 from torch.distributed import DeviceMesh
 
@@ -70,16 +70,9 @@ class FsdpParameterGroup:
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
     _model_weight_placements: tuple[Placement, ...]
-    # Cached sharded-gradient DTensors keyed by the main_grad DBuffer identity.
-    # Rebuilding DTensors every backward costs O(params) ``_FromTorchTensor``
-    # calls on the host; when main_grad storage is reused we rebind the cached
-    # DTensor's local storage in place instead. Invalidation: cleared whenever
-    # ``_main_grad`` is replaced (redistribute) or ``main_grad`` changes dtype.
-    _grad_dtensor_cache: list[dist_tensor.DTensor | None]
-    _grad_dtensor_cache_main_grad_id: int | None
-    # Cached reduce-scatter input (partial) buffer, reused across microbatches
-    # when parameter shapes and dtype are unchanged.  Avoids a fresh DBuffer
-    # allocation + storage release per backward.
+    # Reduce-scatter input buffer, allocated lazily on the first fused-wgrad
+    # access (get_main_grad) and reused for the reduce-scatter in the same
+    # backward.  Fresh per backward via ``_reset_partial_grad_buffer``.
     _partial_grad_buffer: DBuffer | None
 
     def __init__(
@@ -165,8 +158,6 @@ class FsdpParameterGroup:
         self._main_grad = None
         self._main_grad_placements = None
         self._main_grad_dtype = None
-        self._grad_dtensor_cache = []
-        self._grad_dtensor_cache_main_grad_id = None
         self._partial_grad_buffer = None
         if self.requires_grad:
             # main_grad itself is materialized lazily by the property below; only its
@@ -186,6 +177,17 @@ class FsdpParameterGroup:
             )
             self._materialize_unsharded_parameter(parameter, unsharded_tensor)
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
+            # Mark the unsharded parameter for TE gradient-accumulation fusion
+            # (layers.py checks ``__fsdp_param__``) and expose the main-grad
+            # getter that TE's wgrad GEMM writes into directly.  The partial
+            # buffer is allocated lazily on first access so the fused wgrad
+            # lands in the reduce-scatter input buffer without a copy_.
+            # Fp8ParameterGroup is excluded: its backward writes the colwise
+            # orientation through a different path, and the fused-wgrad GEMM
+            # target view would not match.
+            if not isinstance(self, Fp8ParameterGroup):
+                parameter.__fsdp_param__ = True
+                parameter.get_main_grad = self._make_main_grad_getter(index)
 
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
@@ -376,53 +378,68 @@ class FsdpParameterGroup:
         )
         return self._main_grad
 
-    def allocate_partial_grad_buffer(self) -> DBuffer:
-        """Allocate (or reuse) the unreduced reduce-scatter input buffer.
+    def _make_main_grad_getter(self, index: int) -> Callable[[], torch.Tensor]:
+        """Build the ``get_main_grad`` callable attached to unsharded parameters.
 
-        The buffer is cached on the group and reused while parameter shapes and
-        dtype are unchanged, avoiding a fresh DBuffer allocation + storage
-        release per backward.  Callers must keep the stream-ordering invariant:
-        the previous reduce-scatter reading this buffer must have completed
-        before ``copy_gradients_to_partial_buffer`` overwrites it (the
-        ``wait_stream`` edge in ``_reduce_gradient_groups`` guarantees this).
+        TE's fused wgrad path (layers.py) calls ``weight.get_main_grad()`` and
+        then writes the wgrad GEMM output directly into the returned view.  The
+        view aliases this group's reduce-scatter input (partial) buffer, so the
+        fused wgrad lands in the buffer that ``reduce_partial_gradients`` later
+        reduce-scatters — eliminating the ``copy_`` in
+        ``copy_gradients_to_partial_buffer``.
         """
+
+        def get_main_grad() -> torch.Tensor:
+            partial_grad = self._ensure_partial_grad_buffer()
+            return partial_grad.get_local_tensor(index)
+
+        return get_main_grad
+
+    def _ensure_partial_grad_buffer(self) -> DBuffer:
+        """Return the reduce-scatter input buffer, allocating it on first use.
+
+        The buffer is allocated lazily so TE's fused wgrad (which fires during
+        the layer's backward) can write directly into it.  Allocated on the
+        reduce-scatter stream to preserve the DBuffer stream-binding invariant.
+        Shapes come from the unsharded parameters themselves (not ``.grad``),
+        because with gradient-accumulation fusion the wgrad is written directly
+        into this buffer and ``parameter.grad`` is never populated.
+        """
+        if self._partial_grad_buffer is not None:
+            return self._partial_grad_buffer
         assert self.requires_grad
-
-        # NCCL symmetric-memory reduce-scatter only selects the symmetric kernel for SUM today.
-        # Preserve AVG semantics by reducing SUM and scaling the output below.
         partial_op = dist.ReduceOp.AVG if self._symm_mem_pool is None else dist.ReduceOp.SUM
-        grads: list[torch.Tensor] = []
-        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            grad = self._get_unsharded_parameter(index).grad
-            if grad is None:
-                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
-            grads.append(grad)
-        tensor_shapes = tuple(grad.shape for grad in grads)
-        dtype = grads[0].dtype
-
-        cached = self._partial_grad_buffer
-        if (
-            cached is not None
-            and cached.layout.tensor_shapes == tensor_shapes
-            and cached.dtype == dtype
-        ):
-            return cached
-
+        unsharded = [
+            self._get_unsharded_parameter(index) for index in range(len(self.fsdp_parameters))
+        ]
         with self._symmetric_memory_context():
             self._partial_grad_buffer = DBuffer(
                 mesh=self.mesh,
                 placements=[Partial(partial_op)] * self.mesh.ndim,
-                tensor_shapes=tensor_shapes,
-                dtype=dtype,
-                device=grads[0].device,
+                tensor_shapes=tuple(parameter.shape for parameter in unsharded),
+                dtype=unsharded[0].dtype,
+                device=unsharded[0].device,
             )
         return self._partial_grad_buffer
 
+    def allocate_partial_grad_buffer(self) -> DBuffer:
+        """Allocate the unreduced reduce-scatter input buffer."""
+        return self._ensure_partial_grad_buffer()
+
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
-        """Pack full local gradients into an existing reduce-scatter input buffer."""
-        # A future fused-wgrad path can write directly into these buffer views.
+        """Pack full local gradients into an existing reduce-scatter input buffer.
+
+        When TransformerEngine wrote the wgrad directly into the partial buffer
+        (gradient-accumulation fusion, signaled by ``grad_added_to_main_grad``),
+        the copy is skipped and only the per-parameter flag is cleared.
+        """
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             parameter = self._get_unsharded_parameter(index)
+            if getattr(parameter, "grad_added_to_main_grad", False):
+                # TE's fused wgrad already wrote into partial_grad's view.
+                setattr(parameter, "grad_added_to_main_grad", False)
+                parameter.grad = None
+                continue
             partial_grad.get_local_tensor(index).copy_(parameter.grad)
             parameter.grad = None
 
@@ -503,39 +520,17 @@ class FsdpParameterGroup:
             self._main_grad = self.main_grad.redistribute(self.main_weight.placements)
 
         # Make each sharded parameter's .grad consistent with the final main_grad.
-        # Reuse cached DTensors where possible: rebinding storage in place avoids
-        # O(params) ``DTensor.from_local`` (``_FromTorchTensor``) host cost per
-        # backward.  The cache is keyed on the main_grad DBuffer identity so a
-        # fresh buffer (redistribute replacement, dtype change) rebuilds it.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.sharded.grad = self._get_sharded_grad_dtensor(index)
+            fsdp_parameter.sharded.grad = self.main_grad.get_dtensor(index)
 
-    def _get_sharded_grad_dtensor(self, index: int) -> dist_tensor.DTensor:
-        """Return the sharded-gradient DTensor for parameter ``index``, cached.
-
-        The first call for a given ``main_grad`` storage builds DTensors via
-        ``get_dtensor``; later calls with the same storage rebind the cached
-        DTensor's local tensor in place, skipping ``DTensor.from_local``.
-        """
-        main_grad = self.main_grad
-        assert main_grad is not None
-        cache_id = self._grad_dtensor_cache_main_grad_id
-        if cache_id != id(main_grad):
-            self._grad_dtensor_cache = [None] * len(self.fsdp_parameters)
-            self._grad_dtensor_cache_main_grad_id = id(main_grad)
-
-        cached = self._grad_dtensor_cache[index]
-        if cached is not None:
-            new_local = main_grad.get_local_tensor(index)
-            # Even-DTensor (Shard(0)): rebinding the private local-tensor field
-            # in place avoids DTensor.from_local host cost per backward.  This
-            # mirrors the v2 path's rebind_uneven_dtensor_local_tensor pattern.
-            cached._local_tensor = new_local
-            return cached
-
-        dtensor = main_grad.get_dtensor(index)
-        self._grad_dtensor_cache[index] = dtensor
-        return dtensor
+        # Release the partial buffer so the next backward allocates a fresh one.
+        # Reusing it across microbatches made the NCCL symmetric-memory pool keep
+        # the storage registered, forcing a device sync on the next fused-wgrad
+        # write.  Release after the reduce-scatter read completes (same stream
+        # ordering as the rest of this method).
+        if self._partial_grad_buffer is not None:
+            self._partial_grad_buffer.release_storage()
+            self._partial_grad_buffer = None
 
 
 class Fp8ParameterGroup(FsdpParameterGroup):
