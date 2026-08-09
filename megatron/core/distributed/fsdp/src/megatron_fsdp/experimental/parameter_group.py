@@ -414,8 +414,10 @@ class FsdpParameterGroup:
         Shapes come from the unsharded parameters themselves (not ``.grad``),
         because with gradient-accumulation fusion the wgrad is written directly
         into this buffer and ``parameter.grad`` is never populated.
-        The buffer dtype is the main-grad dtype (the wgrad dtype TE produces),
-        which differs from the compute dtype for MXFP8 groups (uint8 payloads).
+        The buffer dtype is the parameter dtype (the wgrad dtype TE produces,
+        bf16) — matching the baseline reduce path: reduce-scatter in bf16, then
+        cast into the fp32 main_grad locally.  Using fp32 here doubles the RS
+        traffic and forces a per-param te_general_gemm cast (regression).
         """
         if self._partial_grad_buffer is not None:
             return self._partial_grad_buffer
@@ -424,7 +426,7 @@ class FsdpParameterGroup:
         unsharded = [
             self._get_unsharded_parameter(index) for index in range(len(self.fsdp_parameters))
         ]
-        dtype = self._main_grad_dtype or unsharded[0].dtype
+        dtype = unsharded[0].dtype
         reduce_scatter_stream = self.owning_module.context.reduce_scatter_stream
         with torch.cuda.stream(reduce_scatter_stream):
             with self._symmetric_memory_context():
