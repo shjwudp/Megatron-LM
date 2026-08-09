@@ -572,7 +572,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
         fine_grained = config.overlap_moe_expert_parallel_comm
         skip_backward_cb = fine_grained and ddp_config.delay_wgrad_compute
-        prefetch_depth = ddp_config.megatron_fsdp_prefetch_depth
         for submodule in reversed(list(module.modules())):
             if submodule is module:
                 continue
@@ -584,7 +583,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     mixed_precision_policy=self.mp_policy,
                     fine_grained=fine_grained,
                     skip_backward_callback=skip_backward_cb,
-                    prefetch_depth=prefetch_depth,
                 )
             elif isinstance(submodule, moe_fsdp_unit_modules):
                 if self.moe_mesh is None:
@@ -601,7 +599,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     fine_grained=fine_grained,
                     skip_backward_callback=skip_backward_cb,
                     grad_divisor=config.expert_model_parallel_size,
-                    prefetch_depth=prefetch_depth,
                 )
         fully_shard(
             module,
@@ -610,7 +607,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             mixed_precision_policy=self.mp_policy,
             fine_grained=fine_grained,
             skip_backward_callback=skip_backward_cb,
-            prefetch_depth=prefetch_depth,
         )
         super().__init__(config=config, module=module)
         if fine_grained:
