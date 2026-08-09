@@ -620,6 +620,7 @@ def ensure_nccl_ep_bootstrapped(
     max_tokens_per_rank,
     recv_capacity_per_rank,
     hidden_dim,
+    num_topk=0,
     num_sms=0,
     zero_copy=False,
 ):
@@ -638,6 +639,9 @@ def ensure_nccl_ep_bootstrapped(
         recv_capacity_per_rank (int): Per-rank receive-buffer capacity in tokens. Must be
             ``>= max_tokens_per_rank``; runtime overflow hard-traps (no soft drop).
         hidden_dim (int): Token hidden size.
+        num_topk (int): MoE router top-k.  Required by TE >= 2.19 (ep_bootstrap gained a
+            required positional ``num_topk`` argument); older TE accepts it as an extra
+            kwarg only if the signature supports it, so we gate on the signature.
         num_sms (int): SM cap passed to TE as ``max_num_sms`` (0 lets TE/NCCL choose).
     """
     if not HAVE_TE_EP:
@@ -647,8 +651,7 @@ def ensure_nccl_ep_bootstrapped(
         )
     if te_ep._BOOTSTRAPPED:  # reuse TE's own one-time guard; no parallel state to drift
         return
-    te_ep.ep_bootstrap(
-        ep_group,
+    ep_bootstrap_kwargs = dict(
         num_experts=num_experts,
         max_tokens_per_rank=max_tokens_per_rank,
         recv_capacity_per_rank=recv_capacity_per_rank,
@@ -656,6 +659,12 @@ def ensure_nccl_ep_bootstrapped(
         max_num_sms=num_sms,
         zero_copy=zero_copy,
     )
+    # TE 2.19+ requires num_topk (positional 4th arg).  Detect by signature to stay
+    # compatible with older TE builds that lack the parameter entirely.
+    ep_bootstrap_params = getattr(te_ep.ep_bootstrap, "__code__", None)
+    if ep_bootstrap_params is not None and "num_topk" in ep_bootstrap_params.co_varnames:
+        ep_bootstrap_kwargs["num_topk"] = num_topk
+    te_ep.ep_bootstrap(ep_group, **ep_bootstrap_kwargs)
 
 
 def nccl_ep_finalize():

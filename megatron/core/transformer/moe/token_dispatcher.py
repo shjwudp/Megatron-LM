@@ -1619,6 +1619,7 @@ class _NCCLEPManager(_DispatchManager):
             max_tokens_per_rank=self._max_tokens_per_rank,
             recv_capacity_per_rank=self._recv_capacity,
             hidden_dim=self.hidden_dim,
+            num_topk=self.router_topk,
             num_sms=(
                 self.config.moe_flex_dispatcher_num_sms
                 if self.config.moe_flex_dispatcher_num_sms is not None
