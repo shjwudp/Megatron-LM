@@ -685,6 +685,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not currently support outer DP sharding.")
         if ddp_config.overlap_grad_reduce or ddp_config.overlap_param_gather:
             raise ValueError("MFSDP v2 does not currently support communication overlap modes.")
+        if config.gradient_accumulation_fusion:
+            raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
         if config.calculate_per_token_loss:
             raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
         if config.fp4 or ddp_config.fp4_param_gather:
