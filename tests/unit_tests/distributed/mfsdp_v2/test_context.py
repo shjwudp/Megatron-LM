@@ -595,3 +595,38 @@ def test_runner_tolerates_transient_mismatch_without_crashing(distributed_setup)
     assert runner.record_consume(layers[2], "colwise") is layers[0]
     assert runner.record_consume(layers[0], "rowwise") is layers[1]
     assert runner.record_consume(layers[1], "rowwise") is layers[2]
+
+
+def test_unshard_records_one_consume_per_module_per_pass(distributed_setup):
+    """Repeated fine-grained hooks on one module record a single consume.
+
+    The 1F1B schedule fires one unshard hook per sub-module (dense, experts),
+    so the same FsdpModule can be unsharded several times within a pass. Only
+    the first call (after reshard) is a real consume for the runner; later
+    calls must not advance the trace or the replay validation diverges.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=3).to(device)
+
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    runner = model.context.runner
+
+    # Batch 1: each layer consumes once via unshard_parameters. Repeated
+    # calls (extra sub-module hooks) must be no-ops for the trace.
+    for layer in layers:
+        layer.unshard_parameters()
+        layer.unshard_parameters()  # duplicate hook — must not record again
+    runner.complete_trace()
+    assert len(runner._trace) == len(layers)
+    assert [occ.module for occ in runner._trace] == list(layers)
+
+    # Batch 2 replay: consume in order; each returns the traced next (wrap).
+    assert runner.record_consume(layers[0], "rowwise") is layers[1]
+    assert runner.record_consume(layers[1], "rowwise") is layers[2]
+    assert runner.record_consume(layers[2], "rowwise") is layers[0]

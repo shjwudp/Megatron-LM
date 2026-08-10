@@ -166,6 +166,11 @@ class FsdpModule:
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
     # already prefetched this module.
     _unshard_event: torch.cuda.Event | None
+    # Set on the first consume of a pass (the hook that actually unshards the
+    # module) and cleared on reshard. The fine-grained schedule fires one hook
+    # per sub-module (dense, experts), so without this flag the runner would
+    # record several consumes for the same module and pollute the trace.
+    _consume_recorded: bool
     # Backward-pre hook sets this to BACKWARD before activation recomputation
     # can run. Forward and backward hooks own all other transitions.
     _phase: Phase
@@ -186,6 +191,7 @@ class FsdpModule:
         self._is_root = False
         self._name = None
         self._unshard_event = None
+        self._consume_recorded = False
         self._phase = FsdpModule.Phase.RESTING
         owned_parameters = _collect_owned_parameters(self)
         assert tuple(placements.dp_axes) == tuple(
@@ -424,10 +430,17 @@ class FsdpModule:
         # This module is now consuming compute; all-gather its parameters and
         # wait, then let the runner decide the prefetch target. Trace-replay
         # mode owns all prefetch decisions (the recompute check is
-        # default-mode logic inside the runner).
+        # default-mode logic inside the runner). The fine-grained schedule
+        # fires one hook per sub-module (dense, experts), so only the first
+        # hook of a pass (module was resharded) is a real consume for the
+        # runner; later hooks of the same pass are no-ops.
+        was_resharded = not self._consume_recorded
         self._unshard_parameter_groups(orientation)
         if self._unshard_event is not None:
             self.context.current_stream().wait_event(self._unshard_event)
+        if not was_resharded:
+            return
+        self._consume_recorded = True
         prefetch = self.context.runner.consume_and_get_next(self, orientation)
         if prefetch is not None:
             next_module, next_orientation = prefetch
@@ -450,6 +463,7 @@ class FsdpModule:
         This method clears ``_unshard_event`` after queuing the release, so
         future users enqueue a fresh all-gather.
         """
+        self._consume_recorded = False
         for group in self._parameter_groups:
             group.reshard_parameters()
 
