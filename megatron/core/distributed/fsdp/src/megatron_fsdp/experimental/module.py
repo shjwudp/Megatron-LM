@@ -400,7 +400,9 @@ class FsdpModule:
 
         Idempotent — if parameters are already unsharded, this is a no-op.
         Called by the 1F1B EP overlap schedule via fine-grained sub-module
-        hooks before each individual sub-module compute.
+        hooks before each individual sub-module compute. Issues the next
+        module's all-gather as a prefetch so it overlaps with this module's
+        compute, mirroring the eager ``pre_forward`` path.
 
         Args:
             orientation: Payload orientation to gather for MXFP8 groups
@@ -409,6 +411,19 @@ class FsdpModule:
         self._unshard_parameter_groups(orientation)
         if self._unshard_event is not None:
             self.context.current_stream().wait_event(self._unshard_event)
+        # Prefetch the successor's all-gather on the shared AG stream. The
+        # prefetch is issued after this module's own wait, so it runs
+        # concurrently with this module's compute instead of stalling the
+        # fine-grained 1F1B schedule. Skip during recompute, whose forward
+        # hooks run inside backward and must not unshard successors.
+        is_recomputing = self._phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
+        if not is_recomputing:
+            if orientation == "rowwise":
+                next_module = self.context.forward_order.next_item(self)
+            else:
+                next_module = self.context.backward_order.next_item(self)
+            if next_module is not None:
+                next_module._unshard_parameter_groups(orientation)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
