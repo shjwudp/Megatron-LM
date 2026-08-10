@@ -78,10 +78,30 @@ class FsdpExecutionRunner:
     plus the global-batch boundary signaled by the training loop. It never
     decides compute order — it only observes occurrences and, during
     replay, suggests which module to all-gather next.
+
+    Two prefetch modes are hidden behind one API:
+
+    - Default (``use_trace_replay=False``): normal forward/backward
+      execution is assumed. ``consume_and_get_next`` returns the static
+      ``forward_order`` / ``backward_order`` successor and the runner
+      stays idle.
+    - Trace-replay (``use_trace_replay=True``): required for complex
+      schedules such as VPP + combined 1F1B whose execution does not
+      follow the static orders. The first global batch is traced and
+      replayed from the second batch; ``consume_and_get_next`` returns
+      the traced successor with its recorded orientation.
     """
 
-    def __init__(self) -> None:
-        """Create a runner in the tracing phase."""
+    def __init__(self, context, *, use_trace_replay: bool = False) -> None:
+        """Create a runner in the tracing phase.
+
+        Args:
+            context: The owning :class:`FsdpContext`, used for the static
+                orders in default mode.
+            use_trace_replay: Enable trace-and-replay prefetch.
+        """
+        self._context = context
+        self._use_trace_replay = use_trace_replay
         self._phase = RunnerPhase.TRACING
         self._trace: list[ConsumeOccurrence] = []
         self._replay_index = 0
@@ -96,6 +116,46 @@ class FsdpExecutionRunner:
     def is_tracing(self) -> bool:
         """Whether the runner is recording a fresh cycle."""
         return self._phase is RunnerPhase.TRACING
+
+    @property
+    def use_trace_replay(self) -> bool:
+        """Whether trace-and-replay prefetch is enabled."""
+        return self._use_trace_replay
+
+    def consume_and_get_next(
+        self, module: "FsdpModule", orientation: str
+    ) -> tuple["FsdpModule", str] | None:
+        """Record/validate a consume and return the module to prefetch next.
+
+        Unified prefetch API used by every unshard entry point
+        (``pre_forward``, ``pre_backward``, ``unshard_parameters``). In
+        default mode it resolves the static-order successor; in
+        trace-replay mode it records the occurrence (tracing) or validates
+        and returns the traced successor (replay).
+
+        Args:
+            module: The FSDP module being consumed by compute.
+            orientation: Payload orientation (``"rowwise"`` forward,
+                ``"colwise"`` backward).
+
+        Returns:
+            ``(next_module, next_orientation)`` to prefetch, or ``None``
+            when there is no successor (tracing batch, divergence, or end
+            of the static order).
+        """
+        if not self._use_trace_replay:
+            if orientation == "rowwise":
+                next_module = self._context.forward_order.next_item(module)
+            else:
+                next_module = self._context.backward_order.next_item(module)
+            if next_module is None:
+                return None
+            return next_module, orientation
+
+        next_module = self.record_consume(module, orientation)
+        if next_module is None:
+            return None
+        return next_module, self.next_prefetch_orientation()
 
     def complete_trace(self) -> None:
         """Compile the recorded trace into the replay cycle.
