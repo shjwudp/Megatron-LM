@@ -183,14 +183,18 @@ class FsdpExecutionRunner:
     def record_reshard(self, module: "FsdpModule") -> None:
         """Record (tracing) or validate (replay) a reshard event.
 
-        Call ``suggest_skip_reshard(module)`` right after this returns to
-        learn whether the actual reshard can be skipped (replay only).
+        The reshard ends the module's current unshard round: it clears the
+        per-round dedup entry so the next unshard of the same module (e.g. the
+        backward pass after the forward pass) records a fresh event. Call
+        ``suggest_skip_reshard(module)`` right after this returns to learn
+        whether the actual reshard can be skipped (replay only).
 
         Args:
             module: The FSDP module whose unsharded storage is released.
         """
         if not self._use_trace_replay:
             return
+        self.reset_round(module)
         self._validate_and_advance(EventKind.RESHARD, module, None)
 
     # ------------------------------------------------------------------

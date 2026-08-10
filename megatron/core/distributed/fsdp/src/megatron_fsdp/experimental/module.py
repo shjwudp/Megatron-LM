@@ -452,9 +452,7 @@ class FsdpModule:
         """
         self.context.runner.record_reshard(self)
         if self.context.runner.suggest_skip_reshard(self):
-            self.context.runner.reset_round(self)
             return
-        self.context.runner.reset_round(self)
         for group in self._parameter_groups:
             group.reshard_parameters()
 

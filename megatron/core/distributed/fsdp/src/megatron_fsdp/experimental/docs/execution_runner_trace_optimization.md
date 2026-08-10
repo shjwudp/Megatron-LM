@@ -153,10 +153,10 @@ Public API of `FsdpExecutionRunner` (owned by `FsdpContext`):
 | Method | Path | Purpose |
 |---|---|---|
 | `record_unshard(module, orientation)` | trace | record/validate an unshard event |
-| `record_reshard(module)` | trace | record/validate a reshard event |
+| `record_reshard(module)` | trace | record/validate a reshard event; clears the module's unshard round |
 | `suggest_prefetch(module, orientation)` | optimization | next module to all-gather ahead |
 | `suggest_skip_reshard(module) -> bool` | optimization | whether to keep storage resident |
-| `reset_round(module)` | trace | end the unshard round (per-round dedup) |
+| `reset_round(module)` | trace | end a module's unshard round (per-round dedup); folded into `record_reshard` |
 | `complete_trace()` | trace | compile the cycle at the batch boundary |
 | `report()` | diagnostics | replay statistics |
 | `phase`, `is_tracing`, `use_trace_replay` | — | runner state |
@@ -172,11 +172,9 @@ if prefetch is not None:
     next_module._unshard_parameter_groups(next_orientation)
 
 # _reshard_parameter_groups (release entry point)
-self.context.runner.record_reshard(self)
+self.context.runner.record_reshard(self)  # clears the module's unshard round
 if self.context.runner.suggest_skip_reshard(self):
-    self.context.runner.reset_round(self)
     return  # storage stays resident
-self.context.runner.reset_round(self)
 for group in self._parameter_groups:
     group.reshard_parameters()
 ... # release storage on the all-gather stream

@@ -609,7 +609,7 @@ def test_unshard_records_one_consume_per_module_per_pass(distributed_setup):
     The 1F1B schedule fires one unshard hook per sub-module (dense, experts),
     so the same FsdpModule can be unsharded several times within a pass. The
     runner dedups them (first call records, later calls are no-ops) and
-    reset_round() re-enables recording after a reshard.
+    record_reshard() clears the round so the next unshard records again.
     """
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -628,9 +628,7 @@ def test_unshard_records_one_consume_per_module_per_pass(distributed_setup):
     for layer in layers:
         runner.record_unshard(layer, "rowwise")
         runner.record_unshard(layer, "rowwise")  # duplicate hook — deduped
-        runner.reset_round(layer)
-        runner.record_reshard(layer)
-        runner.reset_round(layer)
+        runner.record_reshard(layer)  # clears the round for the next unshard
     runner.complete_trace()
     assert len(runner._trace) == 2 * len(layers)
     assert [e.kind for e in runner._trace] == [
