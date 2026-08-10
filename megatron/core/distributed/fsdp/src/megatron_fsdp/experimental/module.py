@@ -380,9 +380,7 @@ class FsdpModule:
         # be complete, so no later backward hook would reshard it.
         if not is_recomputing:
             torch.cuda.nvtx.range_push(self._nvtx_label("prefetch"))
-            next_module = context.forward_order.next_item(self)
-            if next_module is not None:
-                next_module._unshard_parameter_groups()
+            self._record_consume_and_prefetch("rowwise")
             torch.cuda.nvtx.range_pop()
 
     def _unshard_parameter_groups(self, orientation: str = "rowwise") -> None:
@@ -435,17 +433,33 @@ class FsdpModule:
         is_recomputing = self._phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
         if is_recomputing:
             return
+        self._record_consume_and_prefetch(orientation)
+
+    def _record_consume_and_prefetch(self, orientation: str) -> None:
+        """Feed the context-wide runner and prefetch the traced next consumer.
+
+        Records this module's consume on the shared :class:`FsdpExecutionRunner`
+        and all-gathers the traced successor (with the orientation recorded for
+        that occurrence) so the prefetch overlaps this module's compute. Falls
+        back to the static order while the runner is tracing. Then releases
+        prefetched modules that neither this module nor the new successor
+        consumes, so a stale prefetch cannot accumulate unsharded storage.
+        """
         runner = self.context.runner
         next_module = runner.record_consume(self, orientation)
-        if next_module is not None:
+        if next_module is None:
+            # Tracing or divergence: fall back to the static order so the
+            # first batch still prefetches under the eager schedule.
+            if orientation == "rowwise":
+                next_module = self.context.forward_order.next_item(self)
+            else:
+                next_module = self.context.backward_order.next_item(self)
+            if next_module is not None:
+                next_module._unshard_parameter_groups(orientation)
+        else:
             # The traced next occurrence may be in the opposite direction, so
             # prefetch with the orientation recorded for that occurrence.
-            next_orientation = runner.next_prefetch_orientation()
-            next_module._unshard_parameter_groups(next_orientation)
-        # Release prefetched modules that neither this module nor the new
-        # successor consumes. The 1F1B schedule does not follow the static
-        # orders, so an earlier prefetch may target a module that is never
-        # executed; without this, its unsharded storage would accumulate.
+            next_module._unshard_parameter_groups(runner.next_prefetch_orientation())
         for stale in list(self.context._prefetched_modules):
             if stale is not next_module:
                 stale._reshard_parameter_groups()
@@ -523,9 +537,7 @@ class FsdpModule:
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
 
-        next_module = context.backward_order.next_item(self)
-        if next_module is not None:
-            next_module._unshard_parameter_groups("colwise")
+        self._record_consume_and_prefetch("colwise")
 
     def post_backward(self, finalize_context: bool = False) -> None:
         """Reduce gradients and return parameters to their sharded resting state.

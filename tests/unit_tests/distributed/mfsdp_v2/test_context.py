@@ -422,3 +422,31 @@ def test_prefetch_releases_stale_unconsumed_modules(distributed_setup):
     assert layers[1]._unshard_event is not None
     assert layers[0] not in ctx._prefetched_modules
     assert layers[1] not in ctx._prefetched_modules
+
+
+def test_eager_pre_forward_feeds_context_runner(distributed_setup):
+    """The eager pre_forward path must also feed the context-wide runner.
+
+    The runner is shared across the full FsdpContext, so a consume driven by
+    the eager forward hooks is traced identically to a fine-grained consume:
+    batch 1 records and prefetches via the static order fallback, batch 2
+    replays the traced order.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    layers = model.layers
+    ctx = model.context
+    assert ctx.runner.is_tracing
+
+    # Eager forward consumes are recorded on the shared runner.
+    with torch.no_grad():
+        model(torch.ones(2, 4, device=device))
+    assert not ctx.runner.is_tracing
+    assert len(ctx.runner._trace) >= 2  # root + child layers
