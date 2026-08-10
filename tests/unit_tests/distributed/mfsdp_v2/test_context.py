@@ -337,3 +337,36 @@ def test_vpp_chunks_reuse_context_on_same_device_only(distributed_setup):
             with fully_shard_context(device=torch.device("cpu"), reuse_existing=True):
                 pass
         fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+
+def test_prefetch_releases_stale_unconsumed_modules(distributed_setup):
+    """Unshard should release prefetched modules the schedule never consumes.
+
+    The fine-grained 1F1B schedule does not follow the static orders, so a
+    prefetched successor may never be executed. The prefetch trace must
+    reshard such stale modules instead of accumulating unsharded storage.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=3).to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    root = model
+    assert root.is_root()
+
+    # layer 0 consumes and prefetches layer 1 (forward order).
+    layers[0].unshard_parameters()
+    assert list(root.context._prefetched_modules) == [layers[1]]
+
+    # layer 2 consumes next; layer 1 was prefetched but is skipped by the
+    # schedule, so it must be resharded (released) and removed from the trace.
+    layers[2].unshard_parameters()
+    assert root.context._prefetched_modules == {layers[2]}
+    assert layers[1]._unshard_event is None
+
+    # The consumer itself stays unsharded and out of the prefetch trace.
+    assert layers[0]._unshard_event is not None
+    assert root.context._prefetched_modules == {layers[2]}

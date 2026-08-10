@@ -56,6 +56,12 @@ class FsdpContext:
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder["FsdpModule"]
     backward_order: IndexedOrder["FsdpModule"]
+    # Modules whose unsharded storage was prefetched (issued ahead of compute)
+    # but not yet consumed by their own compute. The fine-grained 1F1B overlap
+    # schedule does not follow the static orders, so a prefetched successor may
+    # never be used; tracking it here lets the next prefetch release it instead
+    # of accumulating unsharded storage across micro-batches.
+    _prefetched_modules: set["FsdpModule"]
 
     def __init__(self, device: torch.device) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
@@ -67,6 +73,7 @@ class FsdpContext:
         self.is_last_microbatch = True
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
+        self._prefetched_modules = set()
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
@@ -408,6 +415,9 @@ class FsdpModule:
             orientation: Payload orientation to gather for MXFP8 groups
                 (``"rowwise"`` on forward, ``"colwise"`` on backward).
         """
+        # This module is now consuming compute; it is no longer merely a
+        # prefetched successor.
+        self.context._prefetched_modules.discard(self)
         self._unshard_parameter_groups(orientation)
         if self._unshard_event is not None:
             self.context.current_stream().wait_event(self._unshard_event)
@@ -417,13 +427,24 @@ class FsdpModule:
         # fine-grained 1F1B schedule. Skip during recompute, whose forward
         # hooks run inside backward and must not unshard successors.
         is_recomputing = self._phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
-        if not is_recomputing:
-            if orientation == "rowwise":
-                next_module = self.context.forward_order.next_item(self)
-            else:
-                next_module = self.context.backward_order.next_item(self)
-            if next_module is not None:
-                next_module._unshard_parameter_groups(orientation)
+        if is_recomputing:
+            return
+        if orientation == "rowwise":
+            next_module = self.context.forward_order.next_item(self)
+        else:
+            next_module = self.context.backward_order.next_item(self)
+        if next_module is not None:
+            next_module._unshard_parameter_groups(orientation)
+        # Release prefetched modules that neither this module nor the new
+        # successor consumes. The 1F1B schedule does not follow the static
+        # orders, so an earlier prefetch may target a module that is never
+        # executed; without this, its unsharded storage would accumulate.
+        for stale in list(self.context._prefetched_modules):
+            if stale is not next_module:
+                stale._reshard_parameter_groups()
+        self.context._prefetched_modules.clear()
+        if next_module is not None:
+            self.context._prefetched_modules.add(next_module)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
@@ -442,6 +463,7 @@ class FsdpModule:
         This method clears ``_unshard_event`` after queuing the release, so
         future users enqueue a fresh all-gather.
         """
+        self.context._prefetched_modules.discard(self)
         for group in self._parameter_groups:
             group.reshard_parameters()
 
