@@ -287,3 +287,53 @@ def test_post_backward_release_processes_nested_fsdp_modules_once(distributed_se
         ("root", "reduce"),
         ("root", "reshard"),
     ]
+
+
+def test_vpp_chunks_share_one_context_via_reuse(distributed_setup):
+    """VPP chunks wrapped inside one scope should share a single FsdpContext.
+
+    Simulates the training-loop wrapping of multiple virtual-pipeline chunks:
+    the outer fully_shard_context() is opened once, and each chunk's adapter
+    (modeled here by nested reuse_existing scopes) joins it instead of
+    creating a new context. All chunks must share streams and cross-root
+    prefetch orders.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+
+    chunks = [MultiChildModel(dim=4, num_children=2).to(device) for _ in range(2)]
+
+    with fully_shard_context(device=device) as outer:
+        for chunk in chunks:
+            # Mirrors FullyShardedDataParallelV2.__init__ wrapping a chunk:
+            # reuse_existing joins the training-loop context.
+            with fully_shard_context(device=device, reuse_existing=True):
+                fully_shard(chunk, mesh=mesh, placements=_flat_placements())
+
+        assert chunk.context is outer
+
+    # After finalize, every chunk root is registered in the shared context's
+    # cross-root orders.
+    for chunk in chunks:
+        assert chunk.context is outer
+        assert chunk.is_root()
+
+    assert len(list(outer.forward_order)) == 2
+    assert len(list(outer.backward_order)) == 2
+    assert outer.allgather_stream is chunks[0].context.allgather_stream
+    assert outer.reduce_scatter_stream is chunks[0].context.reduce_scatter_stream
+
+
+def test_vpp_chunks_reuse_context_on_same_device_only(distributed_setup):
+    """reuse_existing must join only a context on the same device."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+
+    with fully_shard_context(device=device):
+        # A different device must not be joined silently; the ambient context
+        # is CUDA so requesting a CPU context keeps the nesting rejection.
+        with pytest.raises(RuntimeError, match="does not support nesting"):
+            with fully_shard_context(device=torch.device("cpu"), reuse_existing=True):
+                pass
+        fully_shard(model, mesh=mesh, placements=_flat_placements())

@@ -46,6 +46,7 @@ class FsdpContext:
 
     allgather_stream: torch.cuda.Stream
     reduce_scatter_stream: torch.cuda.Stream
+    device: torch.device
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
@@ -62,6 +63,7 @@ class FsdpContext:
         Args:
             device: Device on which this context schedules communication.
         """
+        self.device = device
         self.is_last_microbatch = True
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
@@ -446,8 +448,11 @@ class FsdpModule:
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
-            for module in context.forward_order:
-                module._post_backward_issued = False
+            # The orders are prefetch-only; reset the idempotency flag by
+            # traversing this root's own subtree instead.
+            for module in self.modules():
+                if isinstance(module, FsdpModule):
+                    module._post_backward_issued = False
             context.register_post_backward_final_callback()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
@@ -474,8 +479,9 @@ class FsdpModule:
         """
         if finalize_context:
             assert self.is_root()
-            for module in reversed(list(self.context.forward_order)):
-                module._issue_post_backward()
+            for module in reversed(list(self.modules())):
+                if isinstance(module, FsdpModule):
+                    module._issue_post_backward()
         else:
             self._issue_post_backward()
         torch.cuda.nvtx.range_pop()

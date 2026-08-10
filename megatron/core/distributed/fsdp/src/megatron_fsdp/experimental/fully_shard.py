@@ -31,17 +31,34 @@ _FSDP_CONTEXT = ContextVar[FsdpContext | None]("megatron_fsdp_context", default=
 
 
 @contextmanager
-def fully_shard_context(device: torch.device | None = None) -> Iterator[FsdpContext]:
+def fully_shard_context(
+    device: torch.device | None = None, *, reuse_existing: bool = False
+) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
     Independent roots are ordered by their root-level ``fully_shard`` calls.
     Construction must finish before any of the registered modules run forward.
 
+    When ``reuse_existing`` is set and a context is already active on the same
+    device, that context is yielded instead of creating a new one. This lets
+    callers that open a context internally (e.g. per-model-chunk adapters)
+    join an outer construction scope, so every module in a multi-chunk model
+    (VPP) shares one set of streams and one cross-root prefetch order. The
+    context is finalized only by the outermost scope.
+
     Args:
         device: CUDA device on which to create communication streams. Defaults to
             the current CUDA device.
+        reuse_existing: Join an already-active context on ``device`` instead of
+            creating a new one. Defaults to False, which rejects nesting.
     """
-    if _FSDP_CONTEXT.get() is not None:
+    existing = _FSDP_CONTEXT.get()
+    if existing is not None:
+        if reuse_existing and existing.device == (
+            device or torch.device("cuda", torch.cuda.current_device())
+        ):
+            yield existing
+            return
         raise RuntimeError("fully_shard_context does not support nesting.")
 
     device = device or torch.device("cuda", torch.cuda.current_device())
