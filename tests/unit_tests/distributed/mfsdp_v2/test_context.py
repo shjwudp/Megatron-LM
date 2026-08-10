@@ -522,3 +522,48 @@ def test_runner_divergence_retraces_and_recovers(distributed_setup):
     assert runner.record_consume(layers[2], "rowwise") is layers[0]
     assert runner.record_consume(layers[0], "rowwise") is layers[1]
     assert runner.record_consume(layers[1], "rowwise") is layers[2]
+
+
+def test_runner_tolerates_transient_mismatch_without_crashing(distributed_setup):
+    """A single unexpected consume must not crash replay; it re-traces.
+
+    Real schedules can deviate transiently (e.g. an extra or reordered
+    occurrence). The runner treats any mismatch as a divergence, clears the
+    trace, and re-traces from the offending occurrence, so training never
+    aborts on a prefetch-order error.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=3).to(device)
+
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    runner = model.context.runner
+
+    # Batch 1 trace: 0, 1, 2.
+    for layer in layers:
+        runner.record_consume(layer, "rowwise")
+    runner.complete_trace()
+
+    # Replay 0 -> 1, then a transient error: consume 2 instead of 2 (same
+    # module) but with the wrong orientation — a mismatch that must not raise.
+    assert runner.record_consume(layers[0], "rowwise") is layers[1]
+    assert runner.record_consume(layers[1], "rowwise") is layers[2]
+    # Transient error: expected rowwise consume of layer 2 comes in colwise.
+    assert runner.record_consume(layers[2], "colwise") is None
+    assert runner.is_tracing  # re-traced, demand-only, no crash
+
+    # The remainder re-traces; a complete cycle compiles again.
+    runner.record_consume(layers[0], "rowwise")
+    runner.record_consume(layers[1], "rowwise")
+    runner.complete_trace()
+    assert not runner.is_tracing
+
+    # Recovered replay follows the new cycle.
+    assert runner.record_consume(layers[2], "colwise") is layers[0]
+    assert runner.record_consume(layers[0], "rowwise") is layers[1]
+    assert runner.record_consume(layers[1], "rowwise") is layers[2]
