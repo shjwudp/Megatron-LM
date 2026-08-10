@@ -399,7 +399,7 @@ def test_eager_pre_forward_feeds_context_runner(distributed_setup):
         fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     ctx = model.context
-    assert ctx.use_trace_replay
+    assert ctx.runner.use_trace_replay
     assert ctx.runner.is_tracing
 
     # Batch 1: eager forward consumes are recorded; without an optimizer
@@ -434,7 +434,7 @@ def test_default_mode_uses_static_order_prefetch(distributed_setup):
         fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     ctx = model.context
-    assert not ctx.use_trace_replay
+    assert not ctx.runner.use_trace_replay
     assert ctx.runner.is_tracing
 
     # A full forward does not feed the runner in default mode.

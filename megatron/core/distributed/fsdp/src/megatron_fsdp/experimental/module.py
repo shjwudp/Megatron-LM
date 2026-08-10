@@ -82,11 +82,6 @@ class FsdpContext:
             self.allgather_stream = torch.cuda.Stream()
             self.reduce_scatter_stream = torch.cuda.Stream()
 
-    @property
-    def use_trace_replay(self) -> bool:
-        """Whether trace-and-replay prefetch is enabled."""
-        return self.runner.use_trace_replay
-
     def register_module(self, module: "FsdpModule") -> None:
         """Register a module constructed in this context."""
         if self._is_finalized:
