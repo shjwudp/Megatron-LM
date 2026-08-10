@@ -360,9 +360,9 @@ def test_prefetch_traces_and_replays_actual_consume_order(distributed_setup):
 
     # Batch 1 (trace): consume in schedule order F L0, B L2, F L1. No
     # prefetch during tracing.
-    assert runner.record_consume(layers[0], "rowwise") is None
-    assert runner.record_consume(layers[2], "colwise") is None
-    assert runner.record_consume(layers[1], "rowwise") is None
+    assert runner.consume_and_get_next(layers[0], "rowwise") is None
+    assert runner.consume_and_get_next(layers[2], "colwise") is None
+    assert runner.consume_and_get_next(layers[1], "rowwise") is None
     assert runner.is_tracing
 
     # Batch boundary compiles the trace into the replay cycle.
@@ -371,13 +371,12 @@ def test_prefetch_traces_and_replays_actual_consume_order(distributed_setup):
 
     # Batch 2 (replay): consume in the same order; each call returns the
     # traced next consumer (with wrap-around at the batch boundary).
-    assert runner.record_consume(layers[0], "rowwise") is layers[2]
-    assert runner.next_prefetch_orientation() == "colwise"
-    assert runner.record_consume(layers[2], "colwise") is layers[1]
-    assert runner.record_consume(layers[1], "rowwise") is layers[0]
+    assert runner.consume_and_get_next(layers[0], "rowwise") == (layers[2], "colwise")
+    assert runner.consume_and_get_next(layers[2], "colwise") == (layers[1], "rowwise")
+    assert runner.consume_and_get_next(layers[1], "rowwise") == (layers[0], "rowwise")
 
     # Divergence re-traces from the mismatching occurrence.
-    assert runner.record_consume(layers[0], "colwise") is None
+    assert runner.consume_and_get_next(layers[0], "colwise") is None
     assert runner.is_tracing
 
 
@@ -465,17 +464,17 @@ def test_runner_wrap_around_chunk_cycle_prefetches_first_module(distributed_setu
 
     # Batch 1 traces the chunk cycle 0 -> 1 -> 2.
     for layer in layers:
-        assert runner.record_consume(layer, "rowwise") is None
+        assert runner.consume_and_get_next(layer, "rowwise") is None
     runner.complete_trace()
 
     # Batch 2 replays: 0 -> 1 -> 2 -> 0 -> 1 -> 2, prefetching the successor
     # at every step including the 2 -> 0 wrap.
-    assert runner.record_consume(layers[0], "rowwise") is layers[1]
-    assert runner.record_consume(layers[1], "rowwise") is layers[2]
-    assert runner.record_consume(layers[2], "rowwise") is layers[0]
-    assert runner.record_consume(layers[0], "rowwise") is layers[1]
-    assert runner.record_consume(layers[1], "rowwise") is layers[2]
-    assert runner.record_consume(layers[2], "rowwise") is layers[0]
+    assert runner.consume_and_get_next(layers[0], "rowwise") == (layers[1], "rowwise")
+    assert runner.consume_and_get_next(layers[1], "rowwise") == (layers[2], "rowwise")
+    assert runner.consume_and_get_next(layers[2], "rowwise") == (layers[0], "rowwise")
+    assert runner.consume_and_get_next(layers[0], "rowwise") == (layers[1], "rowwise")
+    assert runner.consume_and_get_next(layers[1], "rowwise") == (layers[2], "rowwise")
+    assert runner.consume_and_get_next(layers[2], "rowwise") == (layers[0], "rowwise")
 
 
 def test_runner_wrap_within_batch_multiple_cycles(distributed_setup):
@@ -500,7 +499,7 @@ def test_runner_wrap_within_batch_multiple_cycles(distributed_setup):
     # Batch 1: two full cycles (0,1,2,0,1,2).
     for _ in range(2):
         for layer in layers:
-            assert runner.record_consume(layer, "rowwise") is None
+            assert runner.consume_and_get_next(layer, "rowwise") is None
     runner.complete_trace()
     assert len(runner._trace) == 6
 
@@ -508,7 +507,7 @@ def test_runner_wrap_within_batch_multiple_cycles(distributed_setup):
     expected_cycle = [layers[0], layers[1], layers[2], layers[0], layers[1], layers[2]]
     for i, layer in enumerate(expected_cycle):
         expected_next = expected_cycle[(i + 1) % len(expected_cycle)]
-        assert runner.record_consume(layer, "rowwise") is expected_next
+        assert runner.consume_and_get_next(layer, "rowwise") == (expected_next, "rowwise")
 
 
 def test_runner_divergence_retraces_and_recovers(distributed_setup):
@@ -531,25 +530,25 @@ def test_runner_divergence_retraces_and_recovers(distributed_setup):
 
     # Batch 1 trace: 0,1,2.
     for layer in layers:
-        runner.record_consume(layer, "rowwise")
+        runner.consume_and_get_next(layer, "rowwise")
     runner.complete_trace()
 
     # Divergence: consume 0 then 2 (expected 1). Re-traces from 2.
-    runner.record_consume(layers[0], "rowwise")
-    assert runner.record_consume(layers[2], "rowwise") is None
+    runner.consume_and_get_next(layers[0], "rowwise")
+    assert runner.consume_and_get_next(layers[2], "rowwise") is None
     assert runner.is_tracing
 
     # The remainder of the divergent batch is traced: 2, then 0, 1 (a full
     # cycle completes and compiles again at the next boundary).
-    runner.record_consume(layers[0], "rowwise")
-    runner.record_consume(layers[1], "rowwise")
+    runner.consume_and_get_next(layers[0], "rowwise")
+    runner.consume_and_get_next(layers[1], "rowwise")
     runner.complete_trace()
     assert not runner.is_tracing
 
     # Replay the recovered cycle.
-    assert runner.record_consume(layers[2], "rowwise") is layers[0]
-    assert runner.record_consume(layers[0], "rowwise") is layers[1]
-    assert runner.record_consume(layers[1], "rowwise") is layers[2]
+    assert runner.consume_and_get_next(layers[2], "rowwise") == (layers[0], "rowwise")
+    assert runner.consume_and_get_next(layers[0], "rowwise") == (layers[1], "rowwise")
+    assert runner.consume_and_get_next(layers[1], "rowwise") == (layers[2], "rowwise")
 
 
 def test_runner_tolerates_transient_mismatch_without_crashing(distributed_setup):
@@ -574,27 +573,27 @@ def test_runner_tolerates_transient_mismatch_without_crashing(distributed_setup)
 
     # Batch 1 trace: 0, 1, 2.
     for layer in layers:
-        runner.record_consume(layer, "rowwise")
+        runner.consume_and_get_next(layer, "rowwise")
     runner.complete_trace()
 
     # Replay 0 -> 1, then a transient error: consume 2 instead of 2 (same
     # module) but with the wrong orientation — a mismatch that must not raise.
-    assert runner.record_consume(layers[0], "rowwise") is layers[1]
-    assert runner.record_consume(layers[1], "rowwise") is layers[2]
+    assert runner.consume_and_get_next(layers[0], "rowwise") == (layers[1], "rowwise")
+    assert runner.consume_and_get_next(layers[1], "rowwise") == (layers[2], "rowwise")
     # Transient error: expected rowwise consume of layer 2 comes in colwise.
-    assert runner.record_consume(layers[2], "colwise") is None
+    assert runner.consume_and_get_next(layers[2], "colwise") is None
     assert runner.is_tracing  # re-traced, demand-only, no crash
 
     # The remainder re-traces; a complete cycle compiles again.
-    runner.record_consume(layers[0], "rowwise")
-    runner.record_consume(layers[1], "rowwise")
+    runner.consume_and_get_next(layers[0], "rowwise")
+    runner.consume_and_get_next(layers[1], "rowwise")
     runner.complete_trace()
     assert not runner.is_tracing
 
     # Recovered replay follows the new cycle.
-    assert runner.record_consume(layers[2], "colwise") is layers[0]
-    assert runner.record_consume(layers[0], "rowwise") is layers[1]
-    assert runner.record_consume(layers[1], "rowwise") is layers[2]
+    assert runner.consume_and_get_next(layers[2], "colwise") == (layers[0], "rowwise")
+    assert runner.consume_and_get_next(layers[0], "rowwise") == (layers[1], "rowwise")
+    assert runner.consume_and_get_next(layers[1], "rowwise") == (layers[2], "rowwise")
 
 
 def test_unshard_records_one_consume_per_module_per_pass(distributed_setup):
@@ -627,6 +626,6 @@ def test_unshard_records_one_consume_per_module_per_pass(distributed_setup):
     assert [occ.module for occ in runner._trace] == list(layers)
 
     # Batch 2 replay: consume in order; each returns the traced next (wrap).
-    assert runner.record_consume(layers[0], "rowwise") is layers[1]
-    assert runner.record_consume(layers[1], "rowwise") is layers[2]
-    assert runner.record_consume(layers[2], "rowwise") is layers[0]
+    assert runner.consume_and_get_next(layers[0], "rowwise") == (layers[1], "rowwise")
+    assert runner.consume_and_get_next(layers[1], "rowwise") == (layers[2], "rowwise")
+    assert runner.consume_and_get_next(layers[2], "rowwise") == (layers[0], "rowwise")

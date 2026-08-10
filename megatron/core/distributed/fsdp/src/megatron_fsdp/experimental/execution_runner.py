@@ -156,28 +156,41 @@ class FsdpExecutionRunner:
             of the static order).
         """
         if not self._use_trace_replay:
-            # Default mode: activation recomputation runs forward hooks
-            # inside backward, whose forward-order prefetch must be skipped
-            # (its backward may already be complete and would not reshard the
-            # prefetched successor). Trace-replay mode owns all prefetch
-            # decisions and intentionally skips this check.
-            if getattr(module, "_phase", None) is not None and (
-                module._phase == module.Phase.BACKWARD
-                or torch._C._current_graph_task_id() != -1
-            ):
-                return None
-            if orientation == "rowwise":
-                next_module = self._context.forward_order.next_item(module)
-            else:
-                next_module = self._context.backward_order.next_item(module)
-            if next_module is None:
-                return None
-            return next_module, orientation
+            return self._static_successor(module, orientation)
 
-        next_module = self.record_consume(module, orientation)
+        return self._replay_successor(module, orientation)
+
+    def _static_successor(
+        self, module: "FsdpModule", orientation: str
+    ) -> tuple["FsdpModule", str] | None:
+        """Default mode: resolve the static-order successor.
+
+        Activation recomputation runs forward hooks inside backward, whose
+        forward-order prefetch must be skipped (its backward may already be
+        complete and would not reshard the prefetched successor). Trace-replay
+        mode owns all prefetch decisions and intentionally skips this check.
+        """
+        if getattr(module, "_phase", None) is not None and (
+            module._phase == module.Phase.BACKWARD
+            or torch._C._current_graph_task_id() != -1
+        ):
+            return None
+        if orientation == "rowwise":
+            next_module = self._context.forward_order.next_item(module)
+        else:
+            next_module = self._context.backward_order.next_item(module)
         if next_module is None:
             return None
-        return next_module, self.next_prefetch_orientation()
+        return next_module, orientation
+
+    def _replay_successor(
+        self, module: "FsdpModule", orientation: str
+    ) -> tuple["FsdpModule", str] | None:
+        """Trace-replay mode: validate the occurrence and return the traced next."""
+        next_module = self._record_consume(module, orientation)
+        if next_module is None:
+            return None
+        return next_module, self._next_prefetch_orientation()
 
     def complete_trace(self) -> None:
         """Compile the recorded trace into the replay cycle.
@@ -222,7 +235,7 @@ class FsdpExecutionRunner:
                 self._complete_trace_calls,
             )
 
-    def record_consume(self, module: "FsdpModule", orientation: str) -> "FsdpModule | None":
+    def _record_consume(self, module: "FsdpModule", orientation: str) -> "FsdpModule | None":
         """Record (tracing) or validate (replay) one consume occurrence.
 
         Args:
@@ -262,10 +275,10 @@ class FsdpExecutionRunner:
         self._replay_index = (self._replay_index + 1) % len(self._trace)
         return self._trace[self._replay_index].module
 
-    def next_prefetch_orientation(self) -> str | None:
+    def _next_prefetch_orientation(self) -> str | None:
         """Return the orientation recorded for the current replay successor.
 
-        Only meaningful immediately after ``record_consume`` returned a
+        Only meaningful immediately after ``_record_consume`` returned a
         module; the returned orientation matches that successor's occurrence.
         """
         if not self._trace:
