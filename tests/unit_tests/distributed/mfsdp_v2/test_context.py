@@ -337,48 +337,87 @@ def test_vpp_chunks_reuse_context_on_same_device_only(distributed_setup):
             with fully_shard_context(device=torch.device("cpu"), reuse_existing=True):
                 pass
         fully_shard(model, mesh=mesh, placements=_flat_placements())
-def test_prefetch_releases_stale_unconsumed_modules(distributed_setup):
-    """Unshard should release prefetched modules the schedule never consumes.
+def test_prefetch_traces_and_replays_actual_consume_order(distributed_setup):
+    """Prefetch should follow the traced 1F1B consume order, not static orders.
 
-    The fine-grained 1F1B schedule does not follow the static orders, so a
-    prefetched successor may never be executed. The prefetch trace must
-    reshard such stale modules instead of accumulating unsharded storage,
-    while the consuming module and the newly prefetched successor stay
-    materialized.
+    The fine-grained schedule can consume modules in an order that differs
+    from forward_order/backward_order (e.g. F L0 -> B L2 -> F L1). The first
+    batch traces that order and returns no prefetch; later batches replay it
+    and prefetch the actual next consumer.
     """
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=3).to(device)
 
-    # Each layer is its own FsdpModule so the context order spans all of them.
     with fully_shard_context(device=device):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
         fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
 
     layers = model.layers
-    root = model
-    assert root.is_root()
+    ctx = model.context
 
-    # layer 0 consumes and prefetches layer 1 (forward order).
+    # Batch 1 (trace): consume in schedule order F L0, B L2, F L1. No
+    # prefetch during tracing.
+    assert ctx.record_consume_or_next_replay(layers[0], "rowwise") is None
+    assert ctx.record_consume_or_next_replay(layers[2], "colwise") is None
+    assert ctx.record_consume_or_next_replay(layers[1], "rowwise") is None
+    assert ctx._trace_history == [
+        (layers[0], "rowwise"),
+        (layers[2], "colwise"),
+        (layers[1], "rowwise"),
+    ]
+
+    # Batch 2 (replay): consume in the same order; each call returns the
+    # traced next consumer (with wrap-around at the batch boundary).
+    assert ctx.record_consume_or_next_replay(layers[0], "rowwise") is layers[2]
+    assert ctx.record_consume_or_next_replay(layers[2], "colwise") is layers[1]
+    assert ctx.record_consume_or_next_replay(layers[1], "rowwise") is layers[0]
+    assert ctx._replay_index == 0
+
+    # Divergence re-traces from the mismatching occurrence.
+    assert ctx.record_consume_or_next_replay(layers[0], "rowwise") is None
+    assert ctx._trace_history == [(layers[0], "rowwise")]
+    assert ctx._replay_index == 0
+
+
+def test_prefetch_releases_stale_unconsumed_modules(distributed_setup):
+    """Unshard should release prefetched modules the schedule never consumes.
+
+    After replay, the prefetched successor is the traced next consumer, so a
+    module that is prefetched but skipped must be resharded instead of
+    accumulating unsharded storage, while the consuming module and the newly
+    prefetched successor stay materialized.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=3).to(device)
+
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    ctx = model.context
+
+    # Trace batch: L0 -> L2 -> L1.
+    ctx.record_consume_or_next_replay(layers[0], "rowwise")
+    ctx.record_consume_or_next_replay(layers[2], "colwise")
+    ctx.record_consume_or_next_replay(layers[1], "rowwise")
+
+    # Replay batch: consume L0, prefetch L2 (traced successor).
     layers[0].unshard_parameters()
-    assert root.context._prefetched_modules == {layers[1]}
+    assert ctx._prefetched_modules == {layers[2]}
     assert layers[0]._unshard_event is not None
 
-    # layer 2 consumes next; layer 1 was prefetched but is skipped by the
-    # schedule, so it must be resharded (released) and removed from the trace.
-    layers[2].unshard_parameters()
-    assert layers[1]._unshard_event is None
-    assert layers[1] not in root.context._prefetched_modules
-
+    # Consume L1 out of traced order (schedule divergence): L2 was prefetched
+    # but is skipped, so it must be resharded and removed from the trace.
+    layers[1].unshard_parameters()
+    assert layers[2]._unshard_event is None
+    assert layers[2] not in ctx._prefetched_modules
     # The consumers stay unsharded and out of the prefetch trace.
     assert layers[0]._unshard_event is not None
-    assert layers[2]._unshard_event is not None
-    assert layers[0] not in root.context._prefetched_modules
-    assert layers[2] not in root.context._prefetched_modules
-
-    # layer 1 re-consumes after the skip: prefetch trace drops it again and
-    # only tracks the next successor.
-    layers[1].unshard_parameters()
     assert layers[1]._unshard_event is not None
-    assert layers[1] not in root.context._prefetched_modules
+    assert layers[0] not in ctx._prefetched_modules
+    assert layers[1] not in ctx._prefetched_modules

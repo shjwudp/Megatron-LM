@@ -62,6 +62,17 @@ class FsdpContext:
     # never be used; tracking it here lets the next prefetch release it instead
     # of accumulating unsharded storage across micro-batches.
     _prefetched_modules: set["FsdpModule"]
+    # Trace-and-replay prefetch order. The combined-1F1B + VPP schedule is
+    # occurrence-based: the same FSDP unit can be consumed in forward and
+    # backward, chunks interleave, and warmup/steady/cooldown differ per PP
+    # rank. The static forward/backward orders cannot express that sequence,
+    # so the first global batch records every unshard consume occurrence
+    # (module, orientation) in actual execution order, and subsequent batches
+    # replay that order to prefetch the true next consumer. A divergence
+    # clears the trace and falls back to demand-only execution until a full
+    # cycle matches again.
+    _trace_history: list[tuple["FsdpModule", str]]
+    _replay_index: int
 
     def __init__(self, device: torch.device) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
@@ -74,6 +85,8 @@ class FsdpContext:
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self._prefetched_modules = set()
+        self._trace_history = []
+        self._replay_index = 0
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
@@ -122,6 +135,43 @@ class FsdpContext:
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
+
+    def record_consume_or_next_replay(
+        self, module: "FsdpModule", orientation: str
+    ) -> "FsdpModule | None":
+        """Record a consume occurrence, or return the traced next consumer.
+
+        During the trace batch (empty ``_trace_history``), the occurrence is
+        appended and ``None`` is returned so no prefetch is issued. From the
+        second batch, the current occurrence is validated against the traced
+        cycle and the module at the following occurrence (wrapping around) is
+        returned for prefetch. If the schedule diverges from the trace, the
+        history is cleared and the occurrence starts a fresh trace, degrading
+        to demand-only execution until a full cycle matches again.
+
+        Args:
+            module: The FSDP module being consumed by compute.
+            orientation: Payload orientation (``"rowwise"`` forward,
+                ``"colwise"`` backward).
+
+        Returns:
+            The module to prefetch next, or ``None`` while tracing.
+        """
+        if not self._trace_history:
+            self._trace_history.append((module, orientation))
+            return None
+        expected, _ = self._trace_history[self._replay_index]
+        if expected is not module:
+            # Schedule diverged (e.g. batch-size or topology change). Re-trace
+            # from this occurrence; prefetch stays disabled until a full
+            # cycle matches.
+            self._trace_history.clear()
+            self._trace_history.append((module, orientation))
+            self._replay_index = 0
+            return None
+        self._replay_index = (self._replay_index + 1) % len(self._trace_history)
+        next_module, next_orientation = self._trace_history[self._replay_index]
+        return next_module
 
     def register_post_backward_final_callback(self) -> None:
         """Register this root context's final callback for the current backward.
@@ -421,20 +471,19 @@ class FsdpModule:
         self._unshard_parameter_groups(orientation)
         if self._unshard_event is not None:
             self.context.current_stream().wait_event(self._unshard_event)
-        # Prefetch the successor's all-gather on the shared AG stream. The
-        # prefetch is issued after this module's own wait, so it runs
-        # concurrently with this module's compute instead of stalling the
-        # fine-grained 1F1B schedule. Skip during recompute, whose forward
-        # hooks run inside backward and must not unshard successors.
+        # Trace-and-replay prefetch: the combined-1F1B + VPP schedule does not
+        # follow the static orders, so the next consumer comes from the traced
+        # execution cycle, not from next_item(). Skip during recompute, whose
+        # forward hooks run inside backward and must not unshard successors.
         is_recomputing = self._phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
         if is_recomputing:
             return
-        if orientation == "rowwise":
-            next_module = self.context.forward_order.next_item(self)
-        else:
-            next_module = self.context.backward_order.next_item(self)
+        next_module = self.context.record_consume_or_next_replay(self, orientation)
         if next_module is not None:
-            next_module._unshard_parameter_groups(orientation)
+            # The traced next occurrence may be in the opposite direction, so
+            # prefetch with the orientation recorded for that occurrence.
+            next_orientation = self.context._trace_history[self.context._replay_index][1]
+            next_module._unshard_parameter_groups(next_orientation)
         # Release prefetched modules that neither this module nor the new
         # successor consumes. The 1F1B schedule does not follow the static
         # orders, so an earlier prefetch may target a module that is never
