@@ -18,7 +18,7 @@ import enum
 import weakref
 from collections.abc import Callable
 from functools import partial
-from typing import Literal, cast
+from typing import cast
 from weakref import ref
 
 import torch
@@ -357,15 +357,19 @@ class FsdpModule:
         assert self._unshard_event is not None
         # Compute waits only for this FsdpModule's all-gather (the prefetch below is
         # issued afterwards, so it is free to run concurrently with this FsdpModule).
+        torch.cuda.nvtx.range_push(self._nvtx_label("wait_ag"))
         current_stream.wait_event(self._unshard_event)
+        torch.cuda.nvtx.range_pop()
 
         # Activation recomputation runs forward hooks inside backward. Do not
         # prefetch the next module in forward order: its backward may already
         # be complete, so no later backward hook would reshard it.
         if not is_recomputing:
+            torch.cuda.nvtx.range_push(self._nvtx_label("prefetch"))
             next_module = context.forward_order.next_item(self)
             if next_module is not None:
                 next_module._unshard_parameter_groups()
+            torch.cuda.nvtx.range_pop()
 
     def _unshard_parameter_groups(self, orientation: str = "rowwise") -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
@@ -384,10 +388,12 @@ class FsdpModule:
             return
 
         allgather_stream = self.context.allgather_stream
+        torch.cuda.nvtx.range_push(self._nvtx_label("allgather"))
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
                 group.unshard_parameters(orientation)
             self._unshard_event = allgather_stream.record_event()
+        torch.cuda.nvtx.range_pop()
 
     def unshard_parameters(self, orientation: str = "rowwise") -> None:
         """Public API: all-gather full parameter storage for compute.
@@ -529,6 +535,7 @@ class FsdpModule:
         reduce_scatter_stream = context.reduce_scatter_stream
         current_stream = context.current_stream()
 
+        torch.cuda.nvtx.range_push(self._nvtx_label("reduce_grad"))
         for group in self._parameter_groups:
             if not group.requires_grad:
                 continue
@@ -542,13 +549,14 @@ class FsdpModule:
             reduce_scatter_stream.wait_stream(current_stream)
             with torch.cuda.stream(reduce_scatter_stream):
                 group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
+        torch.cuda.nvtx.range_pop()
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
         """Parameter groups owned by this FsdpModule."""
         return self._parameter_groups
 
-    def _nvtx_label(self, phase: Literal["forward", "backward"]) -> str:
+    def _nvtx_label(self, phase: str) -> str:
         name = self.name if self.name else "<root>"
         return f"MFSDP {name} {phase}"
 
