@@ -382,27 +382,28 @@ def test_prefetch_traces_and_replays_actual_consume_order(distributed_setup):
 
 
 def test_eager_pre_forward_feeds_context_runner(distributed_setup):
-    """The eager pre_forward path must also feed the context-wide runner.
+    """In trace-replay mode, the eager pre_forward feeds the context runner.
 
     The runner is shared across the full FsdpContext, so a consume driven by
     the eager forward hooks is traced identically to a fine-grained consume:
-    batch 1 records and prefetches via the static order fallback, batch 2
+    batch 1 records (demand-only), and after the batch boundary batch 2
     replays the traced order.
     """
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device, use_trace_replay=True):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=_flat_placements())
         fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     ctx = model.context
+    assert ctx.use_trace_replay
     assert ctx.runner.is_tracing
 
-    # Eager forward consumes are recorded on the shared runner; without an
-    # optimizer boundary the runner stays tracing.
+    # Batch 1: eager forward consumes are recorded; without an optimizer
+    # boundary the runner stays tracing.
     with torch.no_grad():
         model(torch.ones(2, 4, device=device))
     assert ctx.runner.is_tracing
@@ -414,6 +415,33 @@ def test_eager_pre_forward_feeds_context_runner(distributed_setup):
     with torch.no_grad():
         model(torch.ones(2, 4, device=device))
     assert not ctx.runner.is_tracing
+
+
+def test_default_mode_uses_static_order_prefetch(distributed_setup):
+    """Default mode keeps static-order prefetch and skips the runner.
+
+    With use_trace_replay=False (the default), pre_forward/pre_backward
+    prefetch via forward_order/backward_order exactly as before the runner,
+    and the runner's trace stays untouched.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    ctx = model.context
+    assert not ctx.use_trace_replay
+    assert ctx.runner.is_tracing
+
+    # A full forward does not feed the runner in default mode.
+    with torch.no_grad():
+        model(torch.ones(2, 4, device=device))
+    assert ctx.runner.is_tracing
+    assert not ctx.runner._trace
 
 
 def test_runner_wrap_around_chunk_cycle_prefetches_first_module(distributed_setup):

@@ -32,7 +32,10 @@ _FSDP_CONTEXT = ContextVar[FsdpContext | None]("megatron_fsdp_context", default=
 
 @contextmanager
 def fully_shard_context(
-    device: torch.device | None = None, *, reuse_existing: bool = False
+    device: torch.device | None = None,
+    *,
+    reuse_existing: bool = False,
+    use_trace_replay: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -51,6 +54,13 @@ def fully_shard_context(
             the current CUDA device.
         reuse_existing: Join an already-active context on ``device`` instead of
             creating a new one. Defaults to False, which rejects nesting.
+        use_trace_replay: Enable trace-and-replay prefetch, which records the
+            actual fine-grained consume order during the first global batch
+            and replays it from the second batch. Required for complex
+            schedules (VPP + combined 1F1B) whose execution does not follow
+            the static forward/backward orders. Defaults to False (normal
+            forward/backward execution with static-order prefetch and
+            activation-recompute support).
     """
     existing = _FSDP_CONTEXT.get()
     if existing is not None:
@@ -65,7 +75,7 @@ def fully_shard_context(
     if device.type != "cuda":
         raise ValueError(f"fully_shard_context requires a CUDA device, got {device}.")
 
-    context = FsdpContext(device=device)
+    context = FsdpContext(device=device, use_trace_replay=use_trace_replay)
     token = _FSDP_CONTEXT.set(context)
     try:
         yield context

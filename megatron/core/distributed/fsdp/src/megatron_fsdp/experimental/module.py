@@ -62,17 +62,27 @@ class FsdpContext:
     # records the actual consume sequence in the first global batch and
     # replays it from the second batch to provide the next consumer.
     runner: FsdpExecutionRunner
-    def __init__(self, device: torch.device) -> None:
+    # Prefetch mode. Default (False): normal forward/backward execution is
+    # assumed, prefetch follows the static forward/backward orders, and the
+    # activation-recompute forward hooks keep the original logic. Complex
+    # schedules (VPP + combined 1F1B) set True: every prefetch is decided by
+    # the runner's trace and replay, and static-order prefetch is disabled.
+    use_trace_replay: bool
+
+    def __init__(self, device: torch.device, *, use_trace_replay: bool = False) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
         Args:
             device: Device on which this context schedules communication.
+            use_trace_replay: Enable trace-and-replay prefetch for complex
+                schedules such as VPP + combined 1F1B. Defaults to False.
         """
         self.device = device
         self.is_last_microbatch = True
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self.runner = FsdpExecutionRunner()
+        self.use_trace_replay = use_trace_replay
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
@@ -372,11 +382,19 @@ class FsdpModule:
         # be complete, so no later backward hook would reshard it.
         if not is_recomputing:
             torch.cuda.nvtx.range_push(self._nvtx_label("prefetch"))
-            next_module = context.runner.record_consume(self, "rowwise")
-            if next_module is not None:
-                next_module._unshard_parameter_groups(
-                    context.runner.next_prefetch_orientation()
-                )
+            if context.use_trace_replay:
+                # Complex schedules (VPP + combined 1F1B): the next consumer
+                # comes from the runner's traced execution cycle.
+                next_module = context.runner.record_consume(self, "rowwise")
+                if next_module is not None:
+                    next_module._unshard_parameter_groups(
+                        context.runner.next_prefetch_orientation()
+                    )
+            else:
+                # Default: normal forward execution, static forward order.
+                next_module = context.forward_order.next_item(self)
+                if next_module is not None:
+                    next_module._unshard_parameter_groups()
             torch.cuda.nvtx.range_pop()
 
     def _unshard_parameter_groups(self, orientation: str = "rowwise") -> None:
@@ -506,9 +524,16 @@ class FsdpModule:
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
 
-        next_module = context.runner.record_consume(self, "colwise")
-        if next_module is not None:
-            next_module._unshard_parameter_groups(context.runner.next_prefetch_orientation())
+        if context.use_trace_replay:
+            next_module = context.runner.record_consume(self, "colwise")
+            if next_module is not None:
+                next_module._unshard_parameter_groups(
+                    context.runner.next_prefetch_orientation()
+                )
+        else:
+            next_module = context.backward_order.next_item(self)
+            if next_module is not None:
+                next_module._unshard_parameter_groups("colwise")
 
     def post_backward(self, finalize_context: bool = False) -> None:
         """Reduce gradients and return parameters to their sharded resting state.

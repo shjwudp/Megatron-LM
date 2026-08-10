@@ -573,7 +573,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
         fine_grained = config.overlap_moe_expert_parallel_comm
         skip_backward_cb = fine_grained and ddp_config.delay_wgrad_compute
-        with fully_shard_context(device=device, reuse_existing=True):
+        # The combined-1F1B EP overlap schedule does not follow the static
+        # forward/backward orders, so enable trace-and-replay prefetch.
+        with fully_shard_context(
+            device=device, reuse_existing=True, use_trace_replay=fine_grained
+        ):
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
                     # The root is always sharded after selected child units so it is not
