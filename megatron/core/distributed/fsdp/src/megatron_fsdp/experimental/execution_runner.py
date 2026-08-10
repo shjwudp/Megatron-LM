@@ -40,6 +40,7 @@ State machine::
 """
 
 import dataclasses
+import logging
 from enum import Enum, auto
 
 import torch
@@ -49,6 +50,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .module import FsdpModule
+
+logger = logging.getLogger(__name__)
 
 
 class RunnerPhase(Enum):
@@ -108,6 +111,13 @@ class FsdpExecutionRunner:
         self._trace: list[ConsumeOccurrence] = []
         self._replay_index = 0
         self._cycles_observed = 0
+        # Diagnostics: how many occurrences were validated during replay, how
+        # many diverged (re-trace), and how many complete_trace calls ran.
+        self._replayed_occurrences = 0
+        self._divergences = 0
+        self._complete_trace_calls = 0
+        if use_trace_replay:
+            logger.info("FsdpExecutionRunner: trace-and-replay prefetch enabled.")
 
     @property
     def phase(self) -> RunnerPhase:
@@ -177,11 +187,40 @@ class FsdpExecutionRunner:
         subsequent calls reset the replay cursor for the next batch while
         keeping the compiled cycle.
         """
+        self._complete_trace_calls += 1
         if self._phase is RunnerPhase.TRACING and self._trace:
             self._phase = RunnerPhase.REPLAYING
+            logger.info(
+                "FsdpExecutionRunner: compiled %d-occurrence trace, entering replay.",
+                len(self._trace),
+            )
         self._replay_index = 0
         if self._phase is RunnerPhase.REPLAYING:
             self._cycles_observed += 1
+        # Log every few batches so a training run shows whether replay is
+        # actually validating occurrences or stuck re-tracing.
+        if self._complete_trace_calls % 10 == 0:
+            self.report()
+
+    def report(self) -> None:
+        """Log the runner's replay statistics.
+
+        A healthy runner shows ``cycles_observed`` increasing with every
+        batch and ``replayed_occurrences`` much larger than ``divergences``.
+        A runner that never replays (e.g. no complete_trace call, or a
+        permanent divergence loop) is visible from this summary.
+        """
+        if self._use_trace_replay:
+            logger.info(
+                "FsdpExecutionRunner: phase=%s trace_len=%d cycles_observed=%d "
+                "replayed_occurrences=%d divergences=%d complete_trace_calls=%d",
+                self._phase.name,
+                len(self._trace),
+                self._cycles_observed,
+                self._replayed_occurrences,
+                self._divergences,
+                self._complete_trace_calls,
+            )
 
     def record_consume(self, module: "FsdpModule", orientation: str) -> "FsdpModule | None":
         """Record (tracing) or validate (replay) one consume occurrence.
@@ -205,9 +244,21 @@ class FsdpExecutionRunner:
             # Schedule diverged from the trace (e.g. batch-size or topology
             # change). Re-trace from this occurrence; prefetch stays disabled
             # until a full cycle matches again.
+            self._divergences += 1
+            logger.warning(
+                "FsdpExecutionRunner: replay divergence at index %d: expected %s(%s), "
+                "got %s(%s). Re-tracing from this occurrence (divergence #%d).",
+                self._replay_index,
+                getattr(expected.module, "_name", None) or type(expected.module).__name__,
+                expected.orientation,
+                getattr(module, "_name", None) or type(module).__name__,
+                orientation,
+                self._divergences,
+            )
             self._retrace(module, orientation)
             return None
 
+        self._replayed_occurrences += 1
         self._replay_index = (self._replay_index + 1) % len(self._trace)
         return self._trace[self._replay_index].module
 
