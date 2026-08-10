@@ -640,3 +640,36 @@ def test_unshard_records_one_consume_per_module_per_pass(distributed_setup):
     assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") == (layers[1], "rowwise")
     assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (layers[2], "rowwise")
     assert _record_unshard_and_prefetch(runner, layers[2], "rowwise") == (layers[0], "rowwise")
+
+
+def test_complete_trace_clears_dedup_so_replay_records(distributed_setup):
+    """complete_trace must clear the per-round dedup set.
+
+    The trace batch's final unshards are not followed by a reshard, so stale
+    dedup entries would suppress the first replay unshards. The batch
+    boundary clears the set; every replay event must record.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    runner = model.context.runner
+
+    # Trace batch: unshard L0 -> reshard -> unshard L1 (no trailing reshard).
+    runner.record_unshard(layers[0], "rowwise")
+    runner.record_reshard(layers[0])
+    runner.record_unshard(layers[1], "rowwise")
+    runner.complete_trace()
+    assert not runner._consumed_this_round
+
+    # Replay: both unshards must record despite the trailing unshard of the
+    # trace batch (no stale dedup suppression).
+    assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") == (layers[1], "rowwise")
+    runner.record_reshard(layers[0])
+    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (layers[0], "rowwise")

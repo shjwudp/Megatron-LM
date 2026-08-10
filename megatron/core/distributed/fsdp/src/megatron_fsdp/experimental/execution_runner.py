@@ -48,7 +48,7 @@ Four per-op interfaces:
 - ``suggest_skip_reshard(module)``: optimization path — whether this reshard
   can be skipped because the next traced unshard reuses the same module and
   orientation, keeping the storage resident.
-- ``reset_round(module)``: mark the consume round over (called on reshard) so
+- ``_reset_round(module)``: internal — clear a module's round on reshard so
   the next pass records a fresh consume; per-pass dedup for the fine-grained
   per-sub-module hooks.
 """
@@ -125,7 +125,7 @@ class FsdpExecutionRunner:
         # Modules consumed in the current round. The fine-grained schedule
         # fires one hook per sub-module (dense, experts), so the same module
         # can be recorded several times within a round; only the first is a
-        # real unshard. Cleared by reset_round() on reshard.
+        # real unshard. Cleared by record_reshard() via _reset_round().
         self._consumed_this_round: set[FsdpModule] = set()
         # Orientation of each module's most recent consume during replay,
         # used to decide whether a reshard can be skipped (storage only needs
@@ -194,7 +194,7 @@ class FsdpExecutionRunner:
         """
         if not self._use_trace_replay:
             return
-        self.reset_round(module)
+        self._reset_round(module)
         self._validate_and_advance(EventKind.RESHARD, module, None)
 
     # ------------------------------------------------------------------
@@ -265,12 +265,11 @@ class FsdpExecutionRunner:
     # Interface 4: round lifecycle
     # ------------------------------------------------------------------
 
-    def reset_round(self, module: "FsdpModule") -> None:
-        """End the unshard round for ``module`` after its reshard.
+    def _reset_round(self, module: "FsdpModule") -> None:
+        """Clear ``module``'s unshard-round dedup entry.
 
-        Called by the module when its unsharded storage is released, so the
-        next hook of the following round records a fresh unshard (per-round
-        dedup).
+        Called by ``record_reshard`` so the next unshard of the same module
+        (e.g. backward after forward) records a fresh event.
         """
         self._consumed_this_round.discard(module)
 
@@ -294,6 +293,10 @@ class FsdpExecutionRunner:
                 len(self._trace),
             )
         self._replay_index = 0
+        # The batch boundary ends every module's unshard round; without this,
+        # dedup entries from the trace batch (whose final unshards were never
+        # followed by a reshard) would suppress the first replay unshards.
+        self._consumed_this_round.clear()
         if self._phase is RunnerPhase.REPLAYING:
             self._cycles_observed += 1
         # Log every few batches so a training run shows whether replay is

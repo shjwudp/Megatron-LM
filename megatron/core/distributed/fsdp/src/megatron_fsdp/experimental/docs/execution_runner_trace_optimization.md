@@ -156,7 +156,7 @@ Public API of `FsdpExecutionRunner` (owned by `FsdpContext`):
 | `record_reshard(module)` | trace | record/validate a reshard event; clears the module's unshard round |
 | `suggest_prefetch(module, orientation)` | optimization | next module to all-gather ahead |
 | `suggest_skip_reshard(module) -> bool` | optimization | whether to keep storage resident |
-| `reset_round(module)` | trace | end a module's unshard round (per-round dedup); folded into `record_reshard` |
+| `_reset_round(module)` | trace (internal) | clear a module's unshard round; called by `record_reshard` |
 | `complete_trace()` | trace | compile the cycle at the batch boundary |
 | `report()` | diagnostics | replay statistics |
 | `phase`, `is_tracing`, `use_trace_replay` | — | runner state |
