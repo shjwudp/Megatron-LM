@@ -42,6 +42,8 @@ State machine::
 import dataclasses
 from enum import Enum, auto
 
+import torch
+
 # Forward reference; FsdpModule is imported lazily to avoid a cycle.
 from typing import TYPE_CHECKING
 
@@ -144,6 +146,16 @@ class FsdpExecutionRunner:
             of the static order).
         """
         if not self._use_trace_replay:
+            # Default mode: activation recomputation runs forward hooks
+            # inside backward, whose forward-order prefetch must be skipped
+            # (its backward may already be complete and would not reshard the
+            # prefetched successor). Trace-replay mode owns all prefetch
+            # decisions and intentionally skips this check.
+            if getattr(module, "_phase", None) is not None and (
+                module._phase == module.Phase.BACKWARD
+                or torch._C._current_graph_task_id() != -1
+            ):
+                return None
             if orientation == "rowwise":
                 next_module = self._context.forward_order.next_item(module)
             else:

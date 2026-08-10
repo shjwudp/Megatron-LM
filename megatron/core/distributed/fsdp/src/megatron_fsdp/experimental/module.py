@@ -374,16 +374,15 @@ class FsdpModule:
         current_stream.wait_event(self._unshard_event)
         torch.cuda.nvtx.range_pop()
 
-        # Activation recomputation runs forward hooks inside backward. Do not
-        # prefetch the next module in forward order: its backward may already
-        # be complete, so no later backward hook would reshard it.
-        if not is_recomputing:
-            torch.cuda.nvtx.range_push(self._nvtx_label("prefetch"))
-            prefetch = context.runner.consume_and_get_next(self, "rowwise")
-            if prefetch is not None:
-                next_module, next_orientation = prefetch
-                next_module._unshard_parameter_groups(next_orientation)
-            torch.cuda.nvtx.range_pop()
+        # Activation recomputation runs forward hooks inside backward. The
+        # runner skips default-mode prefetch during recompute; in trace-replay
+        # mode it owns all prefetch decisions.
+        torch.cuda.nvtx.range_push(self._nvtx_label("prefetch"))
+        prefetch = context.runner.consume_and_get_next(self, "rowwise")
+        if prefetch is not None:
+            next_module, next_orientation = prefetch
+            next_module._unshard_parameter_groups(next_orientation)
+        torch.cuda.nvtx.range_pop()
 
     def _unshard_parameter_groups(self, orientation: str = "rowwise") -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
@@ -423,18 +422,12 @@ class FsdpModule:
                 (``"rowwise"`` on forward, ``"colwise"`` on backward).
         """
         # This module is now consuming compute; all-gather its parameters and
-        # wait, then record the occurrence on the context-wide runner and
-        # prefetch the traced next consumer. The combined-1F1B + VPP schedule
-        # does not follow the static orders, so the next consumer comes from
-        # the traced execution cycle, not from next_item(). Skip during
-        # recompute, whose forward hooks run inside backward and must not
-        # unshard successors.
+        # wait, then let the runner decide the prefetch target. Trace-replay
+        # mode owns all prefetch decisions (the recompute check is
+        # default-mode logic inside the runner).
         self._unshard_parameter_groups(orientation)
         if self._unshard_event is not None:
             self.context.current_stream().wait_event(self._unshard_event)
-        is_recomputing = self._phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
-        if is_recomputing:
-            return
         prefetch = self.context.runner.consume_and_get_next(self, orientation)
         if prefetch is not None:
             next_module, next_orientation = prefetch
