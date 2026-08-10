@@ -338,7 +338,7 @@ def test_vpp_chunks_reuse_context_on_same_device_only(distributed_setup):
                 pass
         fully_shard(model, mesh=mesh, placements=_flat_placements())
 def test_prefetch_traces_and_replays_actual_consume_order(distributed_setup):
-    """Prefetch should follow the traced 1F1B consume order, not static orders.
+    """The runner should trace batch 1 and replay the actual consume order.
 
     The fine-grained schedule can consume modules in an order that differs
     from forward_order/backward_order (e.g. F L0 -> B L2 -> F L1). The first
@@ -355,30 +355,30 @@ def test_prefetch_traces_and_replays_actual_consume_order(distributed_setup):
         fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
 
     layers = model.layers
-    ctx = model.context
+    runner = model.context.runner
+    assert runner.is_tracing
 
     # Batch 1 (trace): consume in schedule order F L0, B L2, F L1. No
     # prefetch during tracing.
-    assert ctx.record_consume_or_next_replay(layers[0], "rowwise") is None
-    assert ctx.record_consume_or_next_replay(layers[2], "colwise") is None
-    assert ctx.record_consume_or_next_replay(layers[1], "rowwise") is None
-    assert ctx._trace_history == [
-        (layers[0], "rowwise"),
-        (layers[2], "colwise"),
-        (layers[1], "rowwise"),
-    ]
+    assert runner.record_consume(layers[0], "rowwise") is None
+    assert runner.record_consume(layers[2], "colwise") is None
+    assert runner.record_consume(layers[1], "rowwise") is None
+    assert runner.is_tracing
+
+    # Batch boundary compiles the trace into the replay cycle.
+    runner.complete_trace()
+    assert not runner.is_tracing
 
     # Batch 2 (replay): consume in the same order; each call returns the
     # traced next consumer (with wrap-around at the batch boundary).
-    assert ctx.record_consume_or_next_replay(layers[0], "rowwise") is layers[2]
-    assert ctx.record_consume_or_next_replay(layers[2], "colwise") is layers[1]
-    assert ctx.record_consume_or_next_replay(layers[1], "rowwise") is layers[0]
-    assert ctx._replay_index == 0
+    assert runner.record_consume(layers[0], "rowwise") is layers[2]
+    assert runner.next_prefetch_orientation() == "colwise"
+    assert runner.record_consume(layers[2], "colwise") is layers[1]
+    assert runner.record_consume(layers[1], "rowwise") is layers[0]
 
     # Divergence re-traces from the mismatching occurrence.
-    assert ctx.record_consume_or_next_replay(layers[0], "rowwise") is None
-    assert ctx._trace_history == [(layers[0], "rowwise")]
-    assert ctx._replay_index == 0
+    assert runner.record_consume(layers[0], "colwise") is None
+    assert runner.is_tracing
 
 
 def test_prefetch_releases_stale_unconsumed_modules(distributed_setup):
@@ -401,10 +401,11 @@ def test_prefetch_releases_stale_unconsumed_modules(distributed_setup):
     layers = model.layers
     ctx = model.context
 
-    # Trace batch: L0 -> L2 -> L1.
-    ctx.record_consume_or_next_replay(layers[0], "rowwise")
-    ctx.record_consume_or_next_replay(layers[2], "colwise")
-    ctx.record_consume_or_next_replay(layers[1], "rowwise")
+    # Trace batch: L0 -> L2 -> L1, then compile.
+    ctx.runner.record_consume(layers[0], "rowwise")
+    ctx.runner.record_consume(layers[2], "colwise")
+    ctx.runner.record_consume(layers[1], "rowwise")
+    ctx.runner.complete_trace()
 
     # Replay batch: consume L0, prefetch L2 (traced successor).
     layers[0].unshard_parameters()

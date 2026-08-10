@@ -759,6 +759,16 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 gradient reduction is complete when backward returns."""
 
+    def complete_fsdp_trace(self) -> None:
+        """Mark the global-batch boundary for the execution-order runner.
+
+        Called by the training loop after each optimizer step so the runner
+        compiles the traced fine-grained consume cycle and, from the second
+        global batch, replays it to prefetch the true next consumer under the
+        combined-1F1B + VPP schedule.
+        """
+        self.module.context.runner.complete_trace()
+
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""
 

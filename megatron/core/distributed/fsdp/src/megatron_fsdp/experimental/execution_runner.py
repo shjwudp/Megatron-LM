@@ -1,0 +1,157 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Execution-order tracer and prefetch planner for fine-grained FSDP.
+
+The combined-1F1B + VPP schedule is occurrence-based: the same FSDP unit can
+be consumed in forward and backward, model chunks interleave, and
+warmup/steady/cooldown differ per pipeline rank. The static
+``forward_order`` / ``backward_order`` sequences cannot express that runtime
+path, so a per-context runner records the actual unshard consume sequence
+during the first global batch and replays it from the second batch to drive
+prefetch of the true next consumer.
+
+State machine::
+
+    TRACING --(complete_trace)--> REPLAYING --(divergence)--> TRACING
+       ^                                                          |
+       +----------------------(complete_trace)--------------------+
+
+- ``TRACING``: every consume occurrence is appended to the trace; no
+  prefetch is issued. The caller (the training loop) calls
+  ``complete_trace()`` once per global batch boundary; the first batch
+  compiles the trace into the replay cycle.
+- ``REPLAYING``: each consume occurrence is validated against the traced
+  cycle; the following occurrence (wrapping around at the batch boundary)
+  is returned for prefetch. A mismatch clears the cycle and returns to
+  ``TRACING``, degrading to demand-only execution until a full cycle
+  matches again.
+"""
+
+import dataclasses
+from enum import Enum, auto
+
+# Forward reference; FsdpModule is imported lazily to avoid a cycle.
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .module import FsdpModule
+
+
+class RunnerPhase(Enum):
+    """Lifecycle phase of an :class:`FsdpExecutionRunner`."""
+
+    TRACING = auto()
+    REPLAYING = auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class ConsumeOccurrence:
+    """One fine-grained parameter consumption.
+
+    Attributes:
+        module: The FSDP module whose full parameters are consumed.
+        orientation: Payload orientation (``"rowwise"`` on forward,
+            ``"colwise"`` on backward).
+    """
+
+    module: "FsdpModule"
+    orientation: str
+
+
+class FsdpExecutionRunner:
+    """Record the fine-grained consume order and plan prefetches.
+
+    The runner is owned by an :class:`FsdpContext` and driven by the
+    fine-grained unshard entry point (``FsdpModule.unshard_parameters``)
+    plus the global-batch boundary signaled by the training loop. It never
+    decides compute order — it only observes occurrences and, during
+    replay, suggests which module to all-gather next.
+    """
+
+    def __init__(self) -> None:
+        """Create a runner in the tracing phase."""
+        self._phase = RunnerPhase.TRACING
+        self._trace: list[ConsumeOccurrence] = []
+        self._replay_index = 0
+        self._cycles_observed = 0
+
+    @property
+    def phase(self) -> RunnerPhase:
+        """Current runner phase."""
+        return self._phase
+
+    @property
+    def is_tracing(self) -> bool:
+        """Whether the runner is recording a fresh cycle."""
+        return self._phase is RunnerPhase.TRACING
+
+    def complete_trace(self) -> None:
+        """Compile the recorded trace into the replay cycle.
+
+        Called by the training loop at every global-batch boundary. The
+        first batch (with a non-empty trace) transitions to ``REPLAYING``;
+        subsequent calls reset the replay cursor for the next batch while
+        keeping the compiled cycle.
+        """
+        if self._phase is RunnerPhase.TRACING and self._trace:
+            self._phase = RunnerPhase.REPLAYING
+        self._replay_index = 0
+        if self._phase is RunnerPhase.REPLAYING:
+            self._cycles_observed += 1
+
+    def record_consume(self, module: "FsdpModule", orientation: str) -> "FsdpModule | None":
+        """Record (tracing) or validate (replay) one consume occurrence.
+
+        Args:
+            module: The FSDP module being consumed by compute.
+            orientation: Payload orientation (``"rowwise"`` forward,
+                ``"colwise"`` backward).
+
+        Returns:
+            During replay, the module to prefetch next (the traced successor,
+            with the orientation recorded for that occurrence), or ``None``
+            while tracing or after a divergence re-trace.
+        """
+        if self._phase is RunnerPhase.TRACING:
+            self._trace.append(ConsumeOccurrence(module=module, orientation=orientation))
+            return None
+
+        expected = self._trace[self._replay_index]
+        if expected.module is not module or expected.orientation != orientation:
+            # Schedule diverged from the trace (e.g. batch-size or topology
+            # change). Re-trace from this occurrence; prefetch stays disabled
+            # until a full cycle matches again.
+            self._retrace(module, orientation)
+            return None
+
+        self._replay_index = (self._replay_index + 1) % len(self._trace)
+        return self._trace[self._replay_index].module
+
+    def next_prefetch_orientation(self) -> str | None:
+        """Return the orientation recorded for the current replay successor.
+
+        Only meaningful immediately after ``record_consume`` returned a
+        module; the returned orientation matches that successor's occurrence.
+        """
+        if not self._trace:
+            return None
+        return self._trace[self._replay_index].orientation
+
+    def _retrace(self, module: "FsdpModule", orientation: str) -> None:
+        """Reset to tracing and seed the new trace with the current occurrence."""
+        self._phase = RunnerPhase.TRACING
+        self._trace = [ConsumeOccurrence(module=module, orientation=orientation)]
+        self._replay_index = 0
+        self._cycles_observed = 0
