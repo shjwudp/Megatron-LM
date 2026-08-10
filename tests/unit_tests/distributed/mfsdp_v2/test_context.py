@@ -600,9 +600,9 @@ def test_unshard_records_one_consume_per_module_per_pass(distributed_setup):
     """Repeated fine-grained hooks on one module record a single consume.
 
     The 1F1B schedule fires one unshard hook per sub-module (dense, experts),
-    so the same FsdpModule can be unsharded several times within a pass. Only
-    the first call (after reshard) is a real consume for the runner; later
-    calls must not advance the trace or the replay validation diverges.
+    so the same FsdpModule can be unsharded several times within a pass. The
+    runner dedups them (first call records, later calls are no-ops) and
+    reset_pass() re-enables recording after a reshard.
     """
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -617,10 +617,12 @@ def test_unshard_records_one_consume_per_module_per_pass(distributed_setup):
     runner = model.context.runner
 
     # Batch 1: each layer consumes once via unshard_parameters. Repeated
-    # calls (extra sub-module hooks) must be no-ops for the trace.
+    # calls (extra sub-module hooks) must be no-ops for the trace, and
+    # reset_pass() (the reshard) allows the next pass to record again.
     for layer in layers:
         layer.unshard_parameters()
         layer.unshard_parameters()  # duplicate hook — must not record again
+        layer._reshard_parameter_groups()  # simulate post-forward reshard
     runner.complete_trace()
     assert len(runner._trace) == len(layers)
     assert [occ.module for occ in runner._trace] == list(layers)

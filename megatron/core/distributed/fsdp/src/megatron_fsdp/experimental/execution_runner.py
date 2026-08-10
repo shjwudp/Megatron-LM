@@ -111,6 +111,11 @@ class FsdpExecutionRunner:
         self._trace: list[ConsumeOccurrence] = []
         self._replay_index = 0
         self._cycles_observed = 0
+        # Modules consumed in the current pass. The fine-grained schedule
+        # fires one hook per sub-module (dense, experts), so the same module
+        # can call consume_and_get_next several times within a pass; only the
+        # first call is a real consume for the trace. Cleared on reshard.
+        self._consumed_this_pass: set[FsdpModule] = set()
         # Diagnostics: how many occurrences were validated during replay, how
         # many diverged (re-trace), and how many complete_trace calls ran.
         self._replayed_occurrences = 0
@@ -158,7 +163,21 @@ class FsdpExecutionRunner:
         if not self._use_trace_replay:
             return self._static_successor(module, orientation)
 
+        # Dedup: the fine-grained schedule fires one hook per sub-module
+        # (dense, experts), so the same module can arrive several times
+        # within a pass. Only the first arrival is a real consume.
+        if module in self._consumed_this_pass:
+            return None
+        self._consumed_this_pass.add(module)
         return self._replay_successor(module, orientation)
+
+    def reset_pass(self, module: "FsdpModule") -> None:
+        """Mark ``module`` as available for a new consume after its reshard.
+
+        Called by the module when its unsharded storage is released, so the
+        next hook of the following pass records a fresh consume.
+        """
+        self._consumed_this_pass.discard(module)
 
     def _static_successor(
         self, module: "FsdpModule", orientation: str
