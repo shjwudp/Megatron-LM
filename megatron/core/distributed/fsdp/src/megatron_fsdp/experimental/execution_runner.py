@@ -222,7 +222,9 @@ class FsdpExecutionRunner:
         """
         if not self._use_trace_replay:
             return self._static_successor(module, orientation)
-        if not self._trace or self._phase is RunnerPhase.TRACING:
+        # Tracing and divergence (re-trace) both disable prefetch; only a
+        # validated replay cycle suggests a prefetch target.
+        if self._phase is not RunnerPhase.REPLAYING or not self._trace:
             return None
         for i in range(len(self._trace)):
             event = self._trace[(self._replay_index + i) % len(self._trace)]
