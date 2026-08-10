@@ -337,20 +337,23 @@ def test_vpp_chunks_reuse_context_on_same_device_only(distributed_setup):
             with fully_shard_context(device=torch.device("cpu"), reuse_existing=True):
                 pass
         fully_shard(model, mesh=mesh, placements=_flat_placements())
-
-
 def test_prefetch_releases_stale_unconsumed_modules(distributed_setup):
     """Unshard should release prefetched modules the schedule never consumes.
 
     The fine-grained 1F1B schedule does not follow the static orders, so a
     prefetched successor may never be executed. The prefetch trace must
-    reshard such stale modules instead of accumulating unsharded storage.
+    reshard such stale modules instead of accumulating unsharded storage,
+    while the consuming module and the newly prefetched successor stay
+    materialized.
     """
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=3).to(device)
 
+    # Each layer is its own FsdpModule so the context order spans all of them.
     with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
         fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
 
     layers = model.layers
@@ -359,14 +362,23 @@ def test_prefetch_releases_stale_unconsumed_modules(distributed_setup):
 
     # layer 0 consumes and prefetches layer 1 (forward order).
     layers[0].unshard_parameters()
-    assert list(root.context._prefetched_modules) == [layers[1]]
+    assert root.context._prefetched_modules == {layers[1]}
+    assert layers[0]._unshard_event is not None
 
     # layer 2 consumes next; layer 1 was prefetched but is skipped by the
     # schedule, so it must be resharded (released) and removed from the trace.
     layers[2].unshard_parameters()
-    assert root.context._prefetched_modules == {layers[2]}
     assert layers[1]._unshard_event is None
+    assert layers[1] not in root.context._prefetched_modules
 
-    # The consumer itself stays unsharded and out of the prefetch trace.
+    # The consumers stay unsharded and out of the prefetch trace.
     assert layers[0]._unshard_event is not None
-    assert root.context._prefetched_modules == {layers[2]}
+    assert layers[2]._unshard_event is not None
+    assert layers[0] not in root.context._prefetched_modules
+    assert layers[2] not in root.context._prefetched_modules
+
+    # layer 1 re-consumes after the skip: prefetch trace drops it again and
+    # only tracks the next successor.
+    layers[1].unshard_parameters()
+    assert layers[1]._unshard_event is not None
+    assert layers[1] not in root.context._prefetched_modules
