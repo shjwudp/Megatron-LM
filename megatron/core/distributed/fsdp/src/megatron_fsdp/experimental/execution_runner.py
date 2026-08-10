@@ -18,9 +18,19 @@ The combined-1F1B + VPP schedule is occurrence-based: the same FSDP unit can
 be consumed in forward and backward, model chunks interleave, and
 warmup/steady/cooldown differ per pipeline rank. The static
 ``forward_order`` / ``backward_order`` sequences cannot express that runtime
-path, so a per-context runner records the actual unshard consume sequence
-during the first global batch and replays it from the second batch to drive
-prefetch of the true next consumer.
+path, so a per-context runner traces the real execution and replays it to
+drive prefetch.
+
+Two cooperating paths:
+
+- **Trace path**: during the first global batch, every fine-grained
+  execution event (consume, reshard) is recorded in actual order. No
+  prefetch is issued and no reshard is optimized away.
+- **Optimization path**: from the second batch, each real op is validated
+  against the traced cycle and translated into optimization directives:
+  a prefetch target after an unshard, and a skip-reshard decision when the
+  traced schedule re-unshards the same module with the same orientation
+  immediately.
 
 State machine::
 
@@ -28,25 +38,29 @@ State machine::
        ^                                                          |
        +----------------------(complete_trace)--------------------+
 
-- ``TRACING``: every consume occurrence is appended to the trace; no
-  prefetch is issued. The caller (the training loop) calls
-  ``complete_trace()`` once per global batch boundary; the first batch
-  compiles the trace into the replay cycle.
-- ``REPLAYING``: each consume occurrence is validated against the traced
-  cycle; the following occurrence (wrapping around at the batch boundary)
-  is returned for prefetch. A mismatch clears the cycle and returns to
-  ``TRACING``, degrading to demand-only execution until a full cycle
-  matches again.
+Four per-op interfaces:
+
+- ``record_unshard(module, orientation)`` / ``record_reshard(module)``:
+  trace path — record the real event, or during replay validate it against
+  the traced cycle and advance the cursor.
+- ``suggest_prefetch()``: optimization path — the next traced unshard
+  (skipping reshard events) to all-gather ahead, or ``None`` while tracing.
+- ``suggest_skip_reshard(module)``: optimization path — whether this reshard
+  can be skipped because the next traced unshard reuses the same module and
+  orientation, keeping the storage resident.
+- ``reset_round(module)``: mark the consume round over (called on reshard) so
+  the next pass records a fresh consume; per-pass dedup for the fine-grained
+  per-sub-module hooks.
 """
 
 import dataclasses
 import logging
 from enum import Enum, auto
 
-import torch
-
 # Forward reference; FsdpModule is imported lazily to avoid a cycle.
 from typing import TYPE_CHECKING
+
+import torch
 
 if TYPE_CHECKING:
     from .module import FsdpModule
@@ -61,40 +75,37 @@ class RunnerPhase(Enum):
     REPLAYING = auto()
 
 
+class EventKind(Enum):
+    """Kind of an execution event on the trace path."""
+
+    UNSHARD = auto()
+    RESHARD = auto()
+
+
 @dataclasses.dataclass(frozen=True)
-class ConsumeOccurrence:
-    """One fine-grained parameter consumption.
+class RunnerEvent:
+    """One fine-grained execution event.
 
     Attributes:
-        module: The FSDP module whose full parameters are consumed.
-        orientation: Payload orientation (``"rowwise"`` on forward,
-            ``"colwise"`` on backward).
+        kind: Whether the module's parameters are consumed or resharded.
+        module: The FSDP module the event applies to.
+        orientation: Payload orientation (``"rowwise"`` forward,
+            ``"colwise"`` backward); ``None`` for reshard events.
     """
 
+    kind: EventKind
     module: "FsdpModule"
-    orientation: str
+    orientation: str | None = None
 
 
 class FsdpExecutionRunner:
-    """Record the fine-grained consume order and plan prefetches.
+    """Record the fine-grained execution and plan prefetches.
 
     The runner is owned by an :class:`FsdpContext` and driven by the
-    fine-grained unshard entry point (``FsdpModule.unshard_parameters``)
-    plus the global-batch boundary signaled by the training loop. It never
-    decides compute order — it only observes occurrences and, during
-    replay, suggests which module to all-gather next.
-
-    Two prefetch modes are hidden behind one API:
-
-    - Default (``use_trace_replay=False``): normal forward/backward
-      execution is assumed. ``consume_and_get_next`` returns the static
-      ``forward_order`` / ``backward_order`` successor and the runner
-      stays idle.
-    - Trace-replay (``use_trace_replay=True``): required for complex
-      schedules such as VPP + combined 1F1B whose execution does not
-      follow the static orders. The first global batch is traced and
-      replayed from the second batch; ``consume_and_get_next`` returns
-      the traced successor with its recorded orientation.
+    fine-grained unshard/reshard entry points plus the global-batch boundary
+    signaled by the training loop. It never decides compute order — it only
+    observes events and, during replay, suggests what to prefetch and which
+    reshards to skip.
     """
 
     def __init__(self, context, *, use_trace_replay: bool = False) -> None:
@@ -108,16 +119,20 @@ class FsdpExecutionRunner:
         self._context = context
         self._use_trace_replay = use_trace_replay
         self._phase = RunnerPhase.TRACING
-        self._trace: list[ConsumeOccurrence] = []
+        self._trace: list[RunnerEvent] = []
         self._replay_index = 0
         self._cycles_observed = 0
-        # Modules consumed in the current pass. The fine-grained schedule
+        # Modules consumed in the current round. The fine-grained schedule
         # fires one hook per sub-module (dense, experts), so the same module
-        # can call consume_and_get_next several times within a pass; only the
-        # first call is a real consume for the trace. Cleared on reshard.
-        self._consumed_this_pass: set[FsdpModule] = set()
-        # Diagnostics: how many occurrences were validated during replay, how
-        # many diverged (re-trace), and how many complete_trace calls ran.
+        # can be recorded several times within a round; only the first is a
+        # real unshard. Cleared by reset_round() on reshard.
+        self._consumed_this_round: set[FsdpModule] = set()
+        # Orientation of each module's most recent consume during replay,
+        # used to decide whether a reshard can be skipped (storage only needs
+        # to stay resident for an immediate same-orientation re-unshard).
+        self._last_orientation: dict[FsdpModule, str] = {}
+        # Diagnostics: how many events were validated during replay, how many
+        # diverged (re-trace), and how many complete_trace calls ran.
         self._replayed_occurrences = 0
         self._divergences = 0
         self._complete_trace_calls = 0
@@ -139,45 +154,172 @@ class FsdpExecutionRunner:
         """Whether trace-and-replay prefetch is enabled."""
         return self._use_trace_replay
 
-    def consume_and_get_next(
-        self, module: "FsdpModule", orientation: str
-    ) -> tuple["FsdpModule", str] | None:
-        """Record/validate a consume and return the module to prefetch next.
+    # ------------------------------------------------------------------
+    # Interface 1: record execution events (consume, reshard)
+    # ------------------------------------------------------------------
 
-        Unified prefetch API used by every unshard entry point
-        (``pre_forward``, ``pre_backward``, ``unshard_parameters``). In
-        default mode it resolves the static-order successor; in
-        trace-replay mode it records the occurrence (tracing) or validates
-        and returns the traced successor (replay).
+    def record_unshard(self, module: "FsdpModule", orientation: str) -> None:
+        """Record (tracing) or validate (replay) an unshard event.
+
+        The fine-grained schedule fires one hook per sub-module (dense,
+        experts), so the same module can arrive several times within a round;
+        only the first arrival is a real unshard for the trace. Call
+        ``suggest_prefetch()`` right after this returns to get the prefetch
+        target (replay only).
 
         Args:
-            module: The FSDP module being consumed by compute.
+            module: The FSDP module being unsharded for compute.
+            orientation: Payload orientation (``"rowwise"`` forward,
+                ``"colwise"`` backward).
+        """
+        if not self._use_trace_replay:
+            return
+        if module in self._consumed_this_round:
+            return
+        self._consumed_this_round.add(module)
+        self._last_orientation[module] = orientation
+        self._validate_and_advance(EventKind.UNSHARD, module, orientation)
+
+    def record_reshard(self, module: "FsdpModule") -> None:
+        """Record (tracing) or validate (replay) a reshard event.
+
+        Call ``suggest_skip_reshard(module)`` right after this returns to
+        learn whether the actual reshard can be skipped (replay only).
+
+        Args:
+            module: The FSDP module whose unsharded storage is released.
+        """
+        if not self._use_trace_replay:
+            return
+        self._validate_and_advance(EventKind.RESHARD, module, None)
+
+    # ------------------------------------------------------------------
+    # Interface 2: prefetch suggestion
+    # ------------------------------------------------------------------
+
+    def suggest_prefetch(
+        self, module: "FsdpModule", orientation: str
+    ) -> tuple["FsdpModule", str] | None:
+        """Return the next module to all-gather ahead of this unshard.
+
+        In default mode, resolves the static ``forward_order`` /
+        ``backward_order`` successor. In trace-replay mode, returns the next
+        traced unshard (skipping reshard events) with its recorded
+        orientation.
+
+        Args:
+            module: The FSDP module just unsharded for compute.
             orientation: Payload orientation (``"rowwise"`` forward,
                 ``"colwise"`` backward).
 
         Returns:
-            ``(next_module, next_orientation)`` to prefetch, or ``None``
-            when there is no successor (tracing batch, divergence, or end
-            of the static order).
+            ``(module, orientation)`` to prefetch, or ``None`` while tracing,
+            after a divergence, or at the end of the static order.
         """
         if not self._use_trace_replay:
             return self._static_successor(module, orientation)
-
-        # Dedup: the fine-grained schedule fires one hook per sub-module
-        # (dense, experts), so the same module can arrive several times
-        # within a pass. Only the first arrival is a real consume.
-        if module in self._consumed_this_pass:
+        if not self._trace or self._phase is RunnerPhase.TRACING:
             return None
-        self._consumed_this_pass.add(module)
-        return self._replay_successor(module, orientation)
+        for i in range(len(self._trace)):
+            event = self._trace[(self._replay_index + i) % len(self._trace)]
+            if event.kind is EventKind.UNSHARD:
+                return event.module, event.orientation
+        return None
 
-    def reset_pass(self, module: "FsdpModule") -> None:
-        """Mark ``module`` as available for a new consume after its reshard.
+    # ------------------------------------------------------------------
+    # Interface 3: reshard-skip suggestion
+    # ------------------------------------------------------------------
+
+    def suggest_skip_reshard(self, module: "FsdpModule") -> bool:
+        """Return whether the reshard of ``module`` can be skipped.
+
+        The optimization path: if the traced schedule immediately re-unshards
+        the same module with the same orientation right after this reshard,
+        the reshard is unnecessary — the storage can stay resident and the
+        following all-gather can be skipped. Returns whether to skip the
+        reshard.
+
+        Args:
+            module: The FSDP module whose unsharded storage is released.
+
+        Returns:
+            True to skip the actual reshard (keep storage resident), False to
+            reshard normally.
+        """
+        if not self._use_trace_replay or self._phase is RunnerPhase.TRACING:
+            return False
+        if not self._trace:
+            return False
+        next_event = self._trace[self._replay_index]
+        return (
+            next_event.kind is EventKind.UNSHARD
+            and next_event.module is module
+            and next_event.orientation == self._last_orientation.get(module)
+        )
+
+    # ------------------------------------------------------------------
+    # Interface 4: round lifecycle
+    # ------------------------------------------------------------------
+
+    def reset_round(self, module: "FsdpModule") -> None:
+        """End the unshard round for ``module`` after its reshard.
 
         Called by the module when its unsharded storage is released, so the
-        next hook of the following pass records a fresh consume.
+        next hook of the following round records a fresh unshard (per-round
+        dedup).
         """
-        self._consumed_this_pass.discard(module)
+        self._consumed_this_round.discard(module)
+
+    # ------------------------------------------------------------------
+    # Lifecycle: batch boundary
+    # ------------------------------------------------------------------
+
+    def complete_trace(self) -> None:
+        """Compile the recorded trace into the replay cycle.
+
+        Called by the training loop at every global-batch boundary. The
+        first batch (with a non-empty trace) transitions to ``REPLAYING``;
+        subsequent calls reset the replay cursor for the next batch while
+        keeping the compiled cycle.
+        """
+        self._complete_trace_calls += 1
+        if self._phase is RunnerPhase.TRACING and self._trace:
+            self._phase = RunnerPhase.REPLAYING
+            logger.info(
+                "FsdpExecutionRunner: compiled %d-event trace, entering replay.",
+                len(self._trace),
+            )
+        self._replay_index = 0
+        if self._phase is RunnerPhase.REPLAYING:
+            self._cycles_observed += 1
+        # Log every few batches so a training run shows whether replay is
+        # actually validating events or stuck re-tracing.
+        if self._complete_trace_calls % 10 == 0:
+            self.report()
+
+    def report(self) -> None:
+        """Log the runner's replay statistics.
+
+        A healthy runner shows ``cycles_observed`` increasing with every
+        batch and ``replayed_occurrences`` much larger than ``divergences``.
+        A runner that never replays (e.g. no complete_trace call, or a
+        permanent divergence loop) is visible from this summary.
+        """
+        if self._use_trace_replay:
+            logger.info(
+                "FsdpExecutionRunner: phase=%s trace_len=%d cycles_observed=%d "
+                "replayed_occurrences=%d divergences=%d complete_trace_calls=%d",
+                self._phase.name,
+                len(self._trace),
+                self._cycles_observed,
+                self._replayed_occurrences,
+                self._divergences,
+                self._complete_trace_calls,
+            )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     def _static_successor(
         self, module: "FsdpModule", orientation: str
@@ -202,84 +344,42 @@ class FsdpExecutionRunner:
             return None
         return next_module, orientation
 
-    def _replay_successor(
-        self, module: "FsdpModule", orientation: str
-    ) -> tuple["FsdpModule", str] | None:
-        """Trace-replay mode: validate the occurrence and return the traced next."""
-        next_module = self._record_consume(module, orientation)
-        if next_module is None:
-            return None
-        return next_module, self._next_prefetch_orientation()
+    def _validate_and_advance(
+        self,
+        kind: EventKind,
+        module: "FsdpModule",
+        orientation: str | None,
+    ) -> None:
+        """Trace (append) or validate-and-advance (replay) one event.
 
-    def complete_trace(self) -> None:
-        """Compile the recorded trace into the replay cycle.
-
-        Called by the training loop at every global-batch boundary. The
-        first batch (with a non-empty trace) transitions to ``REPLAYING``;
-        subsequent calls reset the replay cursor for the next batch while
-        keeping the compiled cycle.
-        """
-        self._complete_trace_calls += 1
-        if self._phase is RunnerPhase.TRACING and self._trace:
-            self._phase = RunnerPhase.REPLAYING
-            logger.info(
-                "FsdpExecutionRunner: compiled %d-occurrence trace, entering replay.",
-                len(self._trace),
-            )
-        self._replay_index = 0
-        if self._phase is RunnerPhase.REPLAYING:
-            self._cycles_observed += 1
-        # Log every few batches so a training run shows whether replay is
-        # actually validating occurrences or stuck re-tracing.
-        if self._complete_trace_calls % 10 == 0:
-            self.report()
-
-    def report(self) -> None:
-        """Log the runner's replay statistics.
-
-        A healthy runner shows ``cycles_observed`` increasing with every
-        batch and ``replayed_occurrences`` much larger than ``divergences``.
-        A runner that never replays (e.g. no complete_trace call, or a
-        permanent divergence loop) is visible from this summary.
-        """
-        if self._use_trace_replay:
-            logger.info(
-                "FsdpExecutionRunner: phase=%s trace_len=%d cycles_observed=%d "
-                "replayed_occurrences=%d divergences=%d complete_trace_calls=%d",
-                self._phase.name,
-                len(self._trace),
-                self._cycles_observed,
-                self._replayed_occurrences,
-                self._divergences,
-                self._complete_trace_calls,
-            )
-
-    def _record_consume(self, module: "FsdpModule", orientation: str) -> "FsdpModule | None":
-        """Record (tracing) or validate (replay) one consume occurrence.
+        The trace path records the real op stream (consume/reshard). During
+        replay each real op is validated against the traced event at the
+        current position; on success the cursor advances. A mismatch is a
+        divergence: the trace is cleared and re-traced from this event,
+        degrading to demand-only execution until a full cycle matches again.
 
         Args:
-            module: The FSDP module being consumed by compute.
-            orientation: Payload orientation (``"rowwise"`` forward,
-                ``"colwise"`` backward).
-
-        Returns:
-            During replay, the module to prefetch next (the traced successor,
-            with the orientation recorded for that occurrence), or ``None``
-            while tracing or after a divergence re-trace.
+            kind: Expected event kind.
+            module: The FSDP module the real op applies to.
+            orientation: Expected orientation (``None`` for reshard).
         """
         if self._phase is RunnerPhase.TRACING:
-            self._trace.append(ConsumeOccurrence(module=module, orientation=orientation))
-            return None
+            self._trace.append(RunnerEvent(kind=kind, module=module, orientation=orientation))
+            return
 
         expected = self._trace[self._replay_index]
-        if expected.module is not module or expected.orientation != orientation:
+        if (
+            expected.kind is not kind
+            or expected.module is not module
+            or expected.orientation != orientation
+        ):
             # Schedule diverged from the trace (e.g. batch-size or topology
-            # change). Re-trace from this occurrence; prefetch stays disabled
+            # change). Re-trace from this event; prefetch stays disabled
             # until a full cycle matches again.
             self._divergences += 1
             logger.warning(
                 "FsdpExecutionRunner: replay divergence at index %d: expected %s(%s), "
-                "got %s(%s). Re-tracing from this occurrence (divergence #%d).",
+                "got %s(%s). Re-tracing from this event (divergence #%d).",
                 self._replay_index,
                 getattr(expected.module, "_name", None) or type(expected.module).__name__,
                 expected.orientation,
@@ -287,26 +387,20 @@ class FsdpExecutionRunner:
                 orientation,
                 self._divergences,
             )
-            self._retrace(module, orientation)
-            return None
+            self._retrace(kind, module, orientation)
+            return
 
         self._replayed_occurrences += 1
         self._replay_index = (self._replay_index + 1) % len(self._trace)
-        return self._trace[self._replay_index].module
 
-    def _next_prefetch_orientation(self) -> str | None:
-        """Return the orientation recorded for the current replay successor.
-
-        Only meaningful immediately after ``_record_consume`` returned a
-        module; the returned orientation matches that successor's occurrence.
-        """
-        if not self._trace:
-            return None
-        return self._trace[self._replay_index].orientation
-
-    def _retrace(self, module: "FsdpModule", orientation: str) -> None:
-        """Reset to tracing and seed the new trace with the current occurrence."""
+    def _retrace(
+        self,
+        kind: EventKind,
+        module: "FsdpModule",
+        orientation: str | None,
+    ) -> None:
+        """Reset to tracing and seed the new trace with the current event."""
         self._phase = RunnerPhase.TRACING
-        self._trace = [ConsumeOccurrence(module=module, orientation=orientation)]
+        self._trace = [RunnerEvent(kind=kind, module=module, orientation=orientation)]
         self._replay_index = 0
         self._cycles_observed = 0

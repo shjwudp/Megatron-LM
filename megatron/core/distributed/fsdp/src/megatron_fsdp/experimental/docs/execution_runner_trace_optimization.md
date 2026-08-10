@@ -152,9 +152,11 @@ Public API of `FsdpExecutionRunner` (owned by `FsdpContext`):
 
 | Method | Path | Purpose |
 |---|---|---|
-| `consume_and_get_next(module, orientation)` | both | consume directive + prefetch target |
-| `reshard(module) -> bool` | optimization | skip-reshard directive |
-| `reset_pass(module)` | trace | re-enable a fresh consume after reshard |
+| `record_unshard(module, orientation)` | trace | record/validate an unshard event |
+| `record_reshard(module)` | trace | record/validate a reshard event |
+| `suggest_prefetch(module, orientation)` | optimization | next module to all-gather ahead |
+| `suggest_skip_reshard(module) -> bool` | optimization | whether to keep storage resident |
+| `reset_round(module)` | trace | end the unshard round (per-round dedup) |
 | `complete_trace()` | trace | compile the cycle at the batch boundary |
 | `report()` | diagnostics | replay statistics |
 | `phase`, `is_tracing`, `use_trace_replay` | — | runner state |
@@ -162,16 +164,19 @@ Public API of `FsdpExecutionRunner` (owned by `FsdpContext`):
 `FsdpModule` integration:
 
 ```python
-# unshard_parameters (consume entry point)
-prefetch = self.context.runner.consume_and_get_next(self, orientation)
+# unshard_parameters (unshard entry point)
+self.context.runner.record_unshard(self, orientation)
+prefetch = self.context.runner.suggest_prefetch(self, orientation)
 if prefetch is not None:
     next_module, next_orientation = prefetch
     next_module._unshard_parameter_groups(next_orientation)
 
 # _reshard_parameter_groups (release entry point)
-self.context.runner.reset_pass(self)
-if self.context.runner.reshard(self):
+self.context.runner.record_reshard(self)
+if self.context.runner.suggest_skip_reshard(self):
+    self.context.runner.reset_round(self)
     return  # storage stays resident
+self.context.runner.reset_round(self)
 for group in self._parameter_groups:
     group.reshard_parameters()
 ... # release storage on the all-gather stream
@@ -184,7 +189,7 @@ for group in self._parameter_groups:
 - **Reshard skip** is safe only for an immediate same-module,
   same-orientation re-consume, so the materialized payload is always the one
   the next compute reads.
-- **Dedup** (`_consumed_this_pass`) keeps the trace at one consume per module
+- **Dedup** (`_consumed_this_round`) keeps the trace at one consume per module
   per pass despite per-sub-module hooks; `reset_pass` is called on reshard so
   the next pass records a fresh consume.
 - **Memory** is bounded: skipping a reshard keeps at most one extra module's

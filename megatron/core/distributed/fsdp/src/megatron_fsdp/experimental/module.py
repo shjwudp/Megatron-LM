@@ -370,10 +370,11 @@ class FsdpModule:
         torch.cuda.nvtx.range_pop()
 
         # Activation recomputation runs forward hooks inside backward. The
-        # runner skips default-mode prefetch during recompute; in trace-replay
-        # mode it owns all prefetch decisions.
+        # runner decides the prefetch target: static-order successor in
+        # default mode, traced next consumer in trace-replay mode.
         torch.cuda.nvtx.range_push(self._nvtx_label("prefetch"))
-        prefetch = context.runner.consume_and_get_next(self, "rowwise")
+        context.runner.record_unshard(self, "rowwise")
+        prefetch = context.runner.suggest_prefetch(self, "rowwise")
         if prefetch is not None:
             next_module, next_orientation = prefetch
             next_module._unshard_parameter_groups(next_orientation)
@@ -424,7 +425,8 @@ class FsdpModule:
         self._unshard_parameter_groups(orientation)
         if self._unshard_event is not None:
             self.context.current_stream().wait_event(self._unshard_event)
-        prefetch = self.context.runner.consume_and_get_next(self, orientation)
+        self.context.runner.record_unshard(self, orientation)
+        prefetch = self.context.runner.suggest_prefetch(self, orientation)
         if prefetch is not None:
             next_module, next_orientation = prefetch
             next_module._unshard_parameter_groups(next_orientation)
@@ -444,9 +446,15 @@ class FsdpModule:
         """Reshard parameter groups and release unsharded storage after compute.
 
         This method clears ``_unshard_event`` after queuing the release, so
-        future users enqueue a fresh all-gather.
+        future users enqueue a fresh all-gather. In trace-replay mode the
+        runner may decide the storage can stay resident (immediate same-
+        orientation re-consume), skipping the release entirely.
         """
-        self.context.runner.reset_pass(self)
+        self.context.runner.record_reshard(self)
+        if self.context.runner.suggest_skip_reshard(self):
+            self.context.runner.reset_round(self)
+            return
+        self.context.runner.reset_round(self)
         for group in self._parameter_groups:
             group.reshard_parameters()
 
@@ -499,7 +507,8 @@ class FsdpModule:
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
 
-        prefetch = context.runner.consume_and_get_next(self, "colwise")
+        context.runner.record_unshard(self, "colwise")
+        prefetch = context.runner.suggest_prefetch(self, "colwise")
         if prefetch is not None:
             next_module, next_orientation = prefetch
             next_module._unshard_parameter_groups(next_orientation)
