@@ -604,10 +604,11 @@ def test_runner_tolerates_transient_mismatch_without_crashing(distributed_setup)
     runner.complete_trace()
     assert not runner.is_tracing
 
-    # Recovered replay follows the new cycle.
+    # Recovered replay follows the new cycle (the cycle now starts with the
+    # colwise consume of layer 2 that caused the divergence).
     assert _record_unshard_and_prefetch(runner, layers[2], "colwise") == (layers[0], "rowwise")
     assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") == (layers[1], "rowwise")
-    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (layers[2], "rowwise")
+    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (layers[2], "colwise")
 
 
 def test_unshard_records_one_consume_per_module_per_pass(distributed_setup):
