@@ -356,7 +356,7 @@ def test_prefetch_traces_and_replays_actual_consume_order(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=3).to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device, use_trace_replay=True):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
         fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
@@ -382,7 +382,9 @@ def test_prefetch_traces_and_replays_actual_consume_order(distributed_setup):
     assert _record_unshard_and_prefetch(runner, layers[2], "colwise") == (layers[1], "rowwise")
     assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (layers[0], "rowwise")
 
-    # Divergence re-traces from the mismatching occurrence.
+    # Divergence re-traces from the mismatching occurrence: the reshard
+    # round of L0 is reset, then L0 is consumed with the wrong orientation.
+    runner.record_reshard(layers[0])
     assert _record_unshard_and_prefetch(runner, layers[0], "colwise") is None
     assert runner.is_tracing
 
@@ -461,7 +463,7 @@ def test_runner_wrap_around_chunk_cycle_prefetches_first_module(distributed_setu
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=3).to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device, use_trace_replay=True):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
         fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
@@ -469,19 +471,20 @@ def test_runner_wrap_around_chunk_cycle_prefetches_first_module(distributed_setu
     layers = model.layers
     runner = model.context.runner
 
-    # Batch 1 traces the chunk cycle 0 -> 1 -> 2.
+    # Batch 1 traces the chunk cycle 0 -> 1 -> 2, each unshard followed by
+    # its reshard round.
     for layer in layers:
         assert _record_unshard_and_prefetch(runner, layer, "rowwise") is None
+        runner.record_reshard(layer)
     runner.complete_trace()
 
-    # Batch 2 replays: 0 -> 1 -> 2 -> 0 -> 1 -> 2, prefetching the successor
-    # at every step including the 2 -> 0 wrap.
-    assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") == (layers[1], "rowwise")
-    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (layers[2], "rowwise")
-    assert _record_unshard_and_prefetch(runner, layers[2], "rowwise") == (layers[0], "rowwise")
-    assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") == (layers[1], "rowwise")
-    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (layers[2], "rowwise")
-    assert _record_unshard_and_prefetch(runner, layers[2], "rowwise") == (layers[0], "rowwise")
+    # Batch 2 replays two full cycles, prefetching the successor at every
+    # step including the 2 -> 0 wrap.
+    for _ in range(2):
+        for layer in layers:
+            next_layer = layers[(layers.index(layer) + 1) % len(layers)]
+            assert _record_unshard_and_prefetch(runner, layer, "rowwise") == (next_layer, "rowwise")
+            runner.record_reshard(layer)
 
 
 def test_runner_wrap_within_batch_multiple_cycles(distributed_setup):
@@ -495,7 +498,7 @@ def test_runner_wrap_within_batch_multiple_cycles(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=3).to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device, use_trace_replay=True):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
         fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
@@ -503,18 +506,22 @@ def test_runner_wrap_within_batch_multiple_cycles(distributed_setup):
     layers = model.layers
     runner = model.context.runner
 
-    # Batch 1: two full cycles (0,1,2,0,1,2).
+    # Batch 1: two full cycles (0,1,2,0,1,2), each unshard followed by its
+    # reshard round.
     for _ in range(2):
         for layer in layers:
             assert _record_unshard_and_prefetch(runner, layer, "rowwise") is None
+            runner.record_reshard(layer)
     runner.complete_trace()
-    assert len(runner._trace) == 6
+    assert len(runner._trace) == 6 * 2
 
-    # Batch 2: each occurrence returns the exact next occurrence.
+    # Batch 2: each occurrence returns the exact next occurrence (the
+    # prefetch skips reshard events, wrapping within and across cycles).
     expected_cycle = [layers[0], layers[1], layers[2], layers[0], layers[1], layers[2]]
     for i, layer in enumerate(expected_cycle):
         expected_next = expected_cycle[(i + 1) % len(expected_cycle)]
         assert _record_unshard_and_prefetch(runner, layer, "rowwise") == (expected_next, "rowwise")
+        runner.record_reshard(layer)
 
 
 def test_runner_divergence_retraces_and_recovers(distributed_setup):
@@ -527,7 +534,7 @@ def test_runner_divergence_retraces_and_recovers(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=3).to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device, use_trace_replay=True):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
         fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
@@ -570,7 +577,7 @@ def test_runner_tolerates_transient_mismatch_without_crashing(distributed_setup)
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=3).to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device, use_trace_replay=True):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
         fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
@@ -615,7 +622,7 @@ def test_unshard_records_one_consume_per_module_per_pass(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=3).to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device, use_trace_replay=True):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
         fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
@@ -653,7 +660,7 @@ def test_complete_trace_clears_dedup_so_replay_records(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device, use_trace_replay=True):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
         fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
