@@ -48,9 +48,6 @@ Four per-op interfaces:
 - ``suggest_skip_reshard(module)``: optimization path — whether this reshard
   can be skipped because the next traced unshard reuses the same module and
   orientation, keeping the storage resident.
-- ``_reset_round(module)``: internal — clear a module's round on reshard so
-  the next pass records a fresh consume; per-pass dedup for the fine-grained
-  per-sub-module hooks.
 """
 
 import dataclasses
@@ -125,7 +122,7 @@ class FsdpExecutionRunner:
         # Modules consumed in the current round. The fine-grained schedule
         # fires one hook per sub-module (dense, experts), so the same module
         # can be recorded several times within a round; only the first is a
-        # real unshard. Cleared by record_reshard() via _reset_round().
+        # real unshard. Cleared by record_reshard() and at the batch boundary.
         self._consumed_this_round: set[FsdpModule] = set()
         # Orientation of each module's most recent consume during replay,
         # used to decide whether a reshard can be skipped (storage only needs
@@ -194,7 +191,10 @@ class FsdpExecutionRunner:
         """
         if not self._use_trace_replay:
             return
-        self._reset_round(module)
+        # The reshard ends the module's unshard round; discard its dedup
+        # entry so the next unshard (e.g. backward after forward) records a
+        # fresh event.
+        self._consumed_this_round.discard(module)
         self._validate_and_advance(EventKind.RESHARD, module, None)
 
     # ------------------------------------------------------------------
@@ -262,18 +262,6 @@ class FsdpExecutionRunner:
             and next_event.module is module
             and next_event.orientation == self._last_orientation.get(module)
         )
-
-    # ------------------------------------------------------------------
-    # Interface 4: round lifecycle
-    # ------------------------------------------------------------------
-
-    def _reset_round(self, module: "FsdpModule") -> None:
-        """Clear ``module``'s unshard-round dedup entry.
-
-        Called by ``record_reshard`` so the next unshard of the same module
-        (e.g. backward after forward) records a fresh event.
-        """
-        self._consumed_this_round.discard(module)
 
     # ------------------------------------------------------------------
     # Lifecycle: batch boundary
