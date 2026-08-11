@@ -1686,8 +1686,13 @@ def wrap_model_chunks_with_ddp(
     # MFSDP v2 chunks must share one FsdpContext so cross-chunk prefetch
     # orders and communication streams coordinate under VPP and the
     # combined-1F1B overlap schedule. The adapter joins an ambient
-    # fully_shard_context when present (reuse_existing=True).
-    wrap_v2_shared_context = DP is FullyShardedDataParallelV2 and len(model_chunks) > 1
+    # fully_shard_context when present (reuse_existing=True). The training
+    # path passes the FullyShardedDataParallel factory (which resolves to V2
+    # from ddp_config.megatron_fsdp_version), not the V2 class itself.
+    wrap_v2_shared_context = (
+        DP is FullyShardedDataParallelV2
+        or (DP is FullyShardedDataParallel and ddp_config.megatron_fsdp_version == 2)
+    ) and len(model_chunks) > 1
     if wrap_v2_shared_context:
         fsdp_context_cm = fully_shard_context()
     else:
