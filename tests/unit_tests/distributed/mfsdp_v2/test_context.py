@@ -481,8 +481,8 @@ def test_runner_wrap_around_chunk_cycle_prefetches_first_module(distributed_setu
     # Batch 2 replays two full cycles, prefetching the successor at every
     # step including the 2 -> 0 wrap.
     for _ in range(2):
-        for layer in layers:
-            next_layer = layers[(layers.index(layer) + 1) % len(layers)]
+        for i, layer in enumerate(layers):
+            next_layer = layers[(i + 1) % len(layers)]
             assert _record_unshard_and_prefetch(runner, layer, "rowwise") == (next_layer, "rowwise")
             runner.record_reshard(layer)
 
@@ -645,8 +645,11 @@ def test_unshard_records_one_consume_per_module_per_pass(distributed_setup):
 
     # Batch 2 replay: consume in order; each returns the traced next (wrap).
     assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") == (layers[1], "rowwise")
+    runner.record_reshard(layers[0])
     assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (layers[2], "rowwise")
+    runner.record_reshard(layers[1])
     assert _record_unshard_and_prefetch(runner, layers[2], "rowwise") == (layers[0], "rowwise")
+    runner.record_reshard(layers[2])
 
 
 def test_complete_trace_clears_dedup_so_replay_records(distributed_setup):

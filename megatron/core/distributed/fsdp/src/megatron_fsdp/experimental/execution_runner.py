@@ -413,3 +413,11 @@ class FsdpExecutionRunner:
         self._trace = [RunnerEvent(kind=kind, module=module, orientation=orientation)]
         self._replay_index = 0
         self._cycles_observed = 0
+        # The divergence event ends the aborted replay round; dedup entries
+        # from it must not suppress the re-traced remainder of the batch.
+        # Re-mark the seed module for an unshard seed so duplicate hooks of
+        # its current round stay deduped (a reshard seed ends that round).
+        self._consumed_this_round.clear()
+        self._last_orientation.clear()
+        if kind is EventKind.UNSHARD:
+            self._consumed_this_round.add(module)
