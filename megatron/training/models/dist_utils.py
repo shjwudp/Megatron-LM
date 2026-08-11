@@ -358,13 +358,23 @@ def _ddp_wrap(
         # fully_shard_context when present (reuse_existing=True); DP is the
         # FullyShardedDataParallel factory, which resolves to V2 from
         # ddp_config.megatron_fsdp_version.
+        #
+        # Enable trace-replay on the ambient context when the combined-1F1B
+        # EP-overlap schedule is active: the adapter requests
+        # use_trace_replay=fine_grained but a reuse_existing join yields THIS
+        # context as-is, so its flags win. Without this the runner is
+        # silently disabled for every VPP + overlap run.
         wrap_v2_shared_context = (
             DP is FullyShardedDataParallel
             and ddp_config.megatron_fsdp_version == 2
             and len(model) > 1
         )
         fsdp_context_cm = (
-            fully_shard_context() if wrap_v2_shared_context else contextlib.nullcontext()
+            fully_shard_context(
+                use_trace_replay=transformer_config.overlap_moe_expert_parallel_comm
+            )
+            if wrap_v2_shared_context
+            else contextlib.nullcontext()
         )
 
         wrapped_model = []

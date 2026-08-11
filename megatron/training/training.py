@@ -1689,12 +1689,20 @@ def wrap_model_chunks_with_ddp(
     # fully_shard_context when present (reuse_existing=True). The training
     # path passes the FullyShardedDataParallel factory (which resolves to V2
     # from ddp_config.megatron_fsdp_version), not the V2 class itself.
+    #
+    # The ambient context must be created with trace-replay enabled when the
+    # combined-1F1B EP-overlap schedule is active: the adapter requests
+    # use_trace_replay=fine_grained but a reuse_existing join yields THIS
+    # context as-is, so its flags win. Creating it without trace-replay
+    # silently disabled the runner for every VPP + overlap run.
     wrap_v2_shared_context = (
         DP is FullyShardedDataParallelV2
         or (DP is FullyShardedDataParallel and ddp_config.megatron_fsdp_version == 2)
     ) and len(model_chunks) > 1
     if wrap_v2_shared_context:
-        fsdp_context_cm = fully_shard_context()
+        fsdp_context_cm = fully_shard_context(
+            use_trace_replay=config.overlap_moe_expert_parallel_comm
+        )
     else:
         fsdp_context_cm = contextlib.nullcontext()
 
