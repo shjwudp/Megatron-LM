@@ -167,7 +167,9 @@ class TestMcoreAdapter:
 
         release_calls = []
         monkeypatch.setattr(
-            wrapped.module[0], "reshard_parameters", lambda: release_calls.append("reshard")
+            wrapped.module[0],
+            "_reshard_parameter_groups",
+            lambda: release_calls.append("reshard"),
         )
         monkeypatch.setattr(
             wrapped.module[0], "post_backward", lambda: release_calls.append("post_backward")
