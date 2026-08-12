@@ -138,49 +138,6 @@ class TestMcoreAdapter:
 
         assert fully_shard_context_calls == [True]
 
-    def test_build_train_and_step(self):
-        root_calls = []
-        monkeypatch.setattr(
-            wrapped.module,
-            "pre_backward",
-            lambda: root_calls.append("pre_backward"),
-        )
-        monkeypatch.setattr(
-            wrapped.module,
-            "post_backward",
-            lambda: root_calls.append("post_backward"),
-        )
-        wrapped._setup_1f1b_overlap_interface()
-        assert find_megatron_fsdp(wrapped) is wrapped
-        assert find_megatron_fsdp(wrapped.module) is wrapped.module
-
-        # The overlap schedule initializes the root before calling child modules directly.
-        assert wrapped.module._context is None
-        wrapped._replace_param_with_raw_if_needed()
-        assert wrapped.module.is_root()
-        assert wrapped.module[0].context is wrapped.module.context
-
-        # no_sync() is entered before the first forward in the non-pipeline schedule.
-        with wrapped.no_sync():
-            assert not wrapped.module.context.is_last_microbatch
-        assert wrapped.module.context.is_last_microbatch
-
-        release_calls = []
-        monkeypatch.setattr(
-            wrapped.module[0],
-            "_reshard_parameter_groups",
-            lambda: release_calls.append("reshard"),
-        )
-        monkeypatch.setattr(
-            wrapped.module[0], "post_backward", lambda: release_calls.append("post_backward")
-        )
-        wrapped.post_forward_release_module(wrapped.module[0])
-        wrapped.post_backward_release_module(wrapped.module[0])
-        assert release_calls == ["reshard", "post_backward"]
-        wrapped.pre_backward()
-        wrapped.post_backward()
-        assert root_calls == ["pre_backward", "post_backward"]
-
     def test_build_train_and_step(self, monkeypatch):
         config = TransformerConfig(
             num_layers=2,
@@ -296,3 +253,6 @@ class TestMcoreAdapter:
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
         torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
+
+        # The optimizer must refresh every chunk's compute weights once per step.
+        assert all(count == len(steps) for count in sync_counts.values())
