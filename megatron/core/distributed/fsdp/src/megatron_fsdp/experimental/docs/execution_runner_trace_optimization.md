@@ -50,7 +50,7 @@ The runner records every fine-grained execution event as a `RunnerEvent`:
 
 ```python
 class EventKind(Enum):
-    CONSUME = auto()   # module params are consumed by compute
+    UNSHARD = auto()   # module params are unsharded for compute
     RESHARD = auto()   # module params are released after compute
 
 @dataclasses.dataclass(frozen=True)
@@ -64,8 +64,8 @@ The trace is the ordered list of events observed during the first global
 batch:
 
 ```text
-[CONSUME(L2, rowwise), RESHARD(L2), CONSUME(L2, colwise), RESHARD(L2),
- CONSUME(L0, rowwise), RESHARD(L0), CONSUME(L0, colwise), RESHARD(L0), ...]
+[UNSHARD(L2, rowwise), RESHARD(L2), UNSHARD(L2, colwise), RESHARD(L2),
+ UNSHARD(L0, rowwise), RESHARD(L0), UNSHARD(L0, colwise), RESHARD(L0), ...]
 ```
 
 During tracing no prefetch is issued (demand-only) and no reshard is
@@ -79,13 +79,13 @@ During replay, each real op is validated against the traced event at the
 current position (`_replay_index`), and the runner returns an optimization
 directive:
 
-- `consume_and_get_next(module, orientation) -> (module, orientation) | None`
-  — validates the consume, advances the cursor, and returns the next
-  **consume** event (skipping intervening reshard events) as the prefetch
-  target.
-- `reshard(module) -> bool` — validates the reshard, advances the cursor,
-  and returns whether the actual reshard can be **skipped** so the storage
-  stays resident.
+- `record_unshard(module, orientation)` — validates the unshard against
+  the traced event, advances the cursor, and
+  `suggest_prefetch(module, orientation)` then returns the next **unshard**
+  event (skipping intervening reshard events) as the prefetch target.
+- `record_reshard(module)` — validates the reshard and advances the cursor;
+  `suggest_skip_reshard(module)` then returns whether the actual reshard can
+  be **skipped** so the storage stays resident.
 
 A mismatch (wrong event kind, module, or orientation) is a divergence:
 the runner clears the trace, re-traces from that event, and degrades to
@@ -99,12 +99,12 @@ During replay, when a reshard for module `M` is about to execute, the runner
 looks at the traced event that follows the reshard:
 
 ```text
-... RESHARD(M)  CONSUME(M, orient) ...
+... RESHARD(M)  UNSHARD(M, orient) ...
 ```
 
-If the next traced consume is the **same module with the same orientation**,
-the storage is re-consumed immediately, so the reshard is unnecessary. The
-runner returns `True` from `reshard(M)` and the module keeps its unsharded
+If the next traced unshard is the **same module with the same orientation**,
+the storage is re-consumed immediately, so the reshard is unnecessary.
+`suggest_skip_reshard(M)` returns `True` and the module keeps its unsharded
 storage resident. The following consume then finds the storage already
 materialized and skips the all-gather.
 
@@ -129,20 +129,20 @@ orientation.
 Traced cycle (forward-only pass over two layers):
 
 ```text
-[CONSUME(L0,row), RESHARD(L0), CONSUME(L0,row), RESHARD(L0),
- CONSUME(L1,row), RESHARD(L1), CONSUME(L1,row), RESHARD(L1)]
+[UNSHARD(L0,row), RESHARD(L0), UNSHARD(L0,row), RESHARD(L0),
+ UNSHARD(L1,row), RESHARD(L1), UNSHARD(L1,row), RESHARD(L1)]
 ```
 
 Replay:
 
 | Real op | Runner directive |
 |---|---|
-| `consume(L0,row)` | prefetch `(L0,row)` (next consume) |
-| `reshard(L0)` | **skip** — next consume is `(L0,row)` |
-| `consume(L0,row)` | storage resident, no all-gather |
-| `consume(L1,row)` | prefetch `(L1,row)` |
-| `reshard(L1)` | **skip** |
-| `consume(L1,row)` | storage resident, no all-gather |
+| `record_unshard(L0,row)` | prefetch `(L0,row)` (next unshard) |
+| `record_reshard(L0)` | `suggest_skip_reshard` → **skip** — next unshard is `(L0,row)` |
+| `record_unshard(L0,row)` | storage resident, no all-gather |
+| `record_unshard(L1,row)` | prefetch `(L1,row)` |
+| `record_reshard(L1)` | **skip** |
+| `record_unshard(L1,row)` | storage resident, no all-gather |
 
 Saves one all-gather and one reshard per module per pass.
 
@@ -156,7 +156,6 @@ Public API of `FsdpExecutionRunner` (owned by `FsdpContext`):
 | `record_reshard(module)` | trace | record/validate a reshard event; clears the module's unshard round |
 | `suggest_prefetch(module, orientation)` | optimization | next module to all-gather ahead |
 | `suggest_skip_reshard(module) -> bool` | optimization | whether to keep storage resident |
-| `_reset_round(module)` | trace (internal) | clear a module's unshard round; called by `record_reshard` |
 | `complete_trace()` | trace | compile the cycle at the batch boundary |
 | `report()` | diagnostics | replay statistics |
 | `phase`, `is_tracing`, `use_trace_replay` | — | runner state |
@@ -172,7 +171,7 @@ if prefetch is not None:
     next_module._unshard_parameter_groups(next_orientation)
 
 # _reshard_parameter_groups (release entry point)
-self.context.runner.record_reshard(self)  # clears the module's unshard round
+self.context.runner.record_reshard(self)
 if self.context.runner.suggest_skip_reshard(self):
     return  # storage stays resident
 for group in self._parameter_groups:
@@ -187,9 +186,9 @@ for group in self._parameter_groups:
 - **Reshard skip** is safe only for an immediate same-module,
   same-orientation re-consume, so the materialized payload is always the one
   the next compute reads.
-- **Dedup** (`_consumed_this_round`) keeps the trace at one consume per module
-  per pass despite per-sub-module hooks; `reset_pass` is called on reshard so
-  the next pass records a fresh consume.
+- **Dedup** (`_consumed_this_round`) keeps the trace at one unshard per module
+  per round despite per-sub-module hooks; `record_reshard` clears the module's
+  dedup entry so the next round records a fresh unshard.
 - **Memory** is bounded: skipping a reshard keeps at most one extra module's
   storage resident, and only while it is immediately reused.
 
