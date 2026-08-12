@@ -191,15 +191,6 @@ class FsdpModule:
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
 
-        meta_parameter_names = [
-            name for name, parameter in owned_parameters.items() if parameter.is_meta
-        ]
-        if meta_parameter_names:
-            raise RuntimeError(
-                "MFSDP v2 requires materialized parameters; "
-                "found meta parameters: " + ", ".join(repr(name) for name in meta_parameter_names)
-            )
-
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
             group_dtype = next(iter(group_parameters.values())).dtype
