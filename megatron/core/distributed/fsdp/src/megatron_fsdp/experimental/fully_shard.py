@@ -32,27 +32,46 @@ _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
 
 @contextmanager
 def fully_shard_context(
-    device: torch.device | None = None, *, use_symmetric_memory: bool = False
+    device: torch.device | None = None,
+    *,
+    reuse_existing: bool = False,
+    use_symmetric_memory: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
     Independent roots are ordered by their root-level ``fully_shard`` calls.
     Construction must finish before any of the registered modules run forward.
 
+    When ``reuse_existing`` is set, a same-device ambient context is yielded
+    instead of creating a nested one. This lets per-chunk adapters join an
+    outer VPP construction scope; only the outermost scope finalizes it.
+
     Args:
         device: CUDA device on which to create communication streams. Defaults to
             the current CUDA device.
+        reuse_existing: Join a compatible already-active context instead of
+            creating a new one. Defaults to False, preserving nesting rejection.
         use_symmetric_memory: Allocate communication staging buffers from PyTorch's
             NCCL symmetric-memory pool.
     """
-    if _FSDP_CONTEXT.get() is not None:
+    requested_device = torch.device(device) if device is not None else torch.device("cuda")
+    if requested_device.type == "cuda" and requested_device.index is None:
+        requested_device = torch.device("cuda", torch.cuda.current_device())
+    existing = _FSDP_CONTEXT.get()
+    if existing is not None:
+        if (
+            reuse_existing
+            and existing.device == requested_device
+            and existing.use_symmetric_memory == use_symmetric_memory
+        ):
+            yield existing
+            return
         raise RuntimeError("fully_shard_context does not support nesting.")
 
-    device = device or torch.device("cuda", torch.cuda.current_device())
-    if device.type != "cuda":
-        raise ValueError(f"fully_shard_context requires a CUDA device, got {device}.")
+    if requested_device.type != "cuda":
+        raise ValueError(f"fully_shard_context requires a CUDA device, got {requested_device}.")
 
-    context = FsdpContext(device=device, use_symmetric_memory=use_symmetric_memory)
+    context = FsdpContext(device=requested_device, use_symmetric_memory=use_symmetric_memory)
     token = _FSDP_CONTEXT.set(context)
     try:
         yield context

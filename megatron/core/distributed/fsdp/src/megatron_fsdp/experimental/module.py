@@ -43,6 +43,7 @@ def _is_fp8_parameter(parameter: nn.Parameter) -> bool:
 class FsdpContext:
     """Runtime stream and prefetch state shared by FSDP roots constructed together."""
 
+    device: torch.device
     allgather_stream: torch.cuda.Stream
     reduce_scatter_stream: torch.cuda.Stream
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
@@ -64,6 +65,7 @@ class FsdpContext:
             use_symmetric_memory: Whether modules constructed in this context allocate
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
         """
+        self.device = device
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.forward_order = IndexedOrder()
