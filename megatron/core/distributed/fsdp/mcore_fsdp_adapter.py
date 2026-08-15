@@ -672,8 +672,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             """All-gather full parameter storage for compute (idempotent)."""
             module = _require_fsdp_module(module)
             module._unshard_parameter_groups()
-            if module._unshard_event is not None:
-                module.context.current_stream().wait_event(module._unshard_event)
 
         def reshard_parameters(module: torch.nn.Module) -> None:
             """Release all-gathered storage and install DTensor parameters."""
