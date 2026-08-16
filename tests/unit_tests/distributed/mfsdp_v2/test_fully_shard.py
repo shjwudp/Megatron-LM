@@ -162,6 +162,17 @@ def _hsdp_placements() -> Placements:
     )
 
 
+def _hfsdp_placements() -> Placements:
+    """HFSDP: shard optimizer state across both DP axes while compute weights
+    stay replicated across DP-outer and sharded within DP-inner."""
+    return Placements(
+        dp_axes=[0, 1],
+        parameter=[Replicate(), Flat()],
+        gradient=[Partial(dist.ReduceOp.AVG), Flat()],
+        optimizer=[Flat(), Flat()],
+    )
+
+
 def _mb(num_bytes: int) -> str:
     return f"{num_bytes / 1024**2:.2f} MB"
 
@@ -276,15 +287,23 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
 @pytest.mark.parametrize("set_to_none", [True, False])
 @pytest.mark.parametrize("num_microbatches", [1, 3])
-def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_none):
-    """HSDP (DP-outer replicated, DP-inner sharded) training should match single-rank SGD.
+@pytest.mark.parametrize(
+    ("placements_factory", "strategy"),
+    [
+        pytest.param(_hsdp_placements, "HSDP", id="hsdp"),
+        pytest.param(_hfsdp_placements, "HFSDP", id="hfsdp"),
+    ],
+)
+def test_hybrid_fsdp_losses_match_baseline(
+    distributed_setup, num_microbatches, set_to_none, placements_factory, strategy
+):
+    """Hybrid FSDP training should match single-rank SGD for both outer strategies.
 
     Gradients reduce-scatter within DP-inner every backward and accumulate into
-    main_grad; the DP-outer all-reduce runs only on the last microbatch, scoped
-    via ``microbatch(...)``. Every rank sees identical data, so the averaged
-    gradient equals the single-rank gradient and losses must match. Both
-    ``zero_grad`` modes are covered: ``set_to_none=True`` overwrites main_grad,
-    ``set_to_none=False`` accumulates into a zeroed main_grad.
+    main_grad; the DP-outer all-reduce (HSDP) or reduce-scatter (HFSDP) runs only
+    on the last microbatch, scoped via ``microbatch(...)``. Every rank sees
+    identical data, so the averaged gradient equals the single-rank gradient and
+    losses must match. Both ``zero_grad`` modes are covered.
     """
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
@@ -305,10 +324,11 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
 
     with fully_shard_context(device=device) as context:
         for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
-        fully_shard(model, mesh=mesh, placements=_hsdp_placements())
+            fully_shard(layer, mesh=mesh, placements=placements_factory())
+        fully_shard(model, mesh=mesh, placements=placements_factory())
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
 
     micro_batch_size = 2
     x = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
@@ -339,12 +359,12 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
         return losses
 
     baseline_losses = train(baseline, baseline_optimizer, "Baseline")
-    sharded_losses = train(model, optimizer, "HSDP")
+    sharded_losses = train(model, optimizer, strategy)
 
     torch.testing.assert_close(
         torch.stack(sharded_losses),
         torch.stack(baseline_losses),
-        msg="HSDP losses did not match baseline losses.",
+        msg=f"{strategy} losses did not match baseline losses.",
     )
 
 
@@ -384,9 +404,7 @@ def test_sharded_grad_dtensor_reuse_across_microbatches(distributed_setup):
     target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
     microbatches = tuple(zip(x.unbind(), target.unbind()))
 
-    sharded_params = [
-        p for p in model.parameters() if getattr(p, "__fsdp_param__", False)
-    ]
+    sharded_params = [p for p in model.parameters() if getattr(p, "__fsdp_param__", False)]
     assert sharded_params, "expected sharded parameters in the model"
 
     def train(model, optimizer, log_prefix) -> list[torch.Tensor]:
@@ -401,9 +419,7 @@ def test_sharded_grad_dtensor_reuse_across_microbatches(distributed_setup):
                     loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                     (loss / num_microbatches).backward()
                 losses.append(loss.detach())
-                step_identities.append(
-                    [id(p.grad) for p in sharded_params if p.grad is not None]
-                )
+                step_identities.append([id(p.grad) for p in sharded_params if p.grad is not None])
             grad_identities.append(step_identities)
             optimizer.step()
         return losses, grad_identities
