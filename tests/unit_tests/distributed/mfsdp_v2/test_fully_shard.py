@@ -369,9 +369,10 @@ def test_sharded_grad_dtensor_reuse_across_microbatches(distributed_setup):
     model = MultiChildModel(dim=dim, num_children=2).to(device)
     baseline = MultiChildModel(dim=dim, num_children=2).to(device)
     model.load_state_dict(baseline.state_dict())
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=_flat_placements())
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device) as context:
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
@@ -396,7 +397,7 @@ def test_sharded_grad_dtensor_reuse_across_microbatches(distributed_setup):
             step_identities = []
             for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
                 is_last = microbatch_index == num_microbatches - 1
-                with microbatch(model, is_last=is_last):
+                with microbatch(context, is_last=is_last):
                     loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                     (loss / num_microbatches).backward()
                 losses.append(loss.detach())
@@ -572,10 +573,6 @@ def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setu
     )
 
 
-@pytest.mark.skip(
-    reason="dev-branch FsdpParameterGroup retains a reference cycle that delays CUDA "
-    "storage release; to be fixed alongside the parameter_group weakref port."
-)
 def test_deleted_model_releases_fsdp_storage(distributed_setup):
     """Deleting an FSDP model should release its persistent storage."""
     world_size = distributed_setup.world_size

@@ -573,8 +573,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
         fine_grained = config.overlap_moe_expert_parallel_comm
         skip_backward_cb = fine_grained and ddp_config.delay_wgrad_compute
-        # The combined-1F1B EP overlap schedule does not follow the static
-        # forward/backward orders, so enable trace-and-replay prefetch.
+        # Join an ambient multi-chunk construction scope when VPP wrapping
+        # opens one; otherwise this adapter owns and finalizes its context. The
+        # combined schedule uses trace-replay because VPP occurrence order does
+        # not follow the static construction order.
         with fully_shard_context(
             device=device,
             reuse_existing=True,
@@ -621,28 +623,103 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 skip_backward_callback=skip_backward_cb,
             )
         super().__init__(config=config, module=module)
+        if config.init_model_with_meta_device:
+            self._reset_parameters_for_meta_device_init()
         if fine_grained:
             self._setup_1f1b_overlap_interface()
 
-    def _setup_1f1b_overlap_interface(self) -> None:
-        """Expose the parameter lifecycle callbacks used by combined 1F1B."""
+    def _reset_parameters_for_meta_device_init(self) -> None:
+        """Reset model parameters that were initialized on the meta device.
 
-        def release_module(module: torch.nn.Module, *, reduce_grad: bool) -> None:
+        Meta-device init leaves parameters without values; ``fully_shard`` then
+        materializes them as empty tensors. Reset each leaf module's weights on
+        the full (unsharded) parameters, copy the aligned values back into the
+        sharded optimizer/compute buffers, and return to the sharded resting state.
+        """
+        root = self.module
+        fsdp_modules = [m for m in root.modules() if isinstance(m, FsdpModule)]
+
+        # Unshard every FSDP unit so reset_parameters() writes the full weight.
+        for m in fsdp_modules:
+            m._unshard_parameter_groups()
+        context = root.context
+        context.current_stream().wait_stream(context.allgather_stream)
+
+        # Reset the original (non-FsdpModule) leaf modules.
+        for m in root.modules():
+            if isinstance(m, FsdpModule):
+                continue
+            if hasattr(m, "reset_parameters"):
+                m.reset_parameters()
+            elif hasattr(m, "_reset_parameters"):
+                m._reset_parameters()
+
+        # Copy the reset full weights back into the sharded buffers, aligned
+        # across DP/EDP ranks, then return to the sharded resting state.
+        for m in fsdp_modules:
+            for group in m._parameter_groups:
+                group.sync_model_weight_from_unsharded_weight()
+            m._reshard_parameter_groups(record_execution=False)
+
+    def _setup_1f1b_overlap_interface(self) -> None:
+        """Expose the parameter lifecycle callbacks used by combined 1F1B.
+
+        All callbacks live on the adapter rather than on ``FsdpModule`` so the
+        experimental module API stays schedule-agnostic; the schedule-facing
+        surface is assembled here.
+        """
+
+        def _require_fsdp_module(module: torch.nn.Module) -> FsdpModule:
             if not isinstance(module, FsdpModule):
                 raise TypeError(
                     "MFSDP v2 combined 1F1B callbacks require an experimental FsdpModule, "
                     f"got {type(module).__name__}."
                 )
-            if reduce_grad:
-                module.post_backward_release_module()
-            else:
-                module.reshard_parameters()
+            return module
 
-        self._replace_param_with_raw_if_needed = self.module._replace_param_with_raw_if_needed
+        def unshard_parameters(module: torch.nn.Module) -> None:
+            """All-gather full parameter storage for compute (idempotent)."""
+            module = _require_fsdp_module(module)
+            module._unshard_and_prefetch("rowwise")
+
+        def reshard_parameters(module: torch.nn.Module) -> None:
+            """Release all-gathered storage and install DTensor parameters."""
+            _require_fsdp_module(module)._reshard_parameter_groups()
+
+        def reduce_grad(module: torch.nn.Module) -> None:
+            """Pack gradients and launch their reduce-scatters."""
+            _require_fsdp_module(module)._reduce_gradient_groups()
+
+        def release_module(module: torch.nn.Module, *, reduce_grad: bool) -> None:
+            if reduce_grad:
+                _require_fsdp_module(module).post_backward()
+            else:
+                reshard_parameters(module)
+
+        def _replace_param_with_raw_if_needed() -> None:
+            """Initialize the root context before a fine-grained schedule runs.
+
+            The experimental API stores raw tensors backed by DBuffer at all
+            times, so no parameter swap is needed, but finalizing the context
+            here ensures a child FSDP unit cannot mistake itself for the root
+            when it executes first.
+            """
+            self.module.context.ensure_finalized()
+
+        # The 1F1B schedule finds the FSDP wrapper via find_megatron_fsdp(),
+        # which may return the bare FsdpModule (no ddp_config). Expose the
+        # adapter's ddp_config on the module so the schedule can read the
+        # data-parallel sharding strategy without special-casing the v2 path.
+        self.module.ddp_config = self.ddp_config
+
+        self.unshard_parameters = unshard_parameters
+        self.reshard_parameters = reshard_parameters
+        self.reduce_grad = reduce_grad
+        self._replace_param_with_raw_if_needed = _replace_param_with_raw_if_needed
         self.post_forward_release_module = partial(release_module, reduce_grad=False)
         self.post_backward_release_module = partial(release_module, reduce_grad=True)
         self.pre_backward = partial(self.module.pre_backward, register_final_callback=False)
-        self.post_backward = partial(self.module.post_backward, finalize_context=True)
+        self.post_backward = self.module.post_backward
 
     @staticmethod
     def _validate_config(
@@ -760,13 +837,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """MFSDP v2 gradient reduction is complete when backward returns."""
 
     def complete_fsdp_trace(self) -> None:
-        """Mark the global-batch boundary for the execution-order runner.
-
-        Called by the training loop after each optimizer step so the runner
-        compiles the traced fine-grained consume cycle and, from the second
-        global batch, replays it to prefetch the true next consumer under the
-        combined-1F1B + VPP schedule.
-        """
+        """Mark a global-batch boundary for the shared execution runner."""
         self.module.context.runner.complete_trace()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:

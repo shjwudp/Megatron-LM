@@ -1758,30 +1758,23 @@ def wrap_model_chunks_with_ddp(
                     expert_data_parallel_world_size=expert_data_parallel_world_size,
                 )
 
-    # Wrap each chunk.
-    # MFSDP v2 chunks must share one FsdpContext so cross-chunk prefetch
-    # orders and communication streams coordinate under VPP and the
-    # combined-1F1B overlap schedule. The adapter joins an ambient
-    # fully_shard_context when present (reuse_existing=True). The training
-    # path passes the FullyShardedDataParallel factory (which resolves to V2
-    # from ddp_config.megatron_fsdp_version), not the V2 class itself.
-    #
-    # The ambient context must be created with trace-replay enabled when the
-    # combined-1F1B EP-overlap schedule is active: the adapter requests
-    # use_trace_replay=fine_grained but a reuse_existing join yields THIS
-    # context as-is, so its flags win. Creating it without trace-replay
-    # silently disabled the runner for every VPP + overlap run.
+    # MFSDP v2 VPP chunks must share streams, microbatch state, and cross-root
+    # prefetch orders. Each adapter joins this ambient construction scope via
+    # ``reuse_existing=True`` and the outer scope finalizes all chunks together.
     wrap_v2_shared_context = (
         DP is FullyShardedDataParallelV2
         or (DP is FullyShardedDataParallel and ddp_config.megatron_fsdp_version == 2)
     ) and len(model_chunks) > 1
-    if wrap_v2_shared_context:
-        fsdp_context_cm = fully_shard_context(
-            use_trace_replay=config.overlap_moe_expert_parallel_comm
+    fsdp_context_cm = (
+        fully_shard_context(
+            use_trace_replay=config.overlap_moe_expert_parallel_comm,
+            use_symmetric_memory=ddp_config.nccl_ub,
         )
-    else:
-        fsdp_context_cm = contextlib.nullcontext()
+        if wrap_v2_shared_context
+        else nullcontext()
+    )
 
+    # Wrap each chunk.
     wrapped = []
     with fsdp_context_cm:
         for chunk, layout, disable_bucketing in zip(

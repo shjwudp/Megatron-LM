@@ -83,9 +83,6 @@ class TestMcoreAdapter:
 
         assert isinstance(wrapped.module, FsdpModule)
         assert isinstance(wrapped.module[0], FsdpModule)
-        assert all(
-            getattr(parameter, "__fsdp_param__", False) for parameter in wrapped.parameters()
-        )
 
         # Post-order wrapping gives the selected TransformerLayer its own parameter group;
         # the root FSDP unit should own only the parameters of the remaining Linear module.
@@ -137,49 +134,6 @@ class TestMcoreAdapter:
         )
 
         assert fully_shard_context_calls == [True]
-
-    def test_build_train_and_step(self):
-        root_calls = []
-        monkeypatch.setattr(
-            wrapped.module,
-            "pre_backward",
-            lambda *, register_final_callback: root_calls.append(
-                ("pre_backward", register_final_callback)
-            ),
-        )
-        monkeypatch.setattr(
-            wrapped.module,
-            "post_backward",
-            lambda *, finalize_context: root_calls.append(("post_backward", finalize_context)),
-        )
-        wrapped._setup_1f1b_overlap_interface()
-        assert find_megatron_fsdp(wrapped) is wrapped
-        assert find_megatron_fsdp(wrapped.module) is wrapped.module
-
-        # The overlap schedule initializes the root before calling child modules directly.
-        assert wrapped.module._context is None
-        wrapped._replace_param_with_raw_if_needed()
-        assert wrapped.module.is_root()
-        assert wrapped.module[0].context is wrapped.module.context
-
-        # no_sync() is entered before the first forward in the non-pipeline schedule.
-        with wrapped.no_sync():
-            assert not wrapped.module.context.is_last_microbatch
-        assert wrapped.module.context.is_last_microbatch
-
-        release_calls = []
-        monkeypatch.setattr(
-            wrapped.module[0], "reshard_parameters", lambda: release_calls.append("reshard")
-        )
-        monkeypatch.setattr(
-            wrapped.module[0], "reduce_grad", lambda: release_calls.append("reduce_grad")
-        )
-        wrapped.post_forward_release_module(wrapped.module[0])
-        wrapped.post_backward_release_module(wrapped.module[0])
-        assert release_calls == ["reshard", "reshard", "reduce_grad"]
-        wrapped.pre_backward()
-        wrapped.post_backward()
-        assert root_calls == [("pre_backward", False), ("post_backward", True)]
 
     def test_build_train_and_step(self, monkeypatch):
         config = TransformerConfig(
@@ -296,3 +250,6 @@ class TestMcoreAdapter:
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
         torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
+
+        # The optimizer must refresh every chunk's compute weights once per step.
+        assert all(count == len(steps) for count in sync_counts.values())

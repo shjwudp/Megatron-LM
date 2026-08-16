@@ -184,7 +184,7 @@ class FsdpParameterGroup:
             main_weight_dtype,
             model_weight_placements,
             main_weight_placements,
-            use_symm_mem,
+            use_symmetric_memory,
         )
 
         self._main_grad = None
@@ -313,6 +313,31 @@ class FsdpParameterGroup:
         # model_weight is the lower-precision compute dtype. Cast before redistributing
         # so cross-rank communication moves the smaller compute-dtype payload.
         self.main_weight.cast(self.model_weight.dtype).redistribute(
+            self.model_weight.placements, out=self.model_weight
+        )
+
+    def sync_model_weight_from_unsharded_weight(self) -> None:
+        """Copy reset unsharded weights back into the sharded buffers.
+
+        ``reset_parameters()`` initializes the replicated weight independently on
+        every rank. Align those replicas from rank zero along each mesh dimension,
+        then scatter the result into the optimizer and compute-weight buffers.
+        """
+        unsharded = self._unsharded_model_weight
+        assert unsharded is not None
+        assert self.model_weight is not None
+        for mesh_dim in range(self.mesh.ndim):
+            group = self.mesh.get_group(mesh_dim=mesh_dim)
+            if torch.distributed.get_world_size(group) == 1:
+                continue
+            src_rank = torch.distributed.get_global_rank(group, 0)
+            torch.distributed.broadcast(unsharded.local_buffer, src=src_rank, group=group)
+
+        if self.main_weight is not self.model_weight:
+            unsharded.cast(self.main_weight.dtype).redistribute(
+                self.main_weight.placements, out=self.main_weight
+            )
+        unsharded.cast(self.model_weight.dtype).redistribute(
             self.model_weight.placements, out=self.model_weight
         )
 
@@ -596,11 +621,14 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         mesh: DeviceMesh,
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
-        reduce_scatter_stream: torch.cuda.Stream | None = None,
-        use_symm_mem: bool = False,
+        reduce_scatter_stream: torch.cuda.Stream,
         grad_divisor: int = 1,
+        use_symmetric_memory: bool = False,
     ) -> None:
-        if use_symm_mem:
+        # Keep the subclass constructor aligned with FsdpParameterGroup. The
+        # shared module factory passes these keywords without knowing whether
+        # a group owns BF16 or MXFP8 weights.
+        if use_symmetric_memory:
             raise ValueError("MFSDP v2 fp8 model weights do not support symmetric memory yet.")
         if te_cast_master_weights_to_fp8() is None:
             raise RuntimeError(
@@ -613,8 +641,9 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             mesh=mesh,
             placements=placements,
             mixed_precision_policy=mixed_precision_policy,
-            use_symm_mem=False,
+            reduce_scatter_stream=reduce_scatter_stream,
             grad_divisor=grad_divisor,
+            use_symmetric_memory=False,
         )
 
     def _init_compute_weight_storage(
@@ -623,9 +652,9 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         main_weight_dtype: torch.dtype,
         model_weight_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
-        use_symm_mem: bool,
+        use_symmetric_memory: bool,
     ) -> None:
-        del main_weight_dtype, main_weight_placements, use_symm_mem
+        del main_weight_dtype, main_weight_placements, use_symmetric_memory
         # The bf16 model-weight storage is replaced by the two uint8 payload
         # DBuffers; the unsharded parameters are the module's own MXFP8Tensor
         # objects whose raw payloads are rebound from the gathered buffers.

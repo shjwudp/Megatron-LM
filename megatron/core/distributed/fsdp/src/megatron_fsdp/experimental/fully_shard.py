@@ -43,45 +43,42 @@ def fully_shard_context(
     Independent roots are ordered by their root-level ``fully_shard`` calls.
     Construction must finish before any of the registered modules run forward.
 
-    When ``reuse_existing`` is set and a context is already active on the same
-    device, that context is yielded instead of creating a new one. This lets
-    callers that open a context internally (e.g. per-model-chunk adapters)
-    join an outer construction scope, so every module in a multi-chunk model
-    (VPP) shares one set of streams and one cross-root prefetch order. The
-    context is finalized only by the outermost scope.
+    When ``reuse_existing`` is set, a same-device ambient context is yielded
+    instead of creating a nested one. This lets per-chunk adapters join an
+    outer VPP construction scope; only the outermost scope finalizes it.
 
     Args:
         device: CUDA device on which to create communication streams. Defaults to
             the current CUDA device.
-        reuse_existing: Join an already-active context on ``device`` instead of
-            creating a new one. Defaults to False, which rejects nesting.
-        use_trace_replay: Enable trace-and-replay prefetch, which records the
-            actual fine-grained consume order during the first global batch
-            and replays it from the second batch. Required for complex
-            schedules (VPP + combined 1F1B) whose execution does not follow
-            the static forward/backward orders. Defaults to False (normal
-            forward/backward execution with static-order prefetch and
-            activation-recompute support).
+        reuse_existing: Join a compatible already-active context instead of
+            creating a new one. Defaults to False, preserving nesting rejection.
+        use_trace_replay: Trace the first batch's actual execution order and replay
+            it for prefetch. Defaults to static forward/backward-order lookahead.
         use_symmetric_memory: Allocate communication staging buffers from PyTorch's
             NCCL symmetric-memory pool.
     """
+    requested_device = torch.device(device) if device is not None else torch.device("cuda")
+    if requested_device.type == "cuda" and requested_device.index is None:
+        requested_device = torch.device("cuda", torch.cuda.current_device())
     existing = _FSDP_CONTEXT.get()
     if existing is not None:
-        if reuse_existing and existing.device == (
-            device or torch.device("cuda", torch.cuda.current_device())
+        if (
+            reuse_existing
+            and existing.device == requested_device
+            and existing.runner.use_trace_replay == use_trace_replay
+            and existing.use_symmetric_memory == use_symmetric_memory
         ):
             yield existing
             return
         raise RuntimeError("fully_shard_context does not support nesting.")
 
-    device = device or torch.device("cuda", torch.cuda.current_device())
-    if device.type != "cuda":
-        raise ValueError(f"fully_shard_context requires a CUDA device, got {device}.")
+    if requested_device.type != "cuda":
+        raise ValueError(f"fully_shard_context requires a CUDA device, got {requested_device}.")
 
     context = FsdpContext(
-        device=device,
-        use_trace_replay=use_trace_replay,
+        device=requested_device,
         use_symmetric_memory=use_symmetric_memory,
+        use_trace_replay=use_trace_replay,
     )
     token = _FSDP_CONTEXT.set(context)
     try:
