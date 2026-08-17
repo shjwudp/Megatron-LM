@@ -38,6 +38,7 @@ module that contains child FSDP modules with CUDA graph enabled.
 | --- | --- |
 | Key | Caller-provided allocation identifier, typically `(param_group_id, role)`. |
 | Interval | Lifetime of one key between a traced `allocate()` and matching `free()`. |
+| Trace slot | Retained best-fit storage used while recording the first micro-batch. |
 | Slot | Physical backing tensor that can be shared by keys whose intervals never overlap. |
 | View | `slot.tensor[:size_for_key]`, cached in `_key_to_view[key]` for O(1) optimized allocation. |
 
@@ -53,14 +54,26 @@ The allocator starts in phase `"trace"`.
 
 `_trace_allocate()` records an alloc event with a monotonic sequence number,
 stores the first observed `(size, dtype, device)` metadata for the key, and
-returns a normal temporary bucket. If the key is already active, allocation is
+returns a view of an online trace slot. It chooses the smallest free slot with
+matching dtype/device and sufficient capacity, allocating a new physical slot
+only when no existing one fits. If the key is already active, allocation is
 idempotent and returns the existing bucket.
 
-`_trace_free()` records a free event, releases the bucket storage, and removes
-the key from `_active_keys`. Double-free is treated as a no-op.
+`_trace_free()` records a free event, marks the trace slot reusable, and removes
+the key from `_active_keys`. It deliberately does not resize the slot storage
+to zero. A re-allocation of an existing key rebinds the same `Bucket.data`
+tensor object to the selected slot so retained mixed-precision views remain
+valid. Double-free is treated as a no-op.
 
-The trace phase records lifetime information only. It does not require later
-micro-batches to replay the same sequence positions.
+Pooling the trace phase matters independently of CUDA graphs. Without it, the
+first micro-batch cycles differently sized all-gather and gradient buffers
+through the CUDA caching allocator before the static plan exists. Those cached
+blocks can establish a reserved-memory high-water mark much larger than the
+simultaneous live set. Online best-fit reuse bounds that allocator churn by the
+trace pool's physical slots.
+
+The trace phase does not require later micro-batches to replay the same
+sequence positions.
 
 ### 2. Plan phase
 
@@ -81,8 +94,12 @@ It performs these steps:
    - visit keys largest-size-first;
    - choose the existing non-conflicting slot with the smallest waste;
    - otherwise create a new slot.
-6. Allocate one `torch.empty(slot_size, dtype, device)` tensor per slot.
-7. Populate `_key_to_slot[key]` and `_key_to_view[key]`.
+6. Require that every traced logical allocation has been freed at the planning
+   boundary.
+7. Resize the online trace-slot storage to zero so its cached blocks can serve
+   the final plan without temporarily holding two communication pools.
+8. Allocate one `torch.empty(slot_size, dtype, device)` tensor per slot.
+9. Populate `_key_to_slot[key]` and `_key_to_view[key]`.
 
 The coloring is heuristic, not a proof of globally optimal memory usage. It is
 simple, deterministic enough for the traced graph on each rank, and captures
@@ -205,7 +222,8 @@ Typical issues:
 | Property | Mechanism |
 | --- | --- |
 | Stable address per planned key | `plan()` allocates one backing tensor per slot and caches `_key_to_view[key]`. |
-| Memory reuse | Conflict-graph coloring lets non-overlapping keys share a slot. |
+| First-pass memory reuse | Online best-fit trace slots retain and reuse physical storage across logical frees. |
+| Planned memory reuse | Conflict-graph coloring lets non-overlapping keys share a slot. |
 | Runtime simplicity | Optimized allocation is a key lookup, collision check, size check, and cached-view return. |
 | Fragmentation control | Per-slot tensors avoid one large contiguous pool allocation. |
 | Recovery from memory pressure | `release()` preserves the plan while dropping storage; auto-resume rebuilds slot tensors and views. |

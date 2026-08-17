@@ -86,6 +86,87 @@ class TestTemporaryBucketAllocator:
 
 class TestTracePoolAllocator:
 
+    def test_trace_phase_reuses_free_slot_without_releasing_storage(self):
+        allocator = TracePoolAllocator()
+        device = torch.device("cpu")
+
+        first = allocator.allocate(key="first", size=16, dtype=torch.float32, device=device)
+        first_ptr = first.data.data_ptr()
+        allocator.free("first")
+
+        # A logical free remains owned by the online trace pool instead of
+        # being returned to the framework allocator.
+        assert first.data._typed_storage()._size() == 16
+
+        second = allocator.allocate(key="second", size=8, dtype=torch.float32, device=device)
+        assert second.data.data_ptr() == first_ptr
+        assert len(allocator._trace_slots) == 1
+
+    def test_trace_phase_uses_best_fit_free_slot(self):
+        allocator = TracePoolAllocator()
+        device = torch.device("cpu")
+
+        large = allocator.allocate(key="large", size=16, dtype=torch.float32, device=device)
+        small = allocator.allocate(key="small", size=8, dtype=torch.float32, device=device)
+        large_ptr = large.data.data_ptr()
+        small_ptr = small.data.data_ptr()
+        allocator.free("large")
+        allocator.free("small")
+
+        chosen = allocator.allocate(key="chosen", size=7, dtype=torch.float32, device=device)
+        assert chosen.data.data_ptr() == small_ptr
+        assert chosen.data.data_ptr() != large_ptr
+
+    def test_trace_phase_does_not_reuse_overlapping_or_incompatible_slots(self):
+        allocator = TracePoolAllocator()
+        device = torch.device("cpu")
+
+        first = allocator.allocate(key="first", size=16, dtype=torch.float32, device=device)
+        overlapping = allocator.allocate(
+            key="overlapping", size=8, dtype=torch.float32, device=device
+        )
+        allocator.free("overlapping")
+        incompatible = allocator.allocate(
+            key="incompatible", size=8, dtype=torch.bfloat16, device=device
+        )
+
+        assert first.data.data_ptr() != overlapping.data.data_ptr()
+        assert incompatible.data.data_ptr() != overlapping.data.data_ptr()
+        assert len(allocator._trace_slots) == 3
+
+    def test_trace_phase_rebinds_existing_bucket_tensor_in_place(self):
+        allocator = TracePoolAllocator()
+        device = torch.device("cpu")
+
+        original = allocator.allocate(key="key", size=8, dtype=torch.float32, device=device)
+        tensor_object = original.data
+        allocator.free("key")
+
+        reallocated = allocator.allocate(key="key", size=8, dtype=torch.float32, device=device)
+        assert reallocated is original
+        assert reallocated.data is tensor_object
+
+    def test_plan_retires_online_trace_slots(self):
+        allocator = TracePoolAllocator()
+        device = torch.device("cpu")
+
+        traced = allocator.allocate(key="traced", size=8, dtype=torch.float32, device=device)
+        trace_storage = traced.data._typed_storage()
+        allocator.free("traced")
+        allocator.plan()
+
+        assert allocator.phase == "optimized"
+        assert allocator._trace_slots == []
+        assert trace_storage._size() == 0
+
+    def test_plan_rejects_live_trace_allocations(self):
+        allocator = TracePoolAllocator()
+        device = torch.device("cpu")
+
+        allocator.allocate(key="live", size=8, dtype=torch.float32, device=device)
+        with pytest.raises(RuntimeError, match="all trace allocations to be freed"):
+            allocator.plan()
+
     def test_optimized_allocate_rejects_live_slot_collision(self):
         allocator = TracePoolAllocator()
         device = torch.device("cpu")

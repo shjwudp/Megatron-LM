@@ -136,10 +136,12 @@ class TracePoolAllocator(BucketAllocator):
 
     **Phase 1 — Trace** (first micro-batch)
 
-    Records alloc/free calls with monotonic sequence numbers.  Buckets are
-    created with ``torch.empty`` and freed via ``_free_storage`` so the same
-    tensor object can be resurrected on re-alloc (keeping outstanding views
-    alive, e.g.  NVFP4 ``_rowwise_data`` references).
+    Records alloc/free calls with monotonic sequence numbers.  Physical trace
+    slots are retained and reused with a best-fit policy instead of returning
+    every logical free to the CUDA caching allocator.  This bounds first-pass
+    allocator churn while preserving the same ``Bucket.data`` tensor object
+    when a key is re-allocated (keeping outstanding views alive, e.g. NVFP4
+    ``_rowwise_data`` references).
 
     **Phase 2 — Plan** (``plan()``)
 
@@ -196,6 +198,14 @@ class TracePoolAllocator(BucketAllocator):
         self._trace_meta: Dict[AllocatorKey, Tuple[int, torch.dtype, torch.device]] = {}
         self._buckets: Dict[AllocatorKey, Bucket] = {}
         self._active_keys: Set[AllocatorKey] = set()
+        # The trace itself uses an online best-fit pool. Without this pool, the
+        # first micro-batch repeatedly returns differently sized FSDP buffers
+        # to the CUDA caching allocator before the static plan exists, which
+        # can permanently raise the allocator's reserved-memory high-water
+        # mark. These slots are retired when ``plan()`` installs the optimized
+        # conflict-graph plan.
+        self._trace_slots: List["TracePoolAllocator._SlotInfo"] = []
+        self._trace_key_to_slot: Dict[AllocatorKey, int] = {}
 
         # Pool state — populated by plan(), used in optimized phase
         self._slots: List["TracePoolAllocator._SlotInfo"] = []
@@ -242,16 +252,40 @@ class TracePoolAllocator(BucketAllocator):
         if key in self._active_keys:
             return self._buckets[key]
 
-        if key not in self._buckets:
-            self._trace.append(self._TraceEvent(seq=self._seq, op="alloc", key=key))
-            self._seq += 1
+        previous_meta = self._trace_meta.get(key)
+        if previous_meta is None:
             self._trace_meta[key] = (size, dtype, device)
-            self._buckets[key] = Bucket(data=torch.empty(size, dtype=dtype, device=device))
         else:
-            self._trace.append(self._TraceEvent(seq=self._seq, op="alloc", key=key))
-            self._seq += 1
-            _alloc_storage(self._buckets[key].data, torch.Size([size]))
+            previous_size, previous_dtype, previous_device = previous_meta
+            if dtype != previous_dtype or device != previous_device:
+                raise ValueError(
+                    f"TracePoolAllocator key {key!r} changed allocation type from "
+                    f"({previous_dtype}, {previous_device}) to ({dtype}, {device})"
+                )
+            self._trace_meta[key] = (max(previous_size, size), dtype, device)
 
+        slot_idx = self._find_trace_slot(size, dtype, device)
+        if slot_idx is None:
+            slot_idx = len(self._trace_slots)
+            tensor = torch.empty(size, dtype=dtype, device=device)
+            self._trace_slots.append(
+                self._SlotInfo(tensor=tensor, size=size, dtype=dtype, device=device, in_use=True)
+            )
+        else:
+            self._trace_slots[slot_idx].in_use = True
+
+        slot_view = self._trace_slots[slot_idx].tensor[:size]
+        if key not in self._buckets:
+            self._buckets[key] = Bucket(data=slot_view)
+        else:
+            # Rebind in place: mixed-precision wrappers may retain the tensor
+            # object even after the logical FSDP buffer is released.
+            with torch.no_grad():
+                self._buckets[key].data.set_(slot_view)
+
+        self._trace.append(self._TraceEvent(seq=self._seq, op="alloc", key=key))
+        self._seq += 1
+        self._trace_key_to_slot[key] = slot_idx
         self._active_keys.add(key)
         return self._buckets[key]
 
@@ -260,9 +294,36 @@ class TracePoolAllocator(BucketAllocator):
             return
         self._trace.append(self._TraceEvent(seq=self._seq, op="free", key=key))
         self._seq += 1
-        if key in self._buckets:
-            _free_storage(self._buckets[key].data)
+        slot_idx = self._trace_key_to_slot.pop(key)
+        self._trace_slots[slot_idx].in_use = False
         self._active_keys.discard(key)
+
+    def _find_trace_slot(
+        self, size: int, dtype: torch.dtype, device: torch.device
+    ) -> Optional[int]:
+        """Return the smallest free trace slot that can satisfy a request."""
+        candidates = (
+            (slot.size - size, slot_idx)
+            for slot_idx, slot in enumerate(self._trace_slots)
+            if not slot.in_use
+            and slot.dtype == dtype
+            and slot.device == device
+            and slot.size >= size
+        )
+        best = min(candidates, default=None)
+        return None if best is None else best[1]
+
+    def _release_trace_slots(self) -> None:
+        """Return online trace-pool storage before installing the static plan."""
+        if self._active_keys:
+            raise RuntimeError(
+                "TracePoolAllocator.plan() requires all trace allocations to be freed; "
+                f"active keys: {tuple(self._active_keys)!r}"
+            )
+        for slot in self._trace_slots:
+            _free_storage(slot.tensor)
+        self._trace_slots.clear()
+        self._trace_key_to_slot.clear()
 
     # -- Phase 2: plan --------------------------------------------------- #
 
@@ -278,6 +339,7 @@ class TracePoolAllocator(BucketAllocator):
         """
         assert self._phase == "trace", "plan() can only be called in trace phase"
         if len(self._trace) == 0:
+            self._release_trace_slots()
             self._phase = "optimized"
             return 0
 
@@ -302,6 +364,7 @@ class TracePoolAllocator(BucketAllocator):
                 sentinel_seq += 1
 
         if not intervals_per_key:
+            self._release_trace_slots()
             self._phase = "optimized"
             return 0
 
@@ -323,6 +386,10 @@ class TracePoolAllocator(BucketAllocator):
         self._slots.clear()
         self._key_to_slot.clear()
         self._key_to_view.clear()
+        # Retire the online trace slots first. Their cached blocks are then
+        # immediately available to satisfy the optimized slot allocations,
+        # avoiding a transient second copy of the communication pool.
+        self._release_trace_slots()
 
         total_elems = 0
         for (dtype, device), keys in groups.items():
@@ -492,6 +559,10 @@ class TracePoolAllocator(BucketAllocator):
         self._trace_meta.clear()
         self._buckets.clear()
         self._active_keys.clear()
+        for slot in self._trace_slots:
+            _free_storage(slot.tensor)
+        self._trace_slots.clear()
+        self._trace_key_to_slot.clear()
         self._slots.clear()
         self._key_to_slot.clear()
         self._key_to_view.clear()
@@ -582,6 +653,14 @@ class TracePoolAllocator(BucketAllocator):
         lines = []
         lines.append(f"=== TracePoolAllocator (phase={self._phase}) ===")
         lines.append(f"trace events: {len(self._trace)}")
+        if self._phase == "trace":
+            trace_pool_bytes = sum(
+                slot.size * slot.tensor.element_size() for slot in self._trace_slots
+            )
+            lines.append(
+                f"trace pool: {len(self._trace_slots)} slots, "
+                f"{trace_pool_bytes} bytes ({trace_pool_bytes / 1024 / 1024:.1f} MB)"
+            )
         for ev in self._trace:
             meta = self._trace_meta.get(ev.key)
             size_str = f"size={meta[0]}" if meta else "size=?"
