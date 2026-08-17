@@ -10,13 +10,17 @@ import torch
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import Flat, Partial, Replicate
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.moe.experts import SequentialMLP
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -253,3 +257,314 @@ class TestMcoreAdapter:
 
         # The optimizer must refresh every chunk's compute weights once per step.
         assert all(count == len(steps) for count in sync_counts.values())
+
+    def test_weight_sync_uses_model_order_when_optimizer_params_are_filtered(self, monkeypatch):
+        """Weight refresh must include FSDP groups omitted from local optimizer shards."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=_build_block(config),
+            pg_collection=self.pg_collection,
+        )
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="adam",
+                lr=1.0e-3,
+                weight_decay=0.0,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                use_distributed_optimizer=False,
+                clip_grad=0.0,
+            ),
+            [model],
+            use_gloo_process_groups=False,
+        )
+        assert isinstance(optimizer, FullyShardedOptimizer)
+
+        parameter_groups = [
+            parameter_group
+            for module in model.modules()
+            if isinstance(module, FsdpModule)
+            for parameter_group in module.parameter_groups
+        ]
+        assert len(parameter_groups) >= 2
+        omitted_parameter_ids = {
+            id(fsdp_parameter.sharded) for fsdp_parameter in parameter_groups[0].fsdp_parameters
+        }
+        for optimizer_param_group in optimizer.optimizer.param_groups:
+            optimizer_param_group["params"] = [
+                parameter
+                for parameter in optimizer_param_group["params"]
+                if id(parameter) not in omitted_parameter_ids
+            ]
+
+        # Collective traversal must not depend on requires_grad either. A
+        # rank-local filter could otherwise reorder refreshes just like an
+        # omitted empty optimizer shard.
+        for fsdp_parameter in parameter_groups[1].fsdp_parameters:
+            fsdp_parameter.sharded.requires_grad_(False)
+
+        sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
+        for parameter_group in parameter_groups:
+
+            def count_sync(parameter_group=parameter_group):
+                sync_counts[parameter_group] += 1
+
+            monkeypatch.setattr(parameter_group, "sync_model_weight_from_main_weight", count_sync)
+
+        optimizer._copy_main_params_to_model_params()
+
+        assert all(count == 1 for count in sync_counts.values())
+
+
+class TestMcoreAdapterHybrid:
+    """Exercise the adapter's DP-outer x DP-inner HFSDP mapping."""
+
+    def setup_method(self):
+        world_size = Utils.world_size
+        if world_size < 4 or world_size % 2:
+            pytest.skip("MFSDP v2 hybrid adapter tests require an even number of >=4 ranks.")
+        # EP spans the whole dense DP domain, so expert DP remains exactly one
+        # while dense DP can still factor into DP-outer x DP-inner.
+        self.expert_model_parallel_size = world_size
+        Utils.initialize_model_parallel(
+            1,
+            1,
+            expert_model_parallel_size=self.expert_model_parallel_size,
+            num_distributed_optimizer_instances=2,
+            expert_num_distributed_optimizer_instances=1,
+        )
+        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_parallel_cuda_manual_seed(1234)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    def test_hfsdp_mesh_placements_and_multiple_steps(self):
+        """HFSDP should use inner sharding, outer optimizer sharding, and train repeatedly."""
+        world_size = torch.distributed.get_world_size()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        model = torch.nn.Linear(config.hidden_size, config.hidden_size).to(
+            device="cuda", dtype=config.params_dtype
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                outer_dp_sharding_strategy="optim",
+                num_distributed_optimizer_instances=2,
+                megatron_fsdp_main_params_dtype=torch.float32,
+                megatron_fsdp_main_grads_dtype=torch.bfloat16,
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        assert tuple(model.mesh.mesh.shape) == (2, world_size // 2)
+        assert sorted(torch.distributed.get_process_group_ranks(model.mesh.get_group(0))) == sorted(
+            torch.distributed.get_process_group_ranks(self.pg_collection.inter_dist_opt)
+        )
+        assert sorted(torch.distributed.get_process_group_ranks(model.mesh.get_group(1))) == sorted(
+            torch.distributed.get_process_group_ranks(self.pg_collection.intra_dp_cp)
+        )
+
+        parameter_group = model.module.parameter_groups[0]
+        assert isinstance(parameter_group.model_weight.placements[0], Replicate)
+        assert isinstance(parameter_group.model_weight.placements[1], Flat)
+        assert isinstance(parameter_group._main_grad_placements[0], Partial)
+        assert isinstance(parameter_group._main_grad_placements[1], Flat)
+        assert all(
+            isinstance(placement, Flat) for placement in parameter_group.main_weight.placements
+        )
+
+        optimizer_config = OptimizerConfig(
+            optimizer="adam",
+            lr=1.0e-3,
+            weight_decay=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_distributed_optimizer=False,
+            clip_grad=0.0,
+        )
+        optimizer = get_megatron_optimizer(
+            optimizer_config,
+            [model],
+            use_gloo_process_groups=False,
+            pg_collection=self.pg_collection,
+        )
+        optimizer.reload_model_params()
+
+        inputs = [
+            torch.randn(4, config.hidden_size, device="cuda", dtype=config.params_dtype)
+            for _ in range(3)
+        ]
+        losses = []
+        for batch in inputs:
+            model.zero_grad_buffer()
+            optimizer.zero_grad(set_to_none=True)
+            loss = model(batch).float().square().mean()
+            loss.backward()
+            success, _, _ = optimizer.step()
+            assert success
+            losses.append(loss.detach())
+
+        assert torch.isfinite(torch.stack(losses)).all()
+
+    def test_hfsdp_meta_init_stages_optimizer_sharding(self):
+        """Meta initialization should materialize both HFSDP axes one at a time."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            init_model_with_meta_device=True,
+        )
+        model = torch.nn.Sequential(
+            torch.nn.Linear(
+                config.hidden_size, config.hidden_size, device="meta", dtype=config.params_dtype
+            ),
+            torch.nn.GELU(),
+            torch.nn.Linear(
+                config.hidden_size, config.hidden_size, device="meta", dtype=config.params_dtype
+            ),
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                outer_dp_sharding_strategy="optim",
+                num_distributed_optimizer_instances=2,
+                megatron_fsdp_main_params_dtype=torch.float32,
+                megatron_fsdp_main_grads_dtype=torch.bfloat16,
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        parameter_groups = [
+            parameter_group
+            for module in model.modules()
+            if isinstance(module, FsdpModule)
+            for parameter_group in module.parameter_groups
+        ]
+        expected_model_weights = {
+            parameter_group: [
+                parameter_group.model_weight.get_local_tensor(index).clone()
+                for index in range(len(parameter_group.fsdp_parameters))
+            ]
+            for parameter_group in parameter_groups
+        }
+
+        # Meta reset populates main_weight by staging through model_weight. Clear
+        # the compute shards and reconstruct them from main_weight to verify that
+        # the staged outer-axis scatter preserved every logical tensor exactly.
+        for parameter_group in parameter_groups:
+            parameter_group.model_weight.local_buffer.zero_()
+            parameter_group.sync_model_weight_from_main_weight()
+            for index, expected_weight in enumerate(expected_model_weights[parameter_group]):
+                torch.testing.assert_close(
+                    parameter_group.model_weight.get_local_tensor(index),
+                    expected_weight,
+                    rtol=0,
+                    atol=0,
+                )
+
+        output = model(torch.randn(2, config.hidden_size, device="cuda", dtype=config.params_dtype))
+        assert torch.isfinite(output).all()
+
+    def test_expert_parameters_keep_plain_fsdp_at_edp_one(self):
+        """Dense HFSDP must not add a dense outer axis to expert parameters."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            num_moe_experts=self.expert_model_parallel_size,
+            moe_ffn_hidden_size=32,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            expert_model_parallel_size=self.expert_model_parallel_size,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        experts = SequentialMLP(
+            num_local_experts=1,
+            config=config,
+            submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
+            pg_collection=self.pg_collection,
+        )
+        module = torch.nn.ModuleDict(
+            {
+                "experts": experts,
+                "dense": torch.nn.Linear(
+                    config.hidden_size,
+                    config.hidden_size,
+                    bias=False,
+                    device="cuda",
+                    dtype=config.params_dtype,
+                ),
+            }
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                outer_dp_sharding_strategy="optim",
+                num_distributed_optimizer_instances=2,
+                megatron_fsdp_main_params_dtype=torch.float32,
+                megatron_fsdp_main_grads_dtype=torch.bfloat16,
+            ),
+            module=module,
+            pg_collection=self.pg_collection,
+        )
+
+        assert self.pg_collection.expt_dp.size() == 1
+        assert self.pg_collection.intra_expt_dp.size() == 1
+        assert tuple(model.moe_mesh.mesh.shape) == (1,)
+
+        dense_group = model.module.parameter_groups[0]
+        assert all(isinstance(placement, Flat) for placement in dense_group.main_weight.placements)
+
+        expert_groups = model.module["experts"].parameter_groups
+        assert expert_groups
+        for parameter_group in expert_groups:
+            assert len(parameter_group.model_weight.placements) == 1
+            assert isinstance(parameter_group.model_weight.placements[0], Flat)
+            assert isinstance(parameter_group._main_grad_placements[0], Flat)
+            assert isinstance(parameter_group.main_weight.placements[0], Flat)
