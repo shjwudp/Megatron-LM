@@ -763,7 +763,11 @@ def _build_hsdp_dp_mesh(
             _init_backend=False,
         )
         flat_mesh._dim_group_names = [flatten_group.group_name]
-        root._pg_registry[flatten_group.group_name] = flatten_group
+        # Older layout-based DeviceMesh versions keep a per-root process-group
+        # registry. Newer versions resolve ``_dim_group_names`` through c10d's
+        # global group registry and no longer expose ``_pg_registry``.
+        if hasattr(root, "_pg_registry"):
+            root._pg_registry[flatten_group.group_name] = flatten_group
         root._flatten_mapping[name] = flat_mesh
     else:
         from torch.distributed.device_mesh import _mesh_resources
