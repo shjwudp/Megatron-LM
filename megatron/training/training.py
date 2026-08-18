@@ -55,7 +55,10 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV1,
     FullyShardedDataParallelV2,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpCommunicationSchedulerConfig,
+    fully_shard_context,
+)
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
@@ -2308,11 +2311,20 @@ def wrap_model_chunks_with_ddp(
         DP is FullyShardedDataParallelV2
         or (DP is FullyShardedDataParallel and ddp_config.megatron_fsdp_version == 2)
     ) and len(model_chunks) > 1
+    fsdp_communication_scheduler = (
+        FsdpCommunicationSchedulerConfig(ddp_config.fsdp_max_pending_reduce_scatter_bytes)
+        if (
+            ddp_config.fsdp_prefetch_successor_after
+            or ddp_config.fsdp_reduce_scatter_release_on_pre_backward
+        )
+        else None
+    )
     fsdp_context_cm = (
         fully_shard_context(
             use_trace_replay=config.overlap_moe_expert_parallel_comm,
             use_symmetric_memory=ddp_config.nccl_ub,
             enable_trace_pool=ddp_config.fsdp_trace_pool,
+            communication_scheduler=fsdp_communication_scheduler,
         )
         if wrap_v2_shared_context
         else nullcontext()

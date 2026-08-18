@@ -261,6 +261,9 @@ class TransformerLayerNode(ScheduleNode):
         self.before_detached = tuple()
         self.is_mtp = extra_args.get("is_mtp", False)
         self.post_wgrad_grad_acc_hooks = None
+        self._fsdp_post_forward_communication_hook = None
+        self._fsdp_pre_backward_communication_hook = None
+        self._fsdp_post_backward_communication_hook = None
 
         self.is_first_layer = extra_args.get("is_first_layer", False)
         self.is_last_layer = extra_args.get("is_last_layer", False)
@@ -305,6 +308,8 @@ class TransformerLayerNode(ScheduleNode):
     def forward(self, *inputs):
         """Execute forward and fire the per-layer post-forward hook on the last slot."""
         output = super().forward(*inputs)
+        if self._fsdp_post_forward_communication_hook is not None:
+            self._fsdp_post_forward_communication_hook(self.name, self.event)
         if self.is_layer_last_node:
             self._post_forward_hook()
         return output
@@ -315,7 +320,11 @@ class TransformerLayerNode(ScheduleNode):
         When ``delay_wgrad_compute`` is set, the hook fires after ``backward_dw``
         instead, because the wgrad work has not yet run when ``backward`` returns.
         """
+        if self._fsdp_pre_backward_communication_hook is not None:
+            self._fsdp_pre_backward_communication_hook(self.name, self.event)
         grads = super().backward(*output_grad)
+        if not self.delay_wgrad_compute and self._fsdp_post_backward_communication_hook is not None:
+            self._fsdp_post_backward_communication_hook(self.name, self.event)
         if not self.delay_wgrad_compute and self.is_layer_first_node:
             self._post_backward_hook()
         return grads
@@ -353,6 +362,10 @@ class TransformerLayerNode(ScheduleNode):
                 for hook in self.post_wgrad_grad_acc_hooks:
                     hook()
 
+        if self._fsdp_post_backward_communication_hook is not None:
+            self.event.record(self.stream)
+            self._fsdp_post_backward_communication_hook(self.name, self.event)
+
         if self.is_layer_first_node:
             self._post_backward_hook()
         self.bwd_dw_callables = None
@@ -366,6 +379,14 @@ class TransformerLayerNode(ScheduleNode):
         """Mark this slot as the layer's first bwd node and register the hook."""
         self.is_layer_first_node = True
         self._post_backward_hook = hook
+
+    def set_fsdp_communication_hooks(
+        self, post_forward_hook, pre_backward_hook, post_backward_hook
+    ):
+        """Attach named schedule-node completion and pre-backward callbacks."""
+        self._fsdp_post_forward_communication_hook = post_forward_hook
+        self._fsdp_pre_backward_communication_hook = pre_backward_hook
+        self._fsdp_post_backward_communication_hook = post_backward_hook
 
     def __del__(self):
         # Release references early to help avoid leaks across iterations.

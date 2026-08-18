@@ -24,7 +24,7 @@ drive prefetch.
 Two cooperating paths:
 
 - **Trace path**: during the first global batch, every fine-grained
-  execution event (consume, reshard) is recorded in actual order. No
+  execution event (consume, reshard, communication anchor) is recorded in actual order. No
   prefetch is issued and no reshard is optimized away.
 - **Optimization path**: from the second batch, each real op is validated
   against the traced cycle and translated into optimization directives:
@@ -38,7 +38,7 @@ State machine::
        ^                                                          |
        +----------------------(complete_trace)--------------------+
 
-Four per-op interfaces:
+The per-op interfaces are:
 
 - ``record_unshard(module, orientation)`` / ``record_reshard(module)``:
   trace path — record the real event, or during replay validate it against
@@ -48,6 +48,9 @@ Four per-op interfaces:
 - ``suggest_skip_reshard(module)``: optimization path — whether this reshard
   can be skipped because the next traced unshard reuses the same module and
   orientation, keeping the storage resident.
+- ``record_completion(...)`` / ``record_reduce_scatter_release(...)``:
+  include configured communication anchors in occurrence replay so VPP and
+  recomputation cannot release a collective at the wrong occurrence.
 """
 
 import dataclasses
@@ -55,11 +58,13 @@ import logging
 from enum import Enum, auto
 
 # Forward reference; FsdpModule is imported lazily to avoid a cycle.
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
 if TYPE_CHECKING:
+    from torch import nn
+
     from .module import FsdpModule
 
 logger = logging.getLogger(__name__)
@@ -77,6 +82,8 @@ class EventKind(Enum):
 
     UNSHARD = auto()
     RESHARD = auto()
+    COMPLETION = auto()
+    RS_RELEASE = auto()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -88,11 +95,15 @@ class RunnerEvent:
         module: The FSDP module the event applies to.
         orientation: Payload orientation (``"rowwise"`` forward,
             ``"colwise"`` backward); ``None`` for reshard events.
+        anchor: Completed descendant module for completion events.
+        phase: Completed execution phase for completion events.
     """
 
     kind: EventKind
     module: "FsdpModule"
     orientation: str | None = None
+    anchor: "nn.Module | str | None" = None
+    phase: "Literal['forward', 'backward'] | None" = None
 
 
 class FsdpExecutionRunner:
@@ -155,7 +166,7 @@ class FsdpExecutionRunner:
     # Interface 1: record execution events (consume, reshard)
     # ------------------------------------------------------------------
 
-    def record_unshard(self, module: "FsdpModule", orientation: str) -> None:
+    def record_unshard(self, module: "FsdpModule", orientation: str) -> bool:
         """Record (tracing) or validate (replay) an unshard event.
 
         The fine-grained schedule fires one hook per sub-module (dense,
@@ -170,12 +181,13 @@ class FsdpExecutionRunner:
                 ``"colwise"`` backward).
         """
         if not self._use_trace_replay:
-            return
+            return True
         if module in self._consumed_this_round:
-            return
+            return False
         self._consumed_this_round.add(module)
         self._last_orientation[module] = orientation
         self._validate_and_advance(EventKind.UNSHARD, module, orientation)
+        return True
 
     def record_reshard(self, module: "FsdpModule") -> None:
         """Record (tracing) or validate (replay) a reshard event.
@@ -196,6 +208,23 @@ class FsdpExecutionRunner:
         # fresh event.
         self._consumed_this_round.discard(module)
         self._validate_and_advance(EventKind.RESHARD, module, None)
+
+    def record_completion(
+        self,
+        owner: "FsdpModule",
+        anchor: "nn.Module | str",
+        phase: "Literal['forward', 'backward']",
+    ) -> None:
+        """Record or validate a configured module-completion occurrence."""
+        if not self._use_trace_replay:
+            return
+        self._validate_and_advance(EventKind.COMPLETION, owner, None, anchor=anchor, phase=phase)
+
+    def record_reduce_scatter_release(self, owner: "FsdpModule", anchor: "nn.Module | str") -> None:
+        """Record or validate a configured pre-backward RS release occurrence."""
+        if not self._use_trace_replay:
+            return
+        self._validate_and_advance(EventKind.RS_RELEASE, owner, None, anchor=anchor)
 
     # ------------------------------------------------------------------
     # Interface 2: prefetch suggestion
@@ -348,6 +377,9 @@ class FsdpExecutionRunner:
         kind: EventKind,
         module: "FsdpModule",
         orientation: str | None,
+        *,
+        anchor: "nn.Module | str | None" = None,
+        phase: "Literal['forward', 'backward'] | None" = None,
     ) -> None:
         """Trace (append) or validate-and-advance (replay) one event.
 
@@ -363,7 +395,11 @@ class FsdpExecutionRunner:
             orientation: Expected orientation (``None`` for reshard).
         """
         if self._phase is RunnerPhase.TRACING:
-            self._trace.append(RunnerEvent(kind=kind, module=module, orientation=orientation))
+            self._trace.append(
+                RunnerEvent(
+                    kind=kind, module=module, orientation=orientation, anchor=anchor, phase=phase
+                )
+            )
             return
 
         expected = self._trace[self._replay_index]
@@ -371,6 +407,8 @@ class FsdpExecutionRunner:
             expected.kind is not kind
             or expected.module is not module
             or expected.orientation != orientation
+            or not _same_anchor(expected.anchor, anchor)
+            or expected.phase != phase
         ):
             # Schedule diverged from the trace (e.g. batch-size or topology
             # change). Re-trace from this event; prefetch stays disabled
@@ -386,7 +424,7 @@ class FsdpExecutionRunner:
                 orientation,
                 self._divergences,
             )
-            self._retrace(kind, module, orientation)
+            self._retrace(kind, module, orientation, anchor=anchor, phase=phase)
             return
 
         self._replayed_occurrences += 1
@@ -397,10 +435,17 @@ class FsdpExecutionRunner:
         kind: EventKind,
         module: "FsdpModule",
         orientation: str | None,
+        *,
+        anchor: "nn.Module | str | None" = None,
+        phase: "Literal['forward', 'backward'] | None" = None,
     ) -> None:
         """Reset to tracing and seed the new trace with the current event."""
         self._phase = RunnerPhase.TRACING
-        self._trace = [RunnerEvent(kind=kind, module=module, orientation=orientation)]
+        self._trace = [
+            RunnerEvent(
+                kind=kind, module=module, orientation=orientation, anchor=anchor, phase=phase
+            )
+        ]
         self._replay_index = 0
         self._cycles_observed = 0
         # The divergence event ends the aborted replay round; dedup entries
@@ -411,3 +456,13 @@ class FsdpExecutionRunner:
         self._last_orientation.clear()
         if kind is EventKind.UNSHARD:
             self._consumed_this_round.add(module)
+        scheduler = getattr(self._context, "communication_scheduler", None)
+        if scheduler is not None:
+            scheduler.handle_replay_divergence()
+
+
+def _same_anchor(left: "nn.Module | str | None", right: "nn.Module | str | None") -> bool:
+    """Compare module anchors by identity and named anchors by value."""
+    if isinstance(left, str) or isinstance(right, str):
+        return isinstance(left, str) and isinstance(right, str) and left == right
+    return left is right

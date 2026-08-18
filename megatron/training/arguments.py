@@ -3156,6 +3156,17 @@ def _add_distributed_args(parser):
                        help="Enable trace-planned temporary-buffer storage for Megatron FSDP v2. "
                         "The first global batch records buffer lifetimes; later batches reuse fixed slots. "
                         "With NCCL user buffers, the slots use PyTorch symmetric memory.")
+    group.add_argument('--fsdp-prefetch-successor-after', action='append', default=[],
+                       help="Delay an MFSDP v2 successor all-gather until a configured completion "
+                       "point. Repeat SOURCE_GLOB:PHASE:DESCENDANT_GLOB rules; prefix the "
+                       "descendant with @ to name a combined-schedule node.")
+    group.add_argument('--fsdp-reduce-scatter-release-on-pre-backward', action='append', default=[],
+                       help="Release one pending MFSDP v2 reduce-scatter at a configured "
+                       "pre-backward point. Repeat SOURCE_GLOB:DESCENDANT_GLOB rules; prefix "
+                       "the descendant with @ to name a combined-schedule node.")
+    group.add_argument('--fsdp-max-pending-reduce-scatter-bytes', type=int, default=None,
+                       help="Maximum bytes held by deferred MFSDP v2 reduce-scatter requests. "
+                       "By default the limit is inferred; zero keeps reduce-scatter eager.")
     group.add_argument('--suggested-communication-unit-size', type=int, default=None,
                    help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '

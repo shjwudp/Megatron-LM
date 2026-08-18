@@ -24,6 +24,7 @@ from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
+from .communication_scheduler import FsdpCommunicationSchedulerConfig, FsdpModuleCommunicationPolicy
 from .module import FsdpContext, FsdpModule
 from .placement import MeshAxis, Placements
 
@@ -39,6 +40,7 @@ def fully_shard_context(
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
     enable_trace_pool: bool = False,
+    communication_scheduler: FsdpCommunicationSchedulerConfig | None = None,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -64,7 +66,10 @@ def fully_shard_context(
         enable_trace_pool: Trace temporary-buffer lifetimes for one global batch,
             then reuse fixed physical slots. When symmetric memory is also enabled,
             allocate and resize those slots inside PyTorch's symmetric-memory pool.
+        communication_scheduler: Optional trace-guided communication scheduler.
+            Supplying it enables occurrence trace replay.
     """
+    use_trace_replay = use_trace_replay or communication_scheduler is not None
     requested_device = torch.device(device) if device is not None else torch.device("cuda")
     if requested_device.type == "cuda" and requested_device.index is None:
         requested_device = torch.device("cuda", torch.cuda.current_device())
@@ -76,6 +81,7 @@ def fully_shard_context(
             and existing.runner.use_trace_replay == use_trace_replay
             and existing.use_symmetric_memory == use_symmetric_memory
             and (existing.trace_pool_allocator is not None) == enable_trace_pool
+            and existing.communication_scheduler_config == communication_scheduler
         ):
             yield existing
             return
@@ -90,6 +96,7 @@ def fully_shard_context(
         unify_communication_stream=unify_communication_stream,
         use_trace_replay=use_trace_replay,
         enable_trace_pool=enable_trace_pool,
+        communication_scheduler_config=communication_scheduler,
     )
     token = _FSDP_CONTEXT.set(context)
     try:
@@ -111,6 +118,7 @@ def fully_shard(
     skip_backward_callback: bool = False,
     grad_divisor: int = 1,
     fuse_wgrad_accumulation: bool = False,
+    communication_policy: FsdpModuleCommunicationPolicy | None = None,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -130,6 +138,9 @@ def fully_shard(
             ``backward_dw()`` to complete.
         fuse_wgrad_accumulation: Let TE write weight gradients directly into a
             full staging buffer that MFSDP subsequently reduce-scatters.
+        communication_policy: Optional completion anchors for delayed successor
+            all-gather and reduce-scatter release. Requires a communication
+            scheduler on the enclosing context.
         grad_divisor: Additional divisor applied to the reduced gradient, on top of the
             averaging the mesh already performs. Defaults to 1, which is correct whenever
             each mesh rank contributes exactly one term to the gradient.
@@ -151,6 +162,12 @@ def fully_shard(
     context = _FSDP_CONTEXT.get()
     if context is None:
         raise RuntimeError("fully_shard must run inside fully_shard_context.")
+    communication_policy = communication_policy or FsdpModuleCommunicationPolicy()
+    if not communication_policy.is_empty and context.communication_scheduler is None:
+        raise ValueError(
+            "A non-empty communication_policy requires fully_shard_context("
+            "communication_scheduler=...)."
+        )
     for submodule in module.modules():
         if isinstance(submodule, FsdpModule) and submodule.context is not context:
             raise ValueError(
@@ -175,6 +192,7 @@ def fully_shard(
             grad_divisor=grad_divisor,
             use_symmetric_memory=context.use_symmetric_memory,
             fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+            communication_policy=communication_policy,
         )
     except Exception:
         module.__class__ = original_cls

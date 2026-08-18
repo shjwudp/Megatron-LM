@@ -409,6 +409,12 @@ def combined_forward_backward_step(
                     forward_fsdp_wrapper.post_forward_release_module,
                     forward_fsdp_wrapper.post_backward_release_module,
                 )
+                if hasattr(forward_fsdp_wrapper, "record_schedule_node_forward_completion"):
+                    layer_plan.set_fsdp_communication_hooks(
+                        forward_fsdp_wrapper.record_schedule_node_forward_completion,
+                        forward_fsdp_wrapper.record_schedule_node_pre_backward,
+                        forward_fsdp_wrapper.record_schedule_node_backward_completion,
+                    )
 
     # backward preprocess, the same as the backward_step()
     unwrap_input_tensor_grad = False

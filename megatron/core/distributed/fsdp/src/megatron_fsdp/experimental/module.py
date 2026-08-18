@@ -26,6 +26,15 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy, fp8_need_transpose_data, is_float8tensor
 from .allocator import TracePoolAllocator
+from .communication_scheduler import (
+    CommunicationPhase,
+    FsdpCommunicationScheduler,
+    FsdpCommunicationSchedulerConfig,
+    FsdpModuleCommunicationPolicy,
+    ModuleCompletion,
+    NamedCompletion,
+    NamedPreBackward,
+)
 from .execution_runner import FsdpExecutionRunner
 from .indexed_order import IndexedOrder
 from .parameter_group import Fp8ParameterGroup, FsdpParameterGroup, get_containing_parameter_group
@@ -62,6 +71,8 @@ class FsdpContext:
     # Selects static-order lookahead or traced VPP occurrence-order replay.
     runner: FsdpExecutionRunner
     trace_pool_allocator: TracePoolAllocator | None
+    communication_scheduler_config: FsdpCommunicationSchedulerConfig | None
+    communication_scheduler: FsdpCommunicationScheduler | None
 
     def __init__(
         self,
@@ -71,6 +82,7 @@ class FsdpContext:
         *,
         use_trace_replay: bool = False,
         enable_trace_pool: bool = False,
+        communication_scheduler_config: FsdpCommunicationSchedulerConfig | None = None,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -86,6 +98,8 @@ class FsdpContext:
                 storage pool. With execution replay, planning waits until one full
                 prefetch-enabled replay batch has also been observed. If symmetric
                 memory is enabled, the allocator backs its slots with that pool.
+            communication_scheduler_config: Optional trace-guided communication
+                scheduler configuration.
         """
         self.device = device
         self.is_last_microbatch = True
@@ -97,6 +111,12 @@ class FsdpContext:
         self.trace_pool_allocator = (
             TracePoolAllocator(use_symmetric_memory=use_symmetric_memory)
             if enable_trace_pool
+            else None
+        )
+        self.communication_scheduler_config = communication_scheduler_config
+        self.communication_scheduler = (
+            FsdpCommunicationScheduler(self, communication_scheduler_config)
+            if communication_scheduler_config is not None
             else None
         )
         # Construction-only; empty after finalization.
@@ -152,6 +172,8 @@ class FsdpContext:
         """Compile execution replay and the optional storage pool once per batch."""
         runner_was_tracing = self.runner.is_tracing
         self.runner.complete_trace()
+        if self.communication_scheduler is not None:
+            self.communication_scheduler.complete_trace(runner_was_tracing=runner_was_tracing)
         if self.trace_pool_allocator is not None and self.trace_pool_allocator.phase == "trace":
             if self.runner.use_trace_replay and runner_was_tracing:
                 # The first fine-grained batch learns execution order with prefetch
@@ -160,6 +182,25 @@ class FsdpContext:
                 # intervals.
                 return
             self.trace_pool_allocator.plan()
+
+    def record_completion_anchor(
+        self,
+        owner: "FsdpModule",
+        anchor: nn.Module | str,
+        phase: CommunicationPhase,
+        event: torch.cuda.Event | None = None,
+    ) -> None:
+        """Record a configured completion point for delayed communication."""
+        if self.communication_scheduler is None:
+            return
+        self.communication_scheduler.record_completion_anchor(owner, anchor, phase, event)
+
+    def finish_grad_sync(self) -> None:
+        """Submit pending gradient collectives and fence their consumers."""
+        if self.communication_scheduler is not None:
+            self.communication_scheduler.finish_grad_sync()
+        else:
+            self.current_stream().wait_stream(self.reduce_scatter_stream)
 
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""
@@ -175,7 +216,7 @@ class FsdpContext:
         """
 
         def post_backward_final_callback() -> None:
-            self.current_stream().wait_stream(self.reduce_scatter_stream)
+            self.finish_grad_sync()
 
         torch.autograd.Variable._execution_engine.queue_callback(post_backward_final_callback)
 
@@ -207,6 +248,7 @@ class FsdpModule:
     # exception is non-reentrant activation recomputation: it runs between pre_backward()
     # and post_backward(), preserving BACKWARD through its nested forward hooks.
     _phase: Phase
+    _communication_policy: FsdpModuleCommunicationPolicy
 
     def __init__(
         self,
@@ -219,6 +261,7 @@ class FsdpModule:
         fine_grained: bool = False,
         skip_backward_callback: bool = False,
         fuse_wgrad_accumulation: bool = False,
+        communication_policy: FsdpModuleCommunicationPolicy | None = None,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -226,6 +269,7 @@ class FsdpModule:
         self._name = None
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
+        self._communication_policy = communication_policy or FsdpModuleCommunicationPolicy()
         owned_parameters = _collect_owned_parameters(self)
         assert tuple(placements.dp_axes) == tuple(
             range(mesh.ndim)
@@ -268,12 +312,18 @@ class FsdpModule:
         self._register_hooks(
             fine_grained=fine_grained, skip_backward_callback=skip_backward_callback
         )
+        self._register_communication_policy_hooks()
         context.register_module(self)
 
     @property
     def context(self) -> FsdpContext:
         """Return the FSDP context."""
         return self._context
+
+    @property
+    def communication_policy(self) -> FsdpModuleCommunicationPolicy:
+        """Return this FSDP unit's communication scheduling policy."""
+        return self._communication_policy
 
     @property
     def phase(self) -> Phase:
@@ -345,6 +395,87 @@ class FsdpModule:
             for fsdp_parameter in group.fsdp_parameters:
                 fsdp_parameter.unsharded.register_post_accumulate_grad_hook(self._make_grad_hook())
 
+    def _register_communication_policy_hooks(self) -> None:
+        """Install hooks for this unit's configured communication anchors."""
+        policy = self.communication_policy
+        if policy.is_empty:
+            return
+        scheduler = self.context.communication_scheduler
+        if scheduler is None:
+            raise RuntimeError("A communication policy requires a context scheduler.")
+
+        seen_completions: set[tuple[nn.Module | str, CommunicationPhase]] = set()
+        owner_ref = ref(self)
+        for completion in policy.prefetch_successor_after:
+            if isinstance(completion, NamedCompletion):
+                key = (completion.name, completion.phase)
+                if key in seen_completions:
+                    raise ValueError("Duplicate prefetch_successor_after completion anchor.")
+                seen_completions.add(key)
+                continue
+            assert isinstance(completion, ModuleCompletion)
+            if not _is_owned_policy_anchor(self, completion.module):
+                raise ValueError(
+                    "prefetch_successor_after anchors must belong to the annotated "
+                    "FSDP unit and cannot cross a nested FSDP-unit boundary."
+                )
+            key = (completion.module, completion.phase)
+            if key in seen_completions:
+                raise ValueError("Duplicate prefetch_successor_after completion anchor.")
+            seen_completions.add(key)
+
+            if completion.phase == "forward":
+
+                def post_forward_anchor(
+                    anchor: nn.Module, _args, _output, *, owner_ref=owner_ref
+                ) -> None:
+                    owner = owner_ref()
+                    if owner is not None:
+                        owner.context.record_completion_anchor(owner, anchor, "forward")
+
+                completion.module.register_forward_hook(post_forward_anchor)
+            else:
+
+                def post_backward_anchor(
+                    anchor: nn.Module, _grad_input, _grad_output, *, owner_ref=owner_ref
+                ) -> None:
+                    owner = owner_ref()
+                    if owner is not None:
+                        owner.context.record_completion_anchor(owner, anchor, "backward")
+
+                completion.module.register_full_backward_hook(post_backward_anchor)
+
+        seen_release_modules: set[nn.Module | str] = set()
+        for release_module in policy.reduce_scatter_release_on_pre_backward:
+            if isinstance(release_module, NamedPreBackward):
+                if release_module.name in seen_release_modules:
+                    raise ValueError("Duplicate reduce-scatter pre-backward release module.")
+                seen_release_modules.add(release_module.name)
+                scheduler.register_reduce_scatter_release_anchor(self, release_module.name)
+                continue
+            if not _is_owned_policy_anchor(self, release_module):
+                raise ValueError(
+                    "reduce_scatter_release_on_pre_backward modules must belong to the "
+                    "annotated FSDP unit and cannot cross a nested FSDP-unit boundary."
+                )
+            if release_module in seen_release_modules:
+                raise ValueError("Duplicate reduce-scatter pre-backward release module.")
+            seen_release_modules.add(release_module)
+            scheduler.register_reduce_scatter_release_anchor(self, release_module)
+
+            def pre_backward_release(
+                anchor: nn.Module, _grad_output, *, owner_ref=owner_ref
+            ) -> None:
+                owner = owner_ref()
+                if owner is None:
+                    return
+                scheduler = owner.context.communication_scheduler
+                if scheduler is not None:
+                    safe_point_event = owner.context.current_stream().record_event()
+                    scheduler.record_reduce_scatter_release(owner, anchor, safe_point_event)
+
+            release_module.register_full_backward_pre_hook(pre_backward_release)
+
     def _make_grad_hook(self) -> Callable[[nn.Parameter], None]:
         module_ref = ref(self)
 
@@ -409,16 +540,24 @@ class FsdpModule:
         forward/backward order, while trace-replay mode follows the observed VPP
         occurrence order. Fine-grained hooks and eager module hooks share this path.
         """
+        scheduler = self.context.communication_scheduler
+        if scheduler is not None:
+            scheduler.demand_unshard(self, orientation)
         self._unshard_parameter_groups(orientation)
         if self._unshard_event is not None:
             self.context.current_stream().wait_event(self._unshard_event)
 
         runner = self.context.runner
-        runner.record_unshard(self, orientation)
+        is_new_occurrence = runner.record_unshard(self, orientation)
+        if not is_new_occurrence:
+            return
         prefetch = runner.suggest_prefetch(self, orientation)
         if prefetch is not None:
             next_module, next_orientation = prefetch
-            next_module._unshard_parameter_groups(next_orientation)
+            if scheduler is None:
+                next_module._unshard_parameter_groups(next_orientation)
+            else:
+                scheduler.schedule_prefetch(self, next_module, next_orientation)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
@@ -486,7 +625,16 @@ class FsdpModule:
 
         self._unshard_and_prefetch("colwise")
         for group in self._parameter_groups:
-            group.prepare_fused_wgrad_buffer()
+            scheduler = context.communication_scheduler
+            if scheduler is None or not group.fuse_wgrad_accumulation or not group.requires_grad:
+                group.prepare_fused_wgrad_buffer()
+                continue
+            scheduler.reserve_reduce_scatter(group)
+            try:
+                group.prepare_fused_wgrad_buffer()
+            except Exception:
+                scheduler.cancel_reduce_scatter_reservation(group)
+                raise
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state.
@@ -513,10 +661,11 @@ class FsdpModule:
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
-        """Pack gradients and immediately launch their reduce-scatters."""
+        """Pack gradients and submit or defer their reduce-scatters."""
         context = self.context
         reduce_scatter_stream = context.reduce_scatter_stream
         current_stream = context.current_stream()
+        scheduler = context.communication_scheduler
 
         for group in self._parameter_groups:
             if not group.requires_grad:
@@ -529,15 +678,28 @@ class FsdpModule:
                 # the reduce-scatter stream has finished consuming it.
                 partial_grad.local_buffer.record_stream(reduce_scatter_stream)
             else:
+                if scheduler is not None:
+                    scheduler.reserve_reduce_scatter(group)
                 with torch.cuda.stream(reduce_scatter_stream):
-                    partial_grad = group.allocate_partial_grad_buffer()
+                    try:
+                        partial_grad = group.allocate_partial_grad_buffer()
+                    except Exception:
+                        if scheduler is not None:
+                            scheduler.cancel_reduce_scatter_reservation(group)
+                        raise
                 current_stream.wait_stream(reduce_scatter_stream)
             group.copy_gradients_to_partial_buffer(partial_grad)
 
-            reduce_scatter_stream.wait_stream(current_stream)
-            with torch.cuda.stream(reduce_scatter_stream):
-                group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
-                group.release_partial_grad_buffer()
+            if scheduler is None:
+                reduce_scatter_stream.wait_stream(current_stream)
+                with torch.cuda.stream(reduce_scatter_stream):
+                    group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
+                    group.release_partial_grad_buffer()
+            else:
+                ready_event = current_stream.record_event()
+                scheduler.mark_reduce_scatter_ready(
+                    group, partial_grad, ready_event, self.context.is_last_microbatch
+                )
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
@@ -611,6 +773,24 @@ def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.
         )
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
+
+
+def _is_owned_policy_anchor(owner: FsdpModule, anchor: nn.Module) -> bool:
+    """Return whether ``anchor`` is inside ``owner`` without crossing an FSDP child."""
+    if anchor is owner:
+        return True
+
+    def visit(module: nn.Module) -> bool:
+        for child in module.children():
+            if child is anchor:
+                return True
+            if isinstance(child, FsdpModule):
+                continue
+            if visit(child):
+                return True
+        return False
+
+    return visit(cast(nn.Module, owner))
 
 
 # ---------------------------------------------------------------------------

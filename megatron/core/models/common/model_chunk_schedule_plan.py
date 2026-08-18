@@ -219,6 +219,45 @@ class TransformerLayerSchedulePlan:
         # After the last forward op, release forward-pass params.
         last_fwd_node.set_post_forward_hook(lambda: post_forward_hook(hook_module))
 
+    def set_fsdp_communication_hooks(
+        self, post_forward_hook, pre_backward_hook, post_backward_hook
+    ):
+        """Wire named schedule-node events to the MFSDP communication scheduler."""
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+        from megatron.core.pipeline_parallel.utils import NoopScheduleNode
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        assert isinstance(self.layer, (TransformerLayer, HybridStack, MultiTokenPredictionLayer)), (
+            "Megatron FSDP communication scheduling only supports TransformerLayer, "
+            f"HybridStack, and MultiTokenPredictionLayer, got {type(self.layer).__name__}."
+        )
+        hook_module = (
+            self.layer
+            if isinstance(self.layer, (TransformerLayer, HybridStack))
+            else self.layer.mtp_model_layer
+        )
+        for node in (
+            self.pre_dispatch_computation,
+            self.moe_dispatch,
+            self.mlp,
+            self.moe_combine,
+            self.mtp_post_process,
+        ):
+            if isinstance(node, NoopScheduleNode):
+                continue
+            node.set_fsdp_communication_hooks(
+                lambda name, event, hook_module=hook_module: post_forward_hook(
+                    hook_module, name, event
+                ),
+                lambda name, event, hook_module=hook_module: pre_backward_hook(
+                    hook_module, name, event
+                ),
+                lambda name, event, hook_module=hook_module: post_backward_hook(
+                    hook_module, name, event
+                ),
+            )
+
     def get_fp8_context(self):
         """
         Get the fp8 context for the transformer layer.
