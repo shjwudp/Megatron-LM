@@ -37,6 +37,7 @@ def fully_shard_context(
     reuse_existing: bool = False,
     use_trace_replay: bool = False,
     use_symmetric_memory: bool = False,
+    enable_trace_pool: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -56,6 +57,8 @@ def fully_shard_context(
             it for prefetch. Defaults to static forward/backward-order lookahead.
         use_symmetric_memory: Allocate communication staging buffers from PyTorch's
             NCCL symmetric-memory pool.
+        enable_trace_pool: Trace temporary-buffer lifetimes for one global batch,
+            then reuse fixed physical slots. Incompatible with symmetric memory.
     """
     requested_device = torch.device(device) if device is not None else torch.device("cuda")
     if requested_device.type == "cuda" and requested_device.index is None:
@@ -67,6 +70,7 @@ def fully_shard_context(
             and existing.device == requested_device
             and existing.runner.use_trace_replay == use_trace_replay
             and existing.use_symmetric_memory == use_symmetric_memory
+            and (existing.trace_pool_allocator is not None) == enable_trace_pool
         ):
             yield existing
             return
@@ -79,6 +83,7 @@ def fully_shard_context(
         device=requested_device,
         use_symmetric_memory=use_symmetric_memory,
         use_trace_replay=use_trace_replay,
+        enable_trace_pool=enable_trace_pool,
     )
     token = _FSDP_CONTEXT.set(context)
     try:
