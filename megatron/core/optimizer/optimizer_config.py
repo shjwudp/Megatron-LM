@@ -374,6 +374,9 @@ class OptimizerConfig:
     clip_grad: float = 1.0
     """Gradient clipping based on global L2 norm."""
 
+    log_grad_norm: bool = False
+    """If true, calculate and log the gradient norm even when gradient clipping is disabled."""
+
     grad_norm_skip_threshold: float = float('inf')
     """Skip gradient update if the gradient norm exceeds this threshold.
 

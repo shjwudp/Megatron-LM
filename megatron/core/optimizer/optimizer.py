@@ -829,6 +829,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         grad_norm = 0.0
         if self.config.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
+        elif self.config.log_grad_norm:
+            grad_norm = self.get_grad_norm()
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
 

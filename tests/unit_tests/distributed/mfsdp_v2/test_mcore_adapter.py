@@ -315,7 +315,7 @@ class TestMcoreAdapter:
         reference_optimizer = get_megatron_optimizer(
             reference_optimizer_config, [reference_model], use_gloo_process_groups=False
         )
-        optimizer_config = replace(reference_optimizer_config)
+        optimizer_config = replace(reference_optimizer_config, log_grad_norm=True)
         with pytest.raises(
             ValueError, match="MFSDP v2 currently requires use_distributed_optimizer=False"
         ):
@@ -367,6 +367,7 @@ class TestMcoreAdapter:
             reference_losses.append(torch.stack(microbatch_losses).mean())
 
         losses = []
+        grad_norms = []
         for microbatches in steps:
             model.zero_grad_buffer()
             optimizer.zero_grad(set_to_none=True)
@@ -376,8 +377,9 @@ class TestMcoreAdapter:
                 loss = output.float().square().mean()
                 (loss / len(microbatches)).backward()
                 microbatch_losses.append(loss.detach())
-            success, _, _ = optimizer.step()
+            success, grad_norm, _ = optimizer.step()
             assert success
+            grad_norms.append(grad_norm)
             losses.append(torch.stack(microbatch_losses).mean())
 
         losses = torch.stack(losses)
@@ -385,6 +387,9 @@ class TestMcoreAdapter:
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
         torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
+        grad_norms = torch.tensor(grad_norms)
+        assert torch.isfinite(grad_norms).all()
+        assert torch.all(grad_norms > 0)
 
         # The optimizer must refresh every chunk's compute weights once per step.
         assert all(count == len(steps) for count in sync_counts.values())

@@ -315,6 +315,9 @@ class LoggerConfig:
     log_l2_norm_grad_to_tensorboard: bool = False
     """Enable gradients logging to tensorboard."""
 
+    log_grad_norm: bool = False
+    """If set, calculate and log the gradient norm even when gradient clipping is disabled."""
+
     log_num_zeros_in_grad: bool = False
     """If set, calculate and log the number of zeros in gradient."""
 
