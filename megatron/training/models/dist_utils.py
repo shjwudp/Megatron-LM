@@ -12,7 +12,10 @@ from megatron.core.distributed import (
     DistributedDataParallelConfig,
     FullyShardedDataParallel,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpCommunicationSchedulerConfig,
+    fully_shard_context,
+)
 from megatron.core.full_cuda_graph import get_shared_capture_stream
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
@@ -360,11 +363,20 @@ def _ddp_wrap(
             and ddp_config.megatron_fsdp_version == 2
             and len(model) > 1
         )
+        fsdp_communication_scheduler = (
+            FsdpCommunicationSchedulerConfig(ddp_config.fsdp_max_pending_reduce_scatter_bytes)
+            if (
+                ddp_config.fsdp_prefetch_successor_after
+                or ddp_config.fsdp_reduce_scatter_release_on_pre_backward
+            )
+            else None
+        )
         fsdp_context_cm = (
             fully_shard_context(
                 use_trace_replay=get_model_config(model[0]).overlap_moe_expert_parallel_comm,
                 use_symmetric_memory=ddp_config.nccl_ub,
                 enable_trace_pool=ddp_config.fsdp_trace_pool,
+                communication_scheduler=fsdp_communication_scheduler,
             )
             if wrap_v2_shared_context
             else nullcontext()

@@ -150,6 +150,22 @@ class DistributedDataParallelConfig:
       to share storage. With NCCL user buffers, the slots use PyTorch symmetric memory.
     """
 
+    fsdp_prefetch_successor_after: Tuple[str, ...] = ()
+    """MFSDP v2 delayed-prefetch rules. Each rule is
+      ``SOURCE_GLOB:PHASE:DESCENDANT_GLOB``. Prefix the descendant with ``@``
+      to select a named combined-schedule node instead of an ``nn.Module``.
+    """
+
+    fsdp_reduce_scatter_release_on_pre_backward: Tuple[str, ...] = ()
+    """MFSDP v2 reduce-scatter release rules. Each rule is
+      ``SOURCE_GLOB:DESCENDANT_GLOB``; ``@NAME`` selects a named schedule node.
+    """
+
+    fsdp_max_pending_reduce_scatter_bytes: Optional[int] = None
+    """Maximum MFSDP v2 deferred reduce-scatter bytes. ``None`` infers the
+      limit, zero keeps reduce-scatter eager, and a positive value overrides it.
+    """
+
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
     """Whether to fall back to persistent buffer when a bucket does not
        fit FSDP double buffer size. If true, FSDP will use the persistently 
@@ -262,6 +278,31 @@ class DistributedDataParallelConfig:
         """Check the validity of the config."""
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
+
+        self.fsdp_prefetch_successor_after = tuple(self.fsdp_prefetch_successor_after)
+        self.fsdp_reduce_scatter_release_on_pre_backward = tuple(
+            self.fsdp_reduce_scatter_release_on_pre_backward
+        )
+        if (
+            self.fsdp_max_pending_reduce_scatter_bytes is not None
+            and self.fsdp_max_pending_reduce_scatter_bytes < 0
+        ):
+            raise ValueError("fsdp_max_pending_reduce_scatter_bytes must be non-negative")
+        if (
+            self.fsdp_max_pending_reduce_scatter_bytes is not None
+            and not self.fsdp_reduce_scatter_release_on_pre_backward
+        ):
+            raise ValueError(
+                "fsdp_max_pending_reduce_scatter_bytes requires at least one "
+                "fsdp_reduce_scatter_release_on_pre_backward rule"
+            )
+        communication_scheduler_enabled = bool(
+            self.fsdp_prefetch_successor_after or self.fsdp_reduce_scatter_release_on_pre_backward
+        )
+        if communication_scheduler_enabled and (
+            not self.use_megatron_fsdp or self.megatron_fsdp_version != 2
+        ):
+            raise ValueError("FSDP communication scheduling requires Megatron-FSDP v2")
 
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."

@@ -15,8 +15,9 @@
 import logging
 import random
 from contextlib import contextmanager
+from fnmatch import fnmatchcase
 from functools import partial
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Literal, Optional, Tuple, Type
 
 __all__ = ["FullyShardedDataParallel"]
 
@@ -59,6 +60,11 @@ try:
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
         Flat,
+        FsdpCommunicationSchedulerConfig,
+        FsdpModuleCommunicationPolicy,
+        ModuleCompletion,
+        NamedCompletion,
+        NamedPreBackward,
         Partial,
         Placements,
         Replicate,
@@ -540,6 +546,143 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 submodule.linear_fc1.fuse_wgrad_accumulation = True
                 submodule.linear_fc2.fuse_wgrad_accumulation = True
 
+    @staticmethod
+    def _communication_scheduler_config(
+        ddp_config: DistributedDataParallelConfig,
+    ) -> "FsdpCommunicationSchedulerConfig | None":
+        """Build the low-level scheduler config when at least one rule is enabled."""
+        if not (
+            ddp_config.fsdp_prefetch_successor_after
+            or ddp_config.fsdp_reduce_scatter_release_on_pre_backward
+        ):
+            return None
+        return FsdpCommunicationSchedulerConfig(ddp_config.fsdp_max_pending_reduce_scatter_bytes)
+
+    @staticmethod
+    def _build_communication_policies(
+        candidates: list[tuple[str, nn.Module]], ddp_config: DistributedDataParallelConfig
+    ) -> "dict[nn.Module, FsdpModuleCommunicationPolicy]":
+        """Resolve MCore FQN/schedule-node rules into low-level module policies."""
+        prefetch_rules = []
+        for text in ddp_config.fsdp_prefetch_successor_after:
+            parts = text.split(":", 2)
+            if len(parts) != 3 or parts[1] not in ("forward", "backward"):
+                raise ValueError(
+                    "MFSDP prefetch rules must use "
+                    "SOURCE_GLOB:forward|backward:DESCENDANT_GLOB, got "
+                    f"{text!r}."
+                )
+            prefetch_rules.append((text, parts[0], parts[1], parts[2]))
+
+        release_rules = []
+        for text in ddp_config.fsdp_reduce_scatter_release_on_pre_backward:
+            parts = text.split(":", 1)
+            if len(parts) != 2:
+                raise ValueError(
+                    "MFSDP reduce-scatter release rules must use "
+                    f"SOURCE_GLOB:DESCENDANT_GLOB, got {text!r}."
+                )
+            release_rules.append((text, parts[0], parts[1]))
+
+        completions_by_source: dict[nn.Module, list[ModuleCompletion | NamedCompletion]] = {}
+        releases_by_source: dict[nn.Module, list[nn.Module | NamedPreBackward]] = {}
+        matched_prefetch_rules: set[str] = set()
+        matched_release_rules: set[str] = set()
+
+        for source_fqn, source in candidates:
+            display_fqn = source_fqn or "<root>"
+            for text, source_glob, phase, anchor_selector in prefetch_rules:
+                if not fnmatchcase(display_fqn, source_glob):
+                    continue
+                matched_prefetch_rules.add(text)
+                if anchor_selector.startswith("@"):
+                    completion = NamedCompletion(anchor_selector[1:], phase)
+                    completions_by_source.setdefault(source, []).append(completion)
+                    logger.info(
+                        "MFSDP communication rule %r matched %s -> named node %s.",
+                        text,
+                        display_fqn,
+                        anchor_selector,
+                    )
+                    continue
+
+                anchor_matches = [
+                    (relative_fqn or "<self>", anchor)
+                    for relative_fqn, anchor in source.named_modules()
+                    if fnmatchcase(relative_fqn or "<self>", anchor_selector)
+                ]
+                if not anchor_matches:
+                    raise ValueError(
+                        f"MFSDP communication rule {text!r} matched source {display_fqn!r} "
+                        "but no descendant anchor."
+                    )
+                for anchor_fqn, anchor in anchor_matches:
+                    completions_by_source.setdefault(source, []).append(
+                        ModuleCompletion(anchor, phase)
+                    )
+                    logger.info(
+                        "MFSDP communication rule %r matched %s -> %s.",
+                        text,
+                        display_fqn,
+                        anchor_fqn,
+                    )
+
+            for text, source_glob, anchor_selector in release_rules:
+                if not fnmatchcase(display_fqn, source_glob):
+                    continue
+                matched_release_rules.add(text)
+                if anchor_selector.startswith("@"):
+                    releases_by_source.setdefault(source, []).append(
+                        NamedPreBackward(anchor_selector[1:])
+                    )
+                    logger.info(
+                        "MFSDP communication rule %r matched %s -> named node %s.",
+                        text,
+                        display_fqn,
+                        anchor_selector,
+                    )
+                    continue
+
+                anchor_matches = [
+                    (relative_fqn or "<self>", anchor)
+                    for relative_fqn, anchor in source.named_modules()
+                    if fnmatchcase(relative_fqn or "<self>", anchor_selector)
+                ]
+                if not anchor_matches:
+                    raise ValueError(
+                        f"MFSDP communication rule {text!r} matched source {display_fqn!r} "
+                        "but no descendant release module."
+                    )
+                for anchor_fqn, anchor in anchor_matches:
+                    releases_by_source.setdefault(source, []).append(anchor)
+                    logger.info(
+                        "MFSDP communication rule %r matched %s -> %s.",
+                        text,
+                        display_fqn,
+                        anchor_fqn,
+                    )
+
+        unmatched_prefetch = [
+            text for text, *_rest in prefetch_rules if text not in matched_prefetch_rules
+        ]
+        unmatched_release = [
+            text for text, *_rest in release_rules if text not in matched_release_rules
+        ]
+        if unmatched_prefetch or unmatched_release:
+            raise ValueError(
+                "MFSDP communication rules did not match an FSDP unit: "
+                f"{unmatched_prefetch + unmatched_release!r}."
+            )
+
+        return {
+            source: FsdpModuleCommunicationPolicy(
+                prefetch_successor_after=tuple(completions_by_source.get(source, ())),
+                reduce_scatter_release_on_pre_backward=tuple(releases_by_source.get(source, ())),
+            )
+            for _fqn, source in candidates
+            if source in completions_by_source or source in releases_by_source
+        }
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -585,6 +728,24 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if fsdp_unit_modules is None:
             fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+        named_modules = list(module.named_modules())
+        moe_expert_modules = tuple(
+            submodule.experts
+            for _submodule_fqn, submodule in named_modules
+            if isinstance(submodule, MoELayer)
+        )
+        communication_candidates = [
+            (fqn, submodule)
+            for fqn, submodule in named_modules
+            if submodule is module
+            or any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules)
+            or submodule in moe_expert_modules
+            or isinstance(submodule, TEGroupedMLP)
+        ]
+        communication_policies = self._build_communication_policies(
+            communication_candidates, ddp_config
+        )
+        communication_scheduler = self._communication_scheduler_config(ddp_config)
         self._configure_te_grouped_mlp_wgrad_fusion(
             module, enabled=config.gradient_accumulation_fusion
         )
@@ -658,12 +819,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             use_trace_replay=fine_grained,
             use_symmetric_memory=ddp_config.nccl_ub,
             enable_trace_pool=ddp_config.fsdp_trace_pool,
+            communication_scheduler=communication_scheduler,
         ):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
                 # Their gradients need the EP divisor because the same expert receives
                 # contributions after dispatch from every EP rank.
-                for submodule in module.modules():
+                for _submodule_fqn, submodule in named_modules:
                     if isinstance(submodule, MoELayer):
                         fully_shard(
                             submodule.experts,
@@ -677,8 +839,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                                 and isinstance(submodule.experts, TEGroupedMLP)
                             ),
                             grad_divisor=config.expert_model_parallel_size,
+                            communication_policy=communication_policies.get(
+                                submodule.experts
+                            ),
                         )
-            for submodule in reversed(list(module.modules())):
+            for _submodule_fqn, submodule in reversed(named_modules):
                 if submodule is module:
                     # The root is always sharded after selected child units so it is not
                     # wrapped twice when its type also appears in fsdp_unit_modules.
@@ -695,6 +860,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             config.gradient_accumulation_fusion
                             and isinstance(submodule, TEGroupedMLP)
                         ),
+                        communication_policy=communication_policies.get(submodule),
                     )
                 elif isinstance(submodule, TEGroupedMLP) and not isinstance(submodule, FsdpModule):
                     # Real MoE layers are sharded through their MoELayer owner above. Keep
@@ -719,6 +885,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             config.gradient_accumulation_fusion
                             and isinstance(submodule, TEGroupedMLP)
                         ),
+                        communication_policy=communication_policies.get(submodule),
                     )
             fully_shard(
                 module,
@@ -730,6 +897,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 fuse_wgrad_accumulation=(
                     config.gradient_accumulation_fusion and isinstance(module, TEGroupedMLP)
                 ),
+                communication_policy=communication_policies.get(module),
             )
         super().__init__(config=config, module=module)
         if config.init_model_with_meta_device:
@@ -815,6 +983,45 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             """
             self.module.context.ensure_finalized()
 
+        def record_schedule_node_completion(
+            module: torch.nn.Module,
+            name: str,
+            event: torch.cuda.Event,
+            phase: Literal["forward", "backward"],
+        ) -> None:
+            """Record a configured named node completion on its actual stream."""
+            module = _require_fsdp_module(module)
+            if not any(
+                isinstance(completion, NamedCompletion)
+                and completion.name == name
+                and completion.phase == phase
+                for completion in module.communication_policy.prefetch_successor_after
+            ):
+                return
+            module.context.record_completion_anchor(module, name, phase, event)
+
+        def record_schedule_node_pre_backward(
+            module: torch.nn.Module, name: str, event: torch.cuda.Event
+        ) -> None:
+            """Release pending RS at a configured named node pre-backward point."""
+            module = _require_fsdp_module(module)
+            if not any(
+                isinstance(anchor, NamedPreBackward) and anchor.name == name
+                for anchor in module.communication_policy.reduce_scatter_release_on_pre_backward
+            ):
+                return
+            if module.phase is FsdpModule.Phase.RESTING:
+                module.pre_backward(register_final_callback=False)
+            elif module.phase is FsdpModule.Phase.BACKWARD:
+                module._unshard_and_prefetch("colwise")
+            else:
+                raise RuntimeError(
+                    "Named MFSDP pre-backward anchor reached a module still in " f"{module.phase}."
+                )
+            scheduler = module.context.communication_scheduler
+            assert scheduler is not None
+            scheduler.record_reduce_scatter_release(module, name, event)
+
         # The 1F1B schedule finds the FSDP wrapper via find_megatron_fsdp(),
         # which may return the bare FsdpModule (no ddp_config). Expose the
         # adapter's ddp_config on the module so the schedule can read the
@@ -829,6 +1036,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         self.post_backward_release_module = partial(release_module, reduce_grad=True)
         self.pre_backward = partial(self.module.pre_backward, register_final_callback=False)
         self.post_backward = self.module.post_backward
+        if self.module.context.communication_scheduler is not None:
+            self.record_schedule_node_forward_completion = partial(
+                record_schedule_node_completion, phase="forward"
+            )
+            self.record_schedule_node_pre_backward = record_schedule_node_pre_backward
+            self.record_schedule_node_backward_completion = partial(
+                record_schedule_node_completion, phase="backward"
+            )
 
     @staticmethod
     def _validate_config(
@@ -1018,7 +1233,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         still be in flight when ``finalize_model_grads`` reaches this method.
         """
         context = self.module.context
-        context.current_stream().wait_stream(context.reduce_scatter_stream)
+        context.finish_grad_sync()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""

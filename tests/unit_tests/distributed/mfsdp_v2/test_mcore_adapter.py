@@ -14,6 +14,9 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
+    ModuleCompletion,
+    NamedCompletion,
+    NamedPreBackward,
     Partial,
     Replicate,
     fully_shard_context,
@@ -63,6 +66,34 @@ class TestMcoreAdapterDense:
 
     def teardown_method(self):
         Utils.destroy_model_parallel()
+
+    def test_communication_rules_resolve_modules_and_named_schedule_nodes(self):
+        """MCore string selectors should stay outside the low-level scheduler API."""
+        source = torch.nn.ModuleDict({"anchor": torch.nn.ReLU()})
+        ddp_config = DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            fsdp_prefetch_successor_after=(
+                "layers.*:forward:@moe_combine",
+                "layers.*:backward:anchor",
+            ),
+            fsdp_reduce_scatter_release_on_pre_backward=("layers.*:@pre_dispatch_computation",),
+        )
+        policies = mcore_fsdp_adapter.FullyShardedDataParallelV2._build_communication_policies(
+            [("layers.0", source)], ddp_config
+        )
+
+        policy = policies[source]
+        assert NamedCompletion("moe_combine", "forward") in policy.prefetch_successor_after
+        assert any(
+            isinstance(completion, ModuleCompletion)
+            and completion.module is source["anchor"]
+            and completion.phase == "backward"
+            for completion in policy.prefetch_successor_after
+        )
+        assert policy.reduce_scatter_release_on_pre_backward == (
+            NamedPreBackward("pre_dispatch_computation"),
+        )
 
     def test_wraps_fsdp_unit_modules_before_root(self, monkeypatch):
         config = TransformerConfig(

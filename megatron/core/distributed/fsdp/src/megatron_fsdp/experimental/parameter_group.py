@@ -110,6 +110,7 @@ class FsdpParameterGroup:
     fuse_wgrad_accumulation: bool
     _model_weight_placements: tuple[Placement, ...]
     _partial_grad_dtype: torch.dtype | None
+    _partial_grad_nbytes_cache: dict[torch.dtype, int]
     _fused_wgrad_buffer: DBuffer | None
     # Cached sharded-gradient DTensors keyed by the main_grad DBuffer identity.
     # Rebuilding DTensors every backward costs O(params) ``_FromTorchTensor``
@@ -223,6 +224,7 @@ class FsdpParameterGroup:
         self._fused_wgrad_buffer = None
         self._main_grad_dtype = None
         self._partial_grad_dtype = None
+        self._partial_grad_nbytes_cache = {}
         self._grad_dtensor_cache = []
         self._grad_dtensor_cache_main_grad_id = None
         if self.requires_grad:
@@ -548,6 +550,24 @@ class FsdpParameterGroup:
             parameter = fsdp_parameter.unsharded
             parameter.grad_added_to_main_grad = False
             parameter.main_grad = None
+
+    def partial_grad_nbytes(self) -> int:
+        """Return the full local reduce-scatter input size before allocation."""
+        if not self.requires_grad or self._partial_grad_dtype is None:
+            return 0
+        grad_dtype = self._partial_grad_dtype
+        for index, _fsdp_parameter in enumerate(self.fsdp_parameters):
+            grad = self._get_unsharded_parameter(index).grad
+            if grad is not None:
+                grad_dtype = grad.dtype
+                break
+        num_bytes = self._partial_grad_nbytes_cache.get(grad_dtype)
+        if num_bytes is None:
+            num_bytes = (
+                self.main_weight.layout.size * torch.empty((), dtype=grad_dtype).element_size()
+            )
+            self._partial_grad_nbytes_cache[grad_dtype] = num_bytes
+        return num_bytes
 
     def get_fused_wgrad(self, index: int) -> torch.Tensor:
         """Return a full parameter-shaped view for TE's fused wgrad GEMM."""
