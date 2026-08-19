@@ -60,6 +60,11 @@ point (during accumulation it may contain an older contribution). TE's
 `register_wgrad_accumulation_and_reduce_hooks()`. It does not re-fire the
 PyTorch hook.
 
+A minimal PyTorch-only reproduction, using a mock module with
+`backward_dw()`, is provided in
+`examples/megatron_fsdp/delay_wgrad_hook_order.py`. The focused unit test uses
+a real TE linear to verify that TE follows the same ordering.
+
 FSDP v2 does not currently register its parameter-completion callbacks through
 TE's delayed-wgrad API. It instead skips the PyTorch callbacks for this path
 and lets the schedule's explicit `post_backward_release_module()` call reduce
