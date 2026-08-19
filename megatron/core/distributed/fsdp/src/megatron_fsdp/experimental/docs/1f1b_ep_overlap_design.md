@@ -51,12 +51,20 @@ calls explicitly at the right moments.
 
 ### Why `delay_wgrad_compute` matters for FSDP
 
-With `delay_wgrad_compute=True`, the per-param `post_accumulate_grad_hook`
-fires when activation gradients are ready, **before** `backward_dw()` writes
-weight gradients. Reducing at that point would reduce only partial gradients.
-FSDP v2 therefore skips the autograd final-callback path for this schedule and
-lets the schedule's explicit `post_backward_release_module()` call handle
-reduction **after** `backward_dw()` completes.
+With `delay_wgrad_compute=True`, PyTorch's per-parameter
+`post_accumulate_grad_hook` fires during activation backward, **before**
+`backward_dw()` writes the current weight-gradient contribution. In a clean
+single-backward test the delayed parameter's `.grad` is still `None` at this
+point (during accumulation it may contain an older contribution). TE's
+`backward_dw()` later writes `.grad` and invokes a separate callback API,
+`register_wgrad_accumulation_and_reduce_hooks()`. It does not re-fire the
+PyTorch hook.
+
+FSDP v2 does not currently register its parameter-completion callbacks through
+TE's delayed-wgrad API. It instead skips the PyTorch callbacks for this path
+and lets the schedule's explicit `post_backward_release_module()` call reduce
+and reshard the whole FSDP unit **after all of the layer's `backward_dw()` work
+completes**.
 
 ---
 
@@ -230,19 +238,27 @@ mesh, and the root).
 
 ### Problem
 
-The normal backward path uses per-param `post_accumulate_grad_hook`
-(registered in `FsdpModule._register_hooks()`) to detect when all parameter
-gradients are ready, then calls `post_backward()` which reshards and reduces.
-With `delay_wgrad_compute=True`, this hook fires during `backward()`
-(activation gradients only), but weight gradients are written later in
-`backward_dw()`, so reduction would see partial gradients.
+The normal backward path uses PyTorch's per-param
+`post_accumulate_grad_hook` (registered in `FsdpModule._register_hooks()`) to
+detect when all parameter gradients are ready, then calls `post_backward()`
+which reshards and reduces. With `delay_wgrad_compute=True`, this hook fires
+during activation backward before the current delayed weight-gradient
+contribution exists; its weight gradient is written later in `backward_dw()`.
+
+TE does invoke callbacks registered with
+`register_wgrad_accumulation_and_reduce_hooks()` after `backward_dw()` writes
+the gradient. Those are TE-specific callbacks, not PyTorch
+`post_accumulate_grad_hook`s. DDP integrates with this TE callback API. MFSDP
+v1 instead installs `post_wgrad_grad_acc_hook` callbacks that the schedule
+invokes immediately after `backward_dw()`. The experimental v2 implementation
+does not currently use either delayed-wgrad callback path.
 
 ### Solution
 
 When `skip_backward_callback=True`, `_register_hooks()` does **not** register
-per-param `post_accumulate_grad_hook`; reduction relies entirely on the
-schedule's explicit `post_backward_release_module()` call, which fires after
-`backward_dw()`:
+per-param `post_accumulate_grad_hook`; reduction relies on the schedule's
+explicit `post_backward_release_module()` call, which fires after all delayed
+weight-gradient callables for the layer:
 
 ```python
 # In FsdpModule._register_hooks()
