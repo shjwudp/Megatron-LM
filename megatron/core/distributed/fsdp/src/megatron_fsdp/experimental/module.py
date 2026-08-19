@@ -569,7 +569,6 @@ def _specialize_placements(
             )
     return tuple(Flat() if type(placement) is Shard else placement for placement in placements)
 
-
 # ---------------------------------------------------------------------------
 # Fine-grained hook registration for 1F1B EP overlap support
 # ---------------------------------------------------------------------------
