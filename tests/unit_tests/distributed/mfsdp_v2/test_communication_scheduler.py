@@ -43,6 +43,12 @@ def test_scheduler_config_rejects_negative_pending_bytes() -> None:
         FsdpCommunicationSchedulerConfig(max_pending_reduce_scatter_bytes=-1)
 
 
+def test_scheduler_config_rejects_nonpositive_prefetch_depth() -> None:
+    """Prefetch depth is a one-based traced-occurrence distance."""
+    with pytest.raises(ValueError, match="prefetch_depth must be positive"):
+        FsdpCommunicationSchedulerConfig(prefetch_depth=0)
+
+
 def test_ddp_pending_byte_override_requires_release_rule() -> None:
     """A standalone byte limit must not be silently ignored by MCore."""
     with pytest.raises(ValueError, match="requires at least one"):
@@ -51,6 +57,28 @@ def test_ddp_pending_byte_override_requires_release_rule() -> None:
             megatron_fsdp_version=2,
             fsdp_max_pending_reduce_scatter_bytes=1024,
         )
+
+
+def test_ddp_prefetch_depth_requires_prefetch_rule() -> None:
+    """A non-default depth must not be silently ignored without an AG rule."""
+    with pytest.raises(ValueError, match="requires at least one"):
+        DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            fsdp_prefetch_depth=2,
+        )
+
+
+def test_static_runner_rejects_deep_prefetch(distributed_setup) -> None:
+    """Depth greater than one relies on occurrence trace replay."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    module = nn.Linear(4, 4, bias=False).to(device)
+    with fully_shard_context(device=device):
+        fully_shard(module, mesh=mesh, placements=_flat_placements())
+
+    with pytest.raises(ValueError, match="requires trace replay"):
+        module.context.runner.suggest_prefetch(module, "rowwise", depth=2)
 
 
 def test_nonempty_policy_requires_context_scheduler(distributed_setup) -> None:
@@ -125,6 +153,50 @@ def test_completion_anchor_releases_traced_successor(distributed_setup, monkeypa
 
     scheduler.record_completion_anchor(modules[0], modules[0], "forward")
     assert calls == ["rowwise"]
+    assert not scheduler.has_pending_prefetches
+
+
+def test_module_prefetches_configured_future_occurrence(distributed_setup, monkeypatch) -> None:
+    """The module path should queue the configured-depth target at its anchor."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    modules = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(3)]).to(device)
+    config = FsdpCommunicationSchedulerConfig(
+        max_pending_reduce_scatter_bytes=0, prefetch_depth=2
+    )
+    policy = FsdpModuleCommunicationPolicy(
+        prefetch_successor_after=(ModuleCompletion(modules[0], "forward"),)
+    )
+    with fully_shard_context(device=device, communication_scheduler=config) as context:
+        fully_shard(
+            modules[0], mesh=mesh, placements=_flat_placements(), communication_policy=policy
+        )
+        for module in modules[1:]:
+            fully_shard(module, mesh=mesh, placements=_flat_placements())
+
+    runner = context.runner
+    scheduler = context.communication_scheduler
+    assert scheduler is not None
+    runner.record_unshard(modules[0], "rowwise")
+    runner.record_completion(modules[0], modules[0], "forward")
+    runner.record_unshard(modules[1], "rowwise")
+    runner.record_unshard(modules[2], "rowwise")
+    runner.complete_trace()
+
+    calls = []
+    for index, module in enumerate(modules):
+        monkeypatch.setattr(
+            module,
+            "_unshard_parameter_groups",
+            lambda orientation, index=index: calls.append((index, orientation)),
+        )
+
+    modules[0]._unshard_and_prefetch("rowwise")
+    assert calls == [(0, "rowwise")]
+    assert scheduler.has_pending_prefetches
+
+    scheduler.record_completion_anchor(modules[0], modules[0], "forward")
+    assert calls == [(0, "rowwise"), (2, "rowwise")]
     assert not scheduler.has_pending_prefetches
 
 

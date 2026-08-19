@@ -156,6 +156,12 @@ class DistributedDataParallelConfig:
       to select a named combined-schedule node instead of an ``nn.Module``.
     """
 
+    fsdp_prefetch_depth: int = 1
+    """One-based future ``UNSHARD`` occurrence selected by each MFSDP v2
+      prefetch. One preserves immediate-successor prefetch; larger values
+      increase lead time and full-parameter residency.
+    """
+
     fsdp_reduce_scatter_release_on_pre_backward: Tuple[str, ...] = ()
     """MFSDP v2 reduce-scatter release rules. Each rule is
       ``SOURCE_GLOB:DESCENDANT_GLOB``; ``@NAME`` selects a named schedule node.
@@ -283,6 +289,12 @@ class DistributedDataParallelConfig:
         self.fsdp_reduce_scatter_release_on_pre_backward = tuple(
             self.fsdp_reduce_scatter_release_on_pre_backward
         )
+        if self.fsdp_prefetch_depth < 1:
+            raise ValueError("fsdp_prefetch_depth must be positive")
+        if self.fsdp_prefetch_depth != 1 and not self.fsdp_prefetch_successor_after:
+            raise ValueError(
+                "fsdp_prefetch_depth requires at least one fsdp_prefetch_successor_after rule"
+            )
         if (
             self.fsdp_max_pending_reduce_scatter_bytes is not None
             and self.fsdp_max_pending_reduce_scatter_bytes < 0

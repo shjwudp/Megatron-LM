@@ -364,7 +364,10 @@ def _ddp_wrap(
             and len(model) > 1
         )
         fsdp_communication_scheduler = (
-            FsdpCommunicationSchedulerConfig(ddp_config.fsdp_max_pending_reduce_scatter_bytes)
+            FsdpCommunicationSchedulerConfig(
+                max_pending_reduce_scatter_bytes=ddp_config.fsdp_max_pending_reduce_scatter_bytes,
+                prefetch_depth=ddp_config.fsdp_prefetch_depth,
+            )
             if (
                 ddp_config.fsdp_prefetch_successor_after
                 or ddp_config.fsdp_reduce_scatter_release_on_pre_backward
