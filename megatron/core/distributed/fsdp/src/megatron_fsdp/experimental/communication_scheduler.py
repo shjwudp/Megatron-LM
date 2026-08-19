@@ -281,21 +281,16 @@ class FsdpCommunicationScheduler:
         torch.cuda.nvtx.range_pop()
 
     def demand_unshard(self, target: "FsdpModule", orientation: str) -> None:
-        """Release queued gathers for a module demanded by current compute."""
-        retained: deque[_PendingPrefetch] = deque()
-        released = False
-        while self._pending_prefetches:
-            pending = self._pending_prefetches.popleft()
-            if pending.target is target:
-                pending.target._unshard_parameter_groups(orientation)
-                released = True
-            else:
-                retained.append(pending)
-        self._pending_prefetches = retained
-        if released:
+        """Release the oldest queued gather for the demanded module occurrence."""
+        for index, pending in enumerate(self._pending_prefetches):
+            if pending.target is not target or pending.orientation != orientation:
+                continue
+            del self._pending_prefetches[index]
+            pending.target._unshard_parameter_groups(pending.orientation)
             self._demand_releases += 1
             torch.cuda.nvtx.range_push("MFSDP delayed AG demand release")
             torch.cuda.nvtx.range_pop()
+            return
 
     def record_reduce_scatter_release(
         self, owner: "FsdpModule", anchor: nn.Module | str, demand_event: torch.cuda.Event | None

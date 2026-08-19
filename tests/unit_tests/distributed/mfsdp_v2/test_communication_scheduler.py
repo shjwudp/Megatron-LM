@@ -165,6 +165,60 @@ def test_demand_unshard_is_delayed_prefetch_backstop(distributed_setup, monkeypa
     assert not scheduler.has_pending_prefetches
 
 
+def test_demand_unshard_releases_only_matching_occurrence(
+    distributed_setup, monkeypatch
+) -> None:
+    """A demand must retain future prefetches for other orientations."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    modules = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(3)]).to(device)
+    forward_policy = FsdpModuleCommunicationPolicy(
+        prefetch_successor_after=(ModuleCompletion(modules[0], "forward"),)
+    )
+    backward_policy = FsdpModuleCommunicationPolicy(
+        prefetch_successor_after=(ModuleCompletion(modules[1], "backward"),)
+    )
+    with fully_shard_context(
+        device=device, communication_scheduler=FsdpCommunicationSchedulerConfig(0)
+    ) as context:
+        fully_shard(
+            modules[0],
+            mesh=mesh,
+            placements=_flat_placements(),
+            communication_policy=forward_policy,
+        )
+        fully_shard(
+            modules[1],
+            mesh=mesh,
+            placements=_flat_placements(),
+            communication_policy=backward_policy,
+        )
+        fully_shard(modules[2], mesh=mesh, placements=_flat_placements())
+
+    runner = context.runner
+    scheduler = context.communication_scheduler
+    assert scheduler is not None
+    runner.record_unshard(modules[0], "rowwise")
+    runner.record_completion(modules[1], modules[1], "backward")
+    runner.complete_trace()
+    runner.record_unshard(modules[0], "rowwise")
+
+    calls = []
+    monkeypatch.setattr(
+        modules[2], "_unshard_parameter_groups", lambda orientation: calls.append(orientation)
+    )
+    scheduler.schedule_prefetch(modules[0], modules[2], "rowwise")
+    scheduler.schedule_prefetch(modules[1], modules[2], "colwise")
+
+    scheduler.demand_unshard(modules[2], "rowwise")
+    assert calls == ["rowwise"]
+    assert scheduler.has_pending_prefetches
+
+    scheduler.record_completion_anchor(modules[1], modules[1], "backward")
+    assert calls == ["rowwise", "colwise"]
+    assert not scheduler.has_pending_prefetches
+
+
 def test_reduce_scatter_waits_for_pre_backward_release(distributed_setup, monkeypatch) -> None:
     """Replay should defer a ready RS until a configured pre-backward point."""
     device = distributed_setup.device
