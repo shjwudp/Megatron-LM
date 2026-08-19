@@ -77,10 +77,10 @@ def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
 
-def _record_unshard_and_prefetch(runner, module, orientation):
+def _record_unshard_and_prefetch(runner, module, orientation, *, depth=1):
     """Record an unshard on the runner and return the suggested prefetch."""
     runner.record_unshard(module, orientation)
-    return runner.suggest_prefetch(module, orientation)
+    return runner.suggest_prefetch(module, orientation, depth=depth)
 
 
 def test_child_then_parent_share_one_context(distributed_setup):
@@ -513,6 +513,89 @@ def test_runner_wrap_within_batch_multiple_cycles(distributed_setup):
             "rowwise",
         )
         runner.record_reshard(layer)
+
+
+def test_runner_prefetch_depth_wraps_over_unshard_occurrences(distributed_setup):
+    """Depth two should select the second future consume across a VPP cycle wrap."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=4).to(device)
+
+    with fully_shard_context(device=device, use_trace_replay=True):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    runner = model.context.runner
+    for layer in layers:
+        assert _record_unshard_and_prefetch(runner, layer, "rowwise", depth=2) is None
+        runner.record_reshard(layer)
+    runner.complete_trace()
+
+    for _ in range(2):
+        for index, layer in enumerate(layers):
+            target = layers[(index + 2) % len(layers)]
+            assert _record_unshard_and_prefetch(runner, layer, "rowwise", depth=2) == (
+                target,
+                "rowwise",
+            )
+            runner.record_reshard(layer)
+
+
+def test_runner_prefetch_depth_uses_occurrence_order_for_repeated_module(distributed_setup):
+    """Repeated VPP module objects should retain occurrence-order depth and orientation."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=3).to(device)
+
+    with fully_shard_context(device=device, use_trace_replay=True):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    runner = model.context.runner
+    occurrences = (
+        (layers[0], "rowwise"),
+        (layers[1], "rowwise"),
+        (layers[0], "colwise"),
+        (layers[2], "colwise"),
+    )
+    for layer, orientation in occurrences:
+        assert _record_unshard_and_prefetch(runner, layer, orientation, depth=2) is None
+        runner.record_reshard(layer)
+    runner.complete_trace()
+
+    for index, (layer, orientation) in enumerate(occurrences):
+        expected = occurrences[(index + 2) % len(occurrences)]
+        assert _record_unshard_and_prefetch(
+            runner, layer, orientation, depth=2
+        ) == expected
+        runner.record_reshard(layer)
+
+
+def test_runner_rejects_prefetch_depth_larger_than_trace(distributed_setup):
+    """A depth without a corresponding traced occurrence is a configuration error."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+
+    with fully_shard_context(device=device, use_trace_replay=True):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    runner = model.context.runner
+    for layer in layers:
+        assert _record_unshard_and_prefetch(runner, layer, "rowwise", depth=3) is None
+        runner.record_reshard(layer)
+    runner.complete_trace()
+
+    runner.record_unshard(layers[0], "rowwise")
+    with pytest.raises(ValueError, match="exceeds the 2 UNSHARD occurrences"):
+        runner.suggest_prefetch(layers[0], "rowwise", depth=3)
 
 
 def test_runner_divergence_retraces_and_recovers(distributed_setup):

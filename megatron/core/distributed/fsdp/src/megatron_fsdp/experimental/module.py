@@ -534,11 +534,12 @@ class FsdpModule:
             self._unshard_event = allgather_stream.record_event()
 
     def _unshard_and_prefetch(self, orientation: str) -> None:
-        """Materialize this module and prefetch its execution-order successor.
+        """Materialize this module and prefetch a future execution occurrence.
 
         The context runner owns the mode switch: default mode uses the static
         forward/backward order, while trace-replay mode follows the observed VPP
-        occurrence order. Fine-grained hooks and eager module hooks share this path.
+        occurrence order and the scheduler's configured prefetch depth.
+        Fine-grained hooks and eager module hooks share this path.
         """
         scheduler = self.context.communication_scheduler
         if scheduler is not None:
@@ -551,7 +552,8 @@ class FsdpModule:
         is_new_occurrence = runner.record_unshard(self, orientation)
         if not is_new_occurrence:
             return
-        prefetch = runner.suggest_prefetch(self, orientation)
+        prefetch_depth = scheduler.config.prefetch_depth if scheduler is not None else 1
+        prefetch = runner.suggest_prefetch(self, orientation, depth=prefetch_depth)
         if prefetch is not None:
             next_module, next_orientation = prefetch
             if scheduler is None:

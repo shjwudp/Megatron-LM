@@ -73,6 +73,7 @@ class TestMcoreAdapterDense:
         ddp_config = DistributedDataParallelConfig(
             use_megatron_fsdp=True,
             megatron_fsdp_version=2,
+            fsdp_prefetch_depth=2,
             fsdp_prefetch_successor_after=(
                 "layers.*:forward:@moe_combine",
                 "layers.*:backward:anchor",
@@ -94,6 +95,13 @@ class TestMcoreAdapterDense:
         assert policy.reduce_scatter_release_on_pre_backward == (
             NamedPreBackward("pre_dispatch_computation"),
         )
+        scheduler_config = (
+            mcore_fsdp_adapter.FullyShardedDataParallelV2._communication_scheduler_config(
+                ddp_config
+            )
+        )
+        assert scheduler_config is not None
+        assert scheduler_config.prefetch_depth == 2
 
     def test_wraps_fsdp_unit_modules_before_root(self, monkeypatch):
         config = TransformerConfig(

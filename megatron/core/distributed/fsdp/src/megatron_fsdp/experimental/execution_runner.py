@@ -43,8 +43,9 @@ The per-op interfaces are:
 - ``record_unshard(module, orientation)`` / ``record_reshard(module)``:
   trace path — record the real event, or during replay validate it against
   the traced cycle and advance the cursor.
-- ``suggest_prefetch()``: optimization path — the next traced unshard
-  (skipping reshard events) to all-gather ahead, or ``None`` while tracing.
+- ``suggest_prefetch()``: optimization path — a configured-depth future
+  traced unshard (skipping other event kinds) to all-gather ahead, or
+  ``None`` while tracing.
 - ``suggest_skip_reshard(module)``: optimization path — whether this reshard
   can be skipped because the next traced unshard reuses the same module and
   orientation, keeping the storage resident.
@@ -231,35 +232,47 @@ class FsdpExecutionRunner:
     # ------------------------------------------------------------------
 
     def suggest_prefetch(
-        self, module: "FsdpModule", orientation: str
+        self, module: "FsdpModule", orientation: str, *, depth: int = 1
     ) -> tuple["FsdpModule", str] | None:
-        """Return the next module to all-gather ahead of this unshard.
+        """Return a future module to all-gather ahead of this unshard.
 
         In default mode, resolves the static ``forward_order`` /
-        ``backward_order`` successor. In trace-replay mode, returns the next
-        traced unshard (skipping reshard events) with its recorded
-        orientation.
+        ``backward_order`` successor. In trace-replay mode, returns the
+        ``depth``-th future traced unshard (skipping other event kinds) with
+        its recorded orientation.
 
         Args:
             module: The FSDP module just unsharded for compute.
             orientation: Payload orientation (``"rowwise"`` forward,
                 ``"colwise"`` backward).
+            depth: One-based number of future traced unshard occurrences to
+                look ahead. Values above one require trace replay.
 
         Returns:
-            ``(module, orientation)`` to prefetch, or ``None`` while tracing,
-            after a divergence, or at the end of the static order.
+            ``(module, orientation)`` to prefetch, or ``None`` while tracing
+            or after a divergence.
         """
+        if depth < 1:
+            raise ValueError(f"Prefetch depth must be positive, got {depth}.")
         if not self._use_trace_replay:
+            if depth != 1:
+                raise ValueError("Prefetch depth greater than one requires trace replay.")
             return self._static_successor(module, orientation)
         # Tracing and divergence (re-trace) both disable prefetch; only a
         # validated replay cycle suggests a prefetch target.
         if self._phase is not RunnerPhase.REPLAYING or not self._trace:
             return None
+        remaining = depth
         for i in range(len(self._trace)):
             event = self._trace[(self._replay_index + i) % len(self._trace)]
             if event.kind is EventKind.UNSHARD:
-                return event.module, event.orientation
-        return None
+                remaining -= 1
+                if remaining == 0:
+                    return event.module, event.orientation
+        raise ValueError(
+            f"Prefetch depth {depth} exceeds the {depth - remaining} "
+            "UNSHARD occurrences in the replay trace."
+        )
 
     # ------------------------------------------------------------------
     # Interface 3: reshard-skip suggestion

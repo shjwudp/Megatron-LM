@@ -2312,7 +2312,10 @@ def wrap_model_chunks_with_ddp(
         or (DP is FullyShardedDataParallel and ddp_config.megatron_fsdp_version == 2)
     ) and len(model_chunks) > 1
     fsdp_communication_scheduler = (
-        FsdpCommunicationSchedulerConfig(ddp_config.fsdp_max_pending_reduce_scatter_bytes)
+        FsdpCommunicationSchedulerConfig(
+            max_pending_reduce_scatter_bytes=ddp_config.fsdp_max_pending_reduce_scatter_bytes,
+            prefetch_depth=ddp_config.fsdp_prefetch_depth,
+        )
         if (
             ddp_config.fsdp_prefetch_successor_after
             or ddp_config.fsdp_reduce_scatter_release_on_pre_backward

@@ -106,9 +106,13 @@ class FsdpCommunicationSchedulerConfig:
         max_pending_reduce_scatter_bytes: ``None`` infers a pending-byte limit
             from the trace, zero keeps reduce-scatter eager, and a positive
             value supplies an explicit limit.
+        prefetch_depth: One-based index of the future traced ``UNSHARD``
+            occurrence to prefetch. One preserves immediate-successor prefetch;
+            larger values trade parameter residency for more lead time.
     """
 
     max_pending_reduce_scatter_bytes: int | None = None
+    prefetch_depth: int = 1
 
     def __post_init__(self) -> None:
         value = self.max_pending_reduce_scatter_bytes
@@ -116,6 +120,8 @@ class FsdpCommunicationSchedulerConfig:
             raise ValueError(
                 "max_pending_reduce_scatter_bytes must be None or non-negative, " f"got {value}."
             )
+        if self.prefetch_depth < 1:
+            raise ValueError(f"prefetch_depth must be positive, got {self.prefetch_depth}.")
 
 
 @dataclasses.dataclass
@@ -626,10 +632,11 @@ class FsdpCommunicationScheduler:
     def report(self) -> None:
         """Log delayed all-gather scheduling statistics."""
         logger.info(
-            "MFSDP communication scheduler: delayed_prefetches=%d "
+            "MFSDP communication scheduler: prefetch_depth=%d delayed_prefetches=%d "
             "anchor_releases=%d demand_releases=%d pending_prefetches=%d "
             "rs_anchor_releases=%d capacity_releases=%d final_releases=%d "
             "pending_rs_bytes=%d",
+            self.config.prefetch_depth,
             self._delayed_prefetches,
             self._anchor_releases,
             self._demand_releases,

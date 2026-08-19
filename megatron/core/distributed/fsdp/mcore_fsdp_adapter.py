@@ -556,7 +556,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             or ddp_config.fsdp_reduce_scatter_release_on_pre_backward
         ):
             return None
-        return FsdpCommunicationSchedulerConfig(ddp_config.fsdp_max_pending_reduce_scatter_bytes)
+        return FsdpCommunicationSchedulerConfig(
+            max_pending_reduce_scatter_bytes=ddp_config.fsdp_max_pending_reduce_scatter_bytes,
+            prefetch_depth=ddp_config.fsdp_prefetch_depth,
+        )
 
     @staticmethod
     def _build_communication_policies(

@@ -9,10 +9,11 @@ module execution points. Its first target is VPP + combined 1F1B with expert
 parallel (EP) communication, but the API is intentionally independent of a
 particular EP backend.
 
-The public policy/configuration API, occurrence recording, delayed successor
-AG, deferred RS, automatic byte-budget inference, MCore selector translation,
-and combined-1F1B named anchors are implemented. The feature remains
-experimental and disabled unless scheduling rules are supplied.
+The public policy/configuration API, occurrence recording, delayed and
+depth-adjustable AG prefetch, deferred RS, automatic byte-budget inference,
+MCore selector translation, and combined-1F1B named anchors are implemented.
+The feature remains experimental and disabled unless scheduling rules are
+supplied.
 
 Related documents:
 
@@ -44,8 +45,8 @@ declare execution points after which FSDP may launch delayed communication.
 
 ## Goals
 
-1. Let a user delay the current FSDP unit's successor prefetch until a
-   configured descendant submodule has executed.
+1. Let a user delay a future FSDP prefetch until a configured descendant
+   submodule has executed, and choose its occurrence lookahead depth.
 2. Let a user nominate modules whose pre-backward entry releases pending RS
    requests.
 3. Infer the pending-RS byte budget by default while retaining an advanced
@@ -74,8 +75,8 @@ declare execution points after which FSDP may launch delayed communication.
   VPP can execute the same object many times in one global batch.
 - **Demand AG**: materialization required by the current consumer. Demand AG
   is never delayed by policy.
-- **Successor AG**: speculative prefetch for the next traced `UNSHARD`
-  occurrence.
+- **Future AG**: speculative prefetch for the configured-depth future traced
+  `UNSHARD` occurrence. Depth one is the immediate successor.
 - **Completion anchor**: a configured submodule post-forward or post-backward
   occurrence. A CUDA event recorded on the submodule's execution stream
   represents completion.
@@ -163,6 +164,10 @@ class FsdpCommunicationSchedulerConfig:
     # None: infer after the trace. Zero: do not defer RS. Positive: explicit
     # pending-byte override.
     max_pending_reduce_scatter_bytes: int | None = None
+
+    # One selects the immediate successor. N selects the Nth future traced
+    # UNSHARD occurrence and trades additional parameter residency for lead.
+    prefetch_depth: int = 1
 ```
 
 The configuration is passed once to the shared context, and annotations are
@@ -200,11 +205,23 @@ replace scheduler state.
 ### API semantics
 
 - `prefetch_successor_after` belongs to the **source** FSDP unit. It means
-  "release this occurrence's traced successor after this descendant
-  completes." It does not mean gathering an FSDP unit after one of its own
-  parameter-consuming descendants, which would be circular.
+  "release this occurrence's configured-depth future prefetch after this
+  descendant completes." The API name retains *successor* for compatibility;
+  `prefetch_depth=1` is the immediate successor. It does not mean gathering an
+  FSDP unit after one of its own parameter-consuming descendants, which would
+  be circular.
+- `prefetch_depth=N` selects the Nth future `UNSHARD` occurrence in the shared
+  context trace, counting repeated VPP executions independently and wrapping
+  at the global-batch boundary. A single context-wide depth produces a
+  one-to-one cyclic shift: every occurrence has exactly one speculative
+  producer and target.
+- Increasing depth moves the target farther into the future but does not move
+  the configured launch anchor. It therefore creates more lead after the
+  protected communication at the cost of more simultaneously resident full
+  parameters. Depth must be positive and cannot exceed the number of traced
+  `UNSHARD` occurrences.
 - A completion anchor must be a descendant of the annotated FSDP unit and
-  must occur after that unit's `UNSHARD` and before the successor's demand
+  must occur after that unit's `UNSHARD` and before the target's demand
   `UNSHARD` in the trace.
 - If several configured anchors match one occurrence, the first matching
   anchor observed at runtime releases the queued successor.
@@ -237,6 +254,7 @@ The experimental MCore CLI surface is:
 
 ```text
 --fsdp-prefetch-successor-after SOURCE_GLOB:PHASE:DESCENDANT_GLOB
+--fsdp-prefetch-depth N
 --fsdp-reduce-scatter-release-on-pre-backward SOURCE_GLOB:DESCENDANT_GLOB
 --fsdp-max-pending-reduce-scatter-bytes:
   None for auto, 0 for eager RS, or a positive byte override
@@ -305,44 +323,43 @@ the same capacity. Cross-rank trace-signature validation is useful future
 hardening; today collective-order divergence remains subject to the same
 SPMD requirement as the underlying FSDP execution.
 
-## Delayed successor all-gather
+## Delayed depth-adjustable all-gather
 
 ### Trace
 
 The first global batch continues to run without speculative prefetch. The
 runner records both the real `UNSHARD` order and configured completion-anchor
-occurrences.
-
-The runner records actual `UNSHARD` order plus configured completion-anchor
-occurrences. During replay, its normal successor lookup identifies the target
-and orientation. When the source policy contains an anchor for the current
-forward/backward orientation, the scheduler queues that successor instead of
-submitting it immediately. If no matching anchor occurs before demand, the
-consumer submits the AG itself.
+occurrences. During replay, the configured depth selects the Nth future
+`UNSHARD` target and its orientation. When the source policy contains an anchor
+for the current forward/backward orientation, the scheduler queues that target
+instead of submitting it immediately. If no matching anchor occurs before
+demand, the consumer submits the AG itself.
 
 ### Replay
 
 ```text
-UNSHARD(A)
-  -> identify B as successor
-  -> queue AG(B), do not submit it
+UNSHARD(A), prefetch_depth=N
+  -> identify T as the Nth future UNSHARD occurrence
+  -> queue AG(T), do not submit it
 
 ANCHOR_DONE(A.x)
   -> record completion event on A.x's execution stream
   -> allgather_stream.wait_event(anchor_event)
-  -> submit AG(B)
+  -> submit AG(T)
 ```
 
-At `UNSHARD(B)`, demand execution remains the correctness backstop. If B's AG
+At `UNSHARD(T)`, demand execution remains the correctness backstop. If T's AG
 was never released, it is submitted immediately. If it was released but has
-not completed, the consumer waits on B's existing unshard event. Both cases
+not completed, the consumer waits on T's existing unshard event. Both cases
 increment separate diagnostics.
 
-A completion anchor only delays AG until after previous work. An AG released
-after EP dispatch can still spill into a later EP combine. Users that require
-strict avoidance should initially choose an anchor after the protected
-communication, such as combine completion. A future extension may add an
-explicit `After(anchor).Before(anchor)` window and a duration fit test.
+A completion anchor is the earliest legal launch point: it only orders AG
+after previous work. It cannot guarantee completion before later EP work, and
+adding a `before` dependency would either be advisory or make the later work
+wait for AG. The intended tuning rule is therefore to place the anchor after
+the protected EP communication and increase `prefetch_depth` only far enough
+to hide AG behind subsequent compute. Nsight validation remains necessary
+because stream ordering alone cannot provide bandwidth quality-of-service.
 
 ## Deferred reduce-scatter
 
@@ -568,7 +585,8 @@ The initial implementation adds tests under
 `tests/unit_tests/distributed/mfsdp_v2/` for:
 
 1. scheduler/config validation and shared-context compatibility;
-2. completion-anchor successor release and demand fallback;
+2. completion-anchor release, demand fallback, and depth-based future target
+   selection across trace wrap and repeated VPP module occurrences;
 3. deferred RS release, automatic budget compilation, and captured
    `is_last_microbatch`;
 4. multi-step loss parity against eager execution;
@@ -600,9 +618,11 @@ no permanent replay divergence.
 Compare identical 24-GPU real-data jobs for:
 
 1. eager M-FSDP v2;
-2. delayed successor AG only;
-3. delayed successor AG plus pre-backward RS release;
-4. ND-parallel reference.
+2. delayed AG at depth one;
+3. delayed AG at successively larger depths until exposed AG stops improving
+   or parameter residency becomes unacceptable;
+4. the best delayed AG depth plus pre-backward RS release;
+5. ND-parallel reference.
 
 Discard trace/planning steps and at least the first five steady-state steps.
 Report mean, median, and standard deviation for step time and model TFLOP/s;
@@ -647,7 +667,7 @@ dependency on a target-owned, parameter-consuming descendant. The API uses
 Implemented in this change:
 
 1. policy dataclasses, validation, and occurrence trace events;
-2. delayed successor AG with anchor and demand release;
+2. delayed depth-adjustable AG with anchor and demand release;
 3. per-domain deferred-RS queues, pre-backward release, and final flush;
 4. automatic/explicit pending-byte budgets and pre-allocation capacity release;
 5. trace-pool lifetime preservation through collective submission;
