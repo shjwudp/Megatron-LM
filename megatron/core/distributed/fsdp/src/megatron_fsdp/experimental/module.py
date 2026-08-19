@@ -190,7 +190,6 @@ class FsdpModule:
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
-
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
             group_dtype = next(iter(group_parameters.values())).dtype
@@ -603,7 +602,7 @@ def _register_fine_grained_forward_hooks(fsdp_module: FsdpModule) -> None:
         )
 
 
-def _fine_grained_pre_forward_hook(submodule: nn.Module, args, kwargs) -> None:
+def _fine_grained_pre_forward_hook(submodule: nn.Module, _args, _kwargs) -> None:
     """Pre-forward hook for fine-grained sub-modules."""
     target = _find_fsdp_target(submodule)
     if target is None:
@@ -639,18 +638,15 @@ def _register_fine_grained_backward_hooks(fsdp_module: FsdpModule) -> None:
         submodule.register_full_backward_pre_hook(_fine_grained_pre_backward_hook)
 
 
-def _fine_grained_pre_backward_hook(submodule: nn.Module, grad_output) -> None:
+def _fine_grained_pre_backward_hook(submodule: nn.Module, _grad_output) -> None:
     """Pre-backward hook for fine-grained sub-modules.
 
-    Marks the parent ``FsdpModule`` BACKWARD and unshards it before the
-    sub-module's backward runs, so its weight-gradient computation sees full
-    parameters.
+    Enters the parent ``FsdpModule`` backward lifecycle before the sub-module's
+    backward runs, so its weight-gradient computation sees full parameters and
+    its later ``post_backward()`` has a matching lifecycle/NVTX entry.
     """
     target = _find_fsdp_target(submodule)
     if target is None:
         return
     if target.phase is FsdpModule.Phase.RESTING:
-        target.phase = FsdpModule.Phase.BACKWARD
-    target._unshard_parameter_groups()
-    if target._unshard_event is not None:
-        target.context.current_stream().wait_event(target._unshard_event)
+        target.pre_backward(register_final_callback=False)
