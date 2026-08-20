@@ -511,7 +511,9 @@ class FsdpModule:
 
         self._unshard_and_prefetch("rowwise")
 
-    def _unshard_parameter_groups(self, orientation: str = "rowwise") -> None:
+    def _unshard_parameter_groups(
+        self, orientation: str = "rowwise", *, reason: str = "consumer"
+    ) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
 
         If ``_unshard_event`` is already set, this FsdpModule was already
@@ -523,14 +525,24 @@ class FsdpModule:
             orientation: Payload orientation to gather for MXFP8 groups —
                 ``"rowwise"`` on the forward pass, ``"colwise"`` on the
                 backward pass. Ignored by regular groups.
+            reason: Scheduling path that submitted this all-gather.
         """
         if self._unshard_event is not None:
             return
 
         allgather_stream = self.context.allgather_stream
+        module_name = self.name if self.name else "<root>"
         with torch.cuda.stream(allgather_stream):
-            for group in self._parameter_groups:
-                group.unshard_parameters(orientation)
+            for group_index, group in enumerate(self._parameter_groups):
+                label = (
+                    f"MFSDP AG module={module_name} group={group_index} "
+                    f"orientation={orientation} release={reason}"
+                )
+                torch.cuda.nvtx.range_push(label)
+                try:
+                    group.unshard_parameters(orientation)
+                finally:
+                    torch.cuda.nvtx.range_pop()
             self._unshard_event = allgather_stream.record_event()
 
     def _unshard_and_prefetch(self, orientation: str) -> None:
@@ -544,7 +556,7 @@ class FsdpModule:
         scheduler = self.context.communication_scheduler
         if scheduler is not None:
             scheduler.demand_unshard(self, orientation)
-        self._unshard_parameter_groups(orientation)
+        self._unshard_parameter_groups(orientation, reason="consumer")
         if self._unshard_event is not None:
             self.context.current_stream().wait_event(self._unshard_event)
 
@@ -557,7 +569,7 @@ class FsdpModule:
         if prefetch is not None:
             next_module, next_orientation = prefetch
             if scheduler is None:
-                next_module._unshard_parameter_groups(next_orientation)
+                next_module._unshard_parameter_groups(next_orientation, reason="static-prefetch")
             else:
                 scheduler.schedule_prefetch(self, next_module, next_orientation)
 
@@ -626,12 +638,15 @@ class FsdpModule:
             context.reduce_scatter_stream.wait_stream(current_stream)
 
         self._unshard_and_prefetch("colwise")
-        for group in self._parameter_groups:
+        module_name = self.name if self.name else "<root>"
+        for group_index, group in enumerate(self._parameter_groups):
             scheduler = context.communication_scheduler
             if scheduler is None or not group.fuse_wgrad_accumulation or not group.requires_grad:
                 group.prepare_fused_wgrad_buffer()
                 continue
-            scheduler.reserve_reduce_scatter(group)
+            scheduler.reserve_reduce_scatter(
+                group, module_name=module_name, group_index=group_index
+            )
             try:
                 group.prepare_fused_wgrad_buffer()
             except Exception:
@@ -669,7 +684,8 @@ class FsdpModule:
         current_stream = context.current_stream()
         scheduler = context.communication_scheduler
 
-        for group in self._parameter_groups:
+        module_name = self.name if self.name else "<root>"
+        for group_index, group in enumerate(self._parameter_groups):
             if not group.requires_grad:
                 continue
 
@@ -681,7 +697,9 @@ class FsdpModule:
                 partial_grad.local_buffer.record_stream(reduce_scatter_stream)
             else:
                 if scheduler is not None:
-                    scheduler.reserve_reduce_scatter(group)
+                    scheduler.reserve_reduce_scatter(
+                        group, module_name=module_name, group_index=group_index
+                    )
                 with torch.cuda.stream(reduce_scatter_stream):
                     try:
                         partial_grad = group.allocate_partial_grad_buffer()
@@ -694,9 +712,16 @@ class FsdpModule:
 
             if scheduler is None:
                 reduce_scatter_stream.wait_stream(current_stream)
-                with torch.cuda.stream(reduce_scatter_stream):
-                    group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
-                    group.release_partial_grad_buffer()
+                label = f"MFSDP RS module={module_name} group={group_index} release=eager"
+                torch.cuda.nvtx.range_push(label)
+                try:
+                    with torch.cuda.stream(reduce_scatter_stream):
+                        group.reduce_partial_gradients(
+                            partial_grad, self.context.is_last_microbatch
+                        )
+                        group.release_partial_grad_buffer()
+                finally:
+                    torch.cuda.nvtx.range_pop()
             else:
                 ready_event = current_stream.record_event()
                 scheduler.mark_reduce_scatter_ready(

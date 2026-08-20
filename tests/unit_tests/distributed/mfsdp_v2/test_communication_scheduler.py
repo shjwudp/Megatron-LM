@@ -142,7 +142,9 @@ def test_completion_anchor_releases_traced_successor(distributed_setup, monkeypa
 
     calls = []
     monkeypatch.setattr(
-        modules[1], "_unshard_parameter_groups", lambda orientation: calls.append(orientation)
+        modules[1],
+        "_unshard_parameter_groups",
+        lambda orientation, *, reason: calls.append((orientation, reason)),
     )
     assert runner.record_unshard(modules[0], "rowwise")
     successor = runner.suggest_prefetch(modules[0], "rowwise")
@@ -152,7 +154,7 @@ def test_completion_anchor_releases_traced_successor(distributed_setup, monkeypa
     assert not calls
 
     scheduler.record_completion_anchor(modules[0], modules[0], "forward")
-    assert calls == ["rowwise"]
+    assert calls == [("rowwise", "anchor")]
     assert not scheduler.has_pending_prefetches
 
 
@@ -188,16 +190,56 @@ def test_module_prefetches_configured_future_occurrence(distributed_setup, monke
         monkeypatch.setattr(
             module,
             "_unshard_parameter_groups",
-            lambda orientation, index=index: calls.append((index, orientation)),
+            lambda orientation, *, reason, index=index: calls.append(
+                (index, orientation, reason)
+            ),
         )
 
     modules[0]._unshard_and_prefetch("rowwise")
-    assert calls == [(0, "rowwise")]
+    assert calls == [(0, "rowwise", "consumer")]
     assert scheduler.has_pending_prefetches
 
     scheduler.record_completion_anchor(modules[0], modules[0], "forward")
-    assert calls == [(0, "rowwise"), (2, "rowwise")]
+    assert calls == [(0, "rowwise", "consumer"), (2, "rowwise", "anchor")]
     assert not scheduler.has_pending_prefetches
+
+
+def test_all_gather_nvtx_range_wraps_parameter_group_submission(
+    distributed_setup, monkeypatch
+) -> None:
+    """Every AG launch should carry its module, group, orientation, and release path."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    module = nn.Linear(4, 4, bias=False).to(device)
+    with fully_shard_context(device=device):
+        fully_shard(module, mesh=mesh, placements=_flat_placements())
+
+    group = module.parameter_groups[0]
+    module_name = module.name if module.name else "<root>"
+    expected_label = (
+        f"MFSDP AG module={module_name} group=0 orientation=colwise release=anchor"
+    )
+    active_ranges = []
+    events = []
+
+    def range_push(label: str) -> None:
+        active_ranges.append(label)
+        events.append(("push", label))
+
+    def range_pop() -> None:
+        events.append(("pop", active_ranges.pop()))
+
+    def unshard_parameters(orientation: str) -> None:
+        assert orientation == "colwise"
+        assert active_ranges[-1] == expected_label
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", range_push)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", range_pop)
+    monkeypatch.setattr(group, "unshard_parameters", unshard_parameters)
+
+    module._unshard_parameter_groups("colwise", reason="anchor")
+
+    assert events == [("push", expected_label), ("pop", expected_label)]
 
 
 def test_demand_unshard_is_delayed_prefetch_backstop(distributed_setup, monkeypatch) -> None:
@@ -229,11 +271,13 @@ def test_demand_unshard_is_delayed_prefetch_backstop(distributed_setup, monkeypa
 
     calls = []
     monkeypatch.setattr(
-        modules[1], "_unshard_parameter_groups", lambda orientation: calls.append(orientation)
+        modules[1],
+        "_unshard_parameter_groups",
+        lambda orientation, *, reason: calls.append((orientation, reason)),
     )
     scheduler.schedule_prefetch(modules[0], *successor)
     scheduler.demand_unshard(modules[1], "rowwise")
-    assert calls == ["rowwise"]
+    assert calls == [("rowwise", "demand")]
     assert not scheduler.has_pending_prefetches
 
 
@@ -277,17 +321,19 @@ def test_demand_unshard_releases_only_matching_occurrence(
 
     calls = []
     monkeypatch.setattr(
-        modules[2], "_unshard_parameter_groups", lambda orientation: calls.append(orientation)
+        modules[2],
+        "_unshard_parameter_groups",
+        lambda orientation, *, reason: calls.append((orientation, reason)),
     )
     scheduler.schedule_prefetch(modules[0], modules[2], "rowwise")
     scheduler.schedule_prefetch(modules[1], modules[2], "colwise")
 
     scheduler.demand_unshard(modules[2], "rowwise")
-    assert calls == ["rowwise"]
+    assert calls == [("rowwise", "demand")]
     assert scheduler.has_pending_prefetches
 
     scheduler.record_completion_anchor(modules[1], modules[1], "backward")
-    assert calls == ["rowwise", "colwise"]
+    assert calls == [("rowwise", "demand"), ("colwise", "anchor")]
     assert not scheduler.has_pending_prefetches
 
 
@@ -306,17 +352,32 @@ def test_reduce_scatter_waits_for_pre_backward_release(distributed_setup, monkey
     assert scheduler is not None
     group = module.parameter_groups[0]
     calls = []
+    active_ranges = []
+    submission_labels = []
+
+    def range_push(label: str) -> None:
+        active_ranges.append(label)
+
+    def range_pop() -> None:
+        active_ranges.pop()
+
+    def reduce_partial_gradients(partial_grad, is_last) -> None:
+        calls.append((partial_grad, is_last))
+        submission_labels.append(active_ranges[-1])
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", range_push)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", range_pop)
     monkeypatch.setattr(
         group,
         "reduce_partial_gradients",
-        lambda partial_grad, is_last: calls.append((partial_grad, is_last)),
+        reduce_partial_gradients,
     )
     monkeypatch.setattr(group, "release_partial_grad_buffer", lambda: None)
 
     # Trace one request and one legal release occurrence. Physical communication
     # remains eager during this first cycle.
     context.runner.record_unshard(module, "rowwise")
-    scheduler.reserve_reduce_scatter(group)
+    scheduler.reserve_reduce_scatter(group, module_name="<root>", group_index=0)
     trace_partial_grad = object()
     scheduler.mark_reduce_scatter_ready(
         group, trace_partial_grad, context.current_stream().record_event(), True
@@ -329,7 +390,7 @@ def test_reduce_scatter_waits_for_pre_backward_release(distributed_setup, monkey
 
     replay_partial_grad = object()
     context.runner.record_unshard(module, "rowwise")
-    scheduler.reserve_reduce_scatter(group)
+    scheduler.reserve_reduce_scatter(group, module_name="<root>", group_index=0)
     scheduler.mark_reduce_scatter_ready(
         group, replay_partial_grad, context.current_stream().record_event(), False
     )
@@ -339,6 +400,10 @@ def test_reduce_scatter_waits_for_pre_backward_release(distributed_setup, monkey
     scheduler.record_reduce_scatter_release(module, module, None)
     assert scheduler.pending_reduce_scatter_bytes == 0
     assert calls == [(trace_partial_grad, True), (replay_partial_grad, False)]
+    assert submission_labels == [
+        "MFSDP RS module=<root> group=0 release=submit-on-ready",
+        "MFSDP RS module=<root> group=0 release=anchor",
+    ]
 
 
 def test_same_group_reuse_drains_older_domain_requests(distributed_setup, monkeypatch) -> None:
@@ -368,8 +433,10 @@ def test_same_group_reuse_drains_older_domain_requests(distributed_setup, monkey
         monkeypatch.setattr(group, "release_partial_grad_buffer", lambda: None)
 
     context.runner.record_unshard(modules[0], "rowwise")
-    for group in groups:
-        scheduler.reserve_reduce_scatter(group)
+    for group_index, group in enumerate(groups):
+        scheduler.reserve_reduce_scatter(
+            group, module_name=f"module.{group_index}", group_index=0
+        )
         scheduler.mark_reduce_scatter_ready(
             group, object(), context.current_stream().record_event(), True
         )
@@ -378,8 +445,10 @@ def test_same_group_reuse_drains_older_domain_requests(distributed_setup, monkey
     calls.clear()
 
     context.runner.record_unshard(modules[0], "rowwise")
-    for group in groups:
-        scheduler.reserve_reduce_scatter(group)
+    for group_index, group in enumerate(groups):
+        scheduler.reserve_reduce_scatter(
+            group, module_name=f"module.{group_index}", group_index=0
+        )
         scheduler.mark_reduce_scatter_ready(
             group, object(), context.current_stream().record_event(), True
         )
@@ -387,7 +456,7 @@ def test_same_group_reuse_drains_older_domain_requests(distributed_setup, monkey
         group.partial_grad_nbytes() for group in groups
     )
 
-    scheduler.reserve_reduce_scatter(groups[1])
+    scheduler.reserve_reduce_scatter(groups[1], module_name="module.1", group_index=0)
     assert calls == [0, 1]
     assert scheduler.pending_reduce_scatter_bytes == groups[1].partial_grad_nbytes()
     scheduler.cancel_reduce_scatter_reservation(groups[1])

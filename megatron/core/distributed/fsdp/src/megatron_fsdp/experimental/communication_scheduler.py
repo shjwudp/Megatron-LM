@@ -173,6 +173,8 @@ class _ReduceScatterRequest:
     sequence: int
     domain: _DomainState
     group: "FsdpParameterGroup"
+    module_name: str
+    group_index: int
     size_bytes: int
     deferred: bool
     trace_request: _TraceReduceScatterRequest | None
@@ -238,7 +240,8 @@ class FsdpCommunicationScheduler:
             if completion.phase == source_phase
         )
         if not completions or self._context.runner.is_tracing:
-            target._unshard_parameter_groups(orientation)
+            reason = "trace-prefetch" if self._context.runner.is_tracing else "eager-prefetch"
+            target._unshard_parameter_groups(orientation, reason=reason)
             return
 
         self._pending_prefetches.append(
@@ -281,10 +284,8 @@ class FsdpCommunicationScheduler:
         if event is None:
             event = self._context.current_stream().record_event()
         self._context.allgather_stream.wait_event(event)
-        pending.target._unshard_parameter_groups(pending.orientation)
+        pending.target._unshard_parameter_groups(pending.orientation, reason="anchor")
         self._anchor_releases += 1
-        torch.cuda.nvtx.range_push("MFSDP delayed AG anchor release")
-        torch.cuda.nvtx.range_pop()
 
     def demand_unshard(self, target: "FsdpModule", orientation: str) -> None:
         """Release the oldest queued gather for the demanded module occurrence."""
@@ -292,10 +293,8 @@ class FsdpCommunicationScheduler:
             if pending.target is not target or pending.orientation != orientation:
                 continue
             del self._pending_prefetches[index]
-            pending.target._unshard_parameter_groups(pending.orientation)
+            pending.target._unshard_parameter_groups(pending.orientation, reason="demand")
             self._demand_releases += 1
-            torch.cuda.nvtx.range_push("MFSDP delayed AG demand release")
-            torch.cuda.nvtx.range_pop()
             return
 
     def record_reduce_scatter_release(
@@ -313,7 +312,9 @@ class FsdpCommunicationScheduler:
         self._submit_reduce_scatter(request, reason="anchor", demand_event=demand_event)
         self._reduce_scatter_releases += 1
 
-    def reserve_reduce_scatter(self, group: "FsdpParameterGroup") -> None:
+    def reserve_reduce_scatter(
+        self, group: "FsdpParameterGroup", *, module_name: str, group_index: int
+    ) -> None:
         """Reserve pending capacity before allocating a full gradient buffer."""
         if group in self._active_request_by_group:
             previous = self._active_request_by_group[group]
@@ -353,6 +354,8 @@ class FsdpCommunicationScheduler:
             sequence=self._next_reduce_scatter_sequence,
             domain=domain,
             group=group,
+            module_name=module_name,
+            group_index=group_index,
             size_bytes=size_bytes,
             deferred=deferred,
             trace_request=trace_request,
@@ -449,7 +452,9 @@ class FsdpCommunicationScheduler:
         )
         while self._pending_prefetches:
             pending = self._pending_prefetches.popleft()
-            pending.target._unshard_parameter_groups(pending.orientation)
+            pending.target._unshard_parameter_groups(
+                pending.orientation, reason=f"flush-{reason.replace(' ', '-')}"
+            )
 
     def _get_domain(self, mesh: DeviceMesh) -> _DomainState:
         key = id(mesh)
@@ -606,16 +611,21 @@ class FsdpCommunicationScheduler:
         if demand_event is not None:
             reduce_scatter_stream.wait_event(demand_event)
         reduce_scatter_stream.wait_event(ready_event)
-        with torch.cuda.stream(reduce_scatter_stream):
-            request.group.reduce_partial_gradients(partial_grad, request.is_last_microbatch)
-            request.group.release_partial_grad_buffer()
+        label = (
+            f"MFSDP RS module={request.module_name} group={request.group_index} release={reason}"
+        )
+        torch.cuda.nvtx.range_push(label)
+        try:
+            with torch.cuda.stream(reduce_scatter_stream):
+                request.group.reduce_partial_gradients(partial_grad, request.is_last_microbatch)
+                request.group.release_partial_grad_buffer()
+        finally:
+            torch.cuda.nvtx.range_pop()
 
         if request.deferred:
             request.domain.pending_bytes -= request.size_bytes
         self._active_request_by_group.pop(request.group, None)
         self._reduce_scatter_requests.remove(request)
-        torch.cuda.nvtx.range_push(f"MFSDP RS release: {reason}")
-        torch.cuda.nvtx.range_pop()
 
     def _reset_reduce_scatter_trace(self) -> None:
         self._trace_reduce_scatter_requests.clear()

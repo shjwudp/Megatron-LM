@@ -68,7 +68,7 @@ def _flat_placements() -> Placements:
 
 
 def _setup_nvtx_recording(monkeypatch: pytest.MonkeyPatch, events: list[NvtxEvent]) -> None:
-    label_stack: list[tuple[str, str]] = []
+    label_stack: list[tuple[str, str] | None] = []
 
     def parse_nvtx_label(label: str) -> tuple[str, str]:
         match = _NVTX_LABEL_PATTERN.fullmatch(label)
@@ -76,12 +76,21 @@ def _setup_nvtx_recording(monkeypatch: pytest.MonkeyPatch, events: list[NvtxEven
         return match.groups()
 
     def record_push(label: str) -> None:
+        if label.startswith(("MFSDP AG ", "MFSDP RS ")):
+            # Communication ranges nest inside the module-phase ranges under test.
+            # Track their stack position so the matching pop remains balanced,
+            # but leave their detailed labels to the scheduler-specific tests.
+            label_stack.append(None)
+            return
         name, phase = parse_nvtx_label(label)
         label_stack.append((name, phase))
         events.append(NvtxEvent("push", name, phase))
 
     def record_pop() -> None:
-        name, phase = label_stack.pop()
+        label = label_stack.pop()
+        if label is None:
+            return
+        name, phase = label
         events.append(NvtxEvent("pop", name, phase))
 
     monkeypatch.setattr(torch.cuda.nvtx, "range_push", record_push)

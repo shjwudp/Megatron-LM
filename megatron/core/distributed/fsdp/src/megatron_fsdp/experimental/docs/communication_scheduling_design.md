@@ -573,9 +573,15 @@ reports include delayed AG count, anchor and demand releases, pending AGs,
 RS anchor/capacity/final releases, and current pending RS bytes. Selector
 resolution logs each matched FSDP unit and anchor.
 
-NVTX ranges identify delayed AG creation, anchor release, demand fallback,
-and RS release reasons so Nsight profiles can distinguish policy decisions
-from collective execution.
+The scheduler emits launch-scoped NVTX ranges around every parameter-group
+collective submission. AG labels include the target FSDP module, parameter-group
+index, payload orientation, and release path (for example, `anchor`, `demand`,
+or `consumer`). RS labels include the owning FSDP module, parameter-group index,
+and release reason (for example, `anchor`, `capacity`, `submit-on-ready`, or
+`finish_grad_sync`). Keeping the CUDA launch API inside the range is required
+for Nsight to associate a later asynchronous kernel with the scheduling
+decision that submitted it; an instantaneous marker after submission is not
+sufficient, especially when autograd runs the hook on a worker thread.
 
 ## Validation plan
 
