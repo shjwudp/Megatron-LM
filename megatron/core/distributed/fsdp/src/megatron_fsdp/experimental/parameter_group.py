@@ -605,6 +605,7 @@ class FsdpParameterGroup:
                 mesh=self.mesh,
                 placements=partial_placements,
                 tensor_shapes=tensor_shapes,
+                allocation_stream=torch.cuda.current_stream(local_buffer.device),
             )
 
         with self._symmetric_memory_context():
@@ -725,7 +726,21 @@ class FsdpParameterGroup:
 
         reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
         if reduce_axis is None:
-            raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
+            # No-shard and ZeRO-1 keep both buffers Partial until the final
+            # microbatch. In that case this step only stages/accumulates the
+            # local partial gradient; the Partial -> optimizer placement
+            # collective below performs the actual reduction.
+            partial_axes = [
+                axis
+                for axis, placement in enumerate(partial_grad.placements)
+                if isinstance(placement, Partial)
+            ]
+            if len(partial_axes) != 1:
+                raise RuntimeError(
+                    "FSDP gradient reduction without a placement change requires "
+                    f"exactly one Partial axis, got {partial_grad.placements!r}."
+                )
+            reduce_axis = partial_axes[0]
         partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
         # Start from the caller's extra divisor (1 unless this group sees more than one
         # contribution per mesh rank, as expert parallelism does), then add back the axis

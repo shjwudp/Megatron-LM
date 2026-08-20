@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+import torch.distributed._symmetric_memory as symm_mem
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -112,6 +113,10 @@ class TestMcoreAdapterDense:
         assert child_parameter_names
         assert root_parameter_names == {"1.weight", "1.bias"}
 
+    @pytest.mark.skipif(
+        not hasattr(symm_mem, "is_symm_mem_tensor"),
+        reason="Requires PyTorch symmetric-memory tensor detection.",
+    )
     def test_nccl_ub_enables_symmetric_memory(self, monkeypatch):
         config = TransformerConfig(
             num_layers=1,

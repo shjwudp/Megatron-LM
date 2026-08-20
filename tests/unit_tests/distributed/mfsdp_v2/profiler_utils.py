@@ -7,6 +7,11 @@ from torch.autograd.profiler_util import FunctionEvent
 from torch.profiler import profile as TorchProfiler
 
 
+def _linked_correlation_id(event: FunctionEvent) -> int:
+    """Return the CPU/device correlation id across PyTorch profiler versions."""
+    return getattr(event, "linked_correlation_id", event.id)
+
+
 def events_overlap(first: FunctionEvent, second: FunctionEvent) -> bool:
     return (
         first.time_range.start < second.time_range.end
@@ -33,12 +38,13 @@ def collect_linked_kernels(
     events = prof.events()
     matching_correlations: set[int] = set()
     for event in events:
-        if event.device_type != DeviceType.CPU or not event.linked_correlation_id:
+        correlation_id = _linked_correlation_id(event)
+        if event.device_type != DeviceType.CPU or not correlation_id:
             continue
         node = event
         while node is not None:
             if cpu_event_name_substring in node.name:
-                matching_correlations.add(event.linked_correlation_id)
+                matching_correlations.add(correlation_id)
                 break
             node = node.cpu_parent
 
@@ -48,7 +54,7 @@ def collect_linked_kernels(
             continue
         if event.activity_type != "kernel":
             continue
-        if event.linked_correlation_id not in matching_correlations:
+        if _linked_correlation_id(event) not in matching_correlations:
             continue
         linked_kernels.append(event)
 
