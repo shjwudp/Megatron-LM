@@ -873,6 +873,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     f"got {group.size()}."
                 )
 
+        # Validate EP from the global topology rather than the contents of this module
+        # chunk. PP/VPP partitioning can legitimately produce dense-only chunks even
+        # though the global TransformerConfig describes a MoE/EP model.
         if config.expert_model_parallel_size > 1:
             if (
                 pg_collection.ep is None
@@ -886,8 +889,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             if pg_collection.expt_dp is None:
                 raise ValueError("MFSDP v2 with EP requires an explicit expert-DP process group.")
-            if not any(isinstance(submodule, MoELayer) for submodule in module.modules()):
-                raise ValueError("MFSDP v2 with EP requires MoE transformer layers.")
         if ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
             raise ValueError(
                 "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."

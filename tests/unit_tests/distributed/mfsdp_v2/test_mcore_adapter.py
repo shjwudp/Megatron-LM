@@ -577,6 +577,45 @@ class TestMcoreAdapterExpertParallel:
         torch.distributed.destroy_process_group(self.reference_group)
         Utils.destroy_model_parallel()
 
+    def test_wraps_dense_only_pipeline_chunk(self):
+        """Allow a dense local chunk when the global model uses expert parallelism."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            num_moe_experts=4,
+            expert_model_parallel_size=2,
+            moe_layer_freq=[0],
+            moe_token_dispatcher_type="alltoall",
+            moe_router_topk=2,
+            moe_grouped_gemm=True,
+            moe_ffn_hidden_size=128,
+            add_bias_linear=False,
+            use_cpu_initialization=True,
+            params_dtype=torch.float32,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            gradient_accumulation_fusion=False,
+            attention_backend=AttnBackend.unfused,
+        )
+        model = _build_block(config)
+        assert not any(isinstance(module, MoETransformerLayer) for module in model.modules())
+
+        wrapped = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        assert isinstance(wrapped.module, FsdpModule)
+
     def test_build_train_and_step(self):
         """Shard experts over expert-DP and dense parameters over full DP."""
         # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
