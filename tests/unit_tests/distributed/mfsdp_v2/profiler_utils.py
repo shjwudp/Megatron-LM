@@ -52,7 +52,7 @@ def collect_linked_kernels(
     for event in events:
         if event.device_type != DeviceType.CUDA:
             continue
-        if event.activity_type != "kernel":
+        if hasattr(event, "activity_type") and event.activity_type != "kernel":
             continue
         if _linked_correlation_id(event) not in matching_correlations:
             continue
