@@ -52,7 +52,15 @@ def collect_linked_kernels(
     for event in events:
         if event.device_type != DeviceType.CUDA:
             continue
-        if hasattr(event, "activity_type") and event.activity_type != "kernel":
+        activity_type = getattr(event, "activity_type", None)
+        if activity_type is not None:
+            if activity_type != "kernel":
+                continue
+        elif cpu_event_name_substring in event.name:
+            # Older profiler FunctionEvents do not expose activity_type and
+            # report an aggregate CUDA event named after the CPU collective in
+            # addition to its linked device kernel. Do not count that wrapper
+            # as a second kernel.
             continue
         if _linked_correlation_id(event) not in matching_correlations:
             continue
