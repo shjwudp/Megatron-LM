@@ -113,6 +113,71 @@ class TestMcoreAdapterDense:
         assert child_parameter_names
         assert root_parameter_names == {"1.weight", "1.bias"}
 
+    def test_zero1_mesh_placements_and_multiple_steps(self):
+        """Pure ZeRO-1 should shard optimizer state without sharding dense weights."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        model = torch.nn.Linear(config.hidden_size, config.hidden_size).to(
+            device="cuda", dtype=config.params_dtype
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim",
+                num_distributed_optimizer_instances=1,
+                megatron_fsdp_main_params_dtype=torch.float32,
+                megatron_fsdp_main_grads_dtype=torch.bfloat16,
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        assert tuple(model.mesh.mesh.shape) == (torch.distributed.get_world_size(),)
+        parameter_group = model.module.parameter_groups[0]
+        assert isinstance(parameter_group.model_weight.placements[0], Replicate)
+        assert isinstance(parameter_group._main_grad_placements[0], Partial)
+        assert isinstance(parameter_group.main_weight.placements[0], Flat)
+
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="adam",
+                lr=1.0e-3,
+                weight_decay=0.0,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                use_distributed_optimizer=False,
+                clip_grad=0.0,
+            ),
+            [model],
+            use_gloo_process_groups=False,
+            pg_collection=self.pg_collection,
+        )
+        optimizer.reload_model_params()
+
+        losses = []
+        for _ in range(3):
+            model.zero_grad_buffer()
+            optimizer.zero_grad(set_to_none=True)
+            batch = torch.randn(4, config.hidden_size, device="cuda", dtype=config.params_dtype)
+            loss = model(batch).float().square().mean()
+            loss.backward()
+            success, _, _ = optimizer.step()
+            assert success
+            losses.append(loss.detach())
+
+        assert torch.isfinite(torch.stack(losses)).all()
+
     @pytest.mark.skipif(
         not hasattr(symm_mem, "is_symm_mem_tensor"),
         reason="Requires PyTorch symmetric-memory tensor detection.",
