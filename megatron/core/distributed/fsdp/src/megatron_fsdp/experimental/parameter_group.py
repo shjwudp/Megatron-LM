@@ -924,6 +924,10 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             dtype=torch.uint8,
             device=device,
         )
+        # These are temporary all-gather destinations, so do not retain their
+        # initial allocations between construction and the first unshard.
+        self._unsharded_rowwise.release_storage()
+        self._unsharded_colwise.release_storage()
         for index, shape in enumerate(tensor_shapes):
             if (
                 len(shape) != 2
@@ -999,16 +1003,24 @@ class Fp8ParameterGroup(FsdpParameterGroup):
                 )
             )
 
-        gather_axis = changed_mesh_axis(
+        quantize_axis = changed_mesh_axis(
             self._model_weight_placements, tuple(Replicate() for _ in range(self.mesh.ndim))
         )
-        if gather_axis is None:
-            raise RuntimeError("FSDP fp8 parameter quantize requires a changed placement axis.")
+        if quantize_axis is None:
+            # ZeRO-1 compute weights are already replicated, so there is no
+            # all-gather axis to infer. TE still needs the data-parallel group
+            # to reduce MXFP8 scale metadata consistently across replicas.
+            if self.mesh.ndim != 1:
+                raise RuntimeError(
+                    "FSDP fp8 quantization of replicated model weights currently "
+                    "requires a one-dimensional data-parallel mesh."
+                )
+            quantize_axis = 0
         cast_master_weights_to_fp8(
             model_weights=model_weights,
             master_weights=master_weights,
             start_offsets=start_offsets,
-            group=self.mesh.get_group(gather_axis),
+            group=self.mesh.get_group(quantize_axis),
             fsdp_shard_model_weights=fsdp_shard_model_weights,
         )
 
@@ -1028,17 +1040,22 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             )
 
     def unshard_parameters(self, orientation: str = "rowwise") -> None:
-        """Gather and bind both MXFP8 payload orientations.
+        """Materialize and bind both MXFP8 payload orientations.
 
         TE primary-weight layers require row-wise and column-wise payloads even
         during forward, so ``orientation`` is accepted for lifecycle parity but
-        both payloads are gathered.
+        both payloads are materialized. ZeRO-1 payloads are already replicated
+        and can be bound directly; sharded payloads are gathered first.
         """
         del orientation
+        unsharded_payloads = []
         for source, target, allocation_key in (
             (self._rowwise_buffer, self._unsharded_rowwise, self._unsharded_rowwise_allocation_key),
             (self._colwise_buffer, self._unsharded_colwise, self._unsharded_colwise_allocation_key),
         ):
+            if source.placements == target.placements:
+                unsharded_payloads.append(source)
+                continue
             if self._trace_pool_allocator is None:
                 with self._symmetric_memory_context():
                     target.reallocate_storage()
@@ -1055,16 +1072,20 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             if gather_axis is None:
                 raise RuntimeError("FSDP fp8 parameter unshard requires a changed placement axis.")
             source.redistribute(target.placements, out=target)
+            unsharded_payloads.append(target)
+        unsharded_rowwise, unsharded_colwise = unsharded_payloads
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             tensor = fsdp_parameter.unsharded
-            set_rowwise_payload(tensor, self._unsharded_rowwise.get_local_tensor(index))
-            set_columnwise_payload(tensor, self._unsharded_colwise.get_local_tensor(index))
+            set_rowwise_payload(tensor, unsharded_rowwise.get_local_tensor(index))
+            set_columnwise_payload(tensor, unsharded_colwise.get_local_tensor(index))
         self._switch_to_unsharded_parameters()
 
     def release_unsharded_storage(self) -> None:
         """Detach FP8 payloads and release gathered buffers."""
         for fsdp_parameter in self.fsdp_parameters:
             clear_payloads(fsdp_parameter.unsharded)
+        if self._rowwise_buffer.placements == self._unsharded_rowwise.placements:
+            return
         if self._trace_pool_allocator is None:
             self._unsharded_rowwise.release_storage()
             self._unsharded_colwise.release_storage()
