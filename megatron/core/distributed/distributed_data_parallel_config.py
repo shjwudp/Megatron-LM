@@ -139,8 +139,9 @@ class DistributedDataParallelConfig:
     """If true, use persistently allocated double buffers for the 
       temporary memory needed in the Megatron FSDP communications.
       This option will cause additional memory overhead, however, it is necessary for
-      to register user buffer (nccl_ub=True) for the Megatron FSDP. 
-      This option will be automatically set to True when nccl_ub=True.
+      registering user buffers (nccl_ub=True) with Megatron-FSDP v1.
+      It is automatically set to True for v1 when nccl_ub=True. Megatron-FSDP v2
+      instead uses PyTorch symmetric memory and leaves this option unchanged.
     """
 
     fsdp_trace_pool: bool = False
