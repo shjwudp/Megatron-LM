@@ -215,15 +215,17 @@ replace scheduler state.
   prefetch, a backward source may select a forward target; its configured
   backward anchors still govern that target's release.
 - `prefetch_depth=N` selects the Nth future `UNSHARD` occurrence in the shared
-  context trace, counting repeated VPP executions independently and wrapping
-  at the global-batch boundary. A single context-wide depth produces a
-  one-to-one cyclic shift: every occurrence has exactly one speculative
-  producer and target.
+  context trace, counting repeated VPP executions independently without
+  wrapping at the global-batch boundary. If fewer than N occurrences remain,
+  the source does not prefetch; the target gathers after the next batch starts.
+  This keeps gathered parameters on the correct side of the optimizer update
+  and leaves no speculative full-parameter allocation live at trace-pool
+  planning time.
 - Increasing depth moves the target farther into the future but does not move
   the configured launch anchor. It therefore creates more lead after the
   protected communication at the cost of more simultaneously resident full
-  parameters. Depth must be positive and cannot exceed the number of traced
-  `UNSHARD` occurrences.
+  parameters within the batch. Depth must be positive and cannot exceed the
+  number of traced `UNSHARD` occurrences.
 - A module completion anchor must be a descendant of the annotated FSDP unit.
   To release a particular delayed prefetch, at least one matching anchor
   occurrence must remain between the source `UNSHARD` and the target's demand
@@ -609,8 +611,9 @@ The initial implementation adds tests under
 `tests/unit_tests/distributed/mfsdp_v2/` for:
 
 1. scheduler/config validation and shared-context compatibility;
-2. completion-anchor release, demand fallback, and depth-based future target
-   selection across trace wrap and repeated VPP module occurrences;
+2. completion-anchor release, demand fallback, depth-based future target
+   selection across repeated VPP module occurrences, and the no-prefetch
+   optimizer boundary;
 3. deferred RS release, automatic budget compilation, and captured
    `is_last_microbatch`;
 4. multi-step loss parity against eager execution;

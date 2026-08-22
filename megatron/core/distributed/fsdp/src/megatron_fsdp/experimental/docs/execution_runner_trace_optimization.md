@@ -81,8 +81,9 @@ directive:
 
 - `record_unshard(module, orientation)` — validates the unshard against
   the traced event, advances the cursor, and
-  `suggest_prefetch(module, orientation)` then returns the next **unshard**
-  event (skipping intervening reshard events) as the prefetch target.
+  `suggest_prefetch(module, orientation)` then returns a future **unshard**
+  event before the current global-batch boundary (skipping intervening
+  reshard events) as the prefetch target.
 - `record_reshard(module)` — validates the reshard and advances the cursor;
   `suggest_skip_reshard(module)` then returns whether the actual reshard can
   be **skipped** so the storage stays resident.
@@ -191,6 +192,10 @@ for group in self._parameter_groups:
   dedup entry so the next round records a fresh unshard.
 - **Memory** is bounded: skipping a reshard keeps at most one extra module's
   storage resident, and only while it is immediately reused.
+- **Optimizer boundary** is closed: lookahead and reshard skipping never wrap
+  from the end of one global batch to the beginning of the next. A pre-step
+  gather would otherwise expose stale weights after the optimizer update and
+  keep a trace-pool allocation live at its planning boundary.
 
 ## 6. Open questions
 
@@ -199,9 +204,7 @@ for group in self._parameter_groups:
    memory for fewer all-gathers and needs a residency budget.
 2. Should the optimization path also skip the all-gather for a module that is
    resident but whose reshard was *not* skipped (e.g. prefetched modules)?
-3. How should the optimization path interact with the MXFP8 scale-inverse
-   grids when a payload is kept resident across optimizer steps?
-4. Should `complete_trace()` compile a more elaborate plan with residency
+3. Should `complete_trace()` compile a more elaborate plan with residency
    windows and configurable prefetch distances instead of the event cursor?
 
 ## 7. Sources

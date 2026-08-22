@@ -44,8 +44,9 @@ The per-op interfaces are:
   trace path — record the real event, or during replay validate it against
   the traced cycle and advance the cursor.
 - ``suggest_prefetch()``: optimization path — a configured-depth future
-  traced unshard (skipping other event kinds) to all-gather ahead, or
-  ``None`` while tracing.
+  traced unshard before the current global-batch boundary (skipping other
+  event kinds) to all-gather ahead, or ``None`` while tracing or when the
+  requested lookahead would cross the optimizer step.
 - ``suggest_skip_reshard(module)``: optimization path — whether this reshard
   can be skipped because the next traced unshard reuses the same module and
   orientation, keeping the storage resident.
@@ -239,7 +240,10 @@ class FsdpExecutionRunner:
         In default mode, resolves the static ``forward_order`` /
         ``backward_order`` successor. In trace-replay mode, returns the
         ``depth``-th future traced unshard (skipping other event kinds) with
-        its recorded orientation.
+        its recorded orientation. Replay lookahead never wraps across the
+        global-batch boundary: parameters gathered before the optimizer step
+        would contain stale weights afterward, and their live storage would
+        also violate trace-pool planning at that boundary.
 
         Args:
             module: The FSDP module just unsharded for compute.
@@ -262,17 +266,23 @@ class FsdpExecutionRunner:
         # validated replay cycle suggests a prefetch target.
         if self._phase is not RunnerPhase.REPLAYING or not self._trace:
             return None
+        total_unshards = sum(event.kind is EventKind.UNSHARD for event in self._trace)
+        if depth > total_unshards:
+            raise ValueError(
+                f"Prefetch depth {depth} exceeds the {total_unshards} "
+                "UNSHARD occurrences in the replay trace."
+            )
+
         remaining = depth
-        for i in range(len(self._trace)):
-            event = self._trace[(self._replay_index + i) % len(self._trace)]
+        for event in self._trace[self._replay_index :]:
             if event.kind is EventKind.UNSHARD:
                 remaining -= 1
                 if remaining == 0:
                     return event.module, event.orientation
-        raise ValueError(
-            f"Prefetch depth {depth} exceeds the {depth - remaining} "
-            "UNSHARD occurrences in the replay trace."
-        )
+        # Fewer than ``depth`` consumes remain in this global batch. Waiting
+        # until the next batch starts keeps the gather after the optimizer
+        # update and leaves the trace-pool boundary free of live allocations.
+        return None
 
     # ------------------------------------------------------------------
     # Interface 3: reshard-skip suggestion
@@ -297,6 +307,9 @@ class FsdpExecutionRunner:
         if not self._use_trace_replay or self._phase is RunnerPhase.TRACING:
             return False
         if not self._trace:
+            return False
+        if self._replay_index >= len(self._trace):
+            # Never retain a materialized parameter across the optimizer step.
             return False
         next_event = self._trace[self._replay_index]
         return (
@@ -415,6 +428,16 @@ class FsdpExecutionRunner:
             )
             return
 
+        if self._replay_index >= len(self._trace):
+            self._divergences += 1
+            logger.warning(
+                "FsdpExecutionRunner: replay emitted an event beyond the traced "
+                "global-batch boundary. Re-tracing from this event (divergence #%d).",
+                self._divergences,
+            )
+            self._retrace(kind, module, orientation, anchor=anchor, phase=phase)
+            return
+
         expected = self._trace[self._replay_index]
         if (
             expected.kind is not kind
@@ -441,7 +464,7 @@ class FsdpExecutionRunner:
             return
 
         self._replayed_occurrences += 1
-        self._replay_index = (self._replay_index + 1) % len(self._trace)
+        self._replay_index += 1
 
     def _retrace(
         self,
