@@ -305,8 +305,8 @@ class FsdpParameterGroup:
         allgather_stream: torch.cuda.Stream,
         use_symmetric_memory: bool,
     ) -> None:
-        """Create the sharded and replicated compute-weight storage."""
-        del model_weight_placements, use_symmetric_memory
+        """Create the resting and materialized compute-weight storage."""
+        del use_symmetric_memory
         with self._symmetric_memory_context():
             self._unsharded_model_weight = DBuffer(
                 mesh=self.mesh,
@@ -315,15 +315,19 @@ class FsdpParameterGroup:
                 dtype=self.dtype,
                 device=self.main_weight.device,
             )
-        if main_weight_dtype == self.dtype:
+        if (
+            main_weight_dtype == self.dtype
+            and main_weight_placements == model_weight_placements
+        ):
             self.model_weight = self.main_weight
         else:
-            # Keep the resting compute-weight shard on the optimizer placement.
-            # ``unshard_parameters`` restores ``model_weight_placements`` before compute.
+            # The optimizer and compute placements may differ. In ZeRO-1, keep a
+            # persistent replicated compute-weight buffer so forward does not issue
+            # parameter all-gathers; only the optimizer state remains sharded.
             with torch.cuda.stream(allgather_stream):
                 self.model_weight = DBuffer(
                     mesh=self.mesh,
-                    placements=main_weight_placements,
+                    placements=model_weight_placements,
                     tensor_shapes=tensor_shapes,
                     dtype=self.dtype,
                     device=self.main_weight.device,
@@ -382,7 +386,17 @@ class FsdpParameterGroup:
         current_stream = torch.cuda.current_stream(self.model_weight.device)
         allgather_stream.wait_stream(current_stream)
         with torch.cuda.stream(allgather_stream):
-            self.model_weight = self.main_weight.cast(self.model_weight.dtype)
+            source = self.main_weight
+            if source.dtype != self.model_weight.dtype:
+                if source.placements == self.model_weight.placements:
+                    source.cast(self.model_weight.dtype, out=self.model_weight)
+                    source = None
+                else:
+                    # Cast the optimizer shard before gathering it so ZeRO-1
+                    # communicates compute precision rather than main precision.
+                    source = source.cast(self.model_weight.dtype)
+            if source is not None:
+                source.redistribute(self.model_weight.placements, out=self.model_weight)
         # CUDA graph capture requires every forked stream to rejoin the capture
         # stream before capture ends.
         current_stream.wait_stream(allgather_stream)
@@ -430,9 +444,9 @@ class FsdpParameterGroup:
         del orientation
         assert self.model_weight is not None
         assert self._unsharded_model_weight is not None
-        # In ZeRO-1, the post-step cast leaves model_weight sharded. Only the first
-        # microbatch sees placements different from the configured model placements
-        # and restores the replicated model weight.
+        # Keep this restoration for callers that replace model_weight with a buffer
+        # carrying the optimizer placement. The normal ZeRO-1 path retains its
+        # replicated compute-weight buffer across the whole step.
         if self.model_weight.placements != self._model_weight_placements:
             with self._symmetric_memory_context():
                 # Allocate the restored destination in symmetric memory when enabled so the
@@ -486,6 +500,13 @@ class FsdpParameterGroup:
         # post-backward reshard behavior would make the caller code less clean,
         # so keep the shared storage-release path.
         if self._unsharded_model_weight is not None:
+            if (
+                self.model_weight is not None
+                and self.model_weight.placements == self._unsharded_model_weight.placements
+            ):
+                # ZeRO-1 binds the persistent replicated model_weight directly;
+                # the temporary all-gather destination was never allocated.
+                return
             if self._trace_pool_allocator is None:
                 self._unsharded_model_weight.release_storage()
             else:
