@@ -45,6 +45,16 @@ from tests.unit_tests.distributed.mfsdp_v1.utils import (
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _select_nccl_symmetric_memory_backend():
+    """Select NCCL before MXFP8 can make the process-global backend immutable."""
+    # PyTorch permits selecting the symmetric-memory backend repeatedly when it
+    # is unchanged, but it cannot switch backends after the first allocation.
+    # Some MXFP8/TE paths can use symmetric memory before the trace-pool case
+    # runs, so select the backend once for this distributed test module.
+    symm_mem.set_backend("NCCL")
+
+
 class TestMegatronFSDPE2EMxfp8:
     NUM_STEPS = 10
     SEQUENCE_LENGTH = 64
