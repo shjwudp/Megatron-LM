@@ -571,7 +571,7 @@ class FsdpModule:
             if scheduler is None:
                 next_module._unshard_parameter_groups(next_orientation, reason="static-prefetch")
             else:
-                scheduler.schedule_prefetch(self, next_module, next_orientation)
+                scheduler.schedule_prefetch(self, orientation, next_module, next_orientation)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
