@@ -59,7 +59,8 @@ def fully_shard_context(
         use_trace_replay: Trace the first batch's actual execution order and replay
             it for prefetch. Defaults to static forward/backward-order lookahead.
         use_symmetric_memory: Allocate communication staging buffers from PyTorch's
-            NCCL symmetric-memory pool.
+            NCCL symmetric-memory pool. Requires PyTorch 2.12 or later; this path
+            does not fall back to conventional local registration.
         unify_communication_stream: Whether all-gathers and reduce-scatters share one
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
