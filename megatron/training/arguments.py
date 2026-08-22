@@ -1151,12 +1151,16 @@ def validate_args(args, defaults={}):
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
 
-        if args.nccl_ub:
+        if args.nccl_ub and args.megatron_fsdp_version != 2:
             # In Megatron-LM, required implementation for manual registration is already provided.
-            # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+            # Enable it by default for Megatron-FSDP v1. V2 passes nccl_ub through to
+            # PyTorch symmetric-memory allocation instead of using the legacy buffers.
             args.fsdp_manual_registration = True
             args.fsdp_double_buffer = True
-            warn_rank_0('FSDP double buffer and manual registration is enabled by default when --nccl-ub is enabled!')
+            warn_rank_0(
+                'FSDP double buffer and manual registration is enabled by default when '
+                '--nccl-ub is enabled for Megatron-FSDP v1!'
+            )
 
         if args.megatron_fsdp_max_pool_double_buffer:
             # MaxPoolAllocator is a type of FSDP double buffer.
@@ -3151,7 +3155,8 @@ def _add_distributed_args(parser):
                        help="Enable double buffering for temporary memory needed for Megatron FSDP communications. "
                         "Double-buffering the communication memory improves memory management efficiency by "
                         "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
-                        "This is required for user buffer registration and is enabled by default when using NCCL user buffers.")
+                        "For Megatron-FSDP v1, this is required for user buffer registration and is enabled by default "
+                        "when using NCCL user buffers. Megatron-FSDP v2 uses PyTorch symmetric memory instead.")
     group.add_argument('--fsdp-trace-pool', action='store_true',
                        help="Enable trace-planned temporary-buffer storage for Megatron FSDP v2. "
                         "The first global batch records buffer lifetimes; later batches reuse fixed slots. "

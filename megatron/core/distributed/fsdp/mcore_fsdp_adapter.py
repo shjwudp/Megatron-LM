@@ -1299,8 +1299,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if ddp_config.nccl_ub and ddp_config.disable_symmetric_registration:
             raise ValueError("MFSDP v2 requires symmetric registration when nccl_ub is enabled.")
-        if ddp_config.fsdp_trace_pool and ddp_config.nccl_ub:
-            raise ValueError("MFSDP v2 trace-pool is incompatible with NCCL user buffers.")
         if ddp_config.fsdp_trace_pool and ddp_config.fsdp_double_buffer:
             raise ValueError("MFSDP v2 trace-pool is incompatible with FSDP double buffering.")
         if ddp_config.fsdp_manual_registration:

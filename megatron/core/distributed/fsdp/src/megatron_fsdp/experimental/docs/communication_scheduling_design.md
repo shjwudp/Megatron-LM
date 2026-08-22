@@ -525,8 +525,10 @@ pool planning:
   toward the scheduler budget, and its storage follows `record_stream`
   lifetime rules after RS submission.
 
-Trace-pool incompatibilities with NCCL user buffers, symmetric memory, and
-legacy FSDP double buffering remain unchanged.
+The trace pool may back its slots with PyTorch NCCL symmetric memory. Legacy
+FSDP double buffering remains incompatible with the trace pool; Megatron-FSDP
+v2 therefore does not enable the v1 manual-registration or double-buffer
+defaults when `--use-nccl-ub` is selected.
 
 ## Failure and fallback behavior
 

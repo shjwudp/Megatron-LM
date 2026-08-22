@@ -366,7 +366,9 @@ class TestMcoreAdapterDense:
         original_fully_shard_context = mcore_fsdp_adapter.fully_shard_context
 
         def record_fully_shard_context(*args, **kwargs):
-            fully_shard_context_calls.append(kwargs["use_symmetric_memory"])
+            fully_shard_context_calls.append(
+                (kwargs["use_symmetric_memory"], kwargs["enable_trace_pool"])
+            )
             return original_fully_shard_context(*args, **kwargs)
 
         monkeypatch.setattr(mcore_fsdp_adapter, "fully_shard_context", record_fully_shard_context)
@@ -377,12 +379,13 @@ class TestMcoreAdapterDense:
                 megatron_fsdp_version=2,
                 data_parallel_sharding_strategy="optim_grads_params",
                 nccl_ub=True,
+                fsdp_trace_pool=True,
             ),
             module=model,
             pg_collection=self.pg_collection,
         )
 
-        assert fully_shard_context_calls == [True]
+        assert fully_shard_context_calls == [(True, True)]
 
     def test_vpp_optimizer_completes_shared_context_once(self, monkeypatch):
         """One optimizer step should complete the context shared by all VPP chunks once."""
