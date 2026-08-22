@@ -738,9 +738,19 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             self.mesh = DeviceMesh.from_group(
                 pg_collection.dp_cp, device_type=device_type, mesh_dim_names=("dp",)
             )
-            placements = Placements(
-                dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
-            )
+            if ddp_config.data_parallel_sharding_strategy == "optim":
+                # ZeRO-1 keeps compute weights replicated, accumulates partial gradients,
+                # and reduce-scatters them into optimizer-owned shards at the step boundary.
+                placements = Placements(
+                    dp_axes=[0],
+                    parameter=[Replicate()],
+                    gradient=[Partial(dist.ReduceOp.AVG)],
+                    optimizer=[Flat()],
+                )
+            else:
+                placements = Placements(
+                    dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
+                )
         dp_mesh = self.mesh
 
         # Hybrid sharding applies only to dense parameters. Expert parameters
@@ -981,11 +991,19 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 raise ValueError("MFSDP v2 with EP requires an explicit expert-DP process group.")
             if not any(isinstance(submodule, MoELayer) for submodule in module.modules()):
                 raise ValueError("MFSDP v2 with EP requires MoE transformer layers.")
-        if ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
+        supported_sharding_strategies = {"optim", "optim_grads_params"}
+        if ddp_config.data_parallel_sharding_strategy not in supported_sharding_strategies:
             raise ValueError(
-                "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."
+                "MFSDP v2 requires data_parallel_sharding_strategy to be one of "
+                f"{sorted(supported_sharding_strategies)}, got "
+                f"{ddp_config.data_parallel_sharding_strategy!r}."
             )
         enable_hsdp = ddp_config.num_distributed_optimizer_instances > 1
+        if enable_hsdp and ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
+            raise ValueError(
+                "MFSDP v2 hybrid sharding requires "
+                "data_parallel_sharding_strategy='optim_grads_params'."
+            )
         if ddp_config.outer_dp_sharding_strategy == "optim" and not enable_hsdp:
             raise ValueError(
                 "MFSDP v2 outer_dp_sharding_strategy='optim' requires "
