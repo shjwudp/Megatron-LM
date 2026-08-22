@@ -133,9 +133,10 @@ collective input directly; no extra `torch.empty` is created.
 - The feature pools M-FSDP unshard and partial-gradient communication buffers.
   Persistent sharded weights, main gradients, optimizer state, activations, and
   MXFP8 quantization temporaries remain under their existing allocators.
-- PyTorch NCCL symmetric memory can back trace-pool slots for regular parameter
-  groups. MXFP8 primary weights and fused-wgrad accumulation retain their
-  existing symmetric-memory restrictions.
+- PyTorch NCCL symmetric memory can back trace-pool slots for regular and MXFP8
+  parameter groups. MXFP8 gathers use separate row-wise and column-wise slots;
+  their ordinary gradient reduce-scatter uses the same symmetric partial-gradient
+  path as regular groups. MXFP8 fused-wgrad accumulation remains unsupported.
 - Every rank in a symmetric-memory collective group must trace the same slot
   allocation order and sizes. An asymmetric model or divergent schedule can
   fail during symmetric-memory rendezvous even before the normal slot-collision
@@ -155,8 +156,8 @@ collective input directly; no extra `torch.empty` is created.
 
 Correctness tests cover Storage identity across trace release/reallocation,
 slot sharing and collisions, arena isolation, DBuffer rebinding, symmetric
-slot provenance, and multi-step loss parity across the trace-to-optimized
-transition. Performance validation should compare identical 24-GPU
+slot provenance, regular and MXFP8 multi-step loss parity across the
+trace-to-optimized transition. Performance validation should compare identical 24-GPU
 PP3/VPP2/EP8 jobs, discard at least the initial execution trace, first replay,
 and first five steps, and report allocated, reserved, and device-used memory on
 one rank from every pipeline stage.

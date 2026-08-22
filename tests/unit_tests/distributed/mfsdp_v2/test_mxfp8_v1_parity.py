@@ -18,6 +18,7 @@ MXFP8Tensor support. Run with torchrun:
 
 import pytest
 import torch
+import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.tensor import DTensor
 from torch.testing import assert_close
 
@@ -123,6 +124,7 @@ class TestMegatronFSDPE2EMxfp8:
         *,
         gradient_accumulation_fusion=False,
         num_steps=None,
+        use_symmetric_trace_pool=False,
     ):
         if num_steps is None:
             num_steps = cls.NUM_STEPS
@@ -145,6 +147,8 @@ class TestMegatronFSDPE2EMxfp8:
                 "init_model_with_meta_device": False,
                 "ckpt_format": "fsdp_dtensor",
             }
+            if use_symmetric_trace_pool:
+                fsdp_args.update(nccl_ub=True, fsdp_trace_pool=True)
         else:
             # Reference: Megatron-FSDP v1, the established fp8 param-gather
             # path (v1 requires the distributed optimizer).
@@ -238,6 +242,27 @@ class TestMegatronFSDPE2EMxfp8:
                 snapshot, _ = cls._capture_parameters(model)
                 parameter_snapshots.append(snapshot)
 
+            if use_symmetric_trace_pool:
+                contexts = {model_chunk.context for model_chunk in model}
+                assert len(contexts) == 1
+                context = contexts.pop()
+                allocator = context.trace_pool_allocator
+                assert allocator is not None
+                assert allocator.phase == "optimized"
+                assert allocator.use_symmetric_memory
+                assert allocator._slots
+                assert all(symm_mem.is_symm_mem_tensor(slot.tensor) for slot in allocator._slots)
+
+                fp8_groups = [
+                    group
+                    for model_chunk in model
+                    for module in model_chunk.modules()
+                    for group in getattr(module, "parameter_groups", ())
+                    if isinstance(group, Fp8ParameterGroup)
+                ]
+                assert fp8_groups
+                assert all(group._symm_mem_pool is not None for group in fp8_groups)
+
             return {
                 "initial_parameters": captured_initial_parameters,
                 "losses": losses,
@@ -328,6 +353,34 @@ class TestMegatronFSDPE2EMxfp8:
         )
         if torch.distributed.get_rank() == 0:
             print(f"[{case['name']}] MFSDP v2 run completed successfully.", flush=True)
+
+        self._assert_training_parity(actual, reference, case)
+
+    @pytest.mark.skipif(
+        not HAVE_TE_MXFP8TENSOR or torch.cuda.get_device_capability()[0] < 10,
+        reason="Requires a Blackwell GPU with Transformer Engine MXFP8Tensor support.",
+    )
+    def test_symmetric_trace_pool_matches_default(self):
+        """Symmetric trace-pool AG/RS preserves MXFP8 training results."""
+        case = {
+            "name": "EP2 optim_grads_params MXFP8 symmetric trace pool",
+            "model_parallel_config": {"expert_model_parallel_size": 2},
+            "model_config": {
+                "data_parallel_sharding_strategy": "optim_grads_params",
+                "megatron_fsdp_main_grads_dtype": torch.float32,
+                "moe_token_dispatcher_type": "alltoall",
+            },
+            "loss_tolerance": {"atol": 0, "rtol": 0.05},
+            "parameter_tolerance": {"atol": 5e-3, "rtol": 1e-3},
+        }
+        reference = self._run_training(use_mfsdp_v2=True, case=case, num_steps=3)
+        actual = self._run_training(
+            use_mfsdp_v2=True,
+            case=case,
+            initial_parameters=reference["initial_parameters"],
+            num_steps=3,
+            use_symmetric_trace_pool=True,
+        )
 
         self._assert_training_parity(actual, reference, case)
 
