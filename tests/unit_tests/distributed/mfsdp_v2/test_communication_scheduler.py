@@ -13,10 +13,13 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpCommunicationSchedulerConfig,
     FsdpModuleCommunicationPolicy,
     ModuleCompletion,
+    NamedCompletion,
     Placements,
     fully_shard,
     fully_shard_context,
 )
+from megatron.core.models.common.utils import TransformerLayerNode
+from megatron.core.pipeline_parallel.utils import ScheduleNode
 
 
 class TinyModel(nn.Module):
@@ -149,13 +152,94 @@ def test_completion_anchor_releases_traced_successor(distributed_setup, monkeypa
     assert runner.record_unshard(modules[0], "rowwise")
     successor = runner.suggest_prefetch(modules[0], "rowwise")
     assert successor == (modules[1], "rowwise")
-    scheduler.schedule_prefetch(modules[0], *successor)
+    scheduler.schedule_prefetch(modules[0], "rowwise", *successor)
     assert scheduler.has_pending_prefetches
     assert not calls
 
     scheduler.record_completion_anchor(modules[0], modules[0], "forward")
     assert calls == [("rowwise", "anchor")]
     assert not scheduler.has_pending_prefetches
+
+
+def test_mixed_orientation_prefetch_uses_future_backward_anchor(
+    distributed_setup, monkeypatch
+) -> None:
+    """A backward source may prefetch a forward target at a later backward anchor."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    modules = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(2)]).to(device)
+    policy = FsdpModuleCommunicationPolicy(
+        prefetch_successor_after=(
+            NamedCompletion("early", "backward"),
+            NamedCompletion("forward-only", "forward"),
+            NamedCompletion("late", "backward"),
+        )
+    )
+    with fully_shard_context(
+        device=device, communication_scheduler=FsdpCommunicationSchedulerConfig(0)
+    ) as context:
+        fully_shard(
+            modules[0], mesh=mesh, placements=_flat_placements(), communication_policy=policy
+        )
+        fully_shard(modules[1], mesh=mesh, placements=_flat_placements())
+
+    runner = context.runner
+    scheduler = context.communication_scheduler
+    assert scheduler is not None
+
+    # The first backward anchor has already passed when the backward source
+    # discovers a forward-oriented target. The next backward anchor is the
+    # legal release point; the intervening forward anchor must not release it.
+    runner.record_completion(modules[0], "early", "backward")
+    runner.record_unshard(modules[0], "colwise")
+    runner.record_completion(modules[0], "forward-only", "forward")
+    runner.record_completion(modules[0], "late", "backward")
+    runner.record_unshard(modules[1], "rowwise")
+    runner.complete_trace()
+
+    calls = []
+    monkeypatch.setattr(
+        modules[1],
+        "_unshard_parameter_groups",
+        lambda orientation, *, reason: calls.append((orientation, reason)),
+    )
+
+    scheduler.record_completion_anchor(modules[0], "early", "backward")
+    assert runner.record_unshard(modules[0], "colwise")
+    successor = runner.suggest_prefetch(modules[0], "colwise")
+    assert successor == (modules[1], "rowwise")
+    scheduler.schedule_prefetch(modules[0], "colwise", *successor)
+    assert scheduler.has_pending_prefetches
+
+    scheduler.record_completion_anchor(modules[0], "forward-only", "forward")
+    assert not calls
+    assert scheduler.has_pending_prefetches
+
+    scheduler.record_completion_anchor(modules[0], "late", "backward")
+    assert calls == [("rowwise", "anchor")]
+    assert not scheduler.has_pending_prefetches
+
+
+@pytest.mark.parametrize("bwd_dw_callables, expected_completions", [([], 1), ([object()], 0)])
+def test_delayed_wgrad_only_defers_nodes_with_wgrad(
+    monkeypatch, bwd_dw_callables, expected_completions
+) -> None:
+    """Communication-only nodes must still emit backward completion with delayed wgrad."""
+    node = TransformerLayerNode.__new__(TransformerLayerNode)
+    node.name = "moe_dispatch"
+    node.event = object()
+    node.delay_wgrad_compute = True
+    node.bwd_dw_callables = bwd_dw_callables
+    node.is_layer_first_node = False
+    node._fsdp_pre_backward_communication_hook = None
+    completions = []
+    node._fsdp_post_backward_communication_hook = (
+        lambda name, event: completions.append((name, event))
+    )
+    monkeypatch.setattr(ScheduleNode, "backward", lambda _self, *_grad: "grad")
+
+    assert node.backward(object()) == "grad"
+    assert len(completions) == expected_completions
 
 
 def test_module_prefetches_configured_future_occurrence(distributed_setup, monkeypatch) -> None:
@@ -275,7 +359,7 @@ def test_demand_unshard_is_delayed_prefetch_backstop(distributed_setup, monkeypa
         "_unshard_parameter_groups",
         lambda orientation, *, reason: calls.append((orientation, reason)),
     )
-    scheduler.schedule_prefetch(modules[0], *successor)
+    scheduler.schedule_prefetch(modules[0], "rowwise", *successor)
     scheduler.demand_unshard(modules[1], "rowwise")
     assert calls == [("rowwise", "demand")]
     assert not scheduler.has_pending_prefetches
@@ -325,8 +409,8 @@ def test_demand_unshard_releases_only_matching_occurrence(
         "_unshard_parameter_groups",
         lambda orientation, *, reason: calls.append((orientation, reason)),
     )
-    scheduler.schedule_prefetch(modules[0], modules[2], "rowwise")
-    scheduler.schedule_prefetch(modules[1], modules[2], "colwise")
+    scheduler.schedule_prefetch(modules[0], "rowwise", modules[2], "rowwise")
+    scheduler.schedule_prefetch(modules[1], "colwise", modules[2], "colwise")
 
     scheduler.demand_unshard(modules[2], "rowwise")
     assert calls == [("rowwise", "demand")]

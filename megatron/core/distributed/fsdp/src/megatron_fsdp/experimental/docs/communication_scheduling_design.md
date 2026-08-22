@@ -210,6 +210,10 @@ replace scheduler state.
   `prefetch_depth=1` is the immediate successor. It does not mean gathering an
   FSDP unit after one of its own parameter-consuming descendants, which would
   be circular.
+- Anchor phase is selected from the source occurrence, independently of the
+  target all-gather orientation. Under interleaved 1F1B and depth-adjustable
+  prefetch, a backward source may select a forward target; its configured
+  backward anchors still govern that target's release.
 - `prefetch_depth=N` selects the Nth future `UNSHARD` occurrence in the shared
   context trace, counting repeated VPP executions independently and wrapping
   at the global-batch boundary. A single context-wide depth produces a
@@ -220,11 +224,15 @@ replace scheduler state.
   protected communication at the cost of more simultaneously resident full
   parameters. Depth must be positive and cannot exceed the number of traced
   `UNSHARD` occurrences.
-- A completion anchor must be a descendant of the annotated FSDP unit and
-  must occur after that unit's `UNSHARD` and before the target's demand
+- A module completion anchor must be a descendant of the annotated FSDP unit.
+  To release a particular delayed prefetch, at least one matching anchor
+  occurrence must remain between the source `UNSHARD` and the target's demand
   `UNSHARD` in the trace.
-- If several configured anchors match one occurrence, the first matching
-  anchor observed at runtime releases the queued successor.
+- Multiple anchors may be configured for the same source phase. An anchor
+  observed before the prefetch is queued has no effect; the first matching
+  anchor observed afterward releases the queued successor. This lets a policy
+  expose successive backward completion points and use the earliest one that
+  remains ahead of a dynamically interleaved source occurrence.
 - `reduce_scatter_release_on_pre_backward` marks release modules; it does not
   identify which unit's RS to launch. The compiled occurrence trace assigns
   the oldest legal pending RS request to each release occurrence.
@@ -312,6 +320,13 @@ CUDA events are runtime objects and are not stored as part of the reusable
 trace identity. During replay, the matching hook records a fresh event on the
 actual execution stream and passes it to the launch path.
 
+With delayed weight-gradient computation, a schedule node that owns deferred
+wgrad work emits its backward completion only after `backward_dw()`. A
+communication-only node such as `moe_dispatch` has no deferred wgrad and emits
+completion when its backward call returns. This makes its event a usable
+post-communication all-gather anchor even when delayed wgrad is enabled for the
+model.
+
 The trace remains occurrence-based. Object identity selects a configured
 rule, while the trace index distinguishes repeated VPP/microbatch
 occurrences.
@@ -338,9 +353,10 @@ demand, the consumer submits the AG itself.
 ### Replay
 
 ```text
-UNSHARD(A), prefetch_depth=N
-  -> identify T as the Nth future UNSHARD occurrence
-  -> queue AG(T), do not submit it
+UNSHARD(A, source_orientation), prefetch_depth=N
+  -> identify (T, target_orientation) as the Nth future UNSHARD occurrence
+  -> select A's anchors from source_orientation
+  -> queue AG(T, target_orientation), do not submit it
 
 ANCHOR_DONE(A.x)
   -> record completion event on A.x's execution stream

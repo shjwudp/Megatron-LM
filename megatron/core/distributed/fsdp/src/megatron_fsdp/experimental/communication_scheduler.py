@@ -130,7 +130,7 @@ class _PendingPrefetch:
 
     source: "FsdpModule"
     target: "FsdpModule"
-    orientation: str
+    target_orientation: str
     completions: tuple[ModuleCompletion | NamedCompletion, ...]
 
 
@@ -230,10 +230,21 @@ class FsdpCommunicationScheduler:
         self._release_anchor_count += 1
 
     def schedule_prefetch(
-        self, source: "FsdpModule", target: "FsdpModule", orientation: str
+        self,
+        source: "FsdpModule",
+        source_orientation: str,
+        target: "FsdpModule",
+        target_orientation: str,
     ) -> None:
-        """Submit or defer a traced successor all-gather."""
-        source_phase: CommunicationPhase = "forward" if orientation == "rowwise" else "backward"
+        """Submit or defer a traced successor all-gather.
+
+        Completion anchors belong to the source occurrence, while the payload
+        orientation belongs to the target occurrence. These orientations may
+        differ in an interleaved 1F1B trace.
+        """
+        source_phase: CommunicationPhase = (
+            "forward" if source_orientation == "rowwise" else "backward"
+        )
         completions = tuple(
             completion
             for completion in source.communication_policy.prefetch_successor_after
@@ -241,16 +252,25 @@ class FsdpCommunicationScheduler:
         )
         if not completions or self._context.runner.is_tracing:
             reason = "trace-prefetch" if self._context.runner.is_tracing else "eager-prefetch"
-            target._unshard_parameter_groups(orientation, reason=reason)
+            target._unshard_parameter_groups(target_orientation, reason=reason)
             return
 
         self._pending_prefetches.append(
             _PendingPrefetch(
-                source=source, target=target, orientation=orientation, completions=completions
+                source=source,
+                target=target,
+                target_orientation=target_orientation,
+                completions=completions,
             )
         )
         self._delayed_prefetches += 1
-        torch.cuda.nvtx.range_push("MFSDP delayed AG queued")
+        source_name = source.name if source.name else "<root>"
+        target_name = target.name if target.name else "<root>"
+        torch.cuda.nvtx.range_push(
+            f"MFSDP delayed AG queued source={source_name} "
+            f"source_orientation={source_orientation} target={target_name} "
+            f"target_orientation={target_orientation}"
+        )
         torch.cuda.nvtx.range_pop()
 
     def record_completion_anchor(
@@ -284,16 +304,16 @@ class FsdpCommunicationScheduler:
         if event is None:
             event = self._context.current_stream().record_event()
         self._context.allgather_stream.wait_event(event)
-        pending.target._unshard_parameter_groups(pending.orientation, reason="anchor")
+        pending.target._unshard_parameter_groups(pending.target_orientation, reason="anchor")
         self._anchor_releases += 1
 
     def demand_unshard(self, target: "FsdpModule", orientation: str) -> None:
         """Release the oldest queued gather for the demanded module occurrence."""
         for index, pending in enumerate(self._pending_prefetches):
-            if pending.target is not target or pending.orientation != orientation:
+            if pending.target is not target or pending.target_orientation != orientation:
                 continue
             del self._pending_prefetches[index]
-            pending.target._unshard_parameter_groups(pending.orientation, reason="demand")
+            pending.target._unshard_parameter_groups(pending.target_orientation, reason="demand")
             self._demand_releases += 1
             return
 
@@ -453,7 +473,7 @@ class FsdpCommunicationScheduler:
         while self._pending_prefetches:
             pending = self._pending_prefetches.popleft()
             pending.target._unshard_parameter_groups(
-                pending.orientation, reason=f"flush-{reason.replace(' ', '-')}"
+                pending.target_orientation, reason=f"flush-{reason.replace(' ', '-')}"
             )
 
     def _get_domain(self, mesh: DeviceMesh) -> _DomainState:
