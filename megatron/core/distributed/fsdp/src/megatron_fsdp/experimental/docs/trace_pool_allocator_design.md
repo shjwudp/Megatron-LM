@@ -141,6 +141,10 @@ collective input directly; no extra `torch.empty` is created.
   allocation order and sizes. An asymmetric model or divergent schedule can
   fail during symmetric-memory rendezvous even before the normal slot-collision
   check detects schedule divergence.
+- PyTorch's symmetric-memory backend is process-global and becomes immutable
+  after the first symmetric allocation. The NCCL backend must therefore be
+  selected before another component allocates from a different symmetric-memory
+  backend; constructing additional NCCL-backed trace pools is idempotent.
 - A pooled symmetric partial-gradient buffer is persistent across backwards.
   The non-pooled symmetric path intentionally allocates this buffer afresh
   because reuse previously introduced a host-visible synchronization in the
