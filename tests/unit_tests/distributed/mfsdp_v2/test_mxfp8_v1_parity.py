@@ -245,6 +245,12 @@ class TestMegatronFSDPE2EMxfp8:
                 "grad_norms": grad_norms,
                 "parameters": parameter_snapshots,
                 "fp8_names": fp8_names,
+                "num_fp8_parameter_groups": sum(
+                    isinstance(group, Fp8ParameterGroup)
+                    for model_chunk in model
+                    for submodule in model_chunk.modules()
+                    for group in getattr(submodule, "parameter_groups", ())
+                ),
             }
         finally:
             Utils.destroy_model_parallel()
@@ -387,6 +393,31 @@ class TestMegatronFSDPE2EMxfp8:
         )
         assert captured_parameters > 0
         assert torch.isfinite(result["losses"][0])
+
+    @pytest.mark.skipif(
+        not HAVE_TE_MXFP8TENSOR or torch.cuda.get_device_capability()[0] < 10,
+        reason="Requires a Blackwell GPU with Transformer Engine MXFP8Tensor support.",
+    )
+    def test_zero1_mxfp8_multiple_steps(self):
+        """Replicated MXFP8 compute weights survive repeated ZeRO-1 updates."""
+        case = {
+            "name": "DP4 optim MXFP8",
+            "model_parallel_config": {},
+            "model_config": {
+                "data_parallel_sharding_strategy": "optim",
+                "megatron_fsdp_main_grads_dtype": torch.float32,
+                "moe_token_dispatcher_type": "alltoall",
+                "fsdp_trace_pool": True,
+            },
+        }
+        result = self._run_training(use_mfsdp_v2=True, case=case, num_steps=3)
+
+        assert result["num_fp8_parameter_groups"] > 0
+        assert torch.isfinite(torch.stack(result["losses"])).all()
+        assert all(grad_norm is not None for grad_norm in result["grad_norms"])
+        assert torch.isfinite(
+            torch.stack([torch.as_tensor(grad_norm) for grad_norm in result["grad_norms"]])
+        ).all()
 
     @pytest.mark.skipif(
         not HAVE_TE_MXFP8TENSOR or torch.cuda.get_device_capability()[0] < 10,
