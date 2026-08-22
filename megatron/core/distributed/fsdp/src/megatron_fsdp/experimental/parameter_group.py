@@ -935,8 +935,13 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         # Keep the subclass constructor aligned with FsdpParameterGroup. The
         # shared module factory passes these keywords without knowing whether
         # a group owns BF16 or MXFP8 weights.
-        if use_symmetric_memory:
-            raise ValueError("MFSDP v2 fp8 model weights do not support symmetric memory yet.")
+        if use_symmetric_memory and (
+            trace_pool_allocator is None or not trace_pool_allocator.use_symmetric_memory
+        ):
+            raise ValueError(
+                "MFSDP v2 fp8 model weights support symmetric memory only through "
+                "a symmetric trace-pool allocator."
+            )
         if te_cast_master_weights_to_fp8() is None:
             raise RuntimeError(
                 "MFSDP v2 fp8 model weights require Transformer Engine with "
@@ -951,7 +956,10 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             allgather_stream=allgather_stream,
             reduce_scatter_stream=reduce_scatter_stream,
             grad_divisor=grad_divisor,
-            use_symmetric_memory=False,
+            # The trace pool supplies symmetric row-wise/column-wise all-gather
+            # outputs. Propagate the flag as well so this group's ordinary gradient
+            # reduce-scatter staging uses symmetric slots and SUM scaling semantics.
+            use_symmetric_memory=use_symmetric_memory,
             fuse_wgrad_accumulation=fuse_wgrad_accumulation,
             trace_pool_allocator=trace_pool_allocator,
         )
