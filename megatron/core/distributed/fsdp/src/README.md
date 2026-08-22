@@ -142,6 +142,12 @@ Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fin
     - **Only effective when using with Megatron-Core.**
     - Defaults to `False`.
     - By default we try to use NCCL window (symmetric) registration if it is available. If not it falls back to conventional local registration.
+    - **Megatron-FSDP v2:** `nccl_ub=True` selects PyTorch NCCL symmetric-memory
+      staging and requires PyTorch 2.12 or later with
+      `torch.distributed._symmetric_memory.is_symm_mem_tensor`. This path does not
+      fall back to conventional local registration. For example,
+      `nvcr.io/nvidia/nemo:26.04` does not provide the required API, while
+      `nvcr.io/nvidia/nemo:26.08` has been validated with it.
 - `fsdp_manual_registration` will manually register the FSDP communication buffers with the NCCL user buffer. For symmetric registration with large models, the registration itself can take a significant amount of time. This option minimizes the number of registration calls to reduce the registration time. However, with this option enabled, you need to manually call the `ParamAndGradBuffer.manual_buffer_registration()` function after the first iteration. This is already implemented in the Megatron-LM training loop. In other use cases, users are expected to call this function themselves. 
     - This is an example of required modification in the training loop.
         ```python
