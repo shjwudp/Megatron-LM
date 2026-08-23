@@ -39,6 +39,11 @@ try:
 except ImportError:
     HAVE_DTENSOR = False
 
+try:
+    from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
+except ImportError:
+    TransformerEngineBaseModule = ()
+
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
@@ -68,6 +73,9 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
         FsdpContext,
         FsdpModule,
+    )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+        ResetParametersContext,
     )
 
     HAVE_MEGATRON_FSDP = True
@@ -540,6 +548,53 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 submodule.linear_fc1.fuse_wgrad_accumulation = True
                 submodule.linear_fc2.fuse_wgrad_accumulation = True
 
+    @staticmethod
+    def _reset_meta_parameters_before_fully_shard(
+        module: torch.nn.Module,
+        device: torch.device,
+        init_param_with_fp8: bool,
+    ) -> None:
+        """Materialize and reset parameters owned by one prospective FSDP unit.
+
+        Resetting before ``fully_shard`` is required for modules such as
+        Transformer Engine FP8 linears: meta construction creates ordinary
+        ``Parameter`` objects, while ``reset_parameters`` replaces them with
+        quantized parameters and records their preserved initialization values.
+        Child FSDP units have already been initialized and sharded, so their
+        subtrees are skipped.
+        """
+
+        def visit(submodule: torch.nn.Module) -> None:
+            if isinstance(submodule, FsdpModule):
+                return
+
+            direct_parameters = list(submodule.parameters(recurse=False))
+            if any(parameter.is_meta for parameter in direct_parameters):
+                reset_parameters = getattr(submodule, "reset_parameters", None)
+                if reset_parameters is None:
+                    reset_parameters = getattr(submodule, "_reset_parameters", None)
+                if reset_parameters is None:
+                    raise ValueError(
+                        "init_model_with_meta_device=True requires every module with "
+                        f"meta parameters to define reset_parameters or _reset_parameters; "
+                        f"got {type(submodule).__qualname__}."
+                    )
+
+                submodule.to_empty(device=device, recurse=False)
+                with ResetParametersContext(
+                    init_param_with_fp8=init_param_with_fp8,
+                    with_cuda_rng_tracker=(
+                        is_te_min_version("0.9.0")
+                        and not isinstance(submodule, TransformerEngineBaseModule)
+                    )
+                ):
+                    reset_parameters()
+
+            for child in submodule.children():
+                visit(child)
+
+        visit(module)
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -648,6 +703,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         self.moe_mesh = expert_dp_mesh
         fine_grained = config.overlap_moe_expert_parallel_comm
         skip_backward_cb = fine_grained and ddp_config.delay_wgrad_compute
+        reset_before_shard = partial(
+            self._reset_meta_parameters_before_fully_shard,
+            device=torch.device(device) if device is not None else torch.device("cuda"),
+            init_param_with_fp8=ddp_config.fp8_param_gather,
+        )
         # Join an ambient multi-chunk construction scope when VPP wrapping
         # opens one; otherwise this adapter owns and finalizes its context. The
         # combined schedule uses trace-replay because VPP occurrence order does
@@ -665,6 +725,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 # contributions after dispatch from every EP rank.
                 for submodule in module.modules():
                     if isinstance(submodule, MoELayer):
+                        if config.init_model_with_meta_device:
+                            reset_before_shard(module=submodule.experts)
                         fully_shard(
                             submodule.experts,
                             mesh=expert_dp_mesh,
@@ -684,6 +746,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
                 if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
+                    if config.init_model_with_meta_device:
+                        reset_before_shard(module=submodule)
                     fully_shard(
                         submodule,
                         mesh=dp_mesh,
@@ -708,6 +772,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         self.moe_mesh = DeviceMesh.from_group(
                             pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("edp",)
                         )
+                    if config.init_model_with_meta_device:
+                        reset_before_shard(module=submodule)
                     fully_shard(
                         submodule,
                         mesh=self.moe_mesh,
@@ -720,6 +786,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             and isinstance(submodule, TEGroupedMLP)
                         ),
                     )
+            if config.init_model_with_meta_device:
+                reset_before_shard(module=module)
             fully_shard(
                 module,
                 mesh=dp_mesh,
@@ -732,43 +800,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 ),
             )
         super().__init__(config=config, module=module)
-        if config.init_model_with_meta_device:
-            self._reset_parameters_for_meta_device_init()
         if fine_grained:
             self._setup_1f1b_overlap_interface()
-
-    def _reset_parameters_for_meta_device_init(self) -> None:
-        """Reset model parameters that were initialized on the meta device.
-
-        Meta-device init leaves parameters without values; ``fully_shard`` then
-        materializes them as empty tensors. Reset each leaf module's weights on
-        the full (unsharded) parameters, copy the aligned values back into the
-        sharded optimizer/compute buffers, and return to the sharded resting state.
-        """
-        root = self.module
-        fsdp_modules = [m for m in root.modules() if isinstance(m, FsdpModule)]
-
-        # Unshard every FSDP unit so reset_parameters() writes the full weight.
-        for m in fsdp_modules:
-            m._unshard_parameter_groups()
-        context = root.context
-        context.current_stream().wait_stream(context.allgather_stream)
-
-        # Reset the original (non-FsdpModule) leaf modules.
-        for m in root.modules():
-            if isinstance(m, FsdpModule):
-                continue
-            if hasattr(m, "reset_parameters"):
-                m.reset_parameters()
-            elif hasattr(m, "_reset_parameters"):
-                m._reset_parameters()
-
-        # Copy the reset full weights back into the sharded buffers, aligned
-        # across DP/EDP ranks, then return to the sharded resting state.
-        for m in fsdp_modules:
-            for group in m._parameter_groups:
-                group.sync_model_weight_from_unsharded_weight()
-            m._reshard_parameter_groups(record_execution=False)
 
     def _setup_1f1b_overlap_interface(self) -> None:
         """Expose the parameter lifecycle callbacks used by combined 1F1B.
