@@ -522,9 +522,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         return self.module.context
 
     @staticmethod
-    def _configure_te_grouped_mlp_wgrad_fusion(
-        module: torch.nn.Module, enabled: bool
-    ) -> None:
+    def _configure_te_grouped_mlp_wgrad_fusion(module: torch.nn.Module, enabled: bool) -> None:
         """Restrict fused wgrad accumulation to routed TE grouped experts.
 
         ``gradient_accumulation_fusion`` is consumed while the model is built, so
@@ -553,6 +551,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """Build the low-level scheduler config when at least one rule is enabled."""
         if not (
             ddp_config.fsdp_prefetch_depth != 1
+            or ddp_config.fsdp_max_prefetch_resident_bytes is not None
             or ddp_config.fsdp_prefetch_successor_after
             or ddp_config.fsdp_reduce_scatter_release_on_pre_backward
         ):
@@ -560,6 +559,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         return FsdpCommunicationSchedulerConfig(
             max_pending_reduce_scatter_bytes=ddp_config.fsdp_max_pending_reduce_scatter_bytes,
             prefetch_depth=ddp_config.fsdp_prefetch_depth,
+            max_prefetch_resident_bytes=ddp_config.fsdp_max_prefetch_resident_bytes,
         )
 
     @staticmethod
@@ -843,9 +843,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                                 and isinstance(submodule.experts, TEGroupedMLP)
                             ),
                             grad_divisor=config.expert_model_parallel_size,
-                            communication_policy=communication_policies.get(
-                                submodule.experts
-                            ),
+                            communication_policy=communication_policies.get(submodule.experts),
                         )
             for _submodule_fqn, submodule in reversed(named_modules):
                 if submodule is module:

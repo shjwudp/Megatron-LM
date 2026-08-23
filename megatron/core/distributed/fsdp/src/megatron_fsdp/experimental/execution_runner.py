@@ -115,6 +115,7 @@ class _PrefetchSuggestion:
     module: "FsdpModule"
     orientation: str
     release_after_reshard_index: int | None = None
+    target_unshard_index: int | None = None
 
 
 class FsdpExecutionRunner:
@@ -177,6 +178,17 @@ class FsdpExecutionRunner:
     def use_trace_replay(self) -> bool:
         """Whether trace-and-replay prefetch is enabled."""
         return self._use_trace_replay
+
+    def max_prefetch_target_nbytes(self) -> int:
+        """Return the largest full-parameter materialization in the trace."""
+        return max(
+            (
+                event.module.unsharded_parameter_nbytes()
+                for event in self._trace
+                if event.kind is EventKind.UNSHARD
+            ),
+            default=0,
+        )
 
     # ------------------------------------------------------------------
     # Interface 1: record execution events (consume, reshard)
@@ -318,9 +330,7 @@ class FsdpExecutionRunner:
         remaining = depth
         target_index = None
         target_event = None
-        for index, event in enumerate(
-            self._trace[self._replay_index :], start=self._replay_index
-        ):
+        for index, event in enumerate(self._trace[self._replay_index :], start=self._replay_index):
             if event.kind is EventKind.UNSHARD:
                 remaining -= 1
                 if remaining == 0:
@@ -342,6 +352,7 @@ class FsdpExecutionRunner:
                 target_event.module,
                 target_event.orientation,
                 release_after_reshard_index,
+                target_index,
             )
         # Fewer than ``depth`` consumes remain in this global batch. Waiting
         # until the next batch starts keeps the gather after the optimizer
@@ -457,8 +468,7 @@ class FsdpExecutionRunner:
             self._phase = RunnerPhase.REPLAYING
             self._compile_completion_occurrences()
             logger.info(
-                "FsdpExecutionRunner: compiled %d-event trace, entering replay.",
-                len(self._trace),
+                "FsdpExecutionRunner: compiled %d-event trace, entering replay.", len(self._trace)
             )
         self._replay_index = 0
         # The batch boundary ends every module's unshard round; without this,
@@ -507,8 +517,7 @@ class FsdpExecutionRunner:
         mode owns all prefetch decisions and intentionally skips this check.
         """
         if getattr(module, "_phase", None) is not None and (
-            module._phase == module.Phase.BACKWARD
-            or torch._C._current_graph_task_id() != -1
+            module._phase == module.Phase.BACKWARD or torch._C._current_graph_task_id() != -1
         ):
             return None
         if orientation == "rowwise":

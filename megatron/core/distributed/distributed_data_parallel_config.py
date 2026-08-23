@@ -164,6 +164,12 @@ class DistributedDataParallelConfig:
       prefetch; larger values increase lead time and full-parameter residency.
     """
 
+    fsdp_max_prefetch_resident_bytes: Optional[int] = None
+    """Maximum bytes held by future MFSDP v2 parameter materializations.
+      ``None`` preserves unbounded residency, zero automatically selects the
+      largest single traced materialization, and a positive value overrides it.
+    """
+
     fsdp_reduce_scatter_release_on_pre_backward: Tuple[str, ...] = ()
     """MFSDP v2 reduce-scatter release rules. Each rule is
       ``SOURCE_GLOB:DESCENDANT_GLOB``; ``@NAME`` selects a named schedule node.
@@ -294,6 +300,11 @@ class DistributedDataParallelConfig:
         if self.fsdp_prefetch_depth < 1:
             raise ValueError("fsdp_prefetch_depth must be positive")
         if (
+            self.fsdp_max_prefetch_resident_bytes is not None
+            and self.fsdp_max_prefetch_resident_bytes < 0
+        ):
+            raise ValueError("fsdp_max_prefetch_resident_bytes must be non-negative")
+        if (
             self.fsdp_max_pending_reduce_scatter_bytes is not None
             and self.fsdp_max_pending_reduce_scatter_bytes < 0
         ):
@@ -308,6 +319,7 @@ class DistributedDataParallelConfig:
             )
         communication_scheduler_enabled = bool(
             self.fsdp_prefetch_depth != 1
+            or self.fsdp_max_prefetch_resident_bytes is not None
             or self.fsdp_prefetch_successor_after
             or self.fsdp_reduce_scatter_release_on_pre_backward
         )

@@ -168,6 +168,10 @@ class FsdpCommunicationSchedulerConfig:
     # One selects the immediate successor. N selects the Nth future traced
     # UNSHARD occurrence and trades additional parameter residency for lead.
     prefetch_depth: int = 1
+
+    # None: unbounded prefetch residency. Zero: infer a one-materialization
+    # byte budget. Positive: explicit resident-byte override.
+    max_prefetch_resident_bytes: int | None = None
 ```
 
 The configuration is passed once to the shared context, and annotations are
@@ -229,6 +233,15 @@ replace scheduler state.
   the launch point. It therefore creates more lead at the cost of more
   simultaneously resident full parameters within the batch. Depth must be
   positive and cannot exceed the number of traced `UNSHARD` occurrences.
+- `max_prefetch_resident_bytes=None` preserves the existing unbounded
+  depth-prefetch behavior. `0` infers the largest single full-parameter
+  materialization in the trace and uses that as the replay budget. A positive
+  value is an explicit override. This decouples occurrence lookahead from the
+  number of future parameter buffers that may remain live.
+- Resident-byte admission uses the target `UNSHARD` trace index as its deadline.
+  Among source-ready requests, the earliest deadline reserves capacity first.
+  A later-deadline target that is already materialized may therefore reshard
+  normally, remain queued, and re-gather when an earlier target reaches demand.
 - If the selected target has an earlier consume/reshard of the same FSDP unit
   between source and target, that physical reshard becomes a lifetime gate.
   The scheduler retains the parameters materialized for the earlier occurrence
@@ -274,6 +287,9 @@ The experimental MCore CLI surface is:
 ```text
 --fsdp-prefetch-successor-after SOURCE_GLOB:PHASE:DESCENDANT_GLOB
 --fsdp-prefetch-depth N
+--fsdp-max-prefetch-resident-bytes:
+  None for unbounded residency, 0 for an automatic one-materialization
+  budget, or a positive byte override
 --fsdp-reduce-scatter-release-on-pre-backward SOURCE_GLOB:DESCENDANT_GLOB
 --fsdp-max-pending-reduce-scatter-bytes:
   None for auto, 0 for eager RS, or a positive byte override
@@ -407,6 +423,44 @@ wait for AG. The intended tuning rule is therefore to place the anchor after
 the protected EP communication and increase `prefetch_depth` only far enough
 to hide AG behind subsequent compute. Nsight validation remains necessary
 because stream ordering alone cannot provide bandwidth quality-of-service.
+
+### Bounded prefetch residency
+
+Large `prefetch_depth` is useful for moving short FSDP gathers away from EP
+transport and giving them enough compute lead, but depth alone also keeps every
+selected target materialized. The residency budget separates those concerns:
+
+```text
+trace lookahead = N occurrences
+resident future bytes <= configured/inferred budget
+```
+
+Every queued request records its target `UNSHARD` index and exact temporary
+materialization size. Replay admits source-ready requests in earliest-deadline
+order. A request with an intervening target reshard participates in deadline
+selection before that reshard occurs; this lets the scheduler reserve capacity
+for a near demand instead of filling the budget with a farther target.
+
+At a target reshard:
+
+1. If that target owns the earliest source-ready deadline and fits the budget,
+   retain its existing materialization and charge its bytes.
+2. Otherwise, physically reshard it, clear its lifetime gate, and leave the
+   request queued.
+3. When a resident target reaches demand, remove its future-residency charge
+   and immediately admit the next earliest ready request that fits.
+
+Demand remains the correctness deadline. If no admitted prefetch completed in
+time, the consumer launches its own AG. The policy is deterministic from the
+compiled trace and frozen byte budget; it does not use replay-time free-memory
+measurements or timing-dependent per-rank decisions.
+
+The automatic budget is the largest single traced materialization rather than
+the sum of `prefetch_depth` targets. Smaller targets may share that byte budget,
+so "one materialization" describes the memory ceiling, not a strict request
+count. Exact per-group sizes include both row-wise and column-wise MXFP8
+payloads and exclude parameter groups whose compute weights are already
+replicated.
 
 ## Deferred reduce-scatter
 

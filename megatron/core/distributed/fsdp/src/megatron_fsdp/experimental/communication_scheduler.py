@@ -109,10 +109,14 @@ class FsdpCommunicationSchedulerConfig:
         prefetch_depth: One-based index of the future traced ``UNSHARD``
             occurrence to prefetch. One preserves immediate-successor prefetch;
             larger values trade parameter residency for more lead time.
+        max_prefetch_resident_bytes: ``None`` preserves unbounded prefetch
+            residency, zero infers a one-materialization byte budget from the
+            execution trace, and a positive value supplies an explicit limit.
     """
 
     max_pending_reduce_scatter_bytes: int | None = None
     prefetch_depth: int = 1
+    max_prefetch_resident_bytes: int | None = None
 
     def __post_init__(self) -> None:
         value = self.max_pending_reduce_scatter_bytes
@@ -122,6 +126,12 @@ class FsdpCommunicationSchedulerConfig:
             )
         if self.prefetch_depth < 1:
             raise ValueError(f"prefetch_depth must be positive, got {self.prefetch_depth}.")
+        resident_bytes = self.max_prefetch_resident_bytes
+        if resident_bytes is not None and resident_bytes < 0:
+            raise ValueError(
+                "max_prefetch_resident_bytes must be None or non-negative, "
+                f"got {resident_bytes}."
+            )
 
 
 @dataclasses.dataclass
@@ -136,7 +146,11 @@ class _PendingPrefetch:
     completion_indices: tuple[int, ...]
     completion_required: bool = False
     target_reshard_index: int | None = None
+    target_unshard_index: int | None = None
+    size_bytes: int = 0
     completed_anchor: "_CompletedPrefetchAnchor | None" = None
+    retained_through_reshard: bool = False
+    residency_deferred: bool = False
 
 
 @dataclasses.dataclass
@@ -208,6 +222,9 @@ class FsdpCommunicationScheduler:
         self.config = config
         self._pending_prefetches: deque[_PendingPrefetch] = deque()
         self._retained_prefetches: deque[_PendingPrefetch] = deque()
+        self._resident_prefetches: deque[_PendingPrefetch] = deque()
+        self._resident_prefetch_bytes = 0
+        self._effective_prefetch_resident_bytes: int | None = None
         self._completed_prefetch_anchors: dict[int, _CompletedPrefetchAnchor] = {}
         self._next_prefetch_sequence = 0
         self._delayed_prefetches = 0
@@ -215,6 +232,8 @@ class FsdpCommunicationScheduler:
         self._latched_anchor_releases = 0
         self._demand_releases = 0
         self._retained_prefetch_reuses = 0
+        self._residency_deferrals = 0
+        self._residency_releases = 0
         self._domains: dict[int, _DomainState] = {}
         self._domain_order: list[_DomainState] = []
         self._reduce_scatter_requests: deque[_ReduceScatterRequest] = deque()
@@ -230,7 +249,14 @@ class FsdpCommunicationScheduler:
     @property
     def has_pending_prefetches(self) -> bool:
         """Return whether a successor gather is waiting for an anchor."""
-        return bool(self._pending_prefetches or self._retained_prefetches)
+        return bool(
+            self._pending_prefetches or self._retained_prefetches or self._resident_prefetches
+        )
+
+    @property
+    def effective_prefetch_resident_bytes(self) -> int | None:
+        """Return the compiled resident-prefetch byte budget, if enabled."""
+        return self._effective_prefetch_resident_bytes
 
     @property
     def pending_reduce_scatter_bytes(self) -> int:
@@ -257,6 +283,7 @@ class FsdpCommunicationScheduler:
         target_orientation: str,
         *,
         target_reshard_index: int | None = None,
+        target_unshard_index: int | None = None,
     ) -> None:
         """Submit or defer a traced successor all-gather.
 
@@ -274,14 +301,14 @@ class FsdpCommunicationScheduler:
             if completion.phase == source_phase
         )
         completion_required = bool(completions)
-        if runner.is_tracing or (not completion_required and target_reshard_index is None):
+        residency_limited = self._prefetch_residency_is_limited()
+        if runner.is_tracing or (
+            not residency_limited and not completion_required and target_reshard_index is None
+        ):
             reason = "trace-prefetch" if runner.is_tracing else "eager-prefetch"
             source_name = source.name if source.name else "<root>"
             target._unshard_parameter_groups(
-                target_orientation,
-                reason=reason,
-                source=source_name,
-                source_phase=source_phase,
+                target_orientation, reason=reason, source=source_name, source_phase=source_phase
             )
             return
 
@@ -298,6 +325,8 @@ class FsdpCommunicationScheduler:
             ),
             completion_required=completion_required,
             target_reshard_index=target_reshard_index,
+            target_unshard_index=target_unshard_index,
+            size_bytes=target.unsharded_parameter_nbytes(),
         )
         self._next_prefetch_sequence += 1
         self._delayed_prefetches += 1
@@ -308,11 +337,16 @@ class FsdpCommunicationScheduler:
             f"source_phase={source_phase} source_orientation={source_orientation} "
             f"target={target_name} "
             f"target_orientation={target_orientation} "
-            f"target_reshard_index={target_reshard_index}"
+            f"target_reshard_index={target_reshard_index} "
+            f"target_unshard_index={target_unshard_index} bytes={pending.size_bytes}"
         )
         torch.cuda.nvtx.range_pop()
 
         pending.completed_anchor = self._pop_latched_completion(pending)
+        if residency_limited:
+            self._pending_prefetches.append(pending)
+            self._drain_ready_prefetches(reason="queue")
+            return
         if self._prefetch_is_ready(pending):
             reason = "latched-anchor" if pending.completed_anchor is not None else "post-reshard"
             self._submit_prefetch(pending, reason=reason)
@@ -356,21 +390,18 @@ class FsdpCommunicationScheduler:
             if event is None:
                 event = self._context.current_stream().record_event()
             self._completed_prefetch_anchors[trace_index] = _CompletedPrefetchAnchor(
-                owner=owner,
-                anchor=anchor,
-                phase=phase,
-                event=event,
+                owner=owner, anchor=anchor, phase=phase, event=event
             )
             return
         if event is None:
             event = self._context.current_stream().record_event()
         pending.completed_anchor = _CompletedPrefetchAnchor(
-            owner=owner,
-            anchor=anchor,
-            phase=phase,
-            event=event,
+            owner=owner, anchor=anchor, phase=phase, event=event
         )
         if self._prefetch_is_ready(pending):
+            if self._prefetch_residency_is_limited():
+                self._drain_ready_prefetches(reason="anchor")
+                return
             self._pending_prefetches.remove(pending)
             self._submit_prefetch(pending, reason="anchor")
 
@@ -378,10 +409,14 @@ class FsdpCommunicationScheduler:
         """Release prefetches gated by one exact physical target reshard."""
         if trace_index is None:
             return
+        matched = False
         for pending in tuple(self._pending_prefetches):
             if pending.target is not target or pending.target_reshard_index != trace_index:
                 continue
             pending.target_reshard_index = None
+            matched = True
+            if self._prefetch_residency_is_limited():
+                continue
             if not self._prefetch_is_ready(pending):
                 continue
             self._pending_prefetches.remove(pending)
@@ -389,6 +424,8 @@ class FsdpCommunicationScheduler:
             if pending.completed_anchor is not None:
                 reason = "anchor+post-reshard"
             self._submit_prefetch(pending, reason=reason)
+        if matched and self._prefetch_residency_is_limited():
+            self._drain_ready_prefetches(reason="post-reshard")
 
     def retain_prefetches_across_reshard(
         self, target: "FsdpModule", trace_index: int | None
@@ -397,19 +434,26 @@ class FsdpCommunicationScheduler:
         if trace_index is None:
             # Replay divergence retraces the rest of the current global batch.
             # Keep a prior reservation alive until demand or the optimizer boundary.
-            return any(pending.target is target for pending in self._retained_prefetches)
+            return any(
+                pending.target is target
+                for pending in (*self._retained_prefetches, *self._resident_prefetches)
+            )
         matches = [
             pending
             for pending in self._pending_prefetches
             if pending.target is target and pending.target_reshard_index == trace_index
         ]
         if not matches:
-            return any(pending.target is target for pending in self._retained_prefetches)
+            return any(
+                pending.target is target
+                for pending in (*self._retained_prefetches, *self._resident_prefetches)
+            )
         if any(
-            pending.completion_required and pending.completed_anchor is None
-            for pending in matches
+            pending.completion_required and pending.completed_anchor is None for pending in matches
         ):
             return False
+        if self._prefetch_residency_is_limited():
+            return self._retain_prefetch_with_residency_budget(target, matches)
 
         target_name = target.name if target.name else "<root>"
         for pending in matches:
@@ -444,6 +488,25 @@ class FsdpCommunicationScheduler:
 
     def demand_unshard(self, target: "FsdpModule", orientation: str) -> None:
         """Consume retained storage or release the oldest queued target gather."""
+        for index, resident in enumerate(self._resident_prefetches):
+            if resident.target is not target or resident.target_orientation != orientation:
+                continue
+            del self._resident_prefetches[index]
+            self._resident_prefetch_bytes -= resident.size_bytes
+            target_name = target.name if target.name else "<root>"
+            reuse_kind = "retained" if resident.retained_through_reshard else "resident"
+            torch.cuda.nvtx.range_push(
+                f"MFSDP AG {reuse_kind} reuse target={target_name} "
+                f"orientation={orientation} reserved_orientation="
+                f"{resident.target_orientation} request={resident.sequence} "
+                f"bytes={resident.size_bytes}"
+            )
+            torch.cuda.nvtx.range_pop()
+            if resident.retained_through_reshard:
+                self._retained_prefetch_reuses += 1
+            self._residency_releases += 1
+            self._drain_ready_prefetches(reason="resident-reuse")
+            return
         for index, retained in enumerate(self._retained_prefetches):
             if retained.target is not target:
                 continue
@@ -473,6 +536,8 @@ class FsdpCommunicationScheduler:
                 request=pending.sequence,
             )
             self._demand_releases += 1
+            if self._prefetch_residency_is_limited():
+                self._drain_ready_prefetches(reason="demand")
             return
 
     def record_reduce_scatter_release(
@@ -600,6 +665,7 @@ class FsdpCommunicationScheduler:
         self._completed_prefetch_anchors.clear()
         if not runner_was_tracing:
             return
+        self._compile_prefetch_resident_budget()
         if self._reduce_scatter_requests:
             raise RuntimeError("Cannot compile communication scheduling with live RS requests.")
         self._compile_reduce_scatter_budgets()
@@ -647,10 +713,12 @@ class FsdpCommunicationScheduler:
 
     def _release_retained_prefetches(self, *, reason: str) -> None:
         """Release retained parameters that did not reach their traced demand."""
-        if not self._retained_prefetches:
+        if not self._retained_prefetches and not self._resident_prefetches:
             return
-        retained = tuple(self._retained_prefetches)
+        retained = tuple(self._retained_prefetches) + tuple(self._resident_prefetches)
         self._retained_prefetches.clear()
+        self._resident_prefetches.clear()
+        self._resident_prefetch_bytes = 0
         logger.warning(
             "MFSDP communication scheduler released %d retained prefetches on %s.",
             len(retained),
@@ -663,6 +731,131 @@ class FsdpCommunicationScheduler:
                 continue
             seen_targets.add(target_key)
             pending.target._reshard_parameter_groups(record_execution=False)
+
+    def _compile_prefetch_resident_budget(self) -> None:
+        """Freeze the optional replay-wide future-materialization byte budget."""
+        configured = self.config.max_prefetch_resident_bytes
+        if configured is None:
+            self._effective_prefetch_resident_bytes = None
+            return
+        inferred = self._context.runner.max_prefetch_target_nbytes()
+        self._effective_prefetch_resident_bytes = inferred if configured == 0 else configured
+        logger.info(
+            "MFSDP AG residency budget: configured=%s inferred_single_target=%d " "effective=%d",
+            configured,
+            inferred,
+            self._effective_prefetch_resident_bytes,
+        )
+
+    def _prefetch_residency_is_limited(self) -> bool:
+        """Return whether future materializations use byte-budget admission."""
+        return self.config.max_prefetch_resident_bytes is not None
+
+    @staticmethod
+    def _prefetch_deadline_key(pending: _PendingPrefetch) -> tuple[float, int]:
+        deadline = (
+            float(pending.target_unshard_index)
+            if pending.target_unshard_index is not None
+            else math.inf
+        )
+        return deadline, pending.sequence
+
+    def _eligible_prefetches(self) -> list[_PendingPrefetch]:
+        """Return requests whose source-completion condition is satisfied."""
+        return [
+            pending
+            for pending in self._pending_prefetches
+            if not pending.completion_required or pending.completed_anchor is not None
+        ]
+
+    def _resident_capacity_allows(self, pending: _PendingPrefetch) -> bool:
+        budget = self._effective_prefetch_resident_bytes
+        return budget is not None and self._resident_prefetch_bytes + pending.size_bytes <= budget
+
+    def _mark_residency_deferred(self, pending: _PendingPrefetch, *, reason: str) -> None:
+        if pending.residency_deferred:
+            return
+        pending.residency_deferred = True
+        self._residency_deferrals += 1
+        target_name = pending.target.name if pending.target.name else "<root>"
+        torch.cuda.nvtx.range_push(
+            f"MFSDP AG residency deferred target={target_name} "
+            f"orientation={pending.target_orientation} request={pending.sequence} "
+            f"bytes={pending.size_bytes} resident_bytes={self._resident_prefetch_bytes} "
+            f"budget={self._effective_prefetch_resident_bytes} reason={reason}"
+        )
+        torch.cuda.nvtx.range_pop()
+
+    def _retain_prefetch_with_residency_budget(
+        self, target: "FsdpModule", matches: list[_PendingPrefetch]
+    ) -> bool:
+        """Reserve the current materialization only for the earliest deadline."""
+        eligible = self._eligible_prefetches()
+        if not eligible:
+            return False
+        winner = min(eligible, key=self._prefetch_deadline_key)
+        if winner not in matches:
+            for pending in matches:
+                self._mark_residency_deferred(pending, reason="earlier-deadline")
+            return False
+        if not self._resident_capacity_allows(winner):
+            self._mark_residency_deferred(winner, reason="capacity")
+            return False
+
+        self._pending_prefetches.remove(winner)
+        winner.target_reshard_index = None
+        winner.retained_through_reshard = True
+        self._resident_prefetches.append(winner)
+        self._resident_prefetch_bytes += winner.size_bytes
+        target_name = target.name if target.name else "<root>"
+        completed = winner.completed_anchor
+        anchor = (
+            _completion_name(winner.source, completed.anchor) if completed is not None else None
+        )
+        provenance = "".join(
+            f" {key}={value}"
+            for key, value in (
+                ("source", winner.source.name if winner.source.name else "<root>"),
+                ("source_phase", winner.source_phase),
+                ("anchor", anchor),
+                ("request", winner.sequence),
+                ("bytes", winner.size_bytes),
+                ("resident_bytes", self._resident_prefetch_bytes),
+                ("budget", self._effective_prefetch_resident_bytes),
+            )
+            if value is not None
+        )
+        torch.cuda.nvtx.range_push(
+            f"MFSDP AG retained target={target_name} "
+            f"orientation={winner.target_orientation} "
+            f"trigger=retain-through-reshard{provenance}"
+        )
+        torch.cuda.nvtx.range_pop()
+        if completed is not None:
+            self._anchor_releases += 1
+        return True
+
+    def _drain_ready_prefetches(self, *, reason: str) -> None:
+        """Admit ready prefetches in earliest-demand order within the byte budget."""
+        if not self._prefetch_residency_is_limited():
+            return
+        while True:
+            eligible = self._eligible_prefetches()
+            if not eligible:
+                return
+            winner = min(eligible, key=self._prefetch_deadline_key)
+            if winner.target_reshard_index is not None:
+                for pending in eligible:
+                    if pending is not winner and self._prefetch_is_ready(pending):
+                        self._mark_residency_deferred(
+                            pending, reason="earlier-deadline-lifetime-gate"
+                        )
+                return
+            if not self._resident_capacity_allows(winner):
+                self._mark_residency_deferred(winner, reason="capacity")
+                return
+            self._pending_prefetches.remove(winner)
+            self._submit_prefetch(winner, reason=f"residency-{reason}")
 
     def _get_domain(self, mesh: DeviceMesh) -> _DomainState:
         key = id(mesh)
@@ -853,7 +1046,9 @@ class FsdpCommunicationScheduler:
         logger.info(
             "MFSDP communication scheduler: prefetch_depth=%d delayed_prefetches=%d "
             "anchor_releases=%d latched_anchor_releases=%d demand_releases=%d "
-            "retained_prefetch_reuses=%d pending_prefetches=%d "
+            "retained_prefetch_reuses=%d residency_deferrals=%d "
+            "residency_releases=%d resident_prefetch_bytes=%d "
+            "effective_prefetch_resident_bytes=%s pending_prefetches=%d "
             "rs_anchor_releases=%d capacity_releases=%d final_releases=%d "
             "pending_rs_bytes=%d",
             self.config.prefetch_depth,
@@ -862,7 +1057,13 @@ class FsdpCommunicationScheduler:
             self._latched_anchor_releases,
             self._demand_releases,
             self._retained_prefetch_reuses,
-            len(self._pending_prefetches) + len(self._retained_prefetches),
+            self._residency_deferrals,
+            self._residency_releases,
+            self._resident_prefetch_bytes,
+            self._effective_prefetch_resident_bytes,
+            len(self._pending_prefetches)
+            + len(self._retained_prefetches)
+            + len(self._resident_prefetches),
             self._reduce_scatter_releases,
             self._capacity_releases,
             self._final_releases,
@@ -900,12 +1101,21 @@ class FsdpCommunicationScheduler:
             ),
             request=pending.sequence,
         )
+        if self._prefetch_residency_is_limited():
+            self._resident_prefetches.append(pending)
+            self._resident_prefetch_bytes += pending.size_bytes
+            target_name = pending.target.name if pending.target.name else "<root>"
+            torch.cuda.nvtx.range_push(
+                f"MFSDP AG residency admitted target={target_name} "
+                f"orientation={pending.target_orientation} request={pending.sequence} "
+                f"bytes={pending.size_bytes} resident_bytes={self._resident_prefetch_bytes} "
+                f"budget={self._effective_prefetch_resident_bytes}"
+            )
+            torch.cuda.nvtx.range_pop()
         if completed is not None:
             self._anchor_releases += 1
 
-    def _pop_latched_completion(
-        self, pending: _PendingPrefetch
-    ) -> _CompletedPrefetchAnchor | None:
+    def _pop_latched_completion(self, pending: _PendingPrefetch) -> _CompletedPrefetchAnchor | None:
         """Return the earliest already-satisfied anchor for ``pending``."""
         for completion_index in pending.completion_indices:
             completed = self._completed_prefetch_anchors.pop(completion_index, None)

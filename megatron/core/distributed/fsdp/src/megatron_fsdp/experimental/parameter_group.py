@@ -469,6 +469,15 @@ class FsdpParameterGroup:
             else:
                 self._trace_pool_allocator.free(self._unsharded_allocation_key)
 
+    def unsharded_parameter_nbytes(self) -> int:
+        """Return temporary bytes needed to materialize this parameter group."""
+        unsharded = self._unsharded_model_weight
+        if unsharded is None:
+            return 0
+        if self.model_weight is not None and self.model_weight.placements == unsharded.placements:
+            return 0
+        return unsharded.local_buffer.numel() * unsharded.local_buffer.element_size()
+
     @property
     def main_grad(self) -> DBuffer | None:
         """Sharded gradient buffer, materialized on first access.
@@ -625,9 +634,7 @@ class FsdpParameterGroup:
                 placements=partial_placements,
                 tensor_shapes=tensor_shapes,
                 allocation_stream=(
-                    torch.cuda.current_stream(local_buffer.device)
-                    if local_buffer.is_cuda
-                    else None
+                    torch.cuda.current_stream(local_buffer.device) if local_buffer.is_cuda else None
                 ),
             )
 
@@ -724,9 +731,7 @@ class FsdpParameterGroup:
             assert self.main_grad.allocation_stream == (
                 torch.cuda.current_stream(self.main_grad.device)
             )
-            changed_axis = changed_mesh_axis(
-                self.main_grad.placements, self._main_grad_placements
-            )
+            changed_axis = changed_mesh_axis(self.main_grad.placements, self._main_grad_placements)
             if changed_axis is None:
                 raise RuntimeError("FSDP gradient accumulation requires a changed placement axis.")
             if isinstance(self.main_grad.placements[changed_axis], Replicate):
@@ -1088,6 +1093,13 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         else:
             self._trace_pool_allocator.free(self._unsharded_rowwise_allocation_key)
             self._trace_pool_allocator.free(self._unsharded_colwise_allocation_key)
+
+    def unsharded_parameter_nbytes(self) -> int:
+        """Return bytes for both full MXFP8 payload orientations."""
+        return sum(
+            buffer.local_buffer.numel() * buffer.local_buffer.element_size()
+            for buffer in (self._unsharded_rowwise, self._unsharded_colwise)
+        )
 
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:

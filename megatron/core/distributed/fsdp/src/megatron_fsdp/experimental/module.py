@@ -617,6 +617,7 @@ class FsdpModule:
                     next_module,
                     next_orientation,
                     target_reshard_index=prefetch.release_after_reshard_index,
+                    target_unshard_index=prefetch.target_unshard_index,
                 )
 
     def post_forward(self) -> None:
@@ -782,6 +783,10 @@ class FsdpModule:
                 scheduler.mark_reduce_scatter_ready(
                     group, partial_grad, ready_event, self.context.is_last_microbatch
                 )
+
+    def unsharded_parameter_nbytes(self) -> int:
+        """Return temporary bytes needed for one full parameter materialization."""
+        return sum(group.unsharded_parameter_nbytes() for group in self._parameter_groups)
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:

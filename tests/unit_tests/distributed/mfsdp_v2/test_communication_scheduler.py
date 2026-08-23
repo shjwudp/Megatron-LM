@@ -53,6 +53,12 @@ def test_scheduler_config_rejects_nonpositive_prefetch_depth() -> None:
         FsdpCommunicationSchedulerConfig(prefetch_depth=0)
 
 
+def test_scheduler_config_rejects_negative_prefetch_resident_bytes() -> None:
+    """The automatic one-target budget is zero; negative limits are invalid."""
+    with pytest.raises(ValueError, match="max_prefetch_resident_bytes"):
+        FsdpCommunicationSchedulerConfig(max_prefetch_resident_bytes=-1)
+
+
 def test_ddp_pending_byte_override_requires_release_rule() -> None:
     """A standalone byte limit must not be silently ignored by MCore."""
     with pytest.raises(ValueError, match="requires at least one"):
@@ -66,9 +72,7 @@ def test_ddp_pending_byte_override_requires_release_rule() -> None:
 def test_ddp_prefetch_depth_enables_immediate_trace_prefetch() -> None:
     """A non-default depth should not require a delayed-release rule."""
     ddp_config = DistributedDataParallelConfig(
-        use_megatron_fsdp=True,
-        megatron_fsdp_version=2,
-        fsdp_prefetch_depth=2,
+        use_megatron_fsdp=True, megatron_fsdp_version=2, fsdp_prefetch_depth=2
     )
 
     scheduler_config = (
@@ -76,6 +80,19 @@ def test_ddp_prefetch_depth_enables_immediate_trace_prefetch() -> None:
     )
     assert scheduler_config is not None
     assert scheduler_config.prefetch_depth == 2
+
+
+def test_ddp_prefetch_residency_limit_enables_scheduler() -> None:
+    """The automatic residency budget should not require a delayed-release rule."""
+    ddp_config = DistributedDataParallelConfig(
+        use_megatron_fsdp=True, megatron_fsdp_version=2, fsdp_max_prefetch_resident_bytes=0
+    )
+
+    scheduler_config = (
+        mcore_fsdp_adapter.FullyShardedDataParallelV2._communication_scheduler_config(ddp_config)
+    )
+    assert scheduler_config is not None
+    assert scheduler_config.max_prefetch_resident_bytes == 0
 
 
 def test_static_runner_rejects_deep_prefetch(distributed_setup) -> None:
@@ -340,10 +357,7 @@ def test_latched_anchor_does_not_cross_vpp_occurrences(distributed_setup, monkey
     assert calls == [("rowwise", "latched-anchor", "@early")]
 
     scheduler.record_completion_anchor(modules[0], "early", "backward")
-    assert calls == [
-        ("rowwise", "latched-anchor", "@early"),
-        ("rowwise", "anchor", "@early"),
-    ]
+    assert calls == [("rowwise", "latched-anchor", "@early"), ("rowwise", "anchor", "@early")]
     assert not scheduler.has_pending_prefetches
 
 
@@ -415,8 +429,8 @@ def test_delayed_wgrad_only_defers_nodes_with_wgrad(
     node.is_layer_first_node = False
     node._fsdp_pre_backward_communication_hook = None
     completions = []
-    node._fsdp_post_backward_communication_hook = (
-        lambda name, event: completions.append((name, event))
+    node._fsdp_post_backward_communication_hook = lambda name, event: completions.append(
+        (name, event)
     )
     monkeypatch.setattr(ScheduleNode, "backward", lambda _self, *_grad: "grad")
 
@@ -429,9 +443,7 @@ def test_module_prefetches_configured_future_occurrence(distributed_setup, monke
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     modules = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(3)]).to(device)
-    config = FsdpCommunicationSchedulerConfig(
-        max_pending_reduce_scatter_bytes=0, prefetch_depth=2
-    )
+    config = FsdpCommunicationSchedulerConfig(max_pending_reduce_scatter_bytes=0, prefetch_depth=2)
     policy = FsdpModuleCommunicationPolicy(
         prefetch_successor_after=(ModuleCompletion(modules[0], "forward"),)
     )
@@ -530,6 +542,72 @@ def test_deep_prefetch_retains_intervening_target_occurrence(
     scheduler.demand_unshard(target, "rowwise")
     assert not scheduler.has_pending_prefetches
     assert not calls
+
+
+def test_prefetch_residency_budget_reserves_earliest_demand(distributed_setup, monkeypatch) -> None:
+    """One auto-sized slot should retain the earliest demand, then re-gather the later one."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    modules = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(4)]).to(device)
+    first_source, second_source, later_target, earlier_target = modules
+    with fully_shard_context(
+        device=device,
+        communication_scheduler=FsdpCommunicationSchedulerConfig(
+            max_pending_reduce_scatter_bytes=0, prefetch_depth=3, max_prefetch_resident_bytes=0
+        ),
+    ) as context:
+        for module in modules:
+            fully_shard(module, mesh=mesh, placements=_flat_placements())
+
+    runner = context.runner
+    scheduler = context.communication_scheduler
+    assert scheduler is not None
+
+    # Compile the automatic budget to exactly one largest traced materialization.
+    runner.record_unshard(later_target, "rowwise")
+    runner.record_unshard(earlier_target, "rowwise")
+    context.complete_trace()
+    target_bytes = later_target.unsharded_parameter_nbytes()
+    assert target_bytes > 0
+    assert scheduler.effective_prefetch_resident_bytes == target_bytes
+
+    calls = []
+    monkeypatch.setattr(
+        later_target,
+        "_unshard_parameter_groups",
+        lambda orientation, *, reason, **_metadata: calls.append((orientation, reason)),
+    )
+
+    scheduler.schedule_prefetch(
+        first_source,
+        "rowwise",
+        later_target,
+        "rowwise",
+        target_reshard_index=10,
+        target_unshard_index=30,
+    )
+    scheduler.schedule_prefetch(
+        second_source,
+        "rowwise",
+        earlier_target,
+        "rowwise",
+        target_reshard_index=11,
+        target_unshard_index=20,
+    )
+
+    # Although the later target reaches its reshard first, full-trace EDF keeps
+    # the only slot available for the earlier demand.
+    assert not scheduler.retain_prefetches_across_reshard(later_target, 10)
+    scheduler.record_target_reshard(later_target, 10)
+    assert not calls
+    assert scheduler.retain_prefetches_across_reshard(earlier_target, 11)
+
+    # Consuming the earlier target releases the slot and immediately submits
+    # the already-ready later target while it still has trace lead time.
+    scheduler.demand_unshard(earlier_target, "rowwise")
+    assert calls == [("rowwise", "residency-resident-reuse")]
+    scheduler.demand_unshard(later_target, "rowwise")
+    assert not scheduler.has_pending_prefetches
 
 
 def test_module_reshard_honors_retained_prefetch(distributed_setup, monkeypatch) -> None:
@@ -717,9 +795,7 @@ def test_demand_unshard_is_delayed_prefetch_backstop(distributed_setup, monkeypa
     assert not scheduler.has_pending_prefetches
 
 
-def test_demand_unshard_releases_only_matching_occurrence(
-    distributed_setup, monkeypatch
-) -> None:
+def test_demand_unshard_releases_only_matching_occurrence(distributed_setup, monkeypatch) -> None:
     """A demand must retain future prefetches for other orientations."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -805,11 +881,7 @@ def test_reduce_scatter_waits_for_pre_backward_release(distributed_setup, monkey
 
     monkeypatch.setattr(torch.cuda.nvtx, "range_push", range_push)
     monkeypatch.setattr(torch.cuda.nvtx, "range_pop", range_pop)
-    monkeypatch.setattr(
-        group,
-        "reduce_partial_gradients",
-        reduce_partial_gradients,
-    )
+    monkeypatch.setattr(group, "reduce_partial_gradients", reduce_partial_gradients)
     monkeypatch.setattr(group, "release_partial_grad_buffer", lambda: None)
 
     # Trace one request and one legal release occurrence. Physical communication
@@ -874,9 +946,7 @@ def test_same_group_reuse_drains_older_domain_requests(distributed_setup, monkey
 
     context.runner.record_unshard(modules[0], "rowwise")
     for group_index, group in enumerate(groups):
-        scheduler.reserve_reduce_scatter(
-            group, module_name=f"module.{group_index}", group_index=0
-        )
+        scheduler.reserve_reduce_scatter(group, module_name=f"module.{group_index}", group_index=0)
         scheduler.mark_reduce_scatter_ready(
             group, object(), context.current_stream().record_event(), True
         )
@@ -886,9 +956,7 @@ def test_same_group_reuse_drains_older_domain_requests(distributed_setup, monkey
 
     context.runner.record_unshard(modules[0], "rowwise")
     for group_index, group in enumerate(groups):
-        scheduler.reserve_reduce_scatter(
-            group, module_name=f"module.{group_index}", group_index=0
-        )
+        scheduler.reserve_reduce_scatter(group, module_name=f"module.{group_index}", group_index=0)
         scheduler.mark_reduce_scatter_ready(
             group, object(), context.current_stream().record_event(), True
         )
