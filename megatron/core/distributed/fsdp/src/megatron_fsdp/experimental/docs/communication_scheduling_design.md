@@ -320,7 +320,9 @@ the replay budget.
 
 CUDA events are runtime objects and are not stored as part of the reusable
 trace identity. During replay, the matching hook records a fresh event on the
-actual execution stream and passes it to the launch path.
+actual execution stream and passes it to the launch path. If the hook runs
+before its source unshard, the scheduler retains that event until the matching
+request is known.
 
 With delayed weight-gradient computation, a schedule node that owns deferred
 wgrad work emits its backward completion only after `backward_dw()`. A
@@ -330,8 +332,11 @@ post-communication all-gather anchor even when delayed wgrad is enabled for the
 model.
 
 The trace remains occurrence-based. Object identity selects a configured
-rule, while the trace index distinguishes repeated VPP/microbatch
-occurrences.
+rule, while the trace index distinguishes repeated VPP/microbatch occurrences.
+At trace compilation, the runner pairs the Nth completion of each configured
+owner/phase/anchor with the Nth source unshard for that owner and phase. It
+only compiles an anchor when the two cardinalities match; demand unshard is the
+safe fallback for an ambiguous trace.
 
 At trace completion, each rank independently freezes the occurrence trace.
 The inferred budget is reduced with `MIN` through the explicit process groups
@@ -349,22 +354,30 @@ runner records both the real `UNSHARD` order and configured completion-anchor
 occurrences. During replay, the configured depth selects the Nth future
 `UNSHARD` target and its orientation. When the source policy contains an anchor
 for the current forward/backward orientation, the scheduler queues that target
-instead of submitting it immediately. If no matching anchor occurs before
-demand, the consumer submits the AG itself.
+instead of submitting it immediately. A matching anchor that already occurred
+for this exact source occurrence is a satisfied "after" condition, so the
+scheduler submits the target immediately after that retained event. If no
+matching anchor occurs before demand, the consumer submits the AG itself.
 
 ### Replay
 
 ```text
 UNSHARD(A, source_orientation), prefetch_depth=N
   -> identify (T, target_orientation) as the Nth future UNSHARD occurrence
-  -> select A's anchors from source_orientation
-  -> queue AG(T, target_orientation), do not submit it
+  -> select A's exact-occurrence anchors from source_orientation
+  -> if an assigned anchor already completed, submit AG(T) after its event
+  -> otherwise queue AG(T, target_orientation)
 
 ANCHOR_DONE(A.x)
   -> record completion event on A.x's execution stream
-  -> allgather_stream.wait_event(anchor_event)
-  -> submit AG(T)
+  -> if its exact-occurrence request exists, submit AG(T) after the event
+  -> otherwise retain the event until that request is created
 ```
+
+Retained events are keyed by exact trace index rather than module name. They
+are cleared at replay divergence and every global-batch boundary, before trace
+indices are reused. Thus a VPP microbatch or the previous optimizer step
+cannot satisfy another occurrence.
 
 At `UNSHARD(T)`, demand execution remains the correctness backstop. If T's AG
 was never released, it is submitted immediately. If it was released but has
@@ -597,14 +610,16 @@ The scheduler emits one `MFSDP AG queued` marker for each delayed request and
 launch-scoped NVTX ranges around every parameter-group collective submission.
 `request` is a context-unique sequence that correlates the queue marker with
 the eventual launch. AG labels use `target`, `orientation`, and `trigger`
-(for example, `anchor`, `demand`, or `consumer`) rather than the ambiguous
-`module` and `release` fields. Scheduled launches also identify `source`,
+(for example, `anchor`, `latched-anchor`, `demand`, or `consumer`) rather than
+the ambiguous `module` and `release` fields. Scheduled launches also identify `source`,
 `source_phase`, and the actual `anchor` that fired. For example:
 
 ```text
 MFSDP AG queued request=42 source=layers.4 source_phase=backward ...
 MFSDP AG target=layers.3 group=1 orientation=colwise trigger=anchor \
   source=layers.4 source_phase=backward anchor=@pre_dispatch_computation request=42
+MFSDP AG target=layers.3 group=1 orientation=colwise trigger=latched-anchor \
+  source=layers.4 source_phase=backward anchor=@moe_dispatch request=43
 ```
 
 An anchor or demand request can be consumed while the target is already
@@ -630,9 +645,9 @@ The initial implementation adds tests under
 `tests/unit_tests/distributed/mfsdp_v2/` for:
 
 1. scheduler/config validation and shared-context compatibility;
-2. completion-anchor release, demand fallback, depth-based future target
-   selection across repeated VPP module occurrences, and the no-prefetch
-   optimizer boundary;
+2. future and already-satisfied completion-anchor release, demand fallback,
+   exact isolation across repeated VPP occurrences and optimizer boundaries,
+   and depth-based future target selection;
 3. deferred RS release, automatic budget compilation, and captured
    `is_last_microbatch`;
 4. multi-step loss parity against eager execution;
