@@ -147,7 +147,7 @@ def test_completion_anchor_releases_traced_successor(distributed_setup, monkeypa
     monkeypatch.setattr(
         modules[1],
         "_unshard_parameter_groups",
-        lambda orientation, *, reason: calls.append((orientation, reason)),
+        lambda orientation, **metadata: calls.append((orientation, metadata)),
     )
     assert runner.record_unshard(modules[0], "rowwise")
     successor = runner.suggest_prefetch(modules[0], "rowwise")
@@ -157,7 +157,18 @@ def test_completion_anchor_releases_traced_successor(distributed_setup, monkeypa
     assert not calls
 
     scheduler.record_completion_anchor(modules[0], modules[0], "forward")
-    assert calls == [("rowwise", "anchor")]
+    assert calls == [
+        (
+            "rowwise",
+            {
+                "reason": "anchor",
+                "source": "<root>",
+                "source_phase": "forward",
+                "anchor": "<self>",
+                "request": 0,
+            },
+        )
+    ]
     assert not scheduler.has_pending_prefetches
 
 
@@ -201,7 +212,7 @@ def test_mixed_orientation_prefetch_uses_future_backward_anchor(
     monkeypatch.setattr(
         modules[1],
         "_unshard_parameter_groups",
-        lambda orientation, *, reason: calls.append((orientation, reason)),
+        lambda orientation, *, reason, **_metadata: calls.append((orientation, reason)),
     )
 
     scheduler.record_completion_anchor(modules[0], "early", "backward")
@@ -274,7 +285,7 @@ def test_module_prefetches_configured_future_occurrence(distributed_setup, monke
         monkeypatch.setattr(
             module,
             "_unshard_parameter_groups",
-            lambda orientation, *, reason, index=index: calls.append(
+            lambda orientation, *, reason, index=index, **_metadata: calls.append(
                 (index, orientation, reason)
             ),
         )
@@ -291,7 +302,7 @@ def test_module_prefetches_configured_future_occurrence(distributed_setup, monke
 def test_all_gather_nvtx_range_wraps_parameter_group_submission(
     distributed_setup, monkeypatch
 ) -> None:
-    """Every AG launch should carry its module, group, orientation, and release path."""
+    """Every AG launch should identify its target, trigger, and scheduler provenance."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     module = nn.Linear(4, 4, bias=False).to(device)
@@ -301,7 +312,8 @@ def test_all_gather_nvtx_range_wraps_parameter_group_submission(
     group = module.parameter_groups[0]
     module_name = module.name if module.name else "<root>"
     expected_label = (
-        f"MFSDP AG module={module_name} group=0 orientation=colwise release=anchor"
+        f"MFSDP AG target={module_name} group=0 orientation=colwise trigger=anchor "
+        "source=layers.2 source_phase=backward anchor=@moe_combine request=7"
     )
     active_ranges = []
     events = []
@@ -321,9 +333,47 @@ def test_all_gather_nvtx_range_wraps_parameter_group_submission(
     monkeypatch.setattr(torch.cuda.nvtx, "range_pop", range_pop)
     monkeypatch.setattr(group, "unshard_parameters", unshard_parameters)
 
-    module._unshard_parameter_groups("colwise", reason="anchor")
+    module._unshard_parameter_groups(
+        "colwise",
+        reason="anchor",
+        source="layers.2",
+        source_phase="backward",
+        anchor="@moe_combine",
+        request=7,
+    )
 
     assert events == [("push", expected_label), ("pop", expected_label)]
+
+
+def test_all_gather_nvtx_marks_scheduler_noop(distributed_setup, monkeypatch) -> None:
+    """A consumed request that launches no AG must remain visible in the trace."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    module = nn.Linear(4, 4, bias=False).to(device)
+    with fully_shard_context(device=device):
+        fully_shard(module, mesh=mesh, placements=_flat_placements())
+
+    module_name = module.name if module.name else "<root>"
+    expected_label = (
+        f"MFSDP AG skipped target={module_name} orientation=rowwise trigger=anchor "
+        "source=layers.2 source_phase=forward anchor=@moe_combine request=11 "
+        "state=already-unsharded"
+    )
+    labels = []
+    module._unshard_event = object()
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", labels.append)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+
+    module._unshard_parameter_groups(
+        "rowwise",
+        reason="anchor",
+        source="layers.2",
+        source_phase="forward",
+        anchor="@moe_combine",
+        request=11,
+    )
+
+    assert labels == [expected_label]
 
 
 def test_demand_unshard_is_delayed_prefetch_backstop(distributed_setup, monkeypatch) -> None:
@@ -357,7 +407,7 @@ def test_demand_unshard_is_delayed_prefetch_backstop(distributed_setup, monkeypa
     monkeypatch.setattr(
         modules[1],
         "_unshard_parameter_groups",
-        lambda orientation, *, reason: calls.append((orientation, reason)),
+        lambda orientation, *, reason, **_metadata: calls.append((orientation, reason)),
     )
     scheduler.schedule_prefetch(modules[0], "rowwise", *successor)
     scheduler.demand_unshard(modules[1], "rowwise")
@@ -407,7 +457,7 @@ def test_demand_unshard_releases_only_matching_occurrence(
     monkeypatch.setattr(
         modules[2],
         "_unshard_parameter_groups",
-        lambda orientation, *, reason: calls.append((orientation, reason)),
+        lambda orientation, *, reason, **_metadata: calls.append((orientation, reason)),
     )
     scheduler.schedule_prefetch(modules[0], "rowwise", modules[2], "rowwise")
     scheduler.schedule_prefetch(modules[1], "colwise", modules[2], "colwise")
@@ -485,8 +535,10 @@ def test_reduce_scatter_waits_for_pre_backward_release(distributed_setup, monkey
     assert scheduler.pending_reduce_scatter_bytes == 0
     assert calls == [(trace_partial_grad, True), (replay_partial_grad, False)]
     assert submission_labels == [
-        "MFSDP RS module=<root> group=0 release=submit-on-ready",
-        "MFSDP RS module=<root> group=0 release=anchor",
+        f"MFSDP RS target=<root> group=0 trigger=submit-on-ready request=0 "
+        f"bytes={group.partial_grad_nbytes()}",
+        f"MFSDP RS target=<root> group=0 trigger=anchor request=1 "
+        f"bytes={group.partial_grad_nbytes()}",
     ]
 
 
