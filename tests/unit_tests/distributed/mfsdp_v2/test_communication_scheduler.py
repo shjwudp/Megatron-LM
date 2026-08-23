@@ -172,17 +172,16 @@ def test_completion_anchor_releases_traced_successor(distributed_setup, monkeypa
     assert not scheduler.has_pending_prefetches
 
 
-def test_mixed_orientation_prefetch_uses_future_backward_anchor(
+def test_mixed_orientation_prefetch_reuses_prior_backward_anchor(
     distributed_setup, monkeypatch
 ) -> None:
-    """A backward source may prefetch a forward target at a later backward anchor."""
+    """An already-completed source anchor should release its exact occurrence."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     modules = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(2)]).to(device)
     policy = FsdpModuleCommunicationPolicy(
         prefetch_successor_after=(
             NamedCompletion("early", "backward"),
-            NamedCompletion("forward-only", "forward"),
             NamedCompletion("late", "backward"),
         )
     )
@@ -199,11 +198,10 @@ def test_mixed_orientation_prefetch_uses_future_backward_anchor(
     assert scheduler is not None
 
     # The first backward anchor has already passed when the backward source
-    # discovers a forward-oriented target. The next backward anchor is the
-    # legal release point; the intervening forward anchor must not release it.
+    # discovers a forward-oriented target. Its exact replay event remains a
+    # satisfied "after" condition for this source occurrence.
     runner.record_completion(modules[0], "early", "backward")
     runner.record_unshard(modules[0], "colwise")
-    runner.record_completion(modules[0], "forward-only", "forward")
     runner.record_completion(modules[0], "late", "backward")
     runner.record_unshard(modules[1], "rowwise")
     runner.complete_trace()
@@ -212,7 +210,9 @@ def test_mixed_orientation_prefetch_uses_future_backward_anchor(
     monkeypatch.setattr(
         modules[1],
         "_unshard_parameter_groups",
-        lambda orientation, *, reason, **_metadata: calls.append((orientation, reason)),
+        lambda orientation, *, reason, **metadata: calls.append(
+            (orientation, reason, metadata.get("anchor"))
+        ),
     )
 
     scheduler.record_completion_anchor(modules[0], "early", "backward")
@@ -220,15 +220,132 @@ def test_mixed_orientation_prefetch_uses_future_backward_anchor(
     successor = runner.suggest_prefetch(modules[0], "colwise")
     assert successor == (modules[1], "rowwise")
     scheduler.schedule_prefetch(modules[0], "colwise", *successor)
-    assert scheduler.has_pending_prefetches
-
-    scheduler.record_completion_anchor(modules[0], "forward-only", "forward")
-    assert not calls
-    assert scheduler.has_pending_prefetches
+    assert calls == [("rowwise", "latched-anchor", "@early")]
+    assert not scheduler.has_pending_prefetches
 
     scheduler.record_completion_anchor(modules[0], "late", "backward")
-    assert calls == [("rowwise", "anchor")]
+    assert calls == [("rowwise", "latched-anchor", "@early")]
     assert not scheduler.has_pending_prefetches
+
+
+def test_latched_anchor_does_not_cross_vpp_occurrences(distributed_setup, monkeypatch) -> None:
+    """An unused anchor from one source occurrence must not release the next."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    modules = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(2)]).to(device)
+    policy = FsdpModuleCommunicationPolicy(
+        prefetch_successor_after=(
+            NamedCompletion("early", "backward"),
+            NamedCompletion("late", "backward"),
+        )
+    )
+    with fully_shard_context(
+        device=device, communication_scheduler=FsdpCommunicationSchedulerConfig(0)
+    ) as context:
+        fully_shard(
+            modules[0], mesh=mesh, placements=_flat_placements(), communication_policy=policy
+        )
+        fully_shard(modules[1], mesh=mesh, placements=_flat_placements())
+
+    runner = context.runner
+    scheduler = context.communication_scheduler
+    assert scheduler is not None
+
+    # Both anchors precede occurrence 0. Occurrence 1 starts before either of
+    # its own anchors, leaving occurrence 0's unused "late" event deliberately
+    # cached when occurrence 1 schedules its request.
+    runner.record_completion(modules[0], "early", "backward")
+    runner.record_completion(modules[0], "late", "backward")
+    runner.record_unshard(modules[0], "colwise")
+    runner.record_reshard(modules[0])
+    runner.record_unshard(modules[0], "colwise")
+    runner.record_completion(modules[0], "early", "backward")
+    runner.record_completion(modules[0], "late", "backward")
+    runner.record_unshard(modules[1], "rowwise")
+    runner.complete_trace()
+
+    calls = []
+    monkeypatch.setattr(
+        modules[1],
+        "_unshard_parameter_groups",
+        lambda orientation, *, reason, **metadata: calls.append(
+            (orientation, reason, metadata.get("anchor"))
+        ),
+    )
+
+    scheduler.record_completion_anchor(modules[0], "early", "backward")
+    scheduler.record_completion_anchor(modules[0], "late", "backward")
+    assert runner.record_unshard(modules[0], "colwise")
+    scheduler.schedule_prefetch(modules[0], "colwise", modules[1], "rowwise")
+    assert calls == [("rowwise", "latched-anchor", "@early")]
+
+    runner.record_reshard(modules[0])
+    assert runner.record_unshard(modules[0], "colwise")
+    scheduler.schedule_prefetch(modules[0], "colwise", modules[1], "rowwise")
+    assert scheduler.has_pending_prefetches
+    assert calls == [("rowwise", "latched-anchor", "@early")]
+
+    scheduler.record_completion_anchor(modules[0], "early", "backward")
+    assert calls == [
+        ("rowwise", "latched-anchor", "@early"),
+        ("rowwise", "anchor", "@early"),
+    ]
+    assert not scheduler.has_pending_prefetches
+
+
+def test_latched_anchor_expires_at_global_batch_boundary(distributed_setup) -> None:
+    """A cached CUDA event must not survive reuse of trace indices next batch."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    module = nn.Linear(4, 4, bias=False).to(device)
+    policy = FsdpModuleCommunicationPolicy(
+        prefetch_successor_after=(NamedCompletion("early", "backward"),)
+    )
+    with fully_shard_context(
+        device=device, communication_scheduler=FsdpCommunicationSchedulerConfig(0)
+    ) as context:
+        fully_shard(module, mesh=mesh, placements=_flat_placements(), communication_policy=policy)
+
+    scheduler = context.communication_scheduler
+    assert scheduler is not None
+    context.runner.record_completion(module, "early", "backward")
+    context.runner.record_unshard(module, "colwise")
+    context.complete_trace()
+
+    scheduler.record_completion_anchor(module, "early", "backward")
+    assert scheduler._completed_prefetch_anchors
+    context.runner.record_unshard(module, "colwise")
+    context.complete_trace()
+    assert not scheduler._completed_prefetch_anchors
+
+
+def test_latched_anchor_expires_on_replay_divergence(distributed_setup) -> None:
+    """A re-trace must discard CUDA events identified by the abandoned trace."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    modules = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(2)]).to(device)
+    policy = FsdpModuleCommunicationPolicy(
+        prefetch_successor_after=(NamedCompletion("early", "backward"),)
+    )
+    with fully_shard_context(
+        device=device, communication_scheduler=FsdpCommunicationSchedulerConfig(0)
+    ) as context:
+        fully_shard(
+            modules[0], mesh=mesh, placements=_flat_placements(), communication_policy=policy
+        )
+        fully_shard(modules[1], mesh=mesh, placements=_flat_placements())
+
+    scheduler = context.communication_scheduler
+    assert scheduler is not None
+    context.runner.record_completion(modules[0], "early", "backward")
+    context.runner.record_unshard(modules[0], "colwise")
+    context.complete_trace()
+
+    scheduler.record_completion_anchor(modules[0], "early", "backward")
+    assert scheduler._completed_prefetch_anchors
+    context.runner.record_unshard(modules[1], "rowwise")
+    assert context.runner.is_tracing
+    assert not scheduler._completed_prefetch_anchors
 
 
 @pytest.mark.parametrize("bwd_dw_callables, expected_completions", [([], 1), ([object()], 0)])
@@ -449,9 +566,9 @@ def test_demand_unshard_releases_only_matching_occurrence(
     scheduler = context.communication_scheduler
     assert scheduler is not None
     runner.record_unshard(modules[0], "rowwise")
+    runner.record_unshard(modules[1], "colwise")
     runner.record_completion(modules[1], modules[1], "backward")
     runner.complete_trace()
-    runner.record_unshard(modules[0], "rowwise")
 
     calls = []
     monkeypatch.setattr(
@@ -459,7 +576,9 @@ def test_demand_unshard_releases_only_matching_occurrence(
         "_unshard_parameter_groups",
         lambda orientation, *, reason, **_metadata: calls.append((orientation, reason)),
     )
+    runner.record_unshard(modules[0], "rowwise")
     scheduler.schedule_prefetch(modules[0], "rowwise", modules[2], "rowwise")
+    runner.record_unshard(modules[1], "colwise")
     scheduler.schedule_prefetch(modules[1], "colwise", modules[2], "colwise")
 
     scheduler.demand_unshard(modules[2], "rowwise")

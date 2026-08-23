@@ -133,7 +133,17 @@ class _PendingPrefetch:
     source_phase: CommunicationPhase
     target: "FsdpModule"
     target_orientation: str
-    completions: tuple[ModuleCompletion | NamedCompletion, ...]
+    completion_indices: tuple[int, ...]
+
+
+@dataclasses.dataclass
+class _CompletedPrefetchAnchor:
+    """One replay completion retained until its source request is known."""
+
+    owner: "FsdpModule"
+    anchor: nn.Module | str
+    phase: CommunicationPhase
+    event: torch.cuda.Event
 
 
 class _ReduceScatterState(Enum):
@@ -194,9 +204,11 @@ class FsdpCommunicationScheduler:
         self._context = context
         self.config = config
         self._pending_prefetches: deque[_PendingPrefetch] = deque()
+        self._completed_prefetch_anchors: dict[int, _CompletedPrefetchAnchor] = {}
         self._next_prefetch_sequence = 0
         self._delayed_prefetches = 0
         self._anchor_releases = 0
+        self._latched_anchor_releases = 0
         self._demand_releases = 0
         self._domains: dict[int, _DomainState] = {}
         self._domain_order: list[_DomainState] = []
@@ -248,13 +260,14 @@ class FsdpCommunicationScheduler:
         source_phase: CommunicationPhase = (
             "forward" if source_orientation == "rowwise" else "backward"
         )
+        runner = self._context.runner
         completions = tuple(
             completion
             for completion in source.communication_policy.prefetch_successor_after
             if completion.phase == source_phase
         )
-        if not completions or self._context.runner.is_tracing:
-            reason = "trace-prefetch" if self._context.runner.is_tracing else "eager-prefetch"
+        if not completions or runner.is_tracing:
+            reason = "trace-prefetch" if runner.is_tracing else "eager-prefetch"
             source_name = source.name if source.name else "<root>"
             target._unshard_parameter_groups(
                 target_orientation,
@@ -270,10 +283,11 @@ class FsdpCommunicationScheduler:
             source_phase=source_phase,
             target=target,
             target_orientation=target_orientation,
-            completions=completions,
+            completion_indices=runner.completion_indices_for_current_unshard(
+                source, source_orientation
+            ),
         )
         self._next_prefetch_sequence += 1
-        self._pending_prefetches.append(pending)
         self._delayed_prefetches += 1
         source_name = source.name if source.name else "<root>"
         target_name = target.name if target.name else "<root>"
@@ -284,6 +298,23 @@ class FsdpCommunicationScheduler:
             f"target_orientation={target_orientation}"
         )
         torch.cuda.nvtx.range_pop()
+
+        completed = self._pop_latched_completion(pending)
+        if completed is not None:
+            self._context.allgather_stream.wait_event(completed.event)
+            pending.target._unshard_parameter_groups(
+                pending.target_orientation,
+                reason="latched-anchor",
+                source=source_name,
+                source_phase=pending.source_phase,
+                anchor=_completion_name(pending.source, completed.anchor),
+                request=pending.sequence,
+            )
+            self._anchor_releases += 1
+            self._latched_anchor_releases += 1
+            return
+
+        self._pending_prefetches.append(pending)
 
     def record_completion_anchor(
         self,
@@ -303,15 +334,27 @@ class FsdpCommunicationScheduler:
                 omitted.
         """
         runner = self._context.runner
-        runner.record_completion(owner, anchor, phase)
+        trace_index = runner.record_completion(owner, anchor, phase)
         if runner.is_tracing:
             # A replay divergence may leave speculative requests from the
             # aborted cycle. Submit them before tracing a replacement cycle.
             self.flush_prefetches(reason="trace")
             return
 
-        pending = self._pop_matching_prefetch(owner, anchor, phase)
+        if trace_index is None:
+            return
+        pending = self._pop_matching_prefetch(trace_index)
         if pending is None:
+            if not runner.completion_precedes_source(trace_index):
+                return
+            if event is None:
+                event = self._context.current_stream().record_event()
+            self._completed_prefetch_anchors[trace_index] = _CompletedPrefetchAnchor(
+                owner=owner,
+                anchor=anchor,
+                phase=phase,
+                event=event,
+            )
             return
         if event is None:
             event = self._context.current_stream().record_event()
@@ -461,6 +504,9 @@ class FsdpCommunicationScheduler:
 
     def complete_trace(self, *, runner_was_tracing: bool) -> None:
         """Infer and freeze pending-byte limits after an execution trace."""
+        # Trace indices repeat in every global batch. Never let a completed
+        # CUDA event from the prior batch satisfy the next batch's occurrence.
+        self._completed_prefetch_anchors.clear()
         if not runner_was_tracing:
             return
         if self._reduce_scatter_requests:
@@ -469,6 +515,7 @@ class FsdpCommunicationScheduler:
 
     def handle_replay_divergence(self) -> None:
         """Return to eager communication while recording a replacement trace."""
+        self._completed_prefetch_anchors.clear()
         self.flush_prefetches(reason="replay divergence")
         for request in tuple(self._reduce_scatter_requests):
             if (
@@ -693,12 +740,14 @@ class FsdpCommunicationScheduler:
         """Log delayed all-gather scheduling statistics."""
         logger.info(
             "MFSDP communication scheduler: prefetch_depth=%d delayed_prefetches=%d "
-            "anchor_releases=%d demand_releases=%d pending_prefetches=%d "
+            "anchor_releases=%d latched_anchor_releases=%d demand_releases=%d "
+            "pending_prefetches=%d "
             "rs_anchor_releases=%d capacity_releases=%d final_releases=%d "
             "pending_rs_bytes=%d",
             self.config.prefetch_depth,
             self._delayed_prefetches,
             self._anchor_releases,
+            self._latched_anchor_releases,
             self._demand_releases,
             len(self._pending_prefetches),
             self._reduce_scatter_releases,
@@ -707,28 +756,28 @@ class FsdpCommunicationScheduler:
             self.pending_reduce_scatter_bytes,
         )
 
-    def _pop_matching_prefetch(
-        self, owner: "FsdpModule", anchor: nn.Module | str, phase: CommunicationPhase
-    ) -> _PendingPrefetch | None:
+    def _pop_matching_prefetch(self, completion_index: int) -> _PendingPrefetch | None:
+        """Pop the request assigned to one exact replay completion index."""
         for index, pending in enumerate(self._pending_prefetches):
-            if pending.source is not owner:
-                continue
-            if not any(
-                (
-                    isinstance(completion, ModuleCompletion)
-                    and completion.module is anchor
-                    and completion.phase == phase
-                )
-                or (
-                    isinstance(completion, NamedCompletion)
-                    and completion.name == anchor
-                    and completion.phase == phase
-                )
-                for completion in pending.completions
-            ):
+            if completion_index not in pending.completion_indices:
                 continue
             del self._pending_prefetches[index]
             return pending
+        return None
+
+    def _pop_latched_completion(
+        self, pending: _PendingPrefetch
+    ) -> _CompletedPrefetchAnchor | None:
+        """Return the earliest already-satisfied anchor for ``pending``."""
+        for completion_index in pending.completion_indices:
+            completed = self._completed_prefetch_anchors.pop(completion_index, None)
+            if completed is None:
+                continue
+            if completed.owner is not pending.source or completed.phase != pending.source_phase:
+                raise RuntimeError(
+                    "A compiled completion occurrence did not match its prefetch source."
+                )
+            return completed
         return None
 
 
