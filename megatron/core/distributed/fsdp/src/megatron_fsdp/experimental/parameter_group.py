@@ -198,11 +198,31 @@ class FsdpParameterGroup:
 
         tensor_shapes = tuple(parameter.shape for parameter in parameter_to_fqns)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
+        main_weight_sources = []
+        parameters_with_high_precision_init = []
+        for parameter in parameter_to_fqns:
+            source = parameter
+            get_high_precision_init_val = getattr(
+                parameter, "get_high_precision_init_val", None
+            )
+            if get_high_precision_init_val is not None:
+                high_precision_init_val = get_high_precision_init_val()
+                if high_precision_init_val is not None:
+                    source = high_precision_init_val
+                    parameters_with_high_precision_init.append(parameter)
+            main_weight_sources.append(source.to(dtype=main_weight_dtype))
         self.main_weight = DBuffer.distribute_tensors(
-            (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
+            main_weight_sources,
             mesh=self.mesh,
             placements=main_weight_placements,
         )
+        for parameter in parameters_with_high_precision_init:
+            parameter.clear_high_precision_init_val()
+        # Drop full-tensor initialization references before allocating and
+        # quantizing the compute-weight buffers below.
+        main_weight_sources.clear()
+        source = None
+        high_precision_init_val = None
 
         if use_symmetric_memory:
             # PyTorch caches this in C++ and returns early when the backend is already NCCL.
@@ -229,7 +249,11 @@ class FsdpParameterGroup:
             # main_grad itself is materialized lazily by the property below; only its
             # dtype and placement metadata are recorded here. See that property for why.
             self._main_grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
-            self._partial_grad_dtype = mixed_precision_policy.grad_comm_dtype or self.dtype
+            # By contract, an unspecified communication dtype inherits the
+            # persistent main-gradient dtype, not the lower-precision model dtype.
+            self._partial_grad_dtype = (
+                mixed_precision_policy.grad_comm_dtype or self._main_grad_dtype
+            )
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self._main_grad_dtype
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
@@ -571,6 +595,10 @@ class FsdpParameterGroup:
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer.
 
+        This buffer is the collective operand, so its dtype must follow
+        ``grad_comm_dtype`` even when autograd produced lower-precision gradients.
+        ``copy_gradients_to_partial_buffer`` performs the required cast while packing.
+
         The default symmetric-memory path deliberately creates fresh storage across
         microbatches because caching that storage made the next backward's ``copy_``
         force a device sync. The trace-pool experiment instead reuses a persistent
@@ -578,6 +606,7 @@ class FsdpParameterGroup:
         and performance behavior must therefore be measured independently.
         """
         assert self.requires_grad
+        assert self._partial_grad_dtype is not None
 
         # NCCL symmetric-memory reduce-scatter only selects the symmetric kernel for SUM today.
         # Preserve AVG semantics by reducing SUM and scaling the output below.
@@ -595,7 +624,7 @@ class FsdpParameterGroup:
             local_buffer = self._trace_pool_allocator.allocate(
                 self._partial_grad_allocation_key,
                 local_numel,
-                grads[0].dtype,
+                self._partial_grad_dtype,
                 grads[0].device,
                 arena=_REDUCE_SCATTER_ARENA,
             )
@@ -616,7 +645,7 @@ class FsdpParameterGroup:
                 mesh=self.mesh,
                 placements=partial_placements,
                 tensor_shapes=tensor_shapes,
-                dtype=grads[0].dtype,
+                dtype=self._partial_grad_dtype,
                 device=grads[0].device,
             )
 
