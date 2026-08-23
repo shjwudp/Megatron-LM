@@ -19,7 +19,7 @@ import logging
 import math
 from collections import deque
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import torch
 import torch.distributed as dist
@@ -128,7 +128,9 @@ class FsdpCommunicationSchedulerConfig:
 class _PendingPrefetch:
     """One traced successor gather waiting for a completion anchor."""
 
+    sequence: int
     source: "FsdpModule"
+    source_phase: CommunicationPhase
     target: "FsdpModule"
     target_orientation: str
     completions: tuple[ModuleCompletion | NamedCompletion, ...]
@@ -192,6 +194,7 @@ class FsdpCommunicationScheduler:
         self._context = context
         self.config = config
         self._pending_prefetches: deque[_PendingPrefetch] = deque()
+        self._next_prefetch_sequence = 0
         self._delayed_prefetches = 0
         self._anchor_releases = 0
         self._demand_releases = 0
@@ -252,23 +255,32 @@ class FsdpCommunicationScheduler:
         )
         if not completions or self._context.runner.is_tracing:
             reason = "trace-prefetch" if self._context.runner.is_tracing else "eager-prefetch"
-            target._unshard_parameter_groups(target_orientation, reason=reason)
+            source_name = source.name if source.name else "<root>"
+            target._unshard_parameter_groups(
+                target_orientation,
+                reason=reason,
+                source=source_name,
+                source_phase=source_phase,
+            )
             return
 
-        self._pending_prefetches.append(
-            _PendingPrefetch(
-                source=source,
-                target=target,
-                target_orientation=target_orientation,
-                completions=completions,
-            )
+        pending = _PendingPrefetch(
+            sequence=self._next_prefetch_sequence,
+            source=source,
+            source_phase=source_phase,
+            target=target,
+            target_orientation=target_orientation,
+            completions=completions,
         )
+        self._next_prefetch_sequence += 1
+        self._pending_prefetches.append(pending)
         self._delayed_prefetches += 1
         source_name = source.name if source.name else "<root>"
         target_name = target.name if target.name else "<root>"
         torch.cuda.nvtx.range_push(
-            f"MFSDP delayed AG queued source={source_name} "
-            f"source_orientation={source_orientation} target={target_name} "
+            f"MFSDP AG queued request={pending.sequence} source={source_name} "
+            f"source_phase={source_phase} source_orientation={source_orientation} "
+            f"target={target_name} "
             f"target_orientation={target_orientation}"
         )
         torch.cuda.nvtx.range_pop()
@@ -304,7 +316,14 @@ class FsdpCommunicationScheduler:
         if event is None:
             event = self._context.current_stream().record_event()
         self._context.allgather_stream.wait_event(event)
-        pending.target._unshard_parameter_groups(pending.target_orientation, reason="anchor")
+        pending.target._unshard_parameter_groups(
+            pending.target_orientation,
+            reason="anchor",
+            source=pending.source.name if pending.source.name else "<root>",
+            source_phase=pending.source_phase,
+            anchor=_completion_name(pending.source, anchor),
+            request=pending.sequence,
+        )
         self._anchor_releases += 1
 
     def demand_unshard(self, target: "FsdpModule", orientation: str) -> None:
@@ -313,7 +332,13 @@ class FsdpCommunicationScheduler:
             if pending.target is not target or pending.target_orientation != orientation:
                 continue
             del self._pending_prefetches[index]
-            pending.target._unshard_parameter_groups(pending.target_orientation, reason="demand")
+            pending.target._unshard_parameter_groups(
+                pending.target_orientation,
+                reason="demand",
+                source=pending.source.name if pending.source.name else "<root>",
+                source_phase=pending.source_phase,
+                request=pending.sequence,
+            )
             self._demand_releases += 1
             return
 
@@ -473,7 +498,11 @@ class FsdpCommunicationScheduler:
         while self._pending_prefetches:
             pending = self._pending_prefetches.popleft()
             pending.target._unshard_parameter_groups(
-                pending.target_orientation, reason=f"flush-{reason.replace(' ', '-')}"
+                pending.target_orientation,
+                reason=f"flush-{reason.replace(' ', '-')}",
+                source=pending.source.name if pending.source.name else "<root>",
+                source_phase=pending.source_phase,
+                request=pending.sequence,
             )
 
     def _get_domain(self, mesh: DeviceMesh) -> _DomainState:
@@ -632,7 +661,8 @@ class FsdpCommunicationScheduler:
             reduce_scatter_stream.wait_event(demand_event)
         reduce_scatter_stream.wait_event(ready_event)
         label = (
-            f"MFSDP RS module={request.module_name} group={request.group_index} release={reason}"
+            f"MFSDP RS target={request.module_name} group={request.group_index} "
+            f"trigger={reason} request={request.sequence} bytes={request.size_bytes}"
         )
         torch.cuda.nvtx.range_push(label)
         try:
@@ -700,3 +730,13 @@ class FsdpCommunicationScheduler:
             del self._pending_prefetches[index]
             return pending
         return None
+
+
+def _completion_name(owner: "FsdpModule", anchor: nn.Module | str) -> str:
+    """Return a compact, stable name for one actual completion anchor."""
+    if isinstance(anchor, str):
+        return f"@{anchor}"
+    for name, module in cast(nn.Module, owner).named_modules():
+        if module is anchor:
+            return name or "<self>"
+    return f"<{type(anchor).__name__}>"

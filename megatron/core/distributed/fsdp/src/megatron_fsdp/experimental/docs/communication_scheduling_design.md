@@ -593,15 +593,34 @@ reports include delayed AG count, anchor and demand releases, pending AGs,
 RS anchor/capacity/final releases, and current pending RS bytes. Selector
 resolution logs each matched FSDP unit and anchor.
 
-The scheduler emits launch-scoped NVTX ranges around every parameter-group
-collective submission. AG labels include the target FSDP module, parameter-group
-index, payload orientation, and release path (for example, `anchor`, `demand`,
-or `consumer`). RS labels include the owning FSDP module, parameter-group index,
-and release reason (for example, `anchor`, `capacity`, `submit-on-ready`, or
-`finish_grad_sync`). Keeping the CUDA launch API inside the range is required
-for Nsight to associate a later asynchronous kernel with the scheduling
-decision that submitted it; an instantaneous marker after submission is not
-sufficient, especially when autograd runs the hook on a worker thread.
+The scheduler emits one `MFSDP AG queued` marker for each delayed request and
+launch-scoped NVTX ranges around every parameter-group collective submission.
+`request` is a context-unique sequence that correlates the queue marker with
+the eventual launch. AG labels use `target`, `orientation`, and `trigger`
+(for example, `anchor`, `demand`, or `consumer`) rather than the ambiguous
+`module` and `release` fields. Scheduled launches also identify `source`,
+`source_phase`, and the actual `anchor` that fired. For example:
+
+```text
+MFSDP AG queued request=42 source=layers.4 source_phase=backward ...
+MFSDP AG target=layers.3 group=1 orientation=colwise trigger=anchor \
+  source=layers.4 source_phase=backward anchor=@pre_dispatch_computation request=42
+```
+
+An anchor or demand request can be consumed while the target is already
+materialized for another VPP occurrence or payload orientation. Such a no-op
+emits an instantaneous `MFSDP AG skipped` range with the same request and
+provenance plus `state=already-unsharded`. Normal consumer no-ops after a
+successful prefetch are intentionally omitted to avoid trace noise. This skip
+marker distinguishes a late consumer AG caused by a lost scheduler request
+from an anchor that was never observed.
+
+RS labels similarly use `target` and `trigger` and include the request
+sequence and byte count. Keeping the CUDA launch API inside the launch range
+is required for Nsight to associate a later asynchronous kernel or
+symmetric-memory memcpy payload with the scheduling decision that submitted
+it; an instantaneous marker after submission is not sufficient, especially
+when autograd runs the hook on a worker thread.
 
 ## Validation plan
 
