@@ -159,8 +159,9 @@ class DistributedDataParallelConfig:
 
     fsdp_prefetch_depth: int = 1
     """One-based future ``UNSHARD`` occurrence selected by each MFSDP v2
-      prefetch. One preserves immediate-successor prefetch; larger values
-      increase lead time and full-parameter residency.
+      prefetch. Without an ``after`` rule, the selected target is prefetched
+      immediately at the source ``UNSHARD``. One preserves immediate-successor
+      prefetch; larger values increase lead time and full-parameter residency.
     """
 
     fsdp_reduce_scatter_release_on_pre_backward: Tuple[str, ...] = ()
@@ -292,10 +293,6 @@ class DistributedDataParallelConfig:
         )
         if self.fsdp_prefetch_depth < 1:
             raise ValueError("fsdp_prefetch_depth must be positive")
-        if self.fsdp_prefetch_depth != 1 and not self.fsdp_prefetch_successor_after:
-            raise ValueError(
-                "fsdp_prefetch_depth requires at least one fsdp_prefetch_successor_after rule"
-            )
         if (
             self.fsdp_max_pending_reduce_scatter_bytes is not None
             and self.fsdp_max_pending_reduce_scatter_bytes < 0
@@ -310,7 +307,9 @@ class DistributedDataParallelConfig:
                 "fsdp_reduce_scatter_release_on_pre_backward rule"
             )
         communication_scheduler_enabled = bool(
-            self.fsdp_prefetch_successor_after or self.fsdp_reduce_scatter_release_on_pre_backward
+            self.fsdp_prefetch_depth != 1
+            or self.fsdp_prefetch_successor_after
+            or self.fsdp_reduce_scatter_release_on_pre_backward
         )
         if communication_scheduler_enabled and (
             not self.use_megatron_fsdp or self.megatron_fsdp_version != 2

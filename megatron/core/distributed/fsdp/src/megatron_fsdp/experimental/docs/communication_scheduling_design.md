@@ -221,11 +221,20 @@ replace scheduler state.
   This keeps gathered parameters on the correct side of the optimizer update
   and leaves no speculative full-parameter allocation live at trace-pool
   planning time.
+- Depth does not require a completion rule. With no source-owned `after` rule,
+  replay submits the selected target at the source `UNSHARD`, the earliest
+  trace-safe point. An `after` rule changes that immediate release into an
+  explicit delay.
 - Increasing depth moves the target farther into the future but does not move
-  the configured launch anchor. It therefore creates more lead after the
-  protected communication at the cost of more simultaneously resident full
-  parameters within the batch. Depth must be positive and cannot exceed the
-  number of traced `UNSHARD` occurrences.
+  the launch point. It therefore creates more lead at the cost of more
+  simultaneously resident full parameters within the batch. Depth must be
+  positive and cannot exceed the number of traced `UNSHARD` occurrences.
+- If the selected target has an earlier consume/reshard of the same FSDP unit
+  between source and target, that physical reshard becomes a lifetime gate.
+  The scheduler retains the parameters materialized for the earlier occurrence
+  across that reshard, then consumes the reservation at the selected future
+  occurrence. A reshard already skipped for immediate same-orientation reuse
+  is not a physical gate.
 - A module completion anchor must be a descendant of the annotated FSDP unit.
   To release a particular delayed prefetch, at least one matching anchor
   occurrence must remain between the source `UNSHARD` and the target's demand
@@ -350,21 +359,22 @@ SPMD requirement as the underlying FSDP execution.
 ### Trace
 
 The first global batch continues to run without speculative prefetch. The
-runner records both the real `UNSHARD` order and configured completion-anchor
+runner records the real `UNSHARD` order and any configured completion-anchor
 occurrences. During replay, the configured depth selects the Nth future
-`UNSHARD` target and its orientation. When the source policy contains an anchor
-for the current forward/backward orientation, the scheduler queues that target
-instead of submitting it immediately. A matching anchor that already occurred
-for this exact source occurrence is a satisfied "after" condition, so the
-scheduler submits the target immediately after that retained event. If no
-matching anchor occurs before demand, the consumer submits the AG itself.
+`UNSHARD` target and its orientation. With no completion rule, the scheduler
+submits that target immediately. When the source policy contains an anchor for
+the current forward/backward orientation, the scheduler queues the target
+instead. A matching anchor that already occurred for this exact source
+occurrence is a satisfied "after" condition. If no matching anchor occurs
+before demand, the consumer submits the AG itself.
 
 ### Replay
 
 ```text
 UNSHARD(A, source_orientation), prefetch_depth=N
   -> identify (T, target_orientation) as the Nth future UNSHARD occurrence
-  -> select A's exact-occurrence anchors from source_orientation
+  -> if no completion policy applies, submit AG(T) immediately
+  -> otherwise select A's exact-occurrence anchors from source_orientation
   -> if an assigned anchor already completed, submit AG(T) after its event
   -> otherwise queue AG(T, target_orientation)
 
@@ -372,6 +382,12 @@ ANCHOR_DONE(A.x)
   -> record completion event on A.x's execution stream
   -> if its exact-occurrence request exists, submit AG(T) after the event
   -> otherwise retain the event until that request is created
+
+RESHARD(T) before the selected target occurrence
+  -> retain T's live parameters instead of releasing and regathering them
+
+UNSHARD(T) at the selected occurrence
+  -> consume the retained parameters without another AG
 ```
 
 Retained events are keyed by exact trace index rather than module name. They
@@ -538,8 +554,10 @@ Delayed communication extends buffer lifetimes and must participate in trace
 pool planning:
 
 - A queued successor AG contains only target metadata. It does not allocate
-  the gather output until its completion anchor releases it. The shifted
-  allocation-to-reshard lifetime is then recorded normally.
+  the gather output until its completion and target-lifetime gates allow it.
+  When an intervening occurrence already materialized the target, replay
+  extends that allocation through the selected demand instead of recording a
+  free/reallocate pair.
 - A trace-pooled partial-gradient key remains active from allocation through
   pending time. It is freed only after its RS has been enqueued on the ordered
   reduce-scatter arena.
@@ -574,10 +592,11 @@ the source, target, phase, and missing selector.
 On execution-trace divergence:
 
 1. stop issuing speculative delayed AG;
-2. submit pending RS requests in recorded FIFO order;
-3. revert new requests to eager communication;
-4. retrace from the divergence event;
-5. do not reuse a trace-pool slot if its lifetime conflicts with the optimized
+2. keep retained parameters live until demand or `finish_grad_sync()`;
+3. submit pending RS requests in recorded FIFO order;
+4. revert new requests to eager communication;
+5. retrace from the divergence event;
+6. do not reuse a trace-pool slot if its lifetime conflicts with the optimized
    plan.
 
 This fallback is allowed only while every collective domain can preserve its
