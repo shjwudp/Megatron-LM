@@ -2,6 +2,7 @@
 
 """MCore optimizer wrapper for experimental Megatron-FSDP v2."""
 
+import os
 from typing import Callable, List, Optional
 
 import torch
@@ -63,6 +64,94 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         self.context = contexts.pop()
         self.is_stub_optimizer = optimizer is None
         self._casted_grads = []
+        self._nan_diagnostic_step = 0
+
+    @torch.no_grad()
+    def _run_nan_diagnostic(self, phase: str) -> None:
+        """Locate the first non-finite FSDP buffer or optimizer state.
+
+        This temporary diagnostic is gated by an environment variable and is
+        intentionally kept out of the production PR. It scans only the final
+        few requested iterations, using foreach infinity norms so the check
+        does not allocate one boolean per model element.
+        """
+        start_step = int(os.environ.get("MCORE_MFSDP_NAN_DIAGNOSTIC_START_STEP", "0"))
+        if start_step <= 0 or self._nan_diagnostic_step < start_step:
+            return
+
+        entries = []
+        for chunk_index, model_chunk in enumerate(self.model_chunks):
+            for module in model_chunk.modules():
+                for group_index, parameter_group in enumerate(
+                    getattr(module, "parameter_groups", ())
+                ):
+                    module_name = getattr(module, "_name", type(module).__qualname__)
+                    prefix = f"chunk={chunk_index} module={module_name!r} group={group_index}"
+                    entries.append((f"{prefix} main_weight", parameter_group.main_weight.local_buffer))
+                    main_grad = getattr(parameter_group, "_main_grad", None)
+                    if main_grad is not None:
+                        entries.append((f"{prefix} main_grad", main_grad.local_buffer))
+
+        if not self.is_stub_optimizer:
+            parameter_labels = {}
+            for group_index, param_group in enumerate(self.optimizer.param_groups):
+                for parameter_index, parameter in enumerate(param_group["params"]):
+                    parameter_labels[parameter] = (
+                        f"optimizer_group={group_index} parameter={parameter_index}"
+                    )
+            for parameter, state in self.optimizer.state.items():
+                prefix = parameter_labels.get(parameter, "optimizer_parameter=unknown")
+                for state_name, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        entries.append((f"{prefix} state={state_name}", value))
+
+        # Foreach kernels require homogeneous device/dtype lists. DTensor-backed
+        # optimizer state is inspected through its local tensor.
+        buckets = {}
+        for label, value in entries:
+            value = getattr(value, "_local_tensor", value)
+            if value is None or not value.is_cuda or not value.is_floating_point():
+                continue
+            buckets.setdefault((value.device, value.dtype), []).append((label, value.reshape(-1)))
+
+        bad_labels = []
+        largest = []
+        for bucket in buckets.values():
+            labels = [label for label, _ in bucket]
+            values = [value for _, value in bucket]
+            norms = torch._foreach_norm(values, float("inf"))
+            for label, norm in zip(labels, norms):
+                norm_value = float(norm.float().cpu())
+                if not torch.isfinite(norm).item():
+                    bad_labels.append(f"{label} inf_norm={norm_value}")
+                else:
+                    largest.append((norm_value, label))
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        largest.sort(reverse=True)
+        if rank == 0:
+            print(
+                "MFSDP_NAN_DIAGNOSTIC "
+                f"step={self._nan_diagnostic_step} phase={phase} "
+                f"largest={largest[:5]}",
+                flush=True,
+            )
+        if bad_labels:
+            print(
+                "MFSDP_NAN_DIAGNOSTIC_BAD "
+                f"rank={rank} step={self._nan_diagnostic_step} phase={phase} "
+                f"entries={bad_labels}",
+                flush=True,
+            )
+
+        any_bad = torch.tensor(bool(bad_labels), dtype=torch.uint8, device="cuda")
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(any_bad, op=torch.distributed.ReduceOp.MAX)
+        if any_bad.item():
+            raise FloatingPointError(
+                f"M-FSDP diagnostic found a non-finite tensor at step "
+                f"{self._nan_diagnostic_step} during {phase}."
+            )
 
     @staticmethod
     def _validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
@@ -148,7 +237,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer and restore MFSDP gradient dtypes."""
+        self._nan_diagnostic_step += 1
+        self._run_nan_diagnostic("before_optimizer_step")
         success = super().step_with_ready_grads()
+        self._run_nan_diagnostic("after_optimizer_and_weight_refresh")
         for parameter, original_grad in self._casted_grads:
             parameter.grad = None
             parameter.grad_dtype = original_grad.dtype

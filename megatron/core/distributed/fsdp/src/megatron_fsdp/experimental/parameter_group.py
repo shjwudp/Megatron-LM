@@ -620,6 +620,11 @@ class FsdpParameterGroup:
                 mesh=self.mesh,
                 placements=partial_placements,
                 tensor_shapes=tensor_shapes,
+                allocation_stream=(
+                    torch.cuda.current_stream(local_buffer.device)
+                    if local_buffer.is_cuda
+                    else None
+                ),
             )
 
         with self._symmetric_memory_context():
