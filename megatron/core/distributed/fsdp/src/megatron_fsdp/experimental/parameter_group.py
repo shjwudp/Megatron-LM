@@ -611,7 +611,7 @@ class FsdpParameterGroup:
             local_buffer = self._trace_pool_allocator.allocate(
                 self._partial_grad_allocation_key,
                 local_numel,
-                grads[0].dtype,
+                self._partial_grad_dtype,
                 grads[0].device,
                 arena=_REDUCE_SCATTER_ARENA,
             )
@@ -628,7 +628,7 @@ class FsdpParameterGroup:
                 mesh=self.mesh,
                 placements=partial_placements,
                 tensor_shapes=tensor_shapes,
-                dtype=grads[0].dtype,
+                dtype=self._partial_grad_dtype,
                 device=grads[0].device,
             )
 
