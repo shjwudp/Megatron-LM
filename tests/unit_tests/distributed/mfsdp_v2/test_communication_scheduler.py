@@ -1203,6 +1203,50 @@ def test_conflict_free_point_admits_prefetch_and_drains_ready_reduce_scatters(
     scheduler.finish_grad_sync()
 
 
+def test_prefetch_before_first_conflict_free_point_keeps_residency_path(
+    distributed_setup, monkeypatch
+) -> None:
+    """A warmup-like AG must not wait for a later backward safe point."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    source, target = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(2)]).to(device)
+    policy = FsdpModuleCommunicationPolicy(conflict_free_on_pre_backward=(source,))
+    with fully_shard_context(
+        device=device,
+        communication_scheduler=FsdpCommunicationSchedulerConfig(
+            max_prefetch_resident_bytes=1 << 30
+        ),
+    ) as context:
+        fully_shard(source, mesh=mesh, placements=_flat_placements(), communication_policy=policy)
+        fully_shard(target, mesh=mesh, placements=_flat_placements())
+
+    runner = context.runner
+    scheduler = context.communication_scheduler
+    assert scheduler is not None
+    runner.record_unshard(source, "rowwise")
+    runner.record_unshard(target, "rowwise")
+    scheduler.record_conflict_free_point(source, source, None)
+    context.complete_trace()
+
+    ag_calls = []
+    monkeypatch.setattr(
+        target,
+        "_unshard_parameter_groups",
+        lambda orientation, **metadata: ag_calls.append((orientation, metadata["reason"])),
+    )
+    runner.record_unshard(source, "rowwise")
+    scheduler.schedule_prefetch(
+        source,
+        "rowwise",
+        target,
+        "rowwise",
+        target_unshard_index=1,
+    )
+
+    assert ag_calls == [("rowwise", "residency-queue")]
+    assert not scheduler.has_pending_prefetches
+
+
 def test_same_group_reuse_drains_older_domain_requests(distributed_setup, monkeypatch) -> None:
     """A recurring VPP unit must preserve domain FIFO before reusing its buffer."""
     device = distributed_setup.device
