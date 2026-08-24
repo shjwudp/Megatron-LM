@@ -88,15 +88,24 @@ class FsdpModuleCommunicationPolicy:
         reduce_scatter_release_on_pre_backward: Descendant modules whose
             pre-backward entry may release a trace-bounded set of pending
             reduce-scatter requests.
+        conflict_free_on_pre_backward: Descendant modules whose pre-backward
+            entry is known to be outside competing communication. The point
+            releases this unit's queued successor prefetch (subject to the
+            normal residency limit) and every ready deferred reduce-scatter.
     """
 
     prefetch_successor_after: tuple[ModuleCompletion | NamedCompletion, ...] = ()
     reduce_scatter_release_on_pre_backward: tuple[nn.Module | NamedPreBackward, ...] = ()
+    conflict_free_on_pre_backward: tuple[nn.Module | NamedPreBackward, ...] = ()
 
     @property
     def is_empty(self) -> bool:
         """Return whether this policy preserves eager communication."""
-        return not (self.prefetch_successor_after or self.reduce_scatter_release_on_pre_backward)
+        return not (
+            self.prefetch_successor_after
+            or self.reduce_scatter_release_on_pre_backward
+            or self.conflict_free_on_pre_backward
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -344,7 +353,11 @@ class FsdpCommunicationScheduler:
             for completion in source.communication_policy.prefetch_successor_after
             if completion.phase == source_phase
         )
-        completion_required = bool(completions)
+        conflict_free_required = bool(
+            source_phase == "backward"
+            and source.communication_policy.conflict_free_on_pre_backward
+        )
+        completion_required = bool(completions) or conflict_free_required
         residency_limited = self._prefetch_residency_is_limited()
         if runner.is_tracing or (
             not residency_limited and not completion_required and target_reshard_index is None
@@ -363,7 +376,16 @@ class FsdpCommunicationScheduler:
             target=target,
             target_orientation=target_orientation,
             completion_indices=(
-                runner.completion_indices_for_current_unshard(source, source_orientation)
+                tuple(
+                    sorted(
+                        runner.completion_indices_for_current_unshard(
+                            source, source_orientation
+                        )
+                        + runner.conflict_free_indices_for_current_unshard(
+                            source, source_orientation
+                        )
+                    )
+                )
                 if completion_required
                 else ()
             ),
@@ -606,6 +628,49 @@ class FsdpCommunicationScheduler:
                 break
             release_credits[id(request.domain)] -= request.size_bytes
             self._submit_reduce_scatter(request, reason="anchor", demand_event=demand_event)
+            self._reduce_scatter_releases += 1
+
+    def record_conflict_free_point(
+        self,
+        owner: "FsdpModule",
+        anchor: nn.Module | str,
+        demand_event: torch.cuda.Event | None,
+    ) -> None:
+        """Release eligible AG prefetches and every ready deferred RS."""
+        self._retire_completed_reduce_scatters()
+        runner = self._context.runner
+        trace_index = runner.record_conflict_free_point(owner, anchor)
+        if runner.is_tracing:
+            # Model the same complete ready-RS drain while inferring the replay
+            # budget. Prefetch remains disabled during the trace batch.
+            self.flush_prefetches(reason="trace")
+            self._trace_reduce_scatter_release()
+            return
+
+        if trace_index is not None:
+            pending = self._find_matching_prefetch(trace_index)
+            if pending is not None:
+                if demand_event is None:
+                    demand_event = self._context.current_stream().record_event()
+                pending.completed_anchor = _CompletedPrefetchAnchor(
+                    owner=owner, anchor=anchor, phase="backward", event=demand_event
+                )
+                if self._prefetch_is_ready(pending):
+                    if self._prefetch_residency_is_limited():
+                        self._drain_ready_prefetches(reason="conflict-free")
+                    else:
+                        self._pending_prefetches.remove(pending)
+                        self._submit_prefetch(pending, reason="conflict-free")
+
+        if not self._budget_compiled:
+            return
+        while True:
+            request = self._oldest_ready_deferred_request()
+            if request is None:
+                return
+            self._submit_reduce_scatter(
+                request, reason="conflict-free", demand_event=demand_event
+            )
             self._reduce_scatter_releases += 1
 
     def reserve_reduce_scatter(
@@ -1055,6 +1120,18 @@ class FsdpCommunicationScheduler:
                 and request.state is _ReduceScatterState.READY
                 and request.size_bytes <= release_credits.get(domain_key, 0)
             ):
+                return request
+        return None
+
+    def _oldest_ready_deferred_request(self) -> _ReduceScatterRequest | None:
+        """Return the oldest ready deferred head from any collective domain."""
+        domain_heads: set[int] = set()
+        for request in self._reduce_scatter_requests:
+            domain_key = id(request.domain)
+            if domain_key in domain_heads:
+                continue
+            domain_heads.add(domain_key)
+            if request.deferred and request.state is _ReduceScatterState.READY:
                 return request
         return None
 

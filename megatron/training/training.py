@@ -2325,6 +2325,7 @@ def wrap_model_chunks_with_ddp(
             or ddp_config.fsdp_max_prefetch_resident_bytes is not None
             or ddp_config.fsdp_prefetch_successor_after
             or ddp_config.fsdp_reduce_scatter_release_on_pre_backward
+            or ddp_config.fsdp_conflict_free_on_pre_backward
             or ddp_config.fsdp_reduce_scatter_release_on_prefetch
         )
         else None

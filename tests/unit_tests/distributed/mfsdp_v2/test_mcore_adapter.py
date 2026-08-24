@@ -79,6 +79,7 @@ class TestMcoreAdapterDense:
                 "layers.*:backward:anchor",
             ),
             fsdp_reduce_scatter_release_on_pre_backward=("layers.*:@pre_dispatch_computation",),
+            fsdp_conflict_free_on_pre_backward=("layers.*:@moe_dispatch",),
             fsdp_reduce_scatter_release_on_prefetch=True,
         )
         policies = mcore_fsdp_adapter.FullyShardedDataParallelV2._build_communication_policies(
@@ -96,6 +97,7 @@ class TestMcoreAdapterDense:
         assert policy.reduce_scatter_release_on_pre_backward == (
             NamedPreBackward("pre_dispatch_computation"),
         )
+        assert policy.conflict_free_on_pre_backward == (NamedPreBackward("moe_dispatch"),)
         scheduler_config = (
             mcore_fsdp_adapter.FullyShardedDataParallelV2._communication_scheduler_config(
                 ddp_config

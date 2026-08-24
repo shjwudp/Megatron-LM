@@ -3179,6 +3179,11 @@ def _add_distributed_args(parser):
                        help="Release one pending MFSDP v2 reduce-scatter at a configured "
                        "pre-backward point. Repeat SOURCE_GLOB:DESCENDANT_GLOB rules; prefix "
                        "the descendant with @ to name a combined-schedule node.")
+    group.add_argument('--fsdp-conflict-free-on-pre-backward', action='append', default=[],
+                       help="Use a configured MFSDP v2 pre-backward point for both successor "
+                       "all-gather admission and a complete drain of ready deferred "
+                       "reduce-scatters. Repeat SOURCE_GLOB:DESCENDANT_GLOB rules; prefix "
+                       "the descendant with @ to name a combined-schedule node.")
     group.add_argument('--fsdp-max-pending-reduce-scatter-bytes', type=int, default=None,
                        help="Maximum bytes held by deferred MFSDP v2 reduce-scatter requests. "
                        "By default the limit is inferred; zero keeps reduce-scatter eager.")

@@ -175,6 +175,13 @@ class DistributedDataParallelConfig:
       ``SOURCE_GLOB:DESCENDANT_GLOB``; ``@NAME`` selects a named schedule node.
     """
 
+    fsdp_conflict_free_on_pre_backward: Tuple[str, ...] = ()
+    """MFSDP v2 unified communication safe-point rules. Each rule is
+      ``SOURCE_GLOB:DESCENDANT_GLOB``; ``@NAME`` selects a named schedule node.
+      At the point, eligible AG prefetches are admitted under the configured
+      residency limit and all ready deferred reduce-scatters are released.
+    """
+
     fsdp_max_pending_reduce_scatter_bytes: Optional[int] = None
     """Maximum MFSDP v2 deferred reduce-scatter bytes. ``None`` infers the
       limit, zero keeps reduce-scatter eager, and a positive value overrides it.
@@ -302,6 +309,9 @@ class DistributedDataParallelConfig:
         self.fsdp_reduce_scatter_release_on_pre_backward = tuple(
             self.fsdp_reduce_scatter_release_on_pre_backward
         )
+        self.fsdp_conflict_free_on_pre_backward = tuple(
+            self.fsdp_conflict_free_on_pre_backward
+        )
         if self.fsdp_prefetch_depth < 1:
             raise ValueError("fsdp_prefetch_depth must be positive")
         if (
@@ -317,16 +327,19 @@ class DistributedDataParallelConfig:
         if (
             self.fsdp_max_pending_reduce_scatter_bytes is not None
             and not self.fsdp_reduce_scatter_release_on_pre_backward
+            and not self.fsdp_conflict_free_on_pre_backward
         ):
             raise ValueError(
                 "fsdp_max_pending_reduce_scatter_bytes requires at least one "
                 "fsdp_reduce_scatter_release_on_pre_backward rule"
+                " or fsdp_conflict_free_on_pre_backward rule"
             )
         communication_scheduler_enabled = bool(
             self.fsdp_prefetch_depth != 1
             or self.fsdp_max_prefetch_resident_bytes is not None
             or self.fsdp_prefetch_successor_after
             or self.fsdp_reduce_scatter_release_on_pre_backward
+            or self.fsdp_conflict_free_on_pre_backward
             or self.fsdp_reduce_scatter_release_on_prefetch
         )
         if communication_scheduler_enabled and (

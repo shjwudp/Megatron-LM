@@ -1129,6 +1129,73 @@ def test_actual_prefetch_releases_one_ready_reduce_scatter(
     scheduler.finish_grad_sync()
 
 
+def test_conflict_free_point_admits_prefetch_and_drains_ready_reduce_scatters(
+    distributed_setup, monkeypatch
+) -> None:
+    """One traced safe point should jointly release AG and every ready RS."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    modules = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(4)]).to(device)
+    source, target, grad_module_0, grad_module_1 = modules
+    policy = FsdpModuleCommunicationPolicy(conflict_free_on_pre_backward=(source,))
+    with fully_shard_context(
+        device=device,
+        communication_scheduler=FsdpCommunicationSchedulerConfig(
+            max_pending_reduce_scatter_bytes=1 << 30,
+            max_prefetch_resident_bytes=1 << 30,
+        ),
+    ) as context:
+        fully_shard(source, mesh=mesh, placements=_flat_placements(), communication_policy=policy)
+        for module in (target, grad_module_0, grad_module_1):
+            fully_shard(module, mesh=mesh, placements=_flat_placements())
+
+    scheduler = context.communication_scheduler
+    assert scheduler is not None
+    groups = [grad_module_0.parameter_groups[0], grad_module_1.parameter_groups[0]]
+    rs_calls = []
+    for index, group in enumerate(groups):
+        monkeypatch.setattr(
+            group,
+            "reduce_partial_gradients",
+            lambda _partial_grad, _is_last, index=index: rs_calls.append(index),
+        )
+        monkeypatch.setattr(group, "release_partial_grad_buffer", lambda: None)
+
+    context.runner.record_unshard(source, "colwise")
+    for index, group in enumerate(groups):
+        scheduler.reserve_reduce_scatter(group, module_name=f"module.{index}", group_index=0)
+        scheduler.mark_reduce_scatter_ready(
+            group, object(), context.current_stream().record_event(), True
+        )
+    scheduler.record_conflict_free_point(source, source, None)
+    scheduler.finish_grad_sync()
+    context.complete_trace()
+    rs_calls.clear()
+
+    ag_calls = []
+    monkeypatch.setattr(
+        target,
+        "_unshard_parameter_groups",
+        lambda orientation, **metadata: ag_calls.append((orientation, metadata["reason"])),
+    )
+
+    context.runner.record_unshard(source, "colwise")
+    scheduler.schedule_prefetch(source, "colwise", target, "colwise")
+    assert scheduler.has_pending_prefetches
+    for index, group in enumerate(groups):
+        scheduler.reserve_reduce_scatter(group, module_name=f"module.{index}", group_index=0)
+        scheduler.mark_reduce_scatter_ready(
+            group, object(), context.current_stream().record_event(), False
+        )
+
+    scheduler.record_conflict_free_point(source, source, None)
+    assert ag_calls == [("colwise", "conflict-free")]
+    assert rs_calls == [0, 1]
+    assert not scheduler.has_pending_prefetches
+    assert scheduler.pending_reduce_scatter_bytes == 0
+    scheduler.finish_grad_sync()
+
+
 def test_same_group_reuse_drains_older_domain_requests(distributed_setup, monkeypatch) -> None:
     """A recurring VPP unit must preserve domain FIFO before reusing its buffer."""
     device = distributed_setup.device
