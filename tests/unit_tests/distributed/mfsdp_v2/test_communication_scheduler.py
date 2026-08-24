@@ -1051,6 +1051,84 @@ def test_reduce_scatter_anchor_does_not_exceed_its_trace_credit(
     scheduler.finish_grad_sync()
 
 
+def test_actual_prefetch_releases_one_ready_reduce_scatter(
+    distributed_setup, monkeypatch
+) -> None:
+    """One submitted AG should add one ordered RS opportunity after its event."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    modules = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(4)]).to(device)
+    source, target, grad_module_0, grad_module_1 = modules
+    policy = FsdpModuleCommunicationPolicy(reduce_scatter_release_on_pre_backward=(source,))
+    with fully_shard_context(
+        device=device,
+        communication_scheduler=FsdpCommunicationSchedulerConfig(
+            max_pending_reduce_scatter_bytes=1 << 30,
+            max_prefetch_resident_bytes=1 << 30,
+            reduce_scatter_release_on_prefetch=True,
+        ),
+    ) as context:
+        fully_shard(source, mesh=mesh, placements=_flat_placements(), communication_policy=policy)
+        for module in (target, grad_module_0, grad_module_1):
+            fully_shard(module, mesh=mesh, placements=_flat_placements())
+
+    scheduler = context.communication_scheduler
+    assert scheduler is not None
+    groups = [grad_module_0.parameter_groups[0], grad_module_1.parameter_groups[0]]
+    calls = []
+    for index, group in enumerate(groups):
+        monkeypatch.setattr(
+            group,
+            "reduce_partial_gradients",
+            lambda _partial_grad, _is_last, index=index: calls.append(index),
+        )
+        monkeypatch.setattr(group, "release_partial_grad_buffer", lambda: None)
+
+    context.runner.record_unshard(source, "rowwise")
+    for index, group in enumerate(groups):
+        scheduler.reserve_reduce_scatter(group, module_name=f"module.{index}", group_index=0)
+        scheduler.mark_reduce_scatter_ready(
+            group, object(), context.current_stream().record_event(), True
+        )
+    scheduler.record_reduce_scatter_release(source, source, None)
+    scheduler.finish_grad_sync()
+    context.complete_trace()
+    calls.clear()
+
+    submissions = []
+    submit_reduce_scatter = scheduler._submit_reduce_scatter
+
+    def record_submission(request, *, reason, demand_event=None, prefetch=None):
+        submissions.append((reason, demand_event, prefetch))
+        return submit_reduce_scatter(
+            request,
+            reason=reason,
+            demand_event=demand_event,
+            prefetch=prefetch,
+        )
+
+    monkeypatch.setattr(scheduler, "_submit_reduce_scatter", record_submission)
+
+    context.runner.record_unshard(source, "rowwise")
+    for index, group in enumerate(groups):
+        scheduler.reserve_reduce_scatter(group, module_name=f"module.{index}", group_index=0)
+        scheduler.mark_reduce_scatter_ready(
+            group, object(), context.current_stream().record_event(), False
+        )
+
+    scheduler.schedule_prefetch(source, "rowwise", target, "rowwise")
+    assert calls == [0]
+    assert scheduler.pending_reduce_scatter_bytes == groups[1].partial_grad_nbytes()
+    assert submissions[0][0] == "prefetch"
+    assert submissions[0][1] is target._unshard_event
+    assert submissions[0][2] is not None
+
+    scheduler.record_reduce_scatter_release(source, source, None)
+    assert calls == [0, 1]
+    assert scheduler.pending_reduce_scatter_bytes == 0
+    scheduler.finish_grad_sync()
+
+
 def test_same_group_reuse_drains_older_domain_requests(distributed_setup, monkeypatch) -> None:
     """A recurring VPP unit must preserve domain FIFO before reusing its buffer."""
     device = distributed_setup.device

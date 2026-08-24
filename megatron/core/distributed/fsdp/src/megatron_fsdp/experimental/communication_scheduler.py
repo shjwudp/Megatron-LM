@@ -113,11 +113,14 @@ class FsdpCommunicationSchedulerConfig:
         max_prefetch_resident_bytes: ``None`` preserves unbounded prefetch
             residency, zero infers a one-materialization byte budget from the
             execution trace, and a positive value supplies an explicit limit.
+        reduce_scatter_release_on_prefetch: Release at most one ready deferred
+            reduce-scatter after each actual parameter-prefetch all-gather.
     """
 
     max_pending_reduce_scatter_bytes: int | None = None
     prefetch_depth: int = 1
     max_prefetch_resident_bytes: int | None = None
+    reduce_scatter_release_on_prefetch: bool = False
 
     def __post_init__(self) -> None:
         value = self.max_pending_reduce_scatter_bytes
@@ -259,6 +262,7 @@ class FsdpCommunicationScheduler:
         self._release_anchor_count = 0
         self._budget_compiled = False
         self._reduce_scatter_releases = 0
+        self._prefetch_reduce_scatter_releases = 0
         self._capacity_releases = 0
         self._final_releases = 0
         self._peak_pending_reduce_scatter_bytes = 0
@@ -1053,6 +1057,30 @@ class FsdpCommunicationScheduler:
                 return request
         return None
 
+    def _release_reduce_scatter_after_prefetch(
+        self, prefetch: _PendingPrefetch, prefetch_event: torch.cuda.Event
+    ) -> None:
+        """Use one actual AG submission as one bounded RS service opportunity."""
+        if not self.config.reduce_scatter_release_on_prefetch or not self._budget_compiled:
+            return
+        self._retire_completed_reduce_scatters()
+        domain_heads: set[int] = set()
+        for request in self._reduce_scatter_requests:
+            domain_key = id(request.domain)
+            if domain_key in domain_heads:
+                continue
+            domain_heads.add(domain_key)
+            if not request.deferred or request.state is not _ReduceScatterState.READY:
+                continue
+            self._submit_reduce_scatter(
+                request,
+                reason="prefetch",
+                demand_event=prefetch_event,
+                prefetch=prefetch,
+            )
+            self._prefetch_reduce_scatter_releases += 1
+            return
+
     def _drain_submit_on_ready_requests(self, domain: _DomainState) -> None:
         while True:
             domain_requests = [
@@ -1071,6 +1099,7 @@ class FsdpCommunicationScheduler:
         *,
         reason: str,
         demand_event: torch.cuda.Event | None = None,
+        prefetch: _PendingPrefetch | None = None,
     ) -> None:
         self._retire_completed_reduce_scatters()
         if request.state is not _ReduceScatterState.READY:
@@ -1089,12 +1118,20 @@ class FsdpCommunicationScheduler:
         in_flight_before = self.in_flight_reduce_scatter_bytes
         pending_after = pending_before - (request.size_bytes if request.deferred else 0)
         in_flight_after = in_flight_before + request.size_bytes
+        prefetch_provenance = ""
+        if prefetch is not None:
+            prefetch_source = prefetch.source.name if prefetch.source.name else "<root>"
+            prefetch_target = prefetch.target.name if prefetch.target.name else "<root>"
+            prefetch_provenance = (
+                f" prefetch_source={prefetch_source} prefetch_target={prefetch_target} "
+                f"prefetch_request={prefetch.sequence}"
+            )
         label = (
             f"MFSDP RS target={request.module_name} group={request.group_index} "
             f"trigger={reason} request={request.sequence} bytes={request.size_bytes} "
             f"pending_before={pending_before} pending_after={pending_after} "
             f"in_flight_before={in_flight_before} in_flight_after={in_flight_after} "
-            f"active_after={pending_after + in_flight_after}"
+            f"active_after={pending_after + in_flight_after}{prefetch_provenance}"
         )
         torch.cuda.nvtx.range_push(label)
         try:
@@ -1189,7 +1226,8 @@ class FsdpCommunicationScheduler:
             "retained_prefetch_reuses=%d residency_deferrals=%d "
             "residency_releases=%d resident_prefetch_bytes=%d "
             "effective_prefetch_resident_bytes=%s pending_prefetches=%d "
-            "rs_anchor_releases=%d capacity_releases=%d final_releases=%d "
+            "rs_anchor_releases=%d rs_prefetch_releases=%d "
+            "capacity_releases=%d final_releases=%d "
             "pending_rs_bytes=%d in_flight_rs_bytes=%d "
             "peak_pending_rs_bytes=%d peak_in_flight_rs_bytes=%d "
             "peak_active_rs_bytes=%d",
@@ -1207,6 +1245,7 @@ class FsdpCommunicationScheduler:
             + len(self._retained_prefetches)
             + len(self._resident_prefetches),
             self._reduce_scatter_releases,
+            self._prefetch_reduce_scatter_releases,
             self._capacity_releases,
             self._final_releases,
             self.pending_reduce_scatter_bytes,
@@ -1235,6 +1274,7 @@ class FsdpCommunicationScheduler:
         completed = pending.completed_anchor
         if completed is not None:
             self._context.allgather_stream.wait_event(completed.event)
+        submits_all_gather = pending.target._unshard_event is None
         pending.target._unshard_parameter_groups(
             pending.target_orientation,
             reason=reason,
@@ -1247,6 +1287,10 @@ class FsdpCommunicationScheduler:
             ),
             request=pending.sequence,
         )
+        if submits_all_gather:
+            prefetch_event = pending.target._unshard_event
+            assert prefetch_event is not None
+            self._release_reduce_scatter_after_prefetch(pending, prefetch_event)
         if self._prefetch_residency_is_limited():
             self._resident_prefetches.append(pending)
             self._resident_prefetch_bytes += pending.size_bytes

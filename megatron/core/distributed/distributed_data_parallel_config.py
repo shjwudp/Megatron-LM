@@ -180,6 +180,11 @@ class DistributedDataParallelConfig:
       limit, zero keeps reduce-scatter eager, and a positive value overrides it.
     """
 
+    fsdp_reduce_scatter_release_on_prefetch: bool = False
+    """If true, each actual MFSDP v2 parameter-prefetch all-gather releases at
+      most one ready deferred reduce-scatter after the all-gather completes.
+    """
+
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
     """Whether to fall back to persistent buffer when a bucket does not
        fit FSDP double buffer size. If true, FSDP will use the persistently 
@@ -322,6 +327,7 @@ class DistributedDataParallelConfig:
             or self.fsdp_max_prefetch_resident_bytes is not None
             or self.fsdp_prefetch_successor_after
             or self.fsdp_reduce_scatter_release_on_pre_backward
+            or self.fsdp_reduce_scatter_release_on_prefetch
         )
         if communication_scheduler_enabled and (
             not self.use_megatron_fsdp or self.megatron_fsdp_version != 2

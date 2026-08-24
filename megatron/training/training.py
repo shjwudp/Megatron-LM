@@ -2316,12 +2316,16 @@ def wrap_model_chunks_with_ddp(
             max_pending_reduce_scatter_bytes=ddp_config.fsdp_max_pending_reduce_scatter_bytes,
             prefetch_depth=ddp_config.fsdp_prefetch_depth,
             max_prefetch_resident_bytes=ddp_config.fsdp_max_prefetch_resident_bytes,
+            reduce_scatter_release_on_prefetch=(
+                ddp_config.fsdp_reduce_scatter_release_on_prefetch
+            ),
         )
         if (
             ddp_config.fsdp_prefetch_depth != 1
             or ddp_config.fsdp_max_prefetch_resident_bytes is not None
             or ddp_config.fsdp_prefetch_successor_after
             or ddp_config.fsdp_reduce_scatter_release_on_pre_backward
+            or ddp_config.fsdp_reduce_scatter_release_on_prefetch
         )
         else None
     )
