@@ -246,11 +246,29 @@ class FsdpExecutionRunner:
             EventKind.COMPLETION, owner, None, anchor=anchor, phase=phase
         )
 
-    def record_reduce_scatter_release(self, owner: "FsdpModule", anchor: "nn.Module | str") -> None:
-        """Record or validate a configured pre-backward RS release occurrence."""
+    def record_reduce_scatter_release(
+        self, owner: "FsdpModule", anchor: "nn.Module | str"
+    ) -> int | None:
+        """Record or validate a configured pre-backward RS release occurrence.
+
+        Returns:
+            The exact trace index for both a newly recorded and a validated
+            occurrence, or ``None`` when trace replay is disabled.
+        """
         if not self._use_trace_replay:
-            return
-        self._validate_and_advance(EventKind.RS_RELEASE, owner, None, anchor=anchor)
+            return None
+        if self._phase is RunnerPhase.TRACING:
+            self._validate_and_advance(EventKind.RS_RELEASE, owner, None, anchor=anchor)
+            return len(self._trace) - 1
+        trace_index = self._validate_and_advance(
+            EventKind.RS_RELEASE, owner, None, anchor=anchor
+        )
+        # A replay mismatch seeds a replacement trace with this occurrence.
+        # Return that seed index so scheduler metadata stays aligned with the
+        # new trace rather than silently dropping its first release point.
+        if trace_index is None and self._phase is RunnerPhase.TRACING:
+            return len(self._trace) - 1
+        return trace_index
 
     # ------------------------------------------------------------------
     # Interface 2: prefetch suggestion

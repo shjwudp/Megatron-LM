@@ -838,12 +838,145 @@ def test_reduce_scatter_waits_for_pre_backward_release(distributed_setup, monkey
     scheduler.record_reduce_scatter_release(module, module, None)
     assert scheduler.pending_reduce_scatter_bytes == 0
     assert calls == [(trace_partial_grad, True), (replay_partial_grad, False)]
-    assert submission_labels == [
+    assert [label.split(" pending_before=", 1)[0] for label in submission_labels] == [
         f"MFSDP RS target=<root> group=0 trigger=submit-on-ready request=0 "
         f"bytes={group.partial_grad_nbytes()}",
         f"MFSDP RS target=<root> group=0 trigger=anchor request=1 "
         f"bytes={group.partial_grad_nbytes()}",
     ]
+    assert all(" in_flight_after=" in label for label in submission_labels)
+
+
+def test_reduce_scatter_anchor_replays_trace_inferred_byte_credit(
+    distributed_setup, monkeypatch
+) -> None:
+    """One replay anchor should drain all requests seen in its trace interval."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    modules = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(3)]).to(device)
+    policy = FsdpModuleCommunicationPolicy(reduce_scatter_release_on_pre_backward=(modules[0],))
+    with fully_shard_context(
+        device=device, communication_scheduler=FsdpCommunicationSchedulerConfig()
+    ) as context:
+        fully_shard(
+            modules[0], mesh=mesh, placements=_flat_placements(), communication_policy=policy
+        )
+        for module in modules[1:]:
+            fully_shard(module, mesh=mesh, placements=_flat_placements())
+
+    scheduler = context.communication_scheduler
+    assert scheduler is not None
+    groups = [module.parameter_groups[0] for module in modules]
+    calls = []
+    for index, group in enumerate(groups):
+        monkeypatch.setattr(
+            group,
+            "reduce_partial_gradients",
+            lambda _partial_grad, _is_last, index=index: calls.append(index),
+        )
+        monkeypatch.setattr(group, "release_partial_grad_buffer", lambda: None)
+
+    context.runner.record_unshard(modules[0], "rowwise")
+    for index, group in enumerate(groups):
+        scheduler.reserve_reduce_scatter(group, module_name=f"module.{index}", group_index=0)
+        scheduler.mark_reduce_scatter_ready(
+            group, object(), context.current_stream().record_event(), True
+        )
+    scheduler.record_reduce_scatter_release(modules[0], modules[0], None)
+    scheduler.finish_grad_sync()
+    context.complete_trace()
+
+    interval_bytes = sum(group.partial_grad_nbytes() for group in groups)
+    assert scheduler.effective_reduce_scatter_budgets == (interval_bytes,)
+    assert calls == [0, 1, 2]
+    calls.clear()
+
+    context.runner.record_unshard(modules[0], "rowwise")
+    for index, group in enumerate(groups):
+        scheduler.reserve_reduce_scatter(group, module_name=f"module.{index}", group_index=0)
+        scheduler.mark_reduce_scatter_ready(
+            group, object(), context.current_stream().record_event(), False
+        )
+    assert scheduler.pending_reduce_scatter_bytes == interval_bytes
+    assert calls == []
+
+    scheduler.record_reduce_scatter_release(modules[0], modules[0], None)
+    assert scheduler.pending_reduce_scatter_bytes == 0
+    assert scheduler.peak_pending_reduce_scatter_bytes == interval_bytes
+    assert scheduler.peak_active_reduce_scatter_bytes >= interval_bytes
+    assert calls == [0, 1, 2]
+    scheduler.finish_grad_sync()
+
+
+def test_reduce_scatter_anchor_does_not_exceed_its_trace_credit(
+    distributed_setup, monkeypatch
+) -> None:
+    """An anchor must not consume ready work traced for a later occurrence."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    modules = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(3)]).to(device)
+    policy = FsdpModuleCommunicationPolicy(reduce_scatter_release_on_pre_backward=(modules[0],))
+    with fully_shard_context(
+        device=device, communication_scheduler=FsdpCommunicationSchedulerConfig()
+    ) as context:
+        fully_shard(
+            modules[0], mesh=mesh, placements=_flat_placements(), communication_policy=policy
+        )
+        for module in modules[1:]:
+            fully_shard(module, mesh=mesh, placements=_flat_placements())
+
+    scheduler = context.communication_scheduler
+    assert scheduler is not None
+    groups = [module.parameter_groups[0] for module in modules]
+    calls = []
+    for index, group in enumerate(groups):
+        monkeypatch.setattr(
+            group,
+            "reduce_partial_gradients",
+            lambda _partial_grad, _is_last, index=index: calls.append(index),
+        )
+        monkeypatch.setattr(group, "release_partial_grad_buffer", lambda: None)
+
+    # Trace one request at the first occurrence and two at the second. The
+    # second interval sets a two-request budget, while the first occurrence's
+    # replay credit remains exactly one request.
+    context.runner.record_unshard(modules[0], "rowwise")
+    scheduler.reserve_reduce_scatter(groups[0], module_name="module.0", group_index=0)
+    scheduler.mark_reduce_scatter_ready(
+        groups[0], object(), context.current_stream().record_event(), True
+    )
+    scheduler.record_reduce_scatter_release(modules[0], modules[0], None)
+    for index, group in enumerate(groups[1:], start=1):
+        scheduler.reserve_reduce_scatter(group, module_name=f"module.{index}", group_index=0)
+        scheduler.mark_reduce_scatter_ready(
+            group, object(), context.current_stream().record_event(), True
+        )
+    scheduler.record_reduce_scatter_release(modules[0], modules[0], None)
+    scheduler.finish_grad_sync()
+    context.complete_trace()
+    calls.clear()
+
+    first_size = groups[0].partial_grad_nbytes()
+    second_size = groups[1].partial_grad_nbytes()
+    assert scheduler.effective_reduce_scatter_budgets == (
+        groups[1].partial_grad_nbytes() + groups[2].partial_grad_nbytes(),
+    )
+
+    context.runner.record_unshard(modules[0], "rowwise")
+    for index, group in enumerate(groups[:2]):
+        scheduler.reserve_reduce_scatter(group, module_name=f"module.{index}", group_index=0)
+        scheduler.mark_reduce_scatter_ready(
+            group, object(), context.current_stream().record_event(), False
+        )
+    scheduler.record_reduce_scatter_release(modules[0], modules[0], None)
+    assert calls == [0]
+    assert scheduler.pending_reduce_scatter_bytes == second_size
+
+    scheduler.record_reduce_scatter_release(modules[0], modules[0], None)
+    assert calls == [0, 1]
+    assert scheduler.pending_reduce_scatter_bytes == 0
+    assert first_size == second_size
+    scheduler.finish_grad_sync()
 
 
 def test_same_group_reuse_drains_older_domain_requests(distributed_setup, monkeypatch) -> None:

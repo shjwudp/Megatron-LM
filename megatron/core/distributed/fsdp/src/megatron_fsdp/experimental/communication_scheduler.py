@@ -86,7 +86,8 @@ class FsdpModuleCommunicationPolicy:
         prefetch_successor_after: Completion points that may release this unit's
             traced successor all-gather.
         reduce_scatter_release_on_pre_backward: Descendant modules whose
-            pre-backward entry may release one pending reduce-scatter request.
+            pre-backward entry may release a trace-bounded set of pending
+            reduce-scatter requests.
     """
 
     prefetch_successor_after: tuple[ModuleCompletion | NamedCompletion, ...] = ()
@@ -162,6 +163,7 @@ class _DomainState:
 
     mesh: DeviceMesh
     pending_bytes: int = 0
+    in_flight_bytes: int = 0
     effective_budget: int = 0
     required_peak: int = 0
     trace_pending_bytes: int = 0
@@ -199,6 +201,18 @@ class _ReduceScatterRequest:
     is_last_microbatch: bool = True
 
 
+@dataclasses.dataclass
+class _InFlightReduceScatter:
+    """One submitted RS input whose stream-ordered lifetime has not retired."""
+
+    sequence: int
+    domain: _DomainState
+    module_name: str
+    group_index: int
+    size_bytes: int
+    completion_event: torch.cuda.Event
+
+
 class FsdpCommunicationScheduler:
     """Context-owned scheduler for delayed parameter and gradient collectives."""
 
@@ -220,12 +234,17 @@ class FsdpCommunicationScheduler:
         self._reduce_scatter_requests: deque[_ReduceScatterRequest] = deque()
         self._active_request_by_group: dict[FsdpParameterGroup, _ReduceScatterRequest] = {}
         self._trace_reduce_scatter_requests: deque[_TraceReduceScatterRequest] = deque()
+        self._trace_reduce_scatter_release_credits: dict[int, dict[int, int]] = {}
+        self._in_flight_reduce_scatters: deque[_InFlightReduceScatter] = deque()
         self._next_reduce_scatter_sequence = 0
         self._release_anchor_count = 0
         self._budget_compiled = False
         self._reduce_scatter_releases = 0
         self._capacity_releases = 0
         self._final_releases = 0
+        self._peak_pending_reduce_scatter_bytes = 0
+        self._peak_in_flight_reduce_scatter_bytes = 0
+        self._peak_active_reduce_scatter_bytes = 0
 
     @property
     def has_pending_prefetches(self) -> bool:
@@ -241,6 +260,26 @@ class FsdpCommunicationScheduler:
     def effective_reduce_scatter_budgets(self) -> tuple[int, ...]:
         """Return inferred/overridden budgets in domain registration order."""
         return tuple(domain.effective_budget for domain in self._domain_order)
+
+    @property
+    def in_flight_reduce_scatter_bytes(self) -> int:
+        """Return submitted RS-input bytes whose completion has not been observed."""
+        return sum(domain.in_flight_bytes for domain in self._domain_order)
+
+    @property
+    def peak_pending_reduce_scatter_bytes(self) -> int:
+        """Return the largest observed deferred, unsubmitted RS footprint."""
+        return self._peak_pending_reduce_scatter_bytes
+
+    @property
+    def peak_in_flight_reduce_scatter_bytes(self) -> int:
+        """Return the largest observed submitted, unretired RS footprint."""
+        return self._peak_in_flight_reduce_scatter_bytes
+
+    @property
+    def peak_active_reduce_scatter_bytes(self) -> int:
+        """Return the largest observed pending plus in-flight RS footprint."""
+        return self._peak_active_reduce_scatter_bytes
 
     def register_reduce_scatter_release_anchor(
         self, owner: "FsdpModule", anchor: nn.Module | str
@@ -479,21 +518,31 @@ class FsdpCommunicationScheduler:
         self, owner: "FsdpModule", anchor: nn.Module | str, demand_event: torch.cuda.Event | None
     ) -> None:
         """Observe a configured pre-backward reduce-scatter release point."""
-        self._context.runner.record_reduce_scatter_release(owner, anchor)
-        self._trace_reduce_scatter_release()
-        if not self._budget_compiled or self._context.runner.is_tracing:
+        self._retire_completed_reduce_scatters()
+        runner = self._context.runner
+        trace_index = runner.record_reduce_scatter_release(owner, anchor)
+        if runner.is_tracing:
+            release_credits = self._trace_reduce_scatter_release()
+            if trace_index is not None:
+                self._trace_reduce_scatter_release_credits[trace_index] = release_credits
+            return
+        if not self._budget_compiled or trace_index is None:
             return
 
-        request = self._oldest_releasable_request()
-        if request is None:
-            return
-        self._submit_reduce_scatter(request, reason="anchor", demand_event=demand_event)
-        self._reduce_scatter_releases += 1
+        release_credits = dict(self._trace_reduce_scatter_release_credits.get(trace_index, {}))
+        while True:
+            request = self._oldest_releasable_request(release_credits)
+            if request is None:
+                break
+            release_credits[id(request.domain)] -= request.size_bytes
+            self._submit_reduce_scatter(request, reason="anchor", demand_event=demand_event)
+            self._reduce_scatter_releases += 1
 
     def reserve_reduce_scatter(
         self, group: "FsdpParameterGroup", *, module_name: str, group_index: int
     ) -> None:
         """Reserve pending capacity before allocating a full gradient buffer."""
+        self._retire_completed_reduce_scatters()
         if group in self._active_request_by_group:
             previous = self._active_request_by_group[group]
             if previous.state is not _ReduceScatterState.READY:
@@ -543,6 +592,12 @@ class FsdpCommunicationScheduler:
         self._active_request_by_group[group] = request
         if deferred:
             domain.pending_bytes += size_bytes
+        self._update_reduce_scatter_peaks()
+        self._emit_reduce_scatter_state(
+            "reserve",
+            request,
+            deferred=deferred,
+        )
 
     def cancel_reduce_scatter_reservation(self, group: "FsdpParameterGroup") -> None:
         """Cancel a reservation whose physical allocation failed."""
@@ -555,6 +610,7 @@ class FsdpCommunicationScheduler:
             request.trace_request.active = False
             request.trace_request.domain.trace_pending_bytes -= request.size_bytes
         self._reduce_scatter_requests.remove(request)
+        self._emit_reduce_scatter_state("cancel", request, deferred=request.deferred)
 
     def mark_reduce_scatter_ready(
         self,
@@ -574,6 +630,8 @@ class FsdpCommunicationScheduler:
         if request.trace_request is not None:
             request.trace_request.ready = True
 
+        self._emit_reduce_scatter_state("ready", request, deferred=request.deferred)
+
         # A submit-on-ready request cannot overtake an older collective in the
         # same domain. Force ready domain heads until every non-deferred request
         # that can legally launch has done so.
@@ -581,6 +639,7 @@ class FsdpCommunicationScheduler:
 
     def finish_grad_sync(self) -> None:
         """Submit every ready request and fence gradient consumers against RS."""
+        self._retire_completed_reduce_scatters()
         self._release_retained_prefetches(reason="finish_grad_sync")
         self._trace_reduce_scatter_flush()
         while self._reduce_scatter_requests:
@@ -694,21 +753,32 @@ class FsdpCommunicationScheduler:
             domain.total_device_bytes = total_bytes
         return request
 
-    def _trace_reduce_scatter_release(self) -> None:
+    def _trace_reduce_scatter_release(self) -> dict[int, int]:
+        """Drain every ready virtual domain head and return per-domain byte credits."""
         if self._budget_compiled and not self._context.runner.is_tracing:
-            return
-        domain_heads: set[int] = set()
-        for request in self._trace_reduce_scatter_requests:
-            if not request.active:
-                continue
-            domain_key = id(request.domain)
-            if domain_key in domain_heads:
-                continue
-            domain_heads.add(domain_key)
-            if request.ready:
+            return {}
+        release_credits: dict[int, int] = {}
+        while True:
+            domain_heads: set[int] = set()
+            released = False
+            for request in self._trace_reduce_scatter_requests:
+                if not request.active:
+                    continue
+                domain_key = id(request.domain)
+                if domain_key in domain_heads:
+                    continue
+                domain_heads.add(domain_key)
+                if not request.ready:
+                    continue
                 request.active = False
                 request.domain.trace_pending_bytes -= request.size_bytes
-                return
+                release_credits[domain_key] = (
+                    release_credits.get(domain_key, 0) + request.size_bytes
+                )
+                released = True
+                break
+            if not released:
+                return release_credits
 
     def _trace_reduce_scatter_flush(self) -> None:
         if self._budget_compiled and not self._context.runner.is_tracing:
@@ -777,14 +847,20 @@ class FsdpCommunicationScheduler:
             (request for request in self._reduce_scatter_requests if request.domain is domain), None
         )
 
-    def _oldest_releasable_request(self) -> _ReduceScatterRequest | None:
+    def _oldest_releasable_request(
+        self, release_credits: dict[int, int]
+    ) -> _ReduceScatterRequest | None:
         domain_heads: set[int] = set()
         for request in self._reduce_scatter_requests:
             domain_key = id(request.domain)
             if domain_key in domain_heads:
                 continue
             domain_heads.add(domain_key)
-            if request.deferred and request.state is _ReduceScatterState.READY:
+            if (
+                request.deferred
+                and request.state is _ReduceScatterState.READY
+                and request.size_bytes <= release_credits.get(domain_key, 0)
+            ):
                 return request
         return None
 
@@ -807,6 +883,7 @@ class FsdpCommunicationScheduler:
         reason: str,
         demand_event: torch.cuda.Event | None = None,
     ) -> None:
+        self._retire_completed_reduce_scatters()
         if request.state is not _ReduceScatterState.READY:
             raise RuntimeError("Cannot submit a reduce-scatter request before it is ready.")
         if self._oldest_domain_request(request.domain) is not request:
@@ -819,25 +896,92 @@ class FsdpCommunicationScheduler:
         if demand_event is not None:
             reduce_scatter_stream.wait_event(demand_event)
         reduce_scatter_stream.wait_event(ready_event)
+        pending_before = self.pending_reduce_scatter_bytes
+        in_flight_before = self.in_flight_reduce_scatter_bytes
+        pending_after = pending_before - (request.size_bytes if request.deferred else 0)
+        in_flight_after = in_flight_before + request.size_bytes
         label = (
             f"MFSDP RS target={request.module_name} group={request.group_index} "
-            f"trigger={reason} request={request.sequence} bytes={request.size_bytes}"
+            f"trigger={reason} request={request.sequence} bytes={request.size_bytes} "
+            f"pending_before={pending_before} pending_after={pending_after} "
+            f"in_flight_before={in_flight_before} in_flight_after={in_flight_after} "
+            f"active_after={pending_after + in_flight_after}"
         )
         torch.cuda.nvtx.range_push(label)
         try:
             with torch.cuda.stream(reduce_scatter_stream):
                 request.group.reduce_partial_gradients(partial_grad, request.is_last_microbatch)
                 request.group.release_partial_grad_buffer()
+                completion_event = reduce_scatter_stream.record_event()
         finally:
             torch.cuda.nvtx.range_pop()
 
         if request.deferred:
             request.domain.pending_bytes -= request.size_bytes
+        request.domain.in_flight_bytes += request.size_bytes
+        self._in_flight_reduce_scatters.append(
+            _InFlightReduceScatter(
+                sequence=request.sequence,
+                domain=request.domain,
+                module_name=request.module_name,
+                group_index=request.group_index,
+                size_bytes=request.size_bytes,
+                completion_event=completion_event,
+            )
+        )
         self._active_request_by_group.pop(request.group, None)
         self._reduce_scatter_requests.remove(request)
+        self._update_reduce_scatter_peaks()
+
+    def _retire_completed_reduce_scatters(self) -> None:
+        """Retire completed RS inputs in their single-stream submission order."""
+        while self._in_flight_reduce_scatters:
+            request = self._in_flight_reduce_scatters[0]
+            if not request.completion_event.query():
+                return
+            self._in_flight_reduce_scatters.popleft()
+            request.domain.in_flight_bytes -= request.size_bytes
+            torch.cuda.nvtx.range_push(
+                f"MFSDP RS retire target={request.module_name} group={request.group_index} "
+                f"request={request.sequence} bytes={request.size_bytes} "
+                f"pending_bytes={self.pending_reduce_scatter_bytes} "
+                f"in_flight_bytes={self.in_flight_reduce_scatter_bytes}"
+            )
+            torch.cuda.nvtx.range_pop()
+
+    def _update_reduce_scatter_peaks(self) -> None:
+        """Update scheduler-lifetime logical RS footprint high-water marks."""
+        pending_bytes = self.pending_reduce_scatter_bytes
+        in_flight_bytes = self.in_flight_reduce_scatter_bytes
+        self._peak_pending_reduce_scatter_bytes = max(
+            self._peak_pending_reduce_scatter_bytes, pending_bytes
+        )
+        self._peak_in_flight_reduce_scatter_bytes = max(
+            self._peak_in_flight_reduce_scatter_bytes, in_flight_bytes
+        )
+        self._peak_active_reduce_scatter_bytes = max(
+            self._peak_active_reduce_scatter_bytes, pending_bytes + in_flight_bytes
+        )
+
+    def _emit_reduce_scatter_state(
+        self, phase: str, request: _ReduceScatterRequest, **metadata: object
+    ) -> None:
+        """Emit a zero-duration NVTX marker with scheduler byte accounting."""
+        suffix = "".join(f" {key}={value}" for key, value in metadata.items())
+        torch.cuda.nvtx.range_push(
+            f"MFSDP RS state={phase} target={request.module_name} "
+            f"group={request.group_index} request={request.sequence} "
+            f"bytes={request.size_bytes} pending_bytes={self.pending_reduce_scatter_bytes} "
+            f"domain_pending_bytes={request.domain.pending_bytes} "
+            f"budget={request.domain.effective_budget} "
+            f"in_flight_bytes={self.in_flight_reduce_scatter_bytes} "
+            f"domain_in_flight_bytes={request.domain.in_flight_bytes}{suffix}"
+        )
+        torch.cuda.nvtx.range_pop()
 
     def _reset_reduce_scatter_trace(self) -> None:
         self._trace_reduce_scatter_requests.clear()
+        self._trace_reduce_scatter_release_credits.clear()
         self._budget_compiled = False
         for domain in self._domain_order:
             domain.pending_bytes = 0
@@ -855,7 +999,9 @@ class FsdpCommunicationScheduler:
             "anchor_releases=%d latched_anchor_releases=%d demand_releases=%d "
             "retained_prefetch_reuses=%d pending_prefetches=%d "
             "rs_anchor_releases=%d capacity_releases=%d final_releases=%d "
-            "pending_rs_bytes=%d",
+            "pending_rs_bytes=%d in_flight_rs_bytes=%d "
+            "peak_pending_rs_bytes=%d peak_in_flight_rs_bytes=%d "
+            "peak_active_rs_bytes=%d",
             self.config.prefetch_depth,
             self._delayed_prefetches,
             self._anchor_releases,
@@ -867,6 +1013,10 @@ class FsdpCommunicationScheduler:
             self._capacity_releases,
             self._final_releases,
             self.pending_reduce_scatter_bytes,
+            self.in_flight_reduce_scatter_bytes,
+            self.peak_pending_reduce_scatter_bytes,
+            self.peak_in_flight_reduce_scatter_bytes,
+            self.peak_active_reduce_scatter_bytes,
         )
 
     def _find_matching_prefetch(self, completion_index: int) -> _PendingPrefetch | None:
