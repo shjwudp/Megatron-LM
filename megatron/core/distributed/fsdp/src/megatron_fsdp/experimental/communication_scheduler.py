@@ -1274,7 +1274,7 @@ class FsdpCommunicationScheduler:
         completed = pending.completed_anchor
         if completed is not None:
             self._context.allgather_stream.wait_event(completed.event)
-        submits_all_gather = pending.target._unshard_event is None
+        target_was_unsharded = pending.target._unshard_event is not None
         pending.target._unshard_parameter_groups(
             pending.target_orientation,
             reason=reason,
@@ -1287,9 +1287,8 @@ class FsdpCommunicationScheduler:
             ),
             request=pending.sequence,
         )
-        if submits_all_gather:
-            prefetch_event = pending.target._unshard_event
-            assert prefetch_event is not None
+        prefetch_event = pending.target._unshard_event
+        if not target_was_unsharded and prefetch_event is not None:
             self._release_reduce_scatter_after_prefetch(pending, prefetch_event)
         if self._prefetch_residency_is_limited():
             self._resident_prefetches.append(pending)
