@@ -1054,7 +1054,7 @@ def test_reduce_scatter_anchor_does_not_exceed_its_trace_credit(
 def test_actual_prefetch_releases_one_ready_reduce_scatter(
     distributed_setup, monkeypatch
 ) -> None:
-    """One submitted AG should add one ordered RS opportunity after its event."""
+    """One submitted AG should add one asynchronous RS opportunity."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     modules = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(4)]).to(device)
@@ -1120,7 +1120,7 @@ def test_actual_prefetch_releases_one_ready_reduce_scatter(
     assert calls == [0]
     assert scheduler.pending_reduce_scatter_bytes == groups[1].partial_grad_nbytes()
     assert submissions[0][0] == "prefetch"
-    assert submissions[0][1] is target._unshard_event
+    assert submissions[0][1] is None
     assert submissions[0][2] is not None
 
     scheduler.record_reduce_scatter_release(source, source, None)

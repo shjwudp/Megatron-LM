@@ -3185,7 +3185,7 @@ def _add_distributed_args(parser):
     group.add_argument('--fsdp-reduce-scatter-release-on-prefetch', action='store_true',
                        help="Use each actual MFSDP v2 parameter-prefetch all-gather as one "
                        "additional reduce-scatter release opportunity. The reduce-scatter "
-                       "waits for the all-gather and at most one ready request is released.")
+                       "remains asynchronous and at most one ready request is released.")
     group.add_argument('--suggested-communication-unit-size', type=int, default=None,
                    help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '

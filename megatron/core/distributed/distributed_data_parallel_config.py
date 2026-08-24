@@ -181,8 +181,8 @@ class DistributedDataParallelConfig:
     """
 
     fsdp_reduce_scatter_release_on_prefetch: bool = False
-    """If true, each actual MFSDP v2 parameter-prefetch all-gather releases at
-      most one ready deferred reduce-scatter after the all-gather completes.
+    """If true, each actual MFSDP v2 parameter-prefetch all-gather submission
+      releases at most one ready deferred reduce-scatter asynchronously.
     """
 
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False

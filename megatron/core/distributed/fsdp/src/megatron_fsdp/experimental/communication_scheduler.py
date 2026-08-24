@@ -113,8 +113,9 @@ class FsdpCommunicationSchedulerConfig:
         max_prefetch_resident_bytes: ``None`` preserves unbounded prefetch
             residency, zero infers a one-materialization byte budget from the
             execution trace, and a positive value supplies an explicit limit.
-        reduce_scatter_release_on_prefetch: Release at most one ready deferred
-            reduce-scatter after each actual parameter-prefetch all-gather.
+        reduce_scatter_release_on_prefetch: Use each actual parameter-prefetch
+            all-gather submission as an opportunity to release at most one ready
+            deferred reduce-scatter. The two collectives remain asynchronous.
     """
 
     max_pending_reduce_scatter_bytes: int | None = None
@@ -1057,10 +1058,8 @@ class FsdpCommunicationScheduler:
                 return request
         return None
 
-    def _release_reduce_scatter_after_prefetch(
-        self, prefetch: _PendingPrefetch, prefetch_event: torch.cuda.Event
-    ) -> None:
-        """Use one actual AG submission as one bounded RS service opportunity."""
+    def _release_reduce_scatter_at_prefetch(self, prefetch: _PendingPrefetch) -> None:
+        """Use one actual AG submission as one asynchronous RS service opportunity."""
         if not self.config.reduce_scatter_release_on_prefetch or not self._budget_compiled:
             return
         self._retire_completed_reduce_scatters()
@@ -1075,7 +1074,6 @@ class FsdpCommunicationScheduler:
             self._submit_reduce_scatter(
                 request,
                 reason="prefetch",
-                demand_event=prefetch_event,
                 prefetch=prefetch,
             )
             self._prefetch_reduce_scatter_releases += 1
@@ -1289,7 +1287,7 @@ class FsdpCommunicationScheduler:
         )
         prefetch_event = pending.target._unshard_event
         if not target_was_unsharded and prefetch_event is not None:
-            self._release_reduce_scatter_after_prefetch(pending, prefetch_event)
+            self._release_reduce_scatter_at_prefetch(pending)
         if self._prefetch_residency_is_limited():
             self._resident_prefetches.append(pending)
             self._resident_prefetch_bytes += pending.size_bytes
