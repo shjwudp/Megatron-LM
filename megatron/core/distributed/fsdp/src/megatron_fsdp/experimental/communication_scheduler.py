@@ -658,11 +658,7 @@ class FsdpCommunicationScheduler:
         if deferred:
             domain.pending_bytes += size_bytes
         self._update_reduce_scatter_peaks()
-        self._emit_reduce_scatter_state(
-            "reserve",
-            request,
-            deferred=deferred,
-        )
+        self._emit_reduce_scatter_state("reserve", request, deferred=deferred)
 
     def cancel_reduce_scatter_reservation(self, group: "FsdpParameterGroup") -> None:
         """Cancel a reservation whose physical allocation failed."""

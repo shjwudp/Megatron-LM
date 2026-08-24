@@ -272,9 +272,7 @@ class FsdpExecutionRunner:
         if self._phase is RunnerPhase.TRACING:
             self._validate_and_advance(EventKind.RS_RELEASE, owner, None, anchor=anchor)
             return len(self._trace) - 1
-        trace_index = self._validate_and_advance(
-            EventKind.RS_RELEASE, owner, None, anchor=anchor
-        )
+        trace_index = self._validate_and_advance(EventKind.RS_RELEASE, owner, None, anchor=anchor)
         # A replay mismatch seeds a replacement trace with this occurrence.
         # Return that seed index so scheduler metadata stays aligned with the
         # new trace rather than silently dropping its first release point.
