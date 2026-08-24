@@ -448,6 +448,42 @@ class FsdpExecutionRunner:
         source_index = self._unshard_index_by_completion.get(completion_index)
         return source_index is not None and completion_index < source_index
 
+    def has_usable_conflict_free_point(
+        self,
+        target_unshard_index: int | None,
+        *,
+        target_reshard_index: int | None = None,
+    ) -> bool:
+        """Return whether replay can safely gate an AG at a conflict-free point.
+
+        A point is usable only when it occurs after the current replay cursor
+        and any physical reshard that must release the target's current
+        materialization, but before the target consume. Requests without such
+        a point retain the normal eager/residency path; in particular, forward
+        warmup must not wait for a backward-only point that has not occurred.
+        """
+        if (
+            not self._use_trace_replay
+            or self._phase is not RunnerPhase.REPLAYING
+            or target_unshard_index is None
+        ):
+            return False
+        if not 0 <= target_unshard_index < len(self._trace):
+            raise ValueError(
+                f"Target unshard index {target_unshard_index} is outside the replay trace."
+            )
+        target_event = self._trace[target_unshard_index]
+        if target_event.kind is not EventKind.UNSHARD:
+            raise ValueError("A conflict-free-point query requires an UNSHARD target event.")
+
+        first_usable_index = self._replay_index
+        if target_reshard_index is not None:
+            first_usable_index = max(first_usable_index, target_reshard_index + 1)
+        return any(
+            event.kind is EventKind.CONFLICT_FREE
+            for event in self._trace[first_usable_index:target_unshard_index]
+        )
+
     # ------------------------------------------------------------------
     # Interface 3: reshard-skip suggestion
     # ------------------------------------------------------------------

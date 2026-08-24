@@ -355,8 +355,9 @@ class FsdpCommunicationScheduler:
             for completion in source.communication_policy.prefetch_successor_after
             if completion.phase == source_phase
         )
-        conflict_free_required = bool(
-            source.communication_policy.conflict_free_on_pre_backward
+        conflict_free_required = runner.has_usable_conflict_free_point(
+            target_unshard_index,
+            target_reshard_index=target_reshard_index,
         )
         completion_required = bool(completions)
         residency_limited = self._prefetch_residency_is_limited()

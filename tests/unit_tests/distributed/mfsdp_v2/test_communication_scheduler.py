@@ -1168,6 +1168,7 @@ def test_conflict_free_point_admits_prefetch_and_drains_ready_reduce_scatters(
             group, object(), context.current_stream().record_event(), True
         )
     scheduler.record_conflict_free_point(source, source, None)
+    context.runner.record_unshard(target, "rowwise")
     scheduler.finish_grad_sync()
     context.complete_trace()
     rs_calls.clear()
@@ -1180,7 +1181,13 @@ def test_conflict_free_point_admits_prefetch_and_drains_ready_reduce_scatters(
     )
 
     context.runner.record_unshard(source, "rowwise")
-    scheduler.schedule_prefetch(source, "rowwise", target, "rowwise")
+    scheduler.schedule_prefetch(
+        source,
+        "rowwise",
+        target,
+        "rowwise",
+        target_unshard_index=2,
+    )
     assert scheduler.has_pending_prefetches
     for index, group in enumerate(groups):
         scheduler.reserve_reduce_scatter(group, module_name=f"module.{index}", group_index=0)
