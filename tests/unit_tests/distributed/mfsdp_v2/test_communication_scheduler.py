@@ -1132,7 +1132,7 @@ def test_actual_prefetch_releases_one_ready_reduce_scatter(
 def test_conflict_free_point_admits_prefetch_and_drains_ready_reduce_scatters(
     distributed_setup, monkeypatch
 ) -> None:
-    """One traced safe point should jointly release AG and every ready RS."""
+    """One safe point should jointly release a forward AG and every ready RS."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     modules = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(4)]).to(device)
@@ -1161,7 +1161,7 @@ def test_conflict_free_point_admits_prefetch_and_drains_ready_reduce_scatters(
         )
         monkeypatch.setattr(group, "release_partial_grad_buffer", lambda: None)
 
-    context.runner.record_unshard(source, "colwise")
+    context.runner.record_unshard(source, "rowwise")
     for index, group in enumerate(groups):
         scheduler.reserve_reduce_scatter(group, module_name=f"module.{index}", group_index=0)
         scheduler.mark_reduce_scatter_ready(
@@ -1179,8 +1179,8 @@ def test_conflict_free_point_admits_prefetch_and_drains_ready_reduce_scatters(
         lambda orientation, **metadata: ag_calls.append((orientation, metadata["reason"])),
     )
 
-    context.runner.record_unshard(source, "colwise")
-    scheduler.schedule_prefetch(source, "colwise", target, "colwise")
+    context.runner.record_unshard(source, "rowwise")
+    scheduler.schedule_prefetch(source, "rowwise", target, "rowwise")
     assert scheduler.has_pending_prefetches
     for index, group in enumerate(groups):
         scheduler.reserve_reduce_scatter(group, module_name=f"module.{index}", group_index=0)
@@ -1189,7 +1189,7 @@ def test_conflict_free_point_admits_prefetch_and_drains_ready_reduce_scatters(
         )
 
     scheduler.record_conflict_free_point(source, source, None)
-    assert ag_calls == [("colwise", "conflict-free")]
+    assert ag_calls == [("rowwise", "conflict-free")]
     assert rs_calls == [0, 1]
     assert not scheduler.has_pending_prefetches
     assert scheduler.pending_reduce_scatter_bytes == 0

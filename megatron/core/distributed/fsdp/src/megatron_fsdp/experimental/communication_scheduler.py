@@ -90,8 +90,9 @@ class FsdpModuleCommunicationPolicy:
             reduce-scatter requests.
         conflict_free_on_pre_backward: Descendant modules whose pre-backward
             entry is known to be outside competing communication. The point
-            releases this unit's queued successor prefetch (subject to the
-            normal residency limit) and every ready deferred reduce-scatter.
+            admits context-wide queued prefetches from configured units
+            (subject to lifetime and residency limits) and every ready
+            deferred reduce-scatter.
     """
 
     prefetch_successor_after: tuple[ModuleCompletion | NamedCompletion, ...] = ()
@@ -159,6 +160,7 @@ class _PendingPrefetch:
     target_orientation: str
     completion_indices: tuple[int, ...]
     completion_required: bool = False
+    conflict_free_required: bool = False
     target_reshard_index: int | None = None
     target_unshard_index: int | None = None
     size_bytes: int = 0
@@ -354,13 +356,15 @@ class FsdpCommunicationScheduler:
             if completion.phase == source_phase
         )
         conflict_free_required = bool(
-            source_phase == "backward"
-            and source.communication_policy.conflict_free_on_pre_backward
+            source.communication_policy.conflict_free_on_pre_backward
         )
-        completion_required = bool(completions) or conflict_free_required
+        completion_required = bool(completions)
         residency_limited = self._prefetch_residency_is_limited()
         if runner.is_tracing or (
-            not residency_limited and not completion_required and target_reshard_index is None
+            not residency_limited
+            and not completion_required
+            and not conflict_free_required
+            and target_reshard_index is None
         ):
             reason = "trace-prefetch" if runner.is_tracing else "eager-prefetch"
             source_name = source.name if source.name else "<root>"
@@ -376,20 +380,12 @@ class FsdpCommunicationScheduler:
             target=target,
             target_orientation=target_orientation,
             completion_indices=(
-                tuple(
-                    sorted(
-                        runner.completion_indices_for_current_unshard(
-                            source, source_orientation
-                        )
-                        + runner.conflict_free_indices_for_current_unshard(
-                            source, source_orientation
-                        )
-                    )
-                )
+                runner.completion_indices_for_current_unshard(source, source_orientation)
                 if completion_required
                 else ()
             ),
             completion_required=completion_required,
+            conflict_free_required=conflict_free_required,
             target_reshard_index=target_reshard_index,
             target_unshard_index=target_unshard_index,
             size_bytes=target.unsharded_parameter_nbytes(),
@@ -639,7 +635,7 @@ class FsdpCommunicationScheduler:
         """Release eligible AG prefetches and every ready deferred RS."""
         self._retire_completed_reduce_scatters()
         runner = self._context.runner
-        trace_index = runner.record_conflict_free_point(owner, anchor)
+        runner.record_conflict_free_point(owner, anchor)
         if runner.is_tracing:
             # Model the same complete ready-RS drain while inferring the replay
             # budget. Prefetch remains disabled during the trace batch.
@@ -647,20 +643,25 @@ class FsdpCommunicationScheduler:
             self._trace_reduce_scatter_release()
             return
 
-        if trace_index is not None:
-            pending = self._find_matching_prefetch(trace_index)
-            if pending is not None:
-                if demand_event is None:
-                    demand_event = self._context.current_stream().record_event()
-                pending.completed_anchor = _CompletedPrefetchAnchor(
-                    owner=owner, anchor=anchor, phase="backward", event=demand_event
-                )
-                if self._prefetch_is_ready(pending):
-                    if self._prefetch_residency_is_limited():
-                        self._drain_ready_prefetches(reason="conflict-free")
-                    else:
-                        self._pending_prefetches.remove(pending)
-                        self._submit_prefetch(pending, reason="conflict-free")
+        while True:
+            eligible = [
+                pending
+                for pending in self._pending_prefetches
+                if pending.conflict_free_required and self._prefetch_is_ready(pending)
+            ]
+            if not eligible:
+                break
+            winner = min(eligible, key=self._prefetch_deadline_key)
+            if self._prefetch_residency_is_limited() and not self._resident_capacity_allows(
+                winner
+            ):
+                self._mark_residency_deferred(winner, reason="conflict-free-capacity")
+                break
+            if demand_event is None:
+                demand_event = self._context.current_stream().record_event()
+            self._context.allgather_stream.wait_event(demand_event)
+            self._pending_prefetches.remove(winner)
+            self._submit_prefetch(winner, reason="conflict-free")
 
         if not self._budget_compiled:
             return
@@ -886,11 +887,12 @@ class FsdpCommunicationScheduler:
         return deadline, pending.sequence
 
     def _eligible_prefetches(self) -> list[_PendingPrefetch]:
-        """Return requests whose source-completion condition is satisfied."""
+        """Return requests eligible outside a configured conflict-free point."""
         return [
             pending
             for pending in self._pending_prefetches
-            if not pending.completion_required or pending.completed_anchor is not None
+            if not pending.conflict_free_required
+            and (not pending.completion_required or pending.completed_anchor is not None)
         ]
 
     def _resident_capacity_allows(self, pending: _PendingPrefetch) -> bool:

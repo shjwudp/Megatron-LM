@@ -147,7 +147,6 @@ class FsdpExecutionRunner:
         # completion anchors from one another.
         self._completion_indices_by_unshard: dict[int, tuple[int, ...]] = {}
         self._unshard_index_by_completion: dict[int, int] = {}
-        self._conflict_free_indices_by_unshard: dict[int, tuple[int, ...]] = {}
         self._cycles_observed = 0
         # Modules consumed in the current round. The fine-grained schedule
         # fires one hook per sub-module (dense, experts), so the same module
@@ -444,26 +443,6 @@ class FsdpExecutionRunner:
             )
         return self._completion_indices_by_unshard.get(source_index, ())
 
-    def conflict_free_indices_for_current_unshard(
-        self, module: "FsdpModule", orientation: str
-    ) -> tuple[int, ...]:
-        """Return conflict-free points assigned to the current backward unshard."""
-        if not self._use_trace_replay or self._phase is not RunnerPhase.REPLAYING:
-            return ()
-        source_index = self._replay_index - 1
-        if source_index < 0:
-            return ()
-        source_event = self._trace[source_index]
-        if (
-            source_event.kind is not EventKind.UNSHARD
-            or source_event.module is not module
-            or source_event.orientation != orientation
-        ):
-            raise RuntimeError(
-                "Conflict-free lookup must immediately follow the source unshard occurrence."
-            )
-        return self._conflict_free_indices_by_unshard.get(source_index, ())
-
     def completion_precedes_source(self, completion_index: int) -> bool:
         """Return whether this completion must be retained for a later request."""
         source_index = self._unshard_index_by_completion.get(completion_index)
@@ -705,42 +684,6 @@ class FsdpExecutionRunner:
             for unshard_index, completion_indices in mapped.items()
             for completion_index in completion_indices
         }
-        self._compile_conflict_free_occurrences(unshards)
-
-    def _compile_conflict_free_occurrences(
-        self, unshards: dict[tuple[int, str], list[int]]
-    ) -> None:
-        """Pair each configured safe point with its owner's backward unshard."""
-        points: dict[tuple[int, tuple[str, object]], list[int]] = {}
-        labels: dict[tuple[int, tuple[str, object]], str] = {}
-        for index, event in enumerate(self._trace):
-            if event.kind is not EventKind.CONFLICT_FREE:
-                continue
-            assert event.anchor is not None
-            anchor_key = _anchor_key(event.anchor)
-            key = (id(event.module), anchor_key)
-            points.setdefault(key, []).append(index)
-            labels[key] = _anchor_label(event.anchor)
-
-        mapped: dict[int, list[int]] = {}
-        for (module_id, anchor_key), point_indices in points.items():
-            unshard_indices = unshards.get((module_id, "backward"), [])
-            if len(point_indices) != len(unshard_indices):
-                logger.warning(
-                    "FsdpExecutionRunner: cannot occurrence-map conflict-free point %s: "
-                    "%d points for %d backward unshards; demand fallback remains enabled.",
-                    labels[(module_id, anchor_key)],
-                    len(point_indices),
-                    len(unshard_indices),
-                )
-                continue
-            for unshard_index, point_index in zip(unshard_indices, point_indices):
-                mapped.setdefault(unshard_index, []).append(point_index)
-
-        self._conflict_free_indices_by_unshard = {
-            unshard_index: tuple(sorted(point_indices))
-            for unshard_index, point_indices in mapped.items()
-        }
 
     def _retrace(
         self,
@@ -761,7 +704,6 @@ class FsdpExecutionRunner:
         self._replay_index = 0
         self._completion_indices_by_unshard.clear()
         self._unshard_index_by_completion.clear()
-        self._conflict_free_indices_by_unshard.clear()
         self._cycles_observed = 0
         # The divergence event ends the aborted replay round; dedup entries
         # from it must not suppress the re-traced remainder of the batch.
