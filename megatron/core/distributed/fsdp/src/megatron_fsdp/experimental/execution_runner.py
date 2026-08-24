@@ -260,9 +260,7 @@ class FsdpExecutionRunner:
         if self._phase is RunnerPhase.TRACING:
             self._validate_and_advance(EventKind.RS_RELEASE, owner, None, anchor=anchor)
             return len(self._trace) - 1
-        trace_index = self._validate_and_advance(
-            EventKind.RS_RELEASE, owner, None, anchor=anchor
-        )
+        trace_index = self._validate_and_advance(EventKind.RS_RELEASE, owner, None, anchor=anchor)
         # A replay mismatch seeds a replacement trace with this occurrence.
         # Return that seed index so scheduler metadata stays aligned with the
         # new trace rather than silently dropping its first release point.
@@ -336,9 +334,7 @@ class FsdpExecutionRunner:
         remaining = depth
         target_index = None
         target_event = None
-        for index, event in enumerate(
-            self._trace[self._replay_index :], start=self._replay_index
-        ):
+        for index, event in enumerate(self._trace[self._replay_index :], start=self._replay_index):
             if event.kind is EventKind.UNSHARD:
                 remaining -= 1
                 if remaining == 0:
@@ -357,9 +353,7 @@ class FsdpExecutionRunner:
                 ):
                     release_after_reshard_index = index
             return _PrefetchSuggestion(
-                target_event.module,
-                target_event.orientation,
-                release_after_reshard_index,
+                target_event.module, target_event.orientation, release_after_reshard_index
             )
         # Fewer than ``depth`` consumes remain in this global batch. Waiting
         # until the next batch starts keeps the gather after the optimizer
@@ -475,8 +469,7 @@ class FsdpExecutionRunner:
             self._phase = RunnerPhase.REPLAYING
             self._compile_completion_occurrences()
             logger.info(
-                "FsdpExecutionRunner: compiled %d-event trace, entering replay.",
-                len(self._trace),
+                "FsdpExecutionRunner: compiled %d-event trace, entering replay.", len(self._trace)
             )
         self._replay_index = 0
         # The batch boundary ends every module's unshard round; without this,
@@ -525,8 +518,7 @@ class FsdpExecutionRunner:
         mode owns all prefetch decisions and intentionally skips this check.
         """
         if getattr(module, "_phase", None) is not None and (
-            module._phase == module.Phase.BACKWARD
-            or torch._C._current_graph_task_id() != -1
+            module._phase == module.Phase.BACKWARD or torch._C._current_graph_task_id() != -1
         ):
             return None
         if orientation == "rowwise":

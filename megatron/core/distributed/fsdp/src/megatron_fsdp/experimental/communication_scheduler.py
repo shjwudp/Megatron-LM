@@ -317,10 +317,7 @@ class FsdpCommunicationScheduler:
             reason = "trace-prefetch" if runner.is_tracing else "eager-prefetch"
             source_name = source.name if source.name else "<root>"
             target._unshard_parameter_groups(
-                target_orientation,
-                reason=reason,
-                source=source_name,
-                source_phase=source_phase,
+                target_orientation, reason=reason, source=source_name, source_phase=source_phase
             )
             return
 
@@ -395,19 +392,13 @@ class FsdpCommunicationScheduler:
             if event is None:
                 event = self._context.current_stream().record_event()
             self._completed_prefetch_anchors[trace_index] = _CompletedPrefetchAnchor(
-                owner=owner,
-                anchor=anchor,
-                phase=phase,
-                event=event,
+                owner=owner, anchor=anchor, phase=phase, event=event
             )
             return
         if event is None:
             event = self._context.current_stream().record_event()
         pending.completed_anchor = _CompletedPrefetchAnchor(
-            owner=owner,
-            anchor=anchor,
-            phase=phase,
-            event=event,
+            owner=owner, anchor=anchor, phase=phase, event=event
         )
         if self._prefetch_is_ready(pending):
             self._pending_prefetches.remove(pending)
@@ -445,8 +436,7 @@ class FsdpCommunicationScheduler:
         if not matches:
             return any(pending.target is target for pending in self._retained_prefetches)
         if any(
-            pending.completion_required and pending.completed_anchor is None
-            for pending in matches
+            pending.completion_required and pending.completed_anchor is None for pending in matches
         ):
             return False
 
@@ -593,11 +583,7 @@ class FsdpCommunicationScheduler:
         if deferred:
             domain.pending_bytes += size_bytes
         self._update_reduce_scatter_peaks()
-        self._emit_reduce_scatter_state(
-            "reserve",
-            request,
-            deferred=deferred,
-        )
+        self._emit_reduce_scatter_state("reserve", request, deferred=deferred)
 
     def cancel_reduce_scatter_reservation(self, group: "FsdpParameterGroup") -> None:
         """Cancel a reservation whose physical allocation failed."""
@@ -1053,9 +1039,7 @@ class FsdpCommunicationScheduler:
         if completed is not None:
             self._anchor_releases += 1
 
-    def _pop_latched_completion(
-        self, pending: _PendingPrefetch
-    ) -> _CompletedPrefetchAnchor | None:
+    def _pop_latched_completion(self, pending: _PendingPrefetch) -> _CompletedPrefetchAnchor | None:
         """Return the earliest already-satisfied anchor for ``pending``."""
         for completion_index in pending.completion_indices:
             completed = self._completed_prefetch_anchors.pop(completion_index, None)
