@@ -38,7 +38,7 @@ def fully_shard_context(
     reuse_existing: bool = False,
     use_trace_replay: bool = False,
     use_symmetric_memory: bool = False,
-    unify_communication_stream: bool = False,
+    unify_communication_stream: bool = True,
     enable_trace_pool: bool = False,
     communication_scheduler: FsdpCommunicationSchedulerConfig | None = None,
 ) -> Iterator[FsdpContext]:
