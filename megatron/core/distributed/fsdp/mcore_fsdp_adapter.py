@@ -663,7 +663,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
     ) -> "FsdpCommunicationSchedulerConfig | None":
         """Build the low-level scheduler config when at least one rule is enabled."""
         if not (
-            ddp_config.fsdp_prefetch_successor_after
+            ddp_config.fsdp_prefetch_depth != 1
+            or ddp_config.fsdp_prefetch_successor_after
             or ddp_config.fsdp_reduce_scatter_release_on_pre_backward
         ):
             return None
