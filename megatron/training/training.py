@@ -4539,9 +4539,60 @@ def train(
     _end_otel_startup_span()
     _start_otel_train_span()
 
+    memory_trace_output_dir = os.environ.get("MFSDP_TRAINING_MEMORY_TRACE_DIR")
+    memory_trace_rank = safe_get_rank()
+    memory_trace_ranks = {
+        int(value)
+        for value in os.environ.get("MFSDP_TRAINING_MEMORY_TRACE_RANKS", "0").split(",")
+        if value.strip()
+    }
+    memory_trace_selected = (
+        memory_trace_output_dir is not None and memory_trace_rank in memory_trace_ranks
+    )
+    memory_trace_start_iteration = int(
+        os.environ.get("MFSDP_TRAINING_MEMORY_TRACE_START_ITERATION", "0")
+    )
+    memory_trace_end_iteration = int(
+        os.environ.get("MFSDP_TRAINING_MEMORY_TRACE_END_ITERATION", "1")
+    )
+    if memory_trace_selected:
+        if memory_trace_start_iteration < iteration:
+            raise ValueError(
+                "MFSDP_TRAINING_MEMORY_TRACE_START_ITERATION cannot precede the "
+                "current training iteration."
+            )
+        if memory_trace_end_iteration <= memory_trace_start_iteration:
+            raise ValueError(
+                "MFSDP_TRAINING_MEMORY_TRACE_END_ITERATION must be greater than "
+                "MFSDP_TRAINING_MEMORY_TRACE_START_ITERATION."
+            )
+
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
+        if memory_trace_selected and iteration == memory_trace_start_iteration:
+            Path(memory_trace_output_dir).mkdir(parents=True, exist_ok=True)
+            max_entries = int(
+                os.environ.get("MFSDP_TRAINING_MEMORY_TRACE_MAX_ENTRIES", "500000")
+            )
+            try:
+                torch.cuda.memory._record_memory_history(
+                    enabled="all",
+                    context="alloc",
+                    stacks="python",
+                    max_entries=max_entries,
+                )
+            except TypeError:
+                torch.cuda.memory._record_memory_history(
+                    True,
+                    trace_alloc_max_entries=max_entries,
+                    trace_alloc_record_context=True,
+                )
+            print_rank_0(
+                "MFSDP allocator history started at training iteration "
+                f"{iteration}; retaining {max_entries} events."
+            )
+
         # At each checkpoint-interval boundary, re-root into a new trace so this
         # pass's iteration + (this interval's) checkpoint/eval/sniff form one compact
         # trace instead of accreting into a run-long one. Must be the first thing in
@@ -4773,6 +4824,25 @@ def train(
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
+
+        if memory_trace_selected and iteration == memory_trace_end_iteration:
+            snapshot_path = Path(memory_trace_output_dir) / (
+                f"rank_{memory_trace_rank}_iterations_"
+                f"{memory_trace_start_iteration}_{memory_trace_end_iteration}.pickle"
+            )
+            torch.cuda.memory._dump_snapshot(str(snapshot_path))
+            stats = torch.cuda.memory_stats()
+            gib = 1024**3
+            print_rank_0(
+                "MFSDP allocator history dumped after training iteration "
+                f"{iteration} to {snapshot_path}; "
+                f"allocated={stats.get('allocated_bytes.all.current', 0) / gib:.2f} GiB, "
+                f"reserved={stats.get('reserved_bytes.all.current', 0) / gib:.2f} GiB."
+            )
+            try:
+                torch.cuda.memory._record_memory_history(enabled=None)
+            except TypeError:
+                torch.cuda.memory._record_memory_history(False)
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
