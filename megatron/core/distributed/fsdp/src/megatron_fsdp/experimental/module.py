@@ -15,6 +15,9 @@
 """Module mixin for the minimal Megatron-FSDP path."""
 
 import enum
+import json
+import logging
+import os
 import weakref
 from collections.abc import Callable
 from typing import Literal, cast
@@ -39,6 +42,8 @@ from .execution_runner import FsdpExecutionRunner
 from .indexed_order import IndexedOrder
 from .parameter_group import Fp8ParameterGroup, FsdpParameterGroup, get_containing_parameter_group
 from .placement import Placements
+
+logger = logging.getLogger(__name__)
 
 
 def _is_in_backward() -> bool:
@@ -122,6 +127,7 @@ class FsdpContext:
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
+        self._complete_trace_calls = 0
         self.allgather_stream = torch.cuda.Stream(device)
         if unify_communication_stream:
             # A unified stream lets an all-gather reuse the storage released by a
@@ -170,6 +176,8 @@ class FsdpContext:
 
     def complete_trace(self) -> None:
         """Compile execution replay and the optional storage pool once per batch."""
+        self._complete_trace_calls += 1
+        batch = self._complete_trace_calls
         runner_was_tracing = self.runner.is_tracing
         self.runner.complete_trace()
         if self.communication_scheduler is not None:
@@ -180,8 +188,88 @@ class FsdpContext:
                 # disabled. Its lifetimes do not describe replay. Keep tracing
                 # storage through one replay batch, then plan from both sets of
                 # intervals.
+                self._dump_memory_boundary(f"batch_{batch}_after_execution_trace")
                 return
+            self._dump_memory_boundary(f"batch_{batch}_before_pool_plan")
             self.trace_pool_allocator.plan()
+            self._dump_memory_boundary(f"batch_{batch}_after_pool_plan")
+            return
+        self._dump_memory_boundary(f"batch_{batch}_optimized_boundary")
+
+    def _dump_memory_boundary(self, label: str) -> None:
+        """Dump an opt-in allocator snapshot at an FSDP global-batch boundary.
+
+        This diagnostic is intentionally controlled by an environment variable so
+        normal training has no memory-history or filesystem overhead. The standard
+        ``--record-memory-history`` option must also be enabled if allocation call
+        stacks are required in the pickle snapshot.
+        """
+        output_dir = os.environ.get("MFSDP_MEMORY_TRACE_DIR")
+        if not output_dir:
+            return
+        max_batches = int(os.environ.get("MFSDP_MEMORY_TRACE_MAX_BATCHES", "3"))
+        if self._complete_trace_calls > max_batches:
+            return
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = 0
+        trace_ranks = {
+            int(value)
+            for value in os.environ.get("MFSDP_MEMORY_TRACE_RANKS", "0").split(",")
+            if value.strip()
+        }
+        if rank not in trace_ranks:
+            return
+
+        os.makedirs(output_dir, exist_ok=True)
+        stats = dict(torch.cuda.memory_stats(self.device))
+        free_bytes, total_bytes = torch.cuda.mem_get_info(self.device)
+        allocator = self.trace_pool_allocator
+        scheduler = self.communication_scheduler
+        report = {
+            "label": label,
+            "rank": rank,
+            "execution_runner_phase": self.runner.phase.name,
+            "trace_pool_phase": allocator.phase if allocator is not None else None,
+            "trace_pool_bytes": allocator.total_pool_bytes if allocator is not None else 0,
+            "trace_pool_active_keys": len(allocator.active_keys) if allocator is not None else 0,
+            "trace_pool_trace_events": len(allocator._trace) if allocator is not None else 0,
+            "trace_pool_trace_slots": len(allocator._trace_slots) if allocator is not None else 0,
+            "trace_pool_optimized_slots": len(allocator._slots) if allocator is not None else 0,
+            "pending_reduce_scatter_bytes": (
+                scheduler.pending_reduce_scatter_bytes if scheduler is not None else 0
+            ),
+            "in_flight_reduce_scatter_bytes": (
+                scheduler.in_flight_reduce_scatter_bytes if scheduler is not None else 0
+            ),
+            "peak_pending_reduce_scatter_bytes": (
+                scheduler.peak_pending_reduce_scatter_bytes if scheduler is not None else 0
+            ),
+            "peak_in_flight_reduce_scatter_bytes": (
+                scheduler.peak_in_flight_reduce_scatter_bytes if scheduler is not None else 0
+            ),
+            "device_total_bytes": total_bytes,
+            "device_free_bytes": free_bytes,
+            "device_used_bytes": total_bytes - free_bytes,
+            "cuda_memory_stats": stats,
+        }
+        stem = os.path.join(output_dir, f"rank_{rank}_{label}")
+        with open(f"{stem}.json", "w", encoding="utf-8") as stream:
+            json.dump(report, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        torch.cuda.memory._dump_snapshot(f"{stem}.pickle")
+        gib = 1024**3
+        logger.warning(
+            "MFSDP memory boundary %s: allocated=%.2f GiB reserved=%.2f GiB "
+            "device_used=%.2f GiB trace_pool=%.2f GiB",
+            label,
+            stats.get("allocated_bytes.all.current", 0) / gib,
+            stats.get("reserved_bytes.all.current", 0) / gib,
+            (total_bytes - free_bytes) / gib,
+            report["trace_pool_bytes"] / gib,
+        )
 
     def record_completion_anchor(
         self,
