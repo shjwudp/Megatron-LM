@@ -128,6 +128,28 @@ class FsdpContext:
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
         self._complete_trace_calls = 0
+        self._memory_trace_rank = self._get_memory_trace_rank()
+        if self._memory_trace_rank is not None:
+            os.makedirs(os.environ["MFSDP_MEMORY_TRACE_DIR"], exist_ok=True)
+            max_entries = int(os.environ.get("MFSDP_MEMORY_TRACE_MAX_ENTRIES", "100000"))
+            try:
+                # PyTorch 2.13's string API avoids the legacy compatibility path and
+                # reliably includes device traces in snapshots. Python-only stacks
+                # are sufficient to attribute allocations and materially cheaper than
+                # collecting C++ frames for every allocator event.
+                torch.cuda.memory._record_memory_history(
+                    enabled="all",
+                    context="alloc",
+                    stacks="python",
+                    max_entries=max_entries,
+                )
+            except TypeError:
+                # Keep the opt-in diagnostic usable with older PyTorch containers.
+                torch.cuda.memory._record_memory_history(
+                    True,
+                    trace_alloc_max_entries=max_entries,
+                    trace_alloc_record_context=True,
+                )
         self.allgather_stream = torch.cuda.Stream(device)
         if unify_communication_stream:
             # A unified stream lets an all-gather reuse the storage released by a
@@ -200,27 +222,14 @@ class FsdpContext:
         """Dump an opt-in allocator snapshot at an FSDP global-batch boundary.
 
         This diagnostic is intentionally controlled by an environment variable so
-        normal training has no memory-history or filesystem overhead. The standard
-        ``--record-memory-history`` option must also be enabled if allocation call
-        stacks are required in the pickle snapshot.
+        normal training has no memory-history or filesystem overhead.
         """
         output_dir = os.environ.get("MFSDP_MEMORY_TRACE_DIR")
-        if not output_dir:
+        rank = self._memory_trace_rank
+        if not output_dir or rank is None:
             return
         max_batches = int(os.environ.get("MFSDP_MEMORY_TRACE_MAX_BATCHES", "3"))
         if self._complete_trace_calls > max_batches:
-            return
-
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            rank = torch.distributed.get_rank()
-        else:
-            rank = 0
-        trace_ranks = {
-            int(value)
-            for value in os.environ.get("MFSDP_MEMORY_TRACE_RANKS", "0").split(",")
-            if value.strip()
-        }
-        if rank not in trace_ranks:
             return
 
         os.makedirs(output_dir, exist_ok=True)
@@ -270,6 +279,22 @@ class FsdpContext:
             (total_bytes - free_bytes) / gib,
             report["trace_pool_bytes"] / gib,
         )
+
+    @staticmethod
+    def _get_memory_trace_rank() -> int | None:
+        """Return this process's rank when opt-in memory tracing selects it."""
+        if not os.environ.get("MFSDP_MEMORY_TRACE_DIR"):
+            return None
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = int(os.environ.get("RANK", "0"))
+        trace_ranks = {
+            int(value)
+            for value in os.environ.get("MFSDP_MEMORY_TRACE_RANKS", "0").split(",")
+            if value.strip()
+        }
+        return rank if rank in trace_ranks else None
 
     def record_completion_anchor(
         self,
