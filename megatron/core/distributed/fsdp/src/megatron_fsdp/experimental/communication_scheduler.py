@@ -19,7 +19,7 @@ import logging
 import math
 from collections import deque
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import torch
 import torch.distributed as dist
@@ -126,12 +126,27 @@ class FsdpCommunicationSchedulerConfig:
 
 @dataclasses.dataclass
 class _PendingPrefetch:
-    """One traced successor gather waiting for a completion anchor."""
+    """One traced successor gather waiting for its scheduling gates."""
 
+    sequence: int
     source: "FsdpModule"
+    source_phase: CommunicationPhase
     target: "FsdpModule"
-    orientation: str
-    completions: tuple[ModuleCompletion | NamedCompletion, ...]
+    target_orientation: str
+    completion_indices: tuple[int, ...]
+    completion_required: bool = False
+    target_reshard_index: int | None = None
+    completed_anchor: "_CompletedPrefetchAnchor | None" = None
+
+
+@dataclasses.dataclass
+class _CompletedPrefetchAnchor:
+    """One replay completion retained until its source request is known."""
+
+    owner: "FsdpModule"
+    anchor: nn.Module | str
+    phase: CommunicationPhase
+    event: torch.cuda.Event
 
 
 class _ReduceScatterState(Enum):
@@ -192,9 +207,14 @@ class FsdpCommunicationScheduler:
         self._context = context
         self.config = config
         self._pending_prefetches: deque[_PendingPrefetch] = deque()
+        self._retained_prefetches: deque[_PendingPrefetch] = deque()
+        self._completed_prefetch_anchors: dict[int, _CompletedPrefetchAnchor] = {}
+        self._next_prefetch_sequence = 0
         self._delayed_prefetches = 0
         self._anchor_releases = 0
+        self._latched_anchor_releases = 0
         self._demand_releases = 0
+        self._retained_prefetch_reuses = 0
         self._domains: dict[int, _DomainState] = {}
         self._domain_order: list[_DomainState] = []
         self._reduce_scatter_requests: deque[_ReduceScatterRequest] = deque()
@@ -210,7 +230,7 @@ class FsdpCommunicationScheduler:
     @property
     def has_pending_prefetches(self) -> bool:
         """Return whether a successor gather is waiting for an anchor."""
-        return bool(self._pending_prefetches)
+        return bool(self._pending_prefetches or self._retained_prefetches)
 
     @property
     def pending_reduce_scatter_bytes(self) -> int:
@@ -230,28 +250,77 @@ class FsdpCommunicationScheduler:
         self._release_anchor_count += 1
 
     def schedule_prefetch(
-        self, source: "FsdpModule", target: "FsdpModule", orientation: str
+        self,
+        source: "FsdpModule",
+        source_orientation: str,
+        target: "FsdpModule",
+        target_orientation: str,
+        *,
+        target_reshard_index: int | None = None,
     ) -> None:
-        """Submit or defer a traced successor all-gather."""
-        source_phase: CommunicationPhase = "forward" if orientation == "rowwise" else "backward"
+        """Submit or defer a traced successor all-gather.
+
+        Completion anchors belong to the source occurrence, while the payload
+        orientation belongs to the target occurrence. These orientations may
+        differ in an interleaved 1F1B trace.
+        """
+        source_phase: CommunicationPhase = (
+            "forward" if source_orientation == "rowwise" else "backward"
+        )
+        runner = self._context.runner
         completions = tuple(
             completion
             for completion in source.communication_policy.prefetch_successor_after
             if completion.phase == source_phase
         )
-        if not completions or self._context.runner.is_tracing:
-            reason = "trace-prefetch" if self._context.runner.is_tracing else "eager-prefetch"
-            target._unshard_parameter_groups(orientation, reason=reason)
+        completion_required = bool(completions)
+        if runner.is_tracing or (not completion_required and target_reshard_index is None):
+            reason = "trace-prefetch" if runner.is_tracing else "eager-prefetch"
+            source_name = source.name if source.name else "<root>"
+            target._unshard_parameter_groups(
+                target_orientation,
+                reason=reason,
+                source=source_name,
+                source_phase=source_phase,
+            )
             return
 
-        self._pending_prefetches.append(
-            _PendingPrefetch(
-                source=source, target=target, orientation=orientation, completions=completions
-            )
+        pending = _PendingPrefetch(
+            sequence=self._next_prefetch_sequence,
+            source=source,
+            source_phase=source_phase,
+            target=target,
+            target_orientation=target_orientation,
+            completion_indices=(
+                runner.completion_indices_for_current_unshard(source, source_orientation)
+                if completion_required
+                else ()
+            ),
+            completion_required=completion_required,
+            target_reshard_index=target_reshard_index,
         )
+        self._next_prefetch_sequence += 1
         self._delayed_prefetches += 1
-        torch.cuda.nvtx.range_push("MFSDP delayed AG queued")
+        source_name = source.name if source.name else "<root>"
+        target_name = target.name if target.name else "<root>"
+        torch.cuda.nvtx.range_push(
+            f"MFSDP AG queued request={pending.sequence} source={source_name} "
+            f"source_phase={source_phase} source_orientation={source_orientation} "
+            f"target={target_name} "
+            f"target_orientation={target_orientation} "
+            f"target_reshard_index={target_reshard_index}"
+        )
         torch.cuda.nvtx.range_pop()
+
+        pending.completed_anchor = self._pop_latched_completion(pending)
+        if self._prefetch_is_ready(pending):
+            reason = "latched-anchor" if pending.completed_anchor is not None else "post-reshard"
+            self._submit_prefetch(pending, reason=reason)
+            if pending.completed_anchor is not None:
+                self._latched_anchor_releases += 1
+            return
+
+        self._pending_prefetches.append(pending)
 
     def record_completion_anchor(
         self,
@@ -271,29 +340,138 @@ class FsdpCommunicationScheduler:
                 omitted.
         """
         runner = self._context.runner
-        runner.record_completion(owner, anchor, phase)
+        trace_index = runner.record_completion(owner, anchor, phase)
         if runner.is_tracing:
             # A replay divergence may leave speculative requests from the
             # aborted cycle. Submit them before tracing a replacement cycle.
             self.flush_prefetches(reason="trace")
             return
 
-        pending = self._pop_matching_prefetch(owner, anchor, phase)
+        if trace_index is None:
+            return
+        pending = self._find_matching_prefetch(trace_index)
         if pending is None:
+            if not runner.completion_precedes_source(trace_index):
+                return
+            if event is None:
+                event = self._context.current_stream().record_event()
+            self._completed_prefetch_anchors[trace_index] = _CompletedPrefetchAnchor(
+                owner=owner,
+                anchor=anchor,
+                phase=phase,
+                event=event,
+            )
             return
         if event is None:
             event = self._context.current_stream().record_event()
-        self._context.allgather_stream.wait_event(event)
-        pending.target._unshard_parameter_groups(pending.orientation, reason="anchor")
-        self._anchor_releases += 1
+        pending.completed_anchor = _CompletedPrefetchAnchor(
+            owner=owner,
+            anchor=anchor,
+            phase=phase,
+            event=event,
+        )
+        if self._prefetch_is_ready(pending):
+            self._pending_prefetches.remove(pending)
+            self._submit_prefetch(pending, reason="anchor")
+
+    def record_target_reshard(self, target: "FsdpModule", trace_index: int | None) -> None:
+        """Release prefetches gated by one exact physical target reshard."""
+        if trace_index is None:
+            return
+        for pending in tuple(self._pending_prefetches):
+            if pending.target is not target or pending.target_reshard_index != trace_index:
+                continue
+            pending.target_reshard_index = None
+            if not self._prefetch_is_ready(pending):
+                continue
+            self._pending_prefetches.remove(pending)
+            reason = "post-reshard"
+            if pending.completed_anchor is not None:
+                reason = "anchor+post-reshard"
+            self._submit_prefetch(pending, reason=reason)
+
+    def retain_prefetches_across_reshard(
+        self, target: "FsdpModule", trace_index: int | None
+    ) -> bool:
+        """Keep live parameters when they already serve a future depth target."""
+        if trace_index is None:
+            # Replay divergence retraces the rest of the current global batch.
+            # Keep a prior reservation alive until demand or the optimizer boundary.
+            return any(pending.target is target for pending in self._retained_prefetches)
+        matches = [
+            pending
+            for pending in self._pending_prefetches
+            if pending.target is target and pending.target_reshard_index == trace_index
+        ]
+        if not matches:
+            return any(pending.target is target for pending in self._retained_prefetches)
+        if any(
+            pending.completion_required and pending.completed_anchor is None
+            for pending in matches
+        ):
+            return False
+
+        target_name = target.name if target.name else "<root>"
+        for pending in matches:
+            self._pending_prefetches.remove(pending)
+            pending.target_reshard_index = None
+            self._retained_prefetches.append(pending)
+            completed = pending.completed_anchor
+            anchor = (
+                _completion_name(pending.source, completed.anchor)
+                if completed is not None
+                else None
+            )
+            provenance = "".join(
+                f" {key}={value}"
+                for key, value in (
+                    ("source", pending.source.name if pending.source.name else "<root>"),
+                    ("source_phase", pending.source_phase),
+                    ("anchor", anchor),
+                    ("request", pending.sequence),
+                )
+                if value is not None
+            )
+            torch.cuda.nvtx.range_push(
+                f"MFSDP AG retained target={target_name} "
+                f"orientation={pending.target_orientation} "
+                f"trigger=retain-through-reshard{provenance}"
+            )
+            torch.cuda.nvtx.range_pop()
+            if completed is not None:
+                self._anchor_releases += 1
+        return True
 
     def demand_unshard(self, target: "FsdpModule", orientation: str) -> None:
-        """Release the oldest queued gather for the demanded module occurrence."""
-        for index, pending in enumerate(self._pending_prefetches):
-            if pending.target is not target or pending.orientation != orientation:
+        """Consume retained storage or release the oldest queued target gather."""
+        for index, retained in enumerate(self._retained_prefetches):
+            if retained.target is not target:
                 continue
+            del self._retained_prefetches[index]
+            target_name = target.name if target.name else "<root>"
+            torch.cuda.nvtx.range_push(
+                f"MFSDP AG retained reuse target={target_name} "
+                f"orientation={orientation} reserved_orientation="
+                f"{retained.target_orientation} request={retained.sequence}"
+            )
+            torch.cuda.nvtx.range_pop()
+            self._retained_prefetch_reuses += 1
+            return
+        for index, pending in enumerate(self._pending_prefetches):
+            if pending.target is not target or pending.target_orientation != orientation:
+                continue
+            # A gate marks an intervening occurrence of the same module. This
+            # demand must not steal a request reserved for a later occurrence.
+            if pending.target_reshard_index is not None:
+                return
             del self._pending_prefetches[index]
-            pending.target._unshard_parameter_groups(pending.orientation, reason="demand")
+            pending.target._unshard_parameter_groups(
+                pending.target_orientation,
+                reason="demand",
+                source=pending.source.name if pending.source.name else "<root>",
+                source_phase=pending.source_phase,
+                request=pending.sequence,
+            )
             self._demand_releases += 1
             return
 
@@ -403,6 +581,7 @@ class FsdpCommunicationScheduler:
 
     def finish_grad_sync(self) -> None:
         """Submit every ready request and fence gradient consumers against RS."""
+        self._release_retained_prefetches(reason="finish_grad_sync")
         self._trace_reduce_scatter_flush()
         while self._reduce_scatter_requests:
             request = self._reduce_scatter_requests[0]
@@ -416,6 +595,9 @@ class FsdpCommunicationScheduler:
 
     def complete_trace(self, *, runner_was_tracing: bool) -> None:
         """Infer and freeze pending-byte limits after an execution trace."""
+        # Trace indices repeat in every global batch. Never let a completed
+        # CUDA event from the prior batch satisfy the next batch's occurrence.
+        self._completed_prefetch_anchors.clear()
         if not runner_was_tracing:
             return
         if self._reduce_scatter_requests:
@@ -424,6 +606,9 @@ class FsdpCommunicationScheduler:
 
     def handle_replay_divergence(self) -> None:
         """Return to eager communication while recording a replacement trace."""
+        self._completed_prefetch_anchors.clear()
+        # Retained parameters remain valid within this global batch. Releasing
+        # them here could invalidate the consumer that exposed the divergence.
         self.flush_prefetches(reason="replay divergence")
         for request in tuple(self._reduce_scatter_requests):
             if (
@@ -453,8 +638,31 @@ class FsdpCommunicationScheduler:
         while self._pending_prefetches:
             pending = self._pending_prefetches.popleft()
             pending.target._unshard_parameter_groups(
-                pending.orientation, reason=f"flush-{reason.replace(' ', '-')}"
+                pending.target_orientation,
+                reason=f"flush-{reason.replace(' ', '-')}",
+                source=pending.source.name if pending.source.name else "<root>",
+                source_phase=pending.source_phase,
+                request=pending.sequence,
             )
+
+    def _release_retained_prefetches(self, *, reason: str) -> None:
+        """Release retained parameters that did not reach their traced demand."""
+        if not self._retained_prefetches:
+            return
+        retained = tuple(self._retained_prefetches)
+        self._retained_prefetches.clear()
+        logger.warning(
+            "MFSDP communication scheduler released %d retained prefetches on %s.",
+            len(retained),
+            reason,
+        )
+        seen_targets: set[int] = set()
+        for pending in retained:
+            target_key = id(pending.target)
+            if target_key in seen_targets:
+                continue
+            seen_targets.add(target_key)
+            pending.target._reshard_parameter_groups(record_execution=False)
 
     def _get_domain(self, mesh: DeviceMesh) -> _DomainState:
         key = id(mesh)
@@ -612,7 +820,8 @@ class FsdpCommunicationScheduler:
             reduce_scatter_stream.wait_event(demand_event)
         reduce_scatter_stream.wait_event(ready_event)
         label = (
-            f"MFSDP RS module={request.module_name} group={request.group_index} release={reason}"
+            f"MFSDP RS target={request.module_name} group={request.group_index} "
+            f"trigger={reason} request={request.sequence} bytes={request.size_bytes}"
         )
         torch.cuda.nvtx.range_push(label)
         try:
@@ -643,40 +852,78 @@ class FsdpCommunicationScheduler:
         """Log delayed all-gather scheduling statistics."""
         logger.info(
             "MFSDP communication scheduler: prefetch_depth=%d delayed_prefetches=%d "
-            "anchor_releases=%d demand_releases=%d pending_prefetches=%d "
+            "anchor_releases=%d latched_anchor_releases=%d demand_releases=%d "
+            "retained_prefetch_reuses=%d pending_prefetches=%d "
             "rs_anchor_releases=%d capacity_releases=%d final_releases=%d "
             "pending_rs_bytes=%d",
             self.config.prefetch_depth,
             self._delayed_prefetches,
             self._anchor_releases,
+            self._latched_anchor_releases,
             self._demand_releases,
-            len(self._pending_prefetches),
+            self._retained_prefetch_reuses,
+            len(self._pending_prefetches) + len(self._retained_prefetches),
             self._reduce_scatter_releases,
             self._capacity_releases,
             self._final_releases,
             self.pending_reduce_scatter_bytes,
         )
 
-    def _pop_matching_prefetch(
-        self, owner: "FsdpModule", anchor: nn.Module | str, phase: CommunicationPhase
-    ) -> _PendingPrefetch | None:
-        for index, pending in enumerate(self._pending_prefetches):
-            if pending.source is not owner:
+    def _find_matching_prefetch(self, completion_index: int) -> _PendingPrefetch | None:
+        """Find the request assigned to one exact replay completion index."""
+        for pending in self._pending_prefetches:
+            if completion_index not in pending.completion_indices:
                 continue
-            if not any(
-                (
-                    isinstance(completion, ModuleCompletion)
-                    and completion.module is anchor
-                    and completion.phase == phase
-                )
-                or (
-                    isinstance(completion, NamedCompletion)
-                    and completion.name == anchor
-                    and completion.phase == phase
-                )
-                for completion in pending.completions
-            ):
-                continue
-            del self._pending_prefetches[index]
             return pending
         return None
+
+    @staticmethod
+    def _prefetch_is_ready(pending: _PendingPrefetch) -> bool:
+        """Return whether completion and target-lifetime gates are satisfied."""
+        completion_ready = not pending.completion_required or pending.completed_anchor is not None
+        return completion_ready and pending.target_reshard_index is None
+
+    def _submit_prefetch(self, pending: _PendingPrefetch, *, reason: str) -> None:
+        """Submit one prefetch after all of its scheduling gates are satisfied."""
+        completed = pending.completed_anchor
+        if completed is not None:
+            self._context.allgather_stream.wait_event(completed.event)
+        pending.target._unshard_parameter_groups(
+            pending.target_orientation,
+            reason=reason,
+            source=pending.source.name if pending.source.name else "<root>",
+            source_phase=pending.source_phase,
+            anchor=(
+                _completion_name(pending.source, completed.anchor)
+                if completed is not None
+                else None
+            ),
+            request=pending.sequence,
+        )
+        if completed is not None:
+            self._anchor_releases += 1
+
+    def _pop_latched_completion(
+        self, pending: _PendingPrefetch
+    ) -> _CompletedPrefetchAnchor | None:
+        """Return the earliest already-satisfied anchor for ``pending``."""
+        for completion_index in pending.completion_indices:
+            completed = self._completed_prefetch_anchors.pop(completion_index, None)
+            if completed is None:
+                continue
+            if completed.owner is not pending.source or completed.phase != pending.source_phase:
+                raise RuntimeError(
+                    "A compiled completion occurrence did not match its prefetch source."
+                )
+            return completed
+        return None
+
+
+def _completion_name(owner: "FsdpModule", anchor: nn.Module | str) -> str:
+    """Return a compact, stable name for one actual completion anchor."""
+    if isinstance(anchor, str):
+        return f"@{anchor}"
+    for name, module in cast(nn.Module, owner).named_modules():
+        if module is anchor:
+            return name or "<self>"
+    return f"<{type(anchor).__name__}>"

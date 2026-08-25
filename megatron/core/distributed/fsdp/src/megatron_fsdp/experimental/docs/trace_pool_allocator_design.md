@@ -71,7 +71,9 @@ After the optimizer step, `FullyShardedOptimizer` calls `complete_trace()` once
 on the `FsdpContext` shared by all VPP chunks. The context first completes
 execution-runner tracing and defers storage planning while the runner is
 tracing. Planning occurs once at the boundary after the first complete replay
-and requires no live logical allocations.
+and requires no live logical allocations. Execution-runner lookahead therefore
+stops at the global-batch boundary; it never creates a cross-optimizer-step
+prefetch lifetime that the pool would have to carry into the next cycle.
 
 The allocator:
 

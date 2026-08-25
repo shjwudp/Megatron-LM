@@ -210,21 +210,40 @@ replace scheduler state.
   `prefetch_depth=1` is the immediate successor. It does not mean gathering an
   FSDP unit after one of its own parameter-consuming descendants, which would
   be circular.
+- Anchor phase is selected from the source occurrence, independently of the
+  target all-gather orientation. Under interleaved 1F1B and depth-adjustable
+  prefetch, a backward source may select a forward target; its configured
+  backward anchors still govern that target's release.
 - `prefetch_depth=N` selects the Nth future `UNSHARD` occurrence in the shared
-  context trace, counting repeated VPP executions independently and wrapping
-  at the global-batch boundary. A single context-wide depth produces a
-  one-to-one cyclic shift: every occurrence has exactly one speculative
-  producer and target.
+  context trace, counting repeated VPP executions independently without
+  wrapping at the global-batch boundary. If fewer than N occurrences remain,
+  the source does not prefetch; the target gathers after the next batch starts.
+  This keeps gathered parameters on the correct side of the optimizer update
+  and leaves no speculative full-parameter allocation live at trace-pool
+  planning time.
+- Depth does not require a completion rule. With no source-owned `after` rule,
+  replay submits the selected target at the source `UNSHARD`, the earliest
+  trace-safe point. An `after` rule changes that immediate release into an
+  explicit delay.
 - Increasing depth moves the target farther into the future but does not move
-  the configured launch anchor. It therefore creates more lead after the
-  protected communication at the cost of more simultaneously resident full
-  parameters. Depth must be positive and cannot exceed the number of traced
-  `UNSHARD` occurrences.
-- A completion anchor must be a descendant of the annotated FSDP unit and
-  must occur after that unit's `UNSHARD` and before the target's demand
+  the launch point. It therefore creates more lead at the cost of more
+  simultaneously resident full parameters within the batch. Depth must be
+  positive and cannot exceed the number of traced `UNSHARD` occurrences.
+- If the selected target has an earlier consume/reshard of the same FSDP unit
+  between source and target, that physical reshard becomes a lifetime gate.
+  The scheduler retains the parameters materialized for the earlier occurrence
+  across that reshard, then consumes the reservation at the selected future
+  occurrence. A reshard already skipped for immediate same-orientation reuse
+  is not a physical gate.
+- A module completion anchor must be a descendant of the annotated FSDP unit.
+  To release a particular delayed prefetch, at least one matching anchor
+  occurrence must remain between the source `UNSHARD` and the target's demand
   `UNSHARD` in the trace.
-- If several configured anchors match one occurrence, the first matching
-  anchor observed at runtime releases the queued successor.
+- Multiple anchors may be configured for the same source phase. An anchor
+  observed before the prefetch is queued has no effect; the first matching
+  anchor observed afterward releases the queued successor. This lets a policy
+  expose successive backward completion points and use the earliest one that
+  remains ahead of a dynamically interleaved source occurrence.
 - `reduce_scatter_release_on_pre_backward` marks release modules; it does not
   identify which unit's RS to launch. The compiled occurrence trace assigns
   the oldest legal pending RS request to each release occurrence.
@@ -310,11 +329,23 @@ the replay budget.
 
 CUDA events are runtime objects and are not stored as part of the reusable
 trace identity. During replay, the matching hook records a fresh event on the
-actual execution stream and passes it to the launch path.
+actual execution stream and passes it to the launch path. If the hook runs
+before its source unshard, the scheduler retains that event until the matching
+request is known.
+
+With delayed weight-gradient computation, a schedule node that owns deferred
+wgrad work emits its backward completion only after `backward_dw()`. A
+communication-only node such as `moe_dispatch` has no deferred wgrad and emits
+completion when its backward call returns. This makes its event a usable
+post-communication all-gather anchor even when delayed wgrad is enabled for the
+model.
 
 The trace remains occurrence-based. Object identity selects a configured
-rule, while the trace index distinguishes repeated VPP/microbatch
-occurrences.
+rule, while the trace index distinguishes repeated VPP/microbatch occurrences.
+At trace compilation, the runner pairs the Nth completion of each configured
+owner/phase/anchor with the Nth source unshard for that owner and phase. It
+only compiles an anchor when the two cardinalities match; demand unshard is the
+safe fallback for an ambiguous trace.
 
 At trace completion, each rank independently freezes the occurrence trace.
 The inferred budget is reduced with `MIN` through the explicit process groups
@@ -328,25 +359,41 @@ SPMD requirement as the underlying FSDP execution.
 ### Trace
 
 The first global batch continues to run without speculative prefetch. The
-runner records both the real `UNSHARD` order and configured completion-anchor
+runner records the real `UNSHARD` order and any configured completion-anchor
 occurrences. During replay, the configured depth selects the Nth future
-`UNSHARD` target and its orientation. When the source policy contains an anchor
-for the current forward/backward orientation, the scheduler queues that target
-instead of submitting it immediately. If no matching anchor occurs before
-demand, the consumer submits the AG itself.
+`UNSHARD` target and its orientation. With no completion rule, the scheduler
+submits that target immediately. When the source policy contains an anchor for
+the current forward/backward orientation, the scheduler queues the target
+instead. A matching anchor that already occurred for this exact source
+occurrence is a satisfied "after" condition. If no matching anchor occurs
+before demand, the consumer submits the AG itself.
 
 ### Replay
 
 ```text
-UNSHARD(A), prefetch_depth=N
-  -> identify T as the Nth future UNSHARD occurrence
-  -> queue AG(T), do not submit it
+UNSHARD(A, source_orientation), prefetch_depth=N
+  -> identify (T, target_orientation) as the Nth future UNSHARD occurrence
+  -> if no completion policy applies, submit AG(T) immediately
+  -> otherwise select A's exact-occurrence anchors from source_orientation
+  -> if an assigned anchor already completed, submit AG(T) after its event
+  -> otherwise queue AG(T, target_orientation)
 
 ANCHOR_DONE(A.x)
   -> record completion event on A.x's execution stream
-  -> allgather_stream.wait_event(anchor_event)
-  -> submit AG(T)
+  -> if its exact-occurrence request exists, submit AG(T) after the event
+  -> otherwise retain the event until that request is created
+
+RESHARD(T) before the selected target occurrence
+  -> retain T's live parameters instead of releasing and regathering them
+
+UNSHARD(T) at the selected occurrence
+  -> consume the retained parameters without another AG
 ```
+
+Retained events are keyed by exact trace index rather than module name. They
+are cleared at replay divergence and every global-batch boundary, before trace
+indices are reused. Thus a VPP microbatch or the previous optimizer step
+cannot satisfy another occurrence.
 
 At `UNSHARD(T)`, demand execution remains the correctness backstop. If T's AG
 was never released, it is submitted immediately. If it was released but has
@@ -507,8 +554,10 @@ Delayed communication extends buffer lifetimes and must participate in trace
 pool planning:
 
 - A queued successor AG contains only target metadata. It does not allocate
-  the gather output until its completion anchor releases it. The shifted
-  allocation-to-reshard lifetime is then recorded normally.
+  the gather output until its completion and target-lifetime gates allow it.
+  When an intervening occurrence already materialized the target, replay
+  extends that allocation through the selected demand instead of recording a
+  free/reallocate pair.
 - A trace-pooled partial-gradient key remains active from allocation through
   pending time. It is freed only after its RS has been enqueued on the ordered
   reduce-scatter arena.
@@ -543,10 +592,11 @@ the source, target, phase, and missing selector.
 On execution-trace divergence:
 
 1. stop issuing speculative delayed AG;
-2. submit pending RS requests in recorded FIFO order;
-3. revert new requests to eager communication;
-4. retrace from the divergence event;
-5. do not reuse a trace-pool slot if its lifetime conflicts with the optimized
+2. keep retained parameters live until demand or `finish_grad_sync()`;
+3. submit pending RS requests in recorded FIFO order;
+4. revert new requests to eager communication;
+5. retrace from the divergence event;
+6. do not reuse a trace-pool slot if its lifetime conflicts with the optimized
    plan.
 
 This fallback is allowed only while every collective domain can preserve its
@@ -575,15 +625,36 @@ reports include delayed AG count, anchor and demand releases, pending AGs,
 RS anchor/capacity/final releases, and current pending RS bytes. Selector
 resolution logs each matched FSDP unit and anchor.
 
-The scheduler emits launch-scoped NVTX ranges around every parameter-group
-collective submission. AG labels include the target FSDP module, parameter-group
-index, payload orientation, and release path (for example, `anchor`, `demand`,
-or `consumer`). RS labels include the owning FSDP module, parameter-group index,
-and release reason (for example, `anchor`, `capacity`, `submit-on-ready`, or
-`finish_grad_sync`). Keeping the CUDA launch API inside the range is required
-for Nsight to associate a later asynchronous kernel with the scheduling
-decision that submitted it; an instantaneous marker after submission is not
-sufficient, especially when autograd runs the hook on a worker thread.
+The scheduler emits one `MFSDP AG queued` marker for each delayed request and
+launch-scoped NVTX ranges around every parameter-group collective submission.
+`request` is a context-unique sequence that correlates the queue marker with
+the eventual launch. AG labels use `target`, `orientation`, and `trigger`
+(for example, `anchor`, `latched-anchor`, `demand`, or `consumer`) rather than
+the ambiguous `module` and `release` fields. Scheduled launches also identify `source`,
+`source_phase`, and the actual `anchor` that fired. For example:
+
+```text
+MFSDP AG queued request=42 source=layers.4 source_phase=backward ...
+MFSDP AG target=layers.3 group=1 orientation=colwise trigger=anchor \
+  source=layers.4 source_phase=backward anchor=@pre_dispatch_computation request=42
+MFSDP AG target=layers.3 group=1 orientation=colwise trigger=latched-anchor \
+  source=layers.4 source_phase=backward anchor=@moe_dispatch request=43
+```
+
+An anchor or demand request can be consumed while the target is already
+materialized for another VPP occurrence or payload orientation. Such a no-op
+emits an instantaneous `MFSDP AG skipped` range with the same request and
+provenance plus `state=already-unsharded`. Normal consumer no-ops after a
+successful prefetch are intentionally omitted to avoid trace noise. This skip
+marker distinguishes a late consumer AG caused by a lost scheduler request
+from an anchor that was never observed.
+
+RS labels similarly use `target` and `trigger` and include the request
+sequence and byte count. Keeping the CUDA launch API inside the launch range
+is required for Nsight to associate a later asynchronous kernel or
+symmetric-memory memcpy payload with the scheduling decision that submitted
+it; an instantaneous marker after submission is not sufficient, especially
+when autograd runs the hook on a worker thread.
 
 ## Validation plan
 
@@ -593,8 +664,9 @@ The initial implementation adds tests under
 `tests/unit_tests/distributed/mfsdp_v2/` for:
 
 1. scheduler/config validation and shared-context compatibility;
-2. completion-anchor release, demand fallback, and depth-based future target
-   selection across trace wrap and repeated VPP module occurrences;
+2. future and already-satisfied completion-anchor release, demand fallback,
+   exact isolation across repeated VPP occurrences and optimizer boundaries,
+   and depth-based future target selection;
 3. deferred RS release, automatic budget compilation, and captured
    `is_last_microbatch`;
 4. multi-step loss parity against eager execution;

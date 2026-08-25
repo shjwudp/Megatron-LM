@@ -371,11 +371,11 @@ def test_prefetch_traces_and_replays_actual_consume_order(distributed_setup):
     runner.complete_trace()
     assert not runner.is_tracing
 
-    # Batch 2 (replay): consume in the same order; each call returns the
-    # traced next consumer (with wrap-around at the batch boundary).
+    # Batch 2 (replay): consume in the same order. The final occurrence has
+    # no prefetch target before the optimizer boundary.
     assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") == (layers[2], "colwise")
     assert _record_unshard_and_prefetch(runner, layers[2], "colwise") == (layers[1], "rowwise")
-    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (layers[0], "rowwise")
+    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") is None
 
     # Divergence re-traces from the mismatching occurrence: the reshard
     # round of L0 is reset, then L0 is consumed with the wrong orientation.
@@ -447,13 +447,8 @@ def test_default_mode_uses_static_order_prefetch(distributed_setup):
     assert not ctx.runner._trace
 
 
-def test_runner_wrap_around_chunk_cycle_prefetches_first_module(distributed_setup):
-    """Replay must prefetch across the cycle wrap: 0 -> 1 -> 2 -> 0.
-
-    A VPP schedule walks the chunk cycle repeatedly. The traced successor of
-    the last occurrence wraps to the first module, so consuming module 2
-    must prefetch module 0 (not None).
-    """
+def test_runner_global_batch_boundary_stops_prefetch(distributed_setup):
+    """Replay must not prefetch parameters across an optimizer step."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=3).to(device)
@@ -473,16 +468,16 @@ def test_runner_wrap_around_chunk_cycle_prefetches_first_module(distributed_setu
         runner.record_reshard(layer)
     runner.complete_trace()
 
-    # Batch 2 replays two full cycles, prefetching the successor at every
-    # step including the 2 -> 0 wrap.
+    # Each replay batch may prefetch within its own trace, but its last
+    # occurrence must wait for the next batch to gather updated weights.
     for _ in range(2):
         for i, layer in enumerate(layers):
-            next_layer = layers[(i + 1) % len(layers)]
-            assert _record_unshard_and_prefetch(runner, layer, "rowwise") == (
-                next_layer,
-                "rowwise",
-            )
+            expected = (layers[i + 1], "rowwise") if i + 1 < len(layers) else None
+            assert _record_unshard_and_prefetch(runner, layer, "rowwise") == expected
             runner.record_reshard(layer)
+            if i + 1 == len(layers):
+                assert not runner.suggest_skip_reshard(layer)
+        runner.complete_trace()
 
 
 def test_runner_wrap_within_batch_multiple_cycles(distributed_setup):
@@ -507,16 +502,15 @@ def test_runner_wrap_within_batch_multiple_cycles(distributed_setup):
 
     expected_cycle = [layers[0], layers[1], layers[2], layers[0], layers[1], layers[2]]
     for i, layer in enumerate(expected_cycle):
-        expected_next = expected_cycle[(i + 1) % len(expected_cycle)]
-        assert _record_unshard_and_prefetch(runner, layer, "rowwise") == (
-            expected_next,
-            "rowwise",
+        expected = (
+            (expected_cycle[i + 1], "rowwise") if i + 1 < len(expected_cycle) else None
         )
+        assert _record_unshard_and_prefetch(runner, layer, "rowwise") == expected
         runner.record_reshard(layer)
 
 
-def test_runner_prefetch_depth_wraps_over_unshard_occurrences(distributed_setup):
-    """Depth two should select the second future consume across a VPP cycle wrap."""
+def test_runner_prefetch_depth_stops_at_global_batch_boundary(distributed_setup):
+    """Depth two should return None when its target would cross the optimizer step."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=4).to(device)
@@ -535,12 +529,14 @@ def test_runner_prefetch_depth_wraps_over_unshard_occurrences(distributed_setup)
 
     for _ in range(2):
         for index, layer in enumerate(layers):
-            target = layers[(index + 2) % len(layers)]
-            assert _record_unshard_and_prefetch(runner, layer, "rowwise", depth=2) == (
-                target,
-                "rowwise",
+            expected = (
+                (layers[index + 2], "rowwise") if index + 2 < len(layers) else None
             )
+            assert _record_unshard_and_prefetch(
+                runner, layer, "rowwise", depth=2
+            ) == expected
             runner.record_reshard(layer)
+        runner.complete_trace()
 
 
 def test_runner_prefetch_depth_uses_occurrence_order_for_repeated_module(distributed_setup):
@@ -568,7 +564,7 @@ def test_runner_prefetch_depth_uses_occurrence_order_for_repeated_module(distrib
     runner.complete_trace()
 
     for index, (layer, orientation) in enumerate(occurrences):
-        expected = occurrences[(index + 2) % len(occurrences)]
+        expected = occurrences[index + 2] if index + 2 < len(occurrences) else None
         assert _record_unshard_and_prefetch(
             runner, layer, orientation, depth=2
         ) == expected
@@ -631,10 +627,7 @@ def test_runner_divergence_retraces_and_recovers(distributed_setup):
         layers[1],
         "rowwise",
     )
-    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (
-        layers[2],
-        "rowwise",
-    )
+    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") is None
 
 
 def test_runner_tolerates_transient_mismatch_without_crashing(distributed_setup):
@@ -735,10 +728,7 @@ def test_complete_trace_clears_dedup_so_replay_records(distributed_setup):
         "rowwise",
     )
     runner.record_reshard(layers[0])
-    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (
-        layers[0],
-        "rowwise",
-    )
+    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") is None
 
 
 def test_trace_pool_plans_after_first_execution_replay(distributed_setup):

@@ -512,7 +512,14 @@ class FsdpModule:
         self._unshard_and_prefetch("rowwise")
 
     def _unshard_parameter_groups(
-        self, orientation: str = "rowwise", *, reason: str = "consumer"
+        self,
+        orientation: str = "rowwise",
+        *,
+        reason: str = "consumer",
+        source: str | None = None,
+        source_phase: str | None = None,
+        anchor: str | None = None,
+        request: int | None = None,
     ) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
 
@@ -525,18 +532,43 @@ class FsdpModule:
             orientation: Payload orientation to gather for MXFP8 groups —
                 ``"rowwise"`` on the forward pass, ``"colwise"`` on the
                 backward pass. Ignored by regular groups.
-            reason: Scheduling path that submitted this all-gather.
+            reason: Scheduling path that triggered this all-gather.
+            source: Module occurrence that requested a scheduled prefetch.
+            source_phase: Execution phase of the scheduled source occurrence.
+            anchor: Completion point that triggered a scheduled prefetch.
+            request: Scheduler request sequence used to correlate queue, skip,
+                and submission ranges.
         """
+        module_name = self.name if self.name else "<root>"
+        provenance = "".join(
+            f" {key}={value}"
+            for key, value in (
+                ("source", source),
+                ("source_phase", source_phase),
+                ("anchor", anchor),
+                ("request", request),
+            )
+            if value is not None
+        )
         if self._unshard_event is not None:
+            # Consumer no-ops are the normal result of successful prefetching.
+            # A scheduler request no-op is actionable: the queue entry has been
+            # consumed without launching an AG and may later fall back to demand.
+            if request is not None:
+                label = (
+                    f"MFSDP AG skipped target={module_name} orientation={orientation} "
+                    f"trigger={reason}{provenance} state=already-unsharded"
+                )
+                torch.cuda.nvtx.range_push(label)
+                torch.cuda.nvtx.range_pop()
             return
 
         allgather_stream = self.context.allgather_stream
-        module_name = self.name if self.name else "<root>"
         with torch.cuda.stream(allgather_stream):
             for group_index, group in enumerate(self._parameter_groups):
                 label = (
-                    f"MFSDP AG module={module_name} group={group_index} "
-                    f"orientation={orientation} release={reason}"
+                    f"MFSDP AG target={module_name} group={group_index} "
+                    f"orientation={orientation} trigger={reason}{provenance}"
                 )
                 torch.cuda.nvtx.range_push(label)
                 try:
@@ -565,13 +597,27 @@ class FsdpModule:
         if not is_new_occurrence:
             return
         prefetch_depth = scheduler.config.prefetch_depth if scheduler is not None else 1
-        prefetch = runner.suggest_prefetch(self, orientation, depth=prefetch_depth)
+        prefetch = runner.suggest_prefetch_plan(self, orientation, depth=prefetch_depth)
         if prefetch is not None:
-            next_module, next_orientation = prefetch
+            next_module = prefetch.module
+            next_orientation = prefetch.orientation
             if scheduler is None:
-                next_module._unshard_parameter_groups(next_orientation, reason="static-prefetch")
+                source_name = self.name if self.name else "<root>"
+                source_phase = "forward" if orientation == "rowwise" else "backward"
+                next_module._unshard_parameter_groups(
+                    next_orientation,
+                    reason="static-prefetch",
+                    source=source_name,
+                    source_phase=source_phase,
+                )
             else:
-                scheduler.schedule_prefetch(self, next_module, next_orientation)
+                scheduler.schedule_prefetch(
+                    self,
+                    orientation,
+                    next_module,
+                    next_orientation,
+                    target_reshard_index=prefetch.release_after_reshard_index,
+                )
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
@@ -596,9 +642,15 @@ class FsdpModule:
             record_execution: Record the reshard in the execution runner. Internal
                 initialization cleanup passes False because it is not a training event.
         """
+        reshard_index = None
         if record_execution:
-            self.context.runner.record_reshard(self)
+            reshard_index = self.context.runner.record_reshard(self)
             if self.context.runner.suggest_skip_reshard(self):
+                return
+            scheduler = self.context.communication_scheduler
+            if scheduler is not None and scheduler.retain_prefetches_across_reshard(
+                self, reshard_index
+            ):
                 return
         for group in self._parameter_groups:
             group.reshard_parameters()
@@ -611,6 +663,9 @@ class FsdpModule:
             for group in self._parameter_groups:
                 group.release_unsharded_storage()
             self._unshard_event = None
+        scheduler = self.context.communication_scheduler
+        if scheduler is not None:
+            scheduler.record_target_reshard(self, reshard_index)
 
     def pre_backward(self, register_final_callback: bool = True) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order.
@@ -712,7 +767,7 @@ class FsdpModule:
 
             if scheduler is None:
                 reduce_scatter_stream.wait_stream(current_stream)
-                label = f"MFSDP RS module={module_name} group={group_index} release=eager"
+                label = f"MFSDP RS target={module_name} group={group_index} trigger=eager"
                 torch.cuda.nvtx.range_push(label)
                 try:
                     with torch.cuda.stream(reduce_scatter_stream):

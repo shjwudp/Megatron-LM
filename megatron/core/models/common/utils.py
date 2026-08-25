@@ -317,21 +317,24 @@ class TransformerLayerNode(ScheduleNode):
     def backward(self, *output_grad):
         """Execute backward and fire the per-layer post-backward hook on the first slot.
 
-        When ``delay_wgrad_compute`` is set, the hook fires after ``backward_dw``
-        instead, because the wgrad work has not yet run when ``backward`` returns.
+        When this node owns delayed wgrad work, the hook fires after
+        ``backward_dw`` instead, because that work has not yet run when
+        ``backward`` returns. Nodes without wgrad work complete here even when
+        the model-wide ``delay_wgrad_compute`` option is enabled.
         """
         if self._fsdp_pre_backward_communication_hook is not None:
             self._fsdp_pre_backward_communication_hook(self.name, self.event)
         grads = super().backward(*output_grad)
-        if not self.delay_wgrad_compute and self._fsdp_post_backward_communication_hook is not None:
+        has_delayed_wgrad = self.delay_wgrad_compute and bool(self.bwd_dw_callables)
+        if not has_delayed_wgrad and self._fsdp_post_backward_communication_hook is not None:
             self._fsdp_post_backward_communication_hook(self.name, self.event)
-        if not self.delay_wgrad_compute and self.is_layer_first_node:
+        if not has_delayed_wgrad and self.is_layer_first_node:
             self._post_backward_hook()
         return grads
 
     def backward_dw(self):
         """Run the slot's delayed weight-gradient callables on the slot's stream."""
-        if not self.delay_wgrad_compute:
+        if not self.delay_wgrad_compute or not self.bwd_dw_callables:
             return
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
