@@ -93,6 +93,12 @@ class DistributedDataParallelConfig:
     megatron_fsdp_version: int = 1
     """Megatron-FSDP implementation version. Valid values are 1 and 2."""
 
+    megatron_fsdp_trace_replay: bool = True
+    """If true, MFSDP v2 uses trace-and-replay prefetch for complex schedules
+    (VPP + combined 1F1B EP overlap). Set to False to disable the execution
+    runner and fall back to static-order prefetch — for A/B convergence and
+    performance comparisons of the runner itself."""
+
     use_custom_fsdp: bool = False
     """
     NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.

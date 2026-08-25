@@ -3111,6 +3111,15 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--megatron-fsdp-version', type=int, default=1, choices=[1, 2],
                        help='Megatron-FSDP implementation version. Defaults to 1.')
+    group.add_argument('--megatron-fsdp-trace-replay', action='store_true', default=True,
+                       help='Use trace-and-replay prefetch for MFSDP v2 under VPP + '
+                       'combined 1F1B EP-overlap schedules. Set --no-megatron-fsdp-trace-replay '
+                       'to disable the execution runner and fall back to static-order '
+                       'prefetch, for A/B comparison of the runner itself.')
+    group.add_argument('--no-megatron-fsdp-trace-replay', action='store_false',
+                       dest='megatron_fsdp_trace_replay',
+                       help='Disable MFSDP v2 trace-and-replay prefetch (static-order '
+                       'prefetch instead) for A/B comparison of the runner.')
     group.add_argument('--no-use-layer-wise-param-layout',
                        action='store_false',
                        dest='use_layer_wise_param_layout',

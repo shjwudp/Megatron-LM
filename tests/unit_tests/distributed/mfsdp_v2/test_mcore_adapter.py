@@ -736,6 +736,46 @@ class TestMcoreAdapterDense:
         success, _, _ = optimizer.step()
         assert success
 
+    @pytest.mark.parametrize("trace_replay", [True, False])
+    def test_trace_replay_toggle_gates_the_runner(self, trace_replay):
+        """The DDP toggle gates trace replay without disabling fine-grained hooks."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        # This unit test exercises the adapter's construction-time gate. Set
+        # the schedule flag after config validation so it does not require an
+        # otherwise unrelated MoE model and EP process-group topology.
+        config.overlap_moe_expert_parallel_comm = True
+        model = torch.nn.Sequential(
+            _build_layer(config), torch.nn.Linear(config.hidden_size, config.hidden_size)
+        ).to(device="cuda", dtype=config.params_dtype)
+
+        wrapped = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                megatron_fsdp_trace_replay=trace_replay,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                megatron_fsdp_main_params_dtype=torch.float32,
+                megatron_fsdp_main_grads_dtype=torch.float32,
+                fsdp_all_gather_in_start_param_sync=False,
+            ),
+            module=model,
+            fsdp_unit_modules=[TransformerLayer],
+            pg_collection=ProcessGroupCollection(dp_cp=self.pg_collection.dp_cp),
+        )
+
+        assert wrapped.module.context.runner.use_trace_replay is trace_replay
+
 
 class TestMcoreAdapterExpertParallel:
     """Exercise the MFSDP v2 adapter over an MoE model with EP=2."""
