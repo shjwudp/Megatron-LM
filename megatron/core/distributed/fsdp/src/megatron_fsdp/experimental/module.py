@@ -129,27 +129,23 @@ class FsdpContext:
         self._is_finalized = False
         self._complete_trace_calls = 0
         self._memory_trace_rank = self._get_memory_trace_rank()
+        self._memory_trace_start_batch = int(
+            os.environ.get("MFSDP_MEMORY_TRACE_START_BATCH", "0")
+        )
+        self._memory_trace_end_batch = int(
+            os.environ.get("MFSDP_MEMORY_TRACE_END_BATCH", "2")
+        )
+        if self._memory_trace_start_batch < 0:
+            raise ValueError("MFSDP_MEMORY_TRACE_START_BATCH must be non-negative.")
+        if self._memory_trace_end_batch <= self._memory_trace_start_batch:
+            raise ValueError(
+                "MFSDP_MEMORY_TRACE_END_BATCH must be greater than "
+                "MFSDP_MEMORY_TRACE_START_BATCH."
+            )
         if self._memory_trace_rank is not None:
             os.makedirs(os.environ["MFSDP_MEMORY_TRACE_DIR"], exist_ok=True)
-            max_entries = int(os.environ.get("MFSDP_MEMORY_TRACE_MAX_ENTRIES", "100000"))
-            try:
-                # PyTorch 2.13's string API avoids the legacy compatibility path and
-                # reliably includes device traces in snapshots. Python-only stacks
-                # are sufficient to attribute allocations and materially cheaper than
-                # collecting C++ frames for every allocator event.
-                torch.cuda.memory._record_memory_history(
-                    enabled="all",
-                    context="alloc",
-                    stacks="python",
-                    max_entries=max_entries,
-                )
-            except TypeError:
-                # Keep the opt-in diagnostic usable with older PyTorch containers.
-                torch.cuda.memory._record_memory_history(
-                    True,
-                    trace_alloc_max_entries=max_entries,
-                    trace_alloc_record_context=True,
-                )
+            if self._memory_trace_start_batch == 0:
+                self._start_memory_history()
         self.allgather_stream = torch.cuda.Stream(device)
         if unify_communication_stream:
             # A unified stream lets an all-gather reuse the storage released by a
@@ -211,12 +207,44 @@ class FsdpContext:
                 # storage through one replay batch, then plan from both sets of
                 # intervals.
                 self._dump_memory_boundary(f"batch_{batch}_after_execution_trace")
+                self._start_memory_history_after_boundary(batch)
                 return
             self._dump_memory_boundary(f"batch_{batch}_before_pool_plan")
             self.trace_pool_allocator.plan()
             self._dump_memory_boundary(f"batch_{batch}_after_pool_plan")
+            self._start_memory_history_after_boundary(batch)
             return
         self._dump_memory_boundary(f"batch_{batch}_optimized_boundary")
+        self._start_memory_history_after_boundary(batch)
+
+    def _start_memory_history(self) -> None:
+        """Begin an allocator-history window on the selected rank."""
+        max_entries = int(os.environ.get("MFSDP_MEMORY_TRACE_MAX_ENTRIES", "500000"))
+        try:
+            # PyTorch 2.13's string API avoids the legacy compatibility path and
+            # reliably includes device traces in snapshots. Python-only stacks
+            # are sufficient to attribute allocations and materially cheaper than
+            # collecting C++ frames for every allocator event.
+            torch.cuda.memory._record_memory_history(
+                enabled="all",
+                context="alloc",
+                stacks="python",
+                max_entries=max_entries,
+            )
+        except TypeError:
+            # Keep the opt-in diagnostic usable with older PyTorch containers.
+            torch.cuda.memory._record_memory_history(
+                True,
+                trace_alloc_max_entries=max_entries,
+                trace_alloc_record_context=True,
+            )
+
+    def _start_memory_history_after_boundary(self, batch: int) -> None:
+        """Start a delayed window after the configured global batch."""
+        if self._memory_trace_rank is None:
+            return
+        if batch == self._memory_trace_start_batch and batch < self._memory_trace_end_batch:
+            self._start_memory_history()
 
     def _dump_memory_boundary(self, label: str) -> None:
         """Dump an opt-in allocator snapshot at an FSDP global-batch boundary.
@@ -228,8 +256,7 @@ class FsdpContext:
         rank = self._memory_trace_rank
         if not output_dir or rank is None:
             return
-        max_batches = int(os.environ.get("MFSDP_MEMORY_TRACE_MAX_BATCHES", "3"))
-        if self._complete_trace_calls > max_batches:
+        if self._complete_trace_calls != self._memory_trace_end_batch:
             return
 
         os.makedirs(output_dir, exist_ok=True)
@@ -240,6 +267,8 @@ class FsdpContext:
         report = {
             "label": label,
             "rank": rank,
+            "memory_trace_start_batch": self._memory_trace_start_batch,
+            "memory_trace_end_batch": self._memory_trace_end_batch,
             "execution_runner_phase": self.runner.phase.name,
             "trace_pool_phase": allocator.phase if allocator is not None else None,
             "trace_pool_bytes": allocator.total_pool_bytes if allocator is not None else 0,
