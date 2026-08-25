@@ -725,7 +725,8 @@ class TestMcoreAdapterDense:
 
         assert all(count == 1 for count in sync_counts.values())
 
-    def test_fused_sgd_casts_mismatched_grads(self):
+    @pytest.mark.parametrize("fsdp_trace_pool", [False, True], ids=["default", "trace_pool"])
+    def test_fused_sgd_casts_mismatched_grads(self, fsdp_trace_pool, monkeypatch):
         """FusedSGD steps after MCore casts V2's BF16 gradients to FP32."""
         config = TransformerConfig(
             num_layers=1,
@@ -746,6 +747,7 @@ class TestMcoreAdapterDense:
                 data_parallel_sharding_strategy="optim_grads_params",
                 megatron_fsdp_main_params_dtype=torch.float32,
                 megatron_fsdp_main_grads_dtype=torch.bfloat16,
+                fsdp_trace_pool=fsdp_trace_pool,
             ),
             module=_build_block(config),
             pg_collection=self.pg_collection,
@@ -766,17 +768,38 @@ class TestMcoreAdapterDense:
             pg_collection=self.pg_collection,
         )
 
-        optimizer.zero_grad(set_to_none=True)
-        output = model(
-            hidden_states=torch.randn(
-                8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16
-            ),
-            attention_mask=None,
-        )
-        output.float().square().mean().backward()
+        cast_pointers = []
+        allocator = optimizer.context.trace_pool_allocator
+        if allocator is not None:
+            allocator_allocate = allocator.allocate
 
-        success, _, _ = optimizer.step()
-        assert success
+            def record_cast_allocation(key, size, dtype, device, *, arena=None):
+                allocation = allocator_allocate(key, size, dtype, device, arena=arena)
+                if arena == "optimizer_grad_cast":
+                    cast_pointers.append(allocation.data_ptr())
+                return allocation
+
+            monkeypatch.setattr(allocator, "allocate", record_cast_allocation)
+
+        num_steps = 3 if fsdp_trace_pool else 1
+        for _ in range(num_steps):
+            optimizer.zero_grad(set_to_none=True)
+            output = model(
+                hidden_states=torch.randn(
+                    8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16
+                ),
+                attention_mask=None,
+            )
+            output.float().square().mean().backward()
+
+            success, _, _ = optimizer.step()
+            assert success
+
+        if allocator is not None:
+            assert allocator.phase == "optimized"
+            assert not allocator.active_keys
+            assert len(cast_pointers) == num_steps
+            assert cast_pointers[-1] == cast_pointers[-2]
 
 
 class TestMcoreAdapterExpertParallel:

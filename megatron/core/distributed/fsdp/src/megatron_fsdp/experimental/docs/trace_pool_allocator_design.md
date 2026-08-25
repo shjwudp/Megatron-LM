@@ -133,8 +133,17 @@ collective input directly; no extra `torch.empty` is created.
 ## Scope and limitations
 
 - The feature pools M-FSDP unshard and partial-gradient communication buffers.
-  Persistent sharded weights, main gradients, optimizer state, activations, and
-  MXFP8 quantization temporaries remain under their existing allocators.
+  For non-precision-aware optimizers, the temporary local gradient casts used
+  to bridge a lower-precision M-FSDP main-gradient buffer to FP32 optimizer
+  parameters are packed into a separate trace-pool arena as well. The packed
+  allocation spans optimizer preparation through the optimizer step and is
+  released before the global-batch trace boundary.
+- Symmetric-memory trace pools retain the ordinary per-gradient cast path. A
+  rank may own empty optimizer shards, so the local cast workspace does not
+  satisfy symmetric memory's rank-invariant allocation-size and ordering
+  contract.
+- Persistent sharded weights, main gradients, optimizer state, activations,
+  and MXFP8 quantization temporaries remain under their existing allocators.
 - PyTorch NCCL symmetric memory can back trace-pool slots for regular and MXFP8
   parameter groups. MXFP8 gathers use separate row-wise and column-wise slots;
   their ordinary gradient reduce-scatter uses the same symmetric partial-gradient
@@ -162,8 +171,9 @@ collective input directly; no extra `torch.empty` is created.
 
 Correctness tests cover Storage identity across trace release/reallocation,
 slot sharing and collisions, arena isolation, DBuffer rebinding, symmetric
-slot provenance, regular and MXFP8 multi-step loss parity across the
-trace-to-optimized transition. Performance validation should compare identical 24-GPU
-PP3/VPP2/EP8 jobs, discard at least the initial execution trace, first replay,
-and first five steps, and report allocated, reserved, and device-used memory on
-one rank from every pipeline stage.
+slot provenance, optimizer-gradient cast replay, and regular and MXFP8
+multi-step loss parity across the trace-to-optimized transition. Performance
+validation should compare identical 24-GPU PP3/VPP2/EP8 jobs, discard at least
+the initial execution trace, first replay, and first five steps, and report
+allocated, reserved, and device-used memory on one rank from every pipeline
+stage.

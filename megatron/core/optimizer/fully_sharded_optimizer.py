@@ -5,6 +5,7 @@
 from typing import Callable, List, Optional
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
@@ -15,6 +16,9 @@ from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
+
+_GRAD_CAST_ALIGNMENT_BYTES = 256
+_OPTIMIZER_GRAD_CAST_ARENA = "optimizer_grad_cast"
 
 
 class FullyShardedOptimizer(MixedPrecisionOptimizer):
@@ -62,7 +66,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             raise ValueError("All MFSDP v2 model chunks must share one FsdpContext.")
         self.context = contexts.pop()
         self.is_stub_optimizer = optimizer is None
-        self._casted_grads = []
+        self._casted_grads: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
+        self._grad_cast_pool_keys: list[tuple[object, ...]] = []
 
     @staticmethod
     def _validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
@@ -133,6 +138,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             return
 
         assert not self._casted_grads
+        assert not self._grad_cast_pool_keys
+        grads_to_cast = []
         for parameter in self.get_parameters():
             if parameter.grad is None:
                 continue
@@ -140,21 +147,98 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 continue
 
             original_grad = parameter.grad
-            parameter.grad = None
-            parameter.grad_dtype = parameter.data.dtype
-            parameter.grad = original_grad.to(dtype=parameter.data.dtype)
-            self._casted_grads.append((parameter, original_grad))
+            local_grad = (
+                original_grad.to_local() if isinstance(original_grad, DTensor) else original_grad
+            )
+            grads_to_cast.append((parameter, original_grad, local_grad))
 
-    @torch.no_grad()
-    def step_with_ready_grads(self) -> bool:
-        """Step the optimizer and restore MFSDP gradient dtypes."""
-        success = super().step_with_ready_grads()
+        allocator = self.context.trace_pool_allocator
+        if allocator is None or allocator.use_symmetric_memory:
+            # Symmetric-memory allocations must have the same sizes and order on
+            # every rank. Empty optimizer shards make that untrue for this local
+            # cast workspace, so retain the ordinary allocator in that mode.
+            for parameter, original_grad, _local_grad in grads_to_cast:
+                parameter.grad = None
+                parameter.grad_dtype = parameter.data.dtype
+                parameter.grad = original_grad.to(dtype=parameter.data.dtype)
+                self._casted_grads.append((parameter, original_grad))
+            return
+
+        groups: dict[
+            tuple[torch.device, torch.dtype],
+            list[tuple[torch.nn.Parameter, torch.Tensor, torch.Tensor]],
+        ] = {}
+        for parameter, original_grad, local_grad in grads_to_cast:
+            group_key = (local_grad.device, parameter.data.dtype)
+            groups.setdefault(group_key, []).append((parameter, original_grad, local_grad))
+
+        try:
+            for (device, dtype), entries in groups.items():
+                element_size = torch.empty((), dtype=dtype).element_size()
+                alignment = max(1, _GRAD_CAST_ALIGNMENT_BYTES // element_size)
+                offsets = []
+                total_numel = 0
+                for _parameter, _original_grad, local_grad in entries:
+                    total_numel = ((total_numel + alignment - 1) // alignment) * alignment
+                    offsets.append(total_numel)
+                    total_numel += local_grad.numel()
+
+                allocation_key = (id(self), "optimizer_grad_cast", device, dtype)
+                local_buffer = allocator.allocate(
+                    allocation_key,
+                    total_numel,
+                    dtype,
+                    device,
+                    arena=_OPTIMIZER_GRAD_CAST_ARENA,
+                )
+                self._grad_cast_pool_keys.append(allocation_key)
+
+                for (parameter, original_grad, local_grad), offset in zip(entries, offsets):
+                    casted_local_grad = local_buffer.narrow(
+                        0, offset, local_grad.numel()
+                    ).view(local_grad.shape)
+                    casted_local_grad.copy_(local_grad)
+                    if isinstance(original_grad, DTensor):
+                        casted_grad = DTensor.from_local(
+                            local_tensor=casted_local_grad,
+                            device_mesh=original_grad.device_mesh,
+                            placements=original_grad.placements,
+                            run_check=False,
+                            shape=original_grad.shape,
+                            stride=casted_local_grad.stride(),
+                        )
+                    else:
+                        casted_grad = casted_local_grad
+
+                    parameter.grad = None
+                    parameter.grad_dtype = parameter.data.dtype
+                    parameter.grad = casted_grad
+                    self._casted_grads.append((parameter, original_grad))
+        except Exception:
+            self._restore_model_grads()
+            raise
+
+    def _restore_model_grads(self) -> None:
+        """Restore original gradient views and release pooled cast storage."""
         for parameter, original_grad in self._casted_grads:
             parameter.grad = None
             parameter.grad_dtype = original_grad.dtype
             parameter.grad = original_grad
         self._casted_grads.clear()
-        return success
+
+        allocator = self.context.trace_pool_allocator
+        if allocator is not None:
+            for allocation_key in self._grad_cast_pool_keys:
+                allocator.free(allocation_key)
+        self._grad_cast_pool_keys.clear()
+
+    @torch.no_grad()
+    def step_with_ready_grads(self) -> bool:
+        """Step the optimizer and restore MFSDP gradient dtypes."""
+        try:
+            return super().step_with_ready_grads()
+        finally:
+            self._restore_model_grads()
 
     def _copy_main_params_to_model_params(self) -> None:
         """Refresh MFSDP V2 compute weights after updating optimizer weights."""
