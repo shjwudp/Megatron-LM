@@ -3167,7 +3167,8 @@ def _add_distributed_args(parser):
                        "descendant with @ to name a combined-schedule node.")
     group.add_argument('--fsdp-prefetch-depth', type=int, default=1,
                        help="Select the Nth future traced UNSHARD occurrence for MFSDP v2 "
-                       "prefetch. One preserves immediate-successor behavior; larger values "
+                       "prefetch. Without an after rule, launch it immediately at the source "
+                       "UNSHARD. One preserves immediate-successor behavior; larger values "
                        "trade full-parameter residency for more prefetch lead time.")
     group.add_argument('--fsdp-reduce-scatter-release-on-pre-backward', action='append', default=[],
                        help="Release one pending MFSDP v2 reduce-scatter at a configured "

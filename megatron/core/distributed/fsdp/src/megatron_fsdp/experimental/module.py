@@ -597,9 +597,10 @@ class FsdpModule:
         if not is_new_occurrence:
             return
         prefetch_depth = scheduler.config.prefetch_depth if scheduler is not None else 1
-        prefetch = runner.suggest_prefetch(self, orientation, depth=prefetch_depth)
+        prefetch = runner.suggest_prefetch_plan(self, orientation, depth=prefetch_depth)
         if prefetch is not None:
-            next_module, next_orientation = prefetch
+            next_module = prefetch.module
+            next_orientation = prefetch.orientation
             if scheduler is None:
                 source_name = self.name if self.name else "<root>"
                 source_phase = "forward" if orientation == "rowwise" else "backward"
@@ -610,7 +611,13 @@ class FsdpModule:
                     source_phase=source_phase,
                 )
             else:
-                scheduler.schedule_prefetch(self, orientation, next_module, next_orientation)
+                scheduler.schedule_prefetch(
+                    self,
+                    orientation,
+                    next_module,
+                    next_orientation,
+                    target_reshard_index=prefetch.release_after_reshard_index,
+                )
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
@@ -635,9 +642,15 @@ class FsdpModule:
             record_execution: Record the reshard in the execution runner. Internal
                 initialization cleanup passes False because it is not a training event.
         """
+        reshard_index = None
         if record_execution:
-            self.context.runner.record_reshard(self)
+            reshard_index = self.context.runner.record_reshard(self)
             if self.context.runner.suggest_skip_reshard(self):
+                return
+            scheduler = self.context.communication_scheduler
+            if scheduler is not None and scheduler.retain_prefetches_across_reshard(
+                self, reshard_index
+            ):
                 return
         for group in self._parameter_groups:
             group.reshard_parameters()
@@ -650,6 +663,9 @@ class FsdpModule:
             for group in self._parameter_groups:
                 group.release_unsharded_storage()
             self._unshard_event = None
+        scheduler = self.context.communication_scheduler
+        if scheduler is not None:
+            scheduler.record_target_reshard(self, reshard_index)
 
     def pre_backward(self, register_final_callback: bool = True) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order.
