@@ -2310,7 +2310,10 @@ def wrap_model_chunks_with_ddp(
     ) and len(model_chunks) > 1
     fsdp_context_cm = (
         fully_shard_context(
-            use_trace_replay=config.overlap_moe_expert_parallel_comm,
+            use_trace_replay=(
+                config.overlap_moe_expert_parallel_comm
+                and ddp_config.megatron_fsdp_trace_replay
+            ),
             use_symmetric_memory=ddp_config.nccl_ub,
             enable_trace_pool=ddp_config.fsdp_trace_pool,
         )
