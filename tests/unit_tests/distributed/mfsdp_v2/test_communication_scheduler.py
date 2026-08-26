@@ -470,6 +470,49 @@ def test_module_prefetches_configured_future_occurrence(distributed_setup, monke
     assert not scheduler.has_pending_prefetches
 
 
+def test_duplicate_consume_skips_the_communication_path(distributed_setup, monkeypatch) -> None:
+    """Only the first fine-grained descendant hook should process an occurrence."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    module = nn.Linear(4, 4, bias=False).to(device)
+    with fully_shard_context(
+        device=device,
+        communication_scheduler=FsdpCommunicationSchedulerConfig(0),
+    ) as context:
+        fully_shard(module, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    calls = []
+
+    class _FakeComputeStream:
+        def wait_event(self, event) -> None:
+            calls.append(("wait", event))
+
+    event = object()
+    module._unshard_event = event
+    monkeypatch.setattr(
+        context.communication_scheduler,
+        "demand_unshard",
+        lambda target, orientation: calls.append(("demand", target, orientation)),
+    )
+    monkeypatch.setattr(
+        module,
+        "_unshard_parameter_groups",
+        lambda orientation, *, reason: calls.append(("unshard", orientation, reason)),
+    )
+    monkeypatch.setattr(context, "current_stream", lambda: _FakeComputeStream())
+
+    module._unshard_and_prefetch("rowwise")
+    first_calls = list(calls)
+    module._unshard_and_prefetch("rowwise")
+
+    assert first_calls == [
+        ("demand", module, "rowwise"),
+        ("unshard", "rowwise", "consumer"),
+        ("wait", event),
+    ]
+    assert calls == first_calls
+
+
 def test_deep_prefetch_retains_intervening_target_occurrence(
     distributed_setup, monkeypatch
 ) -> None:

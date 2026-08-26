@@ -585,6 +585,16 @@ class FsdpModule:
         occurrence order and the scheduler's configured prefetch depth.
         Fine-grained hooks and eager module hooks share this path.
         """
+        runner = self.context.runner
+        is_new_occurrence = runner.record_unshard(self, orientation)
+        if not is_new_occurrence:
+            # Fine-grained execution registers this hook on every descendant,
+            # but only the first descendant entered in one module occurrence
+            # consumes parameters. Avoid repeating scheduler lookup, unshard
+            # checks, compute-stream waits, and successor planning for the
+            # remaining descendants.
+            return
+
         scheduler = self.context.communication_scheduler
         if scheduler is not None:
             scheduler.demand_unshard(self, orientation)
@@ -592,10 +602,6 @@ class FsdpModule:
         if self._unshard_event is not None:
             self.context.current_stream().wait_event(self._unshard_event)
 
-        runner = self.context.runner
-        is_new_occurrence = runner.record_unshard(self, orientation)
-        if not is_new_occurrence:
-            return
         prefetch_depth = scheduler.config.prefetch_depth if scheduler is not None else 1
         prefetch = runner.suggest_prefetch_plan(self, orientation, depth=prefetch_depth)
         if prefetch is not None:
