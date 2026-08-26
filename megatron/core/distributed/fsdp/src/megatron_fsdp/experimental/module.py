@@ -15,6 +15,7 @@
 """Module mixin for the minimal Megatron-FSDP path."""
 
 import enum
+import logging
 import os
 import weakref
 from collections.abc import Callable
@@ -40,6 +41,8 @@ from .execution_runner import FsdpExecutionRunner
 from .indexed_order import IndexedOrder
 from .parameter_group import Fp8ParameterGroup, FsdpParameterGroup, get_containing_parameter_group
 from .placement import Placements
+
+logger = logging.getLogger(__name__)
 
 
 def _is_in_backward() -> bool:
