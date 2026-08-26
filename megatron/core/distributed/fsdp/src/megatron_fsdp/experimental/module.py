@@ -129,6 +129,30 @@ class FsdpContext:
             self.reduce_scatter_stream = self.allgather_stream
         else:
             self.reduce_scatter_stream = torch.cuda.Stream(device)
+        if os.environ.get("MFSDP_TRAINING_MEMORY_TRACE_START_EARLY") == "1":
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else int(os.environ.get("RANK", "0"))
+            )
+            trace_ranks = {
+                int(value)
+                for value in os.environ.get(
+                    "MFSDP_TRAINING_MEMORY_TRACE_RANKS", "0"
+                ).split(",")
+                if value.strip()
+            }
+            if rank in trace_ranks:
+                logger.warning(
+                    "MFSDP allocator stream role=allgather rank=%s cuda_stream=%s",
+                    rank,
+                    self.allgather_stream.cuda_stream,
+                )
+                logger.warning(
+                    "MFSDP allocator stream role=reduce_scatter rank=%s cuda_stream=%s",
+                    rank,
+                    self.reduce_scatter_stream.cuda_stream,
+                )
 
     def register_module(self, module: "FsdpModule") -> None:
         """Register a module constructed in this context."""

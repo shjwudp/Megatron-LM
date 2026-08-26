@@ -4549,6 +4549,9 @@ def train(
     memory_trace_selected = (
         memory_trace_output_dir is not None and memory_trace_rank in memory_trace_ranks
     )
+    memory_trace_started_early = (
+        os.environ.get("MFSDP_TRAINING_MEMORY_TRACE_START_EARLY") == "1"
+    )
     memory_trace_start_iteration = int(
         os.environ.get("MFSDP_TRAINING_MEMORY_TRACE_START_ITERATION", "0")
     )
@@ -4570,7 +4573,11 @@ def train(
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
-        if memory_trace_selected and iteration == memory_trace_start_iteration:
+        if (
+            memory_trace_selected
+            and iteration == memory_trace_start_iteration
+            and not memory_trace_started_early
+        ):
             Path(memory_trace_output_dir).mkdir(parents=True, exist_ok=True)
             max_entries = int(
                 os.environ.get("MFSDP_TRAINING_MEMORY_TRACE_MAX_ENTRIES", "500000")

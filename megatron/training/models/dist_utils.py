@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Callable
 
@@ -349,6 +350,21 @@ def _ddp_wrap(
         # Preserve a dedicated initialization stream for all other implementations.
         ddp_stream = torch.cuda.Stream()
     ddp_stream.wait_stream(torch.cuda.current_stream())
+    if os.environ.get("MFSDP_TRAINING_MEMORY_TRACE_START_EARLY") == "1":
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        trace_ranks = {
+            int(value)
+            for value in os.environ.get(
+                "MFSDP_TRAINING_MEMORY_TRACE_RANKS", "0"
+            ).split(",")
+            if value.strip()
+        }
+        if rank in trace_ranks:
+            logger.warning(
+                "MFSDP allocator stream role=ddp_initialization rank=%s cuda_stream=%s",
+                rank,
+                ddp_stream.cuda_stream,
+            )
 
     with torch.cuda.stream(ddp_stream):
         dp_init_kwargs = {}

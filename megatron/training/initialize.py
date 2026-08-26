@@ -290,6 +290,47 @@ def _initialize_distributed(
         if device_count > 0:
             torch.cuda.set_device(args.local_rank)
             device_id = torch.device(f'cuda:{args.local_rank}')
+
+            # Start the opt-in allocator history immediately after device
+            # selection. The normal training-window capture starts only after
+            # model/optimizer construction, which turns initialization-stream
+            # allocations into stackless live-ins and prevents attribution.
+            if os.environ.get("MFSDP_TRAINING_MEMORY_TRACE_START_EARLY") == "1":
+                trace_output_dir = os.environ.get("MFSDP_TRAINING_MEMORY_TRACE_DIR")
+                trace_ranks = {
+                    int(value)
+                    for value in os.environ.get(
+                        "MFSDP_TRAINING_MEMORY_TRACE_RANKS", "0"
+                    ).split(",")
+                    if value.strip()
+                }
+                if trace_output_dir is not None and args.rank in trace_ranks:
+                    os.makedirs(trace_output_dir, exist_ok=True)
+                    max_entries = int(
+                        os.environ.get(
+                            "MFSDP_TRAINING_MEMORY_TRACE_MAX_ENTRIES", "2000000"
+                        )
+                    )
+                    try:
+                        torch.cuda.memory._record_memory_history(
+                            enabled="all",
+                            context="alloc",
+                            stacks="python",
+                            max_entries=max_entries,
+                        )
+                    except TypeError:
+                        torch.cuda.memory._record_memory_history(
+                            True,
+                            trace_alloc_max_entries=max_entries,
+                            trace_alloc_record_context=True,
+                        )
+                    logger.warning(
+                        "MFSDP allocator history started before distributed/model "
+                        "initialization: rank=%s default_cuda_stream=%s max_entries=%s",
+                        args.rank,
+                        torch.cuda.default_stream(device_id).cuda_stream,
+                        max_entries,
+                    )
         else:
             device_id = None
 
