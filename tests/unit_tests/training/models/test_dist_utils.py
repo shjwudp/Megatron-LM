@@ -320,6 +320,10 @@ class TestDdpWrap:
         self.ddp_config.bucket_size = 40000000
         self.ddp_config.overlap_grad_reduce = True
         self.ddp_config.use_distributed_optimizer = False
+        self.ddp_config.fsdp_prefetch_successor_after = ()
+        self.ddp_config.fsdp_reduce_scatter_release_on_pre_backward = ()
+        self.ddp_config.fsdp_max_pending_reduce_scatter_bytes = None
+        self.ddp_config.fsdp_prefetch_depth = 1
         self.model = [_make_model_module(), _make_model_module()]
 
     @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
@@ -618,6 +622,10 @@ class TestDdpWrapBucketSize:
         cfg.bucket_size = None
         cfg.overlap_grad_reduce = True
         cfg.use_distributed_optimizer = False
+        cfg.fsdp_prefetch_successor_after = ()
+        cfg.fsdp_reduce_scatter_release_on_pre_backward = ()
+        cfg.fsdp_max_pending_reduce_scatter_bytes = None
+        cfg.fsdp_prefetch_depth = 1
         for k, v in overrides.items():
             setattr(cfg, k, v)
         return cfg
@@ -711,6 +719,10 @@ class TestDdpWrapFullParamLayout:
         cfg.bucket_size = 8_000
         cfg.overlap_grad_reduce = True
         cfg.use_distributed_optimizer = True
+        cfg.fsdp_prefetch_successor_after = ()
+        cfg.fsdp_reduce_scatter_release_on_pre_backward = ()
+        cfg.fsdp_max_pending_reduce_scatter_bytes = None
+        cfg.fsdp_prefetch_depth = 1
         for k, v in overrides.items():
             setattr(cfg, k, v)
         return cfg
