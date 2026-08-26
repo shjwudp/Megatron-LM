@@ -16,6 +16,7 @@ from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
+    FsdpCommunicationSchedulerConfig,
     Partial,
     Placements,
     Replicate,
@@ -302,6 +303,68 @@ def test_fully_shard_sgd_losses_match_baseline(
         torch.stack(baseline_losses),
         msg="Sharded losses did not match baseline losses.",
     )
+
+
+def test_multiple_gradient_groups_pack_before_reduce_scatter(distributed_setup, monkeypatch):
+    """One group's RS must not precede another group's staging-buffer allocation."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = nn.Linear(8, 4).to(device)
+    assert model.bias is not None
+    # Pipeline-shared parameters receive an independent DBuffer so their shard
+    # boundary cannot depend on unrelated parameters. Use that production case
+    # to exercise two ordinary parameter groups in one FSDP unit.
+    model.bias.shared_embedding = True
+    with fully_shard_context(
+        device=device,
+        communication_scheduler=FsdpCommunicationSchedulerConfig(
+            max_pending_reduce_scatter_bytes=0
+        ),
+    ):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    groups = model.parameter_groups
+    assert len(groups) == 2
+    calls = []
+
+    def record(kind, group_index, operation):
+        def wrapped(*args, **kwargs):
+            calls.append((kind, group_index))
+            return operation(*args, **kwargs)
+
+        return wrapped
+
+    for group_index, group in enumerate(groups):
+        monkeypatch.setattr(
+            group,
+            "allocate_partial_grad_buffer",
+            record("allocate", group_index, group.allocate_partial_grad_buffer),
+        )
+        monkeypatch.setattr(
+            group,
+            "copy_gradients_to_partial_buffer",
+            record("copy", group_index, group.copy_gradients_to_partial_buffer),
+        )
+        monkeypatch.setattr(
+            group,
+            "reduce_partial_gradients",
+            record("reduce_scatter", group_index, group.reduce_partial_gradients),
+        )
+
+    model(torch.randn(3, 8, device=device)).sum().backward()
+
+    assert calls == [
+        ("allocate", 0),
+        ("allocate", 1),
+        ("copy", 0),
+        ("copy", 1),
+        ("reduce_scatter", 0),
+        ("reduce_scatter", 1),
+    ]
 
 
 @pytest.mark.parametrize("mixed_wgrad", [False, True], ids=["fused_only", "fused_and_ordinary"])
