@@ -379,6 +379,49 @@ class TestDdpWrap:
         mock_ddp.assert_not_called()
         mock_torch_fsdp.assert_not_called()
 
+    @patch("megatron.training.models.dist_utils.fully_shard_context")
+    @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_vpp_depth_only_scheduler_configures_shared_fsdp_context(
+        self,
+        mock_stream,
+        mock_curr,
+        mock_ctx,
+        mock_cfg,
+        mock_fsdp,
+        mock_fully_shard_context,
+    ):
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        mock_fully_shard_context.return_value.__enter__ = Mock(return_value=None)
+        mock_fully_shard_context.return_value.__exit__ = Mock(return_value=False)
+        mock_cfg.return_value.cuda_graph_impl = "none"
+        mock_cfg.return_value.overlap_moe_expert_parallel_comm = True
+        self.ddp_config.megatron_fsdp_version = 2
+        self.ddp_config.fsdp_prefetch_depth = 3
+        self.ddp_config.fsdp_prefetch_successor_after = ()
+        self.ddp_config.fsdp_reduce_scatter_release_on_pre_backward = ()
+        self.ddp_config.fsdp_max_pending_reduce_scatter_bytes = None
+        self.ddp_config.nccl_ub = False
+        self.ddp_config.fsdp_trace_pool = True
+
+        _ddp_wrap(
+            self.model,
+            False,
+            self.ddp_config,
+            False,
+            use_megatron_fsdp=True,
+            pg_collection=self.pg,
+        )
+
+        scheduler = mock_fully_shard_context.call_args.kwargs["communication_scheduler"]
+        assert scheduler.prefetch_depth == 3
+        assert scheduler.max_pending_reduce_scatter_bytes is None
+        assert mock_fsdp.call_count == 2
+
     @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
     @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
