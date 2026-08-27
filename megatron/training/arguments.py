@@ -3170,13 +3170,27 @@ def _add_distributed_args(parser):
                        "prefetch. Without an after rule, launch it immediately at the source "
                        "UNSHARD. One preserves immediate-successor behavior; larger values "
                        "trade full-parameter residency for more prefetch lead time.")
+    group.add_argument('--fsdp-max-prefetch-resident-bytes', type=int, default=None,
+                       help="Maximum bytes held by future MFSDP v2 parameter materializations. "
+                       "Zero infers a one-materialization budget from the execution trace; "
+                       "a positive value is an explicit override. By default residency is "
+                       "unbounded.")
     group.add_argument('--fsdp-reduce-scatter-release-on-pre-backward', action='append', default=[],
                        help="Release one pending MFSDP v2 reduce-scatter at a configured "
                        "pre-backward point. Repeat SOURCE_GLOB:DESCENDANT_GLOB rules; prefix "
                        "the descendant with @ to name a combined-schedule node.")
+    group.add_argument('--fsdp-conflict-free-on-pre-backward', action='append', default=[],
+                       help="Use a configured MFSDP v2 pre-backward point for both successor "
+                       "all-gather admission and a complete drain of ready deferred "
+                       "reduce-scatters. Repeat SOURCE_GLOB:DESCENDANT_GLOB rules; prefix "
+                       "the descendant with @ to name a combined-schedule node.")
     group.add_argument('--fsdp-max-pending-reduce-scatter-bytes', type=int, default=None,
                        help="Maximum bytes held by deferred MFSDP v2 reduce-scatter requests. "
                        "By default the limit is inferred; zero keeps reduce-scatter eager.")
+    group.add_argument('--fsdp-reduce-scatter-release-on-prefetch', action='store_true',
+                       help="Use each actual MFSDP v2 parameter-prefetch all-gather as one "
+                       "additional reduce-scatter release opportunity. The reduce-scatter "
+                       "remains asynchronous and at most one ready request is released.")
     group.add_argument('--suggested-communication-unit-size', type=int, default=None,
                    help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '

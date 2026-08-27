@@ -154,8 +154,8 @@ class FsdpModuleCommunicationPolicy:
     # descendant completion anchors.
     prefetch_successor_after: tuple[ModuleCompletion | NamedCompletion, ...] = ()
 
-    # A pre-backward occurrence of one of these descendants may release an
-    # RS request from the context-wide pending queue.
+    # A pre-backward occurrence of one of these descendants may release the
+    # trace-bounded FIFO work assigned to that exact occurrence.
     reduce_scatter_release_on_pre_backward: tuple[nn.Module | NamedPreBackward, ...] = ()
 
 
@@ -168,6 +168,10 @@ class FsdpCommunicationSchedulerConfig:
     # One selects the immediate successor. N selects the Nth future traced
     # UNSHARD occurrence and trades additional parameter residency for lead.
     prefetch_depth: int = 1
+
+    # None: unbounded prefetch residency. Zero: infer a one-materialization
+    # byte budget. Positive: explicit resident-byte override.
+    max_prefetch_resident_bytes: int | None = None
 ```
 
 The configuration is passed once to the shared context, and annotations are
@@ -229,6 +233,15 @@ replace scheduler state.
   the launch point. It therefore creates more lead at the cost of more
   simultaneously resident full parameters within the batch. Depth must be
   positive and cannot exceed the number of traced `UNSHARD` occurrences.
+- `max_prefetch_resident_bytes=None` preserves the existing unbounded
+  depth-prefetch behavior. `0` infers the largest single full-parameter
+  materialization in the trace and uses that as the replay budget. A positive
+  value is an explicit override. This decouples occurrence lookahead from the
+  number of future parameter buffers that may remain live.
+- Resident-byte admission uses the target `UNSHARD` trace index as its deadline.
+  Among source-ready requests, the earliest deadline reserves capacity first.
+  A later-deadline target that is already materialized may therefore reshard
+  normally, remain queued, and re-gather when an earlier target reaches demand.
 - If the selected target has an earlier consume/reshard of the same FSDP unit
   between source and target, that physical reshard becomes a lifetime gate.
   The scheduler retains the parameters materialized for the earlier occurrence
@@ -245,8 +258,9 @@ replace scheduler state.
   expose successive backward completion points and use the earliest one that
   remains ahead of a dynamically interleaved source occurrence.
 - `reduce_scatter_release_on_pre_backward` marks release modules; it does not
-  identify which unit's RS to launch. The compiled occurrence trace assigns
-  the oldest legal pending RS request to each release occurrence.
+  identify which units' RS to launch. During trace, each exact release
+  occurrence records a per-collective-domain byte credit for all ready FIFO
+  work seen at that point. Replay may release no more than that credit.
 - An empty module policy preserves eager behavior.
 - `max_pending_reduce_scatter_bytes=None` is the normal user experience and
   requests automatic inference. `0` disables RS deferral without disabling
@@ -274,6 +288,9 @@ The experimental MCore CLI surface is:
 ```text
 --fsdp-prefetch-successor-after SOURCE_GLOB:PHASE:DESCENDANT_GLOB
 --fsdp-prefetch-depth N
+--fsdp-max-prefetch-resident-bytes:
+  None for unbounded residency, 0 for an automatic one-materialization
+  budget, or a positive byte override
 --fsdp-reduce-scatter-release-on-pre-backward SOURCE_GLOB:DESCENDANT_GLOB
 --fsdp-max-pending-reduce-scatter-bytes:
   None for auto, 0 for eager RS, or a positive byte override
@@ -325,7 +342,9 @@ RS_RELEASE(owner, anchor)
 RS reserve/readiness/flush operations are recorded by a context-local budget
 simulator rather than inserted into the runner's successor trace. The
 simulator retains request size and collective-domain metadata needed to infer
-the replay budget.
+the replay budget. Each `RS_RELEASE` trace index also retains the exact
+per-domain byte credit drained there; this distinguishes repeated VPP
+occurrences of the same release module.
 
 CUDA events are runtime objects and are not stored as part of the reusable
 trace identity. During replay, the matching hook records a fresh event on the
@@ -408,6 +427,44 @@ the protected EP communication and increase `prefetch_depth` only far enough
 to hide AG behind subsequent compute. Nsight validation remains necessary
 because stream ordering alone cannot provide bandwidth quality-of-service.
 
+### Bounded prefetch residency
+
+Large `prefetch_depth` is useful for moving short FSDP gathers away from EP
+transport and giving them enough compute lead, but depth alone also keeps every
+selected target materialized. The residency budget separates those concerns:
+
+```text
+trace lookahead = N occurrences
+resident future bytes <= configured/inferred budget
+```
+
+Every queued request records its target `UNSHARD` index and exact temporary
+materialization size. Replay admits source-ready requests in earliest-deadline
+order. A request with an intervening target reshard participates in deadline
+selection before that reshard occurs; this lets the scheduler reserve capacity
+for a near demand instead of filling the budget with a farther target.
+
+At a target reshard:
+
+1. If that target owns the earliest source-ready deadline and fits the budget,
+   retain its existing materialization and charge its bytes.
+2. Otherwise, physically reshard it, clear its lifetime gate, and leave the
+   request queued.
+3. When a resident target reaches demand, remove its future-residency charge
+   and immediately admit the next earliest ready request that fits.
+
+Demand remains the correctness deadline. If no admitted prefetch completed in
+time, the consumer launches its own AG. The policy is deterministic from the
+compiled trace and frozen byte budget; it does not use replay-time free-memory
+measurements or timing-dependent per-rank decisions.
+
+The automatic budget is the largest single traced materialization rather than
+the sum of `prefetch_depth` targets. Smaller targets may share that byte budget,
+so "one materialization" describes the memory ceiling, not a strict request
+count. Exact per-group sizes include both row-wise and column-wise MXFP8
+payloads and exclude parameter groups whose compute weights are already
+replicated.
+
 ## Deferred reduce-scatter
 
 ### Request state machine
@@ -441,16 +498,27 @@ the following ordering:
 1. Ensure the release module's demand AG has been submitted.
 2. Make the RS stream wait for that demand-AG completion event when both use
    contending resources.
-3. Submit the FIFO RS request assigned to this release occurrence.
+3. Submit the FIFO RS requests covered by this exact occurrence's traced byte
+   credit.
 4. Let the release module's backward compute overlap the RS.
 5. Keep successor AG governed by its independent completion-anchor policy.
 
-A release hook does not drain the queue. It submits at most one ready,
-deferred request: the oldest request that is also the FIFO head of its
-collective domain. A release reached before any request is ready is a no-op;
-capacity enforcement or the final flush will submit the request later. This
-keeps the hint advisory and avoids extending a burst across several protected
-communication phases.
+The initial trace virtually drains every ready FIFO head at a release
+occurrence, independently for each collective domain. It records the number
+of drained bytes per domain as that exact runner trace index's release credit.
+Replay repeatedly submits a ready domain head only while the request fits the
+remaining credit. It cannot borrow credit from a later occurrence, and an
+unready head prevents later requests in that domain from overtaking it.
+
+This interval-credit rule fixes a production/service mismatch in modules with
+multiple parameter groups. For example, one layer occurrence may make expert,
+dense-group-0, and dense-group-1 gradients ready before one semantic release
+point. Releasing only one request per point would accumulate two requests per
+layer until capacity, same-group reuse, or the final flush forced them onto the
+critical path. The traced credit services the complete observed interval while
+still bounding each replay burst to trace-observed work. A release reached
+before any request is ready remains a no-op; capacity enforcement or the final
+flush submits it later.
 
 The implementation keeps global creation order for diagnostics and a
 separate byte budget/FIFO constraint per `DeviceMesh` domain. Disjoint
@@ -476,7 +544,12 @@ global-batch trace/planning boundary.
 
 Users should not need to calculate a byte value. During the first immediate-RS
 trace, the scheduler records exact request sizes and simulates the configured
-release policy.
+release policy. At each release occurrence, the simulator drains all ready
+domain heads and records both the per-occurrence byte credit and the remaining
+pending footprint. Consequently, `required_peak` describes the largest
+between-anchor production interval (plus any work blocked behind an unready
+domain head), rather than a backlog caused by releasing only one request per
+anchor.
 
 The inferred budget is:
 
@@ -622,8 +695,9 @@ At trace compilation the runner logs trace length and replay state, while the
 RS scheduler logs required peak, inferred/overridden context limit, observed
 free/total device bytes, and effective budget per domain. Periodic scheduler
 reports include delayed AG count, anchor and demand releases, pending AGs,
-RS anchor/capacity/final releases, and current pending RS bytes. Selector
-resolution logs each matched FSDP unit and anchor.
+RS anchor/capacity/final releases, current pending and in-flight RS bytes, and
+peak pending/in-flight/combined active RS bytes. Selector resolution logs each
+matched FSDP unit and anchor.
 
 The scheduler emits one `MFSDP AG queued` marker for each delayed request and
 launch-scoped NVTX ranges around every parameter-group collective submission.
@@ -650,11 +724,14 @@ marker distinguishes a late consumer AG caused by a lost scheduler request
 from an anchor that was never observed.
 
 RS labels similarly use `target` and `trigger` and include the request
-sequence and byte count. Keeping the CUDA launch API inside the launch range
-is required for Nsight to associate a later asynchronous kernel or
-symmetric-memory memcpy payload with the scheduling decision that submitted
-it; an instantaneous marker after submission is not sufficient, especially
-when autograd runs the hook on a worker thread.
+sequence, byte count, and pending/in-flight byte counts immediately before and
+after submission. Instantaneous `MFSDP RS state=reserve`, `state=ready`, and
+`MFSDP RS retire` markers expose the logical lifetime separately from the CUDA
+launch. Keeping the CUDA launch API inside the launch range is required for
+Nsight to associate a later asynchronous kernel or symmetric-memory memcpy
+payload with the scheduling decision that submitted it; an instantaneous
+marker after submission is not sufficient, especially when autograd runs the
+hook on a worker thread.
 
 ## Validation plan
 
@@ -667,8 +744,8 @@ The initial implementation adds tests under
 2. future and already-satisfied completion-anchor release, demand fallback,
    exact isolation across repeated VPP occurrences and optimizer boundaries,
    and depth-based future target selection;
-3. deferred RS release, automatic budget compilation, and captured
-   `is_last_microbatch`;
+3. trace-bounded multi-request RS release, automatic interval-budget
+   compilation, and captured `is_last_microbatch`;
 4. multi-step loss parity against eager execution;
 5. MCore module/named-selector translation.
 

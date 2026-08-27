@@ -560,9 +560,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         return self.module.context
 
     @staticmethod
-    def _configure_te_grouped_mlp_wgrad_fusion(
-        module: torch.nn.Module, enabled: bool
-    ) -> None:
+    def _configure_te_grouped_mlp_wgrad_fusion(module: torch.nn.Module, enabled: bool) -> None:
         """Restrict fused wgrad accumulation to routed TE grouped experts.
 
         ``gradient_accumulation_fusion`` is consumed while the model is built, so
@@ -664,13 +662,20 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """Build the low-level scheduler config when at least one rule is enabled."""
         if not (
             ddp_config.fsdp_prefetch_depth != 1
+            or ddp_config.fsdp_max_prefetch_resident_bytes is not None
             or ddp_config.fsdp_prefetch_successor_after
             or ddp_config.fsdp_reduce_scatter_release_on_pre_backward
+            or ddp_config.fsdp_conflict_free_on_pre_backward
+            or ddp_config.fsdp_reduce_scatter_release_on_prefetch
         ):
             return None
         return FsdpCommunicationSchedulerConfig(
             max_pending_reduce_scatter_bytes=ddp_config.fsdp_max_pending_reduce_scatter_bytes,
             prefetch_depth=ddp_config.fsdp_prefetch_depth,
+            max_prefetch_resident_bytes=ddp_config.fsdp_max_prefetch_resident_bytes,
+            reduce_scatter_release_on_prefetch=(
+                ddp_config.fsdp_reduce_scatter_release_on_prefetch
+            ),
         )
 
     @staticmethod
@@ -699,10 +704,22 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             release_rules.append((text, parts[0], parts[1]))
 
+        conflict_free_rules = []
+        for text in ddp_config.fsdp_conflict_free_on_pre_backward:
+            parts = text.split(":", 1)
+            if len(parts) != 2:
+                raise ValueError(
+                    "MFSDP conflict-free rules must use "
+                    f"SOURCE_GLOB:DESCENDANT_GLOB, got {text!r}."
+                )
+            conflict_free_rules.append((text, parts[0], parts[1]))
+
         completions_by_source: dict[nn.Module, list[ModuleCompletion | NamedCompletion]] = {}
         releases_by_source: dict[nn.Module, list[nn.Module | NamedPreBackward]] = {}
+        conflict_free_by_source: dict[nn.Module, list[nn.Module | NamedPreBackward]] = {}
         matched_prefetch_rules: set[str] = set()
         matched_release_rules: set[str] = set()
+        matched_conflict_free_rules: set[str] = set()
 
         for source_fqn, source in candidates:
             display_fqn = source_fqn or "<root>"
@@ -777,25 +794,72 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         anchor_fqn,
                     )
 
+            for text, source_glob, anchor_selector in conflict_free_rules:
+                if not fnmatchcase(display_fqn, source_glob):
+                    continue
+                matched_conflict_free_rules.add(text)
+                if anchor_selector.startswith("@"):
+                    conflict_free_by_source.setdefault(source, []).append(
+                        NamedPreBackward(anchor_selector[1:])
+                    )
+                    logger.info(
+                        "MFSDP conflict-free rule %r matched %s -> named node %s.",
+                        text,
+                        display_fqn,
+                        anchor_selector,
+                    )
+                    continue
+
+                anchor_matches = [
+                    (relative_fqn or "<self>", anchor)
+                    for relative_fqn, anchor in source.named_modules()
+                    if fnmatchcase(relative_fqn or "<self>", anchor_selector)
+                ]
+                if not anchor_matches:
+                    raise ValueError(
+                        f"MFSDP conflict-free rule {text!r} matched source "
+                        f"{display_fqn!r} but no descendant safe-point module."
+                    )
+                for anchor_fqn, anchor in anchor_matches:
+                    conflict_free_by_source.setdefault(source, []).append(anchor)
+                    logger.info(
+                        "MFSDP conflict-free rule %r matched %s -> %s.",
+                        text,
+                        display_fqn,
+                        anchor_fqn,
+                    )
+
         unmatched_prefetch = [
             text for text, *_rest in prefetch_rules if text not in matched_prefetch_rules
         ]
         unmatched_release = [
             text for text, *_rest in release_rules if text not in matched_release_rules
         ]
-        if unmatched_prefetch or unmatched_release:
+        unmatched_conflict_free = [
+            text
+            for text, *_rest in conflict_free_rules
+            if text not in matched_conflict_free_rules
+        ]
+        if unmatched_prefetch or unmatched_release or unmatched_conflict_free:
             raise ValueError(
                 "MFSDP communication rules did not match an FSDP unit: "
-                f"{unmatched_prefetch + unmatched_release!r}."
+                f"{unmatched_prefetch + unmatched_release + unmatched_conflict_free!r}."
             )
 
         return {
             source: FsdpModuleCommunicationPolicy(
                 prefetch_successor_after=tuple(completions_by_source.get(source, ())),
                 reduce_scatter_release_on_pre_backward=tuple(releases_by_source.get(source, ())),
+                conflict_free_on_pre_backward=tuple(
+                    conflict_free_by_source.get(source, ())
+                ),
             )
             for _fqn, source in candidates
-            if source in completions_by_source or source in releases_by_source
+            if (
+                source in completions_by_source
+                or source in releases_by_source
+                or source in conflict_free_by_source
+            )
         }
 
     def __init__(
@@ -971,9 +1035,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                                 and isinstance(submodule.experts, TEGroupedMLP)
                             ),
                             grad_divisor=config.expert_model_parallel_size,
-                            communication_policy=communication_policies.get(
-                                submodule.experts
-                            ),
+                            communication_policy=communication_policies.get(submodule.experts),
                         )
                         self._copy_mcore_attributes_to_sharded_parameters(submodule.experts)
             for _submodule_fqn, submodule in reversed(named_modules):
@@ -1110,12 +1172,17 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         def record_schedule_node_pre_backward(
             module: torch.nn.Module, name: str, event: torch.cuda.Event
         ) -> None:
-            """Release pending RS at a configured named node pre-backward point."""
+            """Record a configured named pre-backward communication point."""
             module = _require_fsdp_module(module)
-            if not any(
+            legacy_release = any(
                 isinstance(anchor, NamedPreBackward) and anchor.name == name
                 for anchor in module.communication_policy.reduce_scatter_release_on_pre_backward
-            ):
+            )
+            conflict_free = any(
+                isinstance(anchor, NamedPreBackward) and anchor.name == name
+                for anchor in module.communication_policy.conflict_free_on_pre_backward
+            )
+            if not legacy_release and not conflict_free:
                 return
             if module.phase is FsdpModule.Phase.RESTING:
                 module.pre_backward(register_final_callback=False)
@@ -1127,7 +1194,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             scheduler = module.context.communication_scheduler
             assert scheduler is not None
-            scheduler.record_reduce_scatter_release(module, name, event)
+            if conflict_free:
+                scheduler.record_conflict_free_point(module, name, event)
+            else:
+                scheduler.record_reduce_scatter_release(module, name, event)
 
         # The 1F1B schedule finds the FSDP wrapper via find_megatron_fsdp(),
         # which may return the bare FsdpModule (no ddp_config). Expose the

@@ -86,6 +86,7 @@ class EventKind(Enum):
     RESHARD = auto()
     COMPLETION = auto()
     RS_RELEASE = auto()
+    CONFLICT_FREE = auto()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -115,6 +116,7 @@ class _PrefetchSuggestion:
     module: "FsdpModule"
     orientation: str
     release_after_reshard_index: int | None = None
+    target_unshard_index: int | None = None
 
 
 class FsdpExecutionRunner:
@@ -177,6 +179,17 @@ class FsdpExecutionRunner:
     def use_trace_replay(self) -> bool:
         """Whether trace-and-replay prefetch is enabled."""
         return self._use_trace_replay
+
+    def max_prefetch_target_nbytes(self) -> int:
+        """Return the largest full-parameter materialization in the trace."""
+        return max(
+            (
+                event.module.unsharded_parameter_nbytes()
+                for event in self._trace
+                if event.kind is EventKind.UNSHARD
+            ),
+            default=0,
+        )
 
     # ------------------------------------------------------------------
     # Interface 1: record execution events (consume, reshard)
@@ -246,11 +259,43 @@ class FsdpExecutionRunner:
             EventKind.COMPLETION, owner, None, anchor=anchor, phase=phase
         )
 
-    def record_reduce_scatter_release(self, owner: "FsdpModule", anchor: "nn.Module | str") -> None:
-        """Record or validate a configured pre-backward RS release occurrence."""
+    def record_reduce_scatter_release(
+        self, owner: "FsdpModule", anchor: "nn.Module | str"
+    ) -> int | None:
+        """Record or validate a configured pre-backward RS release occurrence.
+
+        Returns:
+            The exact trace index for both a newly recorded and a validated
+            occurrence, or ``None`` when trace replay is disabled.
+        """
         if not self._use_trace_replay:
-            return
-        self._validate_and_advance(EventKind.RS_RELEASE, owner, None, anchor=anchor)
+            return None
+        if self._phase is RunnerPhase.TRACING:
+            self._validate_and_advance(EventKind.RS_RELEASE, owner, None, anchor=anchor)
+            return len(self._trace) - 1
+        trace_index = self._validate_and_advance(EventKind.RS_RELEASE, owner, None, anchor=anchor)
+        # A replay mismatch seeds a replacement trace with this occurrence.
+        # Return that seed index so scheduler metadata stays aligned with the
+        # new trace rather than silently dropping its first release point.
+        if trace_index is None and self._phase is RunnerPhase.TRACING:
+            return len(self._trace) - 1
+        return trace_index
+
+    def record_conflict_free_point(
+        self, owner: "FsdpModule", anchor: "nn.Module | str"
+    ) -> int | None:
+        """Record or validate one unified backward communication safe point."""
+        if not self._use_trace_replay:
+            return None
+        if self._phase is RunnerPhase.TRACING:
+            self._validate_and_advance(EventKind.CONFLICT_FREE, owner, None, anchor=anchor)
+            return len(self._trace) - 1
+        trace_index = self._validate_and_advance(
+            EventKind.CONFLICT_FREE, owner, None, anchor=anchor
+        )
+        if trace_index is None and self._phase is RunnerPhase.TRACING:
+            return len(self._trace) - 1
+        return trace_index
 
     # ------------------------------------------------------------------
     # Interface 2: prefetch suggestion
@@ -318,9 +363,7 @@ class FsdpExecutionRunner:
         remaining = depth
         target_index = None
         target_event = None
-        for index, event in enumerate(
-            self._trace[self._replay_index :], start=self._replay_index
-        ):
+        for index, event in enumerate(self._trace[self._replay_index :], start=self._replay_index):
             if event.kind is EventKind.UNSHARD:
                 remaining -= 1
                 if remaining == 0:
@@ -342,6 +385,7 @@ class FsdpExecutionRunner:
                 target_event.module,
                 target_event.orientation,
                 release_after_reshard_index,
+                target_index,
             )
         # Fewer than ``depth`` consumes remain in this global batch. Waiting
         # until the next batch starts keeps the gather after the optimizer
@@ -404,6 +448,42 @@ class FsdpExecutionRunner:
         source_index = self._unshard_index_by_completion.get(completion_index)
         return source_index is not None and completion_index < source_index
 
+    def has_usable_conflict_free_point(
+        self,
+        target_unshard_index: int | None,
+        *,
+        target_reshard_index: int | None = None,
+    ) -> bool:
+        """Return whether replay can safely gate an AG at a conflict-free point.
+
+        A point is usable only when it occurs after the current replay cursor
+        and any physical reshard that must release the target's current
+        materialization, but before the target consume. Requests without such
+        a point retain the normal eager/residency path; in particular, forward
+        warmup must not wait for a backward-only point that has not occurred.
+        """
+        if (
+            not self._use_trace_replay
+            or self._phase is not RunnerPhase.REPLAYING
+            or target_unshard_index is None
+        ):
+            return False
+        if not 0 <= target_unshard_index < len(self._trace):
+            raise ValueError(
+                f"Target unshard index {target_unshard_index} is outside the replay trace."
+            )
+        target_event = self._trace[target_unshard_index]
+        if target_event.kind is not EventKind.UNSHARD:
+            raise ValueError("A conflict-free-point query requires an UNSHARD target event.")
+
+        first_usable_index = self._replay_index
+        if target_reshard_index is not None:
+            first_usable_index = max(first_usable_index, target_reshard_index + 1)
+        return any(
+            event.kind is EventKind.CONFLICT_FREE
+            for event in self._trace[first_usable_index:target_unshard_index]
+        )
+
     # ------------------------------------------------------------------
     # Interface 3: reshard-skip suggestion
     # ------------------------------------------------------------------
@@ -457,8 +537,7 @@ class FsdpExecutionRunner:
             self._phase = RunnerPhase.REPLAYING
             self._compile_completion_occurrences()
             logger.info(
-                "FsdpExecutionRunner: compiled %d-event trace, entering replay.",
-                len(self._trace),
+                "FsdpExecutionRunner: compiled %d-event trace, entering replay.", len(self._trace)
             )
         self._replay_index = 0
         # The batch boundary ends every module's unshard round; without this,
@@ -507,8 +586,7 @@ class FsdpExecutionRunner:
         mode owns all prefetch decisions and intentionally skips this check.
         """
         if getattr(module, "_phase", None) is not None and (
-            module._phase == module.Phase.BACKWARD
-            or torch._C._current_graph_task_id() != -1
+            module._phase == module.Phase.BACKWARD or torch._C._current_graph_task_id() != -1
         ):
             return None
         if orientation == "rowwise":

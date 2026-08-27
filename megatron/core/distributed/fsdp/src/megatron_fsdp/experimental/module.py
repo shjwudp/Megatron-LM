@@ -195,6 +195,17 @@ class FsdpContext:
             return
         self.communication_scheduler.record_completion_anchor(owner, anchor, phase, event)
 
+    def record_conflict_free_point(
+        self,
+        owner: "FsdpModule",
+        anchor: nn.Module | str,
+        event: torch.cuda.Event | None = None,
+    ) -> None:
+        """Record one unified AG-prefetch and deferred-RS release point."""
+        if self.communication_scheduler is None:
+            return
+        self.communication_scheduler.record_conflict_free_point(owner, anchor, event)
+
     def finish_grad_sync(self) -> None:
         """Submit pending gradient collectives and fence their consumers."""
         if self.communication_scheduler is not None:
@@ -476,6 +487,37 @@ class FsdpModule:
 
             release_module.register_full_backward_pre_hook(pre_backward_release)
 
+        seen_conflict_free_modules: set[nn.Module | str] = set()
+        for safe_module in policy.conflict_free_on_pre_backward:
+            safe_key = safe_module.name if isinstance(safe_module, NamedPreBackward) else safe_module
+            if safe_key in seen_release_modules:
+                raise ValueError(
+                    "A conflict-free point cannot also be a legacy reduce-scatter "
+                    "pre-backward release point."
+                )
+            if safe_key in seen_conflict_free_modules:
+                raise ValueError("Duplicate conflict-free pre-backward point.")
+            seen_conflict_free_modules.add(safe_key)
+            scheduler.register_reduce_scatter_release_anchor(self, safe_key)
+            if isinstance(safe_module, NamedPreBackward):
+                continue
+            if not _is_owned_policy_anchor(self, safe_module):
+                raise ValueError(
+                    "conflict_free_on_pre_backward modules must belong to the annotated "
+                    "FSDP unit and cannot cross a nested FSDP-unit boundary."
+                )
+
+            def pre_backward_conflict_free(
+                anchor: nn.Module, _grad_output, *, owner_ref=owner_ref
+            ) -> None:
+                owner = owner_ref()
+                if owner is None:
+                    return
+                safe_point_event = owner.context.current_stream().record_event()
+                owner.context.record_conflict_free_point(owner, anchor, safe_point_event)
+
+            safe_module.register_full_backward_pre_hook(pre_backward_conflict_free)
+
     def _make_grad_hook(self) -> Callable[[nn.Parameter], None]:
         module_ref = ref(self)
 
@@ -617,6 +659,7 @@ class FsdpModule:
                     next_module,
                     next_orientation,
                     target_reshard_index=prefetch.release_after_reshard_index,
+                    target_unshard_index=prefetch.target_unshard_index,
                 )
 
     def post_forward(self) -> None:
@@ -813,6 +856,10 @@ class FsdpModule:
                 scheduler.mark_reduce_scatter_ready(
                     group, partial_grad, ready_event, self.context.is_last_microbatch
                 )
+
+    def unsharded_parameter_nbytes(self) -> int:
+        """Return temporary bytes needed for one full parameter materialization."""
+        return sum(group.unsharded_parameter_nbytes() for group in self._parameter_groups)
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:

@@ -207,6 +207,8 @@ class TestMcoreAdapterDense:
                 "layers.*:backward:anchor",
             ),
             fsdp_reduce_scatter_release_on_pre_backward=("layers.*:@pre_dispatch_computation",),
+            fsdp_conflict_free_on_pre_backward=("layers.*:@moe_dispatch",),
+            fsdp_reduce_scatter_release_on_prefetch=True,
         )
         policies = mcore_fsdp_adapter.FullyShardedDataParallelV2._build_communication_policies(
             [("layers.0", source)], ddp_config
@@ -223,6 +225,7 @@ class TestMcoreAdapterDense:
         assert policy.reduce_scatter_release_on_pre_backward == (
             NamedPreBackward("pre_dispatch_computation"),
         )
+        assert policy.conflict_free_on_pre_backward == (NamedPreBackward("moe_dispatch"),)
         scheduler_config = (
             mcore_fsdp_adapter.FullyShardedDataParallelV2._communication_scheduler_config(
                 ddp_config
@@ -230,6 +233,7 @@ class TestMcoreAdapterDense:
         )
         assert scheduler_config is not None
         assert scheduler_config.prefetch_depth == 2
+        assert scheduler_config.reduce_scatter_release_on_prefetch
 
     def test_wraps_fsdp_unit_modules_before_root(self, monkeypatch):
         config = TransformerConfig(
