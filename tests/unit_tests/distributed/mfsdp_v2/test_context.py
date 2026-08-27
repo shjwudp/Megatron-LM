@@ -137,20 +137,47 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     assert list(context.backward_order) == [model.layers[1], model.layers[0]]
 
 
-def test_fine_grained_hooks_preserve_registered_module_hierarchy(distributed_setup):
-    """Fine-grained parent references must not become registered child modules."""
+def test_explicit_lifecycle_supports_direct_submodule_execution(distributed_setup):
+    """A split schedule can drive FSDP without hooks on every child module."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = MultiChildModel(dim=4, num_children=2).to(device)
-    module_names = tuple(name for name, _ in model.named_modules())
-    layer_keys = tuple(model.layers._modules)
+    torch.manual_seed(1234)
+    model = NestedModel().to(device)
+    reference_weight = model.inner.weight.detach().clone()
+    reference_bias = model.bias.detach().clone()
+    inputs = torch.arange(8, device=device, dtype=model.bias.dtype).reshape(2, 4)
+    expected = torch.nn.functional.linear(inputs, reference_weight) + reference_bias
 
     with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_flat_placements(),
+            skip_backward_callback=True,
+        )
 
-    assert tuple(name for name, _ in model.named_modules()) == module_names
-    assert tuple(model.layers._modules) == layer_keys
+    # The schedule calls ``inner`` directly, so the normal hooks on ``model``
+    # cannot run. Explicit pre/post boundaries materialize and release the unit.
+    assert not model.inner._forward_pre_hooks
+    assert not model.inner._backward_pre_hooks
+    model._unshard_parameter_groups()
+    model.context.current_stream().wait_event(model._unshard_event)
+    actual = model.inner(inputs) + model.bias
+    model._reshard_parameter_groups()
+    torch.testing.assert_close(actual, expected)
+
+    # Enter backward before the split node runs and finalize only after its
+    # gradients are available. This is the same contract used by combined 1F1B.
+    model.pre_backward(register_final_callback=False)
+    # A nested unit's normal full-backward-pre hook can observe the same
+    # boundary after the schedule entered it explicitly.
+    model.pre_backward(register_final_callback=False)
+    actual.sum().backward()
+    assert model.phase is model.Phase.BACKWARD
+    assert model.inner.weight.grad is not None
+    model.post_backward()
+    assert model.phase is model.Phase.RESTING
 
 
 def test_nested_prefetch_orders_use_dfs(distributed_setup):

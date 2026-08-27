@@ -581,8 +581,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
-        fine_grained = config.overlap_moe_expert_parallel_comm
-        skip_backward_cb = fine_grained and ddp_config.delay_wgrad_compute
+        overlap_enabled = config.overlap_moe_expert_parallel_comm
+        skip_backward_cb = overlap_enabled and ddp_config.delay_wgrad_compute
         with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
@@ -596,7 +596,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             placements=placements,
                             mixed_precision_policy=self.mp_policy,
                             grad_divisor=config.expert_model_parallel_size,
-                            fine_grained=fine_grained,
                             skip_backward_callback=skip_backward_cb,
                         )
             for submodule in reversed(list(module.modules())):
@@ -610,7 +609,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         mesh=dp_mesh,
                         placements=placements,
                         mixed_precision_policy=self.mp_policy,
-                        fine_grained=fine_grained,
                         skip_backward_callback=skip_backward_cb,
                     )
             fully_shard(
@@ -618,11 +616,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 mesh=dp_mesh,
                 placements=placements,
                 mixed_precision_policy=self.mp_policy,
-                fine_grained=fine_grained,
                 skip_backward_callback=skip_backward_cb,
             )
         super().__init__(config=config, module=module)
-        if fine_grained:
+        if overlap_enabled:
             self._setup_1f1b_overlap_interface()
 
     def _setup_1f1b_overlap_interface(self) -> None:
@@ -633,23 +630,59 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         surface is assembled here.
         """
 
-        def _require_fsdp_module(module: torch.nn.Module) -> FsdpModule:
+        def _fsdp_modules(
+            module: torch.nn.Module, *, recursive: bool = True
+        ) -> tuple[FsdpModule, ...]:
             if not isinstance(module, FsdpModule):
                 raise TypeError(
                     "MFSDP v2 combined 1F1B callbacks require an experimental FsdpModule, "
                     f"got {type(module).__name__}."
                 )
-            return module
+            if not recursive:
+                return (module,)
+            return tuple(
+                submodule for submodule in module.modules() if isinstance(submodule, FsdpModule)
+            )
+
+        def prepare_forward_module(
+            module: torch.nn.Module, *, recursive: bool = True
+        ) -> None:
+            """Materialize a schedule unit before its first forward node.
+
+            The explicit schedule callback replaces submodule-wide forward hooks.
+            Nested FSDP units, such as the expert unit inside a transformer layer,
+            are prepared together at the layer boundary.
+            """
+            for fsdp_module in _fsdp_modules(module, recursive=recursive):
+                fsdp_module._unshard_parameter_groups()
+                if fsdp_module._unshard_event is not None:
+                    fsdp_module.context.current_stream().wait_event(
+                        fsdp_module._unshard_event
+                    )
+                if fsdp_module.phase is not FsdpModule.Phase.BACKWARD:
+                    next_module = fsdp_module.context.forward_order.next_item(fsdp_module)
+                    if next_module is not None:
+                        next_module._unshard_parameter_groups()
+
+        def prepare_backward_module(module: torch.nn.Module) -> None:
+            """Enter backward for a schedule unit before its first backward node."""
+            for fsdp_module in _fsdp_modules(module):
+                if fsdp_module.phase is FsdpModule.Phase.RESTING:
+                    fsdp_module.pre_backward(register_final_callback=False)
 
         def release_module(module: torch.nn.Module, *, reduce_grad: bool) -> None:
-            module = _require_fsdp_module(module)
-            if reduce_grad:
-                module.post_backward()
-            else:
-                module._reshard_parameter_groups()
+            fsdp_modules = _fsdp_modules(module)
+            for fsdp_module in reversed(fsdp_modules):
+                if reduce_grad:
+                    fsdp_module.post_backward()
+                elif fsdp_module.phase is not FsdpModule.Phase.BACKWARD:
+                    # A combined segment can run another microbatch's forward
+                    # while this layer is in backward. Keep the shared full
+                    # parameters until the backward boundary releases them.
+                    fsdp_module._reshard_parameter_groups()
 
         def _replace_param_with_raw_if_needed() -> None:
-            """Initialize the root context before a fine-grained schedule runs.
+            """Initialize the root context before the explicit schedule runs.
 
             The experimental API stores raw tensors backed by DBuffer at all
             times, so no parameter swap is needed, but finalizing the context
@@ -659,8 +692,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             self.module.context.ensure_finalized()
 
         self._replace_param_with_raw_if_needed = _replace_param_with_raw_if_needed
+        self.pre_forward_module = prepare_forward_module
+        self.pre_backward_module = prepare_backward_module
         self.post_forward_release_module = partial(release_module, reduce_grad=False)
         self.post_backward_release_module = partial(release_module, reduce_grad=True)
+        self.pre_forward = partial(prepare_forward_module, self.module, recursive=False)
         self.pre_backward = partial(self.module.pre_backward, register_final_callback=False)
         self.post_backward = self.module.post_backward
 

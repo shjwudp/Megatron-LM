@@ -90,6 +90,7 @@ def combined_1f1b_schedule_for_no_pipelining(
         checkpoint_activations_microbatch=None,
         is_first_microbatch=check_first_val_step(True),
         current_microbatch=0,
+        fsdp_wrapper=fsdp_wrapper,
     )
     # The forward step is executed in parallel with the backward step of another microbatch
     # EP A2A in forward step is hidden by the attention/mlp computation in the backward step
@@ -347,7 +348,18 @@ def combined_forward_backward_step(
     from .schedules import set_current_microbatch
 
     if fsdp_wrapper is not None and b_model is not None:
-        fsdp_wrapper.pre_backward()
+        with torch.cuda.stream(get_comp_stream()):
+            fsdp_wrapper.pre_backward()
+    elif (
+        fsdp_wrapper is not None
+        and f_model is not None
+        and hasattr(fsdp_wrapper, "pre_forward_module")
+    ):
+        # The first forward-only microbatch has no backward entry to materialize
+        # root-owned embedding/output parameters. Prepare only the root unit;
+        # per-layer units are handled by the explicit schedule callbacks below.
+        with torch.cuda.stream(get_comp_stream()):
+            fsdp_wrapper.pre_forward()
 
     if f_model is not None and config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
@@ -388,9 +400,9 @@ def combined_forward_backward_step(
                 f_schedule_plan, AbstractSchedulePlan
             ), "first output of forward_step_func must be one instance of AbstractSchedulePlan"
 
-        # Wire per-layer FSDP parameter release callbacks.  The EP overlap
-        # schedule bypasses normal FSDP forward/backward hooks, so we release
-        # each layer's all-gathered parameters explicitly after its compute.
+        # Wire explicit per-layer FSDP lifecycle callbacks. The EP overlap
+        # schedule bypasses normal FSDP forward/backward hooks, so MFSDP v2
+        # materializes and releases each layer at schedule-owned boundaries.
         # Only needed for optim_grads_params strategy (where params are sharded).
         forward_fsdp_wrapper = find_megatron_fsdp(f_model)
         if (
@@ -400,9 +412,9 @@ def combined_forward_backward_step(
         ):
             for i in range(f_schedule_plan.num_layers()):
                 layer_plan = f_schedule_plan.get_layer(i)
-                # Validation workaround: disable per-layer forward reshard in EP-overlap
-                # schedule to avoid releasing weights before the matching backward consumes them.
-                layer_plan.set_fsdp_reshard_hooks(
+                layer_plan.set_fsdp_lifecycle_hooks(
+                    getattr(forward_fsdp_wrapper, "pre_forward_module", None),
+                    getattr(forward_fsdp_wrapper, "pre_backward_module", None),
                     forward_fsdp_wrapper.post_forward_release_module,
                     forward_fsdp_wrapper.post_backward_release_module,
                 )

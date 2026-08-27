@@ -175,16 +175,22 @@ class TransformerLayerSchedulePlan:
         else:
             self.mtp_post_process = NoopScheduleNode()
 
-    def set_fsdp_reshard_hooks(self, post_forward_hook, post_backward_hook):
-        """Wire FSDP parameter release callbacks for the fine-grained overlap schedule.
+    def set_fsdp_lifecycle_hooks(
+        self, pre_forward_hook, pre_backward_hook, post_forward_hook, post_backward_hook
+    ):
+        """Wire explicit FSDP lifecycle callbacks into the overlap schedule.
 
         The EP overlap schedule bypasses the normal FSDP forward/backward hooks
         (registered on the FSDP unit module) because it calls sub-modules directly
-        instead of going through TransformerLayer.forward(). This method attaches
-        explicit release hooks to individual schedule nodes so that all-gathered
-        parameters are freed at the right time.
+        instead of going through TransformerLayer.forward(). This method makes the
+        schedule own the layer boundaries instead of registering hooks on every
+        submodule.
 
         Args:
+            pre_forward_hook: Optional callable(module) that materializes the
+                layer's parameters before its first forward node.
+            pre_backward_hook: Optional callable(module) that materializes the
+                layer's parameters before its first backward node.
             post_forward_hook: Callable(module) that releases forward-pass params
                 (bwd=False). Typically ``fsdp_wrapper.post_forward_release_module``.
             post_backward_hook: Callable(module) that releases backward-pass params
@@ -205,7 +211,11 @@ class TransformerLayerSchedulePlan:
         else:
             hook_module = self.layer.mtp_model_layer
 
-        # After the last backward op (pre_dispatch_computation), release backward-pass params.
+        # The first forward node is also the last backward node.
+        if pre_forward_hook is not None:
+            self.pre_dispatch_computation.set_pre_forward_hook(
+                lambda: pre_forward_hook(hook_module)
+            )
         self.pre_dispatch_computation.set_post_backward_hook(
             lambda: post_backward_hook(hook_module)
         )
@@ -216,7 +226,9 @@ class TransformerLayerSchedulePlan:
         else:
             last_fwd_node = self.moe_combine
 
-        # After the last forward op, release forward-pass params.
+        # The last forward node is also the first backward node.
+        if pre_backward_hook is not None:
+            last_fwd_node.set_pre_backward_hook(lambda: pre_backward_hook(hook_module))
         last_fwd_node.set_post_forward_hook(lambda: post_forward_hook(hook_module))
 
     def get_fp8_context(self):

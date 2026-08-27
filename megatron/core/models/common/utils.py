@@ -266,10 +266,14 @@ class TransformerLayerNode(ScheduleNode):
         self.is_last_layer = extra_args.get("is_last_layer", False)
 
         # Whether this slot is the first/last node of its TransformerLayer in
-        # forward / backward order. Set by ``set_post_*_hook``; used to decide
-        # when to invoke the layer-level FSDP reshard hooks.
-        self.is_layer_first_node = None
-        self.is_layer_last_node = None
+        # forward order. The first forward node is also the last backward node,
+        # and the last forward node is the first backward node.
+        self.is_layer_first_node = False
+        self.is_layer_last_node = False
+        self._pre_forward_hook = None
+        self._pre_backward_hook = None
+        self._post_forward_hook = None
+        self._post_backward_hook = None
 
         self.bwd_dw_callables = []
         if bwd_dw_callables is not None:
@@ -291,32 +295,27 @@ class TransformerLayerNode(ScheduleNode):
         return detached
 
     def forward_impl(self, *args):
-        """Invoke the slot's submodule forward."""
-        return self.submodule(self, *args)
+        """Invoke the slot's submodule forward and explicit layer boundaries."""
+        if self.is_layer_first_node and self._pre_forward_hook is not None:
+            self._pre_forward_hook()
+        output = self.submodule(self, *args)
+        if self.is_layer_last_node and self._post_forward_hook is not None:
+            self._post_forward_hook()
+        return output
 
     def backward_impl(self, outputs, output_grad):
-        """Run the slot's backward and return the input grads."""
+        """Run the slot's backward and explicit layer boundaries."""
+        if self.is_layer_last_node and self._pre_backward_hook is not None:
+            self._pre_backward_hook()
         detached_grad = tuple([e.grad for e in self.detached])
         grads = output_grad + detached_grad
         self.default_backward_func(outputs + self.before_detached, grads)
 
-        return grads
-
-    def forward(self, *inputs):
-        """Execute forward and fire the per-layer post-forward hook on the last slot."""
-        output = super().forward(*inputs)
-        if self.is_layer_last_node:
-            self._post_forward_hook()
-        return output
-
-    def backward(self, *output_grad):
-        """Execute backward and fire the per-layer post-backward hook on the first slot.
-
-        When ``delay_wgrad_compute`` is set, the hook fires after ``backward_dw``
-        instead, because the wgrad work has not yet run when ``backward`` returns.
-        """
-        grads = super().backward(*output_grad)
-        if not self.delay_wgrad_compute and self.is_layer_first_node:
+        if (
+            not self.delay_wgrad_compute
+            and self.is_layer_first_node
+            and self._post_backward_hook is not None
+        ):
             self._post_backward_hook()
         return grads
 
@@ -331,31 +330,39 @@ class TransformerLayerNode(ScheduleNode):
             nvtx_range_push(nvtx_msg)
             for module in self.bwd_dw_callables:
                 module.backward_dw()
-            nvtx_range_pop(nvtx_msg)
+            # Collect ``post_wgrad_grad_acc_hook`` from params whose grads were
+            # produced by *this* slot's wgrad callables. The hook must run on the
+            # same stream right after the wgrad it depends on; collecting on the
+            # first invocation makes the per-iteration hook order deterministic.
+            if self.post_wgrad_grad_acc_hooks is None:
+                self.post_wgrad_grad_acc_hooks = []
+                for module in self.bwd_dw_callables:
+                    for param in module.parameters():
+                        if (
+                            getattr(param, "post_wgrad_grad_acc_hook", False)
+                            and param.requires_grad
+                            and param.grad is not None
+                        ):
+                            self.post_wgrad_grad_acc_hooks.append(param.post_wgrad_grad_acc_hook)
 
-        # Collect ``post_wgrad_grad_acc_hook`` from params whose grads were
-        # produced by *this* slot's wgrad callables. The hook must run on the
-        # same stream right after the wgrad it depends on; collecting on the
-        # first invocation makes the per-iteration hook order deterministic.
-        if self.post_wgrad_grad_acc_hooks is None:
-            self.post_wgrad_grad_acc_hooks = []
-            for module in self.bwd_dw_callables:
-                for param in module.parameters():
-                    if (
-                        getattr(param, "post_wgrad_grad_acc_hook", False)
-                        and param.requires_grad
-                        and param.grad is not None
-                    ):
-                        self.post_wgrad_grad_acc_hooks.append(param.post_wgrad_grad_acc_hook)
-
-        if self.post_wgrad_grad_acc_hooks:
-            with torch.cuda.stream(self.stream):
+            if self.post_wgrad_grad_acc_hooks:
                 for hook in self.post_wgrad_grad_acc_hooks:
                     hook()
 
-        if self.is_layer_first_node:
-            self._post_backward_hook()
+            if self.is_layer_first_node and self._post_backward_hook is not None:
+                self._post_backward_hook()
+            nvtx_range_pop(nvtx_msg)
         self.bwd_dw_callables = None
+
+    def set_pre_forward_hook(self, hook):
+        """Mark this slot as the first forward node and register the hook."""
+        self.is_layer_first_node = True
+        self._pre_forward_hook = hook
+
+    def set_pre_backward_hook(self, hook):
+        """Mark this slot as the first backward node and register the hook."""
+        self.is_layer_last_node = True
+        self._pre_backward_hook = hook
 
     def set_post_forward_hook(self, hook):
         """Mark this slot as the layer's last fwd node and register the hook."""

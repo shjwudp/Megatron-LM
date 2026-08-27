@@ -46,7 +46,7 @@ calls explicitly at the right moments.
 
 | Flag | What it does |
 |---|---|
-| `--overlap-moe-expert-parallel-comm` | Enables the combined 1F1B schedule and fine-grained FSDP hooks. |
+| `--overlap-moe-expert-parallel-comm` | Enables the combined 1F1B schedule and its explicit FSDP lifecycle callbacks. |
 | `--delay-wgrad-compute` | TE layers postpone weight gradient computation until `backward_dw()`. FSDP must defer `reduce_grad()` until after `backward_dw()`. |
 
 ### Why `delay_wgrad_compute` matters for FSDP
@@ -64,8 +64,8 @@ disables that hook for this schedule and lets the explicit
 
 ## 1. Schedule Integration Contract
 
-The schedule in `combined_1f1b.py` has six integration points where it calls
-into FSDP. MFSDP v2 satisfies all six.
+The schedule in `combined_1f1b.py` calls into MFSDP v2 at the root and layer
+boundaries described below.
 
 ### 1.1 Discovery — `find_megatron_fsdp(model)`
 
@@ -92,11 +92,16 @@ def _replace_param_with_raw_if_needed() -> None:
     self.module.context.ensure_finalized()
 ```
 
-### 1.3 Root backward-phase setup — `pre_backward()`
+### 1.3 Root lifecycle setup — `pre_forward()` / `pre_backward()`
 
-**File:** `combined_1f1b.py` → `FsdpModule.pre_backward()`
+**File:** `combined_1f1b.py` → adapter callbacks
 
-Called before each combined backward segment. MFSDP v2:
+The first forward-only microbatch calls `pre_forward()` to materialize
+root-owned parameters such as embeddings and the output layer. Layer-owned
+parameters are managed by the callbacks in §1.4.
+
+Before a combined segment that has backward work, the schedule instead calls
+`pre_backward()`. MFSDP v2:
 
 - transitions this module to `Phase.BACKWARD`,
 - if root: forks the reduce-scatter stream from the current stream so later
@@ -105,23 +110,27 @@ Called before each combined backward segment. MFSDP v2:
 - unshards parameters (all-gather) and waits for them,
 - prefetches the next module in `backward_order` (static-order prefetch).
 
-### 1.4 Per-layer parameter release — `set_fsdp_reshard_hooks()`
+### 1.4 Per-layer lifecycle — `set_fsdp_lifecycle_hooks()`
 
 **File:** `combined_1f1b.py` → adapter callbacks
 
-The schedule attaches two callables per `TransformerLayerSchedulePlan`:
+The schedule attaches four callables per `TransformerLayerSchedulePlan`:
 
+- **`pre_forward_module(module)`** — called inside the first forward node's
+  CUDA stream; unshards the layer and its nested FSDP units.
 - **`post_forward_release_module(module)`** — called after the last forward
   node of a layer; reshard only (no gradient reduction).
+- **`pre_backward_module(module)`** — called inside the first backward node's
+  CUDA stream; enters backward and materializes the layer and its nested FSDP
+  units.
 - **`post_backward_release_module(module)`** — called after the last backward
   node; runs the module's `post_backward()` (reshard + gradient reduction).
 
-The `FullyShardedDataParallelV2` adapter binds both through a single
-`release_module(module, *, reduce_grad)` helper (in
-`_setup_1f1b_overlap_interface`) that validates the argument is an
-`FsdpModule`, then calls `module._reshard_parameter_groups()` (forward) or
-`module.post_backward()` (backward). No release helpers live on `FsdpModule`
-itself.
+The callbacks execute in the schedule node's stream so the parameter
+all-gather/reduce-scatter dependencies are ordered with the compute that uses
+them. The adapter applies each callback recursively because routed experts can
+be a nested `FsdpModule` on a different expert-DP mesh while their containing
+`TransformerLayer` owns the dense parameters.
 
 ### 1.5 Root backward finalization — `post_backward()`
 
@@ -163,64 +172,30 @@ This wires into `config.no_sync_func` via the existing training-loop contract.
 
 ---
 
-## 2. Fine-Grained Hook Registration
+## 2. Explicit Schedule-Owned Lifecycle
 
-With `overlap_moe_expert_parallel_comm=True`, hooks are registered on **every
-sub-module** of each FSDP unit, not just on the FSDP unit itself. This is
-controlled by the `fine_grained` parameter of `fully_shard()` (wired from the
-adapter as `fine_grained = config.overlap_moe_expert_parallel_comm`).
+MFSDP v2 keeps its normal hooks only on each `FsdpModule`. It does **not** add
+hooks or parent references to every descendant module. The combined schedule
+cannot rely on the normal hooks because it invokes attention, dispatch, expert,
+and combine callables directly, so it owns these boundaries explicitly:
 
-### 2.1 Pre-forward hooks on sub-modules
+| Schedule boundary | MFSDP v2 action |
+|---|---|
+| First forward node | `pre_forward_module(layer)` |
+| Last forward node | `post_forward_release_module(layer)` |
+| First backward node | `pre_backward_module(layer)` |
+| Last backward node, after delayed `backward_dw()` | `post_backward_release_module(layer)` |
 
-When the schedule calls `f_layer.attn.forward()`, a pre-forward hook on the
-sub-module fires, resolves the parent `FsdpModule`, and unshards it:
+The first forward node is `pre_dispatch_computation`; the last is `mlp` for a
+dense layer and `moe_combine` for an MoE layer. Backward uses the same nodes in
+reverse order. `TransformerLayerNode` invokes the callbacks inside its stream
+acquisition context, which establishes the required CUDA ordering without
+arbitrary submodule hooks.
 
-```python
-def _register_fine_grained_forward_hooks(module: FsdpModule) -> None:
-    for submodule in module.modules():
-        if _find_fsdp_target(submodule) is not module:
-            continue
-        submodule.register_forward_pre_hook(_fine_grained_pre_forward,
-                                            prepend=True, with_kwargs=True)
-
-def _fine_grained_pre_forward(hook_module, args, kwargs):
-    target = _find_fsdp_target(hook_module)
-    if target is None:
-        return
-    target._unshard_parameter_groups()
-    if target._unshard_event is not None:
-        target.context.current_stream().wait_event(target._unshard_event)
-```
-
-### 2.2 Pre-backward hooks on sub-modules
-
-A `register_full_backward_pre_hook` on each sub-module enters the parent
-`FsdpModule` backward lifecycle before that sub-module's own backward runs, so
-its weight-gradient computation sees full parameters and its later release has
-a matching lifecycle/NVTX entry:
-
-```python
-def _fine_grained_pre_backward_hook(submodule: nn.Module, _grad_output) -> None:
-    target = _find_fsdp_target(submodule)
-    if target is None:
-        return
-    if target.phase is FsdpModule.Phase.RESTING:
-        target.pre_backward(register_final_callback=False)
-```
-
-### 2.3 Wiring from `fully_shard()`
-
-```python
-def fully_shard(module, mesh, placements, *, fine_grained=False, ...):
-    ...
-    if fine_grained:
-        _register_fine_grained_forward_hooks(module)
-        _register_fine_grained_backward_hooks(module)
-```
-
-The adapter passes `fine_grained=config.overlap_moe_expert_parallel_comm` for
-every unit it shards (transformer layers, MoE sub-modules on the expert-DP
-mesh, and the root).
+Forward preparation deliberately uses the unshard primitive without changing
+the FSDP phase. In a combined 1F1B segment, forward and backward can use the
+same logical layer concurrently. Backward preparation owns the phase transition
+through `pre_backward(register_final_callback=False)`.
 
 ---
 
@@ -253,9 +228,9 @@ for group in self._parameter_groups:
         fsdp_parameter.unsharded.register_post_accumulate_grad_hook(self._make_grad_hook())
 ```
 
-The adapter wires it as `skip_backward_cb = fine_grained and
-ddp_config.delay_wgrad_compute` (the flag only matters on the fine-grained
-path, where the schedule drives reduction explicitly).
+The adapter wires it as `skip_backward_cb = overlap_enabled and
+ddp_config.delay_wgrad_compute` (the flag only matters on the explicit overlap
+path, where the schedule drives reduction).
 
 ---
 
@@ -265,14 +240,13 @@ path, where the schedule drives reduction explicitly).
 
 | Method | Signature | Description |
 |---|---|---|
-| `pre_backward()` | `(register_final_callback: bool = True) -> None` | Backward-phase setup; the explicit schedule disables the autograd final callback. |
+| `pre_backward()` | `(register_final_callback: bool = True) -> None` | Idempotent backward-phase setup; the explicit schedule disables the autograd final callback. |
 | `post_backward()` | `() -> None` | Finalize backward: no-op unless BACKWARD phase; reduce+reshard this module, and any submodule `FsdpModule` still in the BACKWARD phase. |
 
-### New parameters on `fully_shard()`
+### New parameter on `fully_shard()`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `fine_grained` | `bool` | `False` | Register hooks on every sub-module for EP overlap. |
 | `skip_backward_callback` | `bool` | `False` | Skip per-param `post_accumulate_grad_hook` for `delay_wgrad_compute`. |
 
 ### New methods on `FullyShardedDataParallelV2` (adapter)
@@ -283,6 +257,9 @@ which binds closures that operate on a passed `FsdpModule`:
 | Attribute | Signature | Description |
 |---|---|---|
 | `_replace_param_with_raw_if_needed` | `() -> None` | Finalize the root context; no parameter swap is needed. |
+| `pre_forward` | `() -> None` | Materialize root-owned parameters for the first forward-only segment. |
+| `pre_forward_module` | `(module) -> None` | Materialize a layer and nested FSDP units before forward. |
+| `pre_backward_module` | `(module) -> None` | Enter backward for a layer and nested FSDP units. |
 | `post_forward_release_module` | `(module) -> None` | Release forward-pass params (reshard only). |
 | `post_backward_release_module` | `(module) -> None` | Release backward-pass params (reshard + reduce). |
 | `no_sync()` | `() -> contextmanager` | Suppress gradient finalization for non-final microbatches. |
@@ -297,10 +274,10 @@ wrapped by an object with `ddp_config`) alongside v1 `MegatronFSDP`.
 
 ## 5. Activation Recomputation Guard
 
-Activation recomputation runs forward hooks inside backward. If the forward
-hook prefetched the next module in forward order, that module's backward may
-already be complete, so no later backward hook would reshard it. MFSDP v2
-detects recomputation via the module phase and the active autograd GraphTask:
+Activation recomputation runs forward computation inside backward. If forward
+preparation prefetched the next module in forward order, that module's backward
+may already be complete, so no later backward boundary would reshard it. MFSDP
+v2 detects recomputation via the module phase and the active autograd GraphTask:
 
 ```python
 is_recomputing = self.phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
@@ -320,11 +297,14 @@ needed for the recomputed GEMMs) but never prefetch a successor.
 
 | File | Change |
 |---|---|
-| `experimental/module.py` | Public lifecycle APIs, fine-grained hooks, `skip_backward_callback`, recompute guard, phase transitions |
-| `experimental/fully_shard.py` | `fine_grained` / `skip_backward_callback` params, hook registration |
-| `mcore_fsdp_adapter.py` | Wire `fine_grained` / `skip_backward_callback`, add `no_sync()` and `_setup_1f1b_overlap_interface()` |
+| `experimental/module.py` | Public lifecycle APIs, `skip_backward_callback`, recompute guard, phase transitions |
+| `experimental/fully_shard.py` | `skip_backward_callback` parameter |
+| `mcore_fsdp_adapter.py` | Add explicit root/layer lifecycle callbacks, `no_sync()`, and `_setup_1f1b_overlap_interface()` |
+| `models/common/utils.py` | Invoke explicit lifecycle callbacks inside schedule-node CUDA streams |
+| `models/common/model_chunk_schedule_plan.py` | Bind lifecycle callbacks to the first/last layer nodes |
+| `pipeline_parallel/combined_1f1b.py` | Drive the root lifecycle and wire per-layer lifecycle callbacks |
 | `megatron_fsdp/utils.py` | Extend `find_megatron_fsdp()` |
-| `tests/unit_tests/distributed/mfsdp_v2/test_context.py` | Fine-grained ownership and explicit-release lifecycle tests |
+| `tests/unit_tests/distributed/mfsdp_v2/test_context.py` | Direct-submodule explicit-lifecycle test |
 | `tests/unit_tests/distributed/mfsdp_v2/test_mcore_nd_parallel.py` | End-to-end EP-overlap parity test |
 | `tests/unit_tests/distributed/mfsdp_v1/utils.py` | Shared GPT overlap-test construction and schedule-plan forward step |
 
@@ -355,7 +335,10 @@ For context, the v1 API contract that the schedule calls:
 | Discovery | `find_megatron_fsdp(model)` | Discovers `MegatronFSDP` instance |
 | Pre-schedule | `fsdp_wrapper._replace_param_with_raw_if_needed()` | Method (root-context init for v2) |
 | Microbatch loop | `no_sync_func()` → `model.no_sync()` | Context manager on adapter |
-| Pre-run | `fsdp_wrapper.pre_backward()` | `partial(_root_pre_backward, module=None, skip_backward_hook=True)` |
+| First forward-only run | `fsdp_wrapper.pre_forward()` | Optional v2 adapter callback |
+| Pre-backward run | `fsdp_wrapper.pre_backward()` | `partial(_root_pre_backward, module=None, skip_backward_hook=True)` |
+| Layer plan | `forward_fsdp_wrapper.pre_forward_module` | Optional v2 adapter callback |
+| Layer plan | `forward_fsdp_wrapper.pre_backward_module` | Optional v2 adapter callback |
 | Layer plan | `forward_fsdp_wrapper.post_forward_release_module` | `partial(_post_forward, input=None, output=None)` |
 | Layer plan | `forward_fsdp_wrapper.post_backward_release_module` | `_post_backward_release_module` |
 | Post-run | `fsdp_wrapper.post_backward()` | `_root_post_backward` |
