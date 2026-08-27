@@ -475,6 +475,7 @@ class TestMcoreAdapterDense:
                 bf16=True,
                 params_dtype=torch.bfloat16,
                 gradient_accumulation_fusion=True,
+                add_bias_linear=False,
             ),
             ddp_config=DistributedDataParallelConfig(
                 use_megatron_fsdp=True,
@@ -500,9 +501,11 @@ class TestMcoreAdapterDense:
 
         assert experts.parameter_groups
         assert all(group.fuse_wgrad_accumulation for group in experts.parameter_groups)
+        assert all(group.fused_wgrad_is_complete for group in experts.parameter_groups)
         assert all(group._symm_mem_pool is not None for group in experts.parameter_groups)
         assert wrapped.module.parameter_groups
         assert all(not group.fuse_wgrad_accumulation for group in wrapped.module.parameter_groups)
+        assert all(not group.fused_wgrad_is_complete for group in wrapped.module.parameter_groups)
         assert all(group._symm_mem_pool is not None for group in wrapped.module.parameter_groups)
         assert wrapped.context.trace_pool_allocator is not None
         assert wrapped.context.trace_pool_allocator.use_symmetric_memory

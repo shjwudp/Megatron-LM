@@ -1034,6 +1034,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                                 config.gradient_accumulation_fusion
                                 and isinstance(submodule.experts, TEGroupedMLP)
                             ),
+                            fused_wgrad_is_complete=(
+                                config.gradient_accumulation_fusion
+                                and isinstance(submodule.experts, TEGroupedMLP)
+                                and not config.add_bias_linear
+                            ),
                             grad_divisor=config.expert_model_parallel_size,
                             communication_policy=communication_policies.get(submodule.experts),
                         )
@@ -1056,6 +1061,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         fuse_wgrad_accumulation=(
                             config.gradient_accumulation_fusion
                             and isinstance(submodule, TEGroupedMLP)
+                        ),
+                        fused_wgrad_is_complete=(
+                            config.gradient_accumulation_fusion
+                            and isinstance(submodule, TEGroupedMLP)
+                            and not config.add_bias_linear
                         ),
                         communication_policy=communication_policies.get(submodule),
                     )
@@ -1085,6 +1095,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             config.gradient_accumulation_fusion
                             and isinstance(submodule, TEGroupedMLP)
                         ),
+                        fused_wgrad_is_complete=(
+                            config.gradient_accumulation_fusion
+                            and isinstance(submodule, TEGroupedMLP)
+                            and not config.add_bias_linear
+                        ),
                         communication_policy=communication_policies.get(submodule),
                     )
                     self._copy_mcore_attributes_to_sharded_parameters(submodule)
@@ -1099,6 +1114,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 skip_backward_callback=skip_backward_cb,
                 fuse_wgrad_accumulation=(
                     config.gradient_accumulation_fusion and isinstance(module, TEGroupedMLP)
+                ),
+                fused_wgrad_is_complete=(
+                    config.gradient_accumulation_fusion
+                    and isinstance(module, TEGroupedMLP)
+                    and not config.add_bias_linear
                 ),
                 communication_policy=communication_policies.get(module),
             )

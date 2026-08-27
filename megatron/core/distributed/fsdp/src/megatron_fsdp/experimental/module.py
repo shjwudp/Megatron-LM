@@ -272,6 +272,7 @@ class FsdpModule:
         fine_grained: bool = False,
         skip_backward_callback: bool = False,
         fuse_wgrad_accumulation: bool = False,
+        fused_wgrad_is_complete: bool = False,
         communication_policy: FsdpModuleCommunicationPolicy | None = None,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
@@ -311,6 +312,7 @@ class FsdpModule:
                 grad_divisor=grad_divisor,
                 use_symmetric_memory=use_symmetric_memory,
                 fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+                fused_wgrad_is_complete=fused_wgrad_is_complete,
                 trace_pool_allocator=context.trace_pool_allocator,
             )
             for group_parameters in _group_parameters(owned_parameters)
@@ -824,7 +826,8 @@ class FsdpModule:
 
             ready_groups = []
             for group_index, group, partial_grad, _is_fused in prepared_groups:
-                group.copy_gradients_to_partial_buffer(partial_grad)
+                if not group.fused_wgrad_is_complete:
+                    group.copy_gradients_to_partial_buffer(partial_grad)
                 ready_groups.append(
                     (group_index, group, partial_grad, current_stream.record_event())
                 )

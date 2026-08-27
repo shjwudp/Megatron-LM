@@ -53,10 +53,13 @@ class _FusedWgradLinearFunction(torch.autograd.Function):
     """Small stand-in for TE's direct-to-main-grad autograd contract."""
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, weight: nn.Parameter, bias: nn.Parameter) -> torch.Tensor:
+    def forward(
+        ctx, x: torch.Tensor, weight: nn.Parameter, bias: nn.Parameter | None
+    ) -> torch.Tensor:
         """Capture the getter during forward, as standard TE modules do."""
         ctx.save_for_backward(x)
         ctx.weight = weight
+        ctx.has_bias = bias is not None
         ctx.get_main_grad = weight.get_main_grad
         return torch.nn.functional.linear(x, weight, bias)
 
@@ -69,7 +72,7 @@ class _FusedWgradLinearFunction(torch.autograd.Function):
         torch.mm(grad_output.t(), x, out=main_grad)
         weight.grad_added_to_main_grad = True
         dummy_wgrad = torch.zeros_like(weight)
-        grad_bias = grad_output.sum(dim=0)
+        grad_bias = grad_output.sum(dim=0) if ctx.has_bias else None
         return None, dummy_wgrad, grad_bias
 
 
@@ -78,7 +81,6 @@ class FusedWgradLinear(nn.Linear):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the test fused-wgrad autograd function."""
-        assert self.bias is not None
         return _FusedWgradLinearFunction.apply(x, self.weight, self.bias)
 
 
@@ -427,6 +429,78 @@ def test_fused_wgrad_mixed_group_matches_baseline(
         assert parameter_group._fused_wgrad_buffer is None
         for fsdp_parameter in parameter_group.fsdp_parameters:
             assert fsdp_parameter.unsharded.main_grad is None
+            assert not fsdp_parameter.unsharded.grad_added_to_main_grad
+
+    torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
+
+
+def test_complete_fused_wgrad_skips_gradient_packing(distributed_setup, monkeypatch):
+    """A bias-free direct-to-buffer group should bypass ordinary-gradient packing."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(1234)
+    baseline = nn.Linear(8, 4, bias=False).to(device)
+    model = FusedWgradLinear(8, 4, bias=False).to(device)
+    model.load_state_dict(baseline.state_dict())
+
+    with fully_shard_context(device=device):
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_flat_placements(),
+            fuse_wgrad_accumulation=True,
+            fused_wgrad_is_complete=True,
+        )
+
+    parameter_group = model.parameter_groups[0]
+    monkeypatch.setattr(
+        parameter_group,
+        "copy_gradients_to_partial_buffer",
+        lambda _partial_grad: pytest.fail("complete fused wgrad must not run packing"),
+    )
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    inputs = [torch.randn(3, 8, device=device) for _ in range(3)]
+    targets = [torch.randn(3, 4, device=device) for _ in range(3)]
+    baseline_losses = []
+    losses = []
+
+    for x, target in zip(inputs, targets):
+        baseline_optimizer.zero_grad()
+        baseline_loss = torch.nn.functional.mse_loss(baseline(x), target)
+        baseline_loss.backward()
+        baseline_optimizer.step()
+        baseline_losses.append(baseline_loss.detach())
+
+        optimizer.zero_grad()
+        loss = torch.nn.functional.mse_loss(model(x), target)
+        with monkeypatch.context() as fused_ops:
+            fused_ops.setattr(
+                torch,
+                "_foreach_copy_",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "complete fused wgrad must not run torch._foreach_copy_"
+                ),
+            )
+            fused_ops.setattr(
+                torch,
+                "_foreach_add_",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "complete fused wgrad must not run torch._foreach_add_"
+                ),
+            )
+            loss.backward()
+        optimizer.step()
+        losses.append(loss.detach())
+
+        assert parameter_group._fused_wgrad_buffer is None
+        for fsdp_parameter in parameter_group.fsdp_parameters:
+            assert fsdp_parameter.unsharded.main_grad is None
+            assert fsdp_parameter.unsharded.grad is None
             assert not fsdp_parameter.unsharded.grad_added_to_main_grad
 
     torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))

@@ -119,6 +119,7 @@ def fully_shard(
     skip_backward_callback: bool = False,
     grad_divisor: int = 1,
     fuse_wgrad_accumulation: bool = False,
+    fused_wgrad_is_complete: bool = False,
     communication_policy: FsdpModuleCommunicationPolicy | None = None,
 ) -> None:
     """Apply FSDP to a module in place.
@@ -139,6 +140,9 @@ def fully_shard(
             ``backward_dw()`` to complete.
         fuse_wgrad_accumulation: Let TE write weight gradients directly into a
             full staging buffer that MFSDP subsequently reduce-scatters.
+        fused_wgrad_is_complete: Every gradient contribution for a fused group is
+            already present in that staging buffer. This skips ordinary-gradient
+            packing while retaining parameter cleanup before reduce-scatter.
         communication_policy: Optional completion anchors for delayed successor
             all-gather and reduce-scatter release. Requires a communication
             scheduler on the enclosing context.
@@ -193,6 +197,7 @@ def fully_shard(
             grad_divisor=grad_divisor,
             use_symmetric_memory=context.use_symmetric_memory,
             fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+            fused_wgrad_is_complete=fused_wgrad_is_complete,
             communication_policy=communication_policy,
         )
     except Exception:
