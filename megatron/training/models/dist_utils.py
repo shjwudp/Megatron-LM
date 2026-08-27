@@ -369,7 +369,8 @@ def _ddp_wrap(
                 prefetch_depth=ddp_config.fsdp_prefetch_depth,
             )
             if (
-                ddp_config.fsdp_prefetch_successor_after
+                ddp_config.fsdp_prefetch_depth != 1
+                or ddp_config.fsdp_prefetch_successor_after
                 or ddp_config.fsdp_reduce_scatter_release_on_pre_backward
             )
             else None
