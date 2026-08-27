@@ -740,33 +740,65 @@ class FsdpModule:
         scheduler = context.communication_scheduler
 
         module_name = self.name if self.name else "<root>"
-        for group_index, group in enumerate(self._parameter_groups):
-            if not group.requires_grad:
-                continue
+        prepared_groups = []
+        has_ordinary_grad = False
+        try:
+            # Allocate every staging buffer before submitting this module's first
+            # reduce-scatter. Otherwise a later group's allocation is ordered after
+            # an earlier group's collective on the shared reduction stream, and the
+            # allocation-to-compute join below exposes that collective to compute.
+            for group_index, group in enumerate(self._parameter_groups):
+                if not group.requires_grad:
+                    continue
 
-            if group.fuse_wgrad_accumulation:
-                partial_grad = group.take_fused_wgrad_buffer()
-                # This buffer was allocated and written on the compute stream.
-                # Keep its storage unavailable to that stream's allocator until
-                # the reduce-scatter stream has finished consuming it.
-                partial_grad.local_buffer.record_stream(reduce_scatter_stream)
-            else:
-                if scheduler is not None:
-                    scheduler.reserve_reduce_scatter(
-                        group, module_name=module_name, group_index=group_index
-                    )
-                with torch.cuda.stream(reduce_scatter_stream):
-                    try:
-                        partial_grad = group.allocate_partial_grad_buffer()
-                    except Exception:
-                        if scheduler is not None:
-                            scheduler.cancel_reduce_scatter_reservation(group)
-                        raise
+                is_fused = group.fuse_wgrad_accumulation
+                if is_fused:
+                    partial_grad = group.take_fused_wgrad_buffer()
+                    # This buffer was allocated and written on the compute stream.
+                    # Keep its storage unavailable to that stream's allocator until
+                    # the reduce-scatter stream has finished consuming it.
+                    partial_grad.local_buffer.record_stream(reduce_scatter_stream)
+                else:
+                    has_ordinary_grad = True
+                    if scheduler is not None:
+                        scheduler.reserve_reduce_scatter(
+                            group, module_name=module_name, group_index=group_index
+                        )
+                    with torch.cuda.stream(reduce_scatter_stream):
+                        try:
+                            partial_grad = group.allocate_partial_grad_buffer()
+                        except Exception:
+                            if scheduler is not None:
+                                scheduler.cancel_reduce_scatter_reservation(group)
+                            raise
+                prepared_groups.append((group_index, group, partial_grad, is_fused))
+
+            # One join covers every ordinary allocation. No current-module RS has
+            # been submitted yet, so it cannot become an accidental prerequisite
+            # of the compute-stream gradient copies.
+            if has_ordinary_grad:
                 current_stream.wait_stream(reduce_scatter_stream)
-            group.copy_gradients_to_partial_buffer(partial_grad)
 
+            ready_groups = []
+            for group_index, group, partial_grad, _is_fused in prepared_groups:
+                group.copy_gradients_to_partial_buffer(partial_grad)
+                ready_groups.append(
+                    (group_index, group, partial_grad, current_stream.record_event())
+                )
+        except Exception:
+            for _group_index, group, _partial_grad, is_fused in prepared_groups:
+                if scheduler is not None:
+                    scheduler.cancel_reduce_scatter_reservation(group)
+                if not is_fused:
+                    group.release_partial_grad_buffer()
+            raise
+
+        # Only after every group has been packed may the first collective enter
+        # the reduction stream. The per-group event keeps each RS dependent on its
+        # producer copy without making the compute stream wait for communication.
+        for group_index, group, partial_grad, ready_event in ready_groups:
             if scheduler is None:
-                reduce_scatter_stream.wait_stream(current_stream)
+                reduce_scatter_stream.wait_event(ready_event)
                 label = f"MFSDP RS target={module_name} group={group_index} trigger=eager"
                 torch.cuda.nvtx.range_push(label)
                 try:
@@ -778,7 +810,6 @@ class FsdpModule:
                 finally:
                     torch.cuda.nvtx.range_pop()
             else:
-                ready_event = current_stream.record_event()
                 scheduler.mark_reduce_scatter_ready(
                     group, partial_grad, ready_event, self.context.is_last_microbatch
                 )
