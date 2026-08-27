@@ -368,12 +368,20 @@ def test_multiple_gradient_groups_pack_before_reduce_scatter(distributed_setup, 
 
 
 @pytest.mark.parametrize("mixed_wgrad", [False, True], ids=["fused_only", "fused_and_ordinary"])
-def test_fused_wgrad_mixed_group_matches_baseline(distributed_setup, mixed_wgrad):
+@pytest.mark.parametrize(
+    "use_symmetric_memory", [False, True], ids=["default_memory", "symmetric_memory"]
+)
+def test_fused_wgrad_mixed_group_matches_baseline(
+    distributed_setup, mixed_wgrad, use_symmetric_memory
+):
     """A fused weight and ordinary bias in one group should train correctly."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
+    if use_symmetric_memory:
+        # Initialize NCCL before the first symmetric-memory rendezvous.
+        dist.barrier(device_ids=[device.index])
 
     mesh = init_device_mesh(device.type, (world_size,))
     torch.manual_seed(1234)
@@ -382,8 +390,15 @@ def test_fused_wgrad_mixed_group_matches_baseline(distributed_setup, mixed_wgrad
     model = model_cls(8, 4).to(device)
     model.load_state_dict(baseline.state_dict())
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device, use_symmetric_memory=use_symmetric_memory):
         fully_shard(model, mesh=mesh, placements=_flat_placements(), fuse_wgrad_accumulation=True)
+
+    def assert_fused_staging_uses_ordinary_memory(module, _grad_output):
+        parameter_group = module.parameter_groups[0]
+        assert parameter_group._fused_wgrad_buffer is not None
+        assert not parameter_group._fused_wgrad_buffer.is_symmetric_memory
+
+    model.register_full_backward_pre_hook(assert_fused_staging_uses_ordinary_memory)
 
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)

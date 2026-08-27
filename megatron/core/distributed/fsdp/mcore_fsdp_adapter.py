@@ -1266,8 +1266,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             unsupported_fused_wgrad_features = []
             if config.use_transformer_engine_op_fuser:
                 unsupported_fused_wgrad_features.append("Transformer Engine op fuser")
-            if ddp_config.nccl_ub:
-                unsupported_fused_wgrad_features.append("symmetric-memory NCCL-UB")
             if unsupported_fused_wgrad_features:
                 raise ValueError(
                     "MFSDP v2 gradient accumulation fusion does not yet support: "

@@ -159,8 +159,6 @@ class FsdpParameterGroup:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
         if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
-        if use_symmetric_memory and fuse_wgrad_accumulation:
-            raise ValueError("MFSDP v2 fused wgrad does not yet support symmetric-memory buffers.")
 
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
         for fqn, parameter in parameters.items():
@@ -582,10 +580,12 @@ class FsdpParameterGroup:
             return
         if self._fused_wgrad_buffer is not None:
             raise RuntimeError("FSDP fused-wgrad buffer is already active for this group.")
-        if self._symm_mem_pool is not None:
-            raise RuntimeError("FSDP fused wgrad does not support symmetric memory yet.")
         assert self._partial_grad_dtype is not None
 
+        # TE writes GEMM output directly into this staging buffer on the compute
+        # stream. Keep it on the ordinary allocator even when the group's AG and
+        # non-fused RS buffers use symmetric memory. DBuffer detects the backing
+        # allocation below and selects the ordinary AVG reduce-scatter path.
         self._fused_wgrad_buffer = DBuffer(
             mesh=self.mesh,
             placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim,
@@ -826,7 +826,7 @@ class FsdpParameterGroup:
         grad_divisor = self.grad_divisor
         if partial_reduce_op == dist.ReduceOp.SUM:
             grad_divisor *= self.mesh.size(reduce_axis)
-        if self._symm_mem_pool is not None:
+        if partial_grad.is_symmetric_memory:
             partial_grad.rendezvous(reduce_axis)
 
         if can_reduce_into_main_grad := (
