@@ -477,6 +477,8 @@ class TestMcoreAdapterDense:
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
+                nccl_ub=True,
+                fsdp_trace_pool=True,
             ),
             module=module,
             pg_collection=ProcessGroupCollection(
@@ -494,8 +496,12 @@ class TestMcoreAdapterDense:
 
         assert experts.parameter_groups
         assert all(group.fuse_wgrad_accumulation for group in experts.parameter_groups)
+        assert all(group._symm_mem_pool is not None for group in experts.parameter_groups)
         assert wrapped.module.parameter_groups
         assert all(not group.fuse_wgrad_accumulation for group in wrapped.module.parameter_groups)
+        assert all(group._symm_mem_pool is not None for group in wrapped.module.parameter_groups)
+        assert wrapped.context.trace_pool_allocator is not None
+        assert wrapped.context.trace_pool_allocator.use_symmetric_memory
 
         expert_compute_parameters = [
             fsdp_parameter.unsharded
