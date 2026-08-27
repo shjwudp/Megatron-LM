@@ -137,20 +137,22 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     assert list(context.backward_order) == [model.layers[1], model.layers[0]]
 
 
-def test_fine_grained_hooks_preserve_registered_module_hierarchy(distributed_setup):
-    """Fine-grained parent references must not become registered child modules."""
+def test_skip_forward_backward_hooks(distributed_setup):
+    """Integrations may replace the standard FSDP module lifecycle hooks."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = MultiChildModel(dim=4, num_children=2).to(device)
-    module_names = tuple(name for name, _ in model.named_modules())
-    layer_keys = tuple(model.layers._modules)
+    model = nn.Sequential(nn.Linear(4, 4, bias=False)).to(device)
 
     with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(
+            model, mesh=mesh, placements=_flat_placements(), skip_forward_backward_hooks=True
+        )
 
-    assert tuple(name for name, _ in model.named_modules()) == module_names
-    assert tuple(model.layers._modules) == layer_keys
+    assert not model._forward_pre_hooks
+    assert not model._forward_hooks
+    assert not model._backward_pre_hooks
+    assert not model._backward_hooks
 
 
 def test_nested_prefetch_orders_use_dfs(distributed_setup):

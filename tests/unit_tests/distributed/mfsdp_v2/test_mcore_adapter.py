@@ -8,10 +8,17 @@ from dataclasses import replace
 
 import pytest
 import torch
+from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Shard
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    Placements,
+    fully_shard,
+    fully_shard_context,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -103,6 +110,58 @@ class TestMcoreAdapterDense:
         }
         assert child_parameter_names
         assert root_parameter_names == {"1.weight", "1.bias"}
+
+    def test_fine_grained_hooks_run_for_direct_submodule(self, monkeypatch):
+        """MCore-owned hooks materialize an FSDP unit called below its root."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        mesh = DeviceMesh.from_group(
+            self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
+        )
+        placements = Placements(
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        )
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False)).to(device)
+        module_names = tuple(name for name, _ in model.named_modules())
+
+        with fully_shard_context(device=device):
+            fully_shard(
+                model,
+                mesh=mesh,
+                placements=placements,
+                skip_forward_backward_hooks=True,
+                skip_backward_callback=True,
+            )
+            assert isinstance(model, FsdpModule)
+            mcore_fsdp_adapter._register_fine_grained_hooks(model)
+
+        assert tuple(name for name, _ in model.named_modules()) == module_names
+
+        unshard_calls = []
+        original_unshard = model._unshard_parameter_groups
+
+        def record_unshard():
+            unshard_calls.append(None)
+            original_unshard()
+
+        pre_backward_calls = []
+        original_pre_backward = model.pre_backward
+
+        def record_pre_backward(register_final_callback=True):
+            pre_backward_calls.append(register_final_callback)
+            original_pre_backward(register_final_callback=register_final_callback)
+
+        monkeypatch.setattr(model, "_unshard_parameter_groups", record_unshard)
+        monkeypatch.setattr(model, "pre_backward", record_pre_backward)
+
+        inputs = torch.randn(2, 4, device=device, requires_grad=True)
+        output = model[0](inputs)
+        assert len(unshard_calls) == 1
+
+        output.sum().backward()
+        assert pre_backward_calls == [False]
+
+        model.post_backward()
+        assert model.phase is FsdpModule.Phase.RESTING
 
     def test_nccl_ub_enables_symmetric_memory(self, monkeypatch):
         config = TransformerConfig(
@@ -256,7 +315,6 @@ class TestMcoreAdapterDense:
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
         torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
-
 
     def test_fused_sgd_casts_mismatched_grads(self):
         """FusedSGD steps after MCore casts V2's BF16 gradients to FP32."""

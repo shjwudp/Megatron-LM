@@ -17,6 +17,7 @@ import random
 from contextlib import contextmanager
 from functools import partial
 from typing import Dict, List, Optional, Tuple, Type
+from weakref import ref
 
 __all__ = ["FullyShardedDataParallel"]
 
@@ -64,6 +65,59 @@ except ImportError as import_megatron_fsdp_error:
     HAVE_MEGATRON_FSDP = False
 
 logger = logging.getLogger(__name__)
+
+_FSDP_PARENT_MODULE_REF_ATTR = "_fsdp_parent_module_ref"
+
+
+def _find_fsdp_target(submodule: nn.Module) -> FsdpModule | None:
+    """Return the nearest parent FsdpModule for a fine-grained schedule module."""
+    if isinstance(submodule, FsdpModule):
+        return submodule
+    parent_ref = getattr(submodule, _FSDP_PARENT_MODULE_REF_ATTR, None)
+    return parent_ref() if parent_ref is not None else None
+
+
+def _fine_grained_pre_forward_hook(submodule: nn.Module, _args, _kwargs) -> None:
+    """Materialize the owning FSDP unit before a schedule sub-module runs."""
+    target = _find_fsdp_target(submodule)
+    if target is None:
+        return
+    target._unshard_parameter_groups()
+    if target._unshard_event is not None:
+        target.context.current_stream().wait_event(target._unshard_event)
+
+    # Fine-grained schedules bypass FsdpModule.pre_forward(), so issue the same
+    # one-module lookahead here. Activation recomputation runs inside backward and
+    # must not restart forward-order prefetch after a later module was finalized.
+    is_recomputing = (
+        target.phase is FsdpModule.Phase.BACKWARD or torch._C._current_graph_task_id() != -1
+    )
+    if not is_recomputing:
+        next_module = target.context.forward_order.next_item(target)
+        if next_module is not None:
+            next_module._unshard_parameter_groups()
+
+
+def _fine_grained_pre_backward_hook(submodule: nn.Module, _grad_output) -> None:
+    """Enter the owning FSDP unit's backward lifecycle before sub-module backward."""
+    target = _find_fsdp_target(submodule)
+    if target is not None and target.phase is FsdpModule.Phase.RESTING:
+        target.pre_backward(register_final_callback=False)
+
+
+def _register_fine_grained_hooks(fsdp_module: FsdpModule) -> None:
+    """Install the sub-module hooks required by MCore combined 1F1B."""
+    for submodule in fsdp_module.modules():
+        if submodule is fsdp_module:
+            continue
+        target = _find_fsdp_target(submodule)
+        if target is not None and target is not fsdp_module:
+            continue
+        object.__setattr__(submodule, _FSDP_PARENT_MODULE_REF_ATTR, ref(fsdp_module))
+        submodule.register_forward_pre_hook(
+            _fine_grained_pre_forward_hook, prepend=True, with_kwargs=True
+        )
+        submodule.register_full_backward_pre_hook(_fine_grained_pre_backward_hook)
 
 
 class FullyShardedDataParallelV1(_BaseDataParallel):
@@ -571,6 +625,24 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
         fine_grained = config.overlap_moe_expert_parallel_comm
         skip_backward_cb = fine_grained and ddp_config.delay_wgrad_compute
+
+        def shard_module(
+            module_to_shard: nn.Module, mesh: DeviceMesh, grad_divisor: int = 1
+        ) -> None:
+            """Shard one MCore unit and install its schedule-specific hooks."""
+            fully_shard(
+                module_to_shard,
+                mesh=mesh,
+                placements=placements,
+                mixed_precision_policy=self.mp_policy,
+                grad_divisor=grad_divisor,
+                skip_forward_backward_hooks=fine_grained,
+                skip_backward_callback=skip_backward_cb,
+            )
+            if fine_grained:
+                assert isinstance(module_to_shard, FsdpModule)
+                _register_fine_grained_hooks(module_to_shard)
+
         with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
@@ -578,14 +650,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 # contributions after dispatch from every EP rank.
                 for submodule in module.modules():
                     if isinstance(submodule, MoELayer):
-                        fully_shard(
+                        shard_module(
                             submodule.experts,
-                            mesh=expert_dp_mesh,
-                            placements=placements,
-                            mixed_precision_policy=self.mp_policy,
+                            expert_dp_mesh,
                             grad_divisor=config.expert_model_parallel_size,
-                            fine_grained=fine_grained,
-                            skip_backward_callback=skip_backward_cb,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -593,22 +661,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
                 if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
-                    fully_shard(
-                        submodule,
-                        mesh=dp_mesh,
-                        placements=placements,
-                        mixed_precision_policy=self.mp_policy,
-                        fine_grained=fine_grained,
-                        skip_backward_callback=skip_backward_cb,
-                    )
-            fully_shard(
-                module,
-                mesh=dp_mesh,
-                placements=placements,
-                mixed_precision_policy=self.mp_policy,
-                fine_grained=fine_grained,
-                skip_backward_callback=skip_backward_cb,
-            )
+                    shard_module(submodule, dp_mesh)
+            shard_module(module, dp_mesh)
         super().__init__(config=config, module=module)
         if fine_grained:
             self._setup_1f1b_overlap_interface()

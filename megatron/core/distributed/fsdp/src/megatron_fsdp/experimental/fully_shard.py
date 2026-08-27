@@ -107,7 +107,7 @@ def fully_shard(
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
-    fine_grained: bool = False,
+    skip_forward_backward_hooks: bool = False,
     skip_backward_callback: bool = False,
     grad_divisor: int = 1,
 ) -> None:
@@ -122,8 +122,10 @@ def fully_shard(
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
-        fine_grained: Register pre-forward and pre-backward hooks on every sub-module
-            so the 1F1B EP overlap schedule can call sub-modules directly.
+        skip_forward_backward_hooks: Skip the standard module-level pre-forward,
+            post-forward, and pre-backward hooks. Integrations that drive the FSDP
+            lifecycle through another hook or explicit callback interface use this
+            to avoid registering two lifecycle paths.
         skip_backward_callback: Skip per-param post_accumulate_grad_hook. Required
             when ``delay_wgrad_compute=True`` so gradient reduction waits for
             ``backward_dw()`` to complete.
@@ -165,7 +167,7 @@ def fully_shard(
             main_grad_placements=tuple(placements.gradient),
             main_weight_placements=tuple(placements.optimizer),
             mixed_precision_policy=mixed_precision_policy,
-            fine_grained=fine_grained,
+            skip_forward_backward_hooks=skip_forward_backward_hooks,
             skip_backward_callback=skip_backward_callback,
             grad_divisor=grad_divisor,
             use_symmetric_memory=context.use_symmetric_memory,

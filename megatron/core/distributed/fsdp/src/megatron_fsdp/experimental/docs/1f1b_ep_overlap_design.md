@@ -166,9 +166,9 @@ This wires into `config.no_sync_func` via the existing training-loop contract.
 ## 2. Fine-Grained Hook Registration
 
 With `overlap_moe_expert_parallel_comm=True`, hooks are registered on **every
-sub-module** of each FSDP unit, not just on the FSDP unit itself. This is
-controlled by the `fine_grained` parameter of `fully_shard()` (wired from the
-adapter as `fine_grained = config.overlap_moe_expert_parallel_comm`).
+sub-module** of each FSDP unit, not just on the FSDP unit itself. These hooks
+belong to `mcore_fsdp_adapter.py` because they implement the MCore combined
+1F1B schedule contract, rather than the generic experimental FSDP lifecycle.
 
 ### 2.1 Pre-forward hooks on sub-modules
 
@@ -176,7 +176,7 @@ When the schedule calls `f_layer.attn.forward()`, a pre-forward hook on the
 sub-module fires, resolves the parent `FsdpModule`, and unshards it:
 
 ```python
-def _register_fine_grained_forward_hooks(module: FsdpModule) -> None:
+def _register_fine_grained_hooks(module: FsdpModule) -> None:
     for submodule in module.modules():
         if _find_fsdp_target(submodule) is not module:
             continue
@@ -208,19 +208,23 @@ def _fine_grained_pre_backward_hook(submodule: nn.Module, _grad_output) -> None:
         target.pre_backward(register_final_callback=False)
 ```
 
-### 2.3 Wiring from `fully_shard()`
+### 2.3 Wiring from the MCore adapter
 
 ```python
-def fully_shard(module, mesh, placements, *, fine_grained=False, ...):
-    ...
-    if fine_grained:
-        _register_fine_grained_forward_hooks(module)
-        _register_fine_grained_backward_hooks(module)
+fully_shard(
+    module,
+    ...,
+    skip_forward_backward_hooks=overlap_enabled,
+)
+if overlap_enabled:
+    _register_fine_grained_hooks(module)
 ```
 
-The adapter passes `fine_grained=config.overlap_moe_expert_parallel_comm` for
-every unit it shards (transformer layers, MoE sub-modules on the expert-DP
-mesh, and the root).
+The adapter applies this sequence child-first to every unit it shards
+(transformer layers, MoE sub-modules on the expert-DP mesh, and the root).
+`skip_forward_backward_hooks=True` prevents the generic FSDP unit hooks and
+the adapter's fine-grained hooks from driving the same lifecycle twice. State
+dict protection and parameter-gradient completion callbacks remain registered.
 
 ---
 
@@ -272,7 +276,7 @@ path, where the schedule drives reduction explicitly).
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `fine_grained` | `bool` | `False` | Register hooks on every sub-module for EP overlap. |
+| `skip_forward_backward_hooks` | `bool` | `False` | Let an integration replace the standard module-level FSDP lifecycle hooks. |
 | `skip_backward_callback` | `bool` | `False` | Skip per-param `post_accumulate_grad_hook` for `delay_wgrad_compute`. |
 
 ### New methods on `FullyShardedDataParallelV2` (adapter)
@@ -320,11 +324,12 @@ needed for the recomputed GEMMs) but never prefetch a successor.
 
 | File | Change |
 |---|---|
-| `experimental/module.py` | Public lifecycle APIs, fine-grained hooks, `skip_backward_callback`, recompute guard, phase transitions |
-| `experimental/fully_shard.py` | `fine_grained` / `skip_backward_callback` params, hook registration |
-| `mcore_fsdp_adapter.py` | Wire `fine_grained` / `skip_backward_callback`, add `no_sync()` and `_setup_1f1b_overlap_interface()` |
+| `experimental/module.py` | Public lifecycle APIs, optional standard lifecycle hooks, `skip_backward_callback`, recompute guard, phase transitions |
+| `experimental/fully_shard.py` | `skip_forward_backward_hooks` / `skip_backward_callback` integration controls |
+| `mcore_fsdp_adapter.py` | Fine-grained combined-1F1B hooks, adapter wiring, `no_sync()`, and `_setup_1f1b_overlap_interface()` |
 | `megatron_fsdp/utils.py` | Extend `find_megatron_fsdp()` |
-| `tests/unit_tests/distributed/mfsdp_v2/test_context.py` | Fine-grained ownership and explicit-release lifecycle tests |
+| `tests/unit_tests/distributed/mfsdp_v2/test_context.py` | Hook opt-out and explicit-release lifecycle tests |
+| `tests/unit_tests/distributed/mfsdp_v2/test_mcore_adapter.py` | Adapter-owned fine-grained hook execution and hierarchy test |
 | `tests/unit_tests/distributed/mfsdp_v2/test_mcore_nd_parallel.py` | End-to-end EP-overlap parity test |
 | `tests/unit_tests/distributed/mfsdp_v1/utils.py` | Shared GPT overlap-test construction and schedule-plan forward step |
 
