@@ -108,7 +108,6 @@ def fully_shard(
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
     skip_forward_backward_hooks: bool = False,
-    skip_backward_callback: bool = False,
     grad_divisor: int = 1,
 ) -> None:
     """Apply FSDP to a module in place.
@@ -126,9 +125,6 @@ def fully_shard(
             post-forward, and pre-backward hooks. Integrations that drive the FSDP
             lifecycle through another hook or explicit callback interface use this
             to avoid registering two lifecycle paths.
-        skip_backward_callback: Skip per-param post_accumulate_grad_hook. Required
-            when ``delay_wgrad_compute=True`` so gradient reduction waits for
-            ``backward_dw()`` to complete.
         grad_divisor: Additional divisor applied to the reduced gradient, on top of the
             averaging the mesh already performs. Defaults to 1, which is correct whenever
             each mesh rank contributes exactly one term to the gradient.
@@ -168,7 +164,6 @@ def fully_shard(
             main_weight_placements=tuple(placements.optimizer),
             mixed_precision_policy=mixed_precision_policy,
             skip_forward_backward_hooks=skip_forward_backward_hooks,
-            skip_backward_callback=skip_backward_callback,
             grad_divisor=grad_divisor,
             use_symmetric_memory=context.use_symmetric_memory,
         )

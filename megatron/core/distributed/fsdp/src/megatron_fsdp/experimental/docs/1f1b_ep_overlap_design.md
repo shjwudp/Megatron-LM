@@ -21,7 +21,7 @@ TransformerLayer.forward()
 backward()
   → pre_backward hook:  unshard_parameters()
   → compute grads
-  → post_backward hook: reshard_parameters() + reduce_grad()
+  → post_backward hook: reduce_grad() + reshard_parameters()
 ```
 
 ### EP overlap flow
@@ -56,8 +56,9 @@ calls explicitly at the right moments.
 `parameter.grad`. With `delay_wgrad_compute=True`, that node runs during the
 main backward before TE's later `backward_dw()` call writes the delayed weight
 gradient. `backward_dw()` does not execute `AccumulateGrad` a second time, so
-reducing from the hook would miss the delayed contribution. FSDP v2 therefore
-disables that hook for this schedule and lets the explicit
+reducing from the hook would miss the delayed contribution. The overlap adapter
+therefore disables the generic FSDP forward/backward lifecycle, including its
+parameter-completion callbacks, and lets the explicit
 `post_backward_release_module()` callback reduce after `backward_dw()`.
 
 ---
@@ -114,30 +115,31 @@ The schedule attaches two callables per `TransformerLayerSchedulePlan`:
 - **`post_forward_release_module(module)`** — called after the last forward
   node of a layer; reshard only (no gradient reduction).
 - **`post_backward_release_module(module)`** — called after the last backward
-  node; runs the module's `post_backward()` (reshard + gradient reduction).
+  node; finalizes the module and any nested FSDP units (gradient reduction +
+  reshard).
 
 The `FullyShardedDataParallelV2` adapter binds both through a single
 `release_module(module, *, reduce_grad)` helper (in
 `_setup_1f1b_overlap_interface`) that validates the argument is an
-`FsdpModule`, then calls `module._reshard_parameter_groups()` (forward) or
-`module.post_backward()` (backward). No release helpers live on `FsdpModule`
-itself.
+`FsdpModule`, then calls `module._reshard_parameter_groups()` (forward) or the
+adapter's descendant-first `finalize_backward(module)` helper (backward). No
+schedule-specific release helpers live on `FsdpModule` itself.
 
 ### 1.5 Root backward finalization — `post_backward()`
 
-**File:** `combined_1f1b.py` → `FsdpModule.post_backward()`
+**File:** `combined_1f1b.py` → `FullyShardedDataParallelV2.post_backward()`
 
-Called once after each overlapped run completes. `post_backward()` is a
-**no-op unless this module is in the BACKWARD phase** (idempotent — the
-schedule may call it on a module already released). MFSDP v2:
+Called once after each overlapped run completes. The adapter's zero-argument
+callback sweeps the root subtree with the same descendant-first helper used by
+per-layer release, finalizing any `FsdpModule` that is still in the BACKWARD
+phase because the schedule skipped its normal release.
 
-- walks the module subtree (excluding itself) and finalizes (reduce +
-  reshard) any submodule `FsdpModule` that is **still in the BACKWARD
-  phase** — i.e. the 1F1B schedule skipped its per-module release,
-- then reduces and reshards this module itself and returns it to `RESTING`.
-
-The v2 adapter binds `self.post_backward = self.module.post_backward` (no
-arguments).
+`FsdpModule.post_backward()` itself remains idempotent: it finalizes only the
+current FSDP unit when that unit is in the BACKWARD phase. Consequently, the
+final adapter sweep safely revisits units already handled by per-layer release.
+Reduce-scatter remains asynchronous; the training loop's subsequent
+`finish_grad_sync()` call fences the current stream against the context's
+reduce-scatter stream before any gradient consumer runs.
 
 ### 1.6 Gradient sync suppression — `no_sync_func()`
 
@@ -223,12 +225,12 @@ if overlap_enabled:
 The adapter applies this sequence child-first to every unit it shards
 (transformer layers, MoE sub-modules on the expert-DP mesh, and the root).
 `skip_forward_backward_hooks=True` prevents the generic FSDP unit hooks and
-the adapter's fine-grained hooks from driving the same lifecycle twice. State
-dict protection and parameter-gradient completion callbacks remain registered.
+parameter-completion callbacks from driving the same lifecycle as the
+adapter's fine-grained hooks. State-dict protection remains registered.
 
 ---
 
-## 3. `delay_wgrad_compute` — Skipping the Autograd Backward Callback
+## 3. `delay_wgrad_compute` — Explicit Schedule-Owned Completion
 
 ### Problem
 
@@ -241,25 +243,21 @@ With `delay_wgrad_compute=True`, this hook fires during `backward()`
 
 ### Solution
 
-When `skip_backward_callback=True`, `_register_hooks()` does **not** register
-per-param `post_accumulate_grad_hook`; reduction relies entirely on the
-schedule's explicit `post_backward_release_module()` call, which fires after
-`backward_dw()`:
+The overlap adapter passes `skip_forward_backward_hooks=True` to
+`fully_shard()`. `_register_hooks()` retains state-dict protection but skips
+the generic forward, backward, and per-parameter completion hooks. Reduction
+therefore relies entirely on the schedule's explicit
+`post_backward_release_module()` call, which fires after `backward_dw()`:
 
 ```python
 # In FsdpModule._register_hooks()
-if skip_backward_callback:
+if skip_forward_backward_hooks:
     return
-for group in self._parameter_groups:
-    if not group.requires_grad:
-        continue
-    for fsdp_parameter in group.fsdp_parameters:
-        fsdp_parameter.unsharded.register_post_accumulate_grad_hook(self._make_grad_hook())
 ```
 
-The adapter wires it as `skip_backward_cb = fine_grained and
-ddp_config.delay_wgrad_compute` (the flag only matters on the fine-grained
-path, where the schedule drives reduction explicitly).
+One integration switch is sufficient because the fine-grained schedule always
+owns the complete FSDP lifecycle, whether or not delayed wgrad is enabled. This
+also prevents a parameter-completion callback from racing the explicit release.
 
 ---
 
@@ -270,14 +268,13 @@ path, where the schedule drives reduction explicitly).
 | Method | Signature | Description |
 |---|---|---|
 | `pre_backward()` | `(register_final_callback: bool = True) -> None` | Backward-phase setup; the explicit schedule disables the autograd final callback. |
-| `post_backward()` | `() -> None` | Finalize backward: no-op unless BACKWARD phase; reduce+reshard this module, and any submodule `FsdpModule` still in the BACKWARD phase. |
+| `post_backward()` | `() -> None` | Idempotently finalize the current FSDP unit: reduce, reshard, reset gradient readiness, and return to RESTING. |
 
 ### New parameters on `fully_shard()`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `skip_forward_backward_hooks` | `bool` | `False` | Let an integration replace the standard module-level FSDP lifecycle hooks. |
-| `skip_backward_callback` | `bool` | `False` | Skip per-param `post_accumulate_grad_hook` for `delay_wgrad_compute`. |
+| `skip_forward_backward_hooks` | `bool` | `False` | Let an integration replace the standard forward, backward, and parameter-completion lifecycle hooks. |
 
 ### New methods on `FullyShardedDataParallelV2` (adapter)
 
@@ -288,7 +285,9 @@ which binds closures that operate on a passed `FsdpModule`:
 |---|---|---|
 | `_replace_param_with_raw_if_needed` | `() -> None` | Finalize the root context; no parameter swap is needed. |
 | `post_forward_release_module` | `(module) -> None` | Release forward-pass params (reshard only). |
-| `post_backward_release_module` | `(module) -> None` | Release backward-pass params (reshard + reduce). |
+| `post_backward_release_module` | `(module) -> None` | Descendant-first release of backward-pass params and gradients. |
+| `post_backward` | `() -> None` | Final descendant-first fallback sweep after one combined segment. |
+| `finish_grad_sync` | `() -> None` | Fence gradient consumers against asynchronous reduce-scatter completion. |
 | `no_sync()` | `() -> contextmanager` | Suppress gradient finalization for non-final microbatches. |
 | `_setup_1f1b_overlap_interface()` | `() -> None` | Bind the schedule-facing callbacks above. |
 
@@ -324,11 +323,11 @@ needed for the recomputed GEMMs) but never prefetch a successor.
 
 | File | Change |
 |---|---|
-| `experimental/module.py` | Public lifecycle APIs, optional standard lifecycle hooks, `skip_backward_callback`, recompute guard, phase transitions |
-| `experimental/fully_shard.py` | `skip_forward_backward_hooks` / `skip_backward_callback` integration controls |
+| `experimental/module.py` | Public lifecycle APIs, optional standard lifecycle hooks, recompute guard, phase transitions |
+| `experimental/fully_shard.py` | `skip_forward_backward_hooks` integration control |
 | `mcore_fsdp_adapter.py` | Fine-grained combined-1F1B hooks, adapter wiring, `no_sync()`, and `_setup_1f1b_overlap_interface()` |
 | `megatron_fsdp/utils.py` | Extend `find_megatron_fsdp()` |
-| `tests/unit_tests/distributed/mfsdp_v2/test_context.py` | Hook opt-out and explicit-release lifecycle tests |
+| `tests/unit_tests/distributed/mfsdp_v2/test_context.py` | Hook opt-out and gradient-readiness reset lifecycle tests |
 | `tests/unit_tests/distributed/mfsdp_v2/test_mcore_adapter.py` | Adapter-owned fine-grained hook execution and hierarchy test |
 | `tests/unit_tests/distributed/mfsdp_v2/test_mcore_nd_parallel.py` | End-to-end EP-overlap parity test |
 | `tests/unit_tests/distributed/mfsdp_v1/utils.py` | Shared GPT overlap-test construction and schedule-plan forward step |

@@ -179,7 +179,6 @@ class FsdpModule:
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
         skip_forward_backward_hooks: bool = False,
-        skip_backward_callback: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -217,10 +216,7 @@ class FsdpModule:
         self._num_trainable_parameters = sum(
             len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
         )
-        self._register_hooks(
-            skip_forward_backward_hooks=skip_forward_backward_hooks,
-            skip_backward_callback=skip_backward_callback,
-        )
+        self._register_hooks(skip_forward_backward_hooks=skip_forward_backward_hooks)
         context.register_module(self)
 
     @property
@@ -258,23 +254,23 @@ class FsdpModule:
         """Return whether this module is an outermost FsdpModule in its context."""
         return self._is_root
 
-    def _register_hooks(
-        self, skip_forward_backward_hooks: bool = False, skip_backward_callback: bool = False
-    ) -> None:
+    def _register_hooks(self, skip_forward_backward_hooks: bool = False) -> None:
         module = cast(nn.Module, self)
         module.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
-        if not skip_forward_backward_hooks:
-            # Use PyTorch's callback module argument instead of capturing self so
-            # these hooks do not retain a deleted FSDP module.
-            module.register_forward_pre_hook(
-                lambda hooked_module, _args: cast(FsdpModule, hooked_module).pre_forward()
-            )
-            module.register_forward_hook(
-                lambda hooked_module, _args, _output: cast(FsdpModule, hooked_module).post_forward()
-            )
-            module.register_full_backward_pre_hook(
-                lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
-            )
+        if skip_forward_backward_hooks:
+            return
+
+        # Use PyTorch's callback module argument instead of capturing self so
+        # these hooks do not retain a deleted FSDP module.
+        module.register_forward_pre_hook(
+            lambda hooked_module, _args: cast(FsdpModule, hooked_module).pre_forward()
+        )
+        module.register_forward_hook(
+            lambda hooked_module, _args, _output: cast(FsdpModule, hooked_module).post_forward()
+        )
+        module.register_full_backward_pre_hook(
+            lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
+        )
         if self._num_trainable_parameters == 0:
             if not skip_forward_backward_hooks:
                 module.register_full_backward_hook(
@@ -282,9 +278,6 @@ class FsdpModule:
                         FsdpModule, hooked_module
                     ).post_backward()
                 )
-            return
-
-        if skip_backward_callback:
             return
 
         # Gradient reduction for trainable parameters is parameter-completion
@@ -416,7 +409,7 @@ class FsdpModule:
 
         Args:
             register_final_callback: Whether to finalize through the autograd engine.
-                Manual backward schedules (the 1F1B EP overlap schedule) finalize
+                Manual backward schedules (e.g. 1F1B EP overlap schedule) finalize
                 explicitly in ``post_backward()``, so they pass False to avoid
                 installing an autograd callback outside the backward pass.
         """
@@ -447,24 +440,16 @@ class FsdpModule:
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state.
 
-        No-op unless this module is in the BACKWARD phase (idempotent). Any
-        submodule FsdpModule still in the BACKWARD phase (e.g. the 1F1B schedule
-        skipped its per-module release) is finalized first.
+        No-op unless this module is in the BACKWARD phase (idempotent). Schedule
+        integrations are responsible for finalizing any nested FSDP units.
         """
         if self.phase is not FsdpModule.Phase.BACKWARD:
             return
-        # The 1F1B schedule may skip a per-module release; finalize any submodule
-        # still in the BACKWARD phase (excluding this module itself).
-        for module in reversed(list(cast(nn.Module, self).modules())):
-            if module is self:
-                continue
-            if isinstance(module, FsdpModule) and module.phase is FsdpModule.Phase.BACKWARD:
-                module.post_backward()
         self._reduce_gradient_groups()
         self._reshard_parameter_groups()
         self.phase = FsdpModule.Phase.RESTING
-        # 1F1B cooldown can run consecutive backward passes without an intervening
-        # pre_forward(), so reset the hook counter as soon as this pass is finalized.
+        # Multiple forwards may precede consecutive backwards in pipeline schedules,
+        # so each completed backward must start the next readiness count from zero.
         self._num_ready_grad_parameters = 0
         torch.cuda.nvtx.range_pop()
 

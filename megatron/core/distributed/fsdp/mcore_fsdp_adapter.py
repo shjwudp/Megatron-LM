@@ -16,7 +16,7 @@ import logging
 import random
 from contextlib import contextmanager
 from functools import partial
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type, cast
 from weakref import ref
 
 __all__ = ["FullyShardedDataParallel"]
@@ -624,7 +624,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
         fine_grained = config.overlap_moe_expert_parallel_comm
-        skip_backward_cb = fine_grained and ddp_config.delay_wgrad_compute
 
         def shard_module(
             module_to_shard: nn.Module, mesh: DeviceMesh, grad_divisor: int = 1
@@ -637,7 +636,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 mixed_precision_policy=self.mp_policy,
                 grad_divisor=grad_divisor,
                 skip_forward_backward_hooks=fine_grained,
-                skip_backward_callback=skip_backward_cb,
             )
             if fine_grained:
                 assert isinstance(module_to_shard, FsdpModule)
@@ -683,10 +681,17 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             return module
 
+        def finalize_backward(module: torch.nn.Module) -> None:
+            """Finalize one schedule unit and any nested FSDP units exactly once."""
+            module = _require_fsdp_module(module)
+            for fsdp_module in reversed(list(cast(nn.Module, module).modules())):
+                if isinstance(fsdp_module, FsdpModule):
+                    fsdp_module.post_backward()
+
         def release_module(module: torch.nn.Module, *, reduce_grad: bool) -> None:
             module = _require_fsdp_module(module)
             if reduce_grad:
-                module.post_backward()
+                finalize_backward(module)
             else:
                 module._reshard_parameter_groups()
 
@@ -700,11 +705,16 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             """
             self.module.context.ensure_finalized()
 
+        def post_backward() -> None:
+            # Sweep the root after each combined segment in case the schedule skipped
+            # a per-layer release. FsdpModule.post_backward() is idempotent.
+            finalize_backward(self.module)
+
         self._replace_param_with_raw_if_needed = _replace_param_with_raw_if_needed
         self.post_forward_release_module = partial(release_module, reduce_grad=False)
         self.post_backward_release_module = partial(release_module, reduce_grad=True)
         self.pre_backward = partial(self.module.pre_backward, register_final_callback=False)
-        self.post_backward = self.module.post_backward
+        self.post_backward = post_backward
 
     @staticmethod
     def _validate_config(
@@ -839,7 +849,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """MFSDP v2 reduces gradients during backward."""
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
-        """MFSDP v2 gradient reduction is complete when backward returns."""
+        """Wait for backward reduce-scatters before gradient consumers run."""
+        context = self.module.context
+        context.current_stream().wait_stream(context.reduce_scatter_stream)
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""
