@@ -198,9 +198,12 @@ class TracePoolAllocator:
         """Compile recorded lifetimes and enter the optimized phase.
 
         CUDA work is synchronized once at this trace-to-optimized boundary.
-        After final slots have claimed their allocations, unused caching-
-        allocator blocks are released. Later batches rebuild any non-FSDP
-        cache around the fixed pool without further trimming.
+        Symmetric-memory slots cannot reuse blocks held by the default CUDA
+        caching allocator, so inactive default-pool blocks are released before
+        materializing a symmetric plan. After final slots have claimed their
+        allocations, unused caching-allocator blocks are released for both
+        backends. Later batches rebuild any non-FSDP cache around the fixed pool
+        without further trimming.
 
         Returns:
             Number of bytes owned by the persistent pool.
@@ -235,6 +238,15 @@ class TracePoolAllocator:
             required_slots.extend((capacity, dtype, device, arena) for capacity in capacities)
             for key, color in colors.items():
                 key_to_required_slot[key] = offset + color
+
+        if self._use_symmetric_memory:
+            # ncclMemAlloc cannot claim inactive blocks still reserved by the
+            # default CUDA caching allocator. Planning is synchronized and has
+            # no live trace-pool keys, so release those cached blocks once before
+            # growing the persistent symmetric slots.
+            for device in cuda_devices:
+                with torch.cuda.device(device):
+                    torch.cuda.empty_cache()
 
         self._materialize_plan(required_slots)
         self._key_to_slot = key_to_required_slot
