@@ -6,12 +6,15 @@ Train the same small GPT model under M-FSDP v2 and the distributed-optimizer
 reference, then compare per-step losses and parameter snapshots.
 """
 
+from collections import Counter
+
 import pytest
 import torch
 from torch.distributed.tensor import DTensor
 from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import module as fsdp_module_impl
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     gather_and_compute_chunk_metadata,
     uneven_dtensor_to_full_tensor,
@@ -78,7 +81,15 @@ class TestMfsdpV2OverlapParity:
                         tensor.copy_(reference)
 
     @classmethod
-    def _run_training(cls, use_mfsdp_v2, case, initial_parameters=None):
+    def _run_training(
+        cls,
+        use_mfsdp_v2,
+        case,
+        initial_parameters=None,
+        model_setup=None,
+        num_steps=None,
+    ):
+        num_steps = cls.NUM_STEPS if num_steps is None else num_steps
         model_parallel_config = case["model_parallel_config"]
         Utils.initialize_model_parallel(**model_parallel_config)
         data_parallel_group = mpu.get_data_parallel_group()
@@ -101,7 +112,7 @@ class TestMfsdpV2OverlapParity:
                 vocab_size=cls.VOCAB_SIZE,
                 padded_vocab_size=cls.VOCAB_SIZE,
                 seq_length=cls.SEQUENCE_LENGTH,
-                train_iters=cls.NUM_STEPS,
+                train_iters=num_steps,
                 gradient_accumulation_fusion=False,
                 use_distributed_optimizer=not use_mfsdp_v2,
                 **model_parallel_config,
@@ -112,11 +123,13 @@ class TestMfsdpV2OverlapParity:
                 cls._load_parameters(model, initial_parameters)
                 for sub_optimizer in getattr(optimizer, "chained_optimizers", [optimizer]):
                     sub_optimizer._copy_main_params_to_model_params()
+            if model_setup is not None:
+                model_setup(model)
 
             captured_initial_parameters = cls._capture_parameters(model)
             data_iterator = make_gpt_mock_data_iterator(
                 dp_group=data_parallel_group,
-                num_samples=cls.GLOBAL_BATCH_SIZE * cls.NUM_STEPS,
+                num_samples=cls.GLOBAL_BATCH_SIZE * num_steps,
                 vocab_size=cls.VOCAB_SIZE,
                 sequence_length=cls.SEQUENCE_LENGTH,
                 batch_size=cls.MICRO_BATCH_SIZE,
@@ -126,7 +139,7 @@ class TestMfsdpV2OverlapParity:
             parameter_snapshots = []
             run_name = "MFSDP v2" if use_mfsdp_v2 else "Reference"
 
-            for step in range(cls.NUM_STEPS):
+            for step in range(num_steps):
                 optimizer.zero_grad()
                 output = pretrain_forward_backward(
                     model=model,
@@ -144,7 +157,7 @@ class TestMfsdpV2OverlapParity:
                     grad_norm_text = "None" if grad_norm is None else f"{float(grad_norm):.8f}"
                     print(
                         f"[{case['name']}][{run_name}] "
-                        f"step={step + 1}/{cls.NUM_STEPS} "
+                        f"step={step + 1}/{num_steps} "
                         f"loss={loss.item():.8f} grad_norm={grad_norm_text} "
                         f"update_successful={update_successful}",
                         flush=True,
@@ -158,6 +171,94 @@ class TestMfsdpV2OverlapParity:
             }
         finally:
             Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Requires PyTorch 2.4.0 or newer."
+    )
+    def test_trace_fine_grained_hook_invocations(self, monkeypatch):
+        """Print the descendant hooks actually reached by one combined-1F1B step."""
+        if not is_te_min_version("2.3.0"):
+            pytest.skip("1F1B expert-parallel overlap requires Transformer Engine 2.3.0 or newer.")
+
+        module_names = {}
+        registered_forward = []
+        registered_backward = []
+        invoked_forward = []
+        invoked_backward = []
+        original_forward = fsdp_module_impl._fine_grained_pre_forward_hook
+        original_backward = fsdp_module_impl._fine_grained_pre_backward_hook
+
+        def describe(submodule):
+            target = fsdp_module_impl._find_fsdp_target(submodule)
+            return (
+                module_names.get(id(submodule), type(submodule).__name__),
+                module_names.get(id(target), type(target).__name__ if target is not None else None),
+            )
+
+        def trace_forward(submodule, args, kwargs):
+            invoked_forward.append(describe(submodule))
+            return original_forward(submodule, args, kwargs)
+
+        def trace_backward(submodule, grad_output):
+            invoked_backward.append(describe(submodule))
+            return original_backward(submodule, grad_output)
+
+        monkeypatch.setattr(fsdp_module_impl, "_fine_grained_pre_forward_hook", trace_forward)
+        monkeypatch.setattr(fsdp_module_impl, "_fine_grained_pre_backward_hook", trace_backward)
+
+        def record_registered_hooks(model):
+            for chunk_index, model_chunk in enumerate(model):
+                for name, submodule in model_chunk.named_modules():
+                    qualified_name = f"{chunk_index}.{name}" if name else str(chunk_index)
+                    module_names[id(submodule)] = qualified_name
+                    if trace_forward in submodule._forward_pre_hooks.values():
+                        registered_forward.append(qualified_name)
+                    if trace_backward in submodule._backward_pre_hooks.values():
+                        registered_backward.append(qualified_name)
+
+        case = {
+            "name": "EP2 optim_grads_params 1F1B hook trace",
+            "model_family": "gpt",
+            "model_parallel_config": {"expert_model_parallel_size": 2},
+            "model_config": {
+                "bf16": True,
+                "data_parallel_sharding_strategy": "optim_grads_params",
+                "clip_grad": 0.0,
+                "megatron_fsdp_main_grads_dtype": torch.float32,
+                "moe_grouped_gemm": True,
+                "moe_token_dispatcher_type": "alltoall",
+                "overlap_moe_expert_parallel_comm": True,
+                "delay_wgrad_compute": True,
+            },
+        }
+        self._run_training(
+            use_mfsdp_v2=True,
+            case=case,
+            model_setup=record_registered_hooks,
+            num_steps=1,
+        )
+
+        rank = torch.distributed.get_rank()
+        for hook_kind, registered, invoked in (
+            ("forward", registered_forward, invoked_forward),
+            ("backward", registered_backward, invoked_backward),
+        ):
+            print(
+                f"FSDP_FINE_HOOK_REGISTERED rank={rank} kind={hook_kind} "
+                f"modules={registered}",
+                flush=True,
+            )
+            for (submodule_name, target_name), count in sorted(Counter(invoked).items()):
+                print(
+                    f"FSDP_FINE_HOOK_INVOKED rank={rank} kind={hook_kind} "
+                    f"submodule={submodule_name} target={target_name} count={count}",
+                    flush=True,
+                )
+
+        assert registered_forward
+        assert registered_backward
+        assert invoked_forward
+        assert invoked_backward
 
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"), reason="Requires PyTorch 2.4.0 or newer."
