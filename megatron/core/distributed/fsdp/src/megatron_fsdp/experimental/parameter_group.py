@@ -353,9 +353,15 @@ class FsdpParameterGroup:
             fsdp_parameter.unsharded.grad = None
 
     def _has_sharded_grads(self) -> bool:
+        # Delayed-wgrad parameters (TE's ``skip_backward_post_hook``) materialize
+        # their gradient in ``backward_dw()`` on a separate stream and are consumed
+        # from ``unsharded.grad``; their ``sharded.grad`` is legitimately ``None``
+        # at reduce time, so exclude them from the all-set-or-all-None invariant.
         has_any_grad = False
         has_any_missing_grad = False
         for fsdp_parameter in self.fsdp_parameters:
+            if getattr(fsdp_parameter.unsharded, "skip_backward_post_hook", False):
+                continue
             if fsdp_parameter.sharded.grad is None:
                 has_any_missing_grad = True
             else:

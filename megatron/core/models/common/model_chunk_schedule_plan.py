@@ -18,6 +18,29 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
+def _resolve_fsdp_root(model: Any) -> Optional[FsdpModule]:
+    """Return the outermost ``FsdpModule`` (root unit) for a schedule model.
+
+    An M-FSDP v2 model chunk wraps the root model as ``adapter ->
+    Float16Module(FsdpModule) -> GPTModel``. The schedule plan is built on the
+    inner ``GPTModel``, so walking ``.module`` downward never reaches the FSDP
+    root unit (which owns the embedding, final norm, and lm head). Every
+    ``FsdpModule`` descendant shares one ``FsdpContext`` whose forward order
+    always begins with the root unit, so we resolve it from there.
+    """
+    if isinstance(model, FsdpModule):
+        return model
+    if model is None:
+        return None
+    for submodule in model.modules():
+        if isinstance(submodule, FsdpModule):
+            for candidate in submodule.context.forward_order:
+                if candidate.is_root():
+                    return candidate
+            return None
+    return None
+
+
 class ModelChunkState:
     """State shared across a model chunk.
 
@@ -309,13 +332,22 @@ class TransformerLayerSchedulePlan:
             with f_layer.get_fp8_context():
                 f_input = f_layer.mtp_post_process.forward(f_input)
 
-        if f_layer and isinstance(f_layer.layer, FsdpModule):
-            f_layer.layer.post_forward()
+        # NOTE: May cause b_layer.pre_dispatch_computation.backward_dw fail
+        # if f_layer and isinstance(f_layer.layer, FsdpModule):
+        #     f_layer.layer.post_forward()
 
         # Delay the last pre_dispatch_computation wgrad in backward pass (wgrad
         # of the first layer) for overlapping with the p2p comm.
         if b_layer is not None and not is_last_layer_in_bwd:
             b_layer.pre_dispatch_computation.backward_dw()
+
+        # if b_layer and isinstance(b_layer.layer, FsdpModule):
+        #     for fsdp_module in b_layer.layer.modules():
+        #         if isinstance(fsdp_module, FsdpModule):
+        #             fsdp_module.post_backward()
+
+        if f_layer and isinstance(f_layer.layer, FsdpModule):
+            f_layer.layer.post_forward()
 
         return f_input, b_grad
 
@@ -550,6 +582,25 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         Returns:
             The output of the forward pass.
         """
+        f_model = f_schedule_plan.state.model if f_schedule_plan is not None else None
+        b_model = b_schedule_plan.state.model if b_schedule_plan is not None else None
+        # Resolve the root FsdpModule (the model chunk's adapter wraps it, so
+        # ``state.model`` may not itself be an FsdpModule). Drive the root unit's
+        # lifecycle before any pre-process compute. The final backward-only call
+        # has no forward plan, so fall back to the backward model: its pre_forward
+        # resets the grad-readiness counter that post_backward needs to fire for
+        # the last microbatch's reduce-scatter.
+        f_fsdp = _resolve_fsdp_root(f_model)
+        b_fsdp = _resolve_fsdp_root(b_model)
+        root_fsdp = f_fsdp if f_fsdp is not None else b_fsdp
+        # The root FsdpModule owns the embedding, final norm, and lm head. Its
+        # parameters are shared by this call's forward and backward passes (they
+        # interleave), so the phase machine cannot reshard between them. Drive the
+        # root once: pre_forward unshards it (FORWARD); the parameter-readiness
+        # counter fires post_backward (FORWARD -> RESTING) once every root grad is
+        # ready, resharding and reduce-scattering at the call boundary.
+        if root_fsdp is not None:
+            root_fsdp.pre_backward()
         f_input = None
         if f_schedule_plan:
             # pp output send/receive sync
@@ -637,6 +688,18 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # pre process backward
         if b_schedule_plan is not None:
             b_schedule_plan.pre_process.backward(b_grad)
+
+        # # When this call has no backward (pure-forward warmup), the readiness
+        # # counter never fires, so reshard the root explicitly so the next call
+        # # starts from RESTING (avoiding an invalid FORWARD -> FORWARD phase
+        # # transition on the next pre_forward).
+        # if root_fsdp is not None and b_schedule_plan is None:
+        #     root_fsdp.post_backward()
+
+        # Order gradient consumers (optimizer) after the root unit's finalize
+        # reduce-scatter, which the parameter-readiness counter launched.
+        if root_fsdp is not None:
+            root_fsdp.context.current_stream().wait_stream(root_fsdp.context.reduce_scatter_stream)
 
         if f_schedule_plan:
             f_schedule_plan.wait_current_stream()
