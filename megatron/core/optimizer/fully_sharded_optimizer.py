@@ -137,6 +137,43 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer and restore MFSDP gradient dtypes."""
+        # --- DEBUG: total gradient-norm probe (remove before commit) ---
+        # Rank-0 local L2 norm of the effective grads, split dense vs expert
+        # (expert = owning group has grad_divisor>1). Compare across runs at the
+        # same sharding: a uniform small value => scaling; expert-only small =>
+        # experts not learning.
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            try:
+                import math
+                from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+                    get_containing_parameter_group,
+                )
+
+                total_sq = dense_sq = expert_sq = 0.0
+                ngrad = 0
+                for _p in self.get_parameters():
+                    _g = _p.grad
+                    if _g is None:
+                        continue
+                    if getattr(_p, "__fsdp_param__", False) and hasattr(_g, "_local_tensor"):
+                        _g = _g._local_tensor
+                    _g = _g.detach().float()
+                    _s = float(_g.square().sum().item())
+                    total_sq += _s
+                    _pg = get_containing_parameter_group(_p)
+                    if _pg is not None and getattr(_pg, "grad_divisor", 1) > 1:
+                        expert_sq += _s
+                    else:
+                        dense_sq += _s
+                    ngrad += 1
+                print(
+                    f"[GN-DEBUG] total={math.sqrt(total_sq):.6e} "
+                    f"dense={math.sqrt(dense_sq):.6e} expert={math.sqrt(expert_sq):.6e} "
+                    f"ngrad={ngrad}",
+                    flush=True,
+                )
+            except Exception as _e:
+                print(f"[GN-DEBUG] err {type(_e).__name__}: {_e}", flush=True)
         success = super().step_with_ready_grads()
         for parameter, original_grad in self._casted_grads:
             parameter.grad = None

@@ -43,6 +43,10 @@ def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGro
     return parameter_group_ref()
 
 
+# --- DEBUG: gradient-accumulation probe state (remove before commit) ---
+_PROBE_ACC = {"dense": {"id": None}, "expert": {"id": None}}
+
+
 def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> None:
     """Sync MFSDP compute weights for parameter groups represented by ``parameters``.
 
@@ -440,6 +444,30 @@ class FsdpParameterGroup:
                 self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
             else:
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
+
+        # --- DEBUG: gradient-accumulation probe (remove before commit) ---
+        # Logs a representative dense and expert group's main_grad norm each
+        # microbatch. If accumulation works this grows ~linearly across the
+        # num_microbatches; if it overwrites instead it stays flat.
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_rank() == 0
+            and self.main_grad is not None
+        ):
+            kind = "expert" if self.grad_divisor > 1 else "dense"
+            entry = _PROBE_ACC[kind]
+            if entry["id"] is None:
+                entry["id"] = id(self)
+            if id(self) == entry["id"]:
+                try:
+                    _norm = float(self.main_grad.local_buffer.float().norm().item())
+                except Exception:
+                    _norm = float("nan")
+                print(
+                    f"[ACC-DEBUG] kind={kind} is_last={int(is_last_microbatch)} "
+                    f"main_grad_norm={_norm:.6e}",
+                    flush=True,
+                )
 
         if is_last_microbatch:
             # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
