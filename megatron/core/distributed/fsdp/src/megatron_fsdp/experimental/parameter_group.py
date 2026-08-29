@@ -247,8 +247,13 @@ class FsdpParameterGroup:
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
-            if main_grad_dtype:
-                sharded_parameter.grad_dtype = main_grad_dtype
+            # Leave grad_dtype unconstrained (None) on the main-weight view. The
+            # fused grouped-GEMM delayed-wgrad path assigns an FP32 wgrad directly
+            # to this FP32 tensor; a BF16 grad_dtype would reject that assignment
+            # (RuntimeError: float grad to BF16 grad_dtype). The optimizer's
+            # _copy_model_grads_to_main_grads casts the (BF16) reduced main-grad to
+            # the FP32 data dtype as needed, so unconstrained grad_dtype is safe.
+            sharded_parameter.grad_dtype = None
             setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
             fsdp_parameters.append(
                 FsdpParameter(fqns=tuple(fqns), sharded=sharded_parameter, unsharded=parameter)
