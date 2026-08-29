@@ -317,18 +317,15 @@ class FsdpModule:
             if not group.requires_grad:
                 continue
             for fsdp_parameter in group.fsdp_parameters:
-                parameter = fsdp_parameter.unsharded
-                # ``skip_backward_post_hook`` is TE's delayed-wgrad contract: these
-                # gradients are materialized by ``backward_dw()``, not autograd.
-                if not getattr(parameter, "skip_backward_post_hook", False):
-                    parameter.register_post_accumulate_grad_hook(grad_hook)
-                    continue
-
-                module_fqn, _, _ = fsdp_parameter.fqns[0].rpartition(".")
-                parameter_module = module.get_submodule(module_fqn) if module_fqn else module
-                parameter_module.register_wgrad_accumulation_and_reduce_hooks(
-                    lambda parameter=parameter: grad_hook(parameter)
-                )
+                # Register the standard grad-completion hook on every param,
+                # including TE's delayed-wgrad (skip_backward_post_hook) expert
+                # weights: the post_accumulate hook fires once their grad is
+                # installed, so the readiness counter completes and the experts
+                # are reduced. Routing those params to the separate
+                # register_wgrad_accumulation_and_reduce_hooks path only completes
+                # the counter when backward_dw() fires, which the 1F1B EP-overlap
+                # schedule does not drive per-microbatch -> experts frozen.
+                fsdp_parameter.unsharded.register_post_accumulate_grad_hook(grad_hook)
 
     @staticmethod
     def _pre_load_state_dict(
