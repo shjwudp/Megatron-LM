@@ -291,6 +291,22 @@ class FsdpModule:
             if module is None:
                 return
             module._num_ready_grad_parameters += 1
+            # --- DEBUG: expert-module timing probe (remove before commit) ---
+            _is_expert = any(
+                getattr(g, "grad_divisor", 1) > 1 for g in module._parameter_groups
+            )
+            if (
+                _is_expert
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_rank() == 0
+            ):
+                print(
+                    f"[EXH-DEBUG] name={module.name!r} phase={module.phase} "
+                    f"ready={module._num_ready_grad_parameters}/"
+                    f"{module._num_trainable_parameters} "
+                    f"manual_finalize={module._manual_backward_finalize}",
+                    flush=True,
+                )
             if (
                 module._num_ready_grad_parameters == module._num_trainable_parameters
                 and not module._manual_backward_finalize
@@ -465,6 +481,19 @@ class FsdpModule:
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
+        # --- DEBUG: expert-module timing probe (remove before commit) ---
+        _is_expert = any(getattr(g, "grad_divisor", 1) > 1 for g in self._parameter_groups)
+        if (
+            _is_expert
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_rank() == 0
+        ):
+            print(
+                f"[PB-DEBUG] name={self.name!r} phase={self.phase} "
+                f"will_reduce={self.phase is FsdpModule.Phase.BACKWARD} "
+                f"ready={self._num_ready_grad_parameters}/{self._num_trainable_parameters}",
+                flush=True,
+            )
         if self.phase is not FsdpModule.Phase.BACKWARD:
             return
         self._reduce_gradient_groups()
