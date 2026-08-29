@@ -234,6 +234,13 @@ class FsdpParameterGroup:
             else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
+            # TE's delayed-wgrad (skip_backward_post_hook) path computes the weight
+            # gradient in FP32 (backward_dw) and assigns it directly. Leave the
+            # compute-weight grad_dtype unconstrained so that FP32 assignment is not
+            # rejected against the BF16 tensor; the reduce-scatter later packs it into
+            # the main-grad buffer (which downcasts as needed).
+            if getattr(parameter, "skip_backward_post_hook", False):
+                parameter.grad_dtype = None
             # Parameter-owned markers must not retain their FSDP module tree.
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
