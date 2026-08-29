@@ -317,15 +317,22 @@ class FsdpModule:
             if not group.requires_grad:
                 continue
             for fsdp_parameter in group.fsdp_parameters:
-                # Register the standard grad-completion hook on every param,
-                # including TE's delayed-wgrad (skip_backward_post_hook) expert
-                # weights: the post_accumulate hook fires once their grad is
-                # installed, so the readiness counter completes and the experts
-                # are reduced. Routing those params to the separate
-                # register_wgrad_accumulation_and_reduce_hooks path only completes
-                # the counter when backward_dw() fires, which the 1F1B EP-overlap
-                # schedule does not drive per-microbatch -> experts frozen.
-                fsdp_parameter.unsharded.register_post_accumulate_grad_hook(grad_hook)
+                parameter = fsdp_parameter.unsharded
+                # ``skip_backward_post_hook`` is TE's delayed-wgrad contract: these
+                # gradients are materialized by ``backward_dw()``, not autograd, so
+                # the readiness counter must be driven by the delayed-wgrad hook
+                # (register_wgrad_accumulation_and_reduce_hooks), which fires inside
+                # backward_dw() -- i.e. AFTER the gradient actually exists. Using the
+                # normal post_accumulate_grad_hook here would complete the counter
+                # before backward_dw() populates the grad (stale/None at reduce time).
+                if not getattr(parameter, "skip_backward_post_hook", False):
+                    parameter.register_post_accumulate_grad_hook(grad_hook)
+                    continue
+                module_fqn, _, _ = fsdp_parameter.fqns[0].rpartition(".")
+                parameter_module = module.get_submodule(module_fqn) if module_fqn else module
+                parameter_module.register_wgrad_accumulation_and_reduce_hooks(
+                    lambda parameter=parameter: grad_hook(parameter)
+                )
 
     @staticmethod
     def _pre_load_state_dict(
@@ -448,6 +455,13 @@ class FsdpModule:
         """
         self._manual_backward_finalize |= manual_finalize
         self.phase = FsdpModule.Phase.BACKWARD
+        # Re-arm the grad-readiness counter for this microbatch's backward. The
+        # 1F1B EP-overlap schedule drives pre_backward on every nested FSDP unit
+        # (incl. the MoE experts) but calls pre_forward only on the top layer, so
+        # the counter would otherwise only reset at the head module and the expert
+        # units would never re-complete it (frozen). Resetting here arms every
+        # sub-unit for each backward.
+        self._num_ready_grad_parameters = 0
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
