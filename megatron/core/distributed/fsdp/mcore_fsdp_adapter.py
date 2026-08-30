@@ -574,8 +574,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         ):
             # The 1F1B EP-overlap schedule drives the FsdpModule lifecycle explicitly
             # (pre_forward/pre_backward/post_forward) and calls submodules directly, so
-            # suppress the module's own forward/backward hooks to avoid double-driving.
-            skip_forward_backward_hooks = config.overlap_moe_expert_parallel_comm
+            # the context's custom_forward_backward_hooks flag suppresses the module's
+            # own forward/backward hooks to avoid double-driving.
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
                 # Their gradients need the EP divisor because the same expert receives
@@ -588,7 +588,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             placements=placements,
                             mixed_precision_policy=self.mp_policy,
                             grad_divisor=config.expert_model_parallel_size,
-                            skip_forward_backward_hooks=skip_forward_backward_hooks,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -601,14 +600,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         mesh=dp_mesh,
                         placements=placements,
                         mixed_precision_policy=self.mp_policy,
-                        skip_forward_backward_hooks=skip_forward_backward_hooks,
                     )
             fully_shard(
-                module,
-                mesh=dp_mesh,
-                placements=placements,
-                mixed_precision_policy=self.mp_policy,
-                skip_forward_backward_hooks=skip_forward_backward_hooks,
+                module, mesh=dp_mesh, placements=placements, mixed_precision_policy=self.mp_policy
             )
 
         if config.overlap_moe_expert_parallel_comm:

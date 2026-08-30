@@ -49,7 +49,7 @@ class FsdpContext:
     # The 1F1B EP-overlap schedule drives the FsdpModule forward/backward lifecycle
     # explicitly (custom forward-backward hooks), so the standard RESTING/FORWARD/
     # BACKWARD phase-transition invariants do not hold. When set, the phase check in
-    # FsdpModule.set_phase() is relaxed (used by skip_forward_backward_hooks).
+    # FsdpModule.set_phase() is relaxed (this is the 1F1B EP-overlap path).
     custom_forward_backward_hooks: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
@@ -188,7 +188,6 @@ class FsdpModule:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
-        skip_forward_backward_hooks: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -196,7 +195,6 @@ class FsdpModule:
         self._name = None
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
-        self._skip_forward_backward_hooks = skip_forward_backward_hooks
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
@@ -247,8 +245,8 @@ class FsdpModule:
         The 1F1B EP-overlap schedule drives the lifecycle explicitly with custom
         forward-backward hooks, so its RESTING/FORWARD/BACKWARD transitions do not
         follow the strict pairwise invariants defined here. When the context has
-        ``custom_forward_backward_hooks`` set (the skip_forward_backward_hooks /
-        overlap path), the transition check is relaxed.
+        ``custom_forward_backward_hooks`` set (the 1F1B EP-overlap path), the
+        transition check is relaxed.
         """
         allowed_transitions = {
             (FsdpModule.Phase.RESTING, FsdpModule.Phase.FORWARD),
@@ -278,7 +276,7 @@ class FsdpModule:
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
         module.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
-        if not self._skip_forward_backward_hooks:
+        if not self.context.custom_forward_backward_hooks:
             # Use PyTorch's callback module argument instead of capturing self so
             # these hooks do not retain a deleted FSDP module.
             module.register_forward_pre_hook(
@@ -456,7 +454,7 @@ class FsdpModule:
             # backward (it launches its own GraphTasks), so suppress it there; the
             # caller coordinates the reducer stream instead. Skip the callback also
             # when hooks are skipped (the 1F1B overlap path).
-            if not self._skip_forward_backward_hooks:
+            if not self.context.custom_forward_backward_hooks:
                 context.register_post_backward_final_callback()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is

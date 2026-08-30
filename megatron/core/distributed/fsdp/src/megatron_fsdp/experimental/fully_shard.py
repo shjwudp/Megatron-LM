@@ -113,7 +113,6 @@ def fully_shard(
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
     grad_divisor: int = 1,
-    skip_forward_backward_hooks: bool = False,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -166,7 +165,6 @@ def fully_shard(
             mixed_precision_policy=mixed_precision_policy,
             grad_divisor=grad_divisor,
             use_symmetric_memory=context.use_symmetric_memory,
-            skip_forward_backward_hooks=skip_forward_backward_hooks,
         )
     except Exception:
         module.__class__ = original_cls
