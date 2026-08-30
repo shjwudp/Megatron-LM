@@ -474,7 +474,18 @@ class FsdpModule:
             next_module._unshard_parameter_groups()
 
     def post_backward(self) -> None:
-        """Reduce gradients and return parameters to their sharded resting state."""
+        """Reduce gradients and return parameters to their sharded resting state.
+
+        Idempotence guard (the ``if self.phase is not BACKWARD: return`` above):
+        ``post_backward`` runs ``_reduce_gradient_groups`` and ``_reshard_parameter_groups``,
+        which are only valid while this unit is actually in its BACKWARD pass. It can be
+        invoked from two places: the parameter-readiness counter (``grad_hook``, once every
+        owned parameter's grad has accumulated) and, for the 1F1B EP-overlap/reschedule
+        path, a parent unit finalizing any child FsdpModule left in the BACKWARD phase. The
+        guard makes the call a no-op if the unit has already been finalized (phase !=
+        BACKWARD), so the counter-driven and parent-driven calls compose safely and the
+        reduce/reshard never runs in FORWARD or RESTING.
+        """
         if self.phase is not FsdpModule.Phase.BACKWARD:
             return
         # Match the main-branch ordering: reshard first (releases the unsharded
