@@ -15,6 +15,7 @@
 import logging
 import random
 from contextlib import contextmanager
+from functools import partial
 from typing import Dict, List, Optional, Tuple, Type
 
 __all__ = ["FullyShardedDataParallel"]
@@ -39,10 +40,16 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
+
+try:
+    from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
+except ImportError:
+    TransformerEngineBaseModule = ()
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import (
@@ -56,6 +63,9 @@ try:
         fully_shard_context,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+        ResetParametersContext,
+    )
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -63,6 +73,20 @@ except ImportError as import_megatron_fsdp_error:
     HAVE_MEGATRON_FSDP = False
 
 logger = logging.getLogger(__name__)
+
+_PERSISTENT_PARAMETER_ATTRIBUTES = (
+    "shared_embedding",
+    "skip_backward_post_hook",
+    "tensor_model_parallel",
+)
+
+
+def copy_mcore_parameter_attributes(destination: nn.Parameter, source: nn.Parameter) -> None:
+    """Copy MCore metadata when replacing a model parameter object."""
+    destination.requires_grad_(source.requires_grad)
+    for attribute in _PERSISTENT_PARAMETER_ATTRIBUTES:
+        if hasattr(source, attribute):
+            setattr(destination, attribute, getattr(source, attribute))
 
 
 class FullyShardedDataParallelV1(_BaseDataParallel):
@@ -491,6 +515,77 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
 class FullyShardedDataParallelV2(_BaseDataParallel):
     """MFSDP v2 wrapper for the Megatron model."""
 
+    def _reset_meta_parameters_before_fully_shard(
+        module: torch.nn.Module,
+        device: torch.device,
+        init_param_with_fp8: bool,
+    ) -> None:
+        """Materialize and reset parameters owned by one prospective FSDP unit.
+
+        Resetting before ``fully_shard`` is required for modules such as
+        Transformer Engine FP8 linears: meta construction creates ordinary
+        ``Parameter`` objects, while ``reset_parameters`` replaces them with
+        quantized parameters and records their preserved initialization values.
+        Child FSDP units have already been initialized and sharded, so their
+        subtrees are skipped.
+        """
+
+        def visit(submodule: torch.nn.Module) -> None:
+            if isinstance(submodule, FsdpModule):
+                return
+
+            old_parameters = dict(
+                submodule.named_parameters(recurse=False, remove_duplicate=False)
+            )
+            if any(parameter.is_meta for parameter in old_parameters.values()):
+                reset_parameters = getattr(submodule, "reset_parameters", None)
+                if reset_parameters is None:
+                    reset_parameters = getattr(submodule, "_reset_parameters", None)
+                if reset_parameters is None:
+                    raise ValueError(
+                        "init_model_with_meta_device=True requires every module with "
+                        f"meta parameters to define reset_parameters or _reset_parameters; "
+                        f"got {type(submodule).__qualname__}."
+                    )
+
+                submodule.to_empty(device=device, recurse=False)
+                with ResetParametersContext(
+                    init_param_with_fp8=init_param_with_fp8,
+                    with_cuda_rng_tracker=(
+                        is_te_min_version("0.9.0")
+                        and not isinstance(submodule, TransformerEngineBaseModule)
+                    ),
+                ):
+                    reset_parameters()
+
+                new_parameters = dict(
+                    submodule.named_parameters(recurse=False, remove_duplicate=False)
+                )
+                if old_parameters.keys() != new_parameters.keys():
+                    raise ValueError(
+                        "reset_parameters must preserve a module's direct parameter names; "
+                        f"{type(submodule).__qualname__} changed from "
+                        f"{tuple(old_parameters)} to {tuple(new_parameters)}."
+                    )
+                for name, old_parameter in old_parameters.items():
+                    new_parameter = new_parameters[name]
+                    copy_mcore_parameter_attributes(new_parameter, old_parameter)
+
+            for child in submodule.children():
+                visit(child)
+
+        visit(module)
+
+    def _copy_mcore_attributes_to_sharded_parameters(self, module: torch.nn.Module) -> None:
+        """Copy MCore metadata to optimizer-facing parameters after sharding."""
+        if not isinstance(module, FsdpModule):
+            raise TypeError(f"Expected an FsdpModule after fully_shard, got {type(module).__name__}.")
+        for parameter_group in module.parameter_groups:
+            for fsdp_parameter in parameter_group.fsdp_parameters:
+                copy_mcore_parameter_attributes(
+                    fsdp_parameter.sharded, fsdp_parameter.unsharded
+                )
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -563,6 +658,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         placements = Placements(
             dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
         )
+        reset_before_shard = partial(
+            FullyShardedDataParallelV2._reset_meta_parameters_before_fully_shard,
+            device=torch.device(device) if device is not None else torch.device("cuda"),
+            init_param_with_fp8=ddp_config.fp8_param_gather,
+        )
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
@@ -587,6 +687,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 # contributions after dispatch from every EP rank.
                 for submodule in module.modules():
                     if isinstance(submodule, MoELayer):
+                        reset_before_shard(module=submodule.experts)
                         fully_shard(
                             submodule.experts,
                             mesh=expert_dp_mesh,
@@ -600,15 +701,24 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
                 if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
+                    reset_before_shard(module=submodule)
                     fully_shard(
                         submodule,
                         mesh=dp_mesh,
                         placements=placements,
                         mixed_precision_policy=self.mp_policy,
                     )
+            reset_before_shard(module=module)
             fully_shard(
                 module, mesh=dp_mesh, placements=placements, mixed_precision_policy=self.mp_policy
             )
+
+        if isinstance(module, FsdpModule):
+            self._copy_mcore_attributes_to_sharded_parameters(module)
+        else:
+            for submodule in module.modules():
+                if isinstance(submodule, FsdpModule):
+                    self._copy_mcore_attributes_to_sharded_parameters(submodule)
 
         if config.overlap_moe_expert_parallel_comm:
             # The 1F1B EP-overlap schedule interleaves forward and backward work in
