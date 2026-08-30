@@ -477,8 +477,11 @@ class FsdpModule:
         """Reduce gradients and return parameters to their sharded resting state."""
         if self.phase is not FsdpModule.Phase.BACKWARD:
             return
-        self._reduce_gradient_groups()
+        # Match the main-branch ordering: reshard first (releases the unsharded
+        # weight storage), then reduce. ``unsharded.grad`` is a separate tensor from
+        # the released weight storage, so the reduce still reads the gradients here.
         self._reshard_parameter_groups()
+        self._reduce_gradient_groups()
         self.phase = FsdpModule.Phase.RESTING
         # 1F1B cooldown can run consecutive backward passes without an intervening
         # pre_forward(), so reset the grad-readiness counter as soon as this pass
