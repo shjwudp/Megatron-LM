@@ -230,11 +230,14 @@ class FsdpParameterGroup:
             else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
-            # TE's delayed-wgrad (skip_backward_post_hook) path computes the weight
-            # gradient in FP32 (backward_dw) and assigns it directly. Leave the
-            # compute-weight grad_dtype unconstrained so that FP32 assignment is not
-            # rejected against the BF16 tensor; the reduce-scatter later packs it into
-            # the main-grad buffer (which downcasts as needed).
+            # NOTE (stopgap): TE's delayed-wgrad (skip_backward_post_hook) path computes the
+            # weight gradient in FP32 (fused grouped-GEMM backward_dw) and assigns it directly
+            # to the FP32 main-weight view, which PyTorch's grad_dtype check (BF16, from
+            # main_grads_dtype) would otherwise reject (RuntimeError: float grad to BF16
+            # grad_dtype). We leave grad_dtype unconstrained here as a stopgap. Decoupling
+            # grad_dtype (M-FSDP's reduced-grad contract) from delay_wgrad_compute is the
+            # right end state; the clean fix belongs in the fused-wgrad path (cast/accumulate
+            # the FP32 wgrad into the BF16 reduced main-grad buffer) rather than in grad_dtype.
             if getattr(parameter, "skip_backward_post_hook", False):
                 parameter.grad_dtype = None
             # Parameter-owned markers must not retain their FSDP module tree.
@@ -244,13 +247,11 @@ class FsdpParameterGroup:
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
             # Advertise the reduced main-grad dtype on the optimizer-view param.
-            # EXCEPTION: TE's delayed-wgrad (skip_backward_post_hook) params have their
-            # weight gradient computed in FP32 by the fused grouped-GEMM backward_dw,
-            # which assigns it directly to this FP32 main-weight view. A BF16 grad_dtype
-            # would reject that assignment (RuntimeError: float grad to BF16 grad_dtype),
-            # so leave grad_dtype unconstrained (None) for those only; the optimizer's
-            # _copy_model_grads_to_main_grads casts the reduced (BF16) main-grad up as
-            # needed. Non-delayed params keep the configured main-grad dtype.
+            # NOTE (stopgap): same as above -- for delayed-wgrad params the fused grouped-GEMM
+            # backward_dw assigns an FP32 wgrad to this FP32 view, so we relax grad_dtype to
+            # None to avoid the BF16 grad_dtype rejection. The optimizer's
+            # _copy_model_grads_to_main_grads casts the reduced (BF16) main-grad up as needed.
+            # Non-delayed params keep the configured main-grad dtype.
             if getattr(parameter, "skip_backward_post_hook", False):
                 sharded_parameter.grad_dtype = None
             elif main_grad_dtype:
