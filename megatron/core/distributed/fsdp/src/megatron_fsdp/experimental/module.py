@@ -258,7 +258,9 @@ class FsdpModule:
         }
         if not self.context.custom_forward_backward_hooks:
             if (self._phase, phase) not in allowed_transitions:
-                raise RuntimeError(f"Invalid FSDP module phase transition: {self._phase} -> {phase}.")
+                raise RuntimeError(
+                    f"Invalid FSDP module phase transition: {self._phase} -> {phase}."
+                )
         self._phase = phase
 
     @property
