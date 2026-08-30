@@ -24,15 +24,24 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-from ..mixed_precision import MixedPrecisionPolicy
+from ..mixed_precision import MixedPrecisionPolicy, fp8_need_transpose_data, is_float8tensor
 from .indexed_order import IndexedOrder
-from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
+from .parameter_group import (
+    Fp8ParameterGroup,
+    FsdpParameterGroup,
+    get_containing_parameter_group,
+)
 from .placement import Flat
 
 
 def _is_in_backward() -> bool:
     """Return whether the current thread is executing an autograd GraphTask."""
     return torch._C._current_graph_task_id() != -1
+
+
+def _is_fp8_parameter(parameter: nn.Parameter) -> bool:
+    """Whether ``parameter`` is an MXFP8 primary weight (needs both orientations)."""
+    return is_float8tensor(parameter) and fp8_need_transpose_data(parameter)
 
 
 class FsdpContext:
@@ -202,7 +211,11 @@ class FsdpModule:
         for group_parameters in _group_parameters(owned_parameters):
             group_dtype = next(iter(group_parameters.values())).dtype
             parameter_groups.append(
-                FsdpParameterGroup(
+                (
+                    Fp8ParameterGroup
+                    if all(_is_fp8_parameter(p) for p in group_parameters.values())
+                    else FsdpParameterGroup
+                )(
                     owning_module=self,
                     parameters=group_parameters,
                     mesh=mesh,
@@ -567,9 +580,11 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
 
 
 def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
-    grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
+    grouped: dict[tuple[torch.dtype, bool, bool], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (parameter.dtype, parameter.requires_grad)
+        # MXFP8 primary weights need both rowwise and colwise payloads, so keep
+        # them in their own DBuffer group.
+        key = (parameter.dtype, parameter.requires_grad, _is_fp8_parameter(parameter))
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 
