@@ -3225,6 +3225,11 @@ def _add_distributed_args(parser):
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
+    group.add_argument('--fsdp-trace-pool', action='store_true', dest='fsdp_trace_pool', default=False,
+                       help='If true, Megatron-FSDP v2 traces one global batch of temporary communication '
+                       'buffer lifetimes, then reuses a fixed set of physical storage slots.')
+    group.add_argument('--fsdp-prefetch-depth', type=int, default=1, dest='fsdp_prefetch_depth',
+                       help='One-based future execution-trace occurrence prefetched by Megatron-FSDP v2.')
     group.add_argument('--create-all-gather-group', action='store_true',
                        help='Create a separate process group for all-gather operations '
                        'to overlap reduce-scatter and all-gather operations.')
