@@ -65,6 +65,7 @@ def fully_shard_context(
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
     custom_forward_backward_hooks: bool = False,
+    prefetch_depth: int = 1,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -82,6 +83,10 @@ def fully_shard_context(
         custom_forward_backward_hooks: Whether a custom schedule (e.g. the 1F1B
             EP-overlap) drives the module lifecycle with its own forward-backward
             hooks. When True, the strict phase-transition check is relaxed.
+        prefetch_depth: One-based future prefetch lead time. The minimal build keeps
+            method2's static-order lookahead (immediate successor), so this is
+            accepted for config compatibility but does not yet extend the prefetch
+            horizon.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
@@ -95,6 +100,7 @@ def fully_shard_context(
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
         custom_forward_backward_hooks=custom_forward_backward_hooks,
+        prefetch_depth=prefetch_depth,
     )
     token = _FSDP_CONTEXT.set(context)
     try:

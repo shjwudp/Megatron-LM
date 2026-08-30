@@ -65,6 +65,10 @@ class FsdpContext:
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder["FsdpModule"]
     backward_order: IndexedOrder["FsdpModule"]
+    # One-based future prefetch lead time. The minimal build keeps static-order
+    # lookahead (immediate successor), so this is accepted for config
+    # compatibility but does not yet extend the prefetch horizon.
+    prefetch_depth: int
 
     def __init__(
         self,
@@ -72,6 +76,7 @@ class FsdpContext:
         use_symmetric_memory: bool = False,
         unify_communication_stream: bool = False,
         custom_forward_backward_hooks: bool = False,
+        prefetch_depth: int = 1,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -84,11 +89,14 @@ class FsdpContext:
             custom_forward_backward_hooks: Whether a custom schedule (e.g. the 1F1B
                 EP-overlap) drives the module lifecycle with its own forward-backward
                 hooks. When True, the strict phase-transition check is relaxed.
+            prefetch_depth: One-based future prefetch lead time (inert on the static
+                prefetch path).
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
         self.custom_forward_backward_hooks = custom_forward_backward_hooks
+        self.prefetch_depth = prefetch_depth
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         # Construction-only; empty after finalization.

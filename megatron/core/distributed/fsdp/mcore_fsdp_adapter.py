@@ -571,6 +571,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             device=device,
             use_symmetric_memory=ddp_config.nccl_ub,
             custom_forward_backward_hooks=config.overlap_moe_expert_parallel_comm,
+            # ``fsdp_trace_pool`` is accepted for config compatibility but is inert
+            # on the minimal build: method2 keeps its proven static-order prefetch,
+            # so no trace-pool allocator is instantiated. ``prefetch_depth`` is
+            # likewise carried but does not yet extend the static prefetch horizon.
+            prefetch_depth=ddp_config.fsdp_prefetch_depth,
         ):
             # The 1F1B EP-overlap schedule drives the FsdpModule lifecycle explicitly
             # (pre_forward/pre_backward/post_forward) and calls submodules directly, so

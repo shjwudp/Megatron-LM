@@ -536,6 +536,11 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         super().__init__(*args, **kwargs)
         self._unsharded_rowwise_allocation_key = (id(self), "unsharded_rowwise")
         self._unsharded_colwise_allocation_key = (id(self), "unsharded_colwise")
+        # Populate the fp8 payload buffers from the fp32 main weights before the
+        # first forward. The base class fills its bf16 model weight inside its
+        # ``_init_compute_weight_storage`` hook, but an fp8 group has no bf16
+        # model-weight buffer and must quantize here.
+        self.sync_model_weight_from_main_weight()
 
     def _init_compute_weight_storage(
         self,
