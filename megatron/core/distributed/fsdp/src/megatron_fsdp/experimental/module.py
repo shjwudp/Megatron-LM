@@ -46,6 +46,11 @@ class FsdpContext:
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
+    # The 1F1B EP-overlap schedule drives the FsdpModule forward/backward lifecycle
+    # explicitly (custom forward-backward hooks), so the standard RESTING/FORWARD/
+    # BACKWARD phase-transition invariants do not hold. When set, the phase check in
+    # FsdpModule.set_phase() is relaxed (used by skip_forward_backward_hooks).
+    custom_forward_backward_hooks: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
@@ -57,6 +62,7 @@ class FsdpContext:
         device: torch.device,
         use_symmetric_memory: bool = False,
         unify_communication_stream: bool = False,
+        custom_forward_backward_hooks: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -66,10 +72,14 @@ class FsdpContext:
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
             unify_communication_stream: Whether all-gathers and reduce-scatters share one
                 communication stream to reduce peak transient memory.
+            custom_forward_backward_hooks: Whether a custom schedule (e.g. the 1F1B
+                EP-overlap) drives the module lifecycle with its own forward-backward
+                hooks. When True, the strict phase-transition check is relaxed.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
+        self.custom_forward_backward_hooks = custom_forward_backward_hooks
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         # Construction-only; empty after finalization.
@@ -232,15 +242,23 @@ class FsdpModule:
 
     @phase.setter
     def phase(self, phase: Phase) -> None:
-        """Transition this module between its valid lifecycle phases."""
+        """Transition this module between its valid lifecycle phases.
+
+        The 1F1B EP-overlap schedule drives the lifecycle explicitly with custom
+        forward-backward hooks, so its RESTING/FORWARD/BACKWARD transitions do not
+        follow the strict pairwise invariants defined here. When the context has
+        ``custom_forward_backward_hooks`` set (the skip_forward_backward_hooks /
+        overlap path), the transition check is relaxed.
+        """
         allowed_transitions = {
             (FsdpModule.Phase.RESTING, FsdpModule.Phase.FORWARD),
             (FsdpModule.Phase.FORWARD, FsdpModule.Phase.RESTING),
             (FsdpModule.Phase.RESTING, FsdpModule.Phase.BACKWARD),
             (FsdpModule.Phase.BACKWARD, FsdpModule.Phase.RESTING),
         }
-        # if (self._phase, phase) not in allowed_transitions:
-        #     raise RuntimeError(f"Invalid FSDP module phase transition: {self._phase} -> {phase}.")
+        if not self.context.custom_forward_backward_hooks:
+            if (self._phase, phase) not in allowed_transitions:
+                raise RuntimeError(f"Invalid FSDP module phase transition: {self._phase} -> {phase}.")
         self._phase = phase
 
     @property

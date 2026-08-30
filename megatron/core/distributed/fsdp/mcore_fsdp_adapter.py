@@ -567,7 +567,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
-        with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
+        with fully_shard_context(
+            device=device,
+            use_symmetric_memory=ddp_config.nccl_ub,
+            custom_forward_backward_hooks=config.overlap_moe_expert_parallel_comm,
+        ):
             # The 1F1B EP-overlap schedule drives the FsdpModule lifecycle explicitly
             # (pre_forward/pre_backward/post_forward) and calls submodules directly, so
             # suppress the module's own forward/backward hooks to avoid double-driving.
