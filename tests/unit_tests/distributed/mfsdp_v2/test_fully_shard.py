@@ -719,6 +719,41 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
         torch.testing.assert_close(second_loss, first_loss)
 
 
+def test_main_weight_uses_preserved_high_precision_initialization(distributed_setup):
+    """Build the optimizer master from TE's preserved pre-quantization values."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    high_precision_init = (
+        torch.arange(64, device=device, dtype=torch.float32).view(8, 8) / 1000 + 0.123456
+    )
+    model = nn.Linear(8, 8, bias=False, device=device, dtype=torch.bfloat16)
+    with torch.no_grad():
+        model.weight.copy_(high_precision_init)
+    assert not torch.equal(model.weight.float(), high_precision_init)
+
+    high_precision_init_cleared = False
+
+    def clear_high_precision_init_val() -> None:
+        nonlocal high_precision_init_cleared
+        high_precision_init_cleared = True
+
+    model.weight.get_high_precision_init_val = lambda: high_precision_init
+    model.weight.clear_high_precision_init_val = clear_high_precision_init_val
+    with fully_shard_context(device=device):
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_no_shard_placements(),
+            mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
+        )
+
+    (parameter_group,) = model.parameter_groups
+    torch.testing.assert_close(
+        parameter_group.main_weight.get_local_tensor(0), high_precision_init, rtol=0, atol=0
+    )
+    assert high_precision_init_cleared
+
+
 def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, monkeypatch):
     """Optimizer synchronization should run once per group, not once per microbatch."""
     world_size = distributed_setup.world_size
