@@ -420,6 +420,12 @@ class TestMcoreAdapterExpertParallel:
         )
         assert isinstance(model.module, FsdpModule)
         assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
+        expert_parameters = tuple(model.module.decoder.layers[1].mlp.experts.parameters())
+        assert expert_parameters
+        assert all(
+            getattr(parameter, "allreduce", True) is False
+            for parameter in expert_parameters
+        )
 
         optimizer_config = OptimizerConfig(
             lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=0.0
@@ -431,6 +437,10 @@ class TestMcoreAdapterExpertParallel:
             replace(optimizer_config), [model], use_gloo_process_groups=False
         )
         assert isinstance(optimizer, FullyShardedOptimizer)
+        assert {
+            param_group["is_expert_parallel"]
+            for param_group in optimizer.optimizer.param_groups
+        } == {False, True}
         optimizer.reload_model_params()
 
         local_batch_size = 2

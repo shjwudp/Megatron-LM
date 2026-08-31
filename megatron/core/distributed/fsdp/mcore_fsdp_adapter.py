@@ -74,6 +74,7 @@ except ImportError as import_megatron_fsdp_error:
 logger = logging.getLogger(__name__)
 
 _PERSISTENT_PARAMETER_ATTRIBUTES = (
+    "allreduce",
     "shared_embedding",
     "skip_backward_post_hook",
     "tensor_model_parallel",
@@ -712,12 +713,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 module, mesh=dp_mesh, placements=placements, mixed_precision_policy=self.mp_policy
             )
 
-        if isinstance(module, FsdpModule):
-            self._copy_mcore_attributes_to_sharded_parameters(module)
-        else:
-            for submodule in module.modules():
-                if isinstance(submodule, FsdpModule):
-                    self._copy_mcore_attributes_to_sharded_parameters(submodule)
+        for submodule in module.modules():
+            if isinstance(submodule, FsdpModule):
+                self._copy_mcore_attributes_to_sharded_parameters(submodule)
 
         if config.overlap_moe_expert_parallel_comm:
             # The 1F1B EP-overlap schedule interleaves forward and backward work in
