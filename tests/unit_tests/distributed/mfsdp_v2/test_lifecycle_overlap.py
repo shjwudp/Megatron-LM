@@ -269,6 +269,58 @@ def test_fine_grained_forward_enters_and_releases_nested_fsdp_units(
                 assert owner._parameters[parameter_name] is parameter.sharded
 
 
+def test_fine_grained_overlap_defers_shared_nested_fsdp_reshard(
+    dp_mesh, placements, distributed_setup
+):
+    """A paired backward must not reshard a nested unit before its forward."""
+    device = distributed_setup.device
+    model = SingleLinear(dim=8).to(device=device, dtype=torch.bfloat16)
+    model.fc.requires_grad_(False)
+    policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
+    with fully_shard_context(device=device, custom_forward_backward_hooks=True):
+        fully_shard(model.fc, mesh=dp_mesh, placements=placements, mixed_precision_policy=policy)
+
+    assert isinstance(model.fc, FsdpModule)
+    weight = next(
+        parameter
+        for group in model.fc.parameter_groups
+        for parameter in group.fsdp_parameters
+        if parameter.fqns[0] == "weight"
+    )
+    forward_saw_materialized_weight = []
+
+    def finish_nested_backward():
+        model.fc.post_backward()
+        assert model.fc._post_backward_pending
+
+    def consume_nested_weight(value):
+        forward_saw_materialized_weight.append(model.fc._parameters["weight"] is weight.unsharded)
+        return value
+
+    forward_layer = make_schedule_layer(ForwardNode())
+    forward_layer._fsdp_modules = (model.fc,)
+    forward_layer.mlp = ForwardNode(forward=consume_nested_weight)
+    backward_layer = make_schedule_layer(ForwardNode())
+    backward_layer._fsdp_modules = (model.fc,)
+    backward_layer.mlp = ForwardNode(backward_dw=finish_nested_backward)
+    inputs = torch.randn(4, 8, device=device, dtype=torch.bfloat16)
+
+    output, _ = TransformerLayerSchedulePlan.run(
+        forward_layer,
+        backward_layer,
+        f_input=inputs,
+        b_grad=torch.ones_like(inputs),
+    )
+
+    assert output is inputs
+    assert forward_saw_materialized_weight == [True]
+    assert model.fc._post_backward_defer_count == 0
+    assert not model.fc._post_backward_pending
+    assert model.fc.phase is FsdpModule.Phase.RESTING
+    assert model.fc._unshard_event is None
+    assert model.fc._parameters["weight"] is weight.sharded
+
+
 def test_model_chunk_defers_root_reshard_until_interleaved_forward_finishes(
     dp_mesh, placements, distributed_setup
 ):

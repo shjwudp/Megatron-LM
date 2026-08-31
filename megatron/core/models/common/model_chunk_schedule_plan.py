@@ -287,6 +287,20 @@ class TransformerLayerSchedulePlan:
             Functions or values for next iteration's computation
         """
 
+        # A middle step can pair forward and backward schedule plans for the
+        # same physical layer (different microbatches). In that case delayed
+        # backward completion may reshard a nested FSDP unit, such as the MoE
+        # experts, before the paired forward reaches it. Hold every shared unit
+        # until the forward has consumed its parameters.
+        shared_fsdp_modules = ()
+        if f_layer is not None and b_layer is not None:
+            backward_fsdp_modules = set(b_layer._fsdp_modules)
+            shared_fsdp_modules = tuple(
+                module for module in f_layer._fsdp_modules if module in backward_fsdp_modules
+            )
+            for fsdp_module in shared_fsdp_modules:
+                fsdp_module.defer_post_backward()
+
         if b_layer is not None:
             # The fine-grained schedule invokes layer submodules directly and
             # splits their backward into separate GraphTasks. Start every nested
@@ -354,6 +368,12 @@ class TransformerLayerSchedulePlan:
             # materialized across schedule steps.
             for fsdp_module in reversed(f_layer._fsdp_modules):
                 fsdp_module.post_forward()
+
+        # Complete any backward finalization that became ready while a paired
+        # forward still needed the same physical FSDP units. Match the child-
+        # before-parent release order used by post_forward above.
+        for fsdp_module in reversed(shared_fsdp_modules):
+            fsdp_module.release_post_backward()
 
         return f_input, b_grad
 
