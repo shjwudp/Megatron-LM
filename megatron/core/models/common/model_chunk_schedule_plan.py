@@ -591,20 +591,30 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         f_model = f_schedule_plan.state.model if f_schedule_plan else None
         b_model = b_schedule_plan.state.model if b_schedule_plan else None
 
-        # The schedule model may be an adapter; resolve its root FSDP module.
-        root_fsdp = _resolve_fsdp_root(f_model) or _resolve_fsdp_root(b_model)
+        # Interleaved virtual-pipeline forward and backward plans may belong to
+        # different model chunks, each with its own FSDP root. Prepare both roots
+        # instead of selecting only the forward root.
+        forward_root_fsdp = _resolve_fsdp_root(f_model)
+        backward_root_fsdp = _resolve_fsdp_root(b_model)
+        root_fsdps = tuple(
+            root for root in (forward_root_fsdp, backward_root_fsdp) if root is not None
+        )
+        if len(root_fsdps) == 2 and root_fsdps[0] is root_fsdps[1]:
+            root_fsdps = root_fsdps[:1]
 
         # On the last pipeline stage, root-owned output and final-norm gradients
         # can become ready near the start of an interleaved backward. Keep the
         # root materialized until the paired forward has also consumed those
         # parameters, then let its pending post-backward reshard and reduce.
-        defer_root_post_backward = root_fsdp is not None and f_schedule_plan is not None
+        defer_root_post_backward = (
+            forward_root_fsdp is not None and forward_root_fsdp is backward_root_fsdp
+        )
         if defer_root_post_backward:
-            root_fsdp.defer_post_backward()
+            forward_root_fsdp.defer_post_backward()
 
-        # The root owns shared parameters used by both interleaved passes. Initialize
-        # its lifecycle once so it remains unsharded until all root gradients are ready.
-        if root_fsdp is not None:
+        # Roots own parameters outside layer FSDP units (embedding, final norm,
+        # and output head), so initialize every participating root lifecycle.
+        for root_fsdp in root_fsdps:
             root_fsdp.pre_backward()
 
         f_input = None
@@ -696,11 +706,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_schedule_plan.pre_process.backward(b_grad)
 
         if defer_root_post_backward:
-            root_fsdp.release_post_backward()
+            forward_root_fsdp.release_post_backward()
 
-        # Order gradient consumers (optimizer) after the root unit's finalize
-        # reduce-scatter, which the parameter-readiness counter launched.
-        if root_fsdp is not None:
+        # Order gradient consumers (optimizer) after each participating root's
+        # finalize reduce-scatter, which its readiness counter launched.
+        for root_fsdp in root_fsdps:
             root_fsdp.context.current_stream().wait_stream(root_fsdp.context.reduce_scatter_stream)
 
         if f_schedule_plan:

@@ -107,6 +107,21 @@ class ModelChunkPlan:
         self.state.model = None
 
 
+def make_schedule_layer(moe_combine):
+    """Build the minimal layer-plan surface consumed by the static scheduler."""
+    return SimpleNamespace(
+        _fsdp_modules=(),
+        config=SimpleNamespace(ep_overlap_early_attn_memory_release=False),
+        pre_dispatch_computation=ForwardNode(),
+        moe_dispatch=ForwardNode(),
+        mlp=ForwardNode(),
+        moe_combine=moe_combine,
+        mtp_post_process=ForwardNode(),
+        get_fp8_context=nullcontext,
+        release_state=lambda: None,
+    )
+
+
 @pytest.fixture(scope="function")
 def dp_mesh(distributed_setup):
     """A single-dimension DP device mesh over the default process group."""
@@ -281,22 +296,8 @@ def test_model_chunk_defers_root_reshard_until_interleaved_forward_finishes(
         root_was_materialized.append(model._parameters["bias"] is root_parameter.unsharded)
         return value
 
-    common_layer_args = {
-        "_fsdp_modules": (),
-        "config": SimpleNamespace(ep_overlap_early_attn_memory_release=False),
-        "pre_dispatch_computation": ForwardNode(),
-        "moe_dispatch": ForwardNode(),
-        "mlp": ForwardNode(),
-        "mtp_post_process": ForwardNode(),
-        "get_fp8_context": nullcontext,
-        "release_state": lambda: None,
-    }
-    forward_layer = SimpleNamespace(
-        **common_layer_args, moe_combine=ForwardNode(forward=consume_root_parameter)
-    )
-    backward_layer = SimpleNamespace(
-        **common_layer_args, moe_combine=ForwardNode(backward=finish_root_backward)
-    )
+    forward_layer = make_schedule_layer(ForwardNode(forward=consume_root_parameter))
+    backward_layer = make_schedule_layer(ForwardNode(backward=finish_root_backward))
     inputs = torch.randn(4, 8, device=device, dtype=torch.bfloat16)
     forward_plan = ModelChunkPlan(model, forward_layer, forward_input=inputs)
     backward_plan = ModelChunkPlan(model, backward_layer)
@@ -312,3 +313,67 @@ def test_model_chunk_defers_root_reshard_until_interleaved_forward_finishes(
     assert model.phase is FsdpModule.Phase.RESTING
     assert model._unshard_event is None
     assert model._parameters["bias"] is root_parameter.sharded
+
+
+def test_model_chunk_prepares_distinct_virtual_pipeline_roots(
+    dp_mesh, placements, distributed_setup
+):
+    """Forward and backward plans from different virtual chunks need both roots."""
+    device = distributed_setup.device
+    forward_model = SingleLinear(dim=8).to(device=device, dtype=torch.bfloat16)
+    backward_model = SingleLinear(dim=8).to(device=device, dtype=torch.bfloat16)
+    for model in (forward_model, backward_model):
+        model.requires_grad_(False)
+        _wrap(model, dp_mesh, placements, device, custom_forward_backward_hooks=True)
+
+    def get_bias_parameter(model):
+        return next(
+            parameter
+            for group in model.parameter_groups
+            for parameter in group.fsdp_parameters
+            if parameter.fqns[0] == "bias"
+        )
+
+    forward_parameter = get_bias_parameter(forward_model)
+    backward_parameter = get_bias_parameter(backward_model)
+    forward_was_materialized = []
+    backward_was_materialized = []
+
+    def consume_forward_parameter(value):
+        forward_was_materialized.append(
+            forward_model._parameters["bias"] is forward_parameter.unsharded
+        )
+        return value
+
+    def consume_backward_parameter(grad):
+        backward_was_materialized.append(
+            backward_model._parameters["bias"] is backward_parameter.unsharded
+        )
+        return grad
+
+    def finish_backward_root(grad):
+        backward_model.post_backward()
+        return grad
+
+    forward_layer = make_schedule_layer(ForwardNode(forward=consume_forward_parameter))
+    backward_layer = make_schedule_layer(ForwardNode(backward=finish_backward_root))
+    inputs = torch.randn(4, 8, device=device, dtype=torch.bfloat16)
+    forward_plan = ModelChunkPlan(forward_model, forward_layer, forward_input=inputs)
+    backward_plan = ModelChunkPlan(backward_model, backward_layer)
+    backward_plan.post_process = ForwardNode(backward=consume_backward_parameter)
+
+    output = TransformerModelChunkSchedulePlan.run(
+        forward_plan, backward_plan, b_grad=torch.ones_like(inputs)
+    )
+
+    assert output is inputs
+    assert forward_was_materialized == [True]
+    assert backward_was_materialized == [True]
+    assert backward_model.phase is FsdpModule.Phase.RESTING
+    assert backward_model._parameters["bias"] is backward_parameter.sharded
+    assert forward_model.phase is FsdpModule.Phase.BACKWARD
+    assert forward_model._parameters["bias"] is forward_parameter.unsharded
+
+    forward_model.post_backward()
+    assert forward_model.phase is FsdpModule.Phase.RESTING
+    assert forward_model._parameters["bias"] is forward_parameter.sharded
