@@ -591,13 +591,16 @@ class FsdpModule:
                     continue
                 is_fused = group.fuse_wgrad_accumulation
                 if is_fused:
-                    partial_grad = group.take_fused_wgrad_buffer()
+                    partial_grad, producer_events = group.take_fused_wgrad_buffer()
                     partial_grad.local_buffer.record_stream(reduce_scatter_stream)
                 else:
                     has_ordinary_grad = True
+                    producer_events = ()
                     with torch.cuda.stream(reduce_scatter_stream):
                         partial_grad = group.allocate_partial_grad_buffer()
-                prepared_groups.append((group_index, group, partial_grad, is_fused))
+                prepared_groups.append(
+                    (group_index, group, partial_grad, is_fused, producer_events)
+                )
 
             # One allocation join is enough because no current-module collective
             # has entered the reduction stream yet.
@@ -605,20 +608,30 @@ class FsdpModule:
                 current_stream.wait_stream(reduce_scatter_stream)
 
             ready_groups = []
-            for group_index, group, partial_grad, _is_fused in prepared_groups:
+            for group_index, group, partial_grad, _is_fused, producer_events in prepared_groups:
                 if not group.fused_wgrad_is_complete:
+                    for producer_event in producer_events:
+                        current_stream.wait_event(producer_event)
                     group.copy_gradients_to_partial_buffer(partial_grad)
                 ready_groups.append(
-                    (group_index, group, partial_grad, current_stream.record_event())
+                    (
+                        group_index,
+                        group,
+                        partial_grad,
+                        producer_events,
+                        current_stream.record_event(),
+                    )
                 )
         except Exception:
-            for _group_index, group, _partial_grad, is_fused in prepared_groups:
+            for _group_index, group, _partial_grad, is_fused, _producer_events in prepared_groups:
                 if not is_fused:
                     group.release_partial_grad_buffer()
             raise
 
         module_name = self.name if self.name else "<root>"
-        for group_index, group, partial_grad, ready_event in ready_groups:
+        for group_index, group, partial_grad, producer_events, ready_event in ready_groups:
+            for producer_event in producer_events:
+                reduce_scatter_stream.wait_event(producer_event)
             reduce_scatter_stream.wait_event(ready_event)
             with torch.cuda.stream(reduce_scatter_stream):
                 torch.cuda.nvtx.range_push(

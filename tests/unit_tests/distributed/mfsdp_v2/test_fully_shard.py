@@ -92,6 +92,44 @@ class MixedWgradLinear(FusedWgradLinear):
         return super().forward(x) + torch.nn.functional.linear(x, self.weight)
 
 
+class _StreamFusedWgradLinearFunction(torch.autograd.Function):
+    """Emulate a fused wgrad GEMM submitted to an auxiliary CUDA stream."""
+
+    @staticmethod
+    def forward(
+        ctx, x: torch.Tensor, weight: nn.Parameter, wgrad_stream: torch.cuda.Stream
+    ) -> torch.Tensor:
+        """Save the operands and auxiliary stream for backward."""
+        ctx.save_for_backward(x)
+        ctx.weight = weight
+        ctx.wgrad_stream = wgrad_stream
+        return torch.nn.functional.linear(x, weight)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Delay and write wgrad on the auxiliary stream without synchronizing it."""
+        (x,) = ctx.saved_tensors
+        weight = ctx.weight
+        with torch.cuda.stream(ctx.wgrad_stream):
+            main_grad = weight.get_main_grad()
+            torch.cuda._sleep(5_000_000)
+            torch.mm(grad_output.t(), x, out=main_grad)
+        weight.grad_added_to_main_grad = True
+        return None, torch.zeros_like(weight), None
+
+
+class StreamFusedWgradLinear(nn.Linear):
+    """Linear whose direct wgrad is produced on a non-default CUDA stream."""
+
+    def __init__(self, in_features: int, out_features: int) -> None:
+        super().__init__(in_features, out_features, bias=False)
+        self.wgrad_stream = torch.cuda.Stream()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the auxiliary-stream fused-wgrad function."""
+        return _StreamFusedWgradLinearFunction.apply(x, self.weight, self.wgrad_stream)
+
+
 class CheckpointedTinyModel(TinyModel):
     """Tiny model that activation-checkpoints each shardable module."""
 
@@ -401,6 +439,36 @@ def test_fused_wgrad_mixed_group_matches_baseline(distributed_setup, mixed_wgrad
             assert not fsdp_parameter.unsharded.grad_added_to_main_grad
 
     torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
+
+
+def test_fused_wgrad_auxiliary_stream_matches_baseline(distributed_setup):
+    """Reduction must wait for direct wgrad produced on an auxiliary stream."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(4321)
+    baseline = nn.Linear(8, 4, bias=False).to(device)
+    model = StreamFusedWgradLinear(8, 4).to(device)
+    model.load_state_dict(baseline.state_dict())
+
+    with fully_shard_context(device=device):
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_flat_placements(),
+            fuse_wgrad_accumulation=True,
+            fused_wgrad_is_complete=True,
+        )
+
+    x = torch.randn(3, 8, device=device)
+    baseline(x).square().mean().backward()
+    model(x).square().mean().backward()
+
+    assert isinstance(model.weight.grad, DTensor)
+    torch.testing.assert_close(model.weight.grad.full_tensor(), baseline.weight.grad)
 
 
 def test_complete_fused_wgrad_skips_gradient_packing(distributed_setup, monkeypatch):
