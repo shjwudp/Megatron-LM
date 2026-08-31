@@ -128,6 +128,42 @@ class NonLeafViewModel(nn.Module):
         return SaveNonLeafWeightView.apply(x, weight_view)
 
 
+class FusedLinearWgrad(torch.autograd.Function):
+    """Emulate Transformer Engine writing wgrad directly into ``main_grad``."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        """Save inputs for a fused linear backward."""
+        ctx.save_for_backward(x, weight)
+        return torch.nn.functional.linear(x, weight)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Overwrite MFSDP's packed wgrad view and return an ignored dummy grad."""
+        x, weight = ctx.saved_tensors
+        assert getattr(weight, "__fsdp_param__", False)
+        assert weight.overwrite_main_grad
+        main_grad = weight.get_main_grad()
+        main_grad.copy_(
+            grad_output.reshape(-1, grad_output.shape[-1]).t().matmul(x.reshape(-1, x.shape[-1]))
+        )
+        weight.grad_added_to_main_grad = True
+        grad_input = grad_output.matmul(weight)
+        return grad_input, torch.full_like(weight, 123.0)
+
+
+class FusedWgradLinear(nn.Linear):
+    """Linear layer with a TE-style fused weight-gradient path."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Expose ``main_grad`` in forward like TE's operation-fuser path."""
+        self.weight.main_grad = self.weight.get_main_grad()
+        output = FusedLinearWgrad.apply(x, self.weight)
+        if self.bias is not None:
+            output = output + self.bias
+        return output
+
+
 def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
@@ -679,6 +715,40 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     local_grad = model.weight.grad.to_local()
     expected = torch.full_like(local_grad, float(world_size + 1))
     torch.testing.assert_close(local_grad, expected, rtol=0, atol=0)
+
+
+def test_te_fused_wgrad_writes_partial_buffer_and_matches_baseline(distributed_setup):
+    """TE-style fused weights and ordinary bias grads should share one packed buffer."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(9753)
+    baseline = nn.Linear(8, 4).to(device)
+    model = FusedWgradLinear(8, 4).to(device)
+    model.load_state_dict(baseline.state_dict())
+
+    with fully_shard_context(device=device, fuse_te_module_wgrad_accumulation=True):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    inputs = torch.randn(2, 3, 8, device=device)
+    for x in inputs:
+        baseline(x).square().mean().backward()
+        model(x).square().mean().backward()
+
+    baseline_grads = {name: parameter.grad for name, parameter in baseline.named_parameters()}
+    for name, parameter in model.named_parameters():
+        assert isinstance(parameter.grad, DTensor)
+        torch.testing.assert_close(parameter.grad.full_tensor(), baseline_grads[name])
+
+    for group in model.parameter_groups:
+        for fsdp_parameter in group.fsdp_parameters:
+            unsharded = fsdp_parameter.unsharded
+            assert unsharded.main_grad is None
+            assert not unsharded.grad_added_to_main_grad
+            assert unsharded.overwrite_main_grad
 
 
 def test_next_forward_uses_optimizer_updated_weights(distributed_setup):

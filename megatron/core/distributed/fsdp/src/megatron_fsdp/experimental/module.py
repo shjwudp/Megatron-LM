@@ -46,6 +46,7 @@ class FsdpContext:
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
+    fuse_te_module_wgrad_accumulation: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
@@ -57,6 +58,7 @@ class FsdpContext:
         device: torch.device,
         use_symmetric_memory: bool = False,
         unify_communication_stream: bool = False,
+        fuse_te_module_wgrad_accumulation: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -66,10 +68,13 @@ class FsdpContext:
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
             unify_communication_stream: Whether all-gathers and reduce-scatters share one
                 communication stream to reduce peak transient memory.
+            fuse_te_module_wgrad_accumulation: Whether Transformer Engine modules write
+                weight gradients directly into MFSDP reduce-scatter input buffers.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
+        self.fuse_te_module_wgrad_accumulation = fuse_te_module_wgrad_accumulation
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         # Construction-only; empty after finalization.
@@ -208,6 +213,7 @@ class FsdpModule:
                     reduce_scatter_stream=context.reduce_scatter_stream,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
+                    fuse_te_module_wgrad_accumulation=context.fuse_te_module_wgrad_accumulation,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
@@ -416,6 +422,11 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
+        if context.fuse_te_module_wgrad_accumulation:
+            for group in self._parameter_groups:
+                if group.requires_grad:
+                    group.prepare_te_module_wgrad_accumulation()
+
         self._unshard_parameter_groups()
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
@@ -441,8 +452,11 @@ class FsdpModule:
             if not group.requires_grad:
                 continue
 
-            with torch.cuda.stream(reduce_scatter_stream):
-                partial_grad = group.allocate_partial_grad_buffer()
+            if context.fuse_te_module_wgrad_accumulation:
+                partial_grad = group.take_partial_grad_buffer()
+            else:
+                with torch.cuda.stream(reduce_scatter_stream):
+                    partial_grad = group.allocate_partial_grad_buffer()
 
             current_stream.wait_stream(reduce_scatter_stream)
             group.copy_gradients_to_partial_buffer(partial_grad)

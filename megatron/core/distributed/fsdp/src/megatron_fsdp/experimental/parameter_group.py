@@ -85,6 +85,10 @@ class FsdpParameterGroup:
     main_grad: DBuffer | None
     _unsharded_model_weight: DBuffer
     _symm_mem_pool: torch.cuda.MemPool | None
+    _partial_grad: DBuffer | None
+    _reduce_scatter_stream: torch.cuda.Stream
+    _fused_wgrad_dtype: torch.dtype
+    _fuse_te_module_wgrad_accumulation: bool
     grad_divisor: int
 
     def __init__(
@@ -100,6 +104,7 @@ class FsdpParameterGroup:
         reduce_scatter_stream: torch.cuda.Stream,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        fuse_te_module_wgrad_accumulation: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -117,6 +122,8 @@ class FsdpParameterGroup:
                 NCCL symmetric-memory pool.
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
+            fuse_te_module_wgrad_accumulation: Whether Transformer Engine modules write
+                weight gradients directly into a packed partial-gradient buffer.
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
@@ -137,6 +144,9 @@ class FsdpParameterGroup:
         self._owning_module = ref(owning_module)
         self.mesh = mesh
         self.grad_divisor = grad_divisor
+        self._reduce_scatter_stream = reduce_scatter_stream
+        self._fuse_te_module_wgrad_accumulation = fuse_te_module_wgrad_accumulation
+        self._partial_grad = None
         first_parameter = next(iter(parameter_to_fqns))
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
@@ -193,8 +203,12 @@ class FsdpParameterGroup:
             )
 
         self.main_grad = None
+        self._fused_wgrad_dtype = self.dtype
         if self.requires_grad:
             grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
+            # Match v1: fused wgrad writes into the communication dtype when one is
+            # configured, avoiding a separate pre-collective cast.
+            self._fused_wgrad_dtype = mixed_precision_policy.grad_comm_dtype or grad_dtype
             # Keep main_grad persistent for the initial implementation. For micro-batch
             # size 1, this allocation could be delayed until post_backward and then
             # eagerly deallocated right after optimizer.step(), avoiding main_grad
@@ -228,6 +242,22 @@ class FsdpParameterGroup:
             else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
+            if self.requires_grad and self._fuse_te_module_wgrad_accumulation:
+                # TE 2.10+ recognizes this v1 contract and asks get_main_grad() for
+                # the destination of each wgrad GEMM. The returned view belongs to
+                # the packed reduce-scatter input buffer allocated below.
+                parameter.__fsdp_param__ = True
+                parameter.grad_added_to_main_grad = False
+                parameter.overwrite_main_grad = True
+                parameter_group_ref = ref(self)
+
+                def get_main_grad(parameter_group_ref=parameter_group_ref, parameter_index=index):
+                    parameter_group = parameter_group_ref()
+                    if parameter_group is None:
+                        raise RuntimeError("MFSDP parameter has no containing parameter group.")
+                    return parameter_group.get_main_grad_for_wgrad(parameter_index)
+
+                parameter.get_main_grad = get_main_grad
             # Parameter-owned markers must not retain their FSDP module tree.
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
@@ -334,21 +364,60 @@ class FsdpParameterGroup:
             if fsdp_parameter.unsharded.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
             grads.append(fsdp_parameter.unsharded.grad)
+        return self._allocate_partial_grad_buffer(grads[0].dtype)
+
+    def _allocate_partial_grad_buffer(self, dtype: torch.dtype) -> DBuffer:
+        """Allocate a packed full-gradient buffer in ``dtype``."""
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
-                tensor_shapes=tuple(grad.shape for grad in grads),
-                dtype=grads[0].dtype,
-                device=grads[0].device,
+                tensor_shapes=self.main_weight.layout.tensor_shapes,
+                dtype=dtype,
+                device=self.main_weight.device,
             )
+
+    def prepare_te_module_wgrad_accumulation(self) -> None:
+        """Make a packed partial-gradient buffer available to Transformer Engine."""
+        if not self._fuse_te_module_wgrad_accumulation:
+            raise RuntimeError("Transformer Engine wgrad accumulation fusion is not enabled.")
+        if self._partial_grad is None:
+            with torch.cuda.stream(self._reduce_scatter_stream):
+                self._partial_grad = self._allocate_partial_grad_buffer(self._fused_wgrad_dtype)
+        torch.cuda.current_stream(self.main_weight.device).wait_stream(self._reduce_scatter_stream)
+
+    def get_main_grad_for_wgrad(self, parameter_index: int) -> torch.Tensor:
+        """Return one full-gradient view for a fused Transformer Engine wgrad GEMM."""
+        self.prepare_te_module_wgrad_accumulation()
+        assert self._partial_grad is not None
+        return self._partial_grad.get_local_tensor(parameter_index)
+
+    def take_partial_grad_buffer(self) -> DBuffer:
+        """Take the packed buffer populated during fused and ordinary backward ops."""
+        if self._partial_grad is None:
+            raise RuntimeError("Missing fused Transformer Engine partial-gradient buffer.")
+        partial_grad = self._partial_grad
+        self._partial_grad = None
+        return partial_grad
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
-        # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_local_tensor(index).copy_(fsdp_parameter.unsharded.grad)
-            fsdp_parameter.unsharded.grad = None
+            parameter = fsdp_parameter.unsharded
+            # Fused TE kernels already populated this parameter's packed view and
+            # return only a dummy .grad to make autograd run post-accumulate hooks.
+            if not getattr(parameter, "grad_added_to_main_grad", False):
+                if parameter.grad is None:
+                    raise RuntimeError(
+                        f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}."
+                    )
+                destination = partial_grad.get_local_tensor(index)
+                if destination.data_ptr() != parameter.grad.data_ptr():
+                    destination.copy_(parameter.grad)
+            parameter.grad = None
+            if self._fuse_te_module_wgrad_accumulation:
+                parameter.grad_added_to_main_grad = False
+                parameter.main_grad = None
 
     def _has_sharded_grads(self) -> bool:
         has_any_grad = False

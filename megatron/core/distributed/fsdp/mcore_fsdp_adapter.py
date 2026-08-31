@@ -602,7 +602,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
-        with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
+        with fully_shard_context(
+            device=device,
+            use_symmetric_memory=ddp_config.nccl_ub,
+            fuse_te_module_wgrad_accumulation=config.gradient_accumulation_fusion,
+        ):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
                 # Their gradients need the EP divisor because the same expert receives
@@ -726,8 +730,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 f"{ddp_config.outer_dp_sharding_strategy!r} requires an outer DP axis, "
                 "i.e. num_distributed_optimizer_instances > 1."
             )
-        if config.gradient_accumulation_fusion:
-            raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
+        if config.gradient_accumulation_fusion and not is_te_min_version("2.10"):
+            raise ValueError(
+                "MFSDP v2 with gradient_accumulation_fusion requires "
+                "Transformer Engine version 2.10 or higher."
+            )
         if config.calculate_per_token_loss:
             raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
         if config.fp8 or config.fp4 or ddp_config.fp8_param_gather or ddp_config.fp4_param_gather:

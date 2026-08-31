@@ -153,6 +153,98 @@ class TestMcoreAdapterDense:
 
         assert fully_shard_context_calls == [True]
 
+    def test_gradient_accumulation_fusion_enables_context(self, monkeypatch):
+        """The adapter should enable the v2 TE wgrad-fusion buffer path."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            gradient_accumulation_fusion=True,
+        )
+        model = torch.nn.Linear(config.hidden_size, config.hidden_size, device="cuda")
+        fully_shard_context_calls = []
+        original_fully_shard_context = mcore_fsdp_adapter.fully_shard_context
+
+        def record_fully_shard_context(*args, **kwargs):
+            fully_shard_context_calls.append(kwargs["fuse_te_module_wgrad_accumulation"])
+            return original_fully_shard_context(*args, **kwargs)
+
+        monkeypatch.setattr(mcore_fsdp_adapter, "is_te_min_version", lambda *_: True)
+        monkeypatch.setattr(mcore_fsdp_adapter, "fully_shard_context", record_fully_shard_context)
+        FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        assert fully_shard_context_calls == [True]
+
+    def test_te_linear_wgrad_fusion_matches_unfused(self):
+        """A real Transformer Engine linear should match its unfused reference."""
+        pytest.importorskip("transformer_engine.pytorch")
+        from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
+
+        fused_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+            gradient_accumulation_fusion=True,
+        )
+        reference_config = replace(fused_config, gradient_accumulation_fusion=False)
+
+        def build_linear(config):
+            return TEColumnParallelLinear(
+                input_size=config.hidden_size,
+                output_size=config.hidden_size,
+                config=config,
+                init_method=config.init_method,
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
+            ).cuda()
+
+        torch.manual_seed(2468)
+        reference = build_linear(reference_config)
+        fused = build_linear(fused_config)
+        fused.load_state_dict(reference.state_dict())
+        fused = FullyShardedDataParallel(
+            config=fused_config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=fused,
+            fsdp_unit_modules=[],
+            pg_collection=self.pg_collection,
+        )
+
+        inputs = torch.randn(2, 3, fused_config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        for x in inputs:
+            reference_output, _ = reference(x)
+            fused_output, _ = fused(x)
+            reference_output.float().square().mean().backward()
+            fused_output.float().square().mean().backward()
+
+        assert isinstance(fused.module.weight.grad, DTensor)
+        torch.testing.assert_close(
+            fused.module.weight.grad.full_tensor(), reference.weight.grad, rtol=1e-2, atol=1e-3
+        )
+
     @pytest.mark.parametrize("optimizer_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
     def test_build_train_and_step(self, optimizer_cuda_graph):
         config = TransformerConfig(
