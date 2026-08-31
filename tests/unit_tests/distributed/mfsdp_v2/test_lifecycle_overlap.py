@@ -15,6 +15,9 @@ Covers PR #6949 ("Expose FsdpModule in M-FSDP v2 1F1B Direct"):
 These are distributed tests: run under ``torchrun`` (see the suite's conftest).
 """
 
+from contextlib import nullcontext
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -29,6 +32,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
+from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
 
 
 class SingleLinear(nn.Module):
@@ -42,6 +46,17 @@ class SingleLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the model."""
         return self.fc(x) + self.bias
+
+
+class ForwardNode:
+    """Minimal forward-only node used to exercise the fine-grained schedule."""
+
+    def __init__(self, forward=None) -> None:
+        self._forward = forward or (lambda value: value)
+
+    def forward(self, value):
+        """Run the configured callable or pass the value through."""
+        return self._forward(value)
 
 
 @pytest.fixture(scope="function")
@@ -66,15 +81,10 @@ def _wrap(model, mesh, placements, device, custom_forward_backward_hooks=False):
     """fully_shard a single model under a context with the given flag."""
     policy = MixedPrecisionPolicy(main_params_dtype=torch.bfloat16, main_grads_dtype=torch.bfloat16)
     model = model.to(device=device)
-    ctx = fully_shard_context(
+    with fully_shard_context(
         device=device, custom_forward_backward_hooks=custom_forward_backward_hooks
-    )
-    context = ctx.__enter__()
-    try:
+    ) as context:
         fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-    except BaseException:
-        ctx.__exit__(None, None, None)
-        raise
     assert isinstance(model, FsdpModule), "fully_shard should attach the FsdpModule mixin."
     return context
 
@@ -113,7 +123,7 @@ def test_post_backward_rearms_readiness_counter(dp_mesh, placements, distributed
     """``post_backward`` resets ``_num_ready_grad_parameters`` so the counter can
     re-complete on the next backward (the frozen-experts fix)."""
     device = distributed_setup.device
-    model = SingleLinear(dim=8)
+    model = SingleLinear(dim=8).to(dtype=torch.bfloat16)
     _wrap(model, dp_mesh, placements, device, custom_forward_backward_hooks=False)
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
@@ -137,6 +147,9 @@ def test_grad_dtype_stopgap_only_for_delayed_wgrad(dp_mesh, placements, distribu
     model = SingleLinear(dim=8)
     # Simulate a TE delayed-wgrad flag on the linear weight only.
     model.fc.weight.skip_backward_post_hook = True  # type: ignore[attr-defined]
+    # TE modules expose this callback registration API. The test only inspects
+    # the resulting gradient dtype, so a no-op registration models that contract.
+    model.fc.register_wgrad_accumulation_and_reduce_hooks = lambda callback: None
     _wrap(model, dp_mesh, placements, device, custom_forward_backward_hooks=False)
 
     grad_dtype_by_fqn = {}
@@ -150,3 +163,44 @@ def test_grad_dtype_stopgap_only_for_delayed_wgrad(dp_mesh, placements, distribu
     assert grad_dtype_by_fqn["fc.weight"] is None
     # Normal param: keeps the configured main-grad dtype.
     assert grad_dtype_by_fqn["bias"] is not None
+
+
+def test_fine_grained_forward_enters_and_releases_nested_fsdp_units(
+    dp_mesh, placements, distributed_setup
+):
+    """Direct submodule calls wait for and release every nested FSDP unit."""
+    device = distributed_setup.device
+    model = SingleLinear(dim=8).to(device=device, dtype=torch.bfloat16)
+    policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
+    with fully_shard_context(device=device, custom_forward_backward_hooks=True):
+        fully_shard(model.fc, mesh=dp_mesh, placements=placements, mixed_precision_policy=policy)
+        fully_shard(model, mesh=dp_mesh, placements=placements, mixed_precision_policy=policy)
+
+    assert isinstance(model, FsdpModule)
+    assert isinstance(model.fc, FsdpModule)
+    fsdp_modules = tuple(
+        submodule for submodule in model.modules() if isinstance(submodule, FsdpModule)
+    )
+    schedule_layer = SimpleNamespace(
+        layer=model,
+        _fsdp_modules=fsdp_modules,
+        pre_dispatch_computation=ForwardNode(),
+        moe_dispatch=ForwardNode(),
+        mlp=ForwardNode(model.fc),
+        moe_combine=ForwardNode(),
+        mtp_post_process=ForwardNode(),
+        get_fp8_context=nullcontext,
+    )
+    inputs = torch.randn(4, 8, device=device, dtype=torch.bfloat16)
+
+    output, _ = TransformerLayerSchedulePlan.run(schedule_layer, None, f_input=inputs)
+
+    assert output.shape == inputs.shape
+    for fsdp_module in fsdp_modules:
+        assert fsdp_module.phase is FsdpModule.Phase.RESTING
+        assert fsdp_module._unshard_event is None
+        for group in fsdp_module.parameter_groups:
+            for parameter in group.fsdp_parameters:
+                owner = fsdp_module.get_submodule(parameter.fqns[0].rpartition(".")[0])
+                parameter_name = parameter.fqns[0].rpartition(".")[2]
+                assert owner._parameters[parameter_name] is parameter.sharded

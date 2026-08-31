@@ -103,6 +103,9 @@ class TransformerLayerSchedulePlan:
         self.layer_state = LayerState()
         self.chunk_state = chunk_state
         self.layer = layer
+        self._fsdp_modules = tuple(
+            submodule for submodule in layer.modules() if isinstance(submodule, FsdpModule)
+        )
         self.event = event
         self.comp_stream = comp_stream
         self.comm_stream = comm_stream
@@ -130,6 +133,8 @@ class TransformerLayerSchedulePlan:
         if hasattr(self, 'layer_state') and self.layer_state is not None:
             del self.layer_state
             self.layer_state = None
+        if hasattr(self, '_fsdp_modules'):
+            del self._fsdp_modules
         if hasattr(self, 'layer'):
             del self.layer
 
@@ -282,22 +287,26 @@ class TransformerLayerSchedulePlan:
             Functions or values for next iteration's computation
         """
 
-        if b_layer and isinstance(b_layer.layer, FsdpModule):
+        if b_layer is not None:
             # The fine-grained schedule invokes layer submodules directly and
             # splits their backward into separate GraphTasks. Start every nested
             # FSDP unit explicitly so delayed weight-gradient computation still
             # sees its full compute parameters. In particular, MoE experts are a
             # child FSDP unit distinct from the TransformerLayer that owns them.
-            for fsdp_module in b_layer.layer.modules():
-                if isinstance(fsdp_module, FsdpModule):
-                    fsdp_module.pre_backward()
+            for fsdp_module in b_layer._fsdp_modules:
+                fsdp_module.pre_backward()
 
         if b_layer is not None:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
 
-        if f_layer and isinstance(f_layer.layer, FsdpModule):
-            f_layer.layer.pre_forward()
+        if f_layer is not None:
+            # The outer unit's prefetch starts the nested expert all-gather, but
+            # only the nested unit's own pre_forward waits for that collective
+            # and enters its lifecycle. The schedule calls the expert directly,
+            # so explicitly enter every unit in module order before compute.
+            for fsdp_module in f_layer._fsdp_modules:
+                fsdp_module.pre_forward()
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
@@ -339,8 +348,12 @@ class TransformerLayerSchedulePlan:
 
         # Delay releasing forward-layer parameters. The forward and backward layers may
         # be the same, and backward pre-dispatch still needs to read those parameters.
-        if f_layer and isinstance(f_layer.layer, FsdpModule):
-            f_layer.layer.post_forward()
+        if f_layer is not None:
+            # Release children before their owning layer so every pre_forward
+            # above has a matching post_forward and no prefetched expert remains
+            # materialized across schedule steps.
+            for fsdp_module in reversed(f_layer._fsdp_modules):
+                fsdp_module.post_forward()
 
         return f_input, b_grad
 
