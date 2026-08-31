@@ -32,7 +32,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
-from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
+from megatron.core.models.common.model_chunk_schedule_plan import (
+    TransformerLayerSchedulePlan,
+    TransformerModelChunkSchedulePlan,
+)
 
 
 class SingleLinear(nn.Module):
@@ -49,14 +52,59 @@ class SingleLinear(nn.Module):
 
 
 class ForwardNode:
-    """Minimal forward-only node used to exercise the fine-grained schedule."""
+    """Minimal bidirectional node used to exercise the fine-grained schedule."""
 
-    def __init__(self, forward=None) -> None:
+    def __init__(self, forward=None, backward=None, backward_dw=None) -> None:
         self._forward = forward or (lambda value: value)
+        self._backward = backward or (lambda value: value)
+        self._backward_dw = backward_dw or (lambda: None)
 
-    def forward(self, value):
+    def forward(self, *args):
         """Run the configured callable or pass the value through."""
-        return self._forward(value)
+        return self._forward(*args)
+
+    def backward(self, value):
+        """Run the configured backward callable or pass the gradient through."""
+        return self._backward(value)
+
+    def backward_dw(self):
+        """Run the configured delayed weight-gradient callable."""
+        return self._backward_dw()
+
+
+class ModelChunkPlan:
+    """Small model-chunk plan sufficient for direct scheduler lifecycle tests."""
+
+    def __init__(self, model, layer, forward_input=None) -> None:
+        self.state = SimpleNamespace(model=model)
+        self.vp_stage = 0
+        self.pre_process = ForwardNode(
+            forward=(lambda: forward_input), backward=(lambda grad: grad)
+        )
+        self.post_process = None
+        self._layers = [layer]
+
+    def record_current_stream(self):
+        """The test nodes all run on the current stream."""
+
+    def wait_current_stream(self):
+        """The test nodes all run on the current stream."""
+
+    def num_layers(self):
+        """Return the number of remaining layer plans."""
+        return len(self._layers)
+
+    def get_layer(self, index):
+        """Return a forward layer plan without consuming it."""
+        return self._layers[index]
+
+    def pop_layer(self):
+        """Consume a backward layer plan in reverse order."""
+        return self._layers.pop()
+
+    def release_state(self):
+        """Release the model reference held by this test plan."""
+        self.state.model = None
 
 
 @pytest.fixture(scope="function")
@@ -204,3 +252,63 @@ def test_fine_grained_forward_enters_and_releases_nested_fsdp_units(
                 owner = fsdp_module.get_submodule(parameter.fqns[0].rpartition(".")[0])
                 parameter_name = parameter.fqns[0].rpartition(".")[2]
                 assert owner._parameters[parameter_name] is parameter.sharded
+
+
+def test_model_chunk_defers_root_reshard_until_interleaved_forward_finishes(
+    dp_mesh, placements, distributed_setup
+):
+    """Root backward completion must not invalidate a paired forward's parameters."""
+    device = distributed_setup.device
+    model = SingleLinear(dim=8).to(device=device, dtype=torch.bfloat16)
+    model.requires_grad_(False)
+    _wrap(model, dp_mesh, placements, device, custom_forward_backward_hooks=True)
+
+    root_parameter = next(
+        parameter
+        for group in model.parameter_groups
+        for parameter in group.fsdp_parameters
+        if parameter.fqns[0] == "bias"
+    )
+    root_was_materialized = []
+
+    def finish_root_backward(grad):
+        model.post_backward()
+        assert model._post_backward_pending
+        assert model.phase is FsdpModule.Phase.BACKWARD
+        return grad
+
+    def consume_root_parameter(value):
+        root_was_materialized.append(model._parameters["bias"] is root_parameter.unsharded)
+        return value
+
+    common_layer_args = {
+        "_fsdp_modules": (),
+        "config": SimpleNamespace(ep_overlap_early_attn_memory_release=False),
+        "pre_dispatch_computation": ForwardNode(),
+        "moe_dispatch": ForwardNode(),
+        "mlp": ForwardNode(),
+        "mtp_post_process": ForwardNode(),
+        "get_fp8_context": nullcontext,
+        "release_state": lambda: None,
+    }
+    forward_layer = SimpleNamespace(
+        **common_layer_args, moe_combine=ForwardNode(forward=consume_root_parameter)
+    )
+    backward_layer = SimpleNamespace(
+        **common_layer_args, moe_combine=ForwardNode(backward=finish_root_backward)
+    )
+    inputs = torch.randn(4, 8, device=device, dtype=torch.bfloat16)
+    forward_plan = ModelChunkPlan(model, forward_layer, forward_input=inputs)
+    backward_plan = ModelChunkPlan(model, backward_layer)
+
+    output = TransformerModelChunkSchedulePlan.run(
+        forward_plan, backward_plan, b_grad=torch.ones_like(inputs)
+    )
+
+    assert output is inputs
+    assert root_was_materialized == [True]
+    assert model._post_backward_defer_count == 0
+    assert not model._post_backward_pending
+    assert model.phase is FsdpModule.Phase.RESTING
+    assert model._unshard_event is None
+    assert model._parameters["bias"] is root_parameter.sharded

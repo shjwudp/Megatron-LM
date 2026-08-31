@@ -185,6 +185,8 @@ class FsdpModule:
     _num_ready_grad_parameters: int
     _is_root: bool
     _num_trainable_parameters: int
+    _post_backward_defer_count: int
+    _post_backward_pending: bool
     # Event recorded after this FsdpModule's full parameters are materialized.
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
     # already prefetched this module.
@@ -246,6 +248,8 @@ class FsdpModule:
         self._num_trainable_parameters = sum(
             len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
         )
+        self._post_backward_defer_count = 0
+        self._post_backward_pending = False
         self._register_hooks()
         context.register_module(self)
 
@@ -493,6 +497,19 @@ class FsdpModule:
         if next_module is not None:
             next_module._unshard_parameter_groups()
 
+    def defer_post_backward(self) -> None:
+        """Keep parameters materialized until a custom schedule releases its hold."""
+        self._post_backward_defer_count += 1
+
+    def release_post_backward(self) -> None:
+        """Release one custom-schedule hold and run a deferred finalization if ready."""
+        if self._post_backward_defer_count == 0:
+            raise RuntimeError("Cannot release an FSDP post-backward hold that is not active.")
+        self._post_backward_defer_count -= 1
+        if self._post_backward_defer_count == 0 and self._post_backward_pending:
+            self._post_backward_pending = False
+            self.post_backward()
+
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state.
 
@@ -503,6 +520,9 @@ class FsdpModule:
         while the unit is in its BACKWARD pass; ``set_phase`` enforces phase transitions
         (relaxed only by ``custom_forward_backward_hooks`` for the 1F1B EP-overlap path).
         """
+        if self._post_backward_defer_count > 0:
+            self._post_backward_pending = True
+            return
         self._reshard_parameter_groups()
         self._reduce_gradient_groups()
         self.phase = FsdpModule.Phase.RESTING
