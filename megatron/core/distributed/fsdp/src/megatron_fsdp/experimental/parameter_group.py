@@ -114,6 +114,10 @@ class FsdpParameterGroup:
     _model_weight_placements: tuple[Placement, ...]
     _partial_grad_dtype: torch.dtype | None
     _fused_wgrad_buffer: DBuffer | None
+    # Recorded after allocation/zeroing so auxiliary producer streams see ready storage.
+    _fused_wgrad_buffer_ready_event: torch.cuda.Event | None
+    # Streams that requested a fused view and may still be writing when backward returns.
+    _fused_wgrad_producer_streams: dict[int, torch.cuda.Stream]
     # Cached sharded-gradient DTensors keyed by the main_grad DBuffer identity.
     # Rebuilding DTensors every backward costs O(params) ``_FromTorchTensor``
     # calls on the host; when main_grad storage is reused we rebind the cached
@@ -256,6 +260,8 @@ class FsdpParameterGroup:
 
         self._main_grad = None
         self._fused_wgrad_buffer = None
+        self._fused_wgrad_buffer_ready_event = None
+        self._fused_wgrad_producer_streams = {}
         self._main_grad_dtype = None
         self._partial_grad_dtype = None
         self._grad_dtensor_cache = []
@@ -607,6 +613,10 @@ class FsdpParameterGroup:
         # Grouped expert kernels may leave zero-token or otherwise skipped regions
         # unwritten. Clear the complete staging buffer before TE writes into its views.
         self._fused_wgrad_buffer.local_buffer.zero_()
+        self._fused_wgrad_buffer_ready_event = torch.cuda.current_stream(
+            self.main_weight.device
+        ).record_event()
+        self._fused_wgrad_producer_streams.clear()
         for fsdp_parameter in self.fsdp_parameters:
             parameter = fsdp_parameter.unsharded
             parameter.grad_added_to_main_grad = False
@@ -619,10 +629,14 @@ class FsdpParameterGroup:
             raise RuntimeError(
                 "FSDP fused-wgrad storage was requested before the module's pre-backward hook."
             )
+        current_stream = torch.cuda.current_stream(self.main_weight.device)
+        if self._fused_wgrad_buffer_ready_event is not None:
+            current_stream.wait_event(self._fused_wgrad_buffer_ready_event)
+        self._fused_wgrad_producer_streams[current_stream.cuda_stream] = current_stream
         return partial_grad.get_local_tensor(index)
 
-    def take_fused_wgrad_buffer(self) -> DBuffer:
-        """Detach and return the completed fused-wgrad buffer for reduction."""
+    def take_fused_wgrad_buffer(self) -> tuple[DBuffer, tuple[torch.cuda.Event, ...]]:
+        """Detach the fused buffer and record completion on every producer stream."""
         partial_grad = self._fused_wgrad_buffer
         if partial_grad is None:
             raise RuntimeError("FSDP fused-wgrad buffer is missing at gradient reduction.")
@@ -637,7 +651,12 @@ class FsdpParameterGroup:
                     "Complete fused-wgrad group did not receive every direct gradient; "
                     f"missing parameters: {missing_fqns!r}."
                 )
+        ready_events = tuple(
+            stream.record_event() for stream in self._fused_wgrad_producer_streams.values()
+        )
         self._fused_wgrad_buffer = None
+        self._fused_wgrad_buffer_ready_event = None
+        self._fused_wgrad_producer_streams.clear()
         for fsdp_parameter in self.fsdp_parameters:
             parameter = fsdp_parameter.unsharded
             parameter.main_grad = None
@@ -646,7 +665,7 @@ class FsdpParameterGroup:
                 # actual contribution is already in the fused staging buffer.
                 parameter.grad = None
                 parameter.grad_added_to_main_grad = False
-        return partial_grad
+        return partial_grad, ready_events
 
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer.

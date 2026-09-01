@@ -541,31 +541,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         return self.module.context
 
     @staticmethod
-    def _configure_te_grouped_mlp_wgrad_fusion(
-        module: torch.nn.Module, enabled: bool
-    ) -> None:
-        """Restrict fused wgrad accumulation to routed TE grouped experts.
-
-        ``gradient_accumulation_fusion`` is consumed while the model is built, so
-        every compatible linear starts with fusion enabled. MFSDP's parameter-group
-        setting must match those linear-module flags: first disable fusion throughout
-        the constructed model, then opt only ``TEGroupedMLP``'s grouped FC1/FC2 back in.
-        """
-        if not enabled:
-            return
-
-        for submodule in module.modules():
-            if hasattr(submodule, "fuse_wgrad_accumulation"):
-                submodule.fuse_wgrad_accumulation = False
-            if hasattr(submodule, "gradient_accumulation_fusion"):
-                submodule.gradient_accumulation_fusion = False
-
-        for submodule in module.modules():
-            if isinstance(submodule, TEGroupedMLP):
-                submodule.linear_fc1.fuse_wgrad_accumulation = True
-                submodule.linear_fc2.fuse_wgrad_accumulation = True
-
-    @staticmethod
     def _reset_meta_parameters_before_fully_shard(
         module: torch.nn.Module,
         device: torch.device,
@@ -683,9 +658,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if fsdp_unit_modules is None:
             fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
-        self._configure_te_grouped_mlp_wgrad_fusion(
-            module, enabled=config.gradient_accumulation_fusion
-        )
 
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
@@ -796,10 +768,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             mixed_precision_policy=self.mp_policy,
                             fine_grained=fine_grained,
                             skip_backward_callback=skip_backward_cb,
-                            fuse_wgrad_accumulation=(
-                                config.gradient_accumulation_fusion
-                                and isinstance(submodule.experts, TEGroupedMLP)
-                            ),
+                            fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
                             fused_wgrad_is_complete=complete_fused_wgrad(submodule.experts),
                             grad_divisor=config.expert_model_parallel_size,
                         )
@@ -819,10 +788,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         mixed_precision_policy=self.mp_policy,
                         fine_grained=fine_grained,
                         skip_backward_callback=skip_backward_cb,
-                        fuse_wgrad_accumulation=(
-                            config.gradient_accumulation_fusion
-                            and isinstance(submodule, TEGroupedMLP)
-                        ),
+                        fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
                         fused_wgrad_is_complete=complete_fused_wgrad(submodule),
                     )
                     self._copy_mcore_attributes_to_sharded_parameters(submodule)
@@ -847,10 +813,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         mixed_precision_policy=self.mp_policy,
                         fine_grained=fine_grained,
                         skip_backward_callback=skip_backward_cb,
-                        fuse_wgrad_accumulation=(
-                            config.gradient_accumulation_fusion
-                            and isinstance(submodule, TEGroupedMLP)
-                        ),
+                        fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
                         fused_wgrad_is_complete=complete_fused_wgrad(submodule),
                     )
                     self._copy_mcore_attributes_to_sharded_parameters(submodule)
@@ -863,9 +826,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 mixed_precision_policy=self.mp_policy,
                 fine_grained=fine_grained,
                 skip_backward_callback=skip_backward_cb,
-                fuse_wgrad_accumulation=(
-                    config.gradient_accumulation_fusion and isinstance(module, TEGroupedMLP)
-                ),
+                fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
                 fused_wgrad_is_complete=complete_fused_wgrad(module),
             )
             self._copy_mcore_attributes_to_sharded_parameters(module)

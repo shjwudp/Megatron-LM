@@ -431,8 +431,8 @@ class TestMcoreAdapterDense:
         assert optimizer.step() == expected_result
         assert complete_trace_calls == 1
 
-    def test_wgrad_fusion_is_scoped_to_te_grouped_mlp(self):
-        """Only TEGroupedMLP linears and their expert FSDP unit should use fusion."""
+    def test_wgrad_fusion_covers_dense_and_te_grouped_mlp(self):
+        """Dense and grouped-expert FSDP units should both use fused wgrad."""
 
         class FusionAwareLinear(torch.nn.Linear):
             def __init__(self):
@@ -475,16 +475,16 @@ class TestMcoreAdapterDense:
 
         assert experts.linear_fc1.fuse_wgrad_accumulation
         assert experts.linear_fc2.fuse_wgrad_accumulation
-        assert not experts.linear_fc1.gradient_accumulation_fusion
-        assert not experts.linear_fc2.gradient_accumulation_fusion
-        assert not dense.fuse_wgrad_accumulation
-        assert not dense.gradient_accumulation_fusion
+        assert experts.linear_fc1.gradient_accumulation_fusion
+        assert experts.linear_fc2.gradient_accumulation_fusion
+        assert dense.fuse_wgrad_accumulation
+        assert dense.gradient_accumulation_fusion
 
         assert experts.parameter_groups
         assert all(group.fuse_wgrad_accumulation for group in experts.parameter_groups)
         assert all(group.fused_wgrad_is_complete for group in experts.parameter_groups)
         assert wrapped.module.parameter_groups
-        assert all(not group.fuse_wgrad_accumulation for group in wrapped.module.parameter_groups)
+        assert all(group.fuse_wgrad_accumulation for group in wrapped.module.parameter_groups)
         assert all(
             not group.fused_wgrad_is_complete for group in wrapped.module.parameter_groups
         )
@@ -500,8 +500,66 @@ class TestMcoreAdapterDense:
             for fsdp_parameter in group.fsdp_parameters
         ]
         assert all(hasattr(parameter, "get_main_grad") for parameter in expert_compute_parameters)
-        assert all(
-            not hasattr(parameter, "get_main_grad") for parameter in dense_compute_parameters
+        assert all(hasattr(parameter, "get_main_grad") for parameter in dense_compute_parameters)
+
+    def test_te_linear_wgrad_fusion_matches_unfused(self):
+        """A real dense Transformer Engine linear should match its unfused reference."""
+        pytest.importorskip("transformer_engine.pytorch")
+        from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
+
+        fused_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+            gradient_accumulation_fusion=True,
+        )
+        reference_config = replace(fused_config, gradient_accumulation_fusion=False)
+
+        def build_linear(config):
+            return TEColumnParallelLinear(
+                input_size=config.hidden_size,
+                output_size=config.hidden_size,
+                config=config,
+                init_method=config.init_method,
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
+            ).cuda()
+
+        torch.manual_seed(2468)
+        reference = build_linear(reference_config)
+        fused = build_linear(fused_config)
+        fused.load_state_dict(reference.state_dict())
+        fused = FullyShardedDataParallel(
+            config=fused_config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=fused,
+            fsdp_unit_modules=[],
+            pg_collection=self.pg_collection,
+        )
+
+        inputs = torch.randn(2, 3, fused_config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        for x in inputs:
+            reference_output, _ = reference(x)
+            fused_output, _ = fused(x)
+            reference_output.float().square().mean().backward()
+            fused_output.float().square().mean().backward()
+
+        assert isinstance(fused.module.weight.grad, DTensor)
+        torch.testing.assert_close(
+            fused.module.weight.grad.full_tensor(), reference.weight.grad, rtol=1e-2, atol=1e-3
         )
 
     @pytest.mark.parametrize("optimizer_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
