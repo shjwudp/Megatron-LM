@@ -64,6 +64,7 @@ def fully_shard_context(
     *,
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
+    enable_prefetch: bool = True,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -78,6 +79,8 @@ def fully_shard_context(
         unify_communication_stream: Whether all-gathers and reduce-scatters share one
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
+        enable_prefetch: Whether FSDP units should all-gather the next unit in static
+            forward and backward order. Demand all-gathers remain enabled.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
@@ -90,6 +93,7 @@ def fully_shard_context(
         device=device,
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
+        enable_prefetch=enable_prefetch,
     )
     token = _FSDP_CONTEXT.set(context)
     try:
@@ -107,7 +111,6 @@ def fully_shard(
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
-    skip_forward_backward_hooks: bool = False,
     grad_divisor: int = 1,
 ) -> None:
     """Apply FSDP to a module in place.
@@ -121,10 +124,6 @@ def fully_shard(
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
-        skip_forward_backward_hooks: Skip the standard module-level forward/backward
-            hooks and per-parameter backward-completion callbacks. Integrations that
-            drive the full FSDP lifecycle through another hook or explicit callback
-            interface use this to avoid registering two lifecycle paths.
         grad_divisor: Additional divisor applied to the reduced gradient, on top of the
             averaging the mesh already performs. Defaults to 1, which is correct whenever
             each mesh rank contributes exactly one term to the gradient.
@@ -163,7 +162,6 @@ def fully_shard(
             main_grad_placements=tuple(placements.gradient),
             main_weight_placements=tuple(placements.optimizer),
             mixed_precision_policy=mixed_precision_policy,
-            skip_forward_backward_hooks=skip_forward_backward_hooks,
             grad_divisor=grad_divisor,
             use_symmetric_memory=context.use_symmetric_memory,
         )
