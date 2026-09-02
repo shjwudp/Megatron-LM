@@ -64,6 +64,7 @@ def fully_shard_context(
     *,
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
+    enable_prefetch: bool = True,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -78,6 +79,8 @@ def fully_shard_context(
         unify_communication_stream: Whether all-gathers and reduce-scatters share one
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
+        enable_prefetch: Whether FSDP units should all-gather the next unit in static
+            forward and backward order. Demand all-gathers remain enabled.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
@@ -90,6 +93,7 @@ def fully_shard_context(
         device=device,
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
+        enable_prefetch=enable_prefetch,
     )
     token = _FSDP_CONTEXT.set(context)
     try:

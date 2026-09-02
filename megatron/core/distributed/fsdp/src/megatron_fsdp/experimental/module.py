@@ -48,6 +48,7 @@ class FsdpContext:
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
+    enable_prefetch: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
@@ -59,6 +60,7 @@ class FsdpContext:
         device: torch.device,
         use_symmetric_memory: bool = False,
         unify_communication_stream: bool = False,
+        enable_prefetch: bool = True,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -68,10 +70,13 @@ class FsdpContext:
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
             unify_communication_stream: Whether all-gathers and reduce-scatters share one
                 communication stream to reduce peak transient memory.
+            enable_prefetch: Whether an FSDP unit should all-gather the next unit in the
+                static forward or backward order. Demand all-gathers remain enabled.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
+        self.enable_prefetch = enable_prefetch
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         # Construction-only; empty after finalization.
@@ -364,7 +369,7 @@ class FsdpModule:
         # Activation recomputation runs forward hooks inside backward. Do not
         # prefetch the next module in forward order: its backward may already
         # be complete, so no later backward hook would reshard it.
-        if not is_recomputing:
+        if context.enable_prefetch and not is_recomputing:
             next_module = context.forward_order.next_item(self)
             if next_module is not None:
                 next_module._unshard_parameter_groups()
@@ -445,9 +450,10 @@ class FsdpModule:
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
 
-        next_module = context.backward_order.next_item(self)
-        if next_module is not None:
-            next_module._unshard_parameter_groups()
+        if context.enable_prefetch:
+            next_module = context.backward_order.next_item(self)
+            if next_module is not None:
+                next_module._unshard_parameter_groups()
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state.

@@ -231,6 +231,38 @@ class TestMcoreAdapterDense:
         assert pre_backward_calls == [False]
         assert model.phase is FsdpModule.Phase.RESTING
 
+    def test_fine_grained_hook_respects_disabled_prefetch(self, monkeypatch):
+        """The fine-grained demand gather must not launch a sibling lookahead."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        mesh = DeviceMesh.from_group(
+            self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
+        )
+        placements = Placements(
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        )
+        model = torch.nn.Sequential(
+            torch.nn.Linear(4, 4, bias=False), torch.nn.Linear(4, 4, bias=False)
+        ).to(device)
+
+        with fully_shard_context(device=device, enable_prefetch=False):
+            fully_shard(model[0], mesh=mesh, placements=placements)
+            fully_shard(model[1], mesh=mesh, placements=placements)
+
+        sibling_unshards = []
+        original_sibling_unshard = model[1]._unshard_parameter_groups
+
+        def record_sibling_unshard():
+            sibling_unshards.append(None)
+            original_sibling_unshard()
+
+        monkeypatch.setattr(model[1], "_unshard_parameter_groups", record_sibling_unshard)
+
+        mcore_fsdp_adapter._fine_grained_pre_forward_hook(model[0], (), {})
+
+        assert model[0]._unshard_event is not None
+        assert sibling_unshards == []
+        model[0]._reshard_parameter_groups()
+
     def test_delayed_wgrad_hook_finalizes_only_its_fsdp_unit(self):
         """An outer completion hook must not finalize a delayed-wgrad child."""
         device = torch.device("cuda", torch.cuda.current_device())
@@ -396,6 +428,42 @@ class TestMcoreAdapterDense:
         )
 
         assert fully_shard_context_calls == [True]
+
+    def test_moe_overlap_disables_static_prefetch(self, monkeypatch):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        # Full overlap validation requires MoE modules; this focused adapter test
+        # verifies propagation after TransformerConfig validation.
+        config.overlap_moe_expert_parallel_comm = True
+        model = torch.nn.Linear(config.hidden_size, config.hidden_size).to(
+            device="cuda", dtype=config.params_dtype
+        )
+        enable_prefetch_calls = []
+        original_fully_shard_context = mcore_fsdp_adapter.fully_shard_context
+
+        def record_fully_shard_context(*args, **kwargs):
+            enable_prefetch_calls.append(kwargs["enable_prefetch"])
+            return original_fully_shard_context(*args, **kwargs)
+
+        monkeypatch.setattr(mcore_fsdp_adapter, "fully_shard_context", record_fully_shard_context)
+        FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        assert enable_prefetch_calls == [False]
 
     @pytest.mark.parametrize("optimizer_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
     def test_build_train_and_step(self, optimizer_cuda_graph):

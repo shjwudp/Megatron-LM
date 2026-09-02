@@ -93,7 +93,7 @@ def _fine_grained_pre_forward_hook(submodule: nn.Module, _args, _kwargs) -> None
     is_recomputing = (
         target.phase is FsdpModule.Phase.BACKWARD or torch._C._current_graph_task_id() != -1
     )
-    if not is_recomputing:
+    if target.context.enable_prefetch and not is_recomputing:
         next_module = target.context.forward_order.next_item(target)
         if next_module is not None:
             next_module._unshard_parameter_groups()
@@ -701,7 +701,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
-        with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
+        with fully_shard_context(
+            device=device,
+            use_symmetric_memory=ddp_config.nccl_ub,
+            # Combined 1F1B executes FSDP units in a dynamic order that does not
+            # match the static module order. Demand gathers remain enabled, but
+            # static lookahead could re-gather a unit whose backward already ended.
+            enable_prefetch=not overlap_moe_expert_parallel,
+        ):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
                 # Their gradients need the EP divisor because the same expert receives

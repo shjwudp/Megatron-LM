@@ -158,6 +158,39 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
     assert list(context.backward_order) == [model, model.right, model.left, model.left.inner]
 
 
+def test_context_can_disable_forward_and_backward_prefetch(distributed_setup, monkeypatch):
+    """Disabling prefetch should retain demand gathers without gathering the next unit."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedModel().to(device)
+
+    with fully_shard_context(device=device, enable_prefetch=False) as context:
+        fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    prefetched = []
+    original_unshard = model.inner._unshard_parameter_groups
+
+    def record_child_unshard():
+        prefetched.append(None)
+        original_unshard()
+
+    monkeypatch.setattr(model.inner, "_unshard_parameter_groups", record_child_unshard)
+
+    model.pre_forward()
+    assert model._unshard_event is not None
+    assert prefetched == []
+    model.post_forward()
+
+    model.pre_backward(register_final_callback=False)
+    assert model._unshard_event is not None
+    assert prefetched == []
+    assert context.enable_prefetch is False
+
+    monkeypatch.setattr(model, "_reduce_gradient_groups", lambda: None)
+    model.post_backward()
+
+
 def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):
     """Context orders should concatenate nested roots at construction boundaries."""
     device = distributed_setup.device

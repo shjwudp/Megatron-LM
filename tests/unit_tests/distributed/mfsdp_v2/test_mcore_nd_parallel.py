@@ -237,6 +237,7 @@ class TestMfsdpV2OverlapParity:
                     "global_batch_size": cls.GLOBAL_BATCH_SIZE,
                     "vocab_size": cls.VOCAB_SIZE,
                     "padded_vocab_size": cls.VOCAB_SIZE,
+                    "untie_embeddings_and_output_weights": True,
                     "seq_length": cls.SEQUENCE_LENGTH,
                     "train_iters": cls.NUM_STEPS,
                     "expert_model_parallel_size": 2,
@@ -373,7 +374,7 @@ class TestMfsdpV2OverlapParity:
         reason="Delayed wgrad without gradient-accumulation fusion requires TE 2.7 or newer.",
     )
     def test_compatible_with_nd_parallel(self, distributed_setup):
-        """MFSDP v2 EP delayed-wgrad overlap matches DistOpt combined 1F1B."""
+        """MFSDP v2 EP delayed-wgrad overlap matches DistOpt without static prefetch."""
         if (
             distributed_setup.world_size < 2
             or distributed_setup.world_size % 2
