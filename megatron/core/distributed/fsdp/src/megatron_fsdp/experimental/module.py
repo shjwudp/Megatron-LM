@@ -179,7 +179,6 @@ class FsdpModule:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
-        skip_forward_backward_hooks: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -219,7 +218,7 @@ class FsdpModule:
                 if group.requires_grad
             )
         )
-        self._register_hooks(skip_forward_backward_hooks=skip_forward_backward_hooks)
+        self._register_hooks()
         context.register_module(self)
 
     @property
@@ -257,11 +256,9 @@ class FsdpModule:
         """Return whether this module is an outermost FsdpModule in its context."""
         return self._is_root
 
-    def _register_hooks(self, skip_forward_backward_hooks: bool = False) -> None:
+    def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
         module.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
-        if skip_forward_backward_hooks:
-            return
 
         # Use PyTorch's callback module argument instead of capturing self so
         # these hooks do not retain a deleted FSDP module.

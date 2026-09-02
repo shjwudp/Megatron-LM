@@ -199,7 +199,7 @@ class TestMcoreAdapterDense:
         module_names = tuple(name for name, _ in model.named_modules())
 
         with fully_shard_context(device=device):
-            fully_shard(model, mesh=mesh, placements=placements, skip_forward_backward_hooks=True)
+            fully_shard(model, mesh=mesh, placements=placements)
             assert isinstance(model, FsdpModule)
             mcore_fsdp_adapter._register_fine_grained_hooks(model)
 
@@ -228,9 +228,6 @@ class TestMcoreAdapterDense:
 
         output.sum().backward()
         assert pre_backward_calls == [False]
-        assert model.phase is FsdpModule.Phase.BACKWARD
-
-        model.post_backward()
         assert model.phase is FsdpModule.Phase.RESTING
 
     def test_overlap_release_finalizes_nested_fsdp_units_once(self, monkeypatch):
@@ -248,13 +245,9 @@ class TestMcoreAdapterDense:
         ).to(device)
 
         with fully_shard_context(device=device):
-            fully_shard(
-                model[0][0], mesh=mesh, placements=placements, skip_forward_backward_hooks=True
-            )
-            fully_shard(
-                model[0], mesh=mesh, placements=placements, skip_forward_backward_hooks=True
-            )
-            fully_shard(model, mesh=mesh, placements=placements, skip_forward_backward_hooks=True)
+            fully_shard(model[0][0], mesh=mesh, placements=placements)
+            fully_shard(model[0], mesh=mesh, placements=placements)
+            fully_shard(model, mesh=mesh, placements=placements)
 
         adapter = object.__new__(mcore_fsdp_adapter.FullyShardedDataParallelV2)
         torch.nn.Module.__init__(adapter)
