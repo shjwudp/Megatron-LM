@@ -27,6 +27,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
+from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Flat
 
@@ -47,6 +48,7 @@ class FsdpContext:
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
+    enable_prefetch: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
@@ -58,6 +60,7 @@ class FsdpContext:
         device: torch.device,
         use_symmetric_memory: bool = False,
         unify_communication_stream: bool = False,
+        enable_prefetch: bool = True,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -67,10 +70,13 @@ class FsdpContext:
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
             unify_communication_stream: Whether all-gathers and reduce-scatters share one
                 communication stream to reduce peak transient memory.
+            enable_prefetch: Whether an FSDP unit should all-gather the next unit in the
+                static forward or backward order. Demand all-gathers remain enabled.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
+        self.enable_prefetch = enable_prefetch
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         # Construction-only; empty after finalization.
@@ -178,7 +184,6 @@ class FsdpModule:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
-        skip_forward_backward_hooks: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -218,7 +223,7 @@ class FsdpModule:
                 if group.requires_grad
             )
         )
-        self._register_hooks(skip_forward_backward_hooks=skip_forward_backward_hooks)
+        self._register_hooks()
         context.register_module(self)
 
     @property
@@ -256,11 +261,9 @@ class FsdpModule:
         """Return whether this module is an outermost FsdpModule in its context."""
         return self._is_root
 
-    def _register_hooks(self, skip_forward_backward_hooks: bool = False) -> None:
+    def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
         module.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
-        if skip_forward_backward_hooks:
-            return
 
         # Use PyTorch's callback module argument instead of capturing self so
         # these hooks do not retain a deleted FSDP module.
@@ -298,7 +301,22 @@ class FsdpModule:
             if not group.requires_grad:
                 continue
             for fsdp_parameter in group.fsdp_parameters:
-                fsdp_parameter.unsharded.register_post_accumulate_grad_hook(grad_hook)
+                parameter = fsdp_parameter.unsharded
+                # ``skip_backward_post_hook`` is TE's delayed-wgrad contract: these
+                # gradients are materialized by ``backward_dw()``, not autograd.
+                if not getattr(parameter, "skip_backward_post_hook", False):
+                    parameter.register_post_accumulate_grad_hook(grad_hook)
+                    continue
+                if len(fsdp_parameter.fqns) > 1:
+                    raise ValueError(
+                        "Tied parameters with delayed wgrad are not supported because "
+                        "Transformer Engine does not accumulate their gradients. See "
+                        "https://github.com/NVIDIA/TransformerEngine/issues/3437"
+                    )
+                parameter_module, _ = get_parameter_owner(module, fsdp_parameter.fqns[0])
+                parameter_module.register_wgrad_accumulation_and_reduce_hooks(
+                    lambda parameter=parameter: grad_hook(parameter)
+                )
 
     @staticmethod
     def _pre_load_state_dict(
@@ -351,7 +369,7 @@ class FsdpModule:
         # Activation recomputation runs forward hooks inside backward. Do not
         # prefetch the next module in forward order: its backward may already
         # be complete, so no later backward hook would reshard it.
-        if not is_recomputing:
+        if context.enable_prefetch and not is_recomputing:
             next_module = context.forward_order.next_item(self)
             if next_module is not None:
                 next_module._unshard_parameter_groups()
@@ -432,12 +450,18 @@ class FsdpModule:
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
 
-        next_module = context.backward_order.next_item(self)
-        if next_module is not None:
-            next_module._unshard_parameter_groups()
+        if context.enable_prefetch:
+            next_module = context.backward_order.next_item(self)
+            if next_module is not None:
+                next_module._unshard_parameter_groups()
 
     def post_backward(self) -> None:
-        """Reduce gradients and return parameters to their sharded resting state."""
+        """Reduce gradients and return parameters to their sharded resting state.
+
+        This is a no-op when the module has already left the backward phase.
+        """
+        if self.phase is not FsdpModule.Phase.BACKWARD:
+            return
         self._reshard_parameter_groups()
         self._reduce_gradient_groups()
         self.phase = FsdpModule.Phase.RESTING

@@ -93,7 +93,7 @@ def _fine_grained_pre_forward_hook(submodule: nn.Module, _args, _kwargs) -> None
     is_recomputing = (
         target.phase is FsdpModule.Phase.BACKWARD or torch._C._current_graph_task_id() != -1
     )
-    if not is_recomputing:
+    if target.context.enable_prefetch and not is_recomputing:
         next_module = target.context.forward_order.next_item(target)
         if next_module is not None:
             next_module._unshard_parameter_groups()
@@ -669,10 +669,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             optimizer=[expert_axis.optimizer],
         )
         overlap_moe_expert_parallel = config.overlap_moe_expert_parallel_comm
-        common_fully_shard_kwargs = dict(
-            mixed_precision_policy=self.mp_policy,
-            skip_forward_backward_hooks=overlap_moe_expert_parallel,
-        )
 
         if has_outer_dp_axis := ddp_config.num_distributed_optimizer_instances > 1:
             # Dense parameters get an outer DP axis. There is no HSDP/HFSDP special case:
@@ -704,7 +700,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
-        with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
+        with fully_shard_context(
+            device=device,
+            use_symmetric_memory=ddp_config.nccl_ub,
+            # Combined 1F1B executes FSDP units in a dynamic order that does not
+            # match the static module order. Demand gathers remain enabled, but
+            # static lookahead could re-gather a unit whose backward already ended.
+            enable_prefetch=not overlap_moe_expert_parallel,
+        ):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
                 # Their gradients need the EP divisor because the same expert receives
@@ -718,7 +721,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
                             grad_divisor=config.expert_model_parallel_size,
-                            **common_fully_shard_kwargs,
+                            mixed_precision_policy=self.mp_policy,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -732,12 +735,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
-                        **common_fully_shard_kwargs,
+                        mixed_precision_policy=self.mp_policy,
                     )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
             fully_shard(
-                module, mesh=dp_mesh, placements=dense_placements, **common_fully_shard_kwargs
+                module,
+                mesh=dp_mesh,
+                placements=dense_placements,
+                mixed_precision_policy=self.mp_policy,
             )
         super().__init__(config=config, module=module)
         if overlap_moe_expert_parallel:
@@ -767,10 +773,26 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     continue
                 if fsdp_module.phase is not FsdpModule.Phase.BACKWARD:
                     continue
-                fsdp_module._original_post_backward()
-                # 1F1B cooldown can run consecutive backward passes without an intervening
-                # pre_forward(), so reset the hook counter as soon as this pass is finalized.
-                fsdp_module._num_ready_grad_parameters = 0
+                countdown = fsdp_module._trainable_parameter_countdown
+                if countdown._value != countdown.initial_value:
+                    ready = []
+                    missing = []
+                    for group in fsdp_module.parameter_groups:
+                        if not group.requires_grad:
+                            continue
+                        for fsdp_parameter in group.fsdp_parameters:
+                            destination = (
+                                ready if fsdp_parameter.unsharded.grad is not None else missing
+                            )
+                            destination.append(fsdp_parameter.fqns)
+                    observed = countdown.initial_value - countdown._value
+                    raise RuntimeError(
+                        "MFSDP schedule ended with an incomplete gradient-completion cycle "
+                        f"for {fsdp_module.name or '<root>'}: "
+                        f"callbacks={observed}/{countdown.initial_value}, "
+                        f"ready={ready!r}, missing={missing!r}."
+                    )
+                fsdp_module.post_backward()
 
         def release_module(module: torch.nn.Module, *, reduce_grad: bool) -> None:
             module = _require_fsdp_module(module)
@@ -788,14 +810,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             when it executes first.
             """
             self.module.context.ensure_finalized()
-
-        # Replace FsdpModule post_backward to defensive post backward to prevent
-        # some post-backward hooks from failing to trigger due to the special
-        # scheduling of 1F1B EP overlap.
-        for fsdp_module in self.module.modules():
-            if isinstance(fsdp_module, FsdpModule):
-                fsdp_module._original_post_backward = fsdp_module.post_backward
-                fsdp_module.post_backward = partial(finalize_backward, fsdp_module)
 
         self._replace_param_with_raw_if_needed = _replace_param_with_raw_if_needed
         self.post_forward_release_module = partial(release_module, reduce_grad=False)
