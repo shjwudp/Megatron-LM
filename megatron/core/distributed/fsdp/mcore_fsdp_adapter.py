@@ -669,7 +669,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
         overlap_moe_expert_parallel = config.overlap_moe_expert_parallel_comm
         common_fully_shard_kwargs = dict(
-            placements=placements,
             mixed_precision_policy=self.mp_policy,
             skip_forward_backward_hooks=overlap_moe_expert_parallel,
         )
@@ -716,6 +715,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         fully_shard(
                             submodule.experts,
                             mesh=expert_dp_mesh,
+                            placements=expert_placements,
                             grad_divisor=config.expert_model_parallel_size,
                             **common_fully_shard_kwargs,
                         )
@@ -727,10 +727,20 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
                     if config.init_model_with_meta_device:
                         _materialize_owned_meta_modules(submodule, device)
-                    fully_shard(submodule, mesh=dp_mesh, **common_fully_shard_kwargs)
+                    fully_shard(
+                        submodule,
+                        mesh=dp_mesh,
+                        placements=dense_placements,
+                        **common_fully_shard_kwargs,
+                    )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
-            fully_shard(submodule, mesh=dp_mesh, **common_fully_shard_kwargs)
+            fully_shard(
+                module,
+                mesh=dp_mesh,
+                placements=dense_placements,
+                **common_fully_shard_kwargs,
+            )
         super().__init__(config=config, module=module)
         if overlap_moe_expert_parallel:
             self._setup_1f1b_overlap_interface()
