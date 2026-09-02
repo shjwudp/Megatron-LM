@@ -798,7 +798,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             module = _require_fsdp_module(module)
             if reduce_grad:
                 finalize_backward(module)
-            else:
+            elif module.phase is not FsdpModule.Phase.BACKWARD:
+                # With an odd number of schedule layers, combined 1F1B pairs the
+                # middle layer's next forward with that same layer's backward.
+                # Its backward still owns the materialized parameters when the
+                # paired forward completes, so defer release to post_backward().
                 module._reshard_parameter_groups()
 
         def _replace_param_with_raw_if_needed() -> None:
@@ -809,7 +813,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             here ensures a child FSDP unit cannot mistake itself for the root
             when it executes first.
             """
-            self.module.context.ensure_finalized()
+            context = self.module.context
+            context.ensure_finalized()
+            # Normal root pre_forward() forks the all-gather stream after the
+            # current stream, which orders the first gather after optimizer
+            # updates and model-weight casts. Combined 1F1B bypasses that root
+            # hook, so establish the same dependency once at schedule entry.
+            context.allgather_stream.wait_stream(context.current_stream())
 
         self._replace_param_with_raw_if_needed = _replace_param_with_raw_if_needed
         self.post_forward_release_module = partial(release_module, reduce_grad=False)

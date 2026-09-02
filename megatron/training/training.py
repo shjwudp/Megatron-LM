@@ -4204,6 +4204,33 @@ def checkpoint_and_decide_exit(
     return False
 
 
+def _configure_data_parallel_no_sync(config, model, args) -> None:
+    """Install the data-parallel wrapper's microbatch synchronization callbacks."""
+    # MFSDP v2 uses no_sync() to mark non-final microbatches even when gradient
+    # communication overlap is disabled. In particular, HFSDP must retain its
+    # DP-outer Partial gradient until the last microbatch rather than finalizing
+    # every contribution into a new optimizer shard.
+    use_model_no_sync = args.overlap_grad_reduce or isinstance(
+        model[0], FullyShardedDataParallelV2
+    )
+    if isinstance(
+        model[0], (FullyShardedDataParallelV1, FullyShardedDataParallelV2, DDP)
+    ) and use_model_no_sync:
+        if args.overlap_grad_reduce:
+            assert config.no_sync_func is None, (
+                'When overlap_grad_reduce is True, config.no_sync_func must be None; '
+                'a custom no_sync_func is not supported when overlapping grad-reduce'
+            )
+        if config.no_sync_func is None:
+            config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
+            if len(model) == 1:
+                config.no_sync_func = config.no_sync_func[0]
+        if args.overlap_grad_reduce and args.align_grad_reduce:
+            config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
+            if len(model) == 1:
+                config.grad_sync_func = config.grad_sync_func[0]
+
+
 def train(
     forward_step_func,
     model,
@@ -4395,20 +4422,7 @@ def train(
     # Setup some training config params.
     config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
     config.timers = timers
-    if isinstance(
-        model[0], (FullyShardedDataParallelV1, FullyShardedDataParallelV2, DDP)
-    ) and args.overlap_grad_reduce:
-        assert config.no_sync_func is None, (
-            'When overlap_grad_reduce is True, config.no_sync_func must be None; '
-            'a custom no_sync_func is not supported when overlapping grad-reduce'
-        )
-        config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
-        if len(model) == 1:
-            config.no_sync_func = config.no_sync_func[0]
-        if args.align_grad_reduce:
-            config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
-            if len(model) == 1:
-                config.grad_sync_func = config.grad_sync_func[0]
+    _configure_data_parallel_no_sync(config, model, args)
     if args.overlap_param_gather and args.align_param_gather:
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:

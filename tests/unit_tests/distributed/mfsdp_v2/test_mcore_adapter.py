@@ -11,7 +11,7 @@ import torch
 import transformer_engine.pytorch as te
 from torch.distributed import DeviceMesh
 from torch.distributed.distributed_c10d import _world
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -37,6 +37,7 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
+from megatron.training.training import _configure_data_parallel_no_sync
 from tests.unit_tests.test_utilities import Utils
 
 logger = logging.getLogger(__name__)
@@ -348,6 +349,12 @@ class TestMcoreAdapterDense:
                 module, "_reduce_gradient_groups", lambda name=name: calls.append((name, "reduce"))
             )
 
+        # An odd layer count can pair this layer's next forward with its current
+        # backward. The forward callback must leave the shared materialization
+        # intact until the backward callback consumes it.
+        adapter.post_forward_release_module(model[0])
+        assert calls == []
+
         # The layer callback releases the nested expert first. The final root sweep
         # releases only the root and safely revisits the already-resting layer subtree.
         adapter.post_backward_release_module(model[0])
@@ -364,6 +371,43 @@ class TestMcoreAdapterDense:
         ]
         for _, module in named_modules:
             assert module.phase is FsdpModule.Phase.RESTING
+
+    def test_overlap_entry_orders_first_gather_after_current_stream(self):
+        """Combined 1F1B should not gather parameters before optimizer updates finish."""
+        events = []
+        current_stream = object()
+
+        class RecordingAllGatherStream:
+            def wait_stream(self, stream) -> None:
+                events.append(("wait_stream", stream))
+
+        class Context:
+            def __init__(self) -> None:
+                self.allgather_stream = RecordingAllGatherStream()
+
+            def ensure_finalized(self) -> None:
+                events.append("ensure_finalized")
+
+            def current_stream(self):
+                return current_stream
+
+        class Module(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.context = Context()
+
+            def pre_backward(self, register_final_callback: bool = True) -> None:
+                del register_final_callback
+
+        module = Module()
+        adapter = object.__new__(mcore_fsdp_adapter.FullyShardedDataParallelV2)
+        torch.nn.Module.__init__(adapter)
+        adapter.module = module
+        adapter._setup_1f1b_overlap_interface()
+
+        adapter._replace_param_with_raw_if_needed()
+
+        assert events == ["ensure_finalized", ("wait_stream", current_stream)]
 
     def test_finish_grad_sync_waits_for_reduce_scatter(self):
         """Gradient consumers should wait for the final asynchronous reduce-scatter."""
@@ -969,6 +1013,77 @@ class TestMcoreAdapterHybrid:
             assert success
             losses.append(loss.detach())
         return torch.stack(losses)
+
+    def test_hfsdp_no_sync_accumulates_microbatches(self):
+        """HFSDP retains every microbatch before its final outer reduce-scatter."""
+        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        reference_config = replace(self._config(), bf16=False, params_dtype=torch.float32)
+        actual_config = replace(reference_config)
+
+        def build_model(config):
+            torch.manual_seed(1234)
+            module = torch.nn.Linear(
+                config.hidden_size,
+                config.hidden_size,
+                bias=False,
+                device="cuda",
+                dtype=config.params_dtype,
+            )
+            return FullyShardedDataParallel(
+                config=config,
+                ddp_config=DistributedDataParallelConfig(
+                    use_megatron_fsdp=True,
+                    megatron_fsdp_version=2,
+                    use_distributed_optimizer=False,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    num_distributed_optimizer_instances=2,
+                    outer_dp_sharding_strategy="optim",
+                    megatron_fsdp_main_grads_dtype=torch.float32,
+                ),
+                module=module,
+                pg_collection=pg_collection,
+            )
+
+        reference = build_model(reference_config)
+        actual = build_model(actual_config)
+
+        class Args:
+            overlap_grad_reduce = False
+            align_grad_reduce = False
+
+        _configure_data_parallel_no_sync(actual_config, [actual], Args())
+        assert actual_config.no_sync_func is not None
+
+        rank_scale = torch.distributed.get_rank() + 1
+        values = torch.arange(
+            1,
+            2 * reference_config.hidden_size + 1,
+            device="cuda",
+            dtype=reference_config.params_dtype,
+        ).view(2, reference_config.hidden_size)
+        first_microbatch = values * rank_scale
+        second_microbatch = values.flip(0) * (rank_scale + 1)
+
+        combined_input = torch.cat((first_microbatch, second_microbatch), dim=0)
+        reference(combined_input).square().mean().backward()
+
+        with actual_config.no_sync_func():
+            (0.5 * actual(first_microbatch).square().mean()).backward()
+        partial_grad = next(actual.parameters()).grad
+        assert isinstance(partial_grad, DTensor)
+        assert isinstance(partial_grad.placements[0], Partial)
+
+        (0.5 * actual(second_microbatch).square().mean()).backward()
+        reference.finish_grad_sync()
+        actual.finish_grad_sync()
+
+        reference_grad = next(reference.parameters()).grad
+        actual_grad = next(actual.parameters()).grad
+        assert isinstance(reference_grad, DTensor)
+        assert isinstance(actual_grad, DTensor)
+        assert all(isinstance(placement, Shard) for placement in actual_grad.placements)
+        torch.testing.assert_close(actual_grad.to_local(), reference_grad.to_local())
 
     @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
     def test_hybrid_placements(self, outer_strategy):

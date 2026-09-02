@@ -14,6 +14,7 @@ from functools import partial
 
 import pytest
 import torch
+from torch.distributed.distributed_c10d import _world
 from torch.distributed.tensor import DTensor
 from torch.testing import assert_close
 
@@ -32,9 +33,17 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
-from megatron.training.training import setup_model_and_optimizer
+from megatron.training.training import _configure_data_parallel_no_sync, setup_model_and_optimizer
 from model_provider import model_provider
 from tests.unit_tests.test_utilities import Utils
+
+
+def _destroy_model_parallel() -> None:
+    """Destroy model-parallel state and every non-WORLD process group."""
+    Utils.destroy_model_parallel()
+    for group in list(_world.pg_map):
+        if group is not torch.distributed.group.WORLD:
+            torch.distributed.destroy_process_group(group)
 
 
 def _set_manual_seed(seed: int) -> None:
@@ -117,7 +126,7 @@ def _pretrain_forward_backward(
 def _make_model_and_optimizer(*, use_mfsdp_v2: bool, overrides: dict):
     """Build a small MoE GPT through the current pretrain configuration API."""
     base_args = {
-        "num_layers": 4,
+        "num_layers": 3,
         "hidden_size": 128,
         "num_attention_heads": 2,
         "max_position_embeddings": 128,
@@ -130,7 +139,7 @@ def _make_model_and_optimizer(*, use_mfsdp_v2: bool, overrides: dict):
         "attention_dropout": 0.0,
         "num_experts": 4,
         "moe_shared_expert_intermediate_size": 256,
-        "moe_layer_freq": [0, 0, 1, 1],
+        "moe_layer_freq": [0, 1, 1],
         "moe_permute_fusion": True,
         "moe_router_fusion": True,
         "moe_router_topk": 2,
@@ -171,6 +180,9 @@ def _make_model_and_optimizer(*, use_mfsdp_v2: bool, overrides: dict):
         cfg_container=cfg_container,
         pg_collection=pg_collection,
     )
+    _configure_data_parallel_no_sync(model[0].config, model, args)
+    if use_mfsdp_v2:
+        assert model[0].config.no_sync_func is not None
     return model, optimizer
 
 
@@ -178,12 +190,13 @@ class TestMfsdpV2OverlapParity:
     NUM_STEPS = 20
     SEQUENCE_LENGTH = 64
     MICRO_BATCH_SIZE = 1
-    GLOBAL_BATCH_SIZE = 8
+    GLOBAL_BATCH_SIZE = 16
     VOCAB_SIZE = 100
 
     def teardown_method(self):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
+        _destroy_model_parallel()
 
     @staticmethod
     def _normalize_parameter_name(name: str) -> str:
@@ -225,7 +238,9 @@ class TestMfsdpV2OverlapParity:
 
     @classmethod
     def _run_training(cls, *, use_mfsdp_v2: bool, initial_parameters=None):
-        Utils.initialize_model_parallel(expert_model_parallel_size=2)
+        Utils.initialize_model_parallel(
+            expert_model_parallel_size=2, num_distributed_optimizer_instances=2
+        )
         data_parallel_group = mpu.get_data_parallel_group()
         _set_manual_seed(42)
 
@@ -241,6 +256,8 @@ class TestMfsdpV2OverlapParity:
                     "seq_length": cls.SEQUENCE_LENGTH,
                     "train_iters": cls.NUM_STEPS,
                     "expert_model_parallel_size": 2,
+                    "num_distributed_optimizer_instances": 2,
+                    "outer_dp_sharding_strategy": "optim",
                     "bf16": True,
                     "data_parallel_sharding_strategy": "optim_grads_params",
                     "clip_grad": 0.0,
@@ -315,6 +332,7 @@ class TestMfsdpV2OverlapParity:
             num_micro_batches = (
                 cls.GLOBAL_BATCH_SIZE // cls.MICRO_BATCH_SIZE // data_parallel_group.size()
             )
+            assert num_micro_batches >= 2, "Combined 1F1B parity requires at least two microbatches."
             data_iterator = _make_mock_data_iterator(
                 dp_group=data_parallel_group,
                 num_batches=cls.NUM_STEPS * num_micro_batches,
@@ -325,6 +343,7 @@ class TestMfsdpV2OverlapParity:
             )
             losses = []
             parameter_snapshots = []
+            successful_updates = []
             run_name = "MFSDP v2" if use_mfsdp_v2 else "DistOpt"
 
             for step in range(cls.NUM_STEPS):
@@ -347,6 +366,7 @@ class TestMfsdpV2OverlapParity:
                 )
                 update_successful, grad_norm, _ = optimizer.step()
                 losses.append(loss)
+                successful_updates.append(update_successful)
                 if torch.distributed.get_rank() == 0:
                     grad_norm_text = "None" if grad_norm is None else f"{float(grad_norm):.8f}"
                     print(
@@ -361,9 +381,10 @@ class TestMfsdpV2OverlapParity:
                 "initial_parameters": captured_initial_parameters,
                 "losses": losses,
                 "parameters": parameter_snapshots,
+                "successful_updates": successful_updates,
             }
         finally:
-            Utils.destroy_model_parallel()
+            _destroy_model_parallel()
 
     @pytest.mark.skipif(
         not is_torch_min_version("2.6.0"),
@@ -374,13 +395,16 @@ class TestMfsdpV2OverlapParity:
         reason="Delayed wgrad without gradient-accumulation fusion requires TE 2.7 or newer.",
     )
     def test_compatible_with_nd_parallel(self, distributed_setup):
-        """MFSDP v2 EP delayed-wgrad overlap matches DistOpt without static prefetch."""
+        """MFSDP v2 HFSDP/EP delayed-wgrad overlap matches DistOpt across microbatches."""
         if (
-            distributed_setup.world_size < 2
-            or distributed_setup.world_size % 2
-            or distributed_setup.world_size > self.GLOBAL_BATCH_SIZE
+            distributed_setup.world_size < 4
+            or distributed_setup.world_size % 4
+            or distributed_setup.world_size
+            > self.GLOBAL_BATCH_SIZE // (2 * self.MICRO_BATCH_SIZE)
         ):
-            pytest.skip("Requires an even world size between two and the global batch size.")
+            pytest.skip(
+                "Requires a world size divisible by four that produces at least two microbatches."
+            )
 
         reference = self._run_training(use_mfsdp_v2=False)
         if torch.distributed.get_rank() == 0:
@@ -393,6 +417,12 @@ class TestMfsdpV2OverlapParity:
             print("MFSDP v2 run completed successfully.", flush=True)
 
         for run_name, run in (("DistOpt", reference), ("MFSDP v2", actual)):
+            failed_steps = [
+                step
+                for step, successful in enumerate(run["successful_updates"], start=1)
+                if not successful
+            ]
+            assert not failed_steps, f"{run_name} skipped optimizer steps {failed_steps}."
             changed_parameters = [
                 name
                 for name, initial_parameter in run["initial_parameters"].items()
