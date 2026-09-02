@@ -764,6 +764,25 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     continue
                 if fsdp_module.phase is not FsdpModule.Phase.BACKWARD:
                     continue
+                countdown = fsdp_module._trainable_parameter_countdown
+                if countdown._value != countdown.initial_value:
+                    ready = []
+                    missing = []
+                    for group in fsdp_module.parameter_groups:
+                        if not group.requires_grad:
+                            continue
+                        for fsdp_parameter in group.fsdp_parameters:
+                            destination = (
+                                ready if fsdp_parameter.unsharded.grad is not None else missing
+                            )
+                            destination.append(fsdp_parameter.fqns)
+                    observed = countdown.initial_value - countdown._value
+                    raise RuntimeError(
+                        "MFSDP schedule ended with an incomplete gradient-completion cycle "
+                        f"for {fsdp_module.name or '<root>'}: "
+                        f"callbacks={observed}/{countdown.initial_value}, "
+                        f"ready={ready!r}, missing={missing!r}."
+                    )
                 fsdp_module.post_backward()
 
         def release_module(module: torch.nn.Module, *, reduce_grad: bool) -> None:
