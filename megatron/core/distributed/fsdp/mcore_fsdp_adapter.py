@@ -668,10 +668,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             optimizer=[expert_axis.optimizer],
         )
         overlap_moe_expert_parallel = config.overlap_moe_expert_parallel_comm
-        common_fully_shard_kwargs = dict(
-            mixed_precision_policy=self.mp_policy,
-            skip_forward_backward_hooks=overlap_moe_expert_parallel,
-        )
+        common_fully_shard_kwargs = dict(mixed_precision_policy=self.mp_policy)
 
         if has_outer_dp_axis := ddp_config.num_distributed_optimizer_instances > 1:
             # Dense parameters get an outer DP axis. There is no HSDP/HFSDP special case:
