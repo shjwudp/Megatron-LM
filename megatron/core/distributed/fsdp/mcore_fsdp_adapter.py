@@ -108,6 +108,7 @@ def _fine_grained_pre_backward_hook(submodule: nn.Module, _grad_output) -> None:
 
 def _register_fine_grained_hooks(module: FsdpModule) -> None:
     """Install the sub-module hooks required by MCore combined 1F1B."""
+
     def register_hooks(submodule: nn.Module, owner: FsdpModule) -> None:
         """Register hooks recursively while preserving the nearest FSDP owner."""
         if isinstance(submodule, FsdpModule):
@@ -733,10 +734,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
             fully_shard(
-                module,
-                mesh=dp_mesh,
-                placements=dense_placements,
-                **common_fully_shard_kwargs,
+                module, mesh=dp_mesh, placements=dense_placements, **common_fully_shard_kwargs
             )
         super().__init__(config=config, module=module)
         if overlap_moe_expert_parallel:
@@ -766,10 +764,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     continue
                 if fsdp_module.phase is not FsdpModule.Phase.BACKWARD:
                     continue
-                fsdp_module._original_post_backward()
-                # 1F1B cooldown can run consecutive backward passes without an intervening
-                # pre_forward(), so reset the hook counter as soon as this pass is finalized.
-                fsdp_module._num_ready_grad_parameters = 0
+                fsdp_module.post_backward()
 
         def release_module(module: torch.nn.Module, *, reduce_grad: bool) -> None:
             module = _require_fsdp_module(module)
@@ -787,14 +782,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             when it executes first.
             """
             self.module.context.ensure_finalized()
-
-        # Replace FsdpModule post_backward to defensive post backward to prevent
-        # some post-backward hooks from failing to trigger due to the special
-        # scheduling of 1F1B EP overlap.
-        for fsdp_module in self.module.modules():
-            if isinstance(fsdp_module, FsdpModule):
-                fsdp_module._original_post_backward = fsdp_module.post_backward
-                fsdp_module.post_backward = partial(finalize_backward, fsdp_module)
 
         self._replace_param_with_raw_if_needed = _replace_param_with_raw_if_needed
         self.post_forward_release_module = partial(release_module, reduce_grad=False)

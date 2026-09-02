@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+import transformer_engine.pytorch as te
 from torch.distributed import DeviceMesh
 from torch.distributed.distributed_c10d import _world
 from torch.distributed.tensor import DTensor, Replicate, Shard
@@ -230,6 +231,47 @@ class TestMcoreAdapterDense:
         assert pre_backward_calls == [False]
         assert model.phase is FsdpModule.Phase.RESTING
 
+    def test_delayed_wgrad_hook_finalizes_only_its_fsdp_unit(self):
+        """An outer completion hook must not finalize a delayed-wgrad child."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        mesh = DeviceMesh.from_group(
+            self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
+        )
+        placements = Placements(
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        )
+        delayed_linear = te.Linear(
+            16,
+            16,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            device=device,
+            delay_wgrad_compute=True,
+            fuse_wgrad_accumulation=False,
+        )
+        model = torch.nn.Sequential(delayed_linear)
+
+        with fully_shard_context(device=device):
+            fully_shard(delayed_linear, mesh=mesh, placements=placements)
+            fully_shard(model, mesh=mesh, placements=placements)
+
+        adapter = object.__new__(mcore_fsdp_adapter.FullyShardedDataParallelV2)
+        torch.nn.Module.__init__(adapter)
+        adapter.module = model
+        adapter._setup_1f1b_overlap_interface()
+
+        inputs = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
+        model(inputs).float().square().mean().backward()
+
+        assert model.phase is FsdpModule.Phase.RESTING
+        assert delayed_linear.phase is FsdpModule.Phase.BACKWARD
+        assert delayed_linear.weight.grad is None
+
+        delayed_linear.backward_dw()
+
+        assert delayed_linear.phase is FsdpModule.Phase.RESTING
+        assert delayed_linear.weight.grad is not None
+
     def test_overlap_release_finalizes_nested_fsdp_units_once(self, monkeypatch):
         """Adapter release recursively finalizes a schedule unit and is idempotent."""
         device = torch.device("cuda", torch.cuda.current_device())
@@ -273,7 +315,6 @@ class TestMcoreAdapterDense:
             monkeypatch.setattr(
                 module, "_reduce_gradient_groups", lambda name=name: calls.append((name, "reduce"))
             )
-            module._num_ready_grad_parameters = module._num_trainable_parameters
 
         # The layer callback releases the nested expert first. The final root sweep
         # releases only the root and safely revisits the already-resting layer subtree.
@@ -282,16 +323,15 @@ class TestMcoreAdapterDense:
         adapter.post_backward()
 
         assert calls == [
-            ("expert", "reduce"),
             ("expert", "reshard"),
-            ("layer", "reduce"),
+            ("expert", "reduce"),
             ("layer", "reshard"),
-            ("root", "reduce"),
+            ("layer", "reduce"),
             ("root", "reshard"),
+            ("root", "reduce"),
         ]
         for _, module in named_modules:
             assert module.phase is FsdpModule.Phase.RESTING
-            assert module._num_ready_grad_parameters == 0
 
     def test_finish_grad_sync_waits_for_reduce_scatter(self):
         """Gradient consumers should wait for the final asynchronous reduce-scatter."""

@@ -450,7 +450,12 @@ class FsdpModule:
             next_module._unshard_parameter_groups()
 
     def post_backward(self) -> None:
-        """Reduce gradients and return parameters to their sharded resting state."""
+        """Reduce gradients and return parameters to their sharded resting state.
+
+        This is a no-op when the module has already left the backward phase.
+        """
+        if self.phase is not FsdpModule.Phase.BACKWARD:
+            return
         self._reshard_parameter_groups()
         self._reduce_gradient_groups()
         self.phase = FsdpModule.Phase.RESTING

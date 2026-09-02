@@ -263,7 +263,6 @@ def test_multiple_forwards_before_backwards_reset_gradient_readiness(
         loss.backward()
 
     assert len(reduce_calls) == 2
-    assert model._num_ready_grad_parameters == 0
     assert model.phase is model.Phase.RESTING
 
     # A schedule fallback may revisit an already released unit.
