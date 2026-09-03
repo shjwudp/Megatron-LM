@@ -14,6 +14,7 @@ from torch.distributed.distributed_c10d import _world
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
+import megatron.core.models.common.fine_grained_mfsdp_scheduler as mfsdp_scheduler
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
@@ -188,7 +189,7 @@ class TestMcoreAdapterDense:
         assert root_parameter_names == {"1.weight", "1.bias"}
 
     def test_fine_grained_hooks_run_for_direct_submodule(self, monkeypatch):
-        """MCore-owned hooks materialize an FSDP unit called below its root."""
+        """Fine-grained hooks gather and finalize the owning FSDP unit once."""
         device = torch.device("cuda", torch.cuda.current_device())
         mesh = DeviceMesh.from_group(
             self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
@@ -199,40 +200,56 @@ class TestMcoreAdapterDense:
         model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False)).to(device)
         module_names = tuple(name for name, _ in model.named_modules())
 
-        with fully_shard_context(device=device):
+        with fully_shard_context(device=device, custom_schedule=True):
             fully_shard(model, mesh=mesh, placements=placements)
-            assert isinstance(model, FsdpModule)
-            mcore_fsdp_adapter._register_fine_grained_hooks(model)
 
+        mfsdp_scheduler.setup_1f1b_overlap_interface(model)
+        assert mfsdp_scheduler._find_fsdp_module(model[0]) is model
         assert tuple(name for name, _ in model.named_modules()) == module_names
 
+        # Reconstructing a schedule plan must not accumulate hooks.
+        hook_counts = tuple(
+            (len(module._forward_pre_hooks), len(module._backward_pre_hooks))
+            for module in model.modules()
+        )
+        mfsdp_scheduler.setup_1f1b_overlap_interface(model)
+        assert (
+            tuple(
+                (len(module._forward_pre_hooks), len(module._backward_pre_hooks))
+                for module in model.modules()
+            )
+            == hook_counts
+        )
+
         unshard_calls = []
-        original_unshard = model._unshard_parameter_groups
+        original_unshard = model.unshard
 
-        def record_unshard():
-            unshard_calls.append(None)
-            original_unshard()
+        def record_unshard(prefetch="none"):
+            unshard_calls.append(prefetch)
+            original_unshard(prefetch=prefetch)
 
-        pre_backward_calls = []
-        original_pre_backward = model.pre_backward
+        post_backward_calls = []
+        original_post_backward = model.post_backward
 
-        def record_pre_backward(register_final_callback=True):
-            pre_backward_calls.append(register_final_callback)
-            original_pre_backward(register_final_callback=register_final_callback)
+        def record_post_backward():
+            post_backward_calls.append(None)
+            original_post_backward()
 
-        monkeypatch.setattr(model, "_unshard_parameter_groups", record_unshard)
-        monkeypatch.setattr(model, "pre_backward", record_pre_backward)
+        monkeypatch.setattr(model, "unshard", record_unshard)
+        monkeypatch.setattr(model, "post_backward", record_post_backward)
 
         inputs = torch.randn(2, 4, device=device, requires_grad=True)
         output = model[0](inputs)
-        assert len(unshard_calls) == 1
+        assert unshard_calls == ["none"]
 
+        mfsdp_scheduler.reshard_fsdp_module(model)
         output.sum().backward()
-        assert pre_backward_calls == [False]
-        assert model.phase is FsdpModule.Phase.RESTING
+        assert unshard_calls == ["none", "none"]
+        assert post_backward_calls == [None]
+        assert model._unshard_event is None
 
-    def test_fine_grained_hook_respects_disabled_prefetch(self, monkeypatch):
-        """The fine-grained demand gather must not launch a sibling lookahead."""
+    def test_fine_grained_hook_does_not_prefetch_static_sibling(self, monkeypatch):
+        """A custom-schedule demand gather must not launch static lookahead."""
         device = torch.device("cuda", torch.cuda.current_device())
         mesh = DeviceMesh.from_group(
             self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
@@ -241,12 +258,17 @@ class TestMcoreAdapterDense:
             dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
         )
         model = torch.nn.Sequential(
-            torch.nn.Linear(4, 4, bias=False), torch.nn.Linear(4, 4, bias=False)
+            torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False)),
+            torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False)),
         ).to(device)
 
-        with fully_shard_context(device=device, enable_prefetch=False):
+        with fully_shard_context(device=device, custom_schedule=True):
             fully_shard(model[0], mesh=mesh, placements=placements)
             fully_shard(model[1], mesh=mesh, placements=placements)
+
+        mfsdp_scheduler.setup_1f1b_overlap_interface(model)
+        assert mfsdp_scheduler._find_fsdp_module(model[0][0]) is model[0]
+        assert mfsdp_scheduler._find_fsdp_module(model[1][0]) is model[1]
 
         sibling_unshards = []
         original_sibling_unshard = model[1]._unshard_parameter_groups
@@ -257,11 +279,11 @@ class TestMcoreAdapterDense:
 
         monkeypatch.setattr(model[1], "_unshard_parameter_groups", record_sibling_unshard)
 
-        mcore_fsdp_adapter._fine_grained_pre_forward_hook(model[0], (), {})
+        mfsdp_scheduler._fine_grained_pre_forward_hook(model[0][0], (), {})
 
         assert model[0]._unshard_event is not None
         assert sibling_unshards == []
-        model[0]._reshard_parameter_groups()
+        mfsdp_scheduler.reshard_fsdp_module(model[0])
 
     def test_delayed_wgrad_hook_finalizes_only_its_fsdp_unit(self):
         """An outer completion hook must not finalize a delayed-wgrad child."""
@@ -283,29 +305,25 @@ class TestMcoreAdapterDense:
         )
         model = torch.nn.Sequential(delayed_linear)
 
-        with fully_shard_context(device=device):
+        with fully_shard_context(device=device, custom_schedule=True):
             fully_shard(delayed_linear, mesh=mesh, placements=placements)
             fully_shard(model, mesh=mesh, placements=placements)
 
-        adapter = object.__new__(mcore_fsdp_adapter.FullyShardedDataParallelV2)
-        torch.nn.Module.__init__(adapter)
-        adapter.module = model
-        adapter._setup_1f1b_overlap_interface()
+        mfsdp_scheduler.setup_1f1b_overlap_interface(model)
 
         inputs = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
         model(inputs).float().square().mean().backward()
 
-        assert model.phase is FsdpModule.Phase.RESTING
-        assert delayed_linear.phase is FsdpModule.Phase.BACKWARD
         assert delayed_linear.weight.grad is None
+        assert delayed_linear._unshard_event is not None
 
         delayed_linear.backward_dw()
 
-        assert delayed_linear.phase is FsdpModule.Phase.RESTING
         assert delayed_linear.weight.grad is not None
+        assert delayed_linear._unshard_event is None
 
-    def test_overlap_release_finalizes_nested_fsdp_units_once(self, monkeypatch):
-        """Adapter release recursively finalizes a schedule unit and is idempotent."""
+    def test_overlap_setup_tracks_nearest_fsdp_owner_once(self):
+        """Setup records nearest owners without registering duplicate hooks."""
         device = torch.device("cuda", torch.cuda.current_device())
         mesh = DeviceMesh.from_group(
             self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
@@ -318,52 +336,28 @@ class TestMcoreAdapterDense:
             torch.nn.Linear(4, 4, bias=False),
         ).to(device)
 
-        with fully_shard_context(device=device):
+        with fully_shard_context(device=device, custom_schedule=True):
             fully_shard(model[0][0], mesh=mesh, placements=placements)
             fully_shard(model[0], mesh=mesh, placements=placements)
             fully_shard(model, mesh=mesh, placements=placements)
 
-        adapter = object.__new__(mcore_fsdp_adapter.FullyShardedDataParallelV2)
-        torch.nn.Module.__init__(adapter)
-        adapter.module = model
-        adapter._setup_1f1b_overlap_interface()
+        mfsdp_scheduler.setup_1f1b_overlap_interface(model)
 
-        # Leaving a nested FSDP subtree must restore the parent owner for later siblings.
-        assert mcore_fsdp_adapter._find_fsdp_target(model[0][0]) is model[0][0]
-        assert mcore_fsdp_adapter._find_fsdp_target(model[1]) is model
+        assert mfsdp_scheduler._find_fsdp_module(model[0][0]) is model[0][0]
+        assert mfsdp_scheduler._find_fsdp_module(model[1]) is model
 
-        model.pre_backward(register_final_callback=False)
-        model[0].pre_backward(register_final_callback=False)
-        model[0][0].pre_backward(register_final_callback=False)
-
-        calls = []
-        named_modules = (("root", model), ("layer", model[0]), ("expert", model[0][0]))
-        for name, module in named_modules:
-            monkeypatch.setattr(
-                module,
-                "_reshard_parameter_groups",
-                lambda name=name: calls.append((name, "reshard")),
+        hook_counts = tuple(
+            (len(module._forward_pre_hooks), len(module._backward_pre_hooks))
+            for module in model.modules()
+        )
+        mfsdp_scheduler.setup_1f1b_overlap_interface(model)
+        assert (
+            tuple(
+                (len(module._forward_pre_hooks), len(module._backward_pre_hooks))
+                for module in model.modules()
             )
-            monkeypatch.setattr(
-                module, "_reduce_gradient_groups", lambda name=name: calls.append((name, "reduce"))
-            )
-
-        # The layer callback releases the nested expert first. The final root sweep
-        # releases only the root and safely revisits the already-resting layer subtree.
-        adapter.post_backward_release_module(model[0])
-        adapter.post_backward()
-        adapter.post_backward()
-
-        assert calls == [
-            ("expert", "reshard"),
-            ("expert", "reduce"),
-            ("layer", "reshard"),
-            ("layer", "reduce"),
-            ("root", "reshard"),
-            ("root", "reduce"),
-        ]
-        for _, module in named_modules:
-            assert module.phase is FsdpModule.Phase.RESTING
+            == hook_counts
+        )
 
     def test_finish_grad_sync_waits_for_reduce_scatter(self):
         """Gradient consumers should wait for the final asynchronous reduce-scatter."""
@@ -429,7 +423,8 @@ class TestMcoreAdapterDense:
 
         assert fully_shard_context_calls == [True]
 
-    def test_moe_overlap_disables_static_prefetch(self, monkeypatch):
+    @pytest.mark.parametrize("overlap", [False, True], ids=["native", "custom"])
+    def test_overlap_selects_custom_schedule(self, monkeypatch, overlap):
         config = TransformerConfig(
             num_layers=1,
             hidden_size=16,
@@ -440,15 +435,15 @@ class TestMcoreAdapterDense:
         )
         # Full overlap validation requires MoE modules; this focused adapter test
         # verifies propagation after TransformerConfig validation.
-        config.overlap_moe_expert_parallel_comm = True
+        config.overlap_moe_expert_parallel_comm = overlap
         model = torch.nn.Linear(config.hidden_size, config.hidden_size).to(
             device="cuda", dtype=config.params_dtype
         )
-        enable_prefetch_calls = []
+        custom_schedule_calls = []
         original_fully_shard_context = mcore_fsdp_adapter.fully_shard_context
 
         def record_fully_shard_context(*args, **kwargs):
-            enable_prefetch_calls.append(kwargs["enable_prefetch"])
+            custom_schedule_calls.append(kwargs["custom_schedule"])
             return original_fully_shard_context(*args, **kwargs)
 
         monkeypatch.setattr(mcore_fsdp_adapter, "fully_shard_context", record_fully_shard_context)
@@ -463,7 +458,7 @@ class TestMcoreAdapterDense:
             pg_collection=self.pg_collection,
         )
 
-        assert enable_prefetch_calls == [False]
+        assert custom_schedule_calls == [overlap]
 
     @pytest.mark.parametrize("optimizer_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
     def test_build_train_and_step(self, optimizer_cuda_graph):

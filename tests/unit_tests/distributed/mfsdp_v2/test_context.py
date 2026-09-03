@@ -158,13 +158,13 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
     assert list(context.backward_order) == [model, model.right, model.left, model.left.inner]
 
 
-def test_context_can_disable_forward_and_backward_prefetch(distributed_setup, monkeypatch):
-    """Disabling prefetch should retain demand gathers without gathering the next unit."""
+def test_custom_schedule_disables_forward_and_backward_prefetch(distributed_setup, monkeypatch):
+    """A custom schedule should retain demand gathers without static lookahead."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = NestedModel().to(device)
 
-    with fully_shard_context(device=device, enable_prefetch=False) as context:
+    with fully_shard_context(device=device, custom_schedule=True) as context:
         fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
         fully_shard(model, mesh=mesh, placements=_flat_placements())
 
@@ -185,7 +185,7 @@ def test_context_can_disable_forward_and_backward_prefetch(distributed_setup, mo
     model.pre_backward(register_final_callback=False)
     assert model._unshard_event is not None
     assert prefetched == []
-    assert context.enable_prefetch is False
+    assert context.custom_schedule is True
 
     monkeypatch.setattr(model, "_reduce_gradient_groups", lambda: None)
     model.post_backward()
