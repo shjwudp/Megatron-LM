@@ -13,7 +13,15 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_runner import EventKind
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_runner import (
+    EventKind,
+    FsdpExecutionRunner,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    Fp8ParameterGroup,
+    FsdpParameterGroup,
+)
 
 
 class NestedModel(nn.Module):
@@ -80,6 +88,130 @@ def _record_unshard_and_prefetch(runner, module, orientation):
     """Record an unshard on the runner and return the suggested prefetch."""
     runner.record_unshard(module, orientation)
     return runner.suggest_prefetch(module, orientation)
+
+
+class _RunnerTestModule:
+    """Minimal runner participant with a configurable reuse capability."""
+
+    def __init__(self, can_reuse: bool) -> None:
+        self.can_reuse = can_reuse
+        self.release_calls = 0
+        self.reuse_calls = []
+
+    def can_reuse_unsharded_storage(
+        self, materialized_orientation: str, requested_orientation: str
+    ) -> bool:
+        self.reuse_calls.append((materialized_orientation, requested_orientation))
+        return self.can_reuse
+
+    def _release_unsharded_parameter_groups(self) -> None:
+        self.release_calls += 1
+
+
+@pytest.mark.parametrize(
+    ("materialized_orientation", "requested_orientation"),
+    (("rowwise", "colwise"), ("colwise", "rowwise")),
+)
+def test_parameter_groups_reuse_cross_orientation_storage(
+    materialized_orientation, requested_orientation
+):
+    """Regular and current MXFP8 groups materialize orientation-complete storage."""
+    regular_group = object.__new__(FsdpParameterGroup)
+    fp8_group = object.__new__(Fp8ParameterGroup)
+
+    assert regular_group.can_reuse_unsharded_storage(
+        materialized_orientation, requested_orientation
+    )
+    assert fp8_group.can_reuse_unsharded_storage(materialized_orientation, requested_orientation)
+
+
+def test_module_requires_every_group_to_support_cross_orientation_reuse():
+    """A mixed module must reject reuse if any parameter group is incompatible."""
+    module = object.__new__(FsdpModule)
+    compatible_group = _RunnerTestModule(can_reuse=True)
+    incompatible_group = _RunnerTestModule(can_reuse=False)
+
+    module._parameter_groups = (compatible_group, incompatible_group)
+
+    assert module.can_reuse_unsharded_storage("rowwise", "rowwise")
+    assert not module.can_reuse_unsharded_storage("rowwise", "colwise")
+
+
+@pytest.mark.parametrize(
+    ("materialized_orientation", "requested_orientation"),
+    (("rowwise", "colwise"), ("colwise", "rowwise")),
+)
+def test_runner_reuses_cross_orientation_storage_within_batch(
+    materialized_orientation, requested_orientation
+):
+    """A compatible resident gather survives an adjacent cross-orientation consume."""
+    runner = FsdpExecutionRunner(context=object(), use_trace_replay=True)
+    module = _RunnerTestModule(can_reuse=True)
+
+    # Trace one adjacent consume pair, including both logical reshards.
+    runner.record_unshard(module, materialized_orientation)
+    runner.record_reshard(module)
+    runner.record_unshard(module, requested_orientation)
+    runner.record_reshard(module)
+    runner.complete_trace()
+
+    runner.record_unshard(module, materialized_orientation)
+    assert runner.suggest_prefetch(module, materialized_orientation) == (
+        module,
+        requested_orientation,
+    )
+    runner.record_reshard(module)
+    assert runner.suggest_skip_reshard(module)
+
+    # Consuming the adjacent opposite-orientation event validates the trace
+    # without releasing the compatible resident storage.
+    runner.record_unshard(module, requested_orientation)
+    assert module.release_calls == 0
+    assert module.reuse_calls == [
+        (materialized_orientation, requested_orientation),
+        (materialized_orientation, requested_orientation),
+    ]
+    runner.record_reshard(module)
+
+    # Reuse must not cross the global-batch/optimizer boundary.
+    assert not runner.suggest_skip_reshard(module)
+
+
+def test_runner_does_not_skip_reshard_for_incompatible_orientation():
+    """An adjacent same-module consume cannot retain an incompatible payload."""
+    runner = FsdpExecutionRunner(context=object(), use_trace_replay=True)
+    module = _RunnerTestModule(can_reuse=False)
+
+    runner.record_unshard(module, "rowwise")
+    runner.record_reshard(module)
+    runner.record_unshard(module, "colwise")
+    runner.complete_trace()
+
+    runner.record_unshard(module, "rowwise")
+    assert runner.suggest_prefetch(module, "rowwise") == (module, "colwise")
+    runner.record_reshard(module)
+
+    assert not runner.suggest_skip_reshard(module)
+    assert module.reuse_calls == [("rowwise", "colwise")]
+
+
+def test_runner_releases_incompatible_cross_orientation_prefetch():
+    """A prefetched payload is discarded when the actual orientation cannot reuse it."""
+    runner = FsdpExecutionRunner(context=object(), use_trace_replay=True)
+    first = _RunnerTestModule(can_reuse=True)
+    incompatible = _RunnerTestModule(can_reuse=False)
+
+    runner.record_unshard(first, "rowwise")
+    runner.record_unshard(incompatible, "rowwise")
+    runner.complete_trace()
+
+    runner.record_unshard(first, "rowwise")
+    assert runner.suggest_prefetch(first, "rowwise") == (incompatible, "rowwise")
+    runner.record_unshard(incompatible, "colwise")
+
+    assert incompatible.release_calls == 1
+    assert incompatible.reuse_calls == [("rowwise", "colwise")]
+    assert runner.is_tracing
 
 
 def test_child_then_parent_share_one_context(distributed_setup):
@@ -687,8 +819,10 @@ def test_runner_releases_abandoned_prefetch_on_divergence(distributed_setup):
     layers[2]._reshard_parameter_groups()
 
 
-def test_runner_rematerializes_prefetch_when_orientation_diverges(distributed_setup, monkeypatch):
-    """A differently oriented consume must replace its stale prefetched payload."""
+def test_runner_reuses_compatible_prefetch_when_orientation_diverges(
+    distributed_setup, monkeypatch
+):
+    """A regular group's prefetched storage serves a differently oriented consume."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
@@ -705,19 +839,25 @@ def test_runner_rematerializes_prefetch_when_orientation_diverges(distributed_se
     runner.complete_trace()
 
     calls = []
-    monkeypatch.setattr(
-        second, "_release_unsharded_parameter_groups", lambda: calls.append(("release", None))
-    )
-    monkeypatch.setattr(
-        second,
-        "_unshard_parameter_groups",
-        lambda orientation="rowwise": calls.append(("unshard", orientation)),
-    )
+    original_release = second._release_unsharded_parameter_groups
+    original_unshard = second._unshard_parameter_groups
+
+    def record_release():
+        calls.append(("release", None))
+        original_release()
+
+    def record_materialization(orientation="rowwise"):
+        if second._unshard_event is None:
+            calls.append(("unshard", orientation))
+        original_unshard(orientation)
+
+    monkeypatch.setattr(second, "_release_unsharded_parameter_groups", record_release)
+    monkeypatch.setattr(second, "_unshard_parameter_groups", record_materialization)
 
     # Replaying the first consume predicts a rowwise second consume and
-    # materializes that payload. The actual colwise consume must release the
-    # prediction before issuing its demand all-gather; MXFP8 orientations are
-    # distinct payloads and cannot safely share this storage.
+    # materializes that payload. Regular groups use one orientation-independent
+    # payload, so the actual colwise consume can reuse it. The trace must still
+    # notice and recover from the schedule-orientation divergence.
     prefetched_module, prefetched_orientation = _record_unshard_and_prefetch(
         runner, first, "rowwise"
     )
@@ -725,7 +865,8 @@ def test_runner_rematerializes_prefetch_when_orientation_diverges(distributed_se
     second.unshard_parameters("colwise")
 
     assert runner.is_tracing
-    assert calls == [("unshard", "rowwise"), ("release", None), ("unshard", "colwise")]
+    assert calls == [("unshard", "rowwise")]
+    second._reshard_parameter_groups()
 
 
 def test_unshard_records_one_consume_per_module_per_pass(distributed_setup):

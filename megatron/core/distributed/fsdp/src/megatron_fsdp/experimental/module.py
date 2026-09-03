@@ -434,6 +434,19 @@ class FsdpModule:
             self._unshard_event = allgather_stream.record_event()
         torch.cuda.nvtx.range_pop()
 
+    def can_reuse_unsharded_storage(
+        self, materialized_orientation: str, requested_orientation: str
+    ) -> bool:
+        """Return whether the resident gather can serve the requested orientation.
+
+        Identical orientations are inherently reusable. Cross-orientation reuse
+        requires support from every parameter group owned by this module.
+        """
+        return materialized_orientation == requested_orientation or all(
+            group.can_reuse_unsharded_storage(materialized_orientation, requested_orientation)
+            for group in self._parameter_groups
+        )
+
     def unshard_parameters(self, orientation: str = "rowwise") -> None:
         """Public API: all-gather full parameter storage for compute.
 

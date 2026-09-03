@@ -370,6 +370,17 @@ class FsdpParameterGroup:
             self.post_optimizer_model_weight.placements != self.model_weight.placements
         )
 
+    def can_reuse_unsharded_storage(
+        self, materialized_orientation: str, requested_orientation: str
+    ) -> bool:
+        """Return whether an existing gather can serve ``requested_orientation``.
+
+        Regular parameter groups materialize one orientation-independent compute
+        payload, so a forward gather can be reused by backward and vice versa.
+        """
+        del materialized_orientation, requested_orientation
+        return True
+
     def unshard_parameters(self, orientation: str = "rowwise") -> None:
         """Install full parameters for local compute.
 
@@ -557,9 +568,8 @@ class Fp8ParameterGroup(FsdpParameterGroup):
     layout as ``main_weight``. Quantization is done by TE's verified
     ``cast_master_weights_to_fp8`` into full-size temporary tensors whose shard
     slices are copied back into the DBuffers; the tensors' scale-inverse grids
-    are filled in place by TE and never gathered. Unshard gathers only the
-    orientation needed by the pass (row-wise on forward, column-wise on
-    backward) and rebinds the module's own MXFP8Tensor payloads from the
+    are filled in place by TE and never gathered. Unshard gathers both payload
+    orientations and rebinds the module's own MXFP8Tensor payloads from the
     gathered buffers; reshard detaches them.
     """
 
@@ -677,6 +687,18 @@ class Fp8ParameterGroup(FsdpParameterGroup):
     def sync_model_weight_from_main_weight(self) -> None:
         """Quantize the sharded main weights into the fp8 payload DBuffers."""
         self._quantize_model_weight_from_main_weight()
+
+    def can_reuse_unsharded_storage(
+        self, materialized_orientation: str, requested_orientation: str
+    ) -> bool:
+        """Return whether an existing gather can serve ``requested_orientation``.
+
+        MXFP8 unshard currently gathers and binds both the row-wise and
+        column-wise payloads together, so either recorded orientation can serve
+        the other without another collective.
+        """
+        del materialized_orientation, requested_orientation
+        return True
 
     def _quantize_model_weight_from_main_weight(self) -> None:
         """Quantize via TE's ``cast_master_weights_to_fp8``.

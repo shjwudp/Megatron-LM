@@ -29,8 +29,8 @@ Two cooperating paths:
 - **Optimization path**: from the second batch, each real op is validated
   against the traced cycle and translated into optimization directives:
   a prefetch target after an unshard, and a skip-reshard decision when the
-  traced schedule re-unshards the same module with the same orientation
-  immediately.
+  traced schedule immediately re-unshards the same module with a compatible
+  orientation.
 
 State machine::
 
@@ -47,7 +47,7 @@ Four per-op interfaces:
   (skipping reshard events) to all-gather ahead, or ``None`` while tracing.
 - ``suggest_skip_reshard(module)``: optimization path — whether this reshard
   can be skipped because the next traced unshard reuses the same module and
-  orientation, keeping the storage resident.
+  its resident payload, keeping the storage resident.
 """
 
 import dataclasses
@@ -129,8 +129,8 @@ class FsdpExecutionRunner:
         # Keep only weak ownership so tracing state cannot retain deleted chunks.
         self._pending_prefetches: WeakKeyDictionary[FsdpModule, str] = WeakKeyDictionary()
         # Orientation of each module's most recent consume during replay,
-        # used to decide whether a reshard can be skipped (storage only needs
-        # to stay resident for an immediate same-orientation re-unshard).
+        # used to ask the module whether an immediate re-unshard can reuse its
+        # resident storage.
         self._last_orientation: dict[FsdpModule, str] = {}
         # Diagnostics: how many events were validated during replay, how many
         # diverged (re-trace), and how many complete_trace calls ran.
@@ -175,9 +175,13 @@ class FsdpExecutionRunner:
                 ``"colwise"`` backward).
         """
         prefetched_orientation = self._pending_prefetches.pop(module, None)
-        if prefetched_orientation is not None and prefetched_orientation != orientation:
-            # A schedule divergence can consume a prefetched module with the
-            # opposite MXFP8 payload orientation. Drop the stale materialization
+        if (
+            prefetched_orientation is not None
+            and prefetched_orientation != orientation
+            and not module.can_reuse_unsharded_storage(prefetched_orientation, orientation)
+        ):
+            # A schedule divergence can consume a prefetched module with an
+            # incompatible payload orientation. Drop the stale materialization
             # before the caller attempts its demand all-gather.
             module._release_unsharded_parameter_groups()
         if not self._use_trace_replay:
@@ -261,10 +265,9 @@ class FsdpExecutionRunner:
         """Return whether the reshard of ``module`` can be skipped.
 
         The optimization path: if the traced schedule immediately re-unshards
-        the same module with the same orientation right after this reshard,
+        the same module with an orientation supported by its resident payload,
         the reshard is unnecessary — the storage can stay resident and the
-        following all-gather can be skipped. Returns whether to skip the
-        reshard.
+        following all-gather can be skipped. Returns whether to skip the reshard.
 
         Args:
             module: The FSDP module whose unsharded storage is released.
@@ -278,15 +281,19 @@ class FsdpExecutionRunner:
         if not self._trace or self._replay_index >= len(self._trace):
             return False
         next_event = self._trace[self._replay_index]
-        skip_reshard = (
-            next_event.kind is EventKind.UNSHARD
-            and next_event.module is module
-            and next_event.orientation == self._last_orientation.get(module)
-        )
-        if skip_reshard:
-            assert next_event.orientation is not None
-            self._pending_prefetches[module] = next_event.orientation
-        return skip_reshard
+        if next_event.kind is not EventKind.UNSHARD or next_event.module is not module:
+            return False
+        assert next_event.orientation is not None
+        materialized_orientation = self._last_orientation.get(module)
+        if materialized_orientation is None or not module.can_reuse_unsharded_storage(
+            materialized_orientation, next_event.orientation
+        ):
+            return False
+        # No all-gather ran for the next consume; remember the orientation that
+        # actually owns the resident storage so record_unshard() can validate
+        # the eventual request against the right materialization.
+        self._pending_prefetches[module] = materialized_orientation
+        return True
 
     # ------------------------------------------------------------------
     # Lifecycle: batch boundary
