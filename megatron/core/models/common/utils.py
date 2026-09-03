@@ -307,7 +307,11 @@ class TransformerLayerNode(ScheduleNode):
         """Execute forward and fire the per-layer post-forward hook on the last slot."""
         output = super().forward(*inputs)
         if self.is_layer_last_node:
-            self._post_forward_hook()
+            # ScheduleNode restores the ambient stream before returning. Re-enter
+            # this node's stream so release hooks can fence parameter storage from
+            # every kernel the node just launched.
+            with torch.cuda.stream(self.stream):
+                self._post_forward_hook()
         return output
 
     def backward(self, *output_grad):
@@ -318,7 +322,8 @@ class TransformerLayerNode(ScheduleNode):
         """
         grads = super().backward(*output_grad)
         if not self.delay_wgrad_compute and self.is_layer_first_node:
-            self._post_backward_hook()
+            with torch.cuda.stream(self.stream):
+                self._post_backward_hook()
         return grads
 
     def backward_dw(self):
@@ -355,7 +360,8 @@ class TransformerLayerNode(ScheduleNode):
                     hook()
 
         if self.is_layer_first_node:
-            self._post_backward_hook()
+            with torch.cuda.stream(self.stream):
+                self._post_backward_hook()
         self.bwd_dw_callables = None
 
     def set_post_forward_hook(self, hook):

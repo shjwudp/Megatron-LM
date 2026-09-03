@@ -4,7 +4,9 @@
 
 import logging
 import os
+from contextlib import nullcontext
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -22,6 +24,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
+from megatron.core.models.common.utils import TransformerLayerNode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -32,6 +36,7 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.optimizer.optimizer import MixedPrecisionOptimizer
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+from megatron.core.pipeline_parallel.utils import ScheduleNode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
@@ -418,6 +423,154 @@ class TestMcoreAdapterDense:
         ]
         for _, module in named_modules:
             assert module.phase is FsdpModule.Phase.RESTING
+
+    def test_same_owner_forward_release_waits_for_combined_backward(self):
+        """An overlapped forward must not release weights still needed by backward."""
+
+        class FakeFsdpModule(torch.nn.Module, FsdpModule):
+            def __init__(self):
+                torch.nn.Module.__init__(self)
+                self._phase = FsdpModule.Phase.RESTING
+                self._trainable_parameter_countdown = SimpleNamespace(_value=0, initial_value=0)
+                self.storage_resident = True
+                self.reshard_calls = []
+
+            def _reshard_parameter_groups(self):
+                self.storage_resident = False
+                self.reshard_calls.append("reshard")
+
+            def post_backward(self):
+                self._reshard_parameter_groups()
+                self.phase = FsdpModule.Phase.RESTING
+
+        owner = FakeFsdpModule()
+        adapter = object.__new__(mcore_fsdp_adapter.FullyShardedDataParallelV2)
+        torch.nn.Module.__init__(adapter)
+        adapter.module = owner
+        adapter._setup_1f1b_overlap_interface()
+        events = []
+
+        class Node:
+            def __init__(self, *, forward=None, backward=None):
+                self.forward_callback = forward
+                self.backward_callback = backward
+
+            def forward(self, value):
+                if self.forward_callback is not None:
+                    self.forward_callback()
+                return value
+
+            def backward(self, value):
+                if self.backward_callback is not None:
+                    self.backward_callback()
+                return value
+
+            def backward_dw(self):
+                return None
+
+        def enter_backward_mlp():
+            owner.phase = FsdpModule.Phase.BACKWARD
+            events.append("backward-mlp")
+
+        def finish_forward():
+            events.append("forward-mlp")
+            adapter.post_forward_release_module(owner)
+
+        def consume_attention_weight():
+            events.append("backward-pre-dispatch")
+            assert owner.storage_resident
+            adapter.post_backward_release_module(owner)
+
+        def layer(*, mlp_forward=None, mlp_backward=None, pre_dispatch_backward=None):
+            return SimpleNamespace(
+                config=SimpleNamespace(ep_overlap_early_attn_memory_release=False),
+                get_fp8_context=nullcontext,
+                mtp_post_process=Node(),
+                moe_combine=Node(),
+                mlp=Node(forward=mlp_forward, backward=mlp_backward),
+                moe_dispatch=Node(),
+                pre_dispatch_computation=Node(backward=pre_dispatch_backward),
+            )
+
+        # Dense MLP weights belong to the same layer-level FSDP owner as
+        # attention weights. Its backward therefore enters BACKWARD before the
+        # paired forward reaches its final (MLP) node.
+        forward_layer = layer(mlp_forward=finish_forward)
+        backward_layer = layer(
+            mlp_backward=enter_backward_mlp, pre_dispatch_backward=consume_attention_weight
+        )
+
+        TransformerLayerSchedulePlan.run(
+            forward_layer,
+            backward_layer,
+            f_input=object(),
+            b_grad=object(),
+            is_last_layer_in_bwd=True,
+        )
+
+        assert events == ["backward-mlp", "forward-mlp", "backward-pre-dispatch"]
+        assert owner.reshard_calls == ["reshard"]
+        assert owner.phase is FsdpModule.Phase.RESTING
+
+    def test_schedule_post_forward_hook_uses_node_stream(self):
+        """A release hook must observe the stream that consumed its weights."""
+        stream = torch.cuda.Stream()
+        node = object.__new__(TransformerLayerNode)
+        ScheduleNode.__init__(
+            node, forward_func=lambda value: value, stream=stream, event=torch.cuda.Event()
+        )
+        node.is_layer_last_node = False
+        seen_streams = []
+        node.set_post_forward_hook(
+            lambda: seen_streams.append(torch.cuda.current_stream().cuda_stream)
+        )
+
+        node.forward(torch.ones(1, device="cuda"))
+
+        assert seen_streams == [stream.cuda_stream]
+
+    def test_schedule_post_backward_hook_uses_node_stream(self, monkeypatch):
+        """Normal backward releases must be fenced from their compute stream."""
+        stream = torch.cuda.Stream()
+        node = object.__new__(TransformerLayerNode)
+        node.stream = stream
+        node.delay_wgrad_compute = False
+        node.is_layer_first_node = True
+        seen_streams = []
+        node._post_backward_hook = lambda: seen_streams.append(
+            torch.cuda.current_stream().cuda_stream
+        )
+        monkeypatch.setattr(ScheduleNode, "backward", lambda _node, *_grads: object())
+
+        node.backward(object())
+
+        assert seen_streams == [stream.cuda_stream]
+
+    def test_schedule_delayed_wgrad_post_backward_hook_uses_node_stream(self):
+        """Delayed-wgrad finalization must remain on the wgrad compute stream."""
+        stream = torch.cuda.Stream()
+        node = object.__new__(TransformerLayerNode)
+        node.stream = stream
+        node.delay_wgrad_compute = True
+        node.is_layer_first_node = True
+        node.post_wgrad_grad_acc_hooks = []
+        seen_streams = []
+
+        class DelayedWgrad:
+            def backward_dw(self):
+                seen_streams.append(("wgrad", torch.cuda.current_stream().cuda_stream))
+
+        node.bwd_dw_callables = [DelayedWgrad()]
+        node._post_backward_hook = lambda: seen_streams.append(
+            ("post-backward", torch.cuda.current_stream().cuda_stream)
+        )
+
+        node.backward_dw()
+
+        assert seen_streams == [
+            ("wgrad", stream.cuda_stream),
+            ("post-backward", stream.cuda_stream),
+        ]
 
     def test_finish_grad_sync_waits_for_reduce_scatter(self):
         """Gradient consumers should wait for the final asynchronous reduce-scatter."""

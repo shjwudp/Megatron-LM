@@ -802,7 +802,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             module = _require_fsdp_module(module)
             if reduce_grad:
                 finalize_backward(module)
-            else:
+            elif module.phase is not FsdpModule.Phase.BACKWARD:
+                # A combined schedule may overlap forward and backward plans for
+                # the same physical layer. Its backward enters first and still
+                # needs the gathered weights after the forward plan completes.
+                # Match the normal post_forward() lifecycle by leaving those
+                # weights resident until post_backward() finalizes the owner.
                 module._reshard_parameter_groups()
 
         def _replace_param_with_raw_if_needed() -> None:
