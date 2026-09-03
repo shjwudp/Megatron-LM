@@ -378,6 +378,7 @@ def _ddp_wrap(
         )
         fsdp_context_cm = (
             fully_shard_context(
+                unify_communication_stream=ddp_config.megatron_fsdp_unify_communication_stream,
                 use_trace_replay=get_model_config(model[0]).overlap_moe_expert_parallel_comm,
                 use_symmetric_memory=ddp_config.nccl_ub,
             )

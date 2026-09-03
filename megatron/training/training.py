@@ -2355,6 +2355,7 @@ def wrap_model_chunks_with_ddp(
     ) and len(model_chunks) > 1
     if wrap_v2_shared_context:
         fsdp_context_cm = fully_shard_context(
+            unify_communication_stream=ddp_config.megatron_fsdp_unify_communication_stream,
             use_trace_replay=config.overlap_moe_expert_parallel_comm,
             use_symmetric_memory=ddp_config.nccl_ub,
         )
