@@ -388,6 +388,25 @@ def tuple_type(x):
     return tuple(int(i) for i in x.strip('()').split(','))
 
 
+def _set_default_fsdp_high_priority_stream_groups(args):
+    """Apply the default FSDP communicator priorities without changing explicit entries."""
+    if args.disable_fsdp_auto_high_priority_streams:
+        return
+
+    # Preserve the existing precedence intentionally: Torch-FSDP2 enables these groups on every
+    # architecture, while Megatron-FSDP enables them only on Blackwell and later architectures.
+    should_auto_enable = args.use_torch_fsdp2 or (
+        args.use_megatron_fsdp and get_device_arch_version() >= 10
+    )
+    if not should_auto_enable:
+        return
+
+    if 'dp_cp' not in args.high_priority_stream_groups:
+        args.high_priority_stream_groups.append('dp_cp')
+    if args.expert_model_parallel_size > 1 and 'ep_dp' not in args.high_priority_stream_groups:
+        args.high_priority_stream_groups.append('ep_dp')
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -1497,14 +1516,9 @@ def validate_args(args, defaults={}):
                 "Using tensor model parallelism or context parallelism require setting the environment variable " \
                 "CUDA_DEVICE_MAX_CONNECTIONS to 1"
 
-    # Setting FSDP communication groups for high priority streams for Blackwell and later architectures
-    # Assigning high priority to communication streams ensures that communication kernels are scheduled
-    # with higher priority, minimizing the exposed communication when it is overlapped with other computation kernels.
-    if args.use_torch_fsdp2 or args.use_megatron_fsdp and get_device_arch_version() >= 10:
-        if 'dp_cp' not in args.high_priority_stream_groups:
-            args.high_priority_stream_groups.append('dp_cp')
-        if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
-            args.high_priority_stream_groups.append('ep_dp')
+    # Assigning high priority to FSDP communication streams minimizes exposed communication when
+    # it overlaps compute. The experimental opt-out preserves explicitly configured group names.
+    _set_default_fsdp_high_priority_stream_groups(args)
 
 
     # Derive the internal gtp_weight_remat_size from the user-facing

@@ -18,7 +18,12 @@ from megatron.training.argument_utils import (
     core_transformer_config_from_args,
     pretrain_cfg_container_from_args,
 )
-from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
+from megatron.training.arguments import (
+    _set_default_fsdp_high_priority_stream_groups,
+    add_megatron_arguments,
+    parse_args,
+    validate_args,
+)
 from megatron.training.config import PretrainConfigContainer
 
 
@@ -71,6 +76,90 @@ def test_moe_norm_flag_reaches_transformer_config():
     )
 
     assert config.moe_use_norm_before_up_proj is True
+
+
+def test_disable_fsdp_auto_high_priority_streams_cli():
+    """The FSDP stream-priority experiment must remain default-off."""
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+
+    assert parser.parse_args([]).disable_fsdp_auto_high_priority_streams is False
+    assert (
+        parser.parse_args(
+            ["--disable-fsdp-auto-high-priority-streams"]
+        ).disable_fsdp_auto_high_priority_streams
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "use_megatron_fsdp",
+        "expert_model_parallel_size",
+        "disable_auto_priority",
+        "initial_groups",
+        "device_arch_version",
+        "expected_groups",
+    ),
+    [
+        (True, 1, False, [], 10, ["dp_cp"]),
+        (True, 8, False, [], 10, ["dp_cp", "ep_dp"]),
+        (True, 8, True, ["ep", "dp_cp", "ep_dp"], 10, ["ep", "dp_cp", "ep_dp"]),
+        (True, 8, False, ["ep", "dp_cp"], 10, ["ep", "dp_cp", "ep_dp"]),
+        (True, 8, False, ["ep_dp", "dp_cp"], 10, ["ep_dp", "dp_cp"]),
+        (True, 8, False, [], 9, []),
+        (False, 8, False, ["pp"], 10, ["pp"]),
+    ],
+)
+def test_default_fsdp_high_priority_stream_groups(
+    monkeypatch,
+    use_megatron_fsdp,
+    expert_model_parallel_size,
+    disable_auto_priority,
+    initial_groups,
+    device_arch_version,
+    expected_groups,
+):
+    """Cover M-FSDP EP1/EP8, explicit groups, duplicates, and the DistOpt path."""
+    monkeypatch.setattr(
+        "megatron.training.arguments.get_device_arch_version", lambda: device_arch_version
+    )
+    args = Namespace(
+        use_torch_fsdp2=False,
+        use_megatron_fsdp=use_megatron_fsdp,
+        expert_model_parallel_size=expert_model_parallel_size,
+        disable_fsdp_auto_high_priority_streams=disable_auto_priority,
+        high_priority_stream_groups=list(initial_groups),
+    )
+
+    _set_default_fsdp_high_priority_stream_groups(args)
+
+    assert args.high_priority_stream_groups == expected_groups
+
+
+@pytest.mark.parametrize(
+    ("disable_auto_priority", "expected_groups"),
+    [(False, ["dp_cp", "ep_dp"]), (True, [])],
+)
+def test_torch_fsdp2_high_priority_precedence_is_preserved(
+    monkeypatch, disable_auto_priority, expected_groups
+):
+    """Torch-FSDP2 retains its architecture-independent auto-enable behavior."""
+    monkeypatch.setattr(
+        "megatron.training.arguments.get_device_arch_version",
+        lambda: pytest.fail("Torch-FSDP2 must short-circuit the architecture query"),
+    )
+    args = Namespace(
+        use_torch_fsdp2=True,
+        use_megatron_fsdp=False,
+        expert_model_parallel_size=8,
+        disable_fsdp_auto_high_priority_streams=disable_auto_priority,
+        high_priority_stream_groups=[],
+    )
+
+    _set_default_fsdp_high_priority_stream_groups(args)
+
+    assert args.high_priority_stream_groups == expected_groups
 
 
 def test_moe_norm_flag_requires_latent_size(monkeypatch):

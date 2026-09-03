@@ -128,6 +128,12 @@ class DistributedInitConfig:
     overlapped with other computation kernels.
     """
 
+    disable_fsdp_auto_high_priority_streams: bool = False
+    """Disable automatic high-priority DP/CP and expert-DP communicators for FSDP.
+
+    Explicit entries supplied through ``high_priority_stream_groups`` remain unchanged.
+    """
+
     distributed_timeout_seconds_after_init: int | None = None
     """Timeout in seconds for process groups after initialization. This timeout is applied to all process groups after initialization and the first iteration completes."""
 
