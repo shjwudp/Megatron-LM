@@ -945,8 +945,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
         """Wait for backward reduce-scatters before gradient consumers run."""
-        context = self.module.context
-        context.current_stream().wait_stream(context.reduce_scatter_stream)
+        self.module.context.finish_grad_sync()
 
     def complete_fsdp_trace(self) -> None:
         """Mark the global-batch boundary for the execution-order runner.

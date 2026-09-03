@@ -138,6 +138,11 @@ class FsdpContext:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
 
+    def finish_grad_sync(self) -> None:
+        """Submit delayed gradient reductions and fence their consumers."""
+        self.runner.finish_gradient_reduce()
+        self.current_stream().wait_stream(self.reduce_scatter_stream)
+
     def register_post_backward_final_callback(self) -> None:
         """Register this root context's final callback for the current backward.
 
@@ -148,7 +153,7 @@ class FsdpContext:
         """
 
         def post_backward_final_callback() -> None:
-            self.current_stream().wait_stream(self.reduce_scatter_stream)
+            self.finish_grad_sync()
 
         torch.autograd.Variable._execution_engine.queue_callback(post_backward_final_callback)
 
@@ -353,7 +358,7 @@ class FsdpModule:
 
         # Validate the consume before materializing so an orientation-mismatched
         # prefetch can be released and replaced by the correct payload.
-        context.runner.record_unshard(self, "rowwise")
+        is_new_occurrence = context.runner.record_unshard(self, "rowwise")
         self._unshard_parameter_groups("rowwise")
         assert self._unshard_event is not None
         # Compute waits only for this FsdpModule's all-gather (the prefetch below is
@@ -361,6 +366,9 @@ class FsdpModule:
         torch.cuda.nvtx.range_push(self._nvtx_label("wait_ag"))
         current_stream.wait_event(self._unshard_event)
         torch.cuda.nvtx.range_pop()
+
+        if is_new_occurrence:
+            context.runner.run_gradient_reduce_safe_point(self, "pre_forward")
 
         # Activation recomputation runs forward hooks inside backward. The
         # runner decides the prefetch target: static-order successor in
@@ -413,10 +421,14 @@ class FsdpModule:
         # Trace-replay mode owns all prefetch decisions (the recompute check is
         # default-mode logic inside the runner); the runner also dedups the
         # fine-grained per-sub-module hooks of a pass.
-        self.context.runner.record_unshard(self, orientation)
+        is_new_occurrence = self.context.runner.record_unshard(self, orientation)
         self._unshard_parameter_groups(orientation)
         if self._unshard_event is not None:
             self.context.current_stream().wait_event(self._unshard_event)
+        if is_new_occurrence:
+            self.context.runner.run_gradient_reduce_safe_point(
+                self, "pre_forward" if orientation == "rowwise" else "pre_backward"
+            )
         prefetch = self.context.runner.suggest_prefetch(self, orientation)
         if prefetch is not None:
             next_module, next_orientation = prefetch
@@ -443,6 +455,7 @@ class FsdpModule:
         is_recomputing = self.phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
         if not is_recomputing:
             self._reshard_parameter_groups()
+            self.context.runner.run_gradient_reduce_safe_point(self, "post_forward")
         if self.phase is FsdpModule.Phase.FORWARD:
             self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
@@ -509,10 +522,13 @@ class FsdpModule:
 
         # Validate before materializing so an opposite-orientation prefetch is
         # released before this backward pass issues its demand all-gather.
-        context.runner.record_unshard(self, "colwise")
+        is_new_occurrence = context.runner.record_unshard(self, "colwise")
         self._unshard_parameter_groups("colwise")
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
+
+        if is_new_occurrence:
+            context.runner.run_gradient_reduce_safe_point(self, "pre_backward")
 
         prefetch = context.runner.suggest_prefetch(self, "colwise")
         if prefetch is not None:
@@ -523,11 +539,12 @@ class FsdpModule:
         """Reduce gradients and return parameters to their sharded resting state."""
         self._reshard_parameter_groups()
         self._reduce_gradient_groups()
+        self.context.runner.run_gradient_reduce_safe_point(self, "post_backward")
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
-        """Pack gradients and immediately launch their reduce-scatters."""
+        """Pack gradients and queue their reduce-scatters."""
         context = self.context
         reduce_scatter_stream = context.reduce_scatter_stream
         current_stream = context.current_stream()
@@ -543,9 +560,21 @@ class FsdpModule:
             current_stream.wait_stream(reduce_scatter_stream)
             group.copy_gradients_to_partial_buffer(partial_grad)
 
-            reduce_scatter_stream.wait_stream(current_stream)
-            with torch.cuda.stream(reduce_scatter_stream):
-                group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
+            ready_event = current_stream.record_event()
+            partial_grad.local_buffer.record_stream(reduce_scatter_stream)
+            is_last_microbatch = context.is_last_microbatch
+
+            def reduce_gradient(
+                group=group,
+                partial_grad=partial_grad,
+                ready_event=ready_event,
+                is_last_microbatch=is_last_microbatch,
+            ) -> None:
+                reduce_scatter_stream.wait_event(ready_event)
+                with torch.cuda.stream(reduce_scatter_stream):
+                    group.reduce_partial_gradients(partial_grad, is_last_microbatch)
+
+            context.runner.queue_gradient_reduce(reduce_gradient)
         torch.cuda.nvtx.range_pop()
 
     @property

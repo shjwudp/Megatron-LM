@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Execution-order tracer and prefetch planner for fine-grained FSDP.
+"""Execution-order tracer and communication runner for fine-grained FSDP.
 
 The combined-1F1B + VPP schedule is occurrence-based: the same FSDP unit can
 be consumed in forward and backward, model chunks interleave, and
@@ -38,7 +38,7 @@ State machine::
        ^                                                          |
        +----------------------(complete_trace)--------------------+
 
-Four per-op interfaces:
+The runner interfaces are:
 
 - ``record_unshard(module, orientation)`` / ``record_reshard(module)``:
   trace path — record the real event, or during replay validate it against
@@ -48,21 +48,31 @@ Four per-op interfaces:
 - ``suggest_skip_reshard(module)``: optimization path — whether this reshard
   can be skipped because the next traced unshard reuses the same module and
   orientation, keeping the storage resident.
+- ``mark_gradient_reduce_safe_point(module, trigger_point)``: register a module
+  lifecycle point where one queued gradient reduction may be submitted.
+- ``queue_gradient_reduce(task)`` / ``finish_gradient_reduce()``: preserve
+  eager reduction by default, or submit delayed reductions in FIFO order.
 """
 
 import dataclasses
 import logging
+from collections import deque
 from enum import Enum, auto
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Literal
 from weakref import WeakKeyDictionary
 
 import torch
 
 # Forward reference; FsdpModule is imported lazily to avoid a cycle.
 if TYPE_CHECKING:
+    from torch import nn
+
     from .module import FsdpModule
 
 logger = logging.getLogger(__name__)
+
+TriggerPoint = Literal["pre_forward", "pre_backward", "post_forward", "post_backward"]
+_TRIGGER_POINTS = {"pre_forward", "pre_backward", "post_forward", "post_backward"}
 
 
 class RunnerPhase(Enum):
@@ -137,6 +147,10 @@ class FsdpExecutionRunner:
         self._replayed_occurrences = 0
         self._divergences = 0
         self._complete_trace_calls = 0
+        self._gradient_reduce_queue: deque[Callable[[], None]] = deque()
+        self._gradient_reduce_safe_points: WeakKeyDictionary[nn.Module, set[TriggerPoint]] = (
+            WeakKeyDictionary()
+        )
         if use_trace_replay:
             logger.info("FsdpExecutionRunner: trace-and-replay prefetch enabled.")
 
@@ -159,7 +173,7 @@ class FsdpExecutionRunner:
     # Interface 1: record execution events (consume, reshard)
     # ------------------------------------------------------------------
 
-    def record_unshard(self, module: "FsdpModule", orientation: str) -> None:
+    def record_unshard(self, module: "FsdpModule", orientation: str) -> bool:
         """Record (tracing) or validate (replay) an unshard event.
 
         The fine-grained schedule fires one hook per sub-module (dense,
@@ -173,6 +187,10 @@ class FsdpExecutionRunner:
             module: The FSDP module being unsharded for compute.
             orientation: Payload orientation (``"rowwise"`` forward,
                 ``"colwise"`` backward).
+
+        Returns:
+            Whether this is the first consume of ``module`` in the current
+            unshard round.
         """
         prefetched_orientation = self._pending_prefetches.pop(module, None)
         if prefetched_orientation is not None and prefetched_orientation != orientation:
@@ -180,13 +198,14 @@ class FsdpExecutionRunner:
             # opposite MXFP8 payload orientation. Drop the stale materialization
             # before the caller attempts its demand all-gather.
             module._release_unsharded_parameter_groups()
-        if not self._use_trace_replay:
-            return
         if module in self._consumed_this_round:
-            return
+            return False
         self._consumed_this_round.add(module)
+        if not self._use_trace_replay:
+            return True
         self._last_orientation[module] = orientation
         self._validate_and_advance(EventKind.UNSHARD, module, orientation)
+        return True
 
     def record_reshard(self, module: "FsdpModule") -> None:
         """Record (tracing) or validate (replay) a reshard event.
@@ -201,16 +220,69 @@ class FsdpExecutionRunner:
             module: The FSDP module whose unsharded storage is released.
         """
         self._pending_prefetches.pop(module, None)
+        self._consumed_this_round.discard(module)
         if not self._use_trace_replay:
             return
         # The reshard ends the module's unshard round; discard its dedup
         # entry so the next unshard (e.g. backward after forward) records a
         # fresh event.
-        self._consumed_this_round.discard(module)
         self._validate_and_advance(EventKind.RESHARD, module, None)
 
     # ------------------------------------------------------------------
-    # Interface 2: prefetch suggestion
+    # Interface 2: delayed gradient reduction
+    # ------------------------------------------------------------------
+
+    def mark_gradient_reduce_safe_point(
+        self, module: "nn.Module", trigger_point: TriggerPoint
+    ) -> None:
+        """Register a logical FSDP lifecycle point as a reduction safe point.
+
+        The FSDP lifecycle emits trigger points for FSDP modules. External
+        execution engines may emit a point for any registered module with
+        :meth:`run_gradient_reduce_safe_point`.
+        """
+        if trigger_point not in _TRIGGER_POINTS:
+            raise ValueError(f"Unsupported trigger point: {trigger_point!r}.")
+        self._gradient_reduce_safe_points.setdefault(module, set()).add(trigger_point)
+
+    def queue_gradient_reduce(self, task: Callable[[], None]) -> None:
+        """Submit ``task`` eagerly, or queue it when safe points are configured."""
+        if not self._gradient_reduce_safe_points and not self._gradient_reduce_queue:
+            task()
+            return
+        self._gradient_reduce_queue.append(task)
+
+    def run_gradient_reduce_safe_point(
+        self,
+        module: "nn.Module",
+        trigger_point: TriggerPoint,
+        event: torch.cuda.Event | None = None,
+    ) -> None:
+        """Submit the oldest queued gradient reduction at a marked safe point.
+
+        ``event`` lets an external execution engine identify a point on a
+        non-current stream; otherwise the point is ordered after the current
+        stream.
+        """
+        if trigger_point not in _TRIGGER_POINTS:
+            raise ValueError(f"Unsupported trigger point: {trigger_point!r}.")
+        if trigger_point not in self._gradient_reduce_safe_points.get(module, ()):
+            return
+        if not self._gradient_reduce_queue:
+            return
+        if event is None:
+            self._context.reduce_scatter_stream.wait_stream(self._context.current_stream())
+        else:
+            self._context.reduce_scatter_stream.wait_event(event)
+        self._gradient_reduce_queue.popleft()()
+
+    def finish_gradient_reduce(self) -> None:
+        """Submit every gradient reduction left before the hard sync deadline."""
+        while self._gradient_reduce_queue:
+            self._gradient_reduce_queue.popleft()()
+
+    # ------------------------------------------------------------------
+    # Interface 3: prefetch suggestion
     # ------------------------------------------------------------------
 
     def suggest_prefetch(
@@ -254,7 +326,7 @@ class FsdpExecutionRunner:
         return None
 
     # ------------------------------------------------------------------
-    # Interface 3: reshard-skip suggestion
+    # Interface 4: reshard-skip suggestion
     # ------------------------------------------------------------------
 
     def suggest_skip_reshard(self, module: "FsdpModule") -> bool:

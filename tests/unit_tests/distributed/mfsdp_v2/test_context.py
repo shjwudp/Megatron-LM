@@ -12,6 +12,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
     fully_shard_context,
+    fully_shard_optimizer,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_runner import EventKind
 
@@ -80,6 +81,163 @@ def _record_unshard_and_prefetch(runner, module, orientation):
     """Record an unshard on the runner and return the suggested prefetch."""
     runner.record_unshard(module, orientation)
     return runner.suggest_prefetch(module, orientation)
+
+
+@pytest.mark.parametrize(
+    "trigger_point", ("pre_forward", "pre_backward", "post_forward", "post_backward")
+)
+def test_gradient_reduce_safe_point_runs_one_fifo_task(distributed_setup, trigger_point):
+    """A marked module/trigger-point pair should release one queued gradient reduction."""
+    device = distributed_setup.device
+    module = nn.Module()
+    other_module = nn.Module()
+
+    with fully_shard_context(device=device) as context:
+        pass
+
+    runner = context.runner
+    calls = []
+    runner.queue_gradient_reduce(lambda: calls.append("eager"))
+    assert calls == ["eager"]
+
+    runner.mark_gradient_reduce_safe_point(module, trigger_point)
+    runner.queue_gradient_reduce(lambda: calls.append("first"))
+    runner.queue_gradient_reduce(lambda: calls.append("second"))
+
+    other_trigger_point = "post_backward" if trigger_point != "post_backward" else "pre_forward"
+    runner.run_gradient_reduce_safe_point(other_module, trigger_point)
+    runner.run_gradient_reduce_safe_point(module, other_trigger_point)
+    assert calls == ["eager"]
+
+    runner.run_gradient_reduce_safe_point(module, trigger_point)
+    assert calls == ["eager", "first"]
+    runner.run_gradient_reduce_safe_point(module, trigger_point)
+    assert calls == ["eager", "first", "second"]
+
+
+def test_finish_grad_sync_drains_gradient_reduce_queue(distributed_setup, monkeypatch):
+    """The hard sync deadline should submit every task before waiting for RS."""
+    device = distributed_setup.device
+    module = nn.Module()
+
+    with fully_shard_context(device=device) as context:
+        pass
+
+    calls = []
+
+    class RecordingStream:
+        def wait_stream(self, stream) -> None:
+            calls.append(("wait", stream))
+
+    context.runner.mark_gradient_reduce_safe_point(module, "pre_backward")
+    context.runner.queue_gradient_reduce(lambda: calls.append("first"))
+    context.runner.queue_gradient_reduce(lambda: calls.append("second"))
+    recording_stream = RecordingStream()
+    monkeypatch.setattr(context, "current_stream", lambda: recording_stream)
+
+    context.finish_grad_sync()
+
+    assert calls == ["first", "second", ("wait", context.reduce_scatter_stream)]
+
+
+def test_gradient_reduce_safe_point_uses_external_event(distributed_setup):
+    """An external execution engine can order a safe point by CUDA event."""
+    device = distributed_setup.device
+    module = nn.Module()
+
+    with fully_shard_context(device=device) as context:
+        pass
+
+    calls = []
+    event = object()
+
+    class RecordingStream:
+        def wait_event(self, waited_event) -> None:
+            calls.append(("wait", waited_event))
+
+    context.reduce_scatter_stream = RecordingStream()
+    context.runner.mark_gradient_reduce_safe_point(module, "pre_backward")
+    context.runner.queue_gradient_reduce(lambda: calls.append("reduce"))
+
+    context.runner.run_gradient_reduce_safe_point(module, "pre_backward", event)
+
+    assert calls == [("wait", event), "reduce"]
+
+
+def test_post_backward_safe_point_sees_current_gradient(distributed_setup, monkeypatch):
+    """Post-backward should enqueue this module's reduction before releasing it."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    module = nn.Linear(4, 4, bias=False).to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(module, mesh=mesh, placements=_flat_placements())
+
+    runner = module.context.runner
+    runner.mark_gradient_reduce_safe_point(module, "post_backward")
+    calls = []
+    monkeypatch.setattr(module, "_reshard_parameter_groups", lambda: None)
+    monkeypatch.setattr(
+        module,
+        "_reduce_gradient_groups",
+        lambda: runner.queue_gradient_reduce(lambda: calls.append("reduce")),
+    )
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    module.phase = module.Phase.BACKWARD
+
+    module.post_backward()
+
+    assert calls == ["reduce"]
+
+
+def test_delayed_gradient_reduce_matches_eager(distributed_setup):
+    """A mid-backward safe point should preserve multi-step training numerics."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Requires at least two ranks to exercise reduce-scatter.")
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fc1 = nn.Linear(8, 8)
+            self.fc2 = nn.Linear(8, 4)
+
+        def forward(self, x):
+            return self.fc2(torch.relu(self.fc1(x)))
+
+    torch.manual_seed(1234)
+    eager = Model().to(device)
+    delayed = Model().to(device)
+    delayed.load_state_dict(eager.state_dict())
+
+    for model in (eager, delayed):
+        with fully_shard_context(device=device):
+            fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+            fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    delayed.fc1.context.runner.mark_gradient_reduce_safe_point(delayed.fc1, "pre_backward")
+
+    eager_optimizer = torch.optim.SGD(eager.parameters(), lr=0.05)
+    delayed_optimizer = torch.optim.SGD(delayed.parameters(), lr=0.05)
+    fully_shard_optimizer(eager_optimizer)
+    fully_shard_optimizer(delayed_optimizer)
+    x = torch.randn(3, 8, device=device)
+    target = torch.randn(3, 4, device=device)
+
+    for _ in range(3):
+        eager_optimizer.zero_grad(set_to_none=True)
+        delayed_optimizer.zero_grad(set_to_none=True)
+        for is_last_microbatch in (False, True):
+            eager.fc1.context.is_last_microbatch = is_last_microbatch
+            delayed.fc1.context.is_last_microbatch = is_last_microbatch
+            eager_loss = torch.nn.functional.mse_loss(eager(x), target)
+            delayed_loss = torch.nn.functional.mse_loss(delayed(x), target)
+            eager_loss.backward()
+            delayed_loss.backward()
+            torch.testing.assert_close(delayed_loss, eager_loss)
+        eager_optimizer.step()
+        delayed_optimizer.step()
 
 
 def test_child_then_parent_share_one_context(distributed_setup):

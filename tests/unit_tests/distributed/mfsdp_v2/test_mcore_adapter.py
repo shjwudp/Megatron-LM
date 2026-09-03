@@ -357,24 +357,14 @@ class TestMcoreAdapterDense:
             assert module.phase is FsdpModule.Phase.RESTING
 
     def test_finish_grad_sync_waits_for_reduce_scatter(self):
-        """Gradient consumers should wait for the final asynchronous reduce-scatter."""
-
-        class RecordingStream:
-            def __init__(self) -> None:
-                self.waited_streams = []
-
-            def wait_stream(self, stream) -> None:
-                self.waited_streams.append(stream)
-
-        current_stream = RecordingStream()
-        reduce_scatter_stream = object()
+        """The adapter should delegate the gradient-sync deadline to its context."""
 
         class Context:
             def __init__(self) -> None:
-                self.reduce_scatter_stream = reduce_scatter_stream
+                self.finish_calls = 0
 
-            def current_stream(self):
-                return current_stream
+            def finish_grad_sync(self) -> None:
+                self.finish_calls += 1
 
         module = torch.nn.Module()
         module.context = Context()
@@ -384,7 +374,7 @@ class TestMcoreAdapterDense:
 
         adapter.finish_grad_sync()
 
-        assert current_stream.waited_streams == [reduce_scatter_stream]
+        assert module.context.finish_calls == 1
 
     def test_optimizer_completes_each_shared_context_trace_once(self, monkeypatch):
         """One optimizer boundary should complete each unique VPP context once."""
