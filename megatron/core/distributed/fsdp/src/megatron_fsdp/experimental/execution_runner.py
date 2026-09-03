@@ -128,10 +128,11 @@ class FsdpExecutionRunner:
         # materialized storage resident until the expected consumer arrives.
         # Keep only weak ownership so tracing state cannot retain deleted chunks.
         self._pending_prefetches: WeakKeyDictionary[FsdpModule, str] = WeakKeyDictionary()
-        # Orientation of each module's most recent consume during replay,
-        # used to ask the module whether an immediate re-unshard can reuse its
-        # resident storage.
-        self._last_orientation: dict[FsdpModule, str] = {}
+        # Orientation that owns each module's resident storage during replay,
+        # used to ask the module whether an immediate re-unshard can reuse that
+        # materialization. A compatible consume with another orientation does
+        # not change this value because no replacement all-gather ran.
+        self._materialized_orientation: dict[FsdpModule, str] = {}
         # Diagnostics: how many events were validated during replay, how many
         # diverged (re-trace), and how many complete_trace calls ran.
         self._replayed_occurrences = 0
@@ -175,6 +176,7 @@ class FsdpExecutionRunner:
                 ``"colwise"`` backward).
         """
         prefetched_orientation = self._pending_prefetches.pop(module, None)
+        materialized_orientation = orientation
         if (
             prefetched_orientation is not None
             and prefetched_orientation != orientation
@@ -184,12 +186,17 @@ class FsdpExecutionRunner:
             # incompatible payload orientation. Drop the stale materialization
             # before the caller attempts its demand all-gather.
             module._release_unsharded_parameter_groups()
+        elif prefetched_orientation is not None:
+            # The prefetched/resident payload serves this consume without a
+            # replacement all-gather, so retain the orientation that actually
+            # owns the storage rather than recording the logical request.
+            materialized_orientation = prefetched_orientation
         if not self._use_trace_replay:
             return
         if module in self._consumed_this_round:
             return
         self._consumed_this_round.add(module)
-        self._last_orientation[module] = orientation
+        self._materialized_orientation[module] = materialized_orientation
         self._validate_and_advance(EventKind.UNSHARD, module, orientation)
 
     def record_reshard(self, module: "FsdpModule") -> None:
@@ -284,7 +291,7 @@ class FsdpExecutionRunner:
         if next_event.kind is not EventKind.UNSHARD or next_event.module is not module:
             return False
         assert next_event.orientation is not None
-        materialized_orientation = self._last_orientation.get(module)
+        materialized_orientation = self._materialized_orientation.get(module)
         if materialized_orientation is None or not module.can_reuse_unsharded_storage(
             materialized_orientation, next_event.orientation
         ):
@@ -327,7 +334,7 @@ class FsdpExecutionRunner:
             self._phase = RunnerPhase.TRACING
             self._trace.clear()
             self._cycles_observed = 0
-            self._last_orientation.clear()
+            self._materialized_orientation.clear()
         if self._phase is RunnerPhase.TRACING and self._trace:
             self._phase = RunnerPhase.REPLAYING
             logger.info(
@@ -475,6 +482,6 @@ class FsdpExecutionRunner:
         # Re-mark the seed module for an unshard seed so duplicate hooks of
         # its current round stay deduped (a reshard seed ends that round).
         self._consumed_this_round.clear()
-        self._last_orientation.clear()
+        self._materialized_orientation.clear()
         if kind is EventKind.UNSHARD:
             self._consumed_this_round.add(module)

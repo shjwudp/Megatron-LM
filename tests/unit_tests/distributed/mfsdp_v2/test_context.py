@@ -108,6 +108,22 @@ class _RunnerTestModule:
         self.release_calls += 1
 
 
+class _AsymmetricRunnerTestModule(_RunnerTestModule):
+    """Runner participant whose row-wise storage can serve either orientation."""
+
+    def __init__(self) -> None:
+        super().__init__(can_reuse=False)
+
+    def can_reuse_unsharded_storage(
+        self, materialized_orientation: str, requested_orientation: str
+    ) -> bool:
+        self.reuse_calls.append((materialized_orientation, requested_orientation))
+        return (
+            materialized_orientation == requested_orientation
+            or materialized_orientation == "rowwise"
+        )
+
+
 @pytest.mark.parametrize(
     ("materialized_orientation", "requested_orientation"),
     (("rowwise", "colwise"), ("colwise", "rowwise")),
@@ -175,6 +191,38 @@ def test_runner_reuses_cross_orientation_storage_within_batch(
 
     # Reuse must not cross the global-batch/optimizer boundary.
     assert not runner.suggest_skip_reshard(module)
+
+
+def test_runner_tracks_materialized_orientation_across_three_consumes():
+    """Compatible consumes retain the orientation that owns resident storage."""
+    runner = FsdpExecutionRunner(context=object(), use_trace_replay=True)
+    module = _AsymmetricRunnerTestModule()
+
+    for orientation in ("rowwise", "colwise", "rowwise"):
+        runner.record_unshard(module, orientation)
+        runner.record_reshard(module)
+    runner.complete_trace()
+
+    runner.record_unshard(module, "rowwise")
+    assert runner.suggest_prefetch(module, "rowwise") == (module, "colwise")
+    runner.record_reshard(module)
+    assert runner.suggest_skip_reshard(module)
+
+    # The column-wise request reuses row-wise resident storage. The following
+    # row-wise request must therefore be checked against the materialization,
+    # not against the most recent logical request.
+    runner.record_unshard(module, "colwise")
+    assert runner.suggest_prefetch(module, "colwise") == (module, "rowwise")
+    runner.record_reshard(module)
+    assert runner.suggest_skip_reshard(module)
+
+    runner.record_unshard(module, "rowwise")
+    assert module.release_calls == 0
+    assert module.reuse_calls == [
+        ("rowwise", "colwise"),
+        ("rowwise", "colwise"),
+        ("rowwise", "rowwise"),
+    ]
 
 
 def test_runner_does_not_skip_reshard_for_incompatible_orientation():
