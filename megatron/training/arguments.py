@@ -3857,6 +3857,16 @@ def _add_experimental_args(parser):
             ),
         )
 
+    group.add_argument(
+        '--megatron-fsdp-unify-communication-stream',
+        action='store_true',
+        help=(
+            'Run Megatron-FSDP v2 parameter all-gathers and gradient reduce-scatters on '
+            'one CUDA stream to reduce peak transient memory at the cost of serializing '
+            'the two collective types.'
+        ),
+    )
+
     group.add_argument("--megatron-fsdp-max-pool-double-buffer", action='store_true',
                         help="When using Megatron-FSDP double buffering, use the MaxPoolAllocator instead of "
                              "the FixedPoolAllocator to support asymmetrical FSDP unit configurations. Will "

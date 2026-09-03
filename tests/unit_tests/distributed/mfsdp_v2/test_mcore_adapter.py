@@ -541,6 +541,40 @@ class TestMcoreAdapterDense:
 
         assert fully_shard_context_calls == [True]
 
+    def test_unified_communication_stream_is_forwarded_to_context(self, monkeypatch):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        model = torch.nn.Linear(config.hidden_size, config.hidden_size).to(
+            device="cuda", dtype=config.params_dtype
+        )
+        context_options = []
+        original_fully_shard_context = mcore_fsdp_adapter.fully_shard_context
+
+        def record_fully_shard_context(*args, **kwargs):
+            context_options.append(kwargs["unify_communication_stream"])
+            return original_fully_shard_context(*args, **kwargs)
+
+        monkeypatch.setattr(mcore_fsdp_adapter, "fully_shard_context", record_fully_shard_context)
+        FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                data_parallel_sharding_strategy="optim_grads_params",
+                megatron_fsdp_unify_communication_stream=True,
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        assert context_options == [True]
+
     def test_moe_overlap_uses_shared_trace_replay_context(self, monkeypatch):
         config = TransformerConfig(
             num_layers=1,

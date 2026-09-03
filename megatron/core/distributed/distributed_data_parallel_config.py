@@ -248,6 +248,14 @@ class DistributedDataParallelConfig:
       will be unsharded.
     """
 
+    megatron_fsdp_unify_communication_stream: bool = False
+    """If true, MFSDP v2 all-gathers and reduce-scatters share one CUDA stream.
+
+    Sharing the stream reduces peak transient memory because the caching allocator can
+    reuse storage between the two collective types, at the cost of serializing their
+    execution. This option is ignored by MFSDP v1.
+    """
+
     megatron_fsdp_max_pool_double_buffer: bool = False
     """
     Builds a double buffer maxpool that can be recycled across asymmetric / hybrid

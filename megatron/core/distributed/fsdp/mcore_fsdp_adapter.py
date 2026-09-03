@@ -709,6 +709,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         with fully_shard_context(
             device=device,
             reuse_existing=True,
+            unify_communication_stream=ddp_config.megatron_fsdp_unify_communication_stream,
             use_trace_replay=overlap_moe_expert_parallel,
             use_symmetric_memory=ddp_config.nccl_ub,
         ):
