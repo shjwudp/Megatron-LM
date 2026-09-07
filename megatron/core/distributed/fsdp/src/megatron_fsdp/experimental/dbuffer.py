@@ -464,13 +464,16 @@ class DBuffer:
         _validate_placements(placements)
         out = self._create_or_validate_out(out, placements=placements)
         reduce_op = _get_reduce_op(partial_placement)
-        # Symmetric-memory MFSDP requires this detector, but ordinary DBuffer
-        # reductions remain supported on older PyTorch versions that lack it.
+        # Always reduce-scatter with SUM and scale by the mesh size afterwards.
+        # AVG reduce-scatter is not reliably implemented everywhere (in particular
+        # it can be selected as a symmetric kernel or produce an unexpected
+        # divisor), so preserve the placement's AVG semantics explicitly by
+        # dividing the SUM result by the number of ranks on this mesh axis.
         if self.is_symmetric_memory:
             self.rendezvous(axis)
-            # NCCL symmetric-memory reduce-scatter selects its symmetric kernel
-            # for SUM. Preserve the placement's AVG semantics by scaling the
-            # SUM result after the collective.
+            if reduce_op == dist.ReduceOp.AVG:
+                reduce_op = dist.ReduceOp.SUM
+        else:
             if reduce_op == dist.ReduceOp.AVG:
                 reduce_op = dist.ReduceOp.SUM
         dist.reduce_scatter_tensor(
@@ -479,7 +482,7 @@ class DBuffer:
             op=reduce_op,
             group=self.mesh.get_group(axis),
         )
-        if self.is_symmetric_memory and partial_placement.reduce_op == "avg":
+        if partial_placement.reduce_op == "avg":
             out.local_buffer.div_(self.mesh.size(axis))
         return out
 
