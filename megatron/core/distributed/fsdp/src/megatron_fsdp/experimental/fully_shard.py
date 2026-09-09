@@ -28,7 +28,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .module import FsdpContext, FsdpModule
-from .schedule import SchedulePolicy
+from .schedule import SchedulePolicy, TraceAndReplayScheduler
 
 _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
 
@@ -68,6 +68,7 @@ def fully_shard_context(
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
     reuse_existing: bool = False,
+    use_trace_replay: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -88,6 +89,10 @@ def fully_shard_context(
             reused scopes exit without finalizing. A context cannot be shared across
             devices, so requesting reuse while a context is active on a different
             ``device`` raises ``ValueError``.
+        use_trace_replay: Enable the per-context :class:`TraceAndReplayScheduler`
+            for occurrence-based (combined-1F1B) schedules. When enabled, fine-grained
+            FSDP units must be built with ``register_hooks=False`` so the scheduler
+            drives execution exclusively.
     """
     existing = _FSDP_CONTEXT.get()
     if existing is not None:
@@ -115,6 +120,8 @@ def fully_shard_context(
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
     )
+    if use_trace_replay:
+        context.scheduler = TraceAndReplayScheduler(context)
     token = _FSDP_CONTEXT.set(context)
     try:
         yield context
