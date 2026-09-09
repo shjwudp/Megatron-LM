@@ -40,7 +40,7 @@ from .quantization import (
     merge_orientations,
     orientation_directions,
 )
-from .schedule import SchedulePolicy
+from .schedule import SchedulePolicy, TraceAndReplayScheduler
 
 
 def _is_in_backward() -> bool:
@@ -78,6 +78,10 @@ class FsdpContext:
     # this context's reduce-scatter stream. Each context owns its own stream, so
     # independent roots sharing a context need only one completion callback.
     _post_backward_hook_registered: bool
+    # Trace-and-replay scheduler for occurrence-based (combined-1F1B) schedules.
+    # ``None`` when trace-and-replay prefetch is disabled; the combined-1F1B
+    # hooks call through this to drive fine-grained execution.
+    scheduler: TraceAndReplayScheduler | None
 
     def __init__(
         self,
@@ -100,6 +104,7 @@ class FsdpContext:
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self._post_backward_hook_registered = False
+        self.scheduler = None
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
@@ -440,6 +445,7 @@ class FsdpModule:
             context.allgather_stream.wait_stream(context.current_stream())
 
         self.unshard(prefetch="forward" if not is_recomputing else "none", orientation=ROWWISE)
+        self.wait_unshard()
 
     def unshard(
         self,
@@ -467,10 +473,6 @@ class FsdpModule:
         """
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups(orientation)
-            assert self._unshard_event is not None
-            # Compute waits only for this FsdpModule's all-gather (the prefetch below is
-            # issued afterwards, so it is free to run concurrently with this FsdpModule).
-            self.context.current_stream().wait_event(self._unshard_event)
 
             context = self.context
             if prefetch == "forward":
@@ -483,6 +485,11 @@ class FsdpModule:
                     self._schedule_policy.backward_prefetch_size,
                     orientation,
                 )
+
+    def wait_unshard(self) -> None:
+        """Wait for this FsdpModule's unshard to complete on the current stream."""
+        if self._unshard_event is not None:
+            self.context.current_stream().wait_event(self._unshard_event)
 
     def _prefetch_parameter_groups(
         self,
@@ -599,6 +606,7 @@ class FsdpModule:
             context.reduce_scatter_stream.wait_stream(current_stream)
 
         self.unshard(prefetch="backward", orientation=COLWISE)
+        self.wait_unshard()
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
