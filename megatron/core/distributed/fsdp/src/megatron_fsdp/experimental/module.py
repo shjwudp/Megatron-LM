@@ -397,6 +397,17 @@ class FsdpModule:
         performs that root sync in ``pre_forward()`` immediately before this.
         """
         with self._nvtx_range("unshard"):
+            # Forward-only / eval passes run under torch.no_grad(). A fine-grained
+            # scheduler unshards this module via a forward pre-hook, but pure
+            # forward passes never reach the post-backward reduce that would
+            # normally reshard and refresh the gradient state. Leftover sharded
+            # grads from a prior training step would then persist into the next
+            # training backward and trip the `_has_sharded_grads` "all set or all
+            # None" check. Clear them on any forward that does not track grads.
+            if not torch.is_grad_enabled():
+                for _group in self._parameter_groups:
+                    for _param in _group.fsdp_parameters:
+                        _param.sharded.grad = None
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
