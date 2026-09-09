@@ -9,6 +9,7 @@ import torch
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     any_sharding_strategy_in,
     find_megatron_fsdp,
+    find_megatron_fsdp_v2,
 )
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
@@ -76,6 +77,13 @@ def combined_1f1b_schedule_for_no_pipelining(
         # We must do this explicitly before the schedule accesses layers directly.
         fsdp_wrapper._replace_param_with_raw_if_needed()
 
+    fsdp_v2_module = find_megatron_fsdp_v2(model)
+    if fsdp_v2_module is not None:
+        context = fsdp_v2_module.context
+
+    if fsdp_v2_module is not None and context.scheduler is not None:
+        context.scheduler.begin_iteration()
+
     # The forward step for the first microbatch is executed alone, no a2a overlapping
     output_tensor, num_tokens, _ = combined_forward_backward_step(
         forward_step_func,
@@ -135,6 +143,10 @@ def combined_1f1b_schedule_for_no_pipelining(
         config,
         fsdp_wrapper=fsdp_wrapper,
     )
+
+    if fsdp_v2_module is not None and context.scheduler is not None:
+        context.scheduler.end_iteration()
+
     return forward_data_store, total_num_tokens
 
 
@@ -216,6 +228,13 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
                 "Use pipeline_model_parallel_size=1 or disable FSDP."
             )
 
+    fsdp_v2_module = find_megatron_fsdp_v2(model)
+    if fsdp_v2_module is not None:
+        context = fsdp_v2_module.context
+
+    if fsdp_v2_module is not None and context.scheduler is not None:
+        context.scheduler.begin_iteration()
+
     # forward prepare
     f_model_chunk_id = None
     f_microbatch_id = None
@@ -278,6 +297,10 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
         # model_chunk_id = num_chunks - id - 1), causing false failures in interleaved PP.
         if b_input_tensor is not None:
             assert input_tensor_grad is not None
+
+    if fsdp_v2_module is not None and context.scheduler is not None:
+        context.scheduler.end_iteration()
+
     return output_tensor, input_tensor_grad
 
 
