@@ -8,6 +8,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp_v2
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -1087,6 +1088,19 @@ def forward_backward_pipelining_with_interleaving(
         adjust_tensor_shapes_fn is None
     ), "adjust_tensor_shapes_fn is not supported for interleaved pipeline parallelism"
 
+    # Trace-and-replay owns one plan per global-batch step, and this function IS one step:
+    # the combined-1F1B helper it drives is invoked once per (forward, backward) microbatch
+    # phase, so a plan compiled from a single phase would diverge from the next one. The
+    # iteration boundary therefore lives here. Forward-only runs (evaluation) are skipped so
+    # an eval op stream never becomes the plan that training then replays.
+    scheduler = None
+    if not forward_only:
+        fsdp_v2_module = find_megatron_fsdp_v2(model)
+        if fsdp_v2_module is not None:
+            scheduler = fsdp_v2_module.context.scheduler
+    if scheduler is not None:
+        scheduler.begin_iteration()
+
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
 
@@ -2115,6 +2129,9 @@ def forward_backward_pipelining_with_interleaving(
     if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
+
+    if scheduler is not None:
+        scheduler.end_iteration()
 
     return forward_data_store
 

@@ -228,12 +228,11 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
                 "Use pipeline_model_parallel_size=1 or disable FSDP."
             )
 
-    fsdp_v2_module = find_megatron_fsdp_v2(model)
-    if fsdp_v2_module is not None:
-        context = fsdp_v2_module.context
-
-    if fsdp_v2_module is not None and context.scheduler is not None:
-        context.scheduler.begin_iteration()
+    # The trace-and-replay iteration boundary is NOT taken here: this helper runs once per
+    # (forward, backward) microbatch phase, while a plan spans one whole global-batch step.
+    # forward_backward_pipelining_with_interleaving() drives begin_iteration()/end_iteration()
+    # around the whole step instead; a plan compiled from a single phase would diverge from
+    # the next phase (measured on 16xGB300: 72 compiles / 56 replay divergences per step).
 
     # forward prepare
     f_model_chunk_id = None
@@ -297,9 +296,6 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
         # model_chunk_id = num_chunks - id - 1), causing false failures in interleaved PP.
         if b_input_tensor is not None:
             assert input_tensor_grad is not None
-
-    if fsdp_v2_module is not None and context.scheduler is not None:
-        context.scheduler.end_iteration()
 
     return output_tensor, input_tensor_grad
 
