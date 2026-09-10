@@ -2363,8 +2363,18 @@ def wrap_model_chunks_with_ddp(
         and ddp_config.megatron_fsdp_version == 2
         and n > 1
     )
+    # Enable trace-and-replay on the ambient context when the combined-1F1B EP-overlap
+    # schedule is active: the per-chunk adapter requests
+    # ``use_trace_replay=config.overlap_moe_expert_parallel_comm``, but a
+    # ``reuse_existing`` join yields THIS context as-is, so this context's flags are the
+    # ones that take effect. Without this the scheduler would be silently disabled for
+    # every VPP + overlap run.
     shared_context = (
-        fully_shard_context(reuse_existing=True, use_symmetric_memory=ddp_config.nccl_ub)
+        fully_shard_context(
+            reuse_existing=True,
+            use_symmetric_memory=ddp_config.nccl_ub,
+            use_trace_replay=config.overlap_moe_expert_parallel_comm,
+        )
         if share_fsdp_context
         else nullcontext()
     )
