@@ -28,7 +28,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .module import FsdpContext, FsdpModule
-from .schedule import SchedulePolicy
+from .schedule import SchedulePolicy, TraceAndReplayScheduler
 
 _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
 
@@ -68,6 +68,7 @@ def fully_shard_context(
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
     reuse_existing: bool = False,
+    use_trace_replay: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -87,7 +88,16 @@ def fully_shard_context(
             the shared context (the outermost scope) calls :meth:`FsdpContext.finalize`;
             reused scopes exit without finalizing. A context cannot be shared across
             devices, so requesting reuse while a context is active on a different
-            ``device`` raises ``ValueError``.
+            ``device`` raises ``ValueError``. ``use_trace_replay`` is still honored when
+            reusing: a reused scope that requests a scheduler the shared context does not
+            have yet attaches it (see :func:`_ensure_trace_replay_scheduler`).
+        use_trace_replay: Enable the per-context :class:`TraceAndReplayScheduler`
+            for occurrence-based (combined-1F1B) schedules. When enabled, fine-grained
+            FSDP units must be built with ``register_hooks=False`` so the scheduler
+            drives execution exclusively. Unlike ``use_symmetric_memory``, this is not
+            fixed at context creation: the scheduler is attached on demand, so a scope
+            that reuses a context created by a caller that did not know about
+            trace-and-replay still gets one.
     """
     existing = _FSDP_CONTEXT.get()
     if existing is not None:
@@ -102,6 +112,12 @@ def fully_shard_context(
                 )
             # Join the outermost scope's context. Only the scope that created the
             # context finalizes it; reused scopes leave finalization to the creator.
+            # A scheduler requested here must still be attached: the scope that created
+            # the shared context (e.g. the ambient VPP scope opened by
+            # megatron/training) may not know whether an occurrence-based schedule will
+            # drive it, and silently dropping the request would leave the combined-1F1B
+            # hooks without a scheduler.
+            _ensure_trace_replay_scheduler(existing, use_trace_replay)
             yield existing
             return
         raise RuntimeError("fully_shard_context does not support nesting.")
@@ -115,6 +131,7 @@ def fully_shard_context(
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
     )
+    _ensure_trace_replay_scheduler(context, use_trace_replay)
     token = _FSDP_CONTEXT.set(context)
     try:
         yield context
@@ -124,6 +141,23 @@ def fully_shard_context(
         context.finalize()
     finally:
         _FSDP_CONTEXT.reset(token)
+
+
+def _ensure_trace_replay_scheduler(context: FsdpContext, use_trace_replay: bool) -> None:
+    """Attach ``context``'s trace-and-replay scheduler if it does not have one yet.
+
+    Scheduler construction is idempotent: a context owns at most one
+    :class:`TraceAndReplayScheduler`, so a repeated request (several VPP model chunks
+    each entering their own ``reuse_existing`` scope) leaves the existing scheduler
+    alone instead of replacing it, which would discard its traced plan.
+
+    Args:
+        context: Context that should own the scheduler.
+        use_trace_replay: Whether the calling scope requested trace-and-replay.
+    """
+    if not use_trace_replay or context.scheduler is not None:
+        return
+    context.scheduler = TraceAndReplayScheduler(context)
 
 
 def fully_shard(

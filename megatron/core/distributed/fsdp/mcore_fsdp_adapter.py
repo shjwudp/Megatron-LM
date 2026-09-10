@@ -659,7 +659,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
         with fully_shard_context(
-            device=device, use_symmetric_memory=ddp_config.nccl_ub, reuse_existing=True
+            device=device,
+            use_symmetric_memory=ddp_config.nccl_ub,
+            reuse_existing=True,
+            use_trace_replay=config.overlap_moe_expert_parallel_comm,
         ):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
