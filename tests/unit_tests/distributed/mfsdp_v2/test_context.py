@@ -250,3 +250,53 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
             fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     assert model.inner.context is first_context
+
+
+def test_fully_shard_context_reuse_attaches_requested_trace_replay(distributed_setup):
+    """A reuse scope requesting trace-and-replay upgrades the shared context.
+
+    The ambient scope that megatron/training opens around multiple VPP model chunks
+    does not know whether an occurrence-based (combined-1F1B) schedule will drive the
+    context, so it cannot request the scheduler itself. The per-chunk adapter then
+    joins that context with ``reuse_existing=True, use_trace_replay=True``; the
+    request must be honored instead of silently dropped, which is what previously left
+    the combined-1F1B hooks without a scheduler.
+    """
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.schedule import (
+        TraceAndReplayScheduler,
+    )
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(2)]).to(device)
+
+    with fully_shard_context(device=device) as context:
+        assert context.scheduler is None
+
+        # First chunk joins and asks for trace-and-replay.
+        with fully_shard_context(
+            device=device, reuse_existing=True, use_trace_replay=True
+        ) as reused:
+            assert reused is context
+            assert isinstance(context.scheduler, TraceAndReplayScheduler)
+
+        # Scheduler attachment is idempotent: later chunks joining the same context
+        # keep the scheduler (and its traced plan) instead of replacing it.
+        scheduler = context.scheduler
+        with fully_shard_context(
+            device=device, reuse_existing=True, use_trace_replay=True
+        ) as reused:
+            assert reused is context
+            assert context.scheduler is scheduler
+
+        # A reuse scope that does not request trace-and-replay leaves it in place.
+        with fully_shard_context(device=device, reuse_existing=True) as reused:
+            assert reused is context
+            assert context.scheduler is scheduler
+
+        fully_shard(model[0], mesh=mesh, placements=_flat_placements())
+        fully_shard(model[1], mesh=mesh, placements=_flat_placements())
+
+    assert model[0].context is context
+    assert model[1].context is context
+    assert context.scheduler is scheduler
