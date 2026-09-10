@@ -162,17 +162,25 @@ def find_megatron_fsdp(model):
 
 
 def find_megatron_fsdp_v2(model):
-    """Walk the model wrapper chain to find a MegatronFSDP v2 instance, if any."""
+    """Walk the model wrapper chain to find a MegatronFSDP v2 instance, if any.
+
+    ``model`` may also be a sequence of pipeline-model chunks, which is how the
+    interleaved (virtual pipeline) schedule passes it. Every chunk of a
+    multi-chunk model is wrapped inside one shared ``fully_shard_context``, so the
+    first FSDP unit found is representative and its ``context`` is the context all
+    chunks belong to.
+    """
     try:
         from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
     except (ImportError, ModuleNotFoundError):
         return None
 
-    m = model
-    while m is not None:
-        if isinstance(m, FsdpModule):
-            return m
-        m = getattr(m, 'module', None)
+    for candidate in model if isinstance(model, (list, tuple)) else (model,):
+        m = candidate
+        while m is not None:
+            if isinstance(m, FsdpModule):
+                return m
+            m = getattr(m, 'module', None)
     return None
 
 
