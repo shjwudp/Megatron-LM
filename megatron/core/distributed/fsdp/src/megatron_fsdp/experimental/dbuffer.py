@@ -261,10 +261,15 @@ class DBuffer:
                 self.mesh,
                 placements,
                 self.layout.tensor_shapes,
+                allocation_stream=self.allocation_stream,
             )
         if isinstance(source_placement, Partial) and isinstance(destination_placement, Replicate):
             return DBuffer.from_local(
-                self.local_buffer, self.mesh, placements, self.layout.tensor_shapes
+                self.local_buffer,
+                self.mesh,
+                placements,
+                self.layout.tensor_shapes,
+                allocation_stream=self.allocation_stream,
             )
         raise ValueError(
             "DBuffer.view() supports identical placements, a Partial-to-Replicate relabel, "
