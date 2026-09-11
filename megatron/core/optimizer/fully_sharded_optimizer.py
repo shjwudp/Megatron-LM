@@ -12,7 +12,7 @@ from ..dist_checkpointing.mapping import ShardedStateDict
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     sync_model_weights_from_main_weights,
 )
-from ..transformer.module import MegatronModule
+from ..transformer.module import MegatronModule, param_is_not_shared
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
@@ -38,6 +38,36 @@ def count_replication(tensor: DTensor) -> int:
                 "the reduction must be finalized first."
             )
     return replication
+
+
+def _filter_params_for_norm(params: List[torch.nn.Parameter]) -> List[torch.nn.Parameter]:
+    """Drop the duplicate copy of a tied parameter from a global gradient statistic.
+
+    With PP > 1 a tied embedding/output weight is split across ranks as two *distinct*
+    parameter objects: the first pipeline stage owns the embedding, and the last stage
+    owns the duplicate output weight that ``LanguageModule`` marks with
+    ``shared = True``. Both hold the same weight and the same gradient, so a statistic
+    that sums every parameter of every rank over the grad-stats group counts the same
+    logical gradient twice: the reported norm comes out ``sqrt(2)`` too large -- a
+    four-rank reproduction returned 7.071 instead of 5 -- and gradients are clipped too
+    hard. ``num-zeros`` is inflated the same way. Keeping only the unmarked copy makes
+    each logical gradient count once.
+
+    Mesh-replicated axes need no help here. When several ranks hold an identical copy
+    *of the same parameter*, as with tensor-parallel or generalized-TP replicas, the
+    copies share one DTensor gradient and ``count_replication`` already divides each
+    rank's contribution by the number of ranks holding that shard, so the callers
+    correct for them. The shared-parameter case is different in kind: it is a separate
+    parameter on a separate pipeline stage, invisible to the mesh layout, which is why
+    it is the only thing filtered out here.
+
+    The callers still skip ``parameter.grad is None`` themselves. Which attribute holds
+    the gradient depends on the optimizer (``decoupled_grad`` for precision-aware runs),
+    and MFSDP v2 needs the gradient DTensor itself to read the replicated mesh axes
+    ``count_replication`` divides by, so this filter deliberately never looks at the
+    gradient.
+    """
+    return [param for param in params if param_is_not_shared(param)]
 
 
 class FullyShardedOptimizer(MixedPrecisionOptimizer):
@@ -155,11 +185,18 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         replaces each DTensor with ``grad._local_tensor`` before it runs, so
         ``get_data_parallel_group_if_dtensor`` always sees plain tensors, returns None,
         and the layout is gone by the time the norm is taken.
+
+        Parameters are filtered with ``_filter_params_for_norm`` first, which drops the
+        duplicate copy of a tied parameter -- the shared embedding/output weight that PP
+        splits across the first and the last pipeline stage -- so that one logical
+        gradient is counted once. Mesh-replicated axes, tensor-parallel and generalized-TP
+        replicas included, need no such filter: those copies share one parameter and one
+        gradient, and ``count_replication`` below already divides them out.
         """
         total_norm_squared = torch.zeros(
             (), dtype=torch.float32, device=torch.cuda.current_device()
         )
-        for parameter in self.get_parameters():
+        for parameter in _filter_params_for_norm(self.get_parameters()):
             # MFSDP v2 reduces into parameter.grad; it never populates decoupled_grad,
             # which is a v1 param-and-grad-buffer concept.
             grad = parameter.grad
@@ -186,9 +223,13 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         DTensor-derived data-parallel group. Counting here keeps MFSDP v2 off that path,
         and matches how ``get_grad_norm`` reduces: each rank contributes its own shard,
         divided by the size of any replicated mesh axis, summed over the grad-stats group.
+
+        Like ``get_grad_norm``, the shared-parameter duplicate is dropped by
+        ``_filter_params_for_norm`` so each element is counted once, while
+        mesh-replicated axes are already divided out by ``count_replication``.
         """
         total_zeros = torch.zeros((), dtype=torch.float32, device=torch.cuda.current_device())
-        for parameter in self.get_parameters():
+        for parameter in _filter_params_for_norm(self.get_parameters()):
             grad = parameter.grad
             if grad is None:
                 continue
