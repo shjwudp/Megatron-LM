@@ -161,6 +161,21 @@ def find_megatron_fsdp(model):
     return None
 
 
+def find_megatron_fsdp_v2(model):
+    """Walk the model wrapper chain to find a MegatronFSDP v2 instance, if any."""
+    try:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+    except (ImportError, ModuleNotFoundError):
+        return None
+
+    m = model
+    while m is not None:
+        if isinstance(m, FsdpModule):
+            return m
+        m = getattr(m, 'module', None)
+    return None
+
+
 def get_mesh_names(
     device_mesh: Optional[DeviceMesh] = None, only_submesh_dims: bool = False
 ) -> list[str]:

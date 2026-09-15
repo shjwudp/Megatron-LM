@@ -3,34 +3,52 @@
 from torch import nn
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.schedule import (
+    TraceAndReplayScheduler,
+)
+
+
+def _scheduler(module: FsdpModule) -> TraceAndReplayScheduler:
+    """Return the context's trace-and-replay scheduler for ``module``."""
+    scheduler = module.context.scheduler
+    assert isinstance(
+        scheduler, TraceAndReplayScheduler
+    ), "Expected a TraceAndReplayScheduler on the FSDP context."
+    return scheduler
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
     """Create a forward pre-hook that unshards the owning FSDP module before the submodule forward."""
+
     def hook(submodule, _args, _kwargs):
-        if owner.is_root():
-            context = owner.context
-            context.allgather_stream.wait_stream(context.current_stream())
-        owner.unshard()
+        scheduler = _scheduler(owner)
+        scheduler.issue_unshard(owner)
+        scheduler.wait_unshard(owner)
+
     return hook
 
 
 def _make_unshard_backward_hook(owner: FsdpModule):
     """Create a backward pre-hook that unshards the owning FSDP module before the submodule backward."""
+
     def hook(submodule, _grad_output):
-        owner.unshard()
+        scheduler = _scheduler(owner)
+        scheduler.issue_unshard(owner)
+        scheduler.wait_unshard(owner)
+
     return hook
 
 
 def _module_post_backward_hook(module: FsdpModule) -> None:
-    module.reshard()
-    module._reduce_gradient_groups()
+    scheduler = _scheduler(module)
+    scheduler.reshard(module)
+    scheduler.issue_reduce_gradients(module)
 
 
 def reshard_fsdp_module(module: FsdpModule) -> None:
     """Reshard the FSDP module after fine-grained computation."""
     assert isinstance(module, FsdpModule), "Expected an FsdpModule."
-    module.reshard()
+    _scheduler(module).reshard(module)
 
 
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:
