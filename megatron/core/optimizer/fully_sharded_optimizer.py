@@ -472,7 +472,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             if torch.distributed.is_available() and torch.distributed.is_initialized()
             else 0
         )
-        logger.info(
+        logger.warning(
             "MFSDP grad-placement check passed rank=%s optimizer=%s checked=%s "
             "skipped_no_grad=%s distinct(grad,main_weight)_placements=%s",
             rank,
