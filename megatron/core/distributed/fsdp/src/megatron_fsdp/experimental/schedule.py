@@ -26,6 +26,13 @@ the same calls in the same order (same op numbers), but the plan can change what
 an op does — e.g. append an all-gather prefetch at a ``wait_unshard`` op, or skip
 a reshard that is immediately undone by a same-module re-unshard.
 
+Unshards are *orientation-aware*. An MXFP8 primary weight rests as two separate
+payload buffers — row-wise (forward GEMM) and column-wise (backward GEMM) — so
+the plan records which one each unshard needs, widens a materialization that has
+to serve both a forward and a backward pass, and refuses to skip a reshard that
+the next unshard needs in order to change orientation. Regular parameter groups
+store one full parameter and ignore the request entirely.
+
 The scheduler owns execution: it drives the real FSDP lifecycle on each module
 (built with ``register_hooks=False`` when the combined scheduler is active), so
 it replicates the root stream-sync that ``pre_forward`` otherwise performs.
@@ -37,6 +44,8 @@ import logging
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Literal
+
+from .quantization import BOTH, PayloadOrientation, merge_orientations, orientation_directions
 
 if TYPE_CHECKING:
     from .module import FsdpModule
@@ -117,7 +126,12 @@ class PlanOp:
     ``PlanOp``\ s instead of the raw events:
 
     - ``skip``: drop the op's real work (e.g. a reshard immediately undone by a
-      same-module re-unshard; the all-gather storage stays resident).
+      same-module re-unshard that needs no payload the reshard released; the
+      all-gather storage stays resident).
+    - ``orientation``: for an ``ISSUE_UNSHARD``, the payload the materialization
+      must carry. It is the union of what every unshard sharing that
+      materialization needs, so it can be wider than the traced event's
+      orientation but never narrower.
     - ``prefetch_after``: after handling this op, issue an all-gather for the
       given ``(module, orientation)`` so its unshard overlaps the current module's
       compute.
@@ -125,6 +139,7 @@ class PlanOp:
 
     trigger_event: TraceEvent
     skip: bool = False
+    orientation: str | None = None
     prefetch_after: tuple[FsdpModule, str | None] | None = None
 
 
@@ -231,22 +246,31 @@ class TraceAndReplayScheduler:
     # Entry points driven by the combined-1F1B hooks (executor)
     # ------------------------------------------------------------------
 
-    def issue_unshard(self, module: FsdpModule, orientation: str) -> None:
+    def issue_unshard(self, module: FsdpModule, orientation: PayloadOrientation) -> None:
         """Materialize ``module``'s parameters and record/validate the op.
 
-        ``orientation`` is the payload the caller is about to compute with --
-        ``"rowwise"`` from a forward hook, ``"colwise"`` from a backward hook --
-        so the all-gather materializes the layout that pass consumes. It is also
-        recorded on the trace event. A module whose forward and backward unshards
-        share one residency window widens the request in place.
+        ``orientation`` is the payload the caller is about to compute with:
+        ``"rowwise"`` from a forward hook, ``"colwise"`` from a backward hook. It
+        is recorded on the trace event, which :meth:`_build_plan` then uses both to
+        widen a materialization that has to serve more than one unshard and to
+        decide whether the reshard separating two of a module's materializations
+        can be skipped. While tracing, the op executes with ``"both"`` instead:
+        the trace has to be correct whatever the plan later decides, and a module
+        whose forward and backward unshards share one residency window needs
+        column-wise data in backward.
 
         For a root, syncs the all-gather stream with the current stream first,
         as an external scheduler must (``module.unshard()`` requires it for a
         root). The materialization is idempotent: if a preceding prefetch (or a
         skipped reshard) already left the storage resident, this is a no-op.
         """
-        self._record(OpKind.ISSUE_UNSHARD, module, orientation)
-        module.unshard(orientation=orientation)
+        plan_op = self._record(OpKind.ISSUE_UNSHARD, module, orientation)
+        if plan_op is not None and plan_op.orientation is not None:
+            module.unshard(plan_op.orientation)
+        else:
+            # Tracing, or a replay that diverged mid-op: materialize the safe
+            # superset so the op stream being recorded stays correct.
+            module.unshard(BOTH)
 
     def wait_unshard(self, module: FsdpModule) -> None:
         """Make compute wait on ``module``'s all-gather, then issue its prefetch.
@@ -330,11 +354,12 @@ class TraceAndReplayScheduler:
     def _prefetch(self, module: FsdpModule, orientation: str | None) -> None:
         """Issue ``module``'s all-gather without consuming an op number.
 
-        ``orientation`` is accepted for the plan builder's ``prefetch_after`` but
-        is not yet acted on: the hooks do not currently carry a payload
-        orientation, so a module is always materialized in its recorded layout.
+        ``orientation`` comes from the plan and is the payload that ``module``'s
+        own materialization will need, so the later unshard finds its payload
+        already resident instead of re-gathering the other orientation. ``None``
+        (no plan available) falls back to the safe superset.
         """
-        module.unshard()
+        module.unshard(orientation or BOTH)
 
     def _retrace(self, kind: OpKind, module: FsdpModule, orientation: str | None) -> None:
         """Reset to tracing and seed the new trace with the current op."""
@@ -348,33 +373,72 @@ class TraceAndReplayScheduler:
     def _build_plan(self) -> None:
         """Compile ``_events`` into an optimized ``_plan``.
 
-        Two transformations are applied to the raw trace:
+        Three transformations are applied to the raw trace:
 
-        1. **Skip redundant reshard.** A ``RESHARD(M)`` immediately followed by an
-           ``ISSUE_UNSHARD(M)`` is pure waste — the storage is released then
-           immediately re-materialized. Mark the reshard ``skip`` so its storage
-           stays resident and the re-unshard becomes a no-op. (Same-module
-           adjacency is the current heuristic; orientation-aware refinement is
-           deferred.)
-        2. **Append prefetch.** At each ``WAIT_UNSHARD`` op, prefetch the next
-           module that will be unsharded (skipping reshard events), so its
+        1. **Widen a materialization that serves several unshards.** Each module's
+           unshards are grouped into *residency windows* delimited by its own
+           reshard events: within one window the storage is materialized once, so
+           the window's first unshard has to gather the union of the orientations
+           its members need. A window holding both a forward (row-wise) and a
+           backward (column-wise) unshard — a module whose two passes are not
+           separated by a reshard — therefore materializes ``"both"``. This is what
+           makes transformation 2 safe.
+        2. **Skip a redundant reshard, orientation-aware.** A ``RESHARD(M)`` is
+           pure waste when the storage it releases is re-materialized immediately
+           with an orientation it already carries: mark it ``skip`` so the storage
+           stays resident and the next unshard becomes a no-op. When that unshard
+           needs the *other* orientation — the normal forward(row-wise) followed by
+           backward(column-wise) transition of one FSDP unit — the reshard must
+           execute, or the backward pass would run with column-wise data missing.
+        3. **Append prefetch.** At each ``WAIT_UNSHARD`` op, prefetch the next
+           module that will be unsharded (skipping reshard events) in the
+           orientation that module's own materialization will use, so its
            all-gather overlaps the current module's compute.
         """
         events = self._events
         plan = [PlanOp(trigger_event=e) for e in events]
         n = len(plan)
 
-        # 1) Skip a reshard immediately undone by a same-module re-unshard.
-        for i in range(n - 1):
-            cur, nxt = events[i], events[i + 1]
-            if (
-                cur.kind is OpKind.RESHARD
-                and nxt.kind is OpKind.ISSUE_UNSHARD
-                and nxt.module is cur.module
-            ):
-                plan[i].skip = True
+        # 1) Group each module's own ops into (opening reshard, unshards) residency
+        #    windows. A module's ops are independent of every other module's, so the
+        #    per-module walk below is a complete description of its residency.
+        per_module_ops: dict[int, list[tuple[int, OpKind]]] = {}
+        for index, event in enumerate(events):
+            per_module_ops.setdefault(id(event.module), []).append((index, event.kind))
 
-        # 2) Prefetch the next unshard (skipping reshard events) after each wait.
+        for ops in per_module_ops.values():
+            windows: list[tuple[int | None, list[int]]] = []
+            opening: int | None = None
+            unshards: list[int] = []
+            for index, kind in ops:
+                if kind is OpKind.RESHARD:
+                    windows.append((opening, unshards))
+                    opening, unshards = index, []
+                elif kind is OpKind.ISSUE_UNSHARD:
+                    unshards.append(index)
+            windows.append((opening, unshards))
+
+            resident: frozenset[str] = frozenset()
+            for window_opening, window_unshards in windows:
+                need = frozenset().union(
+                    *(orientation_directions(events[i].orientation) for i in window_unshards)
+                )
+                if window_opening is not None:
+                    if window_unshards and need <= resident:
+                        # The storage still carries everything the window needs.
+                        plan[window_opening].skip = True
+                    else:
+                        # The reshard runs and releases every orientation.
+                        resident = frozenset()
+                if window_unshards:
+                    # 1) This single materialization must cover the whole window.
+                    materialized = merge_orientations(need)
+                    for index in window_unshards:
+                        plan[index].orientation = materialized
+                    resident = need
+
+        # 3) Prefetch the next unshard (skipping reshard events) after each wait,
+        #    in the orientation that unshard's own materialization will use.
         for i in range(n):
             if events[i].kind is not OpKind.WAIT_UNSHARD:
                 continue
@@ -383,7 +447,7 @@ class TraceAndReplayScheduler:
                     events[j].kind is OpKind.ISSUE_UNSHARD
                     and events[j].module is not events[i].module
                 ):
-                    plan[i].prefetch_after = (events[j].module, events[j].orientation)
+                    plan[i].prefetch_after = (events[j].module, plan[j].orientation)
                     break
 
         self._plan = plan
