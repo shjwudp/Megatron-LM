@@ -32,6 +32,7 @@ from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import Fp8ParameterGroup, FsdpParameterGroup, get_containing_parameter_group
 from .placement import Flat
+from .quantization import BOTH, PayloadOrientation
 from .schedule import SchedulePolicy, TraceAndReplayScheduler
 
 
@@ -41,7 +42,12 @@ def _is_in_backward() -> bool:
 
 
 def _is_fp8_parameter(parameter: nn.Parameter) -> bool:
-    """Whether ``parameter`` is an MXFP8 primary weight (needs both orientations)."""
+    """Whether ``parameter`` is a TE MXFP8 primary weight with two payloads.
+
+    Such a parameter rests as separate row-wise (forward GEMM) and column-wise
+    (backward GEMM) payload buffers, so which of them an unshard must gather
+    depends on the pass.
+    """
     return is_float8tensor(parameter) and fp8_need_transpose_data(parameter)
 
 
@@ -426,7 +432,11 @@ class FsdpModule:
         self.unshard(prefetch="forward" if not is_recomputing else "none")
         self.wait_unshard()
 
-    def unshard(self, prefetch: Literal["forward", "backward", "none"] = "none") -> None:
+    def unshard(
+        self,
+        prefetch: Literal["forward", "backward", "none"] = "none",
+        orientation: PayloadOrientation = BOTH,
+    ) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
 
         External schedulers invoking this directly (rather than through the
@@ -435,9 +445,23 @@ class FsdpModule:
         ``context.allgather_stream.wait_stream(context.current_stream())``
         before this when ``self.is_root()``; the automatic forward path
         performs that root sync in ``pre_forward()`` immediately before this.
+
+        Args:
+            prefetch: Static order to prefetch successors from, if any.
+            orientation: Payload orientation to materialize for MXFP8 primary
+                weights -- ``"rowwise"`` on a forward pass, ``"colwise"`` on a
+                backward pass, ``"both"`` when a single materialization has to
+                serve both. Ignored by regular parameter groups. The
+                trace-and-replay scheduler is the only caller that narrows this:
+                it knows from its compiled plan whether a reshard separates a
+                module's forward and backward unshards. The automatic
+                ``pre_forward`` / ``pre_backward`` hooks and
+                ``_prefetch_parameter_groups`` keep the ``"both"`` default,
+                because they cannot see the plan and a module whose two passes
+                share one residency window needs both payloads.
         """
         with self._nvtx_range("unshard"):
-            self._unshard_parameter_groups()
+            self._unshard_parameter_groups(orientation)
 
             context = self.context
             if prefetch == "forward":
@@ -470,7 +494,7 @@ class FsdpModule:
             prefetched_size += next_module.num_parameter_elements
             next_module = order.next_item(next_module)
 
-    def _unshard_parameter_groups(self, orientation: str = "rowwise") -> None:
+    def _unshard_parameter_groups(self, orientation: PayloadOrientation = BOTH) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
 
         If ``_unshard_event`` is already set, this FsdpModule was already
@@ -479,9 +503,10 @@ class FsdpModule:
         can wait without depending on later release work.
 
         Args:
-            orientation: Payload orientation to gather for MXFP8 groups —
-                ``"rowwise"`` on the forward pass, ``"colwise"`` on the
-                backward pass. Ignored by regular groups.
+            orientation: Payload orientation to gather for MXFP8 groups --
+                ``"rowwise"`` on a forward pass, ``"colwise"`` on a backward
+                pass, ``"both"`` when one materialization has to serve both.
+                Ignored by regular groups.
         """
         if self._unshard_event is not None:
             return

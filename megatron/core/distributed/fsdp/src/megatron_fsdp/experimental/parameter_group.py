@@ -37,9 +37,12 @@ from .module_utils import (
 )
 from .placement import BlockAtomic, changed_mesh_axis, sharded_reduce_group
 from .quantization import (
+    COLWISE,
     E4M3_BLOCK_SIZE,
+    ROWWISE,
     allocate_quantize_temp,
     clear_payloads,
+    orientation_directions,
     set_columnwise_payload,
     set_rowwise_payload,
     te_cast_master_weights_to_fp8,
@@ -427,8 +430,9 @@ class FsdpParameterGroup:
 
         Args:
             orientation: Which payload orientation to gather for MXFP8 groups
-                (``"rowwise"`` on forward, ``"colwise"`` on backward). Ignored
-                by regular groups.
+                (``"rowwise"`` on forward, ``"colwise"`` on backward, ``"both"``
+                when one materialization serves both). Regular groups store their
+                full parameter in one buffer and ignore this value.
         """
         del orientation
         assert self.model_weight is not None
@@ -601,9 +605,10 @@ class Fp8ParameterGroup(FsdpParameterGroup):
     Quantization is done by TE's verified ``cast_master_weights_to_fp8`` into
     full-size temporary tensors whose shard slices are copied back into the
     optimizer-layout views; the tensors' scale-inverse grids are filled in place
-    by TE and never gathered. Unshard gathers only the orientation needed by the
-    pass (row-wise on forward, column-wise on backward) and rebinds the module's
-    own MXFP8Tensor payloads from the gathered buffers; reshard detaches them.
+    by TE and never gathered. Unshard gathers the orientation the pass needs
+    (row-wise on forward, column-wise on backward, or both when one
+    materialization has to serve both) and rebinds the module's own MXFP8Tensor
+    payloads from the gathered buffers; reshard detaches them.
     """
 
     # Payload storage in the parameter layout, and its optimizer-layout views.
@@ -618,6 +623,15 @@ class Fp8ParameterGroup(FsdpParameterGroup):
     _colwise_is_stale: bool
     _unsharded_rowwise: DBuffer
     _unsharded_colwise: DBuffer
+    # The scale-inverse grids are filled in place by TE at quantization time and
+    # are never gathered, so they have to outlive a single unshard. TE's
+    # ``MXFP8Tensor.update_usage`` *drops* the grid of every direction it
+    # disables, and a per-phase unshard disables one direction each pass
+    # (forward keeps only row-wise, backward only column-wise). This group
+    # therefore snapshots the grids once and re-attaches whatever TE dropped
+    # before the next quantization or unshard reads them.
+    _rowwise_scale_invs: tuple[torch.Tensor, ...] | None
+    _colwise_scale_invs: tuple[torch.Tensor, ...] | None
 
     def __init__(
         self,
@@ -639,6 +653,8 @@ class Fp8ParameterGroup(FsdpParameterGroup):
                 "MFSDP v2 fp8 model weights require Transformer Engine with "
                 "cast_master_weights_to_fp8 support."
             )
+        self._rowwise_scale_invs = None
+        self._colwise_scale_invs = None
         super().__init__(
             owning_module=owning_module,
             fqn_to_parameter=fqn_to_parameter,
@@ -784,6 +800,49 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         """
         return sharded_reduce_group(self.mesh, self.main_weight.placements)
 
+    def _cache_scale_inverses(self) -> None:
+        """Snapshot the per-tensor scale-inverse grids before TE can drop them.
+
+        TE's ``MXFP8Tensor.update_usage`` sets a disabled direction's grid to
+        ``None``; the grids are filled in place by quantization and are never
+        gathered, so the group has to hold its own reference to survive a pass
+        that only needs one orientation. Cached once, as soon as the tensors are
+        quantized; a later call is a no-op.
+        """
+        if self._rowwise_scale_invs is not None:
+            return
+        rowwise = tuple(
+            parameter.unsharded._rowwise_scale_inv for parameter in self.fsdp_parameters
+        )
+        colwise = tuple(
+            parameter.unsharded._columnwise_scale_inv for parameter in self.fsdp_parameters
+        )
+        if any(tensor is None for tensor in rowwise + colwise):
+            # Not quantized yet; a later call will cache them.
+            return
+        self._rowwise_scale_invs = rowwise
+        self._colwise_scale_invs = colwise
+
+    def _restore_scale_inverses(self) -> None:
+        """Re-attach the scale-inverse grids TE dropped via ``update_usage``.
+
+        Called before every quantization and every unshard, because both read
+        the grids (TE's quantize workspaces alias them, and
+        ``update_usage(rowwise_usage=True)`` raises when the row-wise grid is
+        missing).
+        """
+        self._cache_scale_inverses()
+        if self._rowwise_scale_invs is None or self._colwise_scale_invs is None:
+            return
+        for parameter, rowwise, colwise in zip(
+            self.fsdp_parameters, self._rowwise_scale_invs, self._colwise_scale_invs
+        ):
+            tensor = parameter.unsharded
+            if tensor._rowwise_scale_inv is None:
+                tensor._rowwise_scale_inv = rowwise
+            if tensor._columnwise_scale_inv is None:
+                tensor._columnwise_scale_inv = colwise
+
     def _quantize_model_weight_from_main_weight(self) -> None:
         """Quantize via TE's ``cast_master_weights_to_fp8``.
 
@@ -792,6 +851,9 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         the shard's flat offset); the shard slices are then copied into the
         optimizer-layout payload views and the temporaries are released.
         """
+        # The workspaces alias the tensors' scale-inverse grids, which a
+        # per-phase unshard may have had TE drop, so restore them first.
+        self._restore_scale_inverses()
         main = self.main_weight.local_buffer
         cast_master_weights_to_fp8 = te_cast_master_weights_to_fp8()
         assert cast_master_weights_to_fp8 is not None
@@ -895,41 +957,70 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             )
             self._colwise_is_stale = False
 
-    def unshard_parameters(self, orientation: str = "rowwise") -> None:
-        """Gather both payload orientations and bind them on the fp8 tensors.
+    def _gather_payload(self, source: DBuffer, target: DBuffer) -> None:
+        """All-gather one orientation's parameter-layout storage into ``target``.
 
-        ``orientation`` is accepted for schedule compatibility but both
-        orientations are always gathered and bound: Megatron's TE layers call
-        ``update_usage(rowwise=True, columnwise=True)`` on fp8 primary weights
-        at forward, so the tensor must carry both row-wise and column-wise
-        data and scale inverses for compute. The scale-inverse grids live on
-        the tensors (global after quantize) and are never gathered.
+        The source rests sharded, so this is where the communication happens.
+        With all-Replicate placements (expert parameters at ZeRO-1, whose
+        parameter layout is Replicate while the optimizer layout is Flat) the
+        pre-gather redistribution already filled the whole source buffer on this
+        rank, so there is nothing left to gather: copy locally into the target
+        that was just reallocated. Both buffers share this mesh and the same
+        tensor_shapes, so their local buffers match. Any other difference is a
+        single-axis redistribution, because the storage is the parameter layout
+        and only its Replicate axes remain.
         """
-        del orientation
+        with self._symmetric_memory_context():
+            target.reallocate_storage()
+        gather_axis = changed_mesh_axis(source.placements, target.placements)
+        if gather_axis is None:
+            target.local_buffer.copy_(source.local_buffer)
+        else:
+            source.redistribute(target.placements, out=target)
+
+    def unshard_parameters(self, orientation: str = "rowwise") -> None:
+        """Gather the requested payload orientation(s) and bind them on the fp8 tensors.
+
+        Args:
+            orientation: Which payload to materialize. ``"rowwise"`` is the
+                forward-GEMM payload, ``"colwise"`` the backward-GEMM payload, and
+                ``"both"`` the union, used when one materialization has to serve a
+                forward and a backward pass with no reshard in between. The
+                column-wise payload cannot be derived locally: TE produces MXFP8
+                column-wise data only in the x2-scaling quantize kernels, its
+                ``post_all_gather_processing`` is an explicit no-op for
+                ``MXFP8Tensor``, and ``MXFP8Tensor.update_usage`` documents that it
+                can only *disable* usages. Whichever orientations are requested
+                therefore have to be all-gathered here.
+
+        The scale-inverse grids are global on the tensors (filled by
+        ``_quantize_model_weight_from_main_weight``) and are never gathered; only
+        the raw uint8 payloads move.
+        """
+        directions = orientation_directions(orientation)
+        # TE drops the scale-inverse grid of every direction it disables, so a
+        # narrower materialization has to re-attach the grid of the other one.
+        self._restore_scale_inverses()
         self._redistribute_payloads_into_storage()
-        for source, target in (
-            (self._rowwise_buffer, self._unsharded_rowwise),
-            (self._colwise_buffer, self._unsharded_colwise),
-        ):
-            with self._symmetric_memory_context():
-                target.reallocate_storage()
-            # With all-Replicate placements (expert parameters at ZeRO-1, whose
-            # parameter layout is Replicate while the optimizer layout is Flat) the
-            # pre-gather redistribution above already filled the whole source buffer
-            # on this rank, so there is nothing left to gather: copy locally into the
-            # unsharded buffer that was just reallocated. Both buffers share this mesh
-            # and the same tensor_shapes, so their local buffers match. Any other
-            # difference is a single-axis redistribution, because the storage is the
-            # parameter layout and only its Replicate axes remain.
-            gather_axis = changed_mesh_axis(source.placements, target.placements)
-            if gather_axis is None:
-                target.local_buffer.copy_(source.local_buffer)
-            else:
-                source.redistribute(target.placements, out=target)
+        if ROWWISE in directions:
+            self._gather_payload(self._rowwise_buffer, self._unsharded_rowwise)
+        if COLWISE in directions:
+            self._gather_payload(self._colwise_buffer, self._unsharded_colwise)
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             tensor = fsdp_parameter.unsharded
-            set_rowwise_payload(tensor, self._unsharded_rowwise.get_local_tensor(index))
-            set_columnwise_payload(tensor, self._unsharded_colwise.get_local_tensor(index))
+            if ROWWISE in directions:
+                set_rowwise_payload(tensor, self._unsharded_rowwise.get_local_tensor(index))
+            if COLWISE in directions:
+                set_columnwise_payload(tensor, self._unsharded_colwise.get_local_tensor(index))
+            # TE propagates the tensor's quantizer usage into ``update_usage`` when
+            # it takes a primary fp8 weight as a GEMM operand, and MXFP8
+            # ``update_usage`` raises rather than deriving a direction that has no
+            # data. Keep the flags equal to the payloads actually bound.
+            quantizer = tensor._quantizer
+            if quantizer is not None:
+                quantizer.set_usage(
+                    rowwise=ROWWISE in directions, columnwise=COLWISE in directions
+                )
         self._switch_to_unsharded_parameters()
 
     def release_unsharded_storage(self) -> None:
