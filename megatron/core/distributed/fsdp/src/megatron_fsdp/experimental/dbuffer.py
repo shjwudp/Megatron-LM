@@ -25,7 +25,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import changed_mesh_axis
+from .placement import changed_mesh_axes
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,6 +58,64 @@ def _get_reduce_op(partial_placement: Partial) -> dist.ReduceOp.RedOpType:
     """Convert a DTensor Partial reduction name to a torch.distributed op."""
     reduce_ops = {"sum": dist.ReduceOp.SUM, "avg": dist.ReduceOp.AVG}
     return reduce_ops[partial_placement.reduce_op]
+
+
+def _is_supported_transition(old_placement: Placement, new_placement: Placement) -> bool:
+    """Whether DBuffer can change one mesh axis directly between two placements."""
+    if isinstance(old_placement, Shard):
+        return isinstance(new_placement, Replicate)
+    if isinstance(old_placement, Partial):
+        return isinstance(new_placement, (Replicate, Shard))
+    if isinstance(old_placement, Replicate):
+        return isinstance(new_placement, Shard) or (
+            isinstance(new_placement, Partial) and new_placement.reduce_op == "avg"
+        )
+    return False
+
+
+def _plan_placement_steps(
+    old_placements: tuple[Placement, ...], new_placements: tuple[Placement, ...]
+) -> tuple[int, ...]:
+    """Return the changed mesh axes in an order that stays valid at every step.
+
+    ``DBuffer`` requires Shard placements to form a suffix (see
+    ``_validate_placements``), so an axis may only change once every axis above
+    it already holds its final placement. Scanning the pending axes in
+    ascending order satisfies that for every transition ``DBuffer`` supports:
+    gathering and reduce-scattering a sharded suffix consumes the innermost
+    shard first, while widening an axis to Shard consumes the outermost axis
+    first. A change with no such order, or a transition with no primitive, is a
+    bug at the call site rather than something to approximate, so it raises
+    instead of producing wrong data.
+    """
+    pending = set(changed_mesh_axes(old_placements, new_placements))
+    current = list(old_placements)
+    steps: list[int] = []
+    while pending:
+        for axis in sorted(pending):
+            candidate = list(current)
+            candidate[axis] = new_placements[axis]
+            try:
+                _validate_placements(candidate)
+            except (TypeError, ValueError, NotImplementedError):
+                continue
+            if not _is_supported_transition(current[axis], new_placements[axis]):
+                continue
+            current[axis] = new_placements[axis]
+            pending.remove(axis)
+            steps.append(axis)
+            break
+        else:
+            unsupported = ", ".join(
+                f"axis {axis}: {current[axis]!r} -> {new_placements[axis]!r}"
+                for axis in sorted(pending)
+            )
+            raise NotImplementedError(
+                "DBuffer cannot compose the remaining placement changes "
+                f"({unsupported}): no order keeps every intermediate placement valid and "
+                "supported."
+            )
+    return tuple(steps)
 
 
 class DBuffer:
@@ -255,13 +313,20 @@ class DBuffer:
                 f"Expected {self.mesh.ndim} placements for device mesh, got {len(placements)}."
             )
 
-        changed_axis = changed_mesh_axis(self.placements, placements)
-        if changed_axis is None:
+        changed_axes = changed_mesh_axes(self.placements, placements)
+        if not changed_axes:
             return self
-        source_placement = self.placements[changed_axis]
-        destination_placement = placements[changed_axis]
-        if isinstance(source_placement, (Replicate, Partial)) and isinstance(
-            destination_placement, Shard
+        # Narrowing one or more Replicate/Partial axes to their local shard is a pure
+        # slice of the source local buffer. get_local_range() walks the sharded axes
+        # from the outermost in, so the target range is a contiguous sub-range of the
+        # (possibly already narrowed) source range, and one narrow covers any number of
+        # newly sharded axes. Reachable with two changed axes when a two-dimensional
+        # mesh shards the optimizer buffer on both axes: pre_optimizer_main_grad is a
+        # view of main_grad from [Partial, Partial] to [Flat, Flat].
+        if all(
+            isinstance(self.placements[axis], (Replicate, Partial))
+            and isinstance(placements[axis], Shard)
+            for axis in changed_axes
         ):
             offset, local_numel = self.layout.get_local_range(self.mesh, placements)
             local_offset = offset - self.offset
@@ -273,7 +338,11 @@ class DBuffer:
                 placements,
                 self.layout,
             )
-        if isinstance(source_placement, Partial) and isinstance(destination_placement, Replicate):
+        if (
+            len(changed_axes) == 1
+            and isinstance(self.placements[changed_axes[0]], Partial)
+            and isinstance(placements[changed_axes[0]], Replicate)
+        ):
             return DBuffer.from_local(self.local_buffer, self.mesh, placements, self.layout)
         raise ValueError(
             "DBuffer.view() supports identical placements, a Partial-to-Replicate relabel, "
@@ -386,10 +455,15 @@ class DBuffer:
     ) -> "DBuffer":
         """Redistribute this buffer to ``new_placements``.
 
-        This dispatcher supports the one-axis transitions:
-        Flat -> Replicate, Partial -> Replicate, Partial -> Flat,
-        Replicate -> Flat, and Replicate -> Partial. Other placement changes are
-        intentionally unsupported.
+        Each changed axis is applied with the single-axis primitive that
+        implements its transition: Flat -> Replicate, Partial -> Replicate,
+        Partial -> Flat, Replicate -> Flat, and Replicate -> Partial. With one
+        changed axis this is exactly that one primitive -- same call, same
+        ``out=`` handling. With several, the primitives are composed in an
+        order that keeps every intermediate placement valid, e.g. Flat + Flat ->
+        Replicate + Replicate gathers the inner axis first and then the outer
+        one. Compositions with no such order raise instead of producing wrong
+        data.
         """
         new_placements = tuple(new_placements)
         if len(new_placements) != self.mesh.ndim:
@@ -399,17 +473,38 @@ class DBuffer:
             )
         _validate_placements(new_placements)
 
-        changed_axis = changed_mesh_axis(self.placements, new_placements)
-        if changed_axis is None:
+        changed_axes = changed_mesh_axes(self.placements, new_placements)
+        if not changed_axes:
             if out is None:
                 return self
             out = self._create_or_validate_out(out, placements=new_placements)
             out.local_buffer.copy_(self.local_buffer)
             return out
+        if len(changed_axes) == 1:
+            return self._redistribute_one_axis(changed_axes[0], new_placements, out=out)
 
-        axis = changed_axis
+        steps = _plan_placement_steps(self.placements, new_placements)
+        buffer = self
+        step_placements = list(self.placements)
+        # Intermediate buffers hold every placement but the last step's, and the
+        # last step writes into ``out`` (allocating only when it is None), so the
+        # composition needs exactly one buffer per changed axis but the last.
+        for axis in steps[:-1]:
+            step_placements[axis] = new_placements[axis]
+            buffer = buffer._redistribute_one_axis(axis, tuple(step_placements))
+        return buffer._redistribute_one_axis(steps[-1], new_placements, out=out)
+
+    def _redistribute_one_axis(
+        self, axis: int, target_placements: tuple[Placement, ...], *, out: "DBuffer | None" = None
+    ) -> "DBuffer":
+        """Change ``axis`` to ``target_placements[axis]``.
+
+        ``target_placements`` must agree with ``self.placements`` on every other
+        axis, so the body below is the one-axis dispatcher that ``redistribute``
+        documents and that validated configurations depend on.
+        """
         old_placement = self.placements[axis]
-        new_placement = new_placements[axis]
+        new_placement = target_placements[axis]
         if isinstance(old_placement, Shard) and isinstance(new_placement, Replicate):
             return self.allgather(axis, out=out)
         if isinstance(old_placement, Partial) and isinstance(new_placement, Replicate):
@@ -417,10 +512,10 @@ class DBuffer:
         if isinstance(old_placement, Partial) and isinstance(new_placement, Shard):
             return self.reduce_scatter(axis, new_placement, out=out)
         if isinstance(old_placement, Replicate) and isinstance(new_placement, Shard):
-            view = self.view(new_placements)
+            view = self.view(target_placements)
             if out is None:
                 return view
-            out = self._create_or_validate_out(out, placements=new_placements)
+            out = self._create_or_validate_out(out, placements=target_placements)
             out.local_buffer.copy_(view.local_buffer)
             return out
         if isinstance(old_placement, Replicate) and isinstance(new_placement, Partial):
@@ -440,7 +535,7 @@ class DBuffer:
             return DBuffer.from_local(
                 self.local_buffer,
                 self.mesh,
-                new_placements,
+                target_placements,
                 self.layout,
                 subgroup_size=self.subgroup_size,
             )

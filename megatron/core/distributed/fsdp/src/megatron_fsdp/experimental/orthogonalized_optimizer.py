@@ -60,7 +60,7 @@ from torch.optim.optimizer import ParamsT
 
 from .dbuffer import DBuffer
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
-from .placement import Flat
+from .placement import Flat, flattened_mesh_group
 from .shard_plan import (
     OwnerGatherPlan,
     OwnerScatterPlan,
@@ -89,10 +89,7 @@ def _get_parameter_dp_group(param: DTensor) -> dist.ProcessGroup:
     if len(flat_axes) == 1:
         return mesh.get_group(flat_axes[0])
     if mesh.ndim == 2 and flat_axes == [0, 1]:
-        flattened_group = getattr(mesh, "_mfsdp_flattened_group", None)
-        if flattened_group is not None:
-            return flattened_group
-        return mesh._flatten().get_group()
+        return flattened_mesh_group(mesh)
     raise ValueError(
         "MFSDP Muon requires either one Flat axis or a two-dimensional all-Flat mesh, "
         f"got mesh shape {tuple(mesh.mesh.shape)} and placements "

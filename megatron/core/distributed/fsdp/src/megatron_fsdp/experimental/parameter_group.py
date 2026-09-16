@@ -34,7 +34,7 @@ from .module_utils import (
     restore_parameter_attributes,
     save_parameter_attributes,
 )
-from .placement import BlockAtomic, changed_mesh_axis
+from .placement import BlockAtomic, changed_mesh_axes, placement_reduce_group
 from .quantization import (
     E4M3_BLOCK_SIZE,
     allocate_quantize_temp,
@@ -775,24 +775,17 @@ class Fp8ParameterGroup(FsdpParameterGroup):
                 )
             )
 
-        # The reduce group is the axis the main weights are sharded over, which is the
-        # axis the amax must be reduced across (each rank owns a disjoint shard, so no
-        # rank sees the whole tensor's amax on its own). It is read from the payload
-        # buffers, which now follow the main-weight placement. When nothing is sharded
-        # (fully replicated main weights) fall back to this FSDP mesh's own axis: every
-        # rank then holds an identical copy, so the MAX is idempotent. The default
-        # process group must NOT be used -- it spans unrelated PP/TP ranks holding
-        # different parameters and would silently corrupt the scales.
-        gather_axis = changed_mesh_axis(
-            tuple(self._rowwise_buffer.placements),
-            tuple(Replicate() for _ in range(self.mesh.ndim)),
-        )
-        reduce_axis = 0 if gather_axis is None else gather_axis
+        # The reduce group must span every axis the main weights are sharded over
+        # (see placement_reduce_group): each rank owns a disjoint shard, so no rank
+        # sees the whole tensor's amax on its own, and under HFSDP the optimizer
+        # placement shards both axes, so only their flattened union does. It is read
+        # from the payload buffers, which now follow the main-weight placement.
+        reduce_group = placement_reduce_group(self.mesh, self._rowwise_buffer.placements)
         cast_master_weights_to_fp8(
             model_weights=model_weights,
             master_weights=master_weights,
             start_offsets=start_offsets,
-            group=self.mesh.get_group(reduce_axis),
+            group=reduce_group,
             fsdp_shard_model_weights=fsdp_shard_model_weights,
         )
 
@@ -835,11 +828,12 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             # already holds the whole tensor on this rank, so there is nothing to gather:
             # copy locally into the unsharded buffer that was just reallocated. Both buffers
             # share this mesh and the same tensor_shapes, so their local buffers match.
-            gather_axis = changed_mesh_axis(source.placements, target.placements)
-            if gather_axis is None:
-                target.local_buffer.copy_(source.local_buffer)
-            else:
+            # Any other difference (including both axes sharded, as under HFSDP) is a
+            # redistribution, which composes one primitive per changed axis.
+            if changed_mesh_axes(source.placements, target.placements):
                 source.redistribute(target.placements, out=target)
+            else:
+                target.local_buffer.copy_(source.local_buffer)
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             tensor = fsdp_parameter.unsharded
             set_rowwise_payload(tensor, self._unsharded_rowwise.get_local_tensor(index))

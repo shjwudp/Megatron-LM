@@ -720,3 +720,291 @@ def test_2d_mesh_replicate_flat_view_to_flat_flat(distributed_setup):
         == replicated_sharded_buffer.local_buffer.numel() // 2
     )
     _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
+
+
+def test_2d_mesh_flat_flat_redistribute_to_replicate_replicate(distributed_setup):
+    """An all-Flat buffer gathers both axes into a preallocated replicated buffer.
+
+    This is the HFSDP fp8 payload unshard: the payloads follow the optimizer
+    placement, which shards both axes under ``outer_dp_sharding_strategy=optim``
+    + ``data_parallel_sharding_strategy=optim_grads_params``, so the unshard
+    redistribution changes two mesh axes at once.
+    """
+    if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
+        pytest.skip("2D DBuffer test requires an even world size of at least 4.")
+
+    device = distributed_setup.device
+    tensors = _same_tensors_on_all_ranks(device)
+    mesh = init_device_mesh(
+        device.type, (2, distributed_setup.world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+
+    fully_sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat(), Flat()])
+    destination = DBuffer.empty(
+        mesh=mesh,
+        placements=[Replicate(), Replicate()],
+        tensor_shapes=fully_sharded_buffer.layout.tensor_shapes,
+        dtype=fully_sharded_buffer.dtype,
+        device=device,
+    )
+    destination_data_ptr = destination.local_buffer.data_ptr()
+
+    redistributed_buffer = fully_sharded_buffer.redistribute(
+        [Replicate(), Replicate()], out=destination
+    )
+
+    assert redistributed_buffer is destination
+    assert redistributed_buffer.local_buffer.data_ptr() == destination_data_ptr
+    assert redistributed_buffer.placements == (Replicate(), Replicate())
+    assert redistributed_buffer.offset == 0
+    assert redistributed_buffer.local_buffer.numel() == redistributed_buffer.layout.size
+    _assert_dbuffer_local_tensors_close(redistributed_buffer, tensors)
+
+
+def test_2d_mesh_partial_partial_redistribute_to_flat_flat(distributed_setup):
+    """A Partial+Partial buffer reduce-scatters both axes into Flat+Flat.
+
+    The reductions must run outer axis first: a Partial+Flat intermediate keeps
+    Shard placements a suffix, while Partial+Shard does not.
+    """
+    if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
+        pytest.skip("2D DBuffer test requires an even world size of at least 4.")
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(
+        device.type, (2, distributed_setup.world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    outer_scale = float(mesh.get_local_rank(0) + 1)
+    tensors = [
+        torch.full((6, 2), outer_scale, dtype=torch.float32, device=device),
+        torch.full((4,), outer_scale * 10, dtype=torch.float32, device=device),
+    ]
+
+    partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial("sum"), Partial("sum")])
+    destination = DBuffer.empty(
+        mesh=mesh,
+        placements=[Flat(), Flat()],
+        tensor_shapes=partial_buffer.layout.tensor_shapes,
+        dtype=partial_buffer.dtype,
+        device=device,
+    )
+
+    redistributed_buffer = partial_buffer.redistribute([Flat(), Flat()], out=destination)
+
+    assert redistributed_buffer is destination
+    assert redistributed_buffer.placements == (Flat(), Flat())
+    assert redistributed_buffer.local_buffer.numel() == partial_buffer.layout.size // mesh.size()
+    replicated_buffer = redistributed_buffer.allgather(0).allgather(1)
+    scale_sum = float(mesh.size(1) * mesh.size(0) * (mesh.size(0) + 1) // 2)
+    expected = [
+        torch.full((6, 2), scale_sum, dtype=torch.float32, device=device),
+        torch.full((4,), scale_sum * 10, dtype=torch.float32, device=device),
+    ]
+    _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
+
+
+def test_2d_mesh_partial_partial_redistribute_to_flat_flat_average(distributed_setup):
+    """Two-axis reduce-scatter to Flat+Flat averages over both axes."""
+    if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
+        pytest.skip("2D DBuffer test requires an even world size of at least 4.")
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(
+        device.type, (2, distributed_setup.world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    outer_scale = float(mesh.get_local_rank(0) + 1)
+    tensors = [
+        torch.full((5, 3), outer_scale, dtype=torch.float32, device=device),
+        torch.full((4,), outer_scale * 10, dtype=torch.float32, device=device),
+    ]
+
+    partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial("avg"), Partial("avg")])
+    redistributed_buffer = partial_buffer.redistribute([Flat(), Flat()])
+
+    assert redistributed_buffer.placements == (Flat(), Flat())
+    replicated_buffer = redistributed_buffer.allgather(0).allgather(1)
+    scale_average = (mesh.size(0) + 1) / 2.0
+    expected = [
+        torch.full((5, 3), scale_average, dtype=torch.float32, device=device),
+        torch.full((4,), scale_average * 10, dtype=torch.float32, device=device),
+    ]
+    _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
+
+
+def test_2d_mesh_replicate_replicate_redistribute_to_flat_flat(distributed_setup):
+    """A fully replicated buffer redistributes to Flat+Flat with one narrow per axis."""
+    if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
+        pytest.skip("2D DBuffer test requires an even world size of at least 4.")
+
+    device = distributed_setup.device
+    tensors = _same_tensors_on_all_ranks(device)
+    mesh = init_device_mesh(
+        device.type, (2, distributed_setup.world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+
+    replicated_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
+    redistributed_buffer = replicated_buffer.redistribute([Flat(), Flat()])
+    expected_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat(), Flat()])
+
+    assert redistributed_buffer.placements == (Flat(), Flat())
+    assert redistributed_buffer.offset == expected_buffer.offset
+    assert redistributed_buffer.local_buffer.numel() == expected_buffer.local_buffer.numel()
+    # Replicate -> Flat is local, so the result must still alias the source storage.
+    assert (
+        redistributed_buffer.local_buffer.untyped_storage()
+        is replicated_buffer.local_buffer.untyped_storage()
+    )
+    for index in range(len(tensors)):
+        torch.testing.assert_close(
+            redistributed_buffer.get_local_tensor(index),
+            expected_buffer.get_local_tensor(index),
+            rtol=0,
+            atol=0,
+        )
+    _assert_dbuffer_local_tensors_close(redistributed_buffer.allgather(0).allgather(1), tensors)
+
+
+def test_2d_mesh_view_two_newly_sharded_axes(distributed_setup):
+    """DBuffer.view slices a full local buffer to two newly sharded axes at once."""
+    if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
+        pytest.skip("2D DBuffer test requires an even world size of at least 4.")
+
+    device = distributed_setup.device
+    tensors = _same_tensors_on_all_ranks(device)
+    mesh = init_device_mesh(
+        device.type, (2, distributed_setup.world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+
+    replicated_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
+    viewed_buffer = replicated_buffer.view([Flat(), Flat()])
+    expected_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat(), Flat()])
+
+    assert viewed_buffer.placements == (Flat(), Flat())
+    assert viewed_buffer.offset == expected_buffer.offset
+    assert viewed_buffer.local_buffer.numel() == expected_buffer.local_buffer.numel()
+    assert (
+        viewed_buffer.local_buffer.untyped_storage()
+        is replicated_buffer.local_buffer.untyped_storage()
+    )
+
+
+def test_2d_mesh_partial_partial_view_to_flat_flat_is_a_storage_destination(distributed_setup):
+    """A Partial+Partial buffer views to the Flat+Flat block a reduce-scatter fills.
+
+    Fp8ParameterGroup and FsdpParameterGroup derive their optimizer-layout views
+    this way, and an all-Partial gradient buffer under a two-axis expert-ZeRO-1
+    configuration changes both axes in that one view.
+    """
+    if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
+        pytest.skip("2D DBuffer test requires an even world size of at least 4.")
+
+    device = distributed_setup.device
+    mesh = init_device_mesh(
+        device.type, (2, distributed_setup.world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    tensors = [
+        torch.full((5, 3), float(distributed_setup.rank + 1), dtype=torch.float32, device=device)
+    ]
+
+    partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial(), Partial()])
+    viewed_buffer = partial_buffer.view([Flat(), Flat()])
+
+    assert viewed_buffer.placements == (Flat(), Flat())
+    assert viewed_buffer.layout == partial_buffer.layout
+    expected_offset, expected_local_numel = partial_buffer.layout.get_local_range(
+        mesh, (Flat(), Flat())
+    )
+    assert viewed_buffer.offset == expected_offset
+    assert viewed_buffer.local_buffer.numel() == expected_local_numel
+    assert (
+        viewed_buffer.local_buffer.untyped_storage()
+        is partial_buffer.local_buffer.untyped_storage()
+    )
+
+
+def test_redistribute_single_axis_dispatches_to_one_primitive(distributed_setup, monkeypatch):
+    """A one-axis redistribute calls exactly the primitive it called before.
+
+    Several validated configurations (ZeRO-3, HSDP, expert ZeRO-1) rest on the
+    one-axis transitions, and the multi-axis composition must leave them
+    untouched: one primitive, the same axis, the same ``out=`` object.
+    """
+    if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
+        pytest.skip("2D DBuffer test requires an even world size of at least 4.")
+
+    device = distributed_setup.device
+    tensors = _same_tensors_on_all_ranks(device)
+    mesh = init_device_mesh(
+        device.type, (2, distributed_setup.world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+
+    calls = []
+    for name in ("allgather", "allreduce", "reduce_scatter", "view"):
+        original = getattr(DBuffer, name)
+
+        def recording(self, *args, _original=original, _name=name, **kwargs):
+            calls.append((_name, args, kwargs.get("out")))
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(DBuffer, name, recording)
+
+    # Shard -> Replicate all-gathers the changed axis.
+    fully_sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat(), Flat()])
+    gather_destination = DBuffer.empty(
+        mesh=mesh,
+        placements=[Replicate(), Flat()],
+        tensor_shapes=fully_sharded_buffer.layout.tensor_shapes,
+        dtype=fully_sharded_buffer.dtype,
+        device=device,
+    )
+    calls.clear()
+    result = fully_sharded_buffer.redistribute([Replicate(), Flat()], out=gather_destination)
+    assert result is gather_destination
+    assert [(name, args, out) for name, args, out in calls] == [
+        ("allgather", (0,), gather_destination)
+    ]
+
+    # Partial -> Shard flat reduce-scatters into the destination.
+    partially_sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Partial()])
+    scatter_destination = DBuffer.empty(
+        mesh=mesh,
+        placements=[Replicate(), Flat()],
+        tensor_shapes=partially_sharded_buffer.layout.tensor_shapes,
+        dtype=partially_sharded_buffer.dtype,
+        device=device,
+    )
+    calls.clear()
+    result = partially_sharded_buffer.redistribute([Replicate(), Flat()], out=scatter_destination)
+    assert result is scatter_destination
+    assert calls == [("reduce_scatter", (1, Flat()), scatter_destination)]
+
+    # Replicate -> Shard slices locally, with no collective.
+    replicated_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Replicate()])
+    calls.clear()
+    result = replicated_buffer.redistribute([Replicate(), Flat()])
+    assert result.placements == (Replicate(), Flat())
+    assert calls == [("view", ((Replicate(), Flat()),), None)]
+
+    # Identical placements short-circuit before any primitive.
+    calls.clear()
+    assert replicated_buffer.redistribute([Replicate(), Replicate()]) is replicated_buffer
+    assert calls == []
+
+
+def test_redistribute_rejects_unorderable_multi_axis_change(distributed_setup):
+    """A multi-axis change with no valid intermediate order raises, not corrupts."""
+    if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
+        pytest.skip("2D DBuffer test requires an even world size of at least 4.")
+
+    device = distributed_setup.device
+    tensors = _same_tensors_on_all_ranks(device)
+    mesh = init_device_mesh(
+        device.type, (2, distributed_setup.world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    fully_sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat(), Flat()])
+
+    # Shard -> Partial has no single-axis primitive, and no order can leave a
+    # valid intermediate for it, so the composition refuses instead of
+    # approximating.
+    with pytest.raises(NotImplementedError, match="remaining placement changes"):
+        fully_sharded_buffer.redistribute([Replicate(), Partial("sum")])
