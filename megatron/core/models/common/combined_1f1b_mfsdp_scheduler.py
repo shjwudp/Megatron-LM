@@ -57,6 +57,24 @@ def _module_post_backward_hook(module: FsdpModule) -> None:
     scheduler.issue_reduce_gradients(module)
 
 
+def end_microbatch(module: FsdpModule) -> None:
+    """Close the trace-and-replay reduce-deferral scope for one microbatch.
+
+    ``module`` is any FsdpModule of the microbatch's model chunk; the scheduler
+    lives on the shared :class:`FsdpContext`. This is a no-op when trace-and-replay
+    is disabled, so the call site does not have to know whether a scheduler exists.
+
+    It is invoked from the combined-1F1B schedule once one microbatch's backward —
+    including its delayed ``backward_dw`` wgrad — has fully retired, i.e. exactly
+    where the schedule leaves the microbatch scope. See
+    ``TraceAndReplayScheduler.end_microbatch`` for why that is a hard barrier.
+    """
+    assert isinstance(module, FsdpModule), "Expected an FsdpModule."
+    scheduler = module.context.scheduler
+    if isinstance(scheduler, TraceAndReplayScheduler):
+        scheduler.end_microbatch(module)
+
+
 def reshard_fsdp_module(module: FsdpModule) -> None:
     """Reshard the FSDP module after fine-grained computation."""
     assert isinstance(module, FsdpModule), "Expected an FsdpModule."

@@ -134,6 +134,18 @@ class DistributedDataParallelConfig:
       disables prefetching and may degrade performance. Adjust this value
       based on your system's memory and performance requirements."""
 
+    defer_grad_reduce: str = 'none'
+    """When to issue an FSDP gradient reduce-scatter relative to where it is
+      recorded. Valid values are 'none' (launch immediately, the default and a
+      strict no-op), 'before_prefetch' / 'after_prefetch' (launch it at the next
+      unshard wait, before or after that op's prefetch all-gathers), and
+      'next_reshard' (launch it at the next reshard). Only affects the
+      trace-and-replay (combined 1F1B) path, which is enabled by
+      ``overlap_moe_expert_parallel_comm``. The queue depth in parameter elements
+      is ``suggested_communication_unit_size``: ``0`` disables deferral, and
+      ``None`` defers a single reduce per anchor. This is a scheduling capability,
+      not a throughput feature."""
+
     keep_fp8_transpose_cache: bool = False
     """If true, keep the fp8 transpose cache when using Megatron FSDP."""
 

@@ -531,4 +531,16 @@ def combined_forward_backward_step(
     if fsdp_wrapper is not None and b_model is not None:
         fsdp_wrapper.post_backward()
 
+    if b_model is not None:
+        # The microbatch's backward is now fully retired, including the delayed
+        # ``backward_dw`` wgrad that the layer scheduler runs last. Close the
+        # trace-and-replay gradient-reduce deferral scope here: a reduce queued by
+        # this microbatch may not be launched against the next microbatch's
+        # ``is_last_microbatch`` or ``main_grad`` state. No-op without a scheduler.
+        from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import end_microbatch
+
+        fsdp_v2_model = find_megatron_fsdp_v2(b_model)
+        if fsdp_v2_model is not None:
+            end_microbatch(fsdp_v2_model)
+
     return output_tensor, num_tokens, input_tensor_grad
