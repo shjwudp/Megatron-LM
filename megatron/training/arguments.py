@@ -1202,11 +1202,25 @@ def validate_args(args, defaults={}):
             "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
 
         if args.nccl_ub:
-            # In Megatron-LM, required implementation for manual registration is already provided.
-            # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
-            args.fsdp_manual_registration = True
+            # Batched (manual) registration is a v1 path. MFSDP v2 rejects
+            # fsdp_manual_registration in _validate_config and instead registers each
+            # communication buffer from a PyTorch memory pool through its own allocator
+            # (with NCCL window/symmetric registration). Enabling the flag unconditionally
+            # made --nccl-ub unusable with --megatron-fsdp-version 2: it raised during model
+            # construction, before iteration 1. Keep the double buffer, which user buffers need.
             args.fsdp_double_buffer = True
-            warn_rank_0('FSDP double buffer and manual registration is enabled by default when --nccl-ub is enabled!')
+            if args.megatron_fsdp_version != 2:
+                args.fsdp_manual_registration = True
+                warn_rank_0(
+                    'FSDP double buffer and manual registration are enabled by default '
+                    'when --nccl-ub is enabled!'
+                )
+            else:
+                warn_rank_0(
+                    'FSDP double buffer is enabled by default when --nccl-ub is enabled! '
+                    'FSDP manual registration is not supported by --megatron-fsdp-version 2 '
+                    'and remains disabled.'
+                )
 
         if args.megatron_fsdp_max_pool_double_buffer:
             # MaxPoolAllocator is a type of FSDP double buffer.

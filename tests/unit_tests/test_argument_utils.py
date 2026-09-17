@@ -131,6 +131,48 @@ def test_freeze_base_model_for_mtp_validation(monkeypatch, overrides, error):
         validate_args(args)
 
 
+def _minimal_fsdp_training_args(monkeypatch):
+    """Minimal args that clear the Megatron-FSDP preconditions of validate_args."""
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py'])
+    args = parse_args()
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 1024
+    args.seq_length = 1024
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.vocab_size = 1024
+    args.use_megatron_fsdp = True
+    args.ckpt_format = 'fsdp_dtensor'
+    return args
+
+
+@pytest.mark.parametrize(("version", "expected_manual_registration"), [(1, True), (2, False)])
+def test_nccl_ub_manual_registration_only_for_mfsdp_v1(
+    monkeypatch, version, expected_manual_registration
+):
+    """--nccl-ub must not auto-enable fsdp_manual_registration on MFSDP v2.
+
+    FullyShardedDataParallelV2._validate_config rejects fsdp_manual_registration, so the
+    unconditional auto-set made `--use-megatron-fsdp --megatron-fsdp-version 2 --nccl-ub`
+    raise during model construction, before the first training iteration. User buffers still
+    need fsdp_double_buffer, so that stays enabled for both versions.
+    """
+    args = _minimal_fsdp_training_args(monkeypatch)
+    args.megatron_fsdp_version = version
+    args.nccl_ub = True
+    assert args.fsdp_manual_registration is False
+    assert args.fsdp_double_buffer is False
+
+    validate_args(args)
+
+    assert args.fsdp_manual_registration is expected_manual_registration
+    assert args.fsdp_double_buffer is True
+
+
 @dataclass
 class ConfigWithOptional:
     """Config with optional fields."""
