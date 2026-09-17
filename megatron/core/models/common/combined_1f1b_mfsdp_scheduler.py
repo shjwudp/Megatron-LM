@@ -80,6 +80,14 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     assert isinstance(module, FsdpModule), "Owner must be an FsdpModule."
     register_hooks(module, module)
 
+    # TR163 PROBE (print-only, throwaway): prove the combined-1F1B hooks were
+    # installed, so the job log shows trace-and-replay was on the execution path.
+    print(
+        f"[TRPROBE rank={__import__('os').environ.get('RANK', '?')}] "
+        f"HOOKS-REGISTERED module={type(module).__name__}",
+        flush=True,
+    )
+
     for submodule in module.modules():
         if isinstance(submodule, FsdpModule):
             submodule.register_post_backward_hook(_module_post_backward_hook)
