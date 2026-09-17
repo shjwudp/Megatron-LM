@@ -3396,6 +3396,16 @@ def _add_distributed_args(parser):
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '
                         'while a smaller value disables prefetching and may degrade performance. Adjust this value based on your system\'s memory '
                         'and performance requirements.')
+    group.add_argument('--defer-grad-reduce', type=str, default='none',
+                   choices=['none', 'before_prefetch', 'after_prefetch', 'next_reshard'],
+                   help='When to issue an FSDP gradient reduce-scatter relative to where it is recorded, '
+                        'on the trace-and-replay (combined 1F1B) path. "none" (default) launches it '
+                        'immediately and is a strict no-op; "before_prefetch"/"after_prefetch" run it at '
+                        'the next unshard wait, before or after that op\'s prefetch all-gathers; '
+                        '"next_reshard" runs it at the next reshard. The queue depth in parameter '
+                        'elements is --suggested-communication-unit-size: 0 disables deferral, unset '
+                        'defers a single reduce per anchor. A scheduling capability, not a throughput '
+                        'feature.')
     group.add_argument('--keep-fp8-transpose-cache', action='store_true',
                        help='If set, keep the fp8 transpose cache when using Megatron FSDP.')
     group.add_argument('--enable-full-sharding-in-hsdp', action='store_true',

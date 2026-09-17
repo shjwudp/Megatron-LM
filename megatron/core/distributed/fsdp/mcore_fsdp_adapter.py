@@ -651,6 +651,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         schedule_policy = SchedulePolicy(
             forward_prefetch_size=ddp_config.suggested_communication_unit_size,
             backward_prefetch_size=ddp_config.suggested_communication_unit_size,
+            defer_grad_reduce=ddp_config.defer_grad_reduce,
         )
         common_fully_shard_kwargs = dict(
             mixed_precision_policy=self.mp_policy,
@@ -790,6 +791,16 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError(
                 "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."
             )
+        if ddp_config.defer_grad_reduce != "none" and not config.overlap_moe_expert_parallel_comm:
+            # Gradient-reduce deferral is a plan-level transformation of the
+            # trace-and-replay scheduler, which only runs on the combined-1F1B
+            # (EP-overlap) path. Accepting the flag elsewhere would silently do
+            # nothing. Same policy as the trace-and-replay enable flag itself.
+            raise ValueError(
+                "defer_grad_reduce only applies to the trace-and-replay (combined 1F1B) "
+                "path; enable overlap_moe_expert_parallel_comm or leave "
+                f"defer_grad_reduce='none', got {ddp_config.defer_grad_reduce!r}."
+            )
         if (
             ddp_config.outer_dp_sharding_strategy != "no_shard"
             and ddp_config.num_distributed_optimizer_instances <= 1
@@ -875,6 +886,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Under the custom schedule like 1F1B, post_backward_final_callback is not invoked.
         # Synchronize gradients here to ensure it is safe to call optimizer.step().
         context = self.module.context
+        if context.scheduler is not None:
+            # The custom schedule reaches this barrier instead of the context-level
+            # post-backward callback, so this is where "the queue is empty before the
+            # optimizer" is actually enforced for combined 1F1B.
+            context.scheduler.assert_no_pending_reduces()
         context.current_stream().wait_stream(context.reduce_scatter_stream)
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:

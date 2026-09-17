@@ -26,6 +26,17 @@ the same calls in the same order (same op numbers), but the plan can change what
 an op does — e.g. append an all-gather prefetch at a ``wait_unshard`` op, or skip
 a reshard that is immediately undone by a same-module re-unshard.
 
+The plan can also move the *issuance time* of a gradient reduce-scatter. With
+``SchedulePolicy.defer_grad_reduce`` set, an ``ISSUE_REDUCE_GRADIENTS`` op enqueues
+its module (FIFO, no device work) instead of launching the reduce, and the plan
+records which later op — a ``WAIT_UNSHARD``, a ``RESHARD`` — fires the queue.
+Deferral is off by default and is an exact no-op then. It is a plan-level decision
+only: while tracing, the scheduler records and executes the unoptimized op stream,
+so the anchor is learned from the trace exactly like the prefetch is. An
+``END_MICROBATCH`` op is a hard barrier — the queue is always launched there, and
+no anchor is ever selected across it, so a queued reduce can never run against
+another microbatch's ``is_last_microbatch`` or ``main_grad`` state.
+
 Unshards are *orientation-aware*. An MXFP8 primary weight rests as two separate
 payload buffers — row-wise (forward GEMM) and column-wise (backward GEMM) — so
 the plan records which one each unshard needs, widens a materialization that has
@@ -53,19 +64,47 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+#: Supported values of :attr:`SchedulePolicy.defer_grad_reduce`.
+#:
+#: ``none``            — launch the reduce-scatter where it is recorded (default).
+#: ``before_prefetch`` — run it at the next ``WAIT_UNSHARD``, *before* that op's
+#:                       prefetch all-gathers, deliberately letting the reduce use
+#:                       the interconnect first.
+#: ``after_prefetch``  — run it at the next ``WAIT_UNSHARD``, after those all-gathers
+#:                       have been issued, so the critical-path all-gather wins.
+#: ``next_reshard``    — run it at the next ``RESHARD``.
+DEFER_GRAD_REDUCE_ANCHORS: tuple[str, ...] = (
+    "none",
+    "before_prefetch",
+    "after_prefetch",
+    "next_reshard",
+)
+
+DeferGradReduce = Literal["none", "before_prefetch", "after_prefetch", "next_reshard"]
+
+
 @dataclass(frozen=True)
 class SchedulePolicy:
     """Control communication scheduling for one FSDP module.
 
     ``None`` prefetches one successor, preserving the default behavior. ``0``
     disables prefetching. Positive values specify parameter-element budgets.
+
+    ``defer_grad_reduce`` selects where a reduce-scatter recorded at
+    ``post_backward`` is launched (see :data:`DEFER_GRAD_REDUCE_ANCHORS`). The
+    prefetch budget is reused as the queue *depth* in parameter elements: ``None``
+    keeps a single queued reduce per anchor, ``0`` disables deferral entirely, and
+    a positive value extends the number of reduces that may be held queued until
+    the accumulated ``num_parameter_elements`` reach it. ``"none"`` (the default)
+    is a strict no-op.
     """
 
     forward_prefetch_size: int | None = None
     backward_prefetch_size: int | None = None
+    defer_grad_reduce: DeferGradReduce = "none"
 
     def __post_init__(self) -> None:
-        """Validate non-negative prefetch budgets."""
+        """Validate non-negative prefetch budgets and the deferral anchor."""
         if self.forward_prefetch_size is not None and self.forward_prefetch_size < 0:
             raise ValueError(
                 "forward_prefetch_size must be non-negative, " f"got {self.forward_prefetch_size}."
@@ -75,6 +114,11 @@ class SchedulePolicy:
                 "backward_prefetch_size must be non-negative, "
                 f"got {self.backward_prefetch_size}."
             )
+        if self.defer_grad_reduce not in DEFER_GRAD_REDUCE_ANCHORS:
+            raise ValueError(
+                f"defer_grad_reduce must be one of {DEFER_GRAD_REDUCE_ANCHORS}, "
+                f"got {self.defer_grad_reduce!r}."
+            )
 
 
 class OpKind(Enum):
@@ -83,12 +127,17 @@ class OpKind(Enum):
     These mirror the lifecycle entry points that the combined-1F1B hooks call:
     unshard (materialize parameters), wait (let compute consume them), reshard
     (release unsharded storage), and issue-reduce-gradients (reduce-scatter).
+
+    ``END_MICROBATCH`` is not a lifecycle entry point: it is recorded where the
+    combined-1F1B scheduler finishes one microbatch's backward, and is a hard
+    barrier for gradient-reduce deferral (see :meth:`TraceAndReplayScheduler.end_microbatch`).
     """
 
     ISSUE_UNSHARD = auto()
     WAIT_UNSHARD = auto()
     RESHARD = auto()
     ISSUE_REDUCE_GRADIENTS = auto()
+    END_MICROBATCH = auto()
 
 
 class _Mode(Enum):
@@ -97,6 +146,17 @@ class _Mode(Enum):
     OFF = auto()      # Scheduler disabled: passthrough, no tracing/optimization.
     TRACING = auto()  # Recording the live op stream while executing unoptimized.
     REPLAYING = auto()  # Executing the compiled plan (prefetch/skip applied).
+
+
+#: One queued (not yet launched) gradient reduce.
+#:
+#: The whole ``_reduce_gradient_groups()`` call is deferred, not just the collective
+#: launch: no partial-grad buffer is allocated until the drain, so the queue costs no
+#: GPU memory. ``is_last_microbatch`` is captured at *enqueue* time because
+#: ``FsdpContext.is_last_microbatch`` is a mutable flag that the ``microbatch``
+#: context manager flips, and ``reduce_partial_gradients`` reads it at *execution*
+#: time.
+_PendingReduce = tuple["FsdpModule", bool]
 
 
 @dataclass(frozen=True)
@@ -136,12 +196,21 @@ class PlanOp:
       ``(module, orientation)`` pairs so their unshards overlap this module's
       compute. More than one entry means the plan is prefetching several modules
       ahead, bounded by the waiting module's parameter-element prefetch budget.
+    - ``defer_reduce``: for an ``ISSUE_REDUCE_GRADIENTS``, do not launch the
+      reduce-scatter now; enqueue it for the anchor this op selected.
+    - ``reduce_gradients_after``: after handling this op, launch every gradient
+      reduce queued onto it, oldest first. Mirrors ``prefetch_after``: the op that
+      carries it is the *anchor*, and the module identities moved onto it are the
+      reduces deferred from earlier in the op stream. ``None`` means "not an
+      anchor"; an empty tuple is never stored.
     """
 
     trigger_event: TraceEvent
     skip: bool = False
     orientation: str | None = None
     prefetch_after: tuple[tuple[FsdpModule, str | None], ...] | None = None
+    defer_reduce: bool = False
+    reduce_gradients_after: tuple[FsdpModule, ...] | None = None
 
 
 class TraceAndReplayScheduler:
@@ -178,6 +247,10 @@ class TraceAndReplayScheduler:
         self._events = []
         self._plan = []
         self._op_index = 0
+        # FIFO queue of reduces deferred to a later anchor, oldest first. Depth is
+        # bounded in parameter elements by the queuing module's prefetch budget.
+        self._pending_reduces: list[_PendingReduce] = []
+        self._pending_reduce_elements = 0
         # Diagnostics.
         self._divergences = 0
 
@@ -290,29 +363,104 @@ class TraceAndReplayScheduler:
         overlap this module's compute. There can be more than one when the waiting
         module's prefetch budget allows a deeper lookahead. During tracing this is a
         plain wait (no prefetch yet).
+
+        When the plan made this op an anchor for deferred gradient reduces, the
+        queue is launched here too. ``after_prefetch`` (and ``next_reshard``) run it
+        after the prefetch all-gathers have been issued — the critical-path
+        all-gather gets the interconnect first; ``before_prefetch`` runs it before
+        them, the opposite prediction. The position follows the policy of the
+        oldest queued module, i.e. the module whose deferral selected this anchor;
+        the queue is FIFO, so it can never be split.
         """
         plan_op = self._record(OpKind.WAIT_UNSHARD, module, None)
         module.wait_unshard()
+        drain_before_prefetch = (
+            plan_op is not None
+            and plan_op.reduce_gradients_after is not None
+            and self._queued_anchor_is_before_prefetch()
+        )
+        if drain_before_prefetch:
+            self._drain_reduces(plan_op)
         if plan_op is not None and plan_op.prefetch_after:
             for target, orientation in plan_op.prefetch_after:
                 self._prefetch(target, orientation)
+        if not drain_before_prefetch:
+            self._drain_reduces(plan_op)
 
     def reshard(self, module: FsdpModule) -> None:
         """Release ``module``'s unsharded storage, unless the plan skips it.
 
         A skipped reshard keeps the storage resident for an immediately-following
         same-module re-unshard (the "reshard + unshard pair"), turning that
-        re-unshard into a no-op.
+        re-unshard into a no-op. A skipped reshard is never selected as a
+        ``next_reshard`` anchor (see :meth:`_build_plan_defer_reduces`), so the early
+        return cannot strand a queued reduce.
         """
         plan_op = self._record(OpKind.RESHARD, module, None)
         if plan_op is not None and plan_op.skip:
             return
         module.reshard()
+        self._drain_reduces(plan_op)
 
     def issue_reduce_gradients(self, module: FsdpModule) -> None:
-        """Launch ``module``'s reduce-scatters."""
-        self._record(OpKind.ISSUE_REDUCE_GRADIENTS, module, None)
+        """Launch ``module``'s reduce-scatters, or queue them for a later anchor.
+
+        While tracing (or when the plan did not move this op, or while a CUDA graph
+        is capturing) the reduce is launched exactly where it is recorded, which is
+        today's behaviour. During replay of a ``defer_reduce`` op the module is
+        appended to the pending FIFO and no device work happens; the plan's anchor
+        launches it.
+
+        Enqueueing happens *after* :meth:`_record`, so ``_op_index`` and the
+        divergence accounting are identical whether or not the op was deferred.
+        """
+        plan_op = self._record(OpKind.ISSUE_REDUCE_GRADIENTS, module, None)
+        if plan_op is not None and plan_op.defer_reduce and self._deferral_allowed():
+            self._queue_reduce(module)
+            return
         module._reduce_gradient_groups()
+
+    def end_microbatch(self, module: FsdpModule) -> None:
+        """Close the current microbatch's deferral scope. A hard barrier.
+
+        Recorded where the combined-1F1B scheduler finishes one microbatch's
+        backward. Every pending reduce is launched here, oldest first, and no anchor
+        is ever selected across this op, so a deferred reduce can never be executed
+        against another microbatch's ``is_last_microbatch`` — or after the next
+        microbatch has started overwriting ``main_grad``. It also flushes from the
+        queue, which is what makes the emptiness assertion in
+        :meth:`FsdpContext.post_backward` hold before ``optimizer.step()``.
+
+        While tracing this records the barrier (so replay finds it at the same op
+        index) and flushes an always-empty queue, i.e. it does no work.
+        """
+        self._record(OpKind.END_MICROBATCH, module, None)
+        self._flush_reduces()
+
+    def pending_reduce_count(self) -> int:
+        """Number of gradient reduces queued but not yet launched."""
+        return len(self._pending_reduces)
+
+    def assert_no_pending_reduces(self) -> None:
+        """Raise if a queued reduce was never launched.
+
+        Called from the context-level post-backward barrier, which is what orders
+        the optimizer after the reduce-scatter stream. A queued-but-unlaunched
+        reduce holds no storage, but leaving it would let ``optimizer.step()`` read
+        ``main_grad`` before its DP-outer reduction ran.
+        """
+        if not self._pending_reduces:
+            return
+        names = [
+            getattr(module, "_name", None) or type(module).__name__
+            for module, _ in self._pending_reduces
+        ]
+        raise RuntimeError(
+            "TraceAndReplayScheduler: %d gradient reduce(s) queued but not launched "
+            "(%s); the optimizer would step on unfinalized gradients. Every queue "
+            "must be flushed at its anchor or at END_MICROBATCH."
+            % (len(self._pending_reduces), ", ".join(names))
+        )
 
     # ------------------------------------------------------------------
     # Internals
@@ -373,8 +521,92 @@ class TraceAndReplayScheduler:
         """
         module.unshard(orientation=orientation or BOTH)
 
+    # ------------------------------------------------------------------
+    # Deferred gradient reduces (a bounded FIFO queue)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _capture_active() -> bool:
+        """Whether a CUDA graph is being captured on the current stream.
+
+        Deferral changes *which* fork edge first joins the reduce-scatter stream to
+        an active capture: ``FsdpModule.pre_backward`` forks it once at the start of
+        backward, and each module re-forks it with ``wait_stream`` before its own
+        collective, so a deferred first allocation on the reduce-scatter stream
+        would be a raw ``cudaMalloc`` under capture. The feature is therefore gated
+        off while capturing and the reduce is issued where it was recorded.
+        """
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - torch is a hard runtime dependency
+            return False
+        if not torch.cuda.is_available():
+            return False
+        return bool(torch.cuda.is_current_stream_capturing())
+
+    def _deferral_allowed(self) -> bool:
+        """Whether queued reduce-scatters may be used right now."""
+        return not self._capture_active()
+
+    def _queue_reduce(self, module: FsdpModule) -> None:
+        """Append ``module``'s reduce to the FIFO without doing its work.
+
+        The whole ``_reduce_gradient_groups()`` call is deferred, so no partial-grad
+        buffer is allocated here and the queue costs no GPU memory. The live
+        ``context.is_last_microbatch`` is captured into the queue element because
+        the flag is mutable and the reduction reads it at execution time.
+
+        The element budget is the queuing module's own prefetch budget (the same
+        knob the plan's anchor selection uses). When the budget is reached this
+        launches the *oldest* entries first — it never refuses to enqueue, so a
+        reduce is never dropped, and it never reorders, so the launched order is the
+        traced order minus the deferred elements.
+        """
+        budget = module._schedule_policy.forward_prefetch_size
+        elements = module.num_parameter_elements
+        if budget is not None and budget > 0:
+            while self._pending_reduces and self._pending_reduce_elements + elements > budget:
+                self._launch_oldest_reduce()
+        self._pending_reduces.append((module, self._context.is_last_microbatch))
+        self._pending_reduce_elements += elements
+
+    def _launch_oldest_reduce(self) -> None:
+        """Launch the oldest pending reduce (strict FIFO pop-front)."""
+        module, is_last_microbatch = self._pending_reduces.pop(0)
+        self._pending_reduce_elements -= module.num_parameter_elements
+        module._reduce_gradient_groups(is_last_microbatch=is_last_microbatch)
+
+    def _flush_reduces(self) -> None:
+        """Launch every pending reduce, oldest first. Never reorders."""
+        while self._pending_reduces:
+            self._launch_oldest_reduce()
+
+    def _drain_reduces(self, plan_op: PlanOp | None) -> None:
+        """Launch the queued reduces when ``plan_op`` is one of their anchors."""
+        if plan_op is None or not plan_op.reduce_gradients_after:
+            return
+        self._flush_reduces()
+
+    def _queued_anchor_is_before_prefetch(self) -> bool:
+        """Whether the oldest queued reduce selected a ``before_prefetch`` anchor.
+
+        One anchor has one drain position, so the oldest queued element decides it;
+        the queue is FIFO, so this is the same module whose op stream reached the
+        anchor first.
+        """
+        for module, _ in self._pending_reduces:
+            policy = getattr(module._schedule_policy, "defer_grad_reduce", "none")
+            return policy == "before_prefetch"
+        return False
+
     def _retrace(self, kind: OpKind, module: FsdpModule, orientation: str | None) -> None:
-        """Reset to tracing and seed the new trace with the current op."""
+        """Reset to tracing and seed the new trace with the current op.
+
+        Any queued reduce is launched first: it is real gradient work that may not
+        be dropped just because the plan diverged. It lies earlier in the op stream
+        than the diverging op, so launching it now also preserves FIFO order.
+        """
+        self._flush_reduces()
         self._mode = _Mode.TRACING
         self._events = []
         self._plan = []
@@ -385,7 +617,7 @@ class TraceAndReplayScheduler:
     def _build_plan(self) -> None:
         """Compile ``_events`` into an optimized ``_plan``.
 
-        Three transformations are applied to the raw trace:
+        Four transformations are applied to the raw trace:
 
         1. **Widen a materialization that serves several unshards.** Each module's
            unshards are grouped into *residency windows* delimited by its own
@@ -415,6 +647,8 @@ class TraceAndReplayScheduler:
            demand unshard is separated from this point by its own reshard is dropped,
            because that reshard would release the storage the prefetch had just
            gathered.
+        4. **Move an eligible gradient reduce onto its anchor.** See
+           :meth:`_build_plan_defer_reduces`.
         """
         events = self._events
         plan = [PlanOp(trigger_event=e) for e in events]
@@ -504,4 +738,96 @@ class TraceAndReplayScheduler:
             if targets:
                 plan[i].prefetch_after = tuple(targets)
 
+        # 4) Move an eligible gradient reduce onto its anchor, if the policy asks
+        #    for it. Nothing happens by default.
+        self._build_plan_defer_reduces(events, plan, n)
+
         self._plan = plan
+
+    def _build_plan_defer_reduces(
+        self, events: list[TraceEvent], plan: list[PlanOp], n: int
+    ) -> None:
+        """Transformation 4: schedule the issuance time of the reduce-scatters.
+
+        For every ``ISSUE_REDUCE_GRADIENTS`` whose module carries a non-``none``
+        ``defer_grad_reduce`` policy, walk forward to the first anchor op —
+        ``WAIT_UNSHARD`` for ``before_prefetch``/``after_prefetch``, ``RESHARD`` for
+        ``next_reshard`` — and record on the reduce op that it must be queued, and on
+        the anchor op that it must launch the queue.
+
+        The walk **stops at an** ``END_MICROBATCH``: an anchor may never cross a
+        microbatch boundary, so a reduce with no reachable anchor before the
+        boundary stays exactly where it is (``defer_reduce`` stays ``False``). A
+        ``RESHARD`` the plan skips is not an anchor either, since a skipped reshard
+        returns before its drain.
+
+        Depth reuses the module's prefetch budget as an element budget, with the
+        same stop rule as step 3: ``None`` moves a single reduce onto an anchor,
+        ``0`` (or a negative) disables deferral entirely, and a positive value keeps
+        moving reduces onto one anchor until the accumulated
+        ``num_parameter_elements`` reach it. The budget is tested *before* the first
+        candidate is appended, so ``0`` cannot silently behave like ``None``.
+        """
+        if self._capture_active():
+            # Constraint: under CUDA-graph capture the reduce must be issued where
+            # it is recorded, so its fork edge stays part of the capture. The replay
+            # path re-checks the same condition.
+            return
+
+        anchor_elements: dict[int, int] = {}
+        for i in range(n):
+            if events[i].kind is not OpKind.ISSUE_REDUCE_GRADIENTS:
+                continue
+            module = events[i].module
+            policy = getattr(module._schedule_policy, "defer_grad_reduce", "none")
+            if policy == "none":
+                continue
+            budget = module._schedule_policy.forward_prefetch_size
+            if budget is not None and budget <= 0:
+                # ``SchedulePolicy`` defines a zero budget as "disabled"; test it
+                # before the first candidate, or ``0`` would silently defer once.
+                continue
+
+            anchor = self._find_reduce_anchor(events, plan, i, n, policy)
+            if anchor is None:
+                continue
+            if anchor in anchor_elements:
+                accumulated = anchor_elements[anchor]
+                if budget is None or accumulated >= budget:
+                    # This anchor already holds its budget's worth of reduces;
+                    # leave this one where it is rather than queueing it behind a
+                    # drain that is already beyond the depth bound.
+                    continue
+            else:
+                accumulated = 0
+
+            plan[i].defer_reduce = True
+            queued = plan[anchor].reduce_gradients_after
+            plan[anchor].reduce_gradients_after = (
+                queued + (module,) if queued is not None else (module,)
+            )
+            anchor_elements[anchor] = accumulated + module.num_parameter_elements
+
+    @staticmethod
+    def _find_reduce_anchor(
+        events: list[TraceEvent], plan: list[PlanOp], i: int, n: int, policy: str
+    ) -> int | None:
+        """Index of the anchor op that should launch the reduce recorded at ``i``.
+
+        Walks forward from ``i`` and returns the first ``WAIT_UNSHARD`` (for the
+        prefetch anchors) or the first non-skipped ``RESHARD`` (for
+        ``next_reshard``), or ``None`` when the microbatch ends first or no such op
+        follows in the trace.
+        """
+        for j in range(i + 1, n):
+            kind = events[j].kind
+            if kind is OpKind.END_MICROBATCH:
+                # Hard barrier: an anchor may never cross a microbatch boundary.
+                return None
+            if policy == "next_reshard":
+                if kind is OpKind.RESHARD and not plan[j].skip:
+                    return j
+                continue
+            if kind is OpKind.WAIT_UNSHARD:
+                return j
+        return None

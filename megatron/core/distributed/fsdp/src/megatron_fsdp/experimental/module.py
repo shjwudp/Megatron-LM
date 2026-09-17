@@ -159,7 +159,16 @@ class FsdpContext:
         return torch.cuda.current_stream(self.allgather_stream.device)
 
     def post_backward(self) -> None:
-        """Order current-stream consumers after this context's gradient reductions."""
+        """Order current-stream consumers after this context's gradient reductions.
+
+        This is the last barrier before ``optimizer.step()``. The trace-and-replay
+        scheduler launches every reduce it queued at its anchor or at the
+        ``END_MICROBATCH`` barrier, so a non-empty queue here means a reduction was
+        never launched and the optimizer would silently step on gradients whose
+        DP-outer reduction has not run.
+        """
+        if self.scheduler is not None:
+            self.scheduler.assert_no_pending_reduces()
         self.current_stream().wait_stream(self.reduce_scatter_stream)
         self._post_backward_hook_registered = False
 
@@ -615,8 +624,24 @@ class FsdpModule:
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
-    def _reduce_gradient_groups(self) -> None:
-        """Pack gradients and immediately launch their reduce-scatters."""
+    def _reduce_gradient_groups(self, *, is_last_microbatch: bool | None = None) -> None:
+        """Pack gradients and launch their reduce-scatters.
+
+        ``is_last_microbatch`` is the value ``reduce_partial_gradients`` uses to
+        decide whether this backward finalizes the deferred DP-outer reduction. The
+        trace-and-replay scheduler reads it from ``FsdpContext.is_last_microbatch``
+        *when it queues* the work and passes the captured value here, because that
+        context flag is mutable — the ``microbatch`` context manager flips it — and
+        would otherwise be read at execution time, possibly in a different
+        microbatch. ``None`` (the immediate path) reads the live context flag, which
+        is exactly today's behaviour.
+
+        While a CUDA graph is capturing the scheduler issues this call where the op
+        was recorded rather than queueing it, so the reduce-scatter stream joins the
+        capture through the same fork edge as before (see ``pre_backward`` above).
+        """
+        if is_last_microbatch is None:
+            is_last_microbatch = self.context.is_last_microbatch
         with self._nvtx_range("reduce_gradients"):
             context = self.context
             reduce_scatter_stream = context.reduce_scatter_stream
@@ -635,7 +660,7 @@ class FsdpModule:
                 reduce_scatter_stream.wait_stream(current_stream)
                 with torch.cuda.stream(reduce_scatter_stream):
                     group.reduce_partial_gradients(
-                        partial_grad, is_last_microbatch=self.context.is_last_microbatch
+                        partial_grad, is_last_microbatch=is_last_microbatch
                     )
 
     @property
