@@ -42,6 +42,12 @@ from .quantization import (
 )
 from .schedule import SchedulePolicy, TraceAndReplayScheduler
 
+# ---------------------------------------------------------------------------
+# TR163 PROBE (print-only, throwaway): count the (prefetch, orientation) each
+# FsdpModule.unshard call actually receives, so the job log can prove the
+# scheduler's per-phase narrowing is delivered. No logic change.
+_TRPROBE_DELIVERED = __import__("collections").Counter()
+
 
 def _is_in_backward() -> bool:
     """Return whether the current thread is executing an autograd GraphTask."""
@@ -471,6 +477,7 @@ class FsdpModule:
                 safe superset for a caller that does not know the pass, and a
                 request narrower than what is already materialized is a no-op.
         """
+        _TRPROBE_DELIVERED[(prefetch, orientation)] += 1  # TR163 PROBE
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups(orientation)
 
