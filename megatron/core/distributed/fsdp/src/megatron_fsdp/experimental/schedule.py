@@ -53,6 +53,64 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# TR163 PROBE -- print-only, no logic change (throwaway instrumentation).
+# The scheduler's own logger.info does not reach the SLURM job log, so the
+# activation of trace-and-replay and the orientation actually delivered to
+# FsdpModule.unshard are surfaced with prints instead.
+_TRPROBE_RANK = __import__("os").environ.get("RANK", "?")
+_TRPROBE_ENV_PRINTED = False
+_TRPROBE_MAX_DELIVERED_PRINTS = 4
+
+
+def _trprobe(message: str) -> None:
+    """Print one probe line so it reaches the job log (logger.info does not)."""
+    print(f"[TRPROBE rank={_TRPROBE_RANK}] {message}", flush=True)
+
+
+def _trprobe_env() -> None:
+    """Record the interpreter and TransformerEngine actually imported."""
+    import sys as _sys
+
+    try:
+        import transformer_engine as _te
+
+        version = getattr(_te, "__version__", None)
+        location = getattr(_te, "__file__", None)
+    except Exception as exc:  # probe only: never mask a real failure
+        version, location = f"<import failed: {exc!r}>", None
+    _trprobe(f"ENV sys.executable={_sys.executable} te_version={version} te_file={location}")
+
+
+def _trprobe_plan(scheduler) -> None:
+    """Summarize a compiled plan: op kinds, resolved orientations, skipped reshards."""
+    from collections import Counter
+
+    kinds: Counter = Counter()
+    orientations: Counter = Counter()
+    skipped = 0
+    for plan_op in scheduler._plan:
+        kind = plan_op.trigger_event.kind.name
+        kinds[kind] += 1
+        if kind == "ISSUE_UNSHARD":
+            orientations[getattr(plan_op, "orientation", None)] += 1
+        if plan_op.skip:
+            skipped += 1
+    _trprobe(f"COMPILED plan={len(scheduler._plan)} kinds={dict(kinds)}")
+    _trprobe(f"COMPILED unshard_orientations={dict(orientations)} skipped_reshards={skipped}")
+
+
+def _trprobe_delivered() -> None:
+    """Print the (prefetch, orientation) pairs FsdpModule.unshard actually received."""
+    try:
+        from .module import _TRPROBE_DELIVERED
+    except Exception:  # probe only: never mask a real failure
+        return
+
+    summary = {f"prefetch={p},orientation={o}": n for (p, o), n in _TRPROBE_DELIVERED.items()}
+    _trprobe(f"DELIVERED unshard_calls={summary}")
+
+
 @dataclass(frozen=True)
 class SchedulePolicy:
     """Control communication scheduling for one FSDP module.
@@ -179,6 +237,9 @@ class TraceAndReplayScheduler:
         self._op_index = 0
         # Diagnostics.
         self._divergences = 0
+        # TR163 PROBE
+        self._trprobe_iters = 0
+        self._trprobe_delivered_prints = 0
 
     # ------------------------------------------------------------------
     # Lifecycle: iteration boundaries
@@ -195,6 +256,13 @@ class TraceAndReplayScheduler:
             self._mode = _Mode.TRACING
             logger.debug("TraceAndReplayScheduler: beginning a tracing step.")
         self._op_index = 0
+        # TR163 PROBE
+        self._trprobe_iters += 1
+        global _TRPROBE_ENV_PRINTED
+        if not _TRPROBE_ENV_PRINTED:
+            _TRPROBE_ENV_PRINTED = True
+            _trprobe_env()
+        _trprobe(f"begin_iteration mode={self._mode.name}")
 
     def end_iteration(self) -> None:
         """Compile the traced op stream into a plan, or validate the replay.
@@ -231,6 +299,18 @@ class TraceAndReplayScheduler:
                 self._events = []
                 self._plan = []
         self._op_index = 0
+        # TR163 PROBE
+        if self._mode is _Mode.REPLAYING and (
+            self._trprobe_delivered_prints < _TRPROBE_MAX_DELIVERED_PRINTS
+            or self._trprobe_iters % 25 == 0
+        ):
+            self._trprobe_delivered_prints += 1
+            _trprobe_delivered()
+        _trprobe(
+            f"end_iteration mode={self._mode.name} ops={self._op_index} "
+            f"plan={len(self._plan)} events={len(self._events)} "
+            f"divergences={self._divergences}"
+        )
 
     def report(self) -> None:
         """Log one-line scheduler statistics (called periodically by the loop)."""
