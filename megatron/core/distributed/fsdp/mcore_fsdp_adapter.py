@@ -661,6 +661,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             device=device,
             use_symmetric_memory=ddp_config.nccl_ub,
             reuse_existing=True,
+            # The trace-and-replay scheduler drives execution when combined 1F1B is
+            # overlapped, and it bypasses schedule_policy's own prefetch walk. Give it
+            # the same element budget so the scheduler path prefetches as deeply as the
+            # automatic one instead of falling back to a single successor.
+            trace_replay_prefetch_budget=ddp_config.suggested_communication_unit_size,
             use_trace_replay=config.overlap_moe_expert_parallel_comm,
         ):
             if expert_dp_mesh is not None:

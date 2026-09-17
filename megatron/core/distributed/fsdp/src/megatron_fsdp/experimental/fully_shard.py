@@ -69,6 +69,7 @@ def fully_shard_context(
     unify_communication_stream: bool = False,
     reuse_existing: bool = False,
     use_trace_replay: bool = False,
+    trace_replay_prefetch_budget: int | None = None,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -98,6 +99,11 @@ def fully_shard_context(
             fixed at context creation: the scheduler is attached on demand, so a scope
             that reuses a context created by a caller that did not know about
             trace-and-replay still gets one.
+        trace_replay_prefetch_budget: Parameter-element budget for the trace-and-replay
+            scheduler's multi-module all-gather prefetch. ``None`` (the default)
+            prefetches a single successor, which is the previous behaviour; a positive
+            value prefetches ahead in the plan until the budget is reached, mirroring
+            ``SchedulePolicy.forward/backward_prefetch_size`` on the non-scheduler path.
     """
     existing = _FSDP_CONTEXT.get()
     if existing is not None:
@@ -117,7 +123,7 @@ def fully_shard_context(
             # megatron/training) may not know whether an occurrence-based schedule will
             # drive it, and silently dropping the request would leave the combined-1F1B
             # hooks without a scheduler.
-            _ensure_trace_replay_scheduler(existing, use_trace_replay)
+            _ensure_trace_replay_scheduler(existing, use_trace_replay, trace_replay_prefetch_budget)
             yield existing
             return
         raise RuntimeError("fully_shard_context does not support nesting.")
@@ -131,7 +137,7 @@ def fully_shard_context(
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
     )
-    _ensure_trace_replay_scheduler(context, use_trace_replay)
+    _ensure_trace_replay_scheduler(context, use_trace_replay, trace_replay_prefetch_budget)
     token = _FSDP_CONTEXT.set(context)
     try:
         yield context
@@ -143,7 +149,9 @@ def fully_shard_context(
         _FSDP_CONTEXT.reset(token)
 
 
-def _ensure_trace_replay_scheduler(context: FsdpContext, use_trace_replay: bool) -> None:
+def _ensure_trace_replay_scheduler(
+    context: FsdpContext, use_trace_replay: bool, prefetch_budget: int | None = None
+) -> None:
     """Attach ``context``'s trace-and-replay scheduler if it does not have one yet.
 
     Scheduler construction is idempotent: a context owns at most one
@@ -154,10 +162,14 @@ def _ensure_trace_replay_scheduler(context: FsdpContext, use_trace_replay: bool)
     Args:
         context: Context that should own the scheduler.
         use_trace_replay: Whether the calling scope requested trace-and-replay.
+        prefetch_budget: Parameter-element budget for the scheduler's multi-module
+            all-gather prefetch; ``None`` prefetches a single successor. Only used
+            the first time the scheduler is attached, since a later request leaves
+            the existing scheduler (and its plan) in place.
     """
     if not use_trace_replay or context.scheduler is not None:
         return
-    context.scheduler = TraceAndReplayScheduler(context)
+    context.scheduler = TraceAndReplayScheduler(context, prefetch_budget)
 
 
 def fully_shard(

@@ -132,15 +132,16 @@ class PlanOp:
       must carry. It is the union of what every unshard sharing that
       materialization needs, so it can be wider than the traced event's
       orientation but never narrower.
-    - ``prefetch_after``: after handling this op, issue an all-gather for the
-      given ``(module, orientation)`` so its unshard overlaps the current module's
-      compute.
+    - ``prefetch_after``: after handling this op, issue all-gathers for the given
+      ``(module, orientation)`` pairs so their unshards overlap this module's
+      compute. More than one entry means the plan is prefetching several modules
+      ahead, bounded by the scheduler's parameter-element budget.
     """
 
     trigger_event: TraceEvent
     skip: bool = False
     orientation: str | None = None
-    prefetch_after: tuple[FsdpModule, str | None] | None = None
+    prefetch_after: tuple[tuple[FsdpModule, str | None], ...] | None = None
 
 
 class TraceAndReplayScheduler:
@@ -165,18 +166,23 @@ class TraceAndReplayScheduler:
     _op_index: int
     _enabled: bool
 
-    def __init__(self, context: FsdpContext) -> None:
+    def __init__(self, context: FsdpContext, prefetch_budget: int | None = None) -> None:
         """Create a scheduler.
 
         Args:
             context: The owning :class:`FsdpContext`, used for streams and to
                 validate the enabled flag.
+            prefetch_budget: Parameter-element budget for multi-module prefetch.
+                ``None`` keeps the historical single-successor lookahead; a
+                positive value lets :meth:`_build_plan` prefetch further ahead,
+                bounded by the accumulated ``num_parameter_elements``.
         """
         self._context = context
         self._mode = _Mode.OFF
         self._events = []
         self._plan = []
         self._op_index = 0
+        self._prefetch_budget = prefetch_budget
         # Diagnostics.
         self._divergences = 0
 
@@ -282,17 +288,19 @@ class TraceAndReplayScheduler:
         module.unshard(orientation=orientation)
 
     def wait_unshard(self, module: FsdpModule) -> None:
-        """Make compute wait on ``module``'s all-gather, then issue its prefetch.
+        """Make compute wait on ``module``'s all-gather, then issue its prefetches.
 
-        During replay, after the wait, issues the plan's appended prefetch (if
-        any): an all-gather for the next module that overlaps this module's
-        compute. During tracing this is a plain wait (no prefetch yet).
+        During replay, after the wait, issues the plan's appended prefetches (if
+        any): all-gathers for the modules that will be unsharded next, so they
+        overlap this module's compute. There can be more than one when the scheduler
+        was given a parameter-element budget. During tracing this is a plain wait
+        (no prefetch yet).
         """
         plan_op = self._record(OpKind.WAIT_UNSHARD, module, None)
         module.wait_unshard()
-        if plan_op is not None and plan_op.prefetch_after is not None:
-            target, orientation = plan_op.prefetch_after
-            self._prefetch(target, orientation)
+        if plan_op is not None and plan_op.prefetch_after:
+            for target, orientation in plan_op.prefetch_after:
+                self._prefetch(target, orientation)
 
     def reshard(self, module: FsdpModule) -> None:
         """Release ``module``'s unsharded storage, unless the plan skips it.
@@ -399,10 +407,16 @@ class TraceAndReplayScheduler:
            needs the *other* orientation — the normal forward(row-wise) followed by
            backward(column-wise) transition of one FSDP unit — the reshard must
            execute, or the backward pass would run with column-wise data missing.
-        3. **Append prefetch.** At each ``WAIT_UNSHARD`` op, prefetch the next
-           module that will be unsharded (skipping reshard events) in the
-           orientation that module's own materialization will use, so its
-           all-gather overlaps the current module's compute.
+        3. **Append prefetch.** At each ``WAIT_UNSHARD`` op, prefetch the modules
+           that will be unsharded next (skipping reshard events), each in the
+           orientation its own materialization will use, so their all-gathers
+           overlap the current module's compute. A ``None`` budget keeps the
+           historical single-successor lookahead; a positive budget extends the walk
+           until the accumulated ``num_parameter_elements`` reaches it, so lookahead
+           depth tracks module sizes rather than a fixed count. A candidate whose
+           demand unshard is separated from this point by its own reshard is
+           dropped, because that reshard would release the storage the prefetch had
+           just gathered.
         """
         events = self._events
         plan = [PlanOp(trigger_event=e) for e in events]
@@ -446,17 +460,38 @@ class TraceAndReplayScheduler:
                         plan[index].orientation = materialized
                     resident = need
 
-        # 3) Prefetch the next unshard (skipping reshard events) after each wait,
-        #    in the orientation that unshard's own materialization will use.
+        # 3) Prefetch the modules that will be unsharded next (skipping reshard
+        #    events), each in the orientation its own materialization will use, so
+        #    their all-gathers overlap this module's compute. A ``None`` budget stops
+        #    after one successor (the historical behaviour); otherwise the walk
+        #    continues until the accumulated parameter elements reach the budget. A
+        #    candidate whose own reshard falls between here and its demand unshard is
+        #    skipped, since that reshard would release what the prefetch gathered.
         for i in range(n):
             if events[i].kind is not OpKind.WAIT_UNSHARD:
                 continue
+            targets: list[tuple[FsdpModule, str | None]] = []
+            seen = {id(events[i].module)}
+            resharded: set[int] = set()
+            accumulated = 0
             for j in range(i + 1, n):
-                if (
-                    events[j].kind is OpKind.ISSUE_UNSHARD
-                    and events[j].module is not events[i].module
-                ):
-                    plan[i].prefetch_after = (events[j].module, plan[j].orientation)
+                event = events[j]
+                if event.kind is OpKind.RESHARD:
+                    resharded.add(id(event.module))
+                    continue
+                if event.kind is not OpKind.ISSUE_UNSHARD:
+                    continue
+                module = event.module
+                if id(module) in seen or id(module) in resharded:
+                    continue
+                seen.add(id(module))
+                targets.append((module, plan[j].orientation))
+                if self._prefetch_budget is None:
                     break
+                accumulated += module.num_parameter_elements
+                if accumulated >= self._prefetch_budget:
+                    break
+            if targets:
+                plan[i].prefetch_after = tuple(targets)
 
         self._plan = plan

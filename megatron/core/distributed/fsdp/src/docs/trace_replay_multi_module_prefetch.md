@@ -1,9 +1,14 @@
 # Trace-and-replay: multi-module all-gather prefetch
 
-Status: **design proposal, draft for review** — no implementation in this PR.
+Status: **implemented, draft for review** — the design below is settled and this PR
+now also carries the implementation. The problem statement, the option analysis,
+the correctness argument, the measurement plan, and the open questions are kept as
+they were written; §5 records what actually landed and §5.1 where the
+implementation differs from the original sketch.
 
 Base: `fix/tr161-vpp-trace-replay` @ `757668734` (the merge of the trace-and-replay
-scheduler and its orientation fix).
+scheduler and its orientation fix). The implementation commit sits directly on top
+of the original documentation commit on `design/tr163-multi-module-prefetch`.
 
 Related: the trace-and-replay scheduler, its `_build_plan` reshard-skip logic, and
 the orientation work that made per-phase unshard narrowing take effect.
@@ -12,8 +17,8 @@ the orientation work that made per-phase unshard narrowing take effect.
 
 ## 1. Problem
 
-On the trace-and-replay path the all-gather prefetch depth is hard-coded to **one
-module**:
+Before this change, the trace-and-replay path hard-coded the all-gather prefetch
+depth to **one** module:
 
 ```python
 # megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/schedule.py
@@ -71,9 +76,10 @@ default, so `_prefetch_parameter_groups` never runs. The trace-and-replay path
 therefore has **strictly less pipelining than the path it replaces** — it inherits a
 depth of one where the module path can go deeper.
 
-This is the gap to close. The plan is also better placed to close it: it knows the
-exact sequence of upcoming unshards and each one's orientation, whereas the
-module-level walk can only follow a static `forward_order` / `backward_order`.
+This was the gap to close, and this PR closes it (see §5). The plan is also better
+placed to close it: it knows the exact sequence of upcoming unshards and each one's
+orientation, whereas the module-level walk can only follow a static `forward_order`
+/ `backward_order`.
 
 ---
 
@@ -155,6 +161,13 @@ scheduler = TraceAndReplayScheduler(context, prefetch_budget=schedule_policy.for
 
 (`forward_prefetch_size` and `backward_prefetch_size` are both set from
 `ddp_config.suggested_communication_unit_size`, so one budget covers both phases.)
+
+*As implemented this sketch differs in three details — the reshard cutoff is folded
+into the same walk rather than applied as a separate pass, module identity is
+compared by `id` (matching the rest of `_build_plan`), and the budget is threaded
+through `fully_shard_context` as an explicit argument instead of being read from a
+`SchedulePolicy` object that the `experimental/` package cannot see. §5.1 records
+each difference and its consequence.*
 
 ### 3.2 Why a budget rather than a fixed module count
 
@@ -247,19 +260,73 @@ attractive lever:
 
 ---
 
-## 5. Implementation sketch
+## 5. Implementation (as landed)
 
 | file | change |
 |---|---|
-| `experimental/schedule.py` | `PlanOp.prefetch_after` becomes a tuple of `(module, orientation)`; `_build_plan` step 3 rewritten to accumulate a budgeted set and to drop entries cut off by a reshard; `wait_unshard` loops over the set; `TraceAndReplayScheduler.__init__` takes the budget |
-| `experimental/fully_shard.py` | pass the budget from the schedule policy when constructing the scheduler |
-| `experimental/module.py` | no change (prefetch stays `prefetch="none"` here; worth asserting to prevent recursion) |
-| tests | extend the `_build_plan` fuzz harness: assert the lookahead set is ordered, distinct, budget-bounded, excludes the module being waited on, and contains no entry whose demand unshard is separated from it by a reshard |
-| config | none needed if `--suggested-communication-unit-size` is reused — but note it also feeds `suggested_RS_queue_capacity` in `megatron_fsdp.py`, so attribution must account for that second effect |
+| `experimental/schedule.py` | `PlanOp.prefetch_after` is now `tuple[tuple[FsdpModule, str \| None], ...] \| None`; `TraceAndReplayScheduler.__init__` takes `prefetch_budget`; `_build_plan` step 3 walks forward from each `WAIT_UNSHARD`, accumulating `num_parameter_elements`, skipping the waited-on module and any module whose own `RESHARD` falls before its demand unshard, and stopping after one target when the budget is `None`; `wait_unshard` loops over the set. |
+| `experimental/fully_shard.py` | `fully_shard_context(..., trace_replay_prefetch_budget: int \| None = None)`, threaded into `_ensure_trace_replay_scheduler` and then the constructor. A context owns at most one scheduler, so only the first attach uses the budget; a later call reusing the context leaves the existing plan in place. |
+| `mcore_fsdp_adapter.py` | passes `trace_replay_prefetch_budget=ddp_config.suggested_communication_unit_size` — the same config value that already feeds `SchedulePolicy.forward/backward_prefetch_size`, so the scheduler path and the module path share one sizing concept. |
+| `experimental/module.py` | no change. `_prefetch` still calls `unshard(orientation=...)` with `prefetch` left at `"none"`, so the budget walk cannot recurse into `_prefetch_parameter_groups` and the two mechanisms do not double up. The sketch's "worth asserting" idea was not turned into an assertion. |
+| tests | new `tests/unit_tests/distributed/mfsdp_v2/test_trace_replay_prefetch.py` drives `_build_plan` with stub modules — no GPU, no `FsdpContext`, no `torch.distributed`. It pins: `None` = one successor; a budget extends the lookahead by accumulated elements; targets are distinct and never the waited-on module; a resharded target is dropped; a target unsharded before its reshard is kept; a target carries its own window's orientation; tracing issues nothing. |
+| config | none added. `--suggested-communication-unit-size` is reused, so the caveat still applies: it also feeds `suggested_RS_queue_capacity` in `megatron_fsdp.py`, and attribution of any measured effect must account for that second effect. |
+
+### 5.1 Where the implementation differs from the sketch
+
+1. **The reshard cutoff is folded into the same walk and applies to every budget,
+   including `None`.** The §3.1 sketch only showed the `seen`/budget loop and left
+   the cutoff to §3.5; the implementation checks it inline. The consequence for the
+   backwards-compatibility contract is worth stating precisely: with
+   `prefetch_budget=None` the depth is one and the target is the next distinct
+   module, **except** when that module's own reshard falls between the wait and its
+   demand unshard. The historical walk prefetched that module anyway and its own
+   reshard then released the gather. The implementation skips it and takes the next
+   module still valid at its demand unshard (or nothing, if none is). Depth stays
+   one, and the skipped prefetch was provably useless — but the trace is not
+   byte-identical to the old walk, so it is pinned by
+   `test_default_budget_skips_a_resharded_successor_to_the_next_valid_one` rather
+   than left implicit.
+2. **Identity is compared by `id`, not by `==`.** This matches the rest of
+   `_build_plan` (`events[j].module is not events[i].module`, `per_module_ops`
+   keyed by `id`) and keeps stub/test modules usable without `__eq__`.
+3. **The budget is threaded as an explicit `fully_shard_context` argument**, not
+   read from `schedule_policy.forward_prefetch_size` as the sketch's snippet shows.
+   The scheduler is constructed inside the `experimental/` package, which does not
+   see the adapter's `SchedulePolicy`; the adapter therefore passes the same
+   `ddp_config.suggested_communication_unit_size` that feeds both
+   `SchedulePolicy` prefetch sizes. The sizing semantics are unchanged, but the
+   plumbing in the sketch's §3.1 snippet is not what landed.
+4. **The tests are deterministic cases rather than an extended fuzz harness.** No
+   `_build_plan` fuzz harness existed to extend, so a new focused test module was
+   added instead; it constructs explicit traces, which makes each pinned property
+   readable as a single scenario.
+
+### 5.2 Verification
+
+The tests are plan-level and need neither a GPU nor a distributed group, but the
+repository's import chain requires a newer `torch` than a bare workstation has.
+They were run inside the site's runtime container on a single node with no GPU
+request:
+
+```
+srun --container-image=nemo-26.08.sqsh --container-mounts=/lustre/:/lustre/ \
+  python -m pytest -q tests/unit_tests/distributed/mfsdp_v2/test_trace_replay_prefetch.py
+```
+
+Result: **8 passed**, and a `--collect-only` over the whole
+`tests/unit_tests/distributed/mfsdp_v2/` directory collects 205 tests with no
+import error. `python -m py_compile` and `ruff check` are clean on all changed
+files. The design's §6 measurement plan (stall decomposition, budget sweep,
+nsys mechanism, determinism guardrails) has **not** been run yet: this PR is the
+implementation, and the numbers remain to be produced.
 
 ---
 
 ## 6. Measurement plan
+
+*Status: not yet run. This PR lands the implementation and its plan-level unit
+tests (§5.2); Step 0's kill criterion and the Step 1–3 frontier below are still
+outstanding and must be run before any performance claim is made.*
 
 **Step 0 — is there headroom at all?** Before writing code, quantify the exposed
 stall from profiles we already have: for each `wait_unshard`, the gap between the end
@@ -302,7 +369,8 @@ without giving up parameter sharding.
    twice the rate of a single orientation, which is closer to the real cost than an
    element count. A natural follow-up if the frontier shows the element budget
    mispricing orientation.
-4. **Prefetch across a reshard** — currently dropped (§3.5). If the plan's skip
+4. **Prefetch across a reshard** — implemented as the §3.5 cutoff: such a candidate
+   is skipped and the walk continues to the next still-valid one. If the plan's skip
    heuristic later releases storage less often, more lookahead becomes usable.
 5. **Does the union orientation in `prefetch_after` still make sense at depth > 1?**
    For a deep lookahead, prefetching a later module's window union early may be
