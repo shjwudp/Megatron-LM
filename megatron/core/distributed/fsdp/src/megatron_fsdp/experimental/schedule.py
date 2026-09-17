@@ -249,28 +249,37 @@ class TraceAndReplayScheduler:
     def issue_unshard(self, module: FsdpModule, orientation: PayloadOrientation) -> None:
         """Materialize ``module``'s parameters and record/validate the op.
 
-        ``orientation`` is the payload the caller is about to compute with:
-        ``"rowwise"`` from a forward hook, ``"colwise"`` from a backward hook. It
-        is recorded on the trace event, which :meth:`_build_plan` then uses both to
-        widen a materialization that has to serve more than one unshard and to
-        decide whether the reshard separating two of a module's materializations
-        can be skipped. While tracing, the op executes with ``"both"`` instead:
-        the trace has to be correct whatever the plan later decides, and a module
-        whose forward and backward unshards share one residency window needs
-        column-wise data in backward.
+        ``orientation`` is the payload the caller is about to compute with
+        (``"rowwise"`` from a forward hook, ``"colwise"`` from a backward hook) and
+        is authoritative for the materialization: this method always requests
+        exactly that orientation, while tracing and while replaying alike.
+
+        Correctness does not depend on the plan, because ``FsdpModule.unshard``
+        owns the residency bookkeeping and widens in place when a requested
+        direction is not already materialized (see
+        ``FsdpModule._unshard_parameter_groups``): a request no wider than what is
+        resident is served as-is, and a request for a direction that is missing
+        gathers only the directions still missing. A module whose forward and
+        backward unshards share one residency window is therefore widened by the
+        module at the backward, instead of being over-materialized to ``"both"`` at
+        the forward.
+
+        ``orientation`` is also recorded on the trace event, which
+        :meth:`_build_plan` uses to decide whether the reshard separating two of a
+        module's materializations can be skipped, and to choose the orientation for
+        a speculative prefetch. That is a scheduling input only; it never overrides
+        the orientation requested here.
 
         For a root, syncs the all-gather stream with the current stream first,
         as an external scheduler must (``module.unshard()`` requires it for a
-        root). The materialization is idempotent: if a preceding prefetch (or a
-        skipped reshard) already left the storage resident, this is a no-op.
+        root).
         """
-        plan_op = self._record(OpKind.ISSUE_UNSHARD, module, orientation)
-        if plan_op is not None and plan_op.orientation is not None:
-            module.unshard(plan_op.orientation)
-        else:
-            # Tracing, or a replay that diverged mid-op: materialize the safe
-            # superset so the op stream being recorded stays correct.
-            module.unshard(BOTH)
+        self._record(OpKind.ISSUE_UNSHARD, module, orientation)
+        # ``prefetch`` is the FIRST parameter of ``FsdpModule.unshard``, so the
+        # orientation must be passed by keyword; positionally it would bind to
+        # ``prefetch`` and leave ``orientation`` at its ``BOTH`` default, silently
+        # disabling per-phase narrowing on the scheduler path.
+        module.unshard(orientation=orientation)
 
     def wait_unshard(self, module: FsdpModule) -> None:
         """Make compute wait on ``module``'s all-gather, then issue its prefetch.
@@ -359,7 +368,7 @@ class TraceAndReplayScheduler:
         already resident instead of re-gathering the other orientation. ``None``
         (no plan available) falls back to the safe superset.
         """
-        module.unshard(orientation or BOTH)
+        module.unshard(orientation=orientation or BOTH)
 
     def _retrace(self, kind: OpKind, module: FsdpModule, orientation: str | None) -> None:
         """Reset to tracing and seed the new trace with the current op."""
