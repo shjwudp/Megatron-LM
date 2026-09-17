@@ -368,6 +368,13 @@ def _ddp_wrap(
         # context around the whole loop so every chunk joins the SAME FSDP context, which is
         # then finalized once here. Mirrors wrap_model_chunks_with_ddp() in
         # megatron/training/training.py.
+        #
+        # Enable trace-and-replay on the ambient context when the combined-1F1B EP-overlap
+        # schedule is active: the per-chunk adapter requests
+        # ``use_trace_replay=config.overlap_moe_expert_parallel_comm``, but a
+        # ``reuse_existing`` join yields THIS context as-is, so this context's flags are the
+        # ones that take effect. Without this the scheduler would be silently disabled for
+        # every VPP + overlap run.
         share_fsdp_context = (
             fully_shard_context is not None
             and use_megatron_fsdp
@@ -376,7 +383,9 @@ def _ddp_wrap(
         )
         shared_context = (
             fully_shard_context(
-                reuse_existing=True, use_symmetric_memory=ddp_config.nccl_ub
+                reuse_existing=True,
+                use_symmetric_memory=ddp_config.nccl_ub,
+                use_trace_replay=get_model_config(model[0]).overlap_moe_expert_parallel_comm,
             )
             if share_fsdp_context
             else nullcontext()

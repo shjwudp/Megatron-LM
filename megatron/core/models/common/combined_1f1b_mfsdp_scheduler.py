@@ -5,42 +5,62 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantization 
     COLWISE,
     ROWWISE,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.schedule import (
+    TraceAndReplayScheduler,
+)
+
+
+def _scheduler(module: FsdpModule) -> TraceAndReplayScheduler:
+    """Return the context's trace-and-replay scheduler for ``module``."""
+    scheduler = module.context.scheduler
+    assert isinstance(
+        scheduler, TraceAndReplayScheduler
+    ), "Expected a TraceAndReplayScheduler on the FSDP context."
+    return scheduler
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
     """Forward pre-hook: unshard the owning FSDP module before the submodule forward."""
 
     def hook(submodule, _args, _kwargs):
+        # The scheduler drives ``unshard()`` directly, so it must perform the root
+        # stream sync that ``pre_forward`` otherwise does (see ``unshard``'s
+        # docstring); it has to happen before the all-gather is issued.
         if owner.is_root():
             context = owner.context
             context.allgather_stream.wait_stream(context.current_stream())
         # A forward GEMM consumes the row-wise MXFP8 payload. If the same
         # materialization also has to serve a backward pass (activation
         # recomputation with no reshard between them), the module widens it.
-        owner.unshard(orientation=ROWWISE)
+        scheduler = _scheduler(owner)
+        scheduler.issue_unshard(owner, ROWWISE)
+        scheduler.wait_unshard(owner)
 
     return hook
 
 
 def _make_unshard_backward_hook(owner: FsdpModule):
-    """Backward pre-hook: unshard the owning FSDP module before the submodule backward."""
+    """Create a backward pre-hook that unshards the owning FSDP module before the submodule backward."""
 
     def hook(submodule, _grad_output):
         # The backward GEMM consumes the column-wise MXFP8 payload.
-        owner.unshard(orientation=COLWISE)
+        scheduler = _scheduler(owner)
+        scheduler.issue_unshard(owner, COLWISE)
+        scheduler.wait_unshard(owner)
 
     return hook
 
 
 def _module_post_backward_hook(module: FsdpModule) -> None:
-    module.reshard()
-    module._reduce_gradient_groups()
+    scheduler = _scheduler(module)
+    scheduler.reshard(module)
+    scheduler.issue_reduce_gradients(module)
 
 
 def reshard_fsdp_module(module: FsdpModule) -> None:
     """Reshard the FSDP module after fine-grained computation."""
     assert isinstance(module, FsdpModule), "Expected an FsdpModule."
-    module.reshard()
+    _scheduler(module).reshard(module)
 
 
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:
