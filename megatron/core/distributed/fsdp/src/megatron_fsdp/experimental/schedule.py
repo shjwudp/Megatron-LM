@@ -266,11 +266,15 @@ class TraceAndReplayScheduler:
         """
         plan_op = self._record(OpKind.ISSUE_UNSHARD, module, orientation)
         if plan_op is not None and plan_op.orientation is not None:
-            module.unshard(plan_op.orientation)
+            # ``prefetch`` is the FIRST parameter of ``FsdpModule.unshard``, so the
+            # orientation has to be passed by keyword; positionally it would bind to
+            # ``prefetch`` and leave ``orientation`` at its ``BOTH`` default, making
+            # the plan's per-phase narrowing inert.
+            module.unshard(orientation=plan_op.orientation)
         else:
             # Tracing, or a replay that diverged mid-op: materialize the safe
             # superset so the op stream being recorded stays correct.
-            module.unshard(BOTH)
+            module.unshard(orientation=BOTH)
 
     def wait_unshard(self, module: FsdpModule) -> None:
         """Make compute wait on ``module``'s all-gather, then issue its prefetch.
@@ -359,7 +363,7 @@ class TraceAndReplayScheduler:
         already resident instead of re-gathering the other orientation. ``None``
         (no plan available) falls back to the safe superset.
         """
-        module.unshard(orientation or BOTH)
+        module.unshard(orientation=orientation or BOTH)
 
     def _retrace(self, kind: OpKind, module: FsdpModule, orientation: str | None) -> None:
         """Reset to tracing and seed the new trace with the current op."""
