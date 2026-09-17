@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantization import (
+    COLWISE,
+    ROWWISE,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.schedule import (
     TraceAndReplayScheduler,
 )
@@ -26,7 +30,9 @@ def _make_unshard_forward_hook(owner: FsdpModule):
             context = owner.context
             context.allgather_stream.wait_stream(context.current_stream())
         scheduler = _scheduler(owner)
-        scheduler.issue_unshard(owner)
+        # A forward GEMM consumes the row-wise MXFP8 payload; the plan widens this
+        # to "both" if the same materialization also has to serve a backward pass.
+        scheduler.issue_unshard(owner, ROWWISE)
         scheduler.wait_unshard(owner)
 
     return hook
@@ -37,7 +43,9 @@ def _make_unshard_backward_hook(owner: FsdpModule):
 
     def hook(submodule, _grad_output):
         scheduler = _scheduler(owner)
-        scheduler.issue_unshard(owner)
+        # The backward GEMM consumes the column-wise MXFP8 payload; the plan widens
+        # this to "both" if the same materialization also serves a forward pass.
+        scheduler.issue_unshard(owner, COLWISE)
         scheduler.wait_unshard(owner)
 
     return hook
