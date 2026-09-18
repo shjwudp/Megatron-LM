@@ -26,11 +26,11 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-from ..mixed_precision import MixedPrecisionPolicy
+from ..mixed_precision import MixedPrecisionPolicy, fp8_need_transpose_data, is_float8tensor
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
-from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
+from .parameter_group import Fp8ParameterGroup, FsdpParameterGroup, get_containing_parameter_group
 from .placement import Flat
 from .schedule import SchedulePolicy
 
@@ -38,6 +38,11 @@ from .schedule import SchedulePolicy
 def _is_in_backward() -> bool:
     """Return whether the current thread is executing an autograd GraphTask."""
     return torch._C._current_graph_task_id() != -1
+
+
+def _is_fp8_parameter(parameter: nn.Parameter) -> bool:
+    """Whether ``parameter`` is an MXFP8 primary weight (needs both orientations)."""
+    return is_float8tensor(parameter) and fp8_need_transpose_data(parameter)
 
 
 class FsdpContext:
@@ -211,11 +216,24 @@ class FsdpModule:
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
+
+        for name, parameter in owned_parameters.items():
+            if is_float8tensor(parameter) and not fp8_need_transpose_data(parameter):
+                raise ValueError(
+                    f"MFSDP v2 only supports MXFP8 primary weights; parameter {name!r} is "
+                    f"a {type(parameter).__name__} without transpose data."
+                )
+
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
             group_dtype = next(iter(group_parameters.values())).dtype
+            parameter_group_cls = (
+                Fp8ParameterGroup
+                if all(_is_fp8_parameter(parameter) for parameter in group_parameters.values())
+                else FsdpParameterGroup
+            )
             parameter_groups.append(
-                FsdpParameterGroup(
+                parameter_group_cls(
                     owning_module=self,
                     fqn_to_parameter=group_parameters,
                     mesh=mesh,
@@ -400,7 +418,11 @@ class FsdpModule:
 
         self.unshard(prefetch="forward" if not is_recomputing else "none")
 
-    def unshard(self, prefetch: Literal["forward", "backward", "none"] = "none") -> None:
+    def unshard(
+        self,
+        prefetch: Literal["forward", "backward", "none"] = "none",
+        orientation: str = "rowwise",
+    ) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
 
         External schedulers invoking this directly (rather than through the
@@ -409,9 +431,15 @@ class FsdpModule:
         ``context.allgather_stream.wait_stream(context.current_stream())``
         before this when ``self.is_root()``; the automatic forward path
         performs that root sync in ``pre_forward()`` immediately before this.
+
+        Args:
+            prefetch: Which order to prefetch successors from.
+            orientation: Payload orientation passed down to MXFP8 groups:
+                ``"rowwise"`` for a forward pass, ``"colwise"`` for a backward
+                pass. Regular groups ignore it.
         """
         with self._nvtx_range("unshard"):
-            self._unshard_parameter_groups()
+            self._unshard_parameter_groups(orientation)
             assert self._unshard_event is not None
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
@@ -420,36 +448,48 @@ class FsdpModule:
             context = self.context
             if prefetch == "forward":
                 self._prefetch_parameter_groups(
-                    context.forward_order, self._schedule_policy.forward_prefetch_size
+                    context.forward_order,
+                    self._schedule_policy.forward_prefetch_size,
+                    orientation,
                 )
             elif prefetch == "backward":
                 self._prefetch_parameter_groups(
-                    context.backward_order, self._schedule_policy.backward_prefetch_size
+                    context.backward_order,
+                    self._schedule_policy.backward_prefetch_size,
+                    orientation,
                 )
 
     def _prefetch_parameter_groups(
-        self, order: IndexedOrder["FsdpModule"], prefetch_size: int | None
+        self,
+        order: IndexedOrder["FsdpModule"],
+        prefetch_size: int | None,
+        orientation: str = "rowwise",
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
         next_module = order.next_item(self)
         if prefetch_size is None:
             if next_module is not None:
-                next_module._unshard_parameter_groups()
+                next_module._unshard_parameter_groups(orientation)
             return
 
         prefetched_size = 0
         while next_module is not None and prefetched_size < prefetch_size:
-            next_module._unshard_parameter_groups()
+            next_module._unshard_parameter_groups(orientation)
             prefetched_size += next_module.num_parameter_elements
             next_module = order.next_item(next_module)
 
-    def _unshard_parameter_groups(self) -> None:
+    def _unshard_parameter_groups(self, orientation: str = "rowwise") -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
 
         If ``_unshard_event`` is already set, this FsdpModule was already
         unsharded or prefetched and this method is a no-op. Otherwise, this
         method records ``_unshard_event`` after materialization so compute
         can wait without depending on later release work.
+
+        Args:
+            orientation: Payload orientation to gather for MXFP8 groups —
+                ``"rowwise"`` on the forward pass, ``"colwise"`` on the
+                backward pass. Ignored by regular groups.
         """
         if self._unshard_event is not None:
             return
@@ -457,7 +497,7 @@ class FsdpModule:
         allgather_stream = self.context.allgather_stream
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
-                group.unshard_parameters()
+                group.unshard_parameters(orientation)
             self._unshard_event = allgather_stream.record_event()
 
     def post_forward(self) -> None:
@@ -512,7 +552,8 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self.unshard(prefetch="backward")
+        # The backward pass consumes the column-wise (backward-GEMM) MXFP8 payload.
+        self.unshard(prefetch="backward", orientation="colwise")
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
@@ -617,9 +658,11 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
 
 
 def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
-    grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
+    # MXFP8 primary weights form their own group even when they share a dtype with
+    # ordinary parameters: they need Fp8ParameterGroup's payload storage.
+    grouped: dict[tuple[torch.dtype, bool, bool], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (parameter.dtype, parameter.requires_grad)
+        key = (parameter.dtype, parameter.requires_grad, _is_fp8_parameter(parameter))
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 
