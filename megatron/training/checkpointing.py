@@ -71,6 +71,9 @@ from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_succe
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
 
 try:
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+        sync_model_weights_from_main_weights,
+    )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
         preprocess_state_dict_for_uneven_dtensor,
     )
@@ -2225,6 +2228,17 @@ def _load_base_checkpoint(
         planner = default_planner.DefaultLoadPlanner(allow_partial_load=allow_partial_load)
         torch.distributed.checkpoint.load_state_dict(
             state_dict=state_dict, storage_reader=fs_storage_reader, planner=planner
+        )
+
+        # DCP wrote Megatron-FSDP v2's optimizer weights ("main weights"), because that
+        # is what the module's DTensor parameters alias. The forward reads a separate
+        # compute-weight buffer, which is only refreshed at the end of an optimizer
+        # step -- i.e. after the first iteration following this load. Sync it here so
+        # the first loaded iteration already computes on the checkpoint's weights.
+        # Parameters outside the MFSDP v2 path are ignored, so this is a no-op for
+        # Megatron-FSDP v1 and for any parameter FSDP does not own.
+        sync_model_weights_from_main_weights(
+            parameter for model_chunk in model for parameter in model_chunk.parameters()
         )
 
         if raw_optimizer_state_dict is not None:

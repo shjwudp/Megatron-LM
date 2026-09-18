@@ -272,4 +272,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         sync_model_weights_from_main_weights(self.get_parameters())
 
     def _copy_model_params_to_main_params(self, state_dict=None) -> None:
-        """No-op: model loads already write into MFSDP v2's main weights."""
+        """No-op: model DTensors alias MFSDP v2's main weights, so a model load already
+        writes them. The reverse copy -- main weights into the forward's compute weights
+        -- is not an optimizer-state concern and is done by the loader itself, since
+        ``_copy_main_params_to_model_params`` only runs at the end of an optimizer step.
+        """
