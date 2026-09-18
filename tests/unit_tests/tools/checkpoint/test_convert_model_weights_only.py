@@ -12,7 +12,7 @@ carries optimizer state cannot be loaded. The ``--model-weights-only`` flag
 weights plus the non-optimizer common state (``args``, ``iteration``,
 ``checkpoint_version``).
 
-The test guards two confirmed defects in that converter:
+The test guards three confirmed defects in that converter:
 
 1. **Common-state format.** The converter used to call the deprecated
    ``strategies.common.load_common`` directly, which only understands the
@@ -31,6 +31,14 @@ The test guards two confirmed defects in that converter:
    checkpoint that still carried optimizer state, while a naive "no key starts
    with ``optimizer.``" assertion still passed.
 
+3. **The internal common-state blob.** The metadata loop used to copy the
+   source's DCP-internal ``common_state/shard_0_1`` object into the output
+   verbatim. Its key name contains no ``optimizer`` component, so every
+   key-level assertion passed, but its *payload* is the whole, unfiltered
+   common state dict -- optimizer entries included -- i.e. exactly the
+   DEFECT-2 failure mode one level down. The converter now drops that internal
+   key under ``--model-weights-only``.
+
 This test builds a synthetic ``torch_dist`` checkpoint that genuinely contains
 optimizer state in both the non-chained (``optimizer.state.<slot>.<param>``)
 and the chained distributed-optimizer (``chained_<i>.optimizer.<...>``)
@@ -38,16 +46,29 @@ layouts, in each of the two common-state formats, runs the converter in both
 modes, and asserts:
 
   * ``model_weights_only=True`` -> every model weight is present and
-    element-wise identical, and **no** output key matches the dotted-component
-    predicate ``(^|\\.)optimizer(\\.|$)``.
+    element-wise identical; **no** output key matches the dotted-component
+    predicate ``(^|\\.)optimizer(\\.|$)``; no *bytes payload* of any output
+    entry hides such a key either (the blob scan); and the internal
+    ``common_state/shard_0_1`` blob is not re-emitted at all.
   * ``model_weights_only=False`` (default) -> the same model weights
     round-trip, and the output still carries optimizer keys, proving the flag
     is what makes the difference.
-  * the non-optimizer common state survives in both modes.
-  * the source fixture really contained optimizer keys (tensor *and*
-    common-state), so the "no optimizer keys" assertion cannot pass vacuously.
+  * the non-optimizer common state survives in both modes as individual
+    ``args`` / ``iteration`` / ``checkpoint_version`` keys -- the exact three
+    keys rank 0 of the real ``fsdp_dtensor`` loader probes for with a raw DCP
+    load (``megatron/training/checkpointing.py``).
+  * the source fixture really contained optimizer keys (tensor, common-state
+    *and*, for the current layout, inside the blob payload), so the negative
+    assertions cannot pass vacuously.
   * ``load_common_state_dict`` reads both the legacy ``common.pt`` and the
     current ``ShardedObject("common_state")`` layout.
+
+Note on the converted output: it is a *raw* DCP checkpoint and the converter
+does not write Megatron's ``metadata.json``, so ``load_common_state_dict``
+cannot read it (it fails in ``verify_checkpoint`` before ever looking for a
+common-state object). That is pre-existing and independent of this fix; the
+``fsdp_dtensor`` loader does not call that accessor -- ``_probe_loader_common_keys``
+mirrors what it actually does.
 
 The conversion cases are parametrized over the two common-state layouts, so
 each mode is exercised against both real-world checkpoint formats.
@@ -83,13 +104,14 @@ import shutil
 import sys
 import tempfile
 from collections import OrderedDict
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import DefaultLoadPlanner, FileSystemReader
-from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+from torch.distributed.checkpoint.metadata import BytesStorageMetadata, TensorStorageMetadata
 
 # Make the conversion tool and helpers importable, matching the sibling tests.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -108,6 +130,12 @@ _OPTIMIZER_KEY_RE = re.compile(r'(^|\.)optimizer(\.|$)')
 
 # The two real-world layouts of a torch_dist checkpoint's common state.
 _COMMON_STATE_FORMATS = ('current', 'legacy')
+
+# DCP-internal key of the current layout's common-state ShardedObject. It is
+# `ShardedObject("common_state", None, (1,), (0,)).unique_key` -- the same key
+# `load_common_state_dict` derives -- and its payload is the whole, unfiltered
+# common state dict (optimizer entries included).
+_COMMON_STATE_DCP_KEY = 'common_state/shard_0_1'
 
 
 def _optimizer_keys(keys):
@@ -221,17 +249,18 @@ def _build_optimizer_state_dict(model_state_dict, num_chained=2):
 
 
 def _build_ckpt_args(num_layers, hidden_size, vocab_size):
-    """Checkpoint args as a plain ``dict``.
+    """Checkpoint args as an ``argparse.Namespace``, exactly as saved.
 
-    Real checkpoints pass through
-    ``megatron.training.training.preprocess_common_state_dict``, which stores
-    ``vars(args)``. A plain dict is also required by the *current* common-state
-    layout, which ``load_common_state_dict`` reads back with
-    ``torch.load(..., weights_only=True)``; a ``SimpleNamespace`` would not
-    unpickle in restricted mode. The converter flattens this dict, so the
-    surviving keys are ``args.<field>``.
+    ``generate_state_dict`` stores ``state_dict['args'] = args`` (a Namespace),
+    and the loader reads it back as an object
+    (``megatron/training/checkpointing.py``: ``checkpoint_args = state_dict['args']``
+    followed by ``hasattr``/``getattr``). The converter's ``flatten`` treats a
+    Namespace as a leaf, so the converted checkpoint keeps a single top-level
+    ``args`` key -- which is what the ``fsdp_dtensor`` loader probes for.
+    ``Namespace`` (and ``SimpleNamespace``) is allowlisted for
+    ``torch.load(weights_only=True)`` by ``megatron/core/safe_globals.py``.
     """
-    return dict(
+    return SimpleNamespace(
         num_layers=num_layers,
         hidden_size=hidden_size,
         num_attention_heads=4,
@@ -390,6 +419,86 @@ def _load_full_tensors(ckpt_dir):
     return state_dict
 
 
+def _load_bytes_payloads(ckpt_dir):
+    """Load every ``BytesStorageMetadata`` entry of a raw DCP checkpoint.
+
+    Returns ``{dcp_key: payload}``; tensor entries are ignored. DCP's default
+    load planner normally deserializes a bytes entry for us (its
+    ``load_bytes`` calls ``torch.load``), but older releases hand back the raw
+    ``io.BytesIO`` instead -- ``_keys_in_object`` copes with either.
+    """
+    reader = FileSystemReader(ckpt_dir)
+    metadata = reader.read_metadata()
+    targets = {
+        key: io.BytesIO()
+        for key, md in metadata.state_dict_metadata.items()
+        if isinstance(md, BytesStorageMetadata)
+    }
+    if targets:
+        dcp.load(targets, storage_reader=reader, planner=DefaultLoadPlanner())
+    return targets
+
+
+def _keys_in_object(obj, _depth=0):
+    """Every string key reachable inside a deserialized checkpoint payload.
+
+    The internal ``common_state`` blob is a pickled ``io.BytesIO`` whose buffer
+    is itself a pickled ``[common_state_dict]`` list, so ``BytesIO`` payloads
+    are followed recursively. ``weights_only=False`` is intentional: these
+    payloads are produced by this test itself, and the check must be able to
+    see through the double serialization the converter used to apply.
+    """
+    if _depth > 4:
+        return []
+    if isinstance(obj, io.BytesIO):
+        try:
+            inner = torch.load(io.BytesIO(obj.getvalue()), weights_only=False)
+        except Exception:
+            return []
+        return _keys_in_object(inner, _depth + 1)
+    if isinstance(obj, dict):
+        keys = []
+        for k, v in obj.items():
+            if isinstance(k, str):
+                keys.append(k)
+            keys.extend(_keys_in_object(v, _depth + 1))
+        return keys
+    if isinstance(obj, (list, tuple)):
+        keys = []
+        for v in obj:
+            keys.extend(_keys_in_object(v, _depth + 1))
+        return keys
+    return []
+
+
+def _optimizer_keys_in_bytes_payloads(ckpt_dir):
+    """Optimizer-component keys hidden *inside* the payload of bytes entries.
+
+    Tensor keys are covered by ``_metadata_keys``. This catches the same class
+    of leak one level down, where the offending name is not the DCP entry name
+    but a string inside a serialized blob: the internal ``common_state`` object
+    is exactly that, since its payload is the whole, unfiltered common state
+    dict, optimizer entries included.
+    """
+    hidden = []
+    for _key, payload in _load_bytes_payloads(ckpt_dir).items():
+        hidden.extend(_optimizer_keys(_keys_in_object(payload)))
+    return sorted(hidden)
+
+
+def _probe_loader_common_keys(ckpt_dir):
+    """Read the converted checkpoint the way the real fsdp_dtensor loader does.
+
+    ``megatron/training/checkpointing.py`` loads the non-tensor state of an
+    ``fsdp_dtensor`` checkpoint on rank 0 with a raw DCP load of exactly
+    ``{'args', 'iteration', 'checkpoint_version'}``; ``args`` must come back as
+    an object (the loader does ``state_dict['args']`` and then ``hasattr``).
+    """
+    state_dict = {'args': None, 'iteration': None, 'checkpoint_version': None}
+    dcp.load(state_dict=state_dict, checkpoint_id=ckpt_dir)
+    return state_dict
+
+
 def run_case(
     label,
     model_weights_only,
@@ -441,7 +550,7 @@ def run_case(
         f"'{common_state_format}'"
     )
     src_keys = _metadata_keys(src_dir)
-    assert ('common_state/shard_0_1' in src_keys) == (
+    assert (_COMMON_STATE_DCP_KEY in src_keys) == (
         common_state_format == 'current'
     ), f"[{label}] unexpected common-state metadata key layout: {sorted(src_keys)[:5]}"
 
@@ -459,8 +568,9 @@ def run_case(
     )
 
     # DEFECT 2 guard, part 1: the source must actually contain optimizer keys
-    # in both the tensor metadata and the (flattened) common state, otherwise
-    # the "no optimizer keys in the output" assertion below passes vacuously.
+    # in the tensor metadata, the (flattened) common state, and -- for the
+    # current layout -- the payload of the internal common-state blob. Without
+    # these, the "no optimizer keys in the output" assertions pass vacuously.
     src_optimizer_keys = _optimizer_keys(src_keys)
     assert src_optimizer_keys, (
         f"[{label}] fixture metadata has no key matching "
@@ -471,11 +581,21 @@ def run_case(
         f"[{label}] fixture common state has no key matching "
         f"{_OPTIMIZER_KEY_RE.pattern!r}"
     )
+    src_blob_optimizer_keys = _optimizer_keys_in_bytes_payloads(src_dir)
+    if common_state_format == 'current':
+        # The current layout's `common_state/shard_0_1` payload is the whole,
+        # unfiltered common state dict, so it must expose the chained optimizer
+        # entries. Post-fix the converter must not re-emit that blob at all.
+        assert src_blob_optimizer_keys, (
+            f"[{label}] fixture common_state blob payload exposes no key matching "
+            f"{_OPTIMIZER_KEY_RE.pattern!r}; the blob scan would be vacuous"
+        )
     _log(
         rank,
         f"[{label}/{common_state_format}] source has "
-        f"{len(src_optimizer_keys)} optimizer tensor keys and "
-        f"{len(src_common_optimizer_keys)} optimizer common-state keys",
+        f"{len(src_optimizer_keys)} optimizer tensor keys, "
+        f"{len(src_common_optimizer_keys)} optimizer common-state keys and "
+        f"{len(src_blob_optimizer_keys)} optimizer keys inside bytes payloads",
     )
 
     # Every rank must participate: dcp.load / _save_state_dict are collective.
@@ -490,13 +610,28 @@ def run_case(
 
     dst_keys = _metadata_keys(dst_dir)
     optimizer_keys = _optimizer_keys(dst_keys)
-    for expected_common_key in ('iteration', 'checkpoint_version'):
+    hidden_optimizer_keys = _optimizer_keys_in_bytes_payloads(dst_dir)
+    for expected_common_key in ('args', 'iteration', 'checkpoint_version'):
         assert expected_common_key in dst_keys, (
             f"[{label}] non-optimizer common state '{expected_common_key}' was dropped"
         )
-    # ``args`` is flattened by the converter, so it survives as ``args.<field>``.
-    assert any(k == 'args' or k.startswith('args.') for k in dst_keys), (
-        f"[{label}] non-optimizer common state 'args' was dropped"
+
+    # Loadability: read the converted checkpoint the way the real fsdp_dtensor
+    # loader does (raw DCP load of the three non-tensor keys, `args` as an
+    # object). See `_probe_loader_common_keys`.
+    #
+    # `load_common_state_dict(dst_dir)` is deliberately *not* used here: the
+    # converter writes a raw DCP checkpoint with no Megatron `metadata.json`,
+    # so that accessor fails in `verify_checkpoint` before it ever looks at a
+    # common-state object. The fsdp_dtensor loader does not call it either.
+    loader_state = _probe_loader_common_keys(dst_dir)
+    assert loader_state['args'] is not None, f"[{label}] converted ckpt has no 'args'"
+    assert getattr(loader_state['args'], 'hidden_size', None) == hidden_size, (
+        f"[{label}] converted ckpt 'args' is not the checkpoint args object"
+    )
+    assert loader_state['iteration'] == 100, f"[{label}] converted ckpt 'iteration' lost"
+    assert loader_state['checkpoint_version'] == 3.0, (
+        f"[{label}] converted ckpt 'checkpoint_version' lost"
     )
 
     # Model weights must survive element-wise, without depending on load order.
@@ -526,10 +661,23 @@ def run_case(
             f"[{label}] model-weights-only output still has optimizer keys "
             f"(predicate {_OPTIMIZER_KEY_RE.pattern!r}): {optimizer_keys[:5]}"
         )
+        # ...and the same predicate applied to every bytes/object payload, so
+        # the internal `common_state/shard_0_1` blob cannot smuggle the source's
+        # unfiltered common state (optimizer entries included) into the output
+        # under a key name the check above never inspects.
+        assert not hidden_optimizer_keys, (
+            f"[{label}] model-weights-only output hides optimizer keys inside a "
+            f"bytes payload (predicate {_OPTIMIZER_KEY_RE.pattern!r}): "
+            f"{hidden_optimizer_keys[:5]}"
+        )
+        assert _COMMON_STATE_DCP_KEY not in dst_keys, (
+            f"[{label}] model-weights-only output still re-emits the internal "
+            f"'{_COMMON_STATE_DCP_KEY}' blob"
+        )
         _log(
             rank,
             f"[{label}/{common_state_format}] PASS: {len(recovered)} model weights "
-            f"round-tripped, 0 optimizer keys",
+            f"round-tripped, 0 optimizer keys, 0 optimizer keys in bytes payloads",
         )
     else:
         assert optimizer_keys, (

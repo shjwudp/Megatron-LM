@@ -38,6 +38,7 @@ from torch.distributed.tensor import DeviceMesh, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import split_dtensor, redistribute_uneven_dtensor_to_replicated
 
+from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import load_common_state_dict
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
@@ -47,6 +48,17 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 )
 from megatron.core.dist_checkpointing.validation import verify_checkpoint
 from megatron.core.msc_utils import MultiStorageClientFeature
+
+
+# DCP-internal key of the current-format common-state ShardedObject, i.e.
+# `ShardedObject("common_state", None, (1,), (0,)).unique_key`. Current Megatron
+# stores the non-sharded common state there (`save_common` is unused) and
+# `load_common_state_dict` reads it separately. `serialization.load_sharded_metadata`
+# excludes it from the state dict -- `k: v for k, v in ckpt_sharded_metadata.items()
+# if v.key != 'common_state'` -- because it is an internal format key rather than
+# a real state entry. The raw DCP metadata read here keys it by its full unique
+# key, so the same exclusion is expressed against `_COMMON_STATE_DCP_KEY`.
+_COMMON_STATE_DCP_KEY = ShardedObject("common_state", None, (1,), (0,)).unique_key
 
 
 def rank0_echo(message):
@@ -414,12 +426,22 @@ def convert_checkpoint(
     metadata = reader.read_metadata()
     state_dict = {}
     for key, md in metadata.state_dict_metadata.items():
-        # Model-weights-only mode: never allocate (or load) optimizer tensors.
-        # Skipping them here avoids materializing potentially enormous optimizer
-        # state that would be dropped later anyway. The dotted-component test
-        # also catches distributed-optimizer keys such as
-        # 'chained_<i>.optimizer...', which a bare 'optimizer.' prefix missed.
-        if model_weights_only and is_optimizer_key(key):
+        # Model-weights-only mode: never allocate (or load) optimizer tensors,
+        # and never load the internal common-state blob.
+        # - Skipping optimizer tensors avoids materializing potentially enormous
+        #   optimizer state that would be dropped later anyway. The
+        #   dotted-component test also catches distributed-optimizer keys such
+        #   as 'chained_<i>.optimizer...', which a bare 'optimizer.' prefix
+        #   missed.
+        # - The `common_state` blob's payload is the whole, *unfiltered* common
+        #   state (optimizer entries included), so re-emitting it would violate
+        #   the weights-only contract even though its own key name is innocuous.
+        #   The filtered common state is still re-emitted as individual keys
+        #   below. `serialization.load_sharded_metadata()` drops this internal
+        #   key for the same reason (`... if v.key != 'common_state'`).
+        if model_weights_only and (
+            key == _COMMON_STATE_DCP_KEY or is_optimizer_key(key)
+        ):
             continue
         if isinstance(md, TensorStorageMetadata):
             # Initialize tensor storage
