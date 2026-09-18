@@ -482,23 +482,46 @@ class FsdpParameterGroup:
         if self._unsharded_model_weight is not None:
             self._unsharded_model_weight.release_storage()
 
-    def allocate_partial_grad_buffer(self) -> DBuffer:
-        """Allocate the unreduced reduce-scatter input buffer."""
+    def allocate_partial_grad_buffer(self, *, require_all_grads: bool = True) -> DBuffer:
+        """Allocate the unreduced reduce-scatter input buffer.
+
+        Args:
+            require_all_grads: Whether every parameter must already hold a gradient.
+                The default preserves the strict contract. Pass ``False`` only when a
+                caller has established that a missing gradient means "this parameter
+                was unused in this backward window" and not "the reduce is early";
+                the missing slots are then zero-filled by
+                :meth:`copy_gradients_to_partial_buffer`.
+        """
         assert self.main_grad is not None
 
-        grads: list[torch.Tensor] = []
-        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            grad = self._get_unsharded_parameter(index).grad
-            if grad is None:
-                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
-            grads.append(grad)
+        parameters = tuple(
+            self._get_unsharded_parameter(index) for index in range(len(self.fsdp_parameters))
+        )
+        grads = tuple(parameter.grad for parameter in parameters)
+        missing = [index for index, grad in enumerate(grads) if grad is None]
+        if missing and require_all_grads:
+            raise RuntimeError(
+                f"Missing gradient for FSDP parameter {self.fsdp_parameters[missing[0]].fqns!r}."
+            )
+        # The buffer layout must not depend on which parameters have gradients: one
+        # slot per parameter, with the dtype/device of a real gradient when there is
+        # one. Every rank derives the same layout, so the reduce-scatter stays a
+        # single collective of the same shape even when slots are zero-filled.
+        present = [grad for grad in grads if grad is not None]
+        dtype = present[0].dtype if present else self.main_grad.dtype
+        device = present[0].device if present else self.main_grad.device
+        tensor_shapes = tuple(
+            grad.shape if grad is not None else parameter.shape
+            for grad, parameter in zip(grads, parameters)
+        )
         with self._symmetric_memory_context():
             return DBuffer.empty(
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
-                tensor_shapes=tuple(grad.shape for grad in grads),
-                dtype=grads[0].dtype,
-                device=grads[0].device,
+                tensor_shapes=tensor_shapes,
+                dtype=dtype,
+                device=device,
                 block_size=self.main_weight.layout.block_size,
                 subgroup_size=self.subgroup_size,
             )
@@ -508,6 +531,12 @@ class FsdpParameterGroup:
         # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             parameter = self._get_unsharded_parameter(index)
+            if parameter.grad is None:
+                # No gradient in this window is an exact zero contribution, and the
+                # buffer slot exists for this parameter on every rank. Zero-filling
+                # keeps the collective collective; skipping it would not.
+                partial_grad.get_local_tensor(index).zero_()
+                continue
             partial_grad.get_local_tensor(index).copy_(parameter.grad)
             parameter.grad = None
 
