@@ -16,7 +16,7 @@
 
 import enum
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Hashable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Literal, cast
 from weakref import ref
@@ -29,7 +29,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy, fp8_need_transpose_data, is_float8tensor
 from ..utils import log_single_rank
-from .countdown import Countdown, GradientReadiness
+from .countdown import MultiplicityReadiness
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
@@ -201,21 +201,27 @@ class FsdpModule:
     _name: str | None
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
-    _trainable_parameter_countdown: Countdown
-    # Set instead of the countdown when the schedule, not the callback count,
-    # delimits this module's backward windows (combined/fine-grained 1F1B).
-    _grad_readiness: GradientReadiness | None
+    # Exact per-parameter gradient accounting against a declared multiplicity.
+    # The automatic path declares 1 for every trainable parameter; the
+    # combined/fine-grained 1F1B path declares the real counts.
+    _grad_readiness: MultiplicityReadiness | None
+    # Per-parameter expected contribution counts declared by the schedule, keyed the
+    # same way as the marks. Empty means "every trainable parameter contributes
+    # once", which is the automatic path.
+    _grad_multiplicity: dict[int, int]
     # FQNs per readiness key, for diagnostics only; the key is the index of the
     # parameter in this module's trainable-parameter order.
     _grad_readiness_fqns: dict[int, tuple[str, ...]]
     # The hook registered through ``register_post_backward_hook``; the schedule
     # invokes it when ``_grad_readiness`` is in use.
     _scheduled_post_backward_hook: Callable[["FsdpModule"], None] | None
-    # A module can legitimately have an ungraded parameter in one window (an unused
-    # branch); warn once so a real schedule bug is still visible without flooding.
+    # An under-fire at the close edge means an over-declaration or a contribution
+    # that never arrived; an over-fire means the multiplicity was under-declared and
+    # the window already closed early. Both are reported once per unit so a real
+    # schedule bug stays visible without flooding.
     _warned_missing_grads: bool
+    _warned_over_fire: bool
     _is_root: bool
-    _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
     # Event recorded after this FsdpModule's full parameters are materialized.
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
@@ -258,8 +264,10 @@ class FsdpModule:
         self._schedule_policy = schedule_policy
         self._grad_readiness = None
         self._grad_readiness_fqns = {}
+        self._grad_multiplicity = {}
         self._scheduled_post_backward_hook = None
         self._warned_missing_grads = False
+        self._warned_over_fire = False
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
@@ -298,13 +306,6 @@ class FsdpModule:
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
-        self._trainable_parameter_countdown = Countdown(
-            sum(
-                len(group.fsdp_parameters)
-                for group in self._parameter_groups
-                if group.requires_grad
-            )
-        )
         # The state-dict safety hook is registered unconditionally. It is still
         # required to keep loading a state dict safe when ``register_hooks`` is
         # False (i.e. execution hooks are disabled), so it must not be turned off
@@ -365,7 +366,7 @@ class FsdpModule:
         self.register_post_backward_hook(FsdpModule.post_backward)
 
     def register_post_backward_hook(
-        self, post_backward_hook: Callable[["FsdpModule"], None], *, schedule_driven: bool = False
+        self, post_backward_hook: Callable[["FsdpModule"], None], *, grad_multiplicity: bool = False
     ) -> None:
         """Register a post-backward hook to run after this module's backward completes.
 
@@ -377,17 +378,19 @@ class FsdpModule:
         Args:
             post_backward_hook: Callback receiving this FSDP module after all of its
                 trainable parameters have accumulated gradients.
-            schedule_driven: Whether the caller is a fine-grained schedule that
+            grad_multiplicity: Whether the caller is a fine-grained schedule that
                 delimits backward windows itself. In that path each module's
-                backward is one ``run_backward`` per schedule node, so the number of
-                post-accumulate-grad callbacks is not the module's parameter count.
-                The hook is then held until
+                backward is one ``run_backward`` per schedule node, so a parameter
+                contributes once per consuming node and the callback count is not
+                the module's parameter count. The hook is then held until
                 :meth:`finalize_scheduled_backward` is called at the schedule's
                 end-of-backward edge, and the per-parameter callbacks only record
-                which parameters are ready.
+                how many contributions each parameter produced. The expected count
+                of each parameter is declared separately through
+                :meth:`set_grad_multiplicity`; anything undeclared is expected once.
         """
         module = cast(nn.Module, self)
-        if self._trainable_parameter_countdown.initial_value == 0:
+        if self._num_trainable_parameters() == 0:
             module.register_full_backward_hook(
                 lambda hooked_module, _grad_input, _grad_output: post_backward_hook(
                     cast(FsdpModule, hooked_module)
@@ -395,50 +398,148 @@ class FsdpModule:
             )
             return
 
-        if schedule_driven:
-            self._register_schedule_completion_hooks(post_backward_hook)
-            return
-
         # Gradient reduction for trainable parameters is parameter-completion
-        # based: once every owned Parameter has accumulated its grad, this
-        # FsdpModule can reduce and reshard. Module full-backward hooks can fire
-        # before that when module inputs do not require grad.
-        module_ref = ref(self)
+        # based: once every owned Parameter has reached its declared multiplicity,
+        # this FsdpModule can reduce and reshard. Module full-backward hooks can
+        # fire before that when module inputs do not require grad.
+        self._register_completion_hooks(post_backward_hook, scheduled=grad_multiplicity)
 
-        def grad_hook(_: nn.Parameter) -> None:
-            module = module_ref()
-            if module is None:
-                return
-            if module._trainable_parameter_countdown.decrement():
-                post_backward_hook(module)
+    def set_grad_multiplicity(self, multiplicity: Mapping[int, int]) -> None:
+        """Declare how many contributions each trainable parameter is expected to make.
 
-        for fsdp_parameter in self._trainable_fsdp_parameters():
-            self._register_grad_hook(fsdp_parameter, grad_hook)
+        Keys are indices into this module's :meth:`_trainable_fsdp_parameters`
+        order, which is the same key space the per-parameter callbacks mark, and the
+        values are the number of autograd GraphTasks that will accumulate that
+        parameter's gradient in one backward window. Combined/fine-grained 1F1B
+        supplies the real counts because its backward is one GraphTask per schedule
+        node; the automatic single-graph path needs no declaration at all and
+        defaults every parameter to 1.
 
-    def _register_schedule_completion_hooks(
-        self, post_backward_hook: Callable[["FsdpModule"], None]
+        The declaration must be set before the hooks are registered. Declaring too
+        few is the original defect (the window closes early and the surplus leaks
+        into the next window), so an undeclared parameter defaults to 1 only because
+        1 is the single-graph truth for the automatic path.
+        """
+        unknown = sorted(set(multiplicity) - set(range(self._num_trainable_parameters())))
+        if unknown:
+            raise ValueError(
+                f"Gradient multiplicity declared for unknown parameter indices {unknown} of "
+                f"{self._name or '<root>'} with {self._num_trainable_parameters()} "
+                f"trainable parameters."
+            )
+        self._grad_multiplicity = dict(multiplicity)
+
+    def _num_trainable_parameters(self) -> int:
+        """Return the size of this module's trainable-parameter key space."""
+        return sum(1 for _ in self._trainable_fsdp_parameters())
+
+    def _register_completion_hooks(
+        self, post_backward_hook: Callable[["FsdpModule"], None], *, scheduled: bool
     ) -> None:
-        """Record which parameters fire instead of counting how many fired.
+        """Install one per-parameter accounting hook set for both completion modes.
 
-        See :class:`GradientReadiness` for why the callback count is not a valid
+        The hook set is identical in both modes; only the declaration differs. The
+        automatic path declares 1 for every parameter, so the first callback of a
+        window finds the accounting complete and triggers exactly as the fire-count
+        signal used to. The schedule-driven path declares the real multiplicities
+        and holds the hook until the schedule's end-of-backward edge, so a parameter
+        consumed by several schedule nodes cannot end the window early.
+
+        See :class:`MultiplicityReadiness` for why a callback count is not a valid
         completion signal in the combined/fine-grained 1F1B path.
         """
         fsdp_parameters = tuple(self._trainable_fsdp_parameters())
-        readiness = GradientReadiness(range(len(fsdp_parameters)))
+        declared = (getattr(self, "_grad_multiplicity", None) or {}) if scheduled else {}
+        expected = {index: declared.get(index, 1) for index in range(len(fsdp_parameters))}
+        readiness = MultiplicityReadiness(cast(Mapping[Hashable, int], expected))
         self._grad_readiness = readiness
         self._grad_readiness_fqns = {
             index: fsdp_parameter.fqns for index, fsdp_parameter in enumerate(fsdp_parameters)
         }
         self._scheduled_post_backward_hook = post_backward_hook
+        close_on_completion = not scheduled
+        module_ref = ref(self)
 
         def grad_hook(index: int) -> Callable[[nn.Parameter], None]:
             def hook(_: nn.Parameter) -> None:
-                readiness.mark(index)
+                module = module_ref()
+                if module is None:
+                    return
+                module._record_grad_contribution(index)
+                if close_on_completion and readiness.is_complete():
+                    module._close_grad_window()
+                    post_backward_hook(module)
 
             return hook
 
         for index, fsdp_parameter in enumerate(fsdp_parameters):
             self._register_grad_hook(fsdp_parameter, grad_hook(index))
+
+    def _record_grad_contribution(self, index: int) -> None:
+        """Charge one gradient contribution to ``index`` in the open window.
+
+        This is the single entry point for both the autograd callback and TE's
+        delayed-wgrad callback, so the delayed path is accounted for by the same
+        clock as the regular one.
+        """
+        assert self._grad_readiness is not None
+        self._grad_readiness.mark(index)
+
+    def _close_grad_window(self) -> None:
+        """Report the window's verdict, re-arm the accounting, and mark it closed.
+
+        Reporting happens before the reset because both the under-fire and the
+        over-fire records describe the window that is ending.
+        """
+        readiness = self._grad_readiness
+        assert readiness is not None
+        if not readiness.is_complete() or readiness.over_fired():
+            self._report_grad_window(readiness)
+        readiness.close()
+
+    def _report_grad_window(self, readiness: MultiplicityReadiness) -> None:
+        """Report an over-fire or an under-fire of the window that is ending.
+
+        Both directions mean the declared multiplicity did not describe the real
+        GraphTask partition. Each is reported once per unit: the point is to make a
+        wrong declaration loud without emitting a line per callback.
+
+        The counts are read here, before :meth:`MultiplicityReadiness.close` resets
+        them, so the message names the parameter, what was observed and what was
+        declared.
+        """
+        over_fired = readiness.over_fired()
+        if over_fired and not getattr(self, "_warned_over_fire", False):
+            self._warned_over_fire = True
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "MFSDP module %s observed MORE gradient contributions than its declared "
+                "multiplicity for %d parameter(s): %s. The multiplicity was under-declared, "
+                "so its backward window closed before the surplus contribution arrived; the "
+                "surplus is charged to a later window. Declare the real per-parameter counts.",
+                self.name or "<root>",
+                len(over_fired),
+                [
+                    (self._grad_readiness_fqns[key], observed, expected)
+                    for key, observed, expected in over_fired
+                ],
+            )
+        missing = readiness.missing()
+        if missing and not getattr(self, "_warned_missing_grads", False):
+            self._warned_missing_grads = True
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "MFSDP module %s closed its backward with %d of %d parameters under their "
+                "declared multiplicity and zero-filled them: %r. Expected for a parameter "
+                "unused in this window; an over-declaration or a schedule node that never ran "
+                "otherwise.",
+                self.name or "<root>",
+                len(missing),
+                len(readiness.expected),
+                self._describe_grad_shortfall(readiness),
+            )
 
     def finalize_scheduled_backward(self) -> None:
         """Close this module's backward window and reduce its gradients.
@@ -446,32 +547,20 @@ class FsdpModule:
         The fine-grained schedule calls this at the point where this module's
         backward ends: from the unit's last backward node, or from the end of the
         model chunk for the module that owns the chunk-level parameters. The
-        per-parameter marks collected since the previous close are idempotent, so a
-        parameter consumed by several schedule nodes cannot end the window early.
+        per-parameter marks collected since the previous close are counted against
+        the declared multiplicity, so a parameter consumed by several schedule nodes
+        cannot end the window early and a parameter that never contributed is
+        observable instead of silently satisfied.
 
-        A parameter without a gradient is genuinely unused in this window, so its
+        A parameter that came up short is genuinely unused in this window, so its
         contribution is an exact zero and its slot is zero-filled rather than
         aborting the module's reduce. The reduce is still issued by every rank, so
-        the decision is collective-safe.
+        the decision is collective-safe. A module whose window never opened is left
+        alone, exactly as before.
         """
-        readiness = self._grad_readiness
-        if readiness is None or not readiness.has_pending_marks:
+        if not self._has_open_grad_window():
             return
-        missing = readiness.missing()
-        if missing and not self._warned_missing_grads:
-            self._warned_missing_grads = True
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                "MFSDP module %s closed its backward with %d of %d parameters ungraded and "
-                "zero-filled them: %r. Expected for a parameter unused in this window; a "
-                "schedule bug otherwise.",
-                self.name or "<root>",
-                len(missing),
-                readiness.initial_value,
-                [self._grad_readiness_fqns[index] for index in sorted(missing)],
-            )
-        readiness.close()
+        self._close_grad_window()
         assert self._scheduled_post_backward_hook is not None
         self._scheduled_post_backward_hook(self)
 
@@ -480,17 +569,43 @@ class FsdpModule:
 
         An open window at the end of a chunk means the module received gradients
         that no end-of-backward edge ever consumed, which is the "reduce-scatter
-        silently dropped" failure mode of a desynchronised completion signal.
+        silently dropped" failure mode of a desynchronised completion signal. An
+        over-fire is reported the same way: it means the window already closed
+        early, so a later contribution re-opened it.
         """
         readiness = self._grad_readiness
-        if readiness is None or not readiness.has_pending_marks:
+        if not self._has_open_grad_window():
             return
+        assert readiness is not None
+        missing = self._describe_grad_shortfall(readiness)
+        over_fired = [
+            (self._grad_readiness_fqns[key], observed, expected)
+            for key, observed, expected in readiness.over_fired()
+        ]
         raise RuntimeError(
             "MFSDP schedule ended with an incomplete gradient-completion window for "
-            f"{self.name or '<root>'}: callbacks={readiness.marked}/{readiness.initial_value}, "
-            f"missing="
-            f"{[self._grad_readiness_fqns[index] for index in sorted(readiness.missing())]!r}."
+            f"{self.name or '<root>'}: marks={readiness.marked_total}/"
+            f"{readiness.expected_total}, missing={missing!r}, over_fired={over_fired!r}."
         )
+
+    def _describe_grad_shortfall(self, readiness: MultiplicityReadiness) -> list[tuple]:
+        """Return ``(fqns, observed, expected)`` for every under-fired parameter."""
+        return [
+            (self._grad_readiness_fqns[key], readiness.count(key), readiness.expected[key])
+            for key in sorted(readiness.missing())
+        ]
+
+    def _has_open_grad_window(self) -> bool:
+        """Return whether this module's accounting holds unconsumed contributions.
+
+        A window is open exactly when at least one contribution has arrived since
+        the last close. A window in which nothing fired is a no-op, matching the
+        previous behaviour: nothing was reduced, so there is nothing to reset.
+        """
+        readiness = self._grad_readiness
+        if readiness is None:
+            return False
+        return readiness.has_pending_marks
 
     def _trainable_fsdp_parameters(self) -> Iterator[FsdpParameter]:
         """Iterate this module's trainable parameters in a stable order."""

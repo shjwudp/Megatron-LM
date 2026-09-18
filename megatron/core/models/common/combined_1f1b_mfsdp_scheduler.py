@@ -1,10 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from typing import cast
+
+import torch.nn as nn
+
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantization import (
     COLWISE,
     ROWWISE,
 )
+from megatron.core.transformer.multi_token_prediction import get_mtp_layer_offset
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
@@ -61,25 +66,119 @@ def finalize_fsdp_backward(module) -> None:
             submodule.finalize_scheduled_backward()
 
 
+def _active_mtp_layers(model) -> int:
+    """Return how many MTP layers this pipeline stage actually runs.
+
+    A pipeline stage can hold an MTP block without running all of its layers: the
+    main model shifts the MTP depth by ``get_mtp_layer_offset`` so the layers it
+    expects another stage to run are skipped. Only the layers with an offset inside
+    this stage's block execute, and each of them consumes the shared embedding once.
+
+    This mirrors the offset that ``fine_grained_callables.submodule_mtp_pre_dispatch_forward``
+    uses to select ``node.chunk_state.mtp_hidden_states[offset]``.
+    """
+    mtp = getattr(model, "mtp", None)
+    layers = getattr(mtp, "layers", None)
+    if not layers:
+        return 0
+    config = getattr(model, "config", None)
+    if config is None:
+        return len(layers)
+    pg_collection = getattr(model, "pg_collection", None)
+    pp = getattr(pg_collection, "pp", None)
+    pp_rank = pp.rank() if pp is not None else 0
+    offset = get_mtp_layer_offset(config, getattr(model, "vp_stage", None), pp_rank=pp_rank)
+    return max(0, len(layers) - offset)
+
+
+def _shared_weight(model):
+    """Return the embedding weight that the output layer reuses, or ``None``.
+
+    Identity, not the FQN, is what ties the two consumers together: the output layer
+    runs against the embedding's own ``Parameter`` object when the model shares them.
+    """
+    getter = getattr(model, "shared_embedding_or_output_weight", None)
+    return getter() if callable(getter) else None
+
+
+def _unit_grad_multiplicity(unit: FsdpModule, shared_weight, mtp_depth: int) -> dict[int, int]:
+    """Return ``unit``'s per-parameter backward contribution counts for combined 1F1B.
+
+    In the combined/fine-grained 1F1B path the backward is one autograd GraphTask per
+    schedule node over detached node inputs, so a parameter contributes once per
+    *consuming node* rather than once per iteration. The counts below are derived
+    from the plan's node set, not guessed:
+
+    * the shared embedding is consumed by the schedule's ``PreProcessNode`` and again
+      by every MTP pre-dispatch node:
+      ``megatron/core/models/common/fine_grained_callables.py`` calls
+      ``layer._get_embeddings(..., embedding=node.chunk_state.model.embedding, ...)``
+      from ``submodule_mtp_pre_dispatch_forward``, i.e. the MTP node explicitly uses
+      the model's embedding.
+    * a tied embedding/output weight is projected once more by the chunk's post
+      process node, and once per MTP head when the MTP loss is computed with the
+      shared weight (``process_mtp_loss`` calls ``output_layer`` per MTP depth).
+    * every other parameter is consumed by exactly one schedule node of this unit.
+
+    Because this is an enumeration, it is deliberately not treated as exhaustive:
+    a parameter that this function declares too low over-fires loudly, and one it
+    declares too high under-fires loudly at the close edge.
+
+    Returns:
+        Parameter index -> expected number of gradient contributions in one window.
+        An index that is absent is expected once.
+    """
+    # The embedding lookup runs in the schedule's PreProcessNode and again in every
+    # MTP pre-dispatch node.
+    embedding_consumers = 1 + mtp_depth
+    # A tied embedding/output weight is projected by the post process node and by
+    # each MTP head.
+    shared_weight_consumers = 1 + mtp_depth
+
+    multiplicity: dict[int, int] = {}
+    for index, fsdp_parameter in enumerate(unit._trainable_fsdp_parameters()):
+        consumers = embedding_consumers
+        if fsdp_parameter.unsharded is shared_weight:
+            consumers += shared_weight_consumers
+        if consumers != 1:
+            multiplicity[index] = consumers
+    return multiplicity
+
+
+def _register_fsdp_hooks(submodule, owner: FsdpModule):
+    """Install the unshard hooks on ``submodule`` and recurse into its children."""
+    if isinstance(submodule, FsdpModule):
+        owner = submodule  # BEFORE registering: an FSDP unit owns itself
+    if len(list(submodule.parameters(recurse=False))) > 0:
+        submodule.register_forward_pre_hook(
+            _make_unshard_forward_hook(owner), prepend=True, with_kwargs=True
+        )
+        submodule.register_full_backward_pre_hook(_make_unshard_backward_hook(owner))
+    for child in submodule.children():
+        _register_fsdp_hooks(child, owner)
+
+
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     """Install the sub-module hooks required by MCore combined 1F1B."""
 
-    def register_hooks(submodule, owner):
-        if isinstance(submodule, FsdpModule):
-            owner = submodule  # BEFORE registering: an FSDP unit owns itself
-        if len(list(submodule.parameters(recurse=False))) > 0:
-            submodule.register_forward_pre_hook(
-                _make_unshard_forward_hook(owner), prepend=True, with_kwargs=True
-            )
-            submodule.register_full_backward_pre_hook(_make_unshard_backward_hook(owner))
-        for child in submodule.children():
-            register_hooks(child, owner)
-
     assert isinstance(module, FsdpModule), "Owner must be an FsdpModule."
-    register_hooks(module, module)
+    _register_fsdp_hooks(module, module)
 
-    for submodule in module.modules():
-        if isinstance(submodule, FsdpModule):
-            # This path disables the automatic module hooks (``register_hooks=False``
-            # in the MFSDP v2 adapter), so the schedule owns the backward window.
-            submodule.register_post_backward_hook(_module_post_backward_hook, schedule_driven=True)
+    # A unit whose parameters outlive one schedule node -- the chunk root that owns
+    # the shared embedding and the output weight -- declares its real counts. Any
+    # other unit is consumed once per parameter by its own layer edge and needs no
+    # declaration.
+    shared_weight = _shared_weight(module)
+    mtp_depth = _active_mtp_layers(module)
+    for submodule in cast(nn.Module, module).modules():
+        if not isinstance(submodule, FsdpModule):
+            continue
+        # This path disables the automatic module hooks (``register_hooks=False`` in
+        # the MFSDP v2 adapter), so the schedule owns the backward window: the unit's
+        # parameters are re-accounted against a declared multiplicity and the reduce
+        # is triggered by ``finalize_fsdp_backward`` at the schedule's
+        # end-of-backward edge instead of by a callback count.
+        submodule.set_grad_multiplicity(
+            _unit_grad_multiplicity(submodule, shared_weight, mtp_depth)
+        )
+        submodule.register_post_backward_hook(_module_post_backward_hook, grad_multiplicity=True)
