@@ -99,7 +99,7 @@ def test_mxfp8_linear_training_step_uses_quantized_dbuffer(
     loss.backward()
     reference_loss.backward()
     torch.testing.assert_close(
-        parameter_group.main_grad.get_local_tensor(0),
+        parameter_group.main_grad.get_tensor_view(0),
         reference.weight.grad[distributed_setup.rank * 128 : (distributed_setup.rank + 1) * 128],
         rtol=5e-2,
         atol=5e-2,
@@ -109,7 +109,7 @@ def test_mxfp8_linear_training_step_uses_quantized_dbuffer(
     optimizer.step()
     reference_optimizer.step()
     torch.testing.assert_close(
-        parameter_group.main_weight.get_local_tensor(0),
+        parameter_group.main_weight.get_tensor_view(0),
         reference_main_weight[distributed_setup.rank * 128 : (distributed_setup.rank + 1) * 128],
         rtol=0,
         atol=0,

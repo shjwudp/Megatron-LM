@@ -322,7 +322,7 @@ class DBuffer:
         """Copy a full logical tensor's local owned range into this buffer.
 
         Meta tensors leave their owned range unspecified. Padding and layout gaps
-        are not observable through ``get_local_tensor()`` and remain unspecified.
+        are not observable through ``get_tensor_view()`` and remain unspecified.
         """
         owned_range = self._get_owned_range(index)
         if owned_range is None or tensor.is_meta:

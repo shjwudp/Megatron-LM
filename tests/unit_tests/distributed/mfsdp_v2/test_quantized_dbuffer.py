@@ -43,16 +43,16 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
     grouped.quantize_(main_weight)
 
     for index in range(len(shapes)):
-        data = grouped.rowwise_data.get_local_tensor(index)
-        assert grouped.rowwise_scale.get_local_tensor(index).shape == (
+        data = grouped.rowwise_data.get_tensor_view(index)
+        assert grouped.rowwise_scale.get_tensor_view(index).shape == (
             data.shape[0],
             data.shape[1] // 32,
         )
-        assert grouped.columnwise_scale.get_local_tensor(index).shape == (
+        assert grouped.columnwise_scale.get_tensor_view(index).shape == (
             data.shape[0] // 32,
             data.shape[1],
         )
-        reference = MXFP8Quantizer(tex.DType.kFloat8E4M3)(main_weight.get_local_tensor(index))
+        reference = MXFP8Quantizer(tex.DType.kFloat8E4M3)(main_weight.get_tensor_view(index))
         for plane, view, expected in zip(
             grouped.planes,
             (
@@ -68,7 +68,7 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
                 reference._columnwise_scale_inv,
             ),
         ):
-            actual = plane.get_local_tensor(index)
+            actual = plane.get_tensor_view(index)
             assert view.shape == actual.shape
             assert view.data_ptr() == actual.data_ptr()
             torch.testing.assert_close(
@@ -76,7 +76,7 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
             )
 
 
-def test_quantized_dbuffer_get_local_tensor_supports_gemm(distributed_setup):
+def test_quantized_dbuffer_get_tensor_supports_gemm(distributed_setup):
     """Compute tensors prepare gathered scales for rowwise and columnwise GEMMs."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     shapes = [(128, 128), (128, 128), (64, 64), (32, 64)]
@@ -91,8 +91,8 @@ def test_quantized_dbuffer_get_local_tensor_supports_gemm(distributed_setup):
     gathered_main = main_weight.redistribute([Replicate()])
     quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
     for index, shape in enumerate(shapes):
-        compute_tensor = gathered.get_local_tensor(index)
-        reference = quantizer(gathered_main.get_local_tensor(index))
+        compute_tensor = gathered.get_tensor(index)
+        reference = quantizer(gathered_main.get_tensor_view(index))
         for layout, inner_dim in (("TN", shape[1]), ("NN", shape[0])):
             activation = quantizer(torch.randn((64, inner_dim), device=distributed_setup.device))
             actual = general_gemm(

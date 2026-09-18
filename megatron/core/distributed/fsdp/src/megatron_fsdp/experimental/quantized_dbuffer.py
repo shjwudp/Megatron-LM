@@ -182,15 +182,15 @@ class QuantizedDBuffer:
 
     def get_tensor_view(self, index: int) -> MXFP8Tensor:
         """Return a compact, unswizzled MXFP8 view that aliases all local planes."""
-        rowwise_data = self.rowwise_data.get_local_tensor(index)
-        rowwise_scale = self.rowwise_scale.get_local_tensor(index)
-        columnwise_scale = self.columnwise_scale.get_local_tensor(index)
+        rowwise_data = self.rowwise_data.get_tensor_view(index)
+        rowwise_scale = self.rowwise_scale.get_tensor_view(index)
+        columnwise_scale = self.columnwise_scale.get_tensor_view(index)
         return MXFP8Tensor(
             shape=rowwise_data.shape,
             dtype=torch.bfloat16,
             rowwise_data=rowwise_data,
             rowwise_scale_inv=rowwise_scale,
-            columnwise_data=self.columnwise_data.get_local_tensor(index),
+            columnwise_data=self.columnwise_data.get_tensor_view(index),
             columnwise_scale_inv=columnwise_scale,
             fp8_dtype=_MXFP8_DTYPE,
             quantizer=_MXFP8_QUANTIZER,
@@ -198,13 +198,16 @@ class QuantizedDBuffer:
             device=rowwise_data.device,
         )
 
-    def get_local_tensor(self, index: int) -> MXFP8Tensor:
+    def get_tensor(self, index: int) -> MXFP8Tensor:
         """Return an unswizzled compute tensor with scales padded for TE's GEMM path.
 
         Data planes remain views. Scale planes alias storage only when no padding
         is needed; otherwise they are copied into padded allocations.
         """
         tensor = self.get_tensor_view(index)
+        # GEMM requires padded scales. Pad here until TE fuses padding into its
+        # scale-swizzle kernel, avoiding these separate allocations and copies:
+        # https://github.com/NVIDIA/TransformerEngine/issues/3518
         tensor._rowwise_scale_inv = _pad_rowwise_scale(tensor._rowwise_scale_inv)
         tensor._columnwise_scale_inv = _pad_columnwise_scale(tensor._columnwise_scale_inv)
         return tensor
@@ -217,7 +220,7 @@ class QuantizedDBuffer:
             if actual != expected:
                 raise ValueError(f"Expected main_weight {attribute} {expected!r}, got {actual!r}.")
         for index in range(len(self.rowwise_data.layout.tensor_shapes)):
-            self.get_tensor_view(index).quantize_(main_weight.get_local_tensor(index))
+            self.get_tensor_view(index).quantize_(main_weight.get_tensor_view(index))
 
     @property
     def planes(self) -> tuple[DBuffer, DBuffer, DBuffer, DBuffer]:

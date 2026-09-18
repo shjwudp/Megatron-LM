@@ -311,7 +311,13 @@ class FsdpParameterGroup:
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
-            unsharded_tensor = self._unsharded_model_weight.get_tensor_view(index)
+            # The compute accessor is named differently per storage class: a QuantizedDBuffer
+            # materializes its padded TE GEMM wrapper via get_tensor(), while a plain DBuffer
+            # returns this rank's local flat view via get_tensor_view().
+            if HAVE_TE and isinstance(self._unsharded_model_weight, QuantizedDBuffer):
+                unsharded_tensor = self._unsharded_model_weight.get_tensor(index)
+            else:
+                unsharded_tensor = self._unsharded_model_weight.get_tensor_view(index)
             if parameter.is_meta:
                 # A meta Parameter cannot set .data to a real tensor because their
                 # TensorImpl types are incompatible, so swap in a materialized Parameter.
@@ -404,7 +410,12 @@ class FsdpParameterGroup:
                 )
 
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.unsharded.data = unsharded_model_weight.get_tensor_view(index)
+            # Same per-class compute accessor split as in _build_fsdp_parameters().
+            if HAVE_TE and isinstance(unsharded_model_weight, QuantizedDBuffer):
+                unsharded_tensor = unsharded_model_weight.get_tensor(index)
+            else:
+                unsharded_tensor = unsharded_model_weight.get_tensor_view(index)
+            fsdp_parameter.unsharded.data = unsharded_tensor
         self._switch_to_unsharded_parameters()
 
     def reshard_parameters(self) -> None:
