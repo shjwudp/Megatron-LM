@@ -78,11 +78,14 @@ try:
         preprocess_state_dict_for_uneven_dtensor,
     )
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
+        get_model_sections,
         handle_experts_in_state_dict,
         handle_fp8_extra_state_case,
         handle_mla_down_proj_in_state_dict,
         handle_mtp_in_state_dict,
         handle_swiglu_in_state_dict,
+        is_model_section_key,
+        partition_optimizer_state_dict_by_model_chunk,
         print_diff_in_state_dicts,
         validate_fsdp_dtensor_model_load,
     )
@@ -931,7 +934,7 @@ def save_checkpoint(
                 ensure_directory_exists(checkpoint_name, check_parent=False)
 
             if ckpt_format == 'fsdp_dtensor':
-                state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+                state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model)
 
             if args.async_save:
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
@@ -1765,27 +1768,65 @@ def _localize_redundant_extra_states(state_dict):
 
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
-    handle_fp8_extra_state_case(state_dict['model'])
+    # One top-level model section per model chunk: ``model`` for a single chunk and
+    # ``model0``, ``model1``, ... under virtual pipeline parallelism (see
+    # ``generate_state_dict``). Every handler below is per-chunk -- it resolves keys, or
+    # builds its module maps, against a single chunk -- so each section is processed
+    # together with the chunk that owns it. With one section this is exactly the previous
+    # single-chunk call sequence.
+    sections = get_model_sections(state_dict, model)
+    optimizer_state_dict = state_dict.get('optimizer')
 
-    def apply(handler):
-        """Run a state dict handler over the model and, when present, the optimizer state."""
-        model_state_dict, optimizer_state_dict = handler(
-            model, state_dict['model'], state_dict.get('optimizer')
+    if len(sections) > 1:
+        # The optimizer is a single, unsectioned top-level entry while the model is
+        # sectioned per chunk, so hand each per-chunk call only the optimizer entries
+        # that resolve against that chunk. Entries owned by no chunk are copied through
+        # unchanged below rather than silently dropped.
+        optimizer_slices, unowned_optimizer_state = partition_optimizer_state_dict_by_model_chunk(
+            optimizer_state_dict,
+            [model_chunk for _section_key, model_chunk in sections],
+            args.num_experts,
         )
-        state_dict['model'] = model_state_dict
-        if 'optimizer' in state_dict:
-            state_dict['optimizer'] = optimizer_state_dict
+    else:
+        optimizer_slices = [optimizer_state_dict]
+        unowned_optimizer_state = {}
 
-    if args.swiglu:
-        apply(handle_swiglu_in_state_dict)
-    # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
-    # layout used on disk. No-op for unfused models.
-    apply(handle_mla_down_proj_in_state_dict)
-    if args.num_experts:
-        state_dict['model'] = handle_experts_in_state_dict(state_dict['model'], args.num_experts)
-    # Rename the MTP inner layer to the name used on disk. Runs last because the handlers
-    # above resolve keys against live module paths, which still use the new name.
-    apply(handle_mtp_in_state_dict)
+    merged_optimizer_state = {}
+    for index, (section_key, model_chunk) in enumerate(sections):
+        model_state_dict = state_dict[section_key]
+        optimizer_slice = optimizer_slices[index]
+        handle_fp8_extra_state_case(model_state_dict)
+
+        if args.swiglu:
+            model_state_dict, optimizer_slice = handle_swiglu_in_state_dict(
+                model_chunk, model_state_dict, optimizer_slice
+            )
+        # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
+        # layout used on disk. No-op for unfused models.
+        model_state_dict, optimizer_slice = handle_mla_down_proj_in_state_dict(
+            model_chunk, model_state_dict, optimizer_slice
+        )
+        if args.num_experts:
+            model_state_dict = handle_experts_in_state_dict(model_state_dict, args.num_experts)
+        # Rename the MTP inner layer to the name used on disk. Runs last because the handlers
+        # above resolve keys against live module paths, which still use the new name.
+        model_state_dict, optimizer_slice = handle_mtp_in_state_dict(
+            model_chunk, model_state_dict, optimizer_slice
+        )
+
+        state_dict[section_key] = model_state_dict
+        optimizer_slices[index] = optimizer_slice
+
+    for optimizer_slice in optimizer_slices:
+        if optimizer_slice is not None:
+            merged_optimizer_state.update(optimizer_slice.get('state') or {})
+
+    if optimizer_state_dict is not None:
+        state_dict['optimizer'] = {
+            **optimizer_state_dict,
+            'state': {**unowned_optimizer_state, **merged_optimizer_state},
+        }
+
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict
@@ -2182,9 +2223,15 @@ def _load_base_checkpoint(
         raw_optimizer_state_dict = (
             state_dict['optimizer'].copy() if 'optimizer' in state_dict else None
         )
-        raw_model_state_dict = state_dict['model'].copy() if 'model' in state_dict else None
+        # The model is sectioned per chunk under virtual pipeline parallelism, so capture
+        # every model section (``model``, or ``model0``, ``model1``, ...), not just
+        # ``model``. They are restored below so the caller loads the un-preprocessed
+        # layout, exactly as in the single-section case.
+        raw_model_state_dict = {
+            key: state_dict[key].copy() for key in state_dict if is_model_section_key(key)
+        }
         model = state_dict.pop('_model')
-        state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+        state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model)
         fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
         state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
         if gpt_compat_layer_maps is not None:
@@ -2244,8 +2291,8 @@ def _load_base_checkpoint(
         if raw_optimizer_state_dict is not None:
             state_dict['optimizer'] = raw_optimizer_state_dict
 
-        if raw_model_state_dict is not None:
-            state_dict['model'] = raw_model_state_dict
+        for section_key, raw_section in raw_model_state_dict.items():
+            state_dict[section_key] = raw_section
     else:
         raise NotImplementedError(f'checkpoint format {ckpt_format} not supported')
 
