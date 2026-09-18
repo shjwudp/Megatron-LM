@@ -59,6 +59,33 @@ def _strip_wrapper_prefixes(path):
     return '.'.join(parts)
 
 
+def _get_model_parameter(model, key):
+    """Resolve an unprefixed model state-dict key to the live (distributed) parameter.
+
+    ``key`` is a ``state_dict_for_save_checkpoint`` key, which never carries a wrapper
+    prefix. Which prefix the *parameters* carry depends on the DDP/FSDP wrapper
+    ``unwrap_model`` stopped at:
+
+    * Megatron-FSDP v1 unwraps to ``MegatronFSDP``, which owns the inner model as
+      ``self.module``, so its parameters are addressed as ``module.<key>``.
+    * Megatron-FSDP v2 shards the model in place and unwraps to the bare model, so
+      its parameters are addressed as ``<key>``.
+
+    Try the bare key first and fall back to the ``module.``-prefixed one so both
+    wrappers resolve to the same parameter object.
+    """
+    prefixed = f'module.{key}'
+    for candidate in (key, prefixed):
+        try:
+            return model.get_parameter(candidate)
+        except AttributeError:
+            continue
+    raise AttributeError(
+        f"Could not resolve parameter {key!r} on {type(model).__name__}: it is "
+        f"neither named {key!r} nor {prefixed!r}."
+    )
+
+
 def _intersect_slice(s1, s2):
     """Intersection of two step-1 slices, or an empty slice when they do not overlap."""
     start = max(s1.start, s2.start)
@@ -286,6 +313,28 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             f"got {data.shape[swiglu_shard_axis]}"
         )
 
+        # Megatron-FSDP v2 installs one plain DTensor parameter per module and does not
+        # publish v1's flat-shard bookkeeping (`megatron_fsdp_slice` /
+        # `megatron_fsdp_dist_index`). The whole fused projection is already a DTensor on
+        # the FSDP mesh, so split the DTensor itself -- the same split the converter
+        # applies when it writes `_w`/`_v` to disk. `split_dtensor` keeps the DTensor's
+        # mesh and placements and records the true chunk offsets, which is what the DCP
+        # load planner consumes.
+        if not hasattr(dist_param, 'megatron_fsdp_slice'):
+            assert isinstance(data, DTensor), (
+                "A parameter without `megatron_fsdp_slice` must be a DTensor, got "
+                f"{type(data).__name__}."
+            )
+            half = data.shape[swiglu_shard_axis] // 2
+            return tuple(
+                split_dtensor(
+                    data,
+                    [half, half],
+                    dim=swiglu_shard_axis,
+                    update_uneven_dtensor_chunk_meta=True,
+                )
+            )
+
         fsdp_slice = dist_param.megatron_fsdp_slice
         megatron_fsdp_dist_index = dist_param.megatron_fsdp_dist_index
 
@@ -346,7 +395,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             if not _key_in_glu_layer(key):
                 _swiglu_skip_count += 1
                 continue
-            dist_param = model.get_parameter(f"module.{key}")
+            dist_param = _get_model_parameter(model, key)
             weight_w, weight_v = split_swiglu_linear_fc1(
                 model_state_dict[key],
                 dist_param,
@@ -378,8 +427,8 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
                 new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(
-                        expert_param_local_key(key[len("module.") :], num_experts)
+                    dist_param = _get_model_parameter(
+                        model, expert_param_local_key(_strip_wrapper_prefixes(key), num_experts)
                     )
                     weight_w, weight_v = split_swiglu_linear_fc1(
                         opt_state_dict[key][subkey],
@@ -518,7 +567,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         if match is None:
             continue
         sizes, names, dim = match
-        dist_param = model.get_parameter(f"module.{key}")
+        dist_param = _get_model_parameter(model, key)
         sub_tensors = split_gdn_fused(model_state_dict[key], dist_param, sizes, dim)
         for sub_name, tensor in zip(names, sub_tensors):
             model_state_dict[f"{key}.{sub_name}"] = tensor
@@ -546,7 +595,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(key[len("module.") :])
+                    dist_param = _get_model_parameter(model, _strip_wrapper_prefixes(key))
                     sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
                         new_opt_state[f"{key}.{sub_name}"][subkey] = tensor
@@ -569,6 +618,28 @@ def split_fused_fsdp_param(data, dist_param, split_sizes, is_expert_param=False,
     even two-way split to arbitrary section sizes.
     """
     assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
+
+    # Megatron-FSDP v2 keeps the whole fused projection in one DTensor and has no
+    # `megatron_fsdp_slice` / `megatron_fsdp_dist_index` to rebase it onto a flat
+    # shard, so split the DTensor directly (see handle_swiglu_in_state_dict).
+    if not hasattr(dist_param, 'megatron_fsdp_slice'):
+        assert isinstance(data, DTensor), (
+            "A parameter without `megatron_fsdp_slice` must be a DTensor, got "
+            f"{type(data).__name__}."
+        )
+        total_full = sum(split_sizes)
+        assert data.shape[split_dim] == total_full, (
+            f"Fused parameter is {data.shape[split_dim]} wide along dim {split_dim}, "
+            f"but the requested sections sum to {total_full}"
+        )
+        return list(
+            split_dtensor(
+                data,
+                list(split_sizes),
+                dim=split_dim,
+                update_uneven_dtensor_chunk_meta=True,
+            )
+        )
 
     fsdp_slice = dist_param.megatron_fsdp_slice
     dist_index = dist_param.megatron_fsdp_dist_index
@@ -731,7 +802,7 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
             continue
 
         sections = split_fused_fsdp_param(
-            model_state_dict[key], model.get_parameter(f'module.{key}'), split_sizes
+            model_state_dict[key], _get_model_parameter(model, key), split_sizes
         )
         for proj_name, section in zip(MLA_UNFUSED_DOWN_PROJS, sections):
             model_state_dict[f'{wrapper}{attention_path}.{proj_name}.{leaf}'] = section
@@ -767,7 +838,7 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
             ]
             for new_key in new_keys:
                 new_optimizer_state[new_key] = optimizer_state[key].copy()
-            dist_param = model.get_parameter(key[len("module.") :])
+            dist_param = _get_model_parameter(model, _strip_wrapper_prefixes(key))
             for subkey in ["exp_avg", "exp_avg_sq"]:
                 sections = split_fused_fsdp_param(
                     optimizer_state[key][subkey], dist_param, split_sizes

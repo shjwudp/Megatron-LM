@@ -48,6 +48,7 @@ from megatron.core.tensor_parallel.layers import (
 from megatron.core.transformer import fsdp_dtensor_checkpoint
 from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     MLA_UNFUSED_DOWN_PROJS,
+    _get_model_parameter,
     _intersect_slice,
     _shift_slice,
     _strip_wrapper_prefixes,
@@ -61,6 +62,7 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     handle_mtp_in_state_dict,
     match_mla_fused_down_proj_key,
     rename_mtp_inner_layer_keys,
+    split_fused_fsdp_param,
     validate_fsdp_dtensor_model_load,
 )
 
@@ -117,6 +119,81 @@ class TestSharedSliceHelpers:
     def test_strip_keeps_inner_module_segments(self):
         """Only leading wrapper segments go; 'module' deeper in the path is a real submodule."""
         assert _strip_wrapper_prefixes("module.decoder.module.weight") == "decoder.module.weight"
+
+
+# ============================================================================
+# Test the MFSDP v1/v2 parameter resolution and fused-DTensor splitting
+# ============================================================================
+class _InnerModel(torch.nn.Module):
+    """Stands in for the bare model that MFSDP v2 shards in place."""
+
+    def __init__(self):
+        super().__init__()
+        self.layer = torch.nn.Linear(4, 4)
+
+
+class _WrappedModel(torch.nn.Module):
+    """Stands in for MFSDP v1's ``MegatronFSDP``, which owns the model as ``module``."""
+
+    def __init__(self):
+        super().__init__()
+        self.module = _InnerModel()
+
+
+class TestModelParameterResolution:
+    """``state_dict_for_save_checkpoint`` keys have no wrapper prefix, but the live
+    parameters do for MFSDP v1 and do not for MFSDP v2. Resolving only one of the two
+    forms is what made the ``fsdp_dtensor`` load path raise
+    ``GPTModel has no attribute 'module'`` for v2."""
+
+    def test_resolves_bare_key_for_v2(self):
+        model = _InnerModel()
+        assert _get_model_parameter(model, "layer.weight") is model.layer.weight
+
+    def test_resolves_module_prefixed_key_for_v1(self):
+        model = _WrappedModel()
+        assert _get_model_parameter(model, "layer.weight") is model.module.layer.weight
+
+    def test_raises_when_neither_form_exists(self):
+        model = _InnerModel()
+        with pytest.raises(AttributeError, match="neither named"):
+            _get_model_parameter(model, "layer.missing")
+
+
+class TestV2DTensorFusedSplit:
+    """MFSDP v2 installs a plain DTensor parameter and publishes neither
+    ``megatron_fsdp_slice`` nor ``megatron_fsdp_dist_index``. The fused-parameter
+    splitter must split the DTensor itself instead of dying on the missing v1
+    flat-shard bookkeeping."""
+
+    def test_split_fused_fsdp_param_splits_the_v2_dtensor(self):
+        if not torch.distributed.is_initialized():
+            pytest.skip(
+                "Requires an initialized torch.distributed process group (run via torchrun)."
+            )
+        if not torch.cuda.is_available():
+            pytest.skip("Requires CUDA.")
+
+        from torch.distributed._tensor import DeviceMesh, Replicate, distribute_tensor
+
+        world_size = torch.distributed.get_world_size()
+        device = torch.device("cuda", torch.cuda.current_device())
+        mesh = DeviceMesh(device.type, list(range(world_size)))
+
+        # Replicated so every rank holds the whole fused tensor and the expected
+        # per-rank result is exact and rank-independent.
+        global_tensor = torch.arange(2 * world_size * 3, dtype=torch.float32, device=device)
+        global_tensor = global_tensor.reshape(2 * world_size, 3)
+        data = distribute_tensor(global_tensor, mesh, [Replicate()])
+
+        # A v2 parameter is a DTensor that simply lacks the v1 flat-shard attributes.
+        sections = split_fused_fsdp_param(data, data, [world_size, world_size], split_dim=0)
+
+        assert len(sections) == 2
+        assert all(section.shape == (world_size, 3) for section in sections)
+        # The split must partition the fused parameter, not duplicate or drop data.
+        assert torch.equal(sections[0].to_local(), global_tensor[:world_size])
+        assert torch.equal(sections[1].to_local(), global_tensor[world_size:])
 
 
 # ============================================================================
