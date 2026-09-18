@@ -43,6 +43,24 @@ def reshard_fsdp_module(module: FsdpModule) -> None:
     module.reshard()
 
 
+def finalize_fsdp_backward(module) -> None:
+    """Declare the end of an FSDP unit's backward from the schedule.
+
+    The fine-grained schedule calls this from the unit's last backward node, which
+    is its only reliable end-of-backward edge: the backward is one ``run_backward``
+    per schedule node, so the number of post-accumulate-grad callbacks is not the
+    unit's parameter count.
+
+    Every FSDP unit nested inside the hook target is closed too -- an expert
+    parameter group is its own unit inside a MoE layer, and it finishes with the
+    layer that contains it. Hook targets that are not FSDP units themselves (for
+    example a ``HybridStack``) still have their nested units closed.
+    """
+    for submodule in module.modules():
+        if isinstance(submodule, FsdpModule):
+            submodule.finalize_scheduled_backward()
+
+
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     """Install the sub-module hooks required by MCore combined 1F1B."""
 
@@ -62,4 +80,6 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
 
     for submodule in module.modules():
         if isinstance(submodule, FsdpModule):
-            submodule.register_post_backward_hook(_module_post_backward_hook)
+            # This path disables the automatic module hooks (``register_hooks=False``
+            # in the MFSDP v2 adapter), so the schedule owns the backward window.
+            submodule.register_post_backward_hook(_module_post_backward_hook, schedule_driven=True)
