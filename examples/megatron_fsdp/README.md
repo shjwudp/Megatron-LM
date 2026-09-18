@@ -118,7 +118,9 @@ SLURM batch script for converting checkpoints from **`torch_dist`** (N-D paralle
 
 #### Prerequisites
 
-Before converting, you need a `param_to_param_group_map.json` file. Generate it by running a `torch_dist` training job with the `--dump-param-to-param-group-map` flag, then converting the output:
+- **A GPU allocation.** The converter builds a CUDA `DeviceMesh` and initializes NCCL, so it cannot run on CPU. Locally, launch it with `torchrun --nproc_per_node=<GPUs>`; the SLURM script below requests GPUs and runs one process per GPU.
+- **`--swiglu` for SwiGLU models.** Required when the model configuration has `swiglu: true` (e.g. `deepseek_v3_proxy`); it is not auto-detected. See [Conversion Command](#conversion-command).
+- **A `param_to_param_group_map.json` file — only for optimizer-inclusive conversion.** This is _not_ needed for the recommended weights-only route (`MODEL_WEIGHTS_ONLY=1`). If you do convert optimizer state, generate the map by running a `torch_dist` training job with the `--dump-param-to-param-group-map` flag, then converting the output:
 
 ```bash
 # 1. Run a training job (or trivial experiment) with the dump flag
@@ -146,7 +148,7 @@ bash examples/megatron_fsdp/sbatch_checkpoint_convert.sh
 Before running, you must edit the script to fill in:
 - The input `torch_dist` checkpoint path
 - The output `fsdp_dtensor` checkpoint path
-- The path to `param_to_param_group_map.json`
+- The path to `param_to_param_group_map.json`, **only if** you set `MODEL_WEIGHTS_ONLY=0`
 - The `#SBATCH` directives and `--container-mounts` for your cluster
 
 #### Environment Variables
@@ -156,10 +158,14 @@ Before running, you must edit the script to fill in:
 | `MEGATRON_PATH` | *(required)* | Path to the Megatron-LM repository. |
 | `CONTAINER_IMAGE` | *(required)* | Container image (`.sqsh` file or Docker URL). |
 | `OUTPUT_PATH` | *(required)* | Base directory for SLURM logs. |
+| `MODEL_WEIGHTS_ONLY` | `1` | `1` adds `--model-weights-only` (model weights only, no optimizer state). Keep at `1` for Megatron-FSDP v2, which cannot save or load optimizer state. Set to `0` only to convert optimizer state for a consumer that supports it (requires `PARAM_TO_PARAM_GROUP_MAP_JSON`). |
+| `LOADABLE_LAYOUT` | `1` | `1` adds `--loadable-layout`, writing `<out>/iter_<N>/` + `latest_checkpointed_iteration.txt`, the layout `--load` requires. Keep at `1` unless you consume the raw DCP files directly; without it `--load <flat dir>` warns and **silently starts from random weights**. |
+| `SWIGLU` | `1` | `1` adds `--swiglu` for models using SwiGLU activations (e.g. `deepseek_v3_proxy`). Set to `0` for non-SwiGLU models. |
+| `PARAM_TO_PARAM_GROUP_MAP_JSON` | *(empty)* | Path to `param_to_param_group_map.json`. Only used when `MODEL_WEIGHTS_ONLY=0`; ignored otherwise. |
 
 #### Conversion Command
 
-The script runs `checkpoint_inspector.py convert-torch-dist-to-fsdp-dtensor` with the `--swiglu` flag (for models using SwiGLU activations). Remove `--swiglu` if converting a non-SwiGLU model.
+The script runs `checkpoint_inspector.py convert-torch-dist-to-fsdp-dtensor` with `--model-weights-only`, `--loadable-layout`, and `--swiglu` by default (all toggleable through the environment variables above), and appends `--param-to-param-group-map-json` only when `MODEL_WEIGHTS_ONLY=0` and `PARAM_TO_PARAM_GROUP_MAP_JSON` is set. The resulting checkpoint is loaded by a Megatron-FSDP v2 run with `--no-load-optim --no-save-optim --no-load-rng`, as described in the [Megatron-FSDP docs](../../docs/user-guide/features/megatron_fsdp.md#loading-a-converted-checkpoint).
 
 ## Further Reading
 

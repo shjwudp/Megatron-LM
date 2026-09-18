@@ -22,6 +22,7 @@ import click
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from model_weight_keys import model_weight_output_key, split_model_section
 from torch.distributed.checkpoint import (
     DefaultLoadPlanner,
     DefaultSavePlanner,
@@ -38,7 +39,8 @@ from torch.distributed.tensor import DeviceMesh, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import split_dtensor, redistribute_uneven_dtensor_to_replicated
 
-from megatron.core.dist_checkpointing.strategies.common import load_common
+from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.serialization import load_common_state_dict
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
 )
@@ -47,6 +49,17 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 )
 from megatron.core.dist_checkpointing.validation import verify_checkpoint
 from megatron.core.msc_utils import MultiStorageClientFeature
+
+
+# DCP-internal key of the current-format common-state ShardedObject, i.e.
+# `ShardedObject("common_state", None, (1,), (0,)).unique_key`. Current Megatron
+# stores the non-sharded common state there (`save_common` is unused) and
+# `load_common_state_dict` reads it separately. `serialization.load_sharded_metadata`
+# excludes it from the state dict -- `k: v for k, v in ckpt_sharded_metadata.items()
+# if v.key != 'common_state'` -- because it is an internal format key rather than
+# a real state entry. The raw DCP metadata read here keys it by its full unique
+# key, so the same exclusion is expressed against `_COMMON_STATE_DCP_KEY`.
+_COMMON_STATE_DCP_KEY = ShardedObject("common_state", None, (1,), (0,)).unique_key
 
 
 def rank0_echo(message):
@@ -107,7 +120,7 @@ def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
         )
 
         # Common state section
-        common_state = load_common(checkpoint_dir)
+        common_state = load_common_state_dict(checkpoint_dir)
         print_header(f"common state ({len(common_state)} items)", "cyan")
         for key, value in common_state.items():
             bullet = click.style("•", fg="magenta")
@@ -285,8 +298,42 @@ def flatten(obj, parent_key="", sep="."):
     return items
 
 
-def save_checkpoint_with_pickle_protocol(state_dict, output_dir, pickle_protocol=4):
-    writer = FileSystemWriter(output_dir)
+def is_optimizer_key(key: str) -> bool:
+    """True when ``optimizer`` appears as a dotted path component of ``key``.
+
+    Distributed-optimizer checkpoints nest optimizer state under the chained
+    optimizer (``chained_0.optimizer...``), so a bare ``key.startswith(
+    "optimizer.")`` test misses it and the key would be emitted as a model weight.
+    """
+    return re.search(r"(^|\.)optimizer(\.|$)", key) is not None
+
+
+def save_checkpoint_with_pickle_protocol(
+    state_dict, output_dir, pickle_protocol=4, loadable_layout=False
+):
+    """Write ``state_dict`` as a raw DCP checkpoint under ``output_dir``.
+
+    ``loadable_layout`` selects the directory layout Megatron's ``--load`` requires:
+    the DCP files go into ``<output_dir>/iter_<iteration:07d>/`` and
+    ``<output_dir>/latest_checkpointed_iteration.txt`` records the iteration.
+    Without it the DCP files land directly in ``<output_dir>``, which is a valid raw
+    DCP checkpoint but *not* a Megatron checkpoint directory: ``--load`` cannot find
+    the tracker file, prints a warning and silently starts from random weights.
+    """
+    if loadable_layout:
+        iteration = state_dict.get('iteration')
+        if iteration is None:
+            raise click.ClickException(
+                "--loadable-layout needs an 'iteration' entry to name iter_<iteration>/: "
+                "the converted state dict has none."
+            )
+        iteration = int(iteration)
+        checkpoint_dir = os.path.join(output_dir, 'iter_{:07d}'.format(iteration))
+    else:
+        iteration = None
+        checkpoint_dir = output_dir
+
+    writer = FileSystemWriter(checkpoint_dir)
     planner = DefaultSavePlanner()
 
     def transform_object_override(write_item, obj):
@@ -309,6 +356,33 @@ def save_checkpoint_with_pickle_protocol(state_dict, output_dir, pickle_protocol
         planner=planner,
         process_group=dist.group.WORLD,
     )
+
+    if loadable_layout:
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            os.makedirs(output_dir, exist_ok=True)
+            tracker_filename = os.path.join(output_dir, 'latest_checkpointed_iteration.txt')
+            with open(tracker_filename, 'w') as f:
+                f.write(str(iteration))
+        if dist.is_initialized():
+            dist.barrier()
+        rank0_echo(
+            click.style(
+                f"[Layout] Wrote a loadable checkpoint; pass --load {output_dir}",
+                fg="green",
+            )
+        )
+    else:
+        rank0_echo(
+            click.style(
+                "WARNING: wrote a raw DCP checkpoint directly into "
+                f"{output_dir}, which is NOT a loadable Megatron checkpoint "
+                "directory: `--load` will silently start from random weights. "
+                "Re-run with --loadable-layout, or move the DCP files into "
+                f"{output_dir}/iter_<7-digit iteration>/ and write the iteration "
+                f"to {output_dir}/latest_checkpointed_iteration.txt.",
+                fg="yellow",
+            )
+        )
 
 
 class VerboseLoadPlanner(DefaultLoadPlanner):
@@ -343,6 +417,8 @@ def convert_checkpoint(
     param_to_param_group_map={},
     rename_mtp_keys=False,
     swiglu_modules=None,
+    model_weights_only: bool = False,
+    loadable_layout: bool = False,
 ):
     """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format.
 
@@ -372,6 +448,26 @@ def convert_checkpoint(
     MCore torch_dist format.
 
     \b
+    Model weights only (model_weights_only=True)
+    ===========================================
+    Emits only 'model.*' weights plus the non-optimizer common state ('args',
+    'iteration', 'checkpoint_version'). All 'optimizer.*' entries are dropped,
+    and optimizer tensors are never even loaded. Use this for Megatron-FSDP v2,
+    whose optimizer checkpointing is unimplemented; load the result with
+    '--no-load-optim' ('--no-save-optim' does not affect loading). 'rng_state*'
+    is dropped as before, so loading may also need '--no-load-rng'.
+
+    \b
+    Virtual pipeline parallelism (VPP)
+    ==================================
+    A VPP 'torch_dist' source sections the model per chunk: its keys are
+    'model0.<param>', 'model1.<param>', ... (the fsdp_dtensor loader requests
+    'model0.module.<param>', ...). Such a key keeps its section index, which
+    replaces the leading 'model' component of 'model_weight_prefix' -- see
+    'model_weight_keys.model_weight_output_key'. Single-section sources are
+    unchanged.
+
+    \b
     Examples
     ========
     Qwen3.5-VL (SWiGLU in language_model only, has GDN + MTP):
@@ -393,6 +489,23 @@ def convert_checkpoint(
     metadata = reader.read_metadata()
     state_dict = {}
     for key, md in metadata.state_dict_metadata.items():
+        # Model-weights-only mode: never allocate (or load) optimizer tensors,
+        # and never load the internal common-state blob.
+        # - Skipping optimizer tensors avoids materializing potentially enormous
+        #   optimizer state that would be dropped later anyway. The
+        #   dotted-component test also catches distributed-optimizer keys such
+        #   as 'chained_<i>.optimizer...', which a bare 'optimizer.' prefix
+        #   missed.
+        # - The `common_state` blob's payload is the whole, *unfiltered* common
+        #   state (optimizer entries included), so re-emitting it would violate
+        #   the weights-only contract even though its own key name is innocuous.
+        #   The filtered common state is still re-emitted as individual keys
+        #   below. `serialization.load_sharded_metadata()` drops this internal
+        #   key for the same reason (`... if v.key != 'common_state'`).
+        if model_weights_only and (
+            key == _COMMON_STATE_DCP_KEY or is_optimizer_key(key)
+        ):
+            continue
         if isinstance(md, TensorStorageMetadata):
             # Initialize tensor storage
             assert len(md.size) > 0, (
@@ -583,14 +696,25 @@ def convert_checkpoint(
             continue
 
         if isinstance(value, torch.Tensor):
+            if model_weights_only and is_optimizer_key(key):
+                # Defensive: optimizer keys are already filtered out at load
+                # time. Drop any stray one instead of converting it, so that
+                # model-weights-only output can never contain optimizer state.
+                # The dotted-component predicate also catches distributed-opt
+                # keys such as 'chained_<i>.optimizer...'.
+                continue
             if key.startswith("optimizer.state."):
                 # Special handling for optimizer state
                 key_list = key.split(".")
                 new_key = f"{optimizer_state_prefix}.{'.'.join(key_list[3:])}.{key_list[2]}"
                 is_param = False
             else:
-                # Special handling for module parameters
-                new_key = f"{model_weight_prefix}.{key}"
+                # Special handling for module parameters. A virtual-pipeline-parallelism
+                # source carries a `model{i}.` section prefix, which must lead the output
+                # key (`model{i}.module.<param>`) because that is the section the
+                # fsdp_dtensor loader requests. Single-section sources keep the plain
+                # `<model_weight_prefix>.<param>` layout.
+                new_key = model_weight_output_key(key, model_weight_prefix)
                 is_param = True
 
             # Handle dist-opt flatten tensors
@@ -640,18 +764,32 @@ def convert_checkpoint(
                         value = value.reshape(orig_shape).redistribute(placements=[Shard(0)])
                 split_tensors = {new_key: value}
 
-            # Handle SWiGLU weights (per-module: only for modules in _swiglu_prefixes)
-            for key, value in list(split_tensors.items()):
-                if is_swiglu_key(key):
-                    swiglu_w_and_v = split_swiglu_weight(key, value)
+            # Handle SWiGLU weights (per-module: only for modules in _swiglu_prefixes).
+            # Capture the pre-split keys before the loop: the loop rebinds its
+            # iteration variable, so reading it afterwards made the param-group
+            # propagation below depend on whichever split key happened to be
+            # iterated last (it only worked by accident).
+            orig_keys = list(split_tensors.keys())
+            for split_key, split_value in list(split_tensors.items()):
+                if is_swiglu_key(split_key):
+                    swiglu_w_and_v = split_swiglu_weight(split_key, split_value)
                     split_tensors.update(swiglu_w_and_v)
-                    del split_tensors[key]
+                    del split_tensors[split_key]
                     _swiglu_split_count += 1
 
             fsdp_dtensor_state_dict.update(split_tensors)
-            if is_param and key in param_to_param_group_map:
-                for new_key in split_tensors.keys():
-                    param_to_param_group_map[new_key] = param_to_param_group_map[key]
+            if is_param:
+                # Propagate each pre-split key's param group to the key(s) it
+                # produced. SWiGLU splitting only inserts a `_w`/`_v` marker
+                # before the weight/bias suffix, so generated keys keep the
+                # pre-split key as a prefix.
+                for orig_key in orig_keys:
+                    if orig_key not in param_to_param_group_map:
+                        continue
+                    orig_param_group = param_to_param_group_map[orig_key]
+                    for new_key in split_tensors.keys():
+                        if new_key == orig_key or new_key.startswith(orig_key):
+                            param_to_param_group_map[new_key] = orig_param_group
         elif key.startswith("rng_state"):
             # Skip RNG states
             continue
@@ -735,37 +873,61 @@ def convert_checkpoint(
             f"Unsupported sharded strategy: {sharded_strategy}", fg="red", bold=True
         )
     )
-    common_state = load_common(input_dir)
-    try:
-        if "param_groups" in common_state["optimizer"]:
-            ckpt_param_groups = common_state["optimizer"]["param_groups"]
-        else:
-            ckpt_param_groups = []
-            for opt_state_dict in common_state["optimizer"].values():
-                ckpt_param_groups.extend(opt_state_dict["optimizer"]["param_groups"])
-    except:
-        ckpt_param_groups = None
+    common_state = load_common_state_dict(input_dir)
+    # ckpt_param_groups is only consumed to reconstruct optimizer.* entries, so
+    # in model-weights-only mode there is no need to read it at all.
+    ckpt_param_groups = None
+    if not model_weights_only:
+        try:
+            if "param_groups" in common_state["optimizer"]:
+                ckpt_param_groups = common_state["optimizer"]["param_groups"]
+            else:
+                ckpt_param_groups = []
+                for opt_state_dict in common_state["optimizer"].values():
+                    ckpt_param_groups.extend(opt_state_dict["optimizer"]["param_groups"])
+        except:
+            ckpt_param_groups = None
     common_state = flatten(common_state)
     for key, value in common_state.items():
         if key.startswith("optimizer.optimizer.param_groups."):
             key = key.replace(
                 "optimizer.optimizer.param_groups.", "optimizer.param_groups."
             )
+        if model_weights_only and is_optimizer_key(key):
+            # Keep the non-optimizer common state (args, iteration,
+            # checkpoint_version, ...), but emit no optimizer key of any kind.
+            # The dotted-component predicate also catches distributed-optimizer
+            # common state such as 'chained_<i>.optimizer...'.
+            continue
         assert key not in fsdp_dtensor_state_dict, (
             f"Key '{key}' already exists in fsdp_dtensor_state_dict."
         )
         fsdp_dtensor_state_dict[key] = value
 
-    # set up per-parameter param_groups
-    if param_to_param_group_map and ckpt_param_groups is not None:
+    # set up per-parameter param_groups (optimizer metadata only)
+    if (
+        not model_weights_only
+        and param_to_param_group_map
+        and ckpt_param_groups is not None
+    ):
         for name in list(fsdp_dtensor_state_dict.keys()):
-            if not name.startswith(model_weight_prefix) or name.endswith(".expert_bias"):
+            # A VPP output key is 'model{i}.module.<param>' while `model_weight_prefix` is
+            # the unsectioned 'model.module'; strip the section before matching so both
+            # layouts are covered instead of silently skipping the whole model.
+            _section, name_without_section = split_model_section(name)
+            if (
+                not name_without_section.startswith(model_weight_prefix)
+                or name_without_section.endswith(".expert_bias")
+            ):
                 continue
 
             assert name in param_to_param_group_map, f"Missing param group for {name}"
             param_group_id = param_to_param_group_map[name]
             assert param_group_id < len(ckpt_param_groups), f"Invalid param group id {param_group_id} for {name}"
-            name_without_prefix = name[len(model_weight_prefix):]
+            # `name` is `<model_weight_prefix>.<param>`, so strip the prefix
+            # *including* its leading dot: otherwise the f-string below adds a
+            # second separator and produces a double-dot key.
+            name_without_prefix = name_without_section[len(model_weight_prefix):].lstrip(".")
             fsdp_dtensor_state_dict[
                 f"{optimizer_param_to_group_prefix}.{name_without_prefix}"
             ] = ckpt_param_groups[param_group_id]
@@ -774,7 +936,9 @@ def convert_checkpoint(
         fsdp_dtensor_state_dict["checkpoint_version"] = 3.0
 
     # Save modified checkpoint
-    save_checkpoint_with_pickle_protocol(fsdp_dtensor_state_dict, output_dir)
+    save_checkpoint_with_pickle_protocol(
+        fsdp_dtensor_state_dict, output_dir, loadable_layout=loadable_layout
+    )
 
     dist.barrier()              # Synchronize all ranks
     dist.destroy_process_group()
@@ -810,7 +974,11 @@ def convert_checkpoint(
 @click.option(
     "--output-model-weight-prefix",
     default="model.module",
-    help="Prefix for model weight keys in the checkpoint.",
+    help="Prefix for model weight keys in the checkpoint. For a single-section source "
+         "the output key is '<prefix>.<param>'. A virtual-pipeline-parallelism source "
+         "key 'model{i}.<param>' keeps its section index, which replaces the prefix's "
+         "leading 'model' component, so the default 'model.module' yields "
+         "'model{i}.module.<param>' -- the section the fsdp_dtensor loader requests.",
 )
 @click.option(
     "--param-to-param-group-map-json",
@@ -828,6 +996,30 @@ def convert_checkpoint(
          "Auto-detected if not set: enabled when '.mtp.layers.*.transformer_layer' "
          "keys are found in the checkpoint.",
 )
+@click.option(
+    "--model-weights-only",
+    is_flag=True,
+    help="Convert only 'model.*' weights and omit ALL 'optimizer.*' entries. "
+         "Use this to load into Megatron-FSDP v2, whose optimizer checkpointing "
+         "is not implemented (optimizer state is therefore unsupported): the "
+         "resulting checkpoint contains no optimizer state of any kind. "
+         "On the load side pair this with '--no-load-optim' ('--no-save-optim' "
+         "does not affect loading). The converter also drops 'rng_state*', so "
+         "loading may additionally require '--no-load-rng'; if the output is "
+         "missing 'args'/'iteration'/'checkpoint_version' or any model weight, "
+         "loading may require '--no-strict-fsdp-dtensor-load' and "
+         "'--dist-ckpt-strictness ignore_all'.",
+)
+@click.option(
+    "--loadable-layout",
+    is_flag=True,
+    help="Write the output as the directory layout Megatron's '--load' requires: "
+         "DCP files under '<output_dir>/iter_<iteration>/' plus "
+         "'<output_dir>/latest_checkpointed_iteration.txt'. Without it the raw DCP "
+         "files are written straight into '<output_dir>', where '--load "
+         "<output_dir>' finds no tracker file and SILENTLY starts from random "
+         "weights (it only prints a warning and still reports success).",
+)
 def convert_torch_dist_to_fsdp_dtensor(
     input_dir,
     output_dir,
@@ -839,6 +1031,8 @@ def convert_torch_dist_to_fsdp_dtensor(
     output_model_weight_prefix,
     param_to_param_group_map_json,
     rename_mtp_keys,
+    model_weights_only,
+    loadable_layout,
 ):
     """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format.
 
@@ -939,6 +1133,8 @@ def convert_torch_dist_to_fsdp_dtensor(
         param_to_param_group_map=param_to_param_group_map,
         rename_mtp_keys=rename_mtp_keys,
         swiglu_modules=_swiglu_modules,
+        model_weights_only=model_weights_only,
+        loadable_layout=loadable_layout,
     )
 
     click.echo(

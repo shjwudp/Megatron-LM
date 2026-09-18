@@ -48,6 +48,7 @@ from megatron.core.tensor_parallel.layers import (
 from megatron.core.transformer import fsdp_dtensor_checkpoint
 from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     MLA_UNFUSED_DOWN_PROJS,
+    _get_model_parameter,
     _intersect_slice,
     _shift_slice,
     _strip_wrapper_prefixes,
@@ -55,12 +56,16 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     flatten_state_dict,
     get_expert_index_from_key,
     get_mla_fused_down_proj_splits,
+    get_model_sections,
     get_mtp_inner_layer_paths,
     get_unexpected_model_keys,
     handle_mla_down_proj_in_state_dict,
     handle_mtp_in_state_dict,
+    is_model_section_key,
     match_mla_fused_down_proj_key,
+    partition_optimizer_state_dict_by_model_chunk,
     rename_mtp_inner_layer_keys,
+    split_fused_fsdp_param,
     validate_fsdp_dtensor_model_load,
 )
 
@@ -117,6 +122,87 @@ class TestSharedSliceHelpers:
     def test_strip_keeps_inner_module_segments(self):
         """Only leading wrapper segments go; 'module' deeper in the path is a real submodule."""
         assert _strip_wrapper_prefixes("module.decoder.module.weight") == "decoder.module.weight"
+
+
+# ============================================================================
+# Test the MFSDP v1/v2 parameter resolution and fused-DTensor splitting
+# ============================================================================
+class _InnerModel(torch.nn.Module):
+    """Stands in for the bare model that MFSDP v2 shards in place."""
+
+    def __init__(self):
+        super().__init__()
+        self.layer = torch.nn.Linear(4, 4)
+
+
+class _WrappedModel(torch.nn.Module):
+    """Stands in for MFSDP v1's ``MegatronFSDP``, which owns the model as ``module``."""
+
+    def __init__(self):
+        super().__init__()
+        self.module = _InnerModel()
+
+
+class TestModelParameterResolution:
+    """``state_dict_for_save_checkpoint`` keys carry a ``module.`` level for MFSDP v1
+    (its ``MegatronFSDP`` wrapper) but the live parameters do not for MFSDP v2 (which
+    shards the bare model in place). Resolving only one of the two forms is what made
+    the ``fsdp_dtensor`` load path raise ``GPTModel has no attribute 'module'`` for v2."""
+
+    def test_resolves_bare_key_for_v2(self):
+        model = _InnerModel()
+        assert _get_model_parameter(model, "layer.weight") is model.layer.weight
+
+    def test_resolves_module_prefixed_key_for_v1(self):
+        model = _WrappedModel()
+        assert _get_model_parameter(model, "layer.weight") is model.module.layer.weight
+
+    def test_resolves_module_level_key_on_the_bare_v2_model(self):
+        """The `fsdp_dtensor` request keys carry v1's `module.` level, but the v2 live
+        model has no such level, so the prefix has to be stripped back off."""
+        model = _InnerModel()
+        assert _get_model_parameter(model, "module.layer.weight") is model.layer.weight
+
+    def test_raises_when_no_form_exists(self):
+        model = _InnerModel()
+        with pytest.raises(AttributeError, match="it is none of"):
+            _get_model_parameter(model, "layer.missing")
+
+
+class TestV2DTensorFusedSplit:
+    """MFSDP v2 installs a plain DTensor parameter and publishes neither
+    ``megatron_fsdp_slice`` nor ``megatron_fsdp_dist_index``. The fused-parameter
+    splitter must split the DTensor itself instead of dying on the missing v1
+    flat-shard bookkeeping."""
+
+    def test_split_fused_fsdp_param_splits_the_v2_dtensor(self):
+        if not torch.distributed.is_initialized():
+            pytest.skip(
+                "Requires an initialized torch.distributed process group (run via torchrun)."
+            )
+        if not torch.cuda.is_available():
+            pytest.skip("Requires CUDA.")
+
+        from torch.distributed._tensor import DeviceMesh, Replicate, distribute_tensor
+
+        world_size = torch.distributed.get_world_size()
+        device = torch.device("cuda", torch.cuda.current_device())
+        mesh = DeviceMesh(device.type, list(range(world_size)))
+
+        # Replicated so every rank holds the whole fused tensor and the expected
+        # per-rank result is exact and rank-independent.
+        global_tensor = torch.arange(2 * world_size * 3, dtype=torch.float32, device=device)
+        global_tensor = global_tensor.reshape(2 * world_size, 3)
+        data = distribute_tensor(global_tensor, mesh, [Replicate()])
+
+        # A v2 parameter is a DTensor that simply lacks the v1 flat-shard attributes.
+        sections = split_fused_fsdp_param(data, data, [world_size, world_size], split_dim=0)
+
+        assert len(sections) == 2
+        assert all(section.shape == (world_size, 3) for section in sections)
+        # The split must partition the fused parameter, not duplicate or drop data.
+        assert torch.equal(sections[0].to_local(), global_tensor[:world_size])
+        assert torch.equal(sections[1].to_local(), global_tensor[world_size:])
 
 
 # ============================================================================
@@ -1378,3 +1464,136 @@ class TestMCoreDataGuard:
         m = FakeMetadata()
         assert hasattr(m, "mcore_data")
         assert "key" in m.mcore_data
+
+
+# ============================================================================
+# Test the 1..N model-section <-> model-chunk pairing (virtual pipeline
+# parallelism). ``generate_state_dict`` writes ``model`` for one model chunk and
+# ``model0``, ``model1``, ... for VPP; the fsdp_dtensor preprocess must process
+# each section with its own chunk instead of unconditionally indexing ``model``.
+# ============================================================================
+class TestModelSections:
+    def test_single_chunk_keeps_the_model_key(self):
+        chunk = _Model()
+        assert get_model_sections({"model": {"a": 1}}, [chunk]) == [("model", chunk)]
+
+    def test_vpp_sections_pair_by_chunk_index(self):
+        chunks = [_Model(), _Model(), _Model()]
+        state_dict = {"model2": {"c": 1}, "model0": {"a": 1}, "model1": {"b": 1}}
+        assert get_model_sections(state_dict, chunks) == [
+            ("model0", chunks[0]),
+            ("model1", chunks[1]),
+            ("model2", chunks[2]),
+        ]
+
+    def test_missing_section_is_skipped_like_an_empty_pipeline_stage(self):
+        chunks = [_Model(), _Model()]
+        assert get_model_sections({"model0": {"a": 1}}, chunks) == [("model0", chunks[0])]
+
+    def test_section_without_a_chunk_raises(self):
+        with pytest.raises(ValueError, match="no matching model chunk"):
+            get_model_sections({"model1": {"b": 1}}, [_Model()])
+
+    def test_no_model_section(self):
+        assert get_model_sections({"args": object()}, [_Model()]) == []
+
+    @pytest.mark.parametrize(
+        "key, expected",
+        [
+            ("model", True),
+            ("model0", True),
+            ("model12", True),
+            ("modelx", False),
+            ("module", False),
+            ("model0.module", False),
+        ],
+    )
+    def test_is_model_section_key(self, key, expected):
+        assert is_model_section_key(key) is expected
+
+
+class _NamedParamModel(torch.nn.Module):
+    """A module tree whose parameters are addressable by dotted name.
+
+    Unlike the ``_Model`` stub above (whose ``get_parameter`` never fails), this raises
+    ``AttributeError`` for an unknown name, which is what the ownership probe relies on.
+    """
+
+    def __init__(self, names):
+        super().__init__()
+        for name in names:
+            parts = name.split(".")
+            module = self
+            for part in parts[:-1]:
+                if not hasattr(module, part):
+                    setattr(module, part, torch.nn.Module())
+                module = getattr(module, part)
+            setattr(module, parts[-1], torch.nn.Parameter(torch.zeros(1)))
+
+
+class TestPartitionOptimizerStateDictByModelChunk:
+    """The optimizer stays one unsectioned entry under VPP, so its ``state`` keys must be
+    routed to the chunk that owns them before a per-chunk handler sees them."""
+
+    def test_keys_are_routed_to_their_owning_chunk(self):
+        chunk0 = _NamedParamModel(
+            ["module.decoder.layers.0.weight", "module.decoder.layers.1.weight"]
+        )
+        chunk1 = _NamedParamModel(["module.decoder.layers.2.weight"])
+        optimizer_state_dict = {
+            "state": {
+                "module.decoder.layers.0.weight": {"exp_avg": "a"},
+                "module.decoder.layers.1.weight": {"exp_avg": "b"},
+                "module.decoder.layers.2.weight": {"exp_avg": "c"},
+            },
+            "param_to_group_meta": {"sentinel": 1},
+        }
+        slices, unowned = partition_optimizer_state_dict_by_model_chunk(
+            optimizer_state_dict, [chunk0, chunk1]
+        )
+        assert list(slices[0]["state"]) == [
+            "module.decoder.layers.0.weight",
+            "module.decoder.layers.1.weight",
+        ]
+        assert list(slices[1]["state"]) == ["module.decoder.layers.2.weight"]
+        assert unowned == {}
+        # Non-state entries ride along in every slice; only ``state`` is partitioned.
+        assert slices[0]["param_to_group_meta"] == {"sentinel": 1}
+        assert slices[1]["param_to_group_meta"] == {"sentinel": 1}
+
+    def test_unresolvable_key_is_preserved_not_silently_dropped(self):
+        chunk0 = _NamedParamModel(["module.decoder.layers.0.weight"])
+        optimizer_state_dict = {
+            "state": {
+                "module.decoder.layers.0.weight": {"exp_avg": "a"},
+                "module.not_a_param": {"exp_avg": "z"},
+            }
+        }
+        slices, unowned = partition_optimizer_state_dict_by_model_chunk(
+            optimizer_state_dict, [chunk0]
+        )
+        assert list(slices[0]["state"]) == ["module.decoder.layers.0.weight"]
+        assert unowned == {"module.not_a_param": {"exp_avg": "z"}}
+
+    def test_bare_key_resolves_with_the_module_prefix(self):
+        """The state-dict key is ``module.<param>`` while the live path may be bare."""
+        chunk = _NamedParamModel(["decoder.layers.0.weight"])
+        optimizer_state_dict = {"state": {"module.decoder.layers.0.weight": {"exp_avg": "a"}}}
+        slices, unowned = partition_optimizer_state_dict_by_model_chunk(
+            optimizer_state_dict, [chunk]
+        )
+        assert list(slices[0]["state"]) == ["module.decoder.layers.0.weight"]
+        assert unowned == {}
+
+    def test_absent_optimizer_gives_none_slices(self):
+        assert partition_optimizer_state_dict_by_model_chunk(None, [object(), object()]) == (
+            [None, None],
+            {},
+        )
+
+    def test_empty_optimizer_state(self):
+        slices, unowned = partition_optimizer_state_dict_by_model_chunk(
+            {"state": {}, "param_to_group_meta": {}}, [_NamedParamModel([])]
+        )
+        assert slices[0]["state"] == {}
+        assert unowned == {}

@@ -27,6 +27,7 @@ from megatron.training.checkpointing import (
     load_args_from_checkpoint,
     load_checkpoint,
     maybe_save_dataloader_state,
+    preprocess_fsdp_dtensor_state_dict,
     read_metadata,
     save_checkpoint,
 )
@@ -653,3 +654,115 @@ class TestBuildShardedStateDictMetadata:
         args = _make_metadata_args()
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert 'distrib_optim_sharding_type' not in metadata
+
+
+# ============================================================================
+# fsdp_dtensor preprocess: model-section <-> model-chunk pairing (VPP)
+# ============================================================================
+class TestPreprocessFsdpDtensorStateDictSections:
+    """``generate_state_dict`` sections the model per chunk (``model`` for one chunk and
+    ``model0``/``model1``/... for virtual pipeline parallelism). The preprocess used to
+    index ``state_dict['model']`` unconditionally and raised ``KeyError`` for a VPP state
+    dict; these tests pin the replacement: every section is handled with the chunk that
+    owns it, and the single-section call sequence is unchanged."""
+
+    class _Chunk:
+        """Model chunk stub whose ``get_parameter`` always fails, i.e. owns no optimizer key."""
+
+        def __init__(self, name):
+            self.name = name
+
+        def get_parameter(self, name):
+            raise AttributeError(name)
+
+    @staticmethod
+    def _args(swiglu=False, num_experts=None):
+        return SimpleNamespace(swiglu=swiglu, num_experts=num_experts)
+
+    @staticmethod
+    def _patch_handlers(monkeypatch, calls):
+        from megatron.training import checkpointing
+
+        def record(name):
+            def handler(model_chunk, model_state_dict, optimizer_state_dict):
+                calls.append((name, model_chunk, tuple(model_state_dict)))
+                return model_state_dict, optimizer_state_dict
+
+            return handler
+
+        monkeypatch.setattr(
+            checkpointing,
+            'handle_fp8_extra_state_case',
+            lambda sd: calls.append(('fp8', None, tuple(sd))),
+        )
+        monkeypatch.setattr(checkpointing, 'handle_swiglu_in_state_dict', record('swiglu'))
+        monkeypatch.setattr(checkpointing, 'handle_mla_down_proj_in_state_dict', record('mla'))
+        monkeypatch.setattr(checkpointing, 'handle_mtp_in_state_dict', record('mtp'))
+        monkeypatch.setattr(
+            checkpointing,
+            'handle_experts_in_state_dict',
+            lambda sd, n: (calls.append(('experts', None, tuple(sd))), sd)[1],
+        )
+        monkeypatch.setattr(
+            checkpointing,
+            'preprocess_state_dict_for_uneven_dtensor',
+            lambda sd: calls.append(('uneven', None, tuple(sorted(sd)))),
+        )
+
+    def test_vpp_sections_pair_each_chunk_with_its_own_section(self, monkeypatch):
+        chunks = [self._Chunk('c0'), self._Chunk('c1')]
+        state_dict = {'model0': {'a': 0}, 'model1': {'b': 0}, 'iteration': 1}
+        calls = []
+        self._patch_handlers(monkeypatch, calls)
+
+        out = preprocess_fsdp_dtensor_state_dict(self._args(), state_dict, chunks)
+
+        assert set(out) == {'model0', 'model1', 'iteration'}
+        assert out['model0'] == {'a': 0}
+        assert out['model1'] == {'b': 0}
+        for handler_name in ('mla', 'mtp'):
+            assert [chunk for (name, chunk, _keys) in calls if name == handler_name] == chunks
+        assert [keys for (name, _chunk, keys) in calls if name == 'fp8'] == [('a',), ('b',)]
+
+    def test_single_section_keeps_the_historical_call_sequence(self, monkeypatch):
+        chunks = [self._Chunk('only')]
+        state_dict = {'model': {'a': 0}}
+        calls = []
+        self._patch_handlers(monkeypatch, calls)
+
+        out = preprocess_fsdp_dtensor_state_dict(self._args(num_experts=4), state_dict, chunks)
+
+        assert out['model'] == {'a': 0}
+        assert [name for (name, _chunk, _keys) in calls] == [
+            'fp8',
+            'mla',
+            'experts',
+            'mtp',
+            'uneven',
+        ]
+        assert [chunk for (name, chunk, _keys) in calls if name == 'mla'] == chunks
+
+    def test_swiglu_still_runs_per_section_when_enabled(self, monkeypatch):
+        chunks = [self._Chunk('c0'), self._Chunk('c1')]
+        state_dict = {'model0': {'a': 0}, 'model1': {'b': 0}}
+        calls = []
+        self._patch_handlers(monkeypatch, calls)
+
+        preprocess_fsdp_dtensor_state_dict(self._args(swiglu=True), state_dict, chunks)
+
+        assert [chunk for (name, chunk, _keys) in calls if name == 'swiglu'] == chunks
+
+    def test_vpp_optimizer_entries_are_not_dropped(self, monkeypatch):
+        """The optimizer is a single unsectioned entry; entries owned by no chunk (here,
+        because the stub chunks expose no parameters) must survive untouched rather than
+        be silently dropped when the per-chunk slices are merged back."""
+        chunks = [self._Chunk('c0'), self._Chunk('c1')]
+        optimizer = {'state': {'p': {'exp_avg': 1}}, 'param_to_group_meta': {'p': {}}}
+        state_dict = {'model0': {'a': 0}, 'model1': {'b': 0}, 'optimizer': optimizer}
+        calls = []
+        self._patch_handlers(monkeypatch, calls)
+
+        out = preprocess_fsdp_dtensor_state_dict(self._args(), state_dict, chunks)
+
+        assert out['optimizer']['state'] == {'p': {'exp_avg': 1}}
+        assert out['optimizer']['param_to_group_meta'] == {'p': {}}
