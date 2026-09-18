@@ -1,5 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from typing import cast
+
+import torch.nn as nn
+
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantization import (
     COLWISE,
@@ -61,25 +65,119 @@ def finalize_fsdp_backward(module) -> None:
             submodule.finalize_scheduled_backward()
 
 
+def _active_mtp_layers(model) -> int:
+    """Return how many MTP layers this pipeline stage actually runs.
+
+    The combined path is reachable only with ``overlap_moe_expert_parallel_comm``,
+    and that configuration asserts ``mtp_num_layers in (None, 0, 1)`` at
+    ``transformer_config.py`` construction time, so this is 0 or 1 by
+    construction. The count is read from the model's MTP block rather than from the
+    config so a pipeline stage that does not own the block reports 0.
+    """
+    mtp = getattr(model, "mtp", None)
+    layers = getattr(mtp, "layers", None)
+    active = 1 if layers else 0
+    if active > 1:
+        raise AssertionError(
+            "Combined/fine-grained 1F1B only supports one MTP layer "
+            "(overlap_moe_expert_parallel_comm asserts mtp_num_layers <= 1), but this "
+            f"model chunk holds {len(layers)} MTP layers. The per-parameter gradient "
+            "multiplicity enumeration does not model deeper MTP."
+        )
+    return active
+
+
+def _shared_weight(model):
+    """Return the embedding weight that the output layer reuses, or ``None``.
+
+    Identity, not the FQN, is what ties the two consumers together: the output layer
+    runs against the embedding's own ``Parameter`` object when the model shares them.
+    """
+    getter = getattr(model, "shared_embedding_or_output_weight", None)
+    return getter() if callable(getter) else None
+
+
+def _unit_grad_multiplicity(unit: FsdpModule, shared_weight, mtp_depth: int) -> dict[int, int]:
+    """Return ``unit``'s per-parameter backward contribution counts for combined 1F1B.
+
+    In the combined/fine-grained 1F1B path the backward is one autograd GraphTask per
+    schedule node over detached node inputs, so a parameter contributes once per
+    *consuming node* rather than once per iteration. The whole space is tiny, because
+    ``overlap_moe_expert_parallel_comm`` requires ``mtp_num_layers <= 1``, so the
+    counts are enumerated directly:
+
+    * the embedding weight is consumed by the schedule's ``PreProcessNode`` and, when
+      the chunk runs MTP, again by the MTP pre-dispatch node:
+      ``megatron/core/models/common/fine_grained_callables.py:74-77`` calls
+      ``layer._get_embeddings(..., embedding=node.chunk_state.model.embedding, ...)``
+      from ``submodule_mtp_pre_dispatch_forward``, i.e. the MTP node explicitly uses
+      the model's embedding. That is the recorded desync, so it is 2 with MTP and 1
+      without.
+    * a tied embedding/output weight is the *same object*, so it also picks up the
+      chunk's ``PostProcessNode`` output projection -- one more consumer. It is 3
+      with MTP and 2 without, which keeps the no-MTP chunk exactly as it is today
+      instead of declaring a consumer that is not there.
+    * every other parameter -- including an untied output weight, which its own
+      output projection consumes exactly once -- is consumed by one node of this
+      unit.
+
+    Because this is an enumeration, it is deliberately not treated as exhaustive:
+    a parameter that this function declares too low over-fires loudly, and one it
+    declares too high under-fires loudly at the close edge.
+
+    Returns:
+        Parameter index -> expected number of gradient contributions in one window.
+        An index that is absent is expected once.
+    """
+    multiplicity: dict[int, int] = {}
+    for index, fsdp_parameter in enumerate(unit._trainable_fsdp_parameters()):
+        # PreProcessNode's embedding lookup, plus one per MTP pre-dispatch node.
+        consumers = 1 + mtp_depth
+        if fsdp_parameter.unsharded is shared_weight:
+            # The same weight object is the output projection's weight, so it also
+            # picks up the PostProcessNode projection. That projection runs with the
+            # MTP loss heads when there are any, and its consumer set does not change
+            # with MTP depth one way or the other, so this adds exactly one.
+            consumers += 1
+        if consumers != 1:
+            multiplicity[index] = consumers
+    return multiplicity
+
+
+def _register_fsdp_hooks(submodule, owner: FsdpModule):
+    """Install the unshard hooks on ``submodule`` and recurse into its children."""
+    if isinstance(submodule, FsdpModule):
+        owner = submodule  # BEFORE registering: an FSDP unit owns itself
+    if len(list(submodule.parameters(recurse=False))) > 0:
+        submodule.register_forward_pre_hook(
+            _make_unshard_forward_hook(owner), prepend=True, with_kwargs=True
+        )
+        submodule.register_full_backward_pre_hook(_make_unshard_backward_hook(owner))
+    for child in submodule.children():
+        _register_fsdp_hooks(child, owner)
+
+
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     """Install the sub-module hooks required by MCore combined 1F1B."""
 
-    def register_hooks(submodule, owner):
-        if isinstance(submodule, FsdpModule):
-            owner = submodule  # BEFORE registering: an FSDP unit owns itself
-        if len(list(submodule.parameters(recurse=False))) > 0:
-            submodule.register_forward_pre_hook(
-                _make_unshard_forward_hook(owner), prepend=True, with_kwargs=True
-            )
-            submodule.register_full_backward_pre_hook(_make_unshard_backward_hook(owner))
-        for child in submodule.children():
-            register_hooks(child, owner)
-
     assert isinstance(module, FsdpModule), "Owner must be an FsdpModule."
-    register_hooks(module, module)
+    _register_fsdp_hooks(module, module)
 
-    for submodule in module.modules():
-        if isinstance(submodule, FsdpModule):
-            # This path disables the automatic module hooks (``register_hooks=False``
-            # in the MFSDP v2 adapter), so the schedule owns the backward window.
-            submodule.register_post_backward_hook(_module_post_backward_hook, schedule_driven=True)
+    # A unit whose parameters outlive one schedule node -- the chunk root that owns
+    # the shared embedding and the output weight -- declares its real counts. Any
+    # other unit is consumed once per parameter by its own layer edge and needs no
+    # declaration.
+    shared_weight = _shared_weight(module)
+    mtp_depth = _active_mtp_layers(module)
+    for submodule in cast(nn.Module, module).modules():
+        if not isinstance(submodule, FsdpModule):
+            continue
+        # This path disables the automatic module hooks (``register_hooks=False`` in
+        # the MFSDP v2 adapter), so the schedule owns the backward window: the unit's
+        # parameters are re-accounted against a declared multiplicity and the reduce
+        # is triggered by ``finalize_fsdp_backward`` at the schedule's
+        # end-of-backward edge instead of by a callback count.
+        submodule.set_grad_multiplicity(
+            _unit_grad_multiplicity(submodule, shared_weight, mtp_depth)
+        )
+        submodule.register_post_backward_hook(_module_post_backward_hook, grad_multiplicity=True)
