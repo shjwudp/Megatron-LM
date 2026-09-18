@@ -147,10 +147,22 @@ mcore_fsdp_adapter -> combined_1f1b_mfsdp_scheduler -> multi_token_prediction
 and breaks `import megatron.core` for the entire repository at pytest collection
 time. The provider above is written to need nothing from that module: it reads the
 MTP depth from the model's own block, so the cycle cannot recur through it.
+
 `tests/unit_tests/distributed/mfsdp_v2/test_mfsdp_v2_scheduler_import.py` pins this
-both statically (AST: no module-level import of `multi_token_prediction`, runnable
-anywhere) and dynamically (the imports succeed, with `pytest.fail` rather than a
-skip marker so it cannot degrade quietly).
+in two separable ways, because the two failure causes need opposite responses:
+
+* an **unconditional static guard** (AST: no module-level import of
+  `multi_token_prediction`) that imports neither torch nor Megatron, so it runs and
+  cannot skip on any host and names the offending line. This is the guard that
+  catches the cycle even on a machine that cannot import the stack at all.
+* the **dynamic import assertions**, gated by a precondition evaluated *before* the
+  import: the host's torch must define `float8_e8m0fnu` (torch 2.4 does not, and
+  dies in `mxfp8_tensor.py` long before any cycle could be reached). The invariant
+  is that the skip condition must be a precondition, never an `except ImportError`,
+  which would let a cycle hide behind a skip. The test file enforces that shape
+  statically rather than only documenting it: it asserts the gate is a `skipif`
+  marker over the precondition, and that the test body contains no
+  `except ImportError` that could skip.
 
 ### What is NOT covered
 
