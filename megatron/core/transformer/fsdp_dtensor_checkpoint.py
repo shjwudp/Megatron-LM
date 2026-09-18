@@ -60,29 +60,34 @@ def _strip_wrapper_prefixes(path):
 
 
 def _get_model_parameter(model, key):
-    """Resolve an unprefixed model state-dict key to the live (distributed) parameter.
+    """Resolve a model state-dict key to the live (distributed) parameter.
 
-    ``key`` is a ``state_dict_for_save_checkpoint`` key, which never carries a wrapper
-    prefix. Which prefix the *parameters* carry depends on the DDP/FSDP wrapper
-    ``unwrap_model`` stopped at:
+    ``key`` is a ``state_dict_for_save_checkpoint`` key, whose ``module.`` level is
+    contributed by the DDP/FSDP wrapper that owns the bare model, while the live
+    parameter path depends on the wrapper ``unwrap_model`` stopped at:
 
-    * Megatron-FSDP v1 unwraps to ``MegatronFSDP``, which owns the inner model as
-      ``self.module``, so its parameters are addressed as ``module.<key>``.
-    * Megatron-FSDP v2 shards the model in place and unwraps to the bare model, so
-      its parameters are addressed as ``<key>``.
+    * Megatron-FSDP v1 unwraps to ``MegatronFSDP``, which itself owns the bare model as
+      ``self.module``, so its keys already start with ``module.`` and its parameters are
+      addressed as ``module.<key>``.
+    * Megatron-FSDP v2 shards the bare model in place and is unwrapped to that bare
+      model, so its parameters are addressed directly.
 
-    Try the bare key first and fall back to the ``module.``-prefixed one so both
-    wrappers resolve to the same parameter object.
+    Try the key as given, then the ``module.``-prefixed form, then the key with its
+    wrapper prefixes stripped, so every wrapper layout resolves to the same parameter
+    object.
     """
-    prefixed = f'module.{key}'
-    for candidate in (key, prefixed):
+    candidates = [key, f'module.{key}']
+    stripped = _strip_wrapper_prefixes(key)
+    if stripped != key:
+        candidates.append(stripped)
+    for candidate in candidates:
         try:
             return model.get_parameter(candidate)
         except AttributeError:
             continue
     raise AttributeError(
-        f"Could not resolve parameter {key!r} on {type(model).__name__}: it is "
-        f"neither named {key!r} nor {prefixed!r}."
+        f"Could not resolve parameter {key!r} on {type(model).__name__}: it is none of "
+        f"{candidates!r}."
     )
 
 

@@ -141,10 +141,10 @@ class _WrappedModel(torch.nn.Module):
 
 
 class TestModelParameterResolution:
-    """``state_dict_for_save_checkpoint`` keys have no wrapper prefix, but the live
-    parameters do for MFSDP v1 and do not for MFSDP v2. Resolving only one of the two
-    forms is what made the ``fsdp_dtensor`` load path raise
-    ``GPTModel has no attribute 'module'`` for v2."""
+    """``state_dict_for_save_checkpoint`` keys carry a ``module.`` level for MFSDP v1
+    (its ``MegatronFSDP`` wrapper) but the live parameters do not for MFSDP v2 (which
+    shards the bare model in place). Resolving only one of the two forms is what made
+    the ``fsdp_dtensor`` load path raise ``GPTModel has no attribute 'module'`` for v2."""
 
     def test_resolves_bare_key_for_v2(self):
         model = _InnerModel()
@@ -154,9 +154,15 @@ class TestModelParameterResolution:
         model = _WrappedModel()
         assert _get_model_parameter(model, "layer.weight") is model.module.layer.weight
 
-    def test_raises_when_neither_form_exists(self):
+    def test_resolves_module_level_key_on_the_bare_v2_model(self):
+        """The `fsdp_dtensor` request keys carry v1's `module.` level, but the v2 live
+        model has no such level, so the prefix has to be stripped back off."""
         model = _InnerModel()
-        with pytest.raises(AttributeError, match="neither named"):
+        assert _get_model_parameter(model, "module.layer.weight") is model.layer.weight
+
+    def test_raises_when_no_form_exists(self):
+        model = _InnerModel()
+        with pytest.raises(AttributeError, match="it is none of"):
             _get_model_parameter(model, "layer.missing")
 
 

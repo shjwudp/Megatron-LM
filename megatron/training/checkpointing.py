@@ -1609,7 +1609,20 @@ def generate_state_dict(
                     }
                 )
             )
-        else:  # torch, torch_dcp, fsdp_dtensor
+        elif args.ckpt_format == 'fsdp_dtensor':
+            # The `fsdp_dtensor` format stores the model under `model.module.<param>`:
+            # the `module.` level is the one Megatron-FSDP v1's `MegatronFSDP`
+            # contributes as an `nn.Module` wrapper around the bare model. MFSDP v2
+            # shards the bare model in place, so `unwrap_model` returns that bare model
+            # and its state dict has no `module.` level -- the request would not match a
+            # checkpoint written by v1 (or by the torch_dist converter, whose model
+            # prefix is `model.module`). Add the level here, next to the model state
+            # dict construction, so both the model and the optimizer request (which is
+            # keyed off the model keys further down) carry it.
+            model_sd = model[i].state_dict_for_save_checkpoint()
+            if not any(k.startswith('module.') for k in model_sd):
+                model_sd = {f'module.{k}': v for k, v in model_sd.items()}
+        else:  # torch, torch_dcp
             model_sd = model[i].state_dict_for_save_checkpoint()
 
         state_dict[key] = model_sd
