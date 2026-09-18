@@ -217,7 +217,13 @@ class FsdpParameterGroup:
             placements=main_weight_placements,
             tensor_shapes=tensor_shapes,
             dtype=main_weight_dtype,
-            device=parameters[0].device,
+            # Allocate on the mesh's device, not on `parameters[0].device`. The
+            # parameters may be CPU- or meta-initialized and sharded onto a CUDA
+            # mesh, in which case `parameters[0].device` puts main_weight on the
+            # CPU/meta device and every collective over it fails. This restores the
+            # behaviour of the `DBuffer.distribute_tensors` call this replaced,
+            # which allocated with `device=mesh.device_type`.
+            device=self.mesh.device_type,
             block_size=block_size,
         )
         for index, parameter in enumerate(parameters):
