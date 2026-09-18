@@ -6,7 +6,10 @@ import torch
 from torch import Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import reshard_fsdp_module
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
+    finalize_fsdp_backward,
+    reshard_fsdp_module,
+)
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -429,9 +432,13 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         has_fsdp_module = any(isinstance(submodule, FsdpModule) for submodule in model.modules())
         if has_fsdp_module:
             for layer_plan in self._transformer_layers:
-                # Forward resharding follows the schedule. Backward resharding and
-                # reduction are triggered by each FsdpModule's gradient countdown.
-                layer_plan.set_fsdp_reshard_hooks(reshard_fsdp_module, lambda _: None)
+                # Forward resharding follows the schedule. Backward reduction is
+                # driven by the schedule's own end-of-backward edge as well: in this
+                # path a unit's backward is one run_backward per schedule node, so a
+                # parameter consumed by several nodes fires its grad hook several
+                # times and no per-parameter callback count delimits the unit's
+                # backward. The edge below is that declaration.
+                layer_plan.set_fsdp_reshard_hooks(reshard_fsdp_module, finalize_fsdp_backward)
 
     def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
         if module is None:
@@ -500,6 +507,23 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         if self.post_process is not None:
             self.post_process.model_chunk_state = None
             self.post_process = None
+
+    def close_fsdp_backward(self):
+        """Close the chunk root's FSDP backward window and verify the whole chunk.
+
+        The root ``FsdpModule`` owns the parameters outside the per-layer FSDP units,
+        and its backward ends with the chunk's last backward operation, the
+        pre-process node. Every nested unit was closed by its own layer-level edge;
+        a unit that still holds unreduced marks here never got that edge, which
+        would otherwise silently drop its reduce-scatter.
+        """
+        model = self._model_chunk_state.model
+        if not isinstance(model, FsdpModule):
+            return
+        model.finalize_scheduled_backward()
+        for submodule in model.modules():
+            if isinstance(submodule, FsdpModule):
+                submodule.assert_scheduled_backward_closed()
 
     @staticmethod
     def run(
@@ -624,6 +648,14 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # pre process backward
         if b_schedule_plan is not None:
             b_schedule_plan.pre_process.backward(b_grad)
+            # The root FsdpModule owns every parameter outside the per-layer FSDP
+            # units (the embedding, the output layer, the decoder's final norm, the
+            # MTP pre/post-processing weights). Its backward window ends with the
+            # chunk's last backward operation, this pre-process node. Closing it
+            # here also checks that every nested unit was closed by its own layer
+            # edge, so a missing edge fails loudly instead of dropping a
+            # reduce-scatter silently.
+            b_schedule_plan.close_fsdp_backward()
 
         if f_schedule_plan:
             f_schedule_plan.wait_current_stream()

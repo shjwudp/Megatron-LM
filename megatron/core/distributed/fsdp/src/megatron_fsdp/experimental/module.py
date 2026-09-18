@@ -15,6 +15,7 @@
 """Module mixin for the minimal Megatron-FSDP path."""
 
 import enum
+import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Literal, cast
@@ -27,10 +28,16 @@ from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy, fp8_need_transpose_data, is_float8tensor
-from .countdown import Countdown
+from ..utils import log_single_rank
+from .countdown import Countdown, GradientReadiness
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
-from .parameter_group import Fp8ParameterGroup, FsdpParameterGroup, get_containing_parameter_group
+from .parameter_group import (
+    Fp8ParameterGroup,
+    FsdpParameter,
+    FsdpParameterGroup,
+    get_containing_parameter_group,
+)
 from .placement import Flat
 from .quantization import (
     BOTH,
@@ -41,6 +48,8 @@ from .quantization import (
     orientation_directions,
 )
 from .schedule import SchedulePolicy
+
+logger = logging.getLogger(__name__)
 
 
 def _is_in_backward() -> bool:
@@ -193,6 +202,18 @@ class FsdpModule:
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
     _trainable_parameter_countdown: Countdown
+    # Set instead of the countdown when the schedule, not the callback count,
+    # delimits this module's backward windows (combined/fine-grained 1F1B).
+    _grad_readiness: GradientReadiness | None
+    # FQNs per readiness key, for diagnostics only; the key is the index of the
+    # parameter in this module's trainable-parameter order.
+    _grad_readiness_fqns: dict[int, tuple[str, ...]]
+    # The hook registered through ``register_post_backward_hook``; the schedule
+    # invokes it when ``_grad_readiness`` is in use.
+    _scheduled_post_backward_hook: Callable[["FsdpModule"], None] | None
+    # A module can legitimately have an ungraded parameter in one window (an unused
+    # branch); warn once so a real schedule bug is still visible without flooding.
+    _warned_missing_grads: bool
     _is_root: bool
     _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
@@ -235,6 +256,10 @@ class FsdpModule:
         self._materialized_orientation = None
         self._phase = FsdpModule.Phase.RESTING
         self._schedule_policy = schedule_policy
+        self._grad_readiness = None
+        self._grad_readiness_fqns = {}
+        self._scheduled_post_backward_hook = None
+        self._warned_missing_grads = False
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
@@ -340,7 +365,7 @@ class FsdpModule:
         self.register_post_backward_hook(FsdpModule.post_backward)
 
     def register_post_backward_hook(
-        self, post_backward_hook: Callable[["FsdpModule"], None]
+        self, post_backward_hook: Callable[["FsdpModule"], None], *, schedule_driven: bool = False
     ) -> None:
         """Register a post-backward hook to run after this module's backward completes.
 
@@ -352,6 +377,14 @@ class FsdpModule:
         Args:
             post_backward_hook: Callback receiving this FSDP module after all of its
                 trainable parameters have accumulated gradients.
+            schedule_driven: Whether the caller is a fine-grained schedule that
+                delimits backward windows itself. In that path each module's
+                backward is one ``run_backward`` per schedule node, so the number of
+                post-accumulate-grad callbacks is not the module's parameter count.
+                The hook is then held until
+                :meth:`finalize_scheduled_backward` is called at the schedule's
+                end-of-backward edge, and the per-parameter callbacks only record
+                which parameters are ready.
         """
         module = cast(nn.Module, self)
         if self._trainable_parameter_countdown.initial_value == 0:
@@ -360,6 +393,10 @@ class FsdpModule:
                     cast(FsdpModule, hooked_module)
                 )
             )
+            return
+
+        if schedule_driven:
+            self._register_schedule_completion_hooks(post_backward_hook)
             return
 
         # Gradient reduction for trainable parameters is parameter-completion
@@ -375,26 +412,113 @@ class FsdpModule:
             if module._trainable_parameter_countdown.decrement():
                 post_backward_hook(module)
 
+        for fsdp_parameter in self._trainable_fsdp_parameters():
+            self._register_grad_hook(fsdp_parameter, grad_hook)
+
+    def _register_schedule_completion_hooks(
+        self, post_backward_hook: Callable[["FsdpModule"], None]
+    ) -> None:
+        """Record which parameters fire instead of counting how many fired.
+
+        See :class:`GradientReadiness` for why the callback count is not a valid
+        completion signal in the combined/fine-grained 1F1B path.
+        """
+        fsdp_parameters = tuple(self._trainable_fsdp_parameters())
+        readiness = GradientReadiness(range(len(fsdp_parameters)))
+        self._grad_readiness = readiness
+        self._grad_readiness_fqns = {
+            index: fsdp_parameter.fqns for index, fsdp_parameter in enumerate(fsdp_parameters)
+        }
+        self._scheduled_post_backward_hook = post_backward_hook
+
+        def grad_hook(index: int) -> Callable[[nn.Parameter], None]:
+            def hook(_: nn.Parameter) -> None:
+                readiness.mark(index)
+
+            return hook
+
+        for index, fsdp_parameter in enumerate(fsdp_parameters):
+            self._register_grad_hook(fsdp_parameter, grad_hook(index))
+
+    def finalize_scheduled_backward(self) -> None:
+        """Close this module's backward window and reduce its gradients.
+
+        The fine-grained schedule calls this at the point where this module's
+        backward ends: from the unit's last backward node, or from the end of the
+        model chunk for the module that owns the chunk-level parameters. The
+        per-parameter marks collected since the previous close are idempotent, so a
+        parameter consumed by several schedule nodes cannot end the window early.
+
+        A parameter without a gradient is genuinely unused in this window, so its
+        contribution is an exact zero and its slot is zero-filled rather than
+        aborting the module's reduce. The reduce is still issued by every rank, so
+        the decision is collective-safe.
+        """
+        readiness = self._grad_readiness
+        if readiness is None or not readiness.has_pending_marks:
+            return
+        missing = readiness.missing()
+        if missing and not self._warned_missing_grads:
+            self._warned_missing_grads = True
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "MFSDP module %s closed its backward with %d of %d parameters ungraded and "
+                "zero-filled them: %r. Expected for a parameter unused in this window; a "
+                "schedule bug otherwise.",
+                self.name or "<root>",
+                len(missing),
+                readiness.initial_value,
+                [self._grad_readiness_fqns[index] for index in sorted(missing)],
+            )
+        readiness.close()
+        assert self._scheduled_post_backward_hook is not None
+        self._scheduled_post_backward_hook(self)
+
+    def assert_scheduled_backward_closed(self) -> None:
+        """Raise if the schedule ended while this module still had a gradient pending.
+
+        An open window at the end of a chunk means the module received gradients
+        that no end-of-backward edge ever consumed, which is the "reduce-scatter
+        silently dropped" failure mode of a desynchronised completion signal.
+        """
+        readiness = self._grad_readiness
+        if readiness is None or not readiness.has_pending_marks:
+            return
+        raise RuntimeError(
+            "MFSDP schedule ended with an incomplete gradient-completion window for "
+            f"{self.name or '<root>'}: callbacks={readiness.marked}/{readiness.initial_value}, "
+            f"missing="
+            f"{[self._grad_readiness_fqns[index] for index in sorted(readiness.missing())]!r}."
+        )
+
+    def _trainable_fsdp_parameters(self) -> Iterator[FsdpParameter]:
+        """Iterate this module's trainable parameters in a stable order."""
         for group in self._parameter_groups:
             if not group.requires_grad:
                 continue
-            for fsdp_parameter in group.fsdp_parameters:
-                parameter = fsdp_parameter.unsharded
-                # ``skip_backward_post_hook`` is TE's delayed-wgrad contract: these
-                # gradients are materialized by ``backward_dw()``, not autograd.
-                if not getattr(parameter, "skip_backward_post_hook", False):
-                    parameter.register_post_accumulate_grad_hook(grad_hook)
-                    continue
-                if len(fsdp_parameter.fqns) > 1:
-                    raise ValueError(
-                        "Tied parameters with delayed wgrad are not supported because "
-                        "Transformer Engine does not accumulate their gradients. See "
-                        "https://github.com/NVIDIA/TransformerEngine/issues/3437"
-                    )
-                parameter_module, _ = get_parameter_owner(module, fsdp_parameter.fqns[0])
-                parameter_module.register_wgrad_accumulation_and_reduce_hooks(
-                    lambda parameter=parameter: grad_hook(parameter)
-                )
+            yield from group.fsdp_parameters
+
+    def _register_grad_hook(
+        self, fsdp_parameter: FsdpParameter, hook: Callable[[nn.Parameter], None]
+    ) -> None:
+        """Register ``hook`` on the representation that actually produces the gradient."""
+        parameter = fsdp_parameter.unsharded
+        # ``skip_backward_post_hook`` is TE's delayed-wgrad contract: these
+        # gradients are materialized by ``backward_dw()``, not autograd.
+        if not getattr(parameter, "skip_backward_post_hook", False):
+            parameter.register_post_accumulate_grad_hook(hook)
+            return
+        if len(fsdp_parameter.fqns) > 1:
+            raise ValueError(
+                "Tied parameters with delayed wgrad are not supported because "
+                "Transformer Engine does not accumulate their gradients. See "
+                "https://github.com/NVIDIA/TransformerEngine/issues/3437"
+            )
+        parameter_module, _ = get_parameter_owner(cast(nn.Module, self), fsdp_parameter.fqns[0])
+        parameter_module.register_wgrad_accumulation_and_reduce_hooks(
+            lambda parameter=parameter: hook(parameter)
+        )
 
     @staticmethod
     def _pre_load_state_dict(
@@ -618,8 +742,14 @@ class FsdpModule:
                 if not group.requires_grad:
                     continue
 
+                # A schedule-driven module was closed by the schedule itself, so a
+                # parameter without a gradient here is one that was unused in the
+                # window and gets a zero-filled slot. The automatic path keeps the
+                # strict check, where a missing gradient means the reduce is early.
                 with torch.cuda.stream(reduce_scatter_stream):
-                    partial_grad = group.allocate_partial_grad_buffer()
+                    partial_grad = group.allocate_partial_grad_buffer(
+                        require_all_grads=self._grad_readiness is None
+                    )
 
                 current_stream.wait_stream(reduce_scatter_stream)
                 group.copy_gradients_to_partial_buffer(partial_grad)
