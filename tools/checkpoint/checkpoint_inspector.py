@@ -307,8 +307,32 @@ def is_optimizer_key(key: str) -> bool:
     return re.search(r"(^|\.)optimizer(\.|$)", key) is not None
 
 
-def save_checkpoint_with_pickle_protocol(state_dict, output_dir, pickle_protocol=4):
-    writer = FileSystemWriter(output_dir)
+def save_checkpoint_with_pickle_protocol(
+    state_dict, output_dir, pickle_protocol=4, loadable_layout=False
+):
+    """Write ``state_dict`` as a raw DCP checkpoint under ``output_dir``.
+
+    ``loadable_layout`` selects the directory layout Megatron's ``--load`` requires:
+    the DCP files go into ``<output_dir>/iter_<iteration:07d>/`` and
+    ``<output_dir>/latest_checkpointed_iteration.txt`` records the iteration.
+    Without it the DCP files land directly in ``<output_dir>``, which is a valid raw
+    DCP checkpoint but *not* a Megatron checkpoint directory: ``--load`` cannot find
+    the tracker file, prints a warning and silently starts from random weights.
+    """
+    if loadable_layout:
+        iteration = state_dict.get('iteration')
+        if iteration is None:
+            raise click.ClickException(
+                "--loadable-layout needs an 'iteration' entry to name iter_<iteration>/: "
+                "the converted state dict has none."
+            )
+        iteration = int(iteration)
+        checkpoint_dir = os.path.join(output_dir, 'iter_{:07d}'.format(iteration))
+    else:
+        iteration = None
+        checkpoint_dir = output_dir
+
+    writer = FileSystemWriter(checkpoint_dir)
     planner = DefaultSavePlanner()
 
     def transform_object_override(write_item, obj):
@@ -331,6 +355,33 @@ def save_checkpoint_with_pickle_protocol(state_dict, output_dir, pickle_protocol
         planner=planner,
         process_group=dist.group.WORLD,
     )
+
+    if loadable_layout:
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            os.makedirs(output_dir, exist_ok=True)
+            tracker_filename = os.path.join(output_dir, 'latest_checkpointed_iteration.txt')
+            with open(tracker_filename, 'w') as f:
+                f.write(str(iteration))
+        if dist.is_initialized():
+            dist.barrier()
+        rank0_echo(
+            click.style(
+                f"[Layout] Wrote a loadable checkpoint; pass --load {output_dir}",
+                fg="green",
+            )
+        )
+    else:
+        rank0_echo(
+            click.style(
+                "WARNING: wrote a raw DCP checkpoint directly into "
+                f"{output_dir}, which is NOT a loadable Megatron checkpoint "
+                "directory: `--load` will silently start from random weights. "
+                "Re-run with --loadable-layout, or move the DCP files into "
+                f"{output_dir}/iter_<7-digit iteration>/ and write the iteration "
+                f"to {output_dir}/latest_checkpointed_iteration.txt.",
+                fg="yellow",
+            )
+        )
 
 
 class VerboseLoadPlanner(DefaultLoadPlanner):
@@ -366,6 +417,7 @@ def convert_checkpoint(
     rename_mtp_keys=False,
     swiglu_modules=None,
     model_weights_only: bool = False,
+    loadable_layout: bool = False,
 ):
     """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format.
 
@@ -862,7 +914,9 @@ def convert_checkpoint(
         fsdp_dtensor_state_dict["checkpoint_version"] = 3.0
 
     # Save modified checkpoint
-    save_checkpoint_with_pickle_protocol(fsdp_dtensor_state_dict, output_dir)
+    save_checkpoint_with_pickle_protocol(
+        fsdp_dtensor_state_dict, output_dir, loadable_layout=loadable_layout
+    )
 
     dist.barrier()              # Synchronize all ranks
     dist.destroy_process_group()
@@ -930,6 +984,16 @@ def convert_checkpoint(
          "loading may require '--no-strict-fsdp-dtensor-load' and "
          "'--dist-ckpt-strictness ignore_all'.",
 )
+@click.option(
+    "--loadable-layout",
+    is_flag=True,
+    help="Write the output as the directory layout Megatron's '--load' requires: "
+         "DCP files under '<output_dir>/iter_<iteration>/' plus "
+         "'<output_dir>/latest_checkpointed_iteration.txt'. Without it the raw DCP "
+         "files are written straight into '<output_dir>', where '--load "
+         "<output_dir>' finds no tracker file and SILENTLY starts from random "
+         "weights (it only prints a warning and still reports success).",
+)
 def convert_torch_dist_to_fsdp_dtensor(
     input_dir,
     output_dir,
@@ -942,6 +1006,7 @@ def convert_torch_dist_to_fsdp_dtensor(
     param_to_param_group_map_json,
     rename_mtp_keys,
     model_weights_only,
+    loadable_layout,
 ):
     """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format.
 
@@ -1043,6 +1108,7 @@ def convert_torch_dist_to_fsdp_dtensor(
         rename_mtp_keys=rename_mtp_keys,
         swiglu_modules=_swiglu_modules,
         model_weights_only=model_weights_only,
+        loadable_layout=loadable_layout,
     )
 
     click.echo(
