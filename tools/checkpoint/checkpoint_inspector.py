@@ -38,7 +38,7 @@ from torch.distributed.tensor import DeviceMesh, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import split_dtensor, redistribute_uneven_dtensor_to_replicated
 
-from megatron.core.dist_checkpointing.strategies.common import load_common
+from megatron.core.dist_checkpointing.serialization import load_common_state_dict
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
 )
@@ -107,7 +107,7 @@ def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
         )
 
         # Common state section
-        common_state = load_common(checkpoint_dir)
+        common_state = load_common_state_dict(checkpoint_dir)
         print_header(f"common state ({len(common_state)} items)", "cyan")
         for key, value in common_state.items():
             bullet = click.style("•", fg="magenta")
@@ -285,6 +285,16 @@ def flatten(obj, parent_key="", sep="."):
     return items
 
 
+def is_optimizer_key(key: str) -> bool:
+    """True when ``optimizer`` appears as a dotted path component of ``key``.
+
+    Distributed-optimizer checkpoints nest optimizer state under the chained
+    optimizer (``chained_0.optimizer...``), so a bare ``key.startswith(
+    "optimizer.")`` test misses it and the key would be emitted as a model weight.
+    """
+    return re.search(r"(^|\.)optimizer(\.|$)", key) is not None
+
+
 def save_checkpoint_with_pickle_protocol(state_dict, output_dir, pickle_protocol=4):
     writer = FileSystemWriter(output_dir)
     planner = DefaultSavePlanner()
@@ -406,8 +416,10 @@ def convert_checkpoint(
     for key, md in metadata.state_dict_metadata.items():
         # Model-weights-only mode: never allocate (or load) optimizer tensors.
         # Skipping them here avoids materializing potentially enormous optimizer
-        # state that would be dropped later anyway.
-        if model_weights_only and key.startswith("optimizer."):
+        # state that would be dropped later anyway. The dotted-component test
+        # also catches distributed-optimizer keys such as
+        # 'chained_<i>.optimizer...', which a bare 'optimizer.' prefix missed.
+        if model_weights_only and is_optimizer_key(key):
             continue
         if isinstance(md, TensorStorageMetadata):
             # Initialize tensor storage
@@ -599,12 +611,14 @@ def convert_checkpoint(
             continue
 
         if isinstance(value, torch.Tensor):
+            if model_weights_only and is_optimizer_key(key):
+                # Defensive: optimizer keys are already filtered out at load
+                # time. Drop any stray one instead of converting it, so that
+                # model-weights-only output can never contain optimizer state.
+                # The dotted-component predicate also catches distributed-opt
+                # keys such as 'chained_<i>.optimizer...'.
+                continue
             if key.startswith("optimizer.state."):
-                if model_weights_only:
-                    # Defensive: optimizer keys are already filtered out at load
-                    # time. Drop any stray one instead of converting it, so that
-                    # model-weights-only output can never contain optimizer state.
-                    continue
                 # Special handling for optimizer state
                 key_list = key.split(".")
                 new_key = f"{optimizer_state_prefix}.{'.'.join(key_list[3:])}.{key_list[2]}"
@@ -770,7 +784,7 @@ def convert_checkpoint(
             f"Unsupported sharded strategy: {sharded_strategy}", fg="red", bold=True
         )
     )
-    common_state = load_common(input_dir)
+    common_state = load_common_state_dict(input_dir)
     # ckpt_param_groups is only consumed to reconstruct optimizer.* entries, so
     # in model-weights-only mode there is no need to read it at all.
     ckpt_param_groups = None
@@ -790,9 +804,11 @@ def convert_checkpoint(
             key = key.replace(
                 "optimizer.optimizer.param_groups.", "optimizer.param_groups."
             )
-        if model_weights_only and key.startswith("optimizer."):
+        if model_weights_only and is_optimizer_key(key):
             # Keep the non-optimizer common state (args, iteration,
-            # checkpoint_version, ...), but emit no optimizer.* key of any kind.
+            # checkpoint_version, ...), but emit no optimizer key of any kind.
+            # The dotted-component predicate also catches distributed-optimizer
+            # common state such as 'chained_<i>.optimizer...'.
             continue
         assert key not in fsdp_dtensor_state_dict, (
             f"Key '{key}' already exists in fsdp_dtensor_state_dict."
