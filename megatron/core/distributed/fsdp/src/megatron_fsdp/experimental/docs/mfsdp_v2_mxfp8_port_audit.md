@@ -199,3 +199,55 @@ Numbering matches the review comments in the port commit.
 
 Cluster test results for this branch are recorded in the delivery report, not
 here, because they are environment-dependent.
+
+## Post-port fix: the port as first pushed could not run at all
+
+Found by actually executing the branch rather than only reviewing it. The v2 arm
+of the branch's own parity test raised
+
+```
+TypeError: Fp8ParameterGroup.__init__() got an unexpected keyword argument 'fqn_to_parameter'
+  experiments/module.py:236
+```
+
+`main` renamed the base-class constructor kwarg `parameters` -> `fqn_to_parameter`
+(`parameter_group.py:104-107` on `4449eec63`). The port updated the base class and
+its call site but not the `#6485`-derived `Fp8ParameterGroup.__init__`, which had
+kept its own `parameters` name and forwarded it by keyword. `up/pr6485` is
+internally consistent (it predates the rename), so **this is a rebase-induced
+port bug, not the author's**. Fixed in the commit that adds this note: the
+subclass constructor now takes `fqn_to_parameter`. Two identifiers, no logic.
+
+With that fix the branch's parity test runs both halves and **passes** at 2 and 4
+ranks (1 node GB300, `nemo-26.08.sqsh`): max |loss rel| 2.97e-4 (2-rank) /
+3.66e-4 (4-rank), max |grad_norm rel| 4.05e-4 / 4.46e-4, against tolerance
+`rtol=5e-2`. That is the first numerical evidence this port has ever had.
+
+## Prerequisite for running the parity test on this branch (NOT for training)
+
+`tests/unit_tests/distributed/mfsdp_v2/test_mxfp8_v1_parity.py` trains twice and
+uses **MFSDP v1** as its reference. Upstream commit `75e901f86` (PR #7134,
+merged 2026-09-15, present on this branch's base) changed one line inside v1's
+`suggested_communication_unit_size is None` branch from `max` to `min`, which
+collapses v1's all-gather prefetch budget on small models and makes that v1
+reference crash with `cudaErrorIllegalAddress` at the end of step 1, while
+reading a parameter whose bucket storage was released.
+
+To run the parity test, pick one:
+
+* pass `--suggested-communication-unit-size` explicitly (any explicit value skips
+  the whole inferred branch, so the `max`/`min` never applies); or
+* apply the prepared upstream mitigation, which keeps #7134's inferred
+  RS queue capacity but restores the all-gather floor
+  (`suggested_AG_prefetch_size = max(500_000_000, value // 2)`).
+
+**This is a prerequisite of the test, not of v2 training.** v2 is unaffected by
+`75e901f86`: the inferred value is a local in v1's `MegatronFSDP.__init__`, is
+never written back to `ddp_config`, and v2's adapter reads only the raw config
+(`None` when the knob is unset). Benchmarking this branch's v2 path does not
+require either workaround.
+
+Note also that the mitigation is a **band-aid for the crash**, not a fix for it:
+even with the floor restored, parameters remain 0-byte at the snapshot point and
+read correctly only because the freed blocks have not been recycled yet. The
+underlying defect is a read-after-free in v1's bucket release path.

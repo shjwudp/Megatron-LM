@@ -602,7 +602,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
     def __init__(
         self,
         owning_module: nn.Module,
-        parameters: dict[str, nn.Parameter],
+        fqn_to_parameter: dict[str, nn.Parameter],
         mesh: DeviceMesh,
         model_weight_placements: tuple[Placement, ...],
         main_grad_placements: tuple[Placement, ...],
@@ -620,7 +620,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             )
         super().__init__(
             owning_module=owning_module,
-            fqn_to_parameter=parameters,
+            fqn_to_parameter=fqn_to_parameter,
             mesh=mesh,
             model_weight_placements=model_weight_placements,
             main_grad_placements=main_grad_placements,
