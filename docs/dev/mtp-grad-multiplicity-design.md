@@ -91,28 +91,66 @@ source with no CUDA/TE stack.
 
 ## 4. The multiplicity provider
 
-`combined_1f1b_mfsdp_scheduler._unit_grad_multiplicity(unit, shared_weight,
-mtp_depth)` walks the unit's trainable parameters (the same key space the marks
-use) and declares non-1 counts for the two cases that actually occur:
+The space is small because the combined path is only reachable with
+`overlap_moe_expert_parallel_comm`, and that configuration asserts
+`mtp_num_layers in (None, 0, 1)` at config-construction time:
 
-* **shared embedding consumed by the pre-process node and every MTP pre-dispatch
-  node**: `1 + mtp_depth`, where `mtp_depth` is the number of MTP layers this
-  pipeline stage actually runs (`_active_mtp_layers`, derived with the same
-  `get_mtp_layer_offset` the schedule uses). Evidence:
-  `megatron/core/models/common/fine_grained_callables.py:74-77` calls
-  `layer._get_embeddings(..., embedding=node.chunk_state.model.embedding, ...)`
-  from `submodule_mtp_pre_dispatch_forward`, i.e. the MTP pre-dispatch node
-  explicitly uses `model.embedding`.
-* **tied embedding/output weight** (`share_embeddings_and_output_weights`, found by
-  identity via `shared_embedding_or_output_weight()`): add `1 + mtp_depth`, the
-  chunk's post-process output projection plus one projection per MTP head
-  (`process_mtp_loss` calls `output_layer` once per MTP depth).
-* everything else: 1 (absent from the mapping).
+```text
+megatron/core/transformer/transformer_config.py:3316-3320
+    assert self.mtp_num_layers in (None, 0, 1), \
+        'MTP supports at most one layer when enabling overlap_moe_expert_parallel_comm.'
+```
 
-Every `FsdpModule` in the chunk is given its own declaration, so the arithmetic
-does not depend on which unit happens to own the shared weight. `mtp_depth == 0`
-makes the embedding rule `1` and the tied-weight rule `2`, which is exactly the
-no-MTP combined case.
+So the whole declaration is enumerable. `_active_mtp_layers` reads the model's own
+MTP block -- 0 or 1, because a pipeline stage that does not own the block reports 0
+-- and raises if it ever sees more, and
+`_unit_grad_multiplicity(unit, shared_weight, mtp_depth)` walks the unit's trainable
+parameters (the same key space the marks use) and declares:
+
+| parameter | `mtp_depth=0` | `mtp_depth=1` | consumers |
+| --- | --- | --- | --- |
+| embedding weight | 1 | 2 | `PreProcessNode` + one MTP pre-dispatch node per depth |
+| tied embedding/output weight (same object) | 2 | 3 | the above + the post-process output projection |
+| untied output weight | 1 (default) | 1 (default) | its own output projection, once |
+| everything else | 1 (default) | 1 (default) | one node of this unit |
+
+Evidence for the embedding term:
+`megatron/core/models/common/fine_grained_callables.py:74-77` calls
+`layer._get_embeddings(..., embedding=node.chunk_state.model.embedding, ...)` from
+`submodule_mtp_pre_dispatch_forward`, i.e. the MTP pre-dispatch node explicitly
+uses `model.embedding`. The tied-output term is the same weight object being reused
+by the chunk's `PostProcessNode` `output_layer` call, matched by identity through
+`shared_embedding_or_output_weight()`.
+
+`mtp_num_layers == 0` collapses to all-1s unless the embeddings and output weight
+are tied, in which case the tied weight is 2: a tied weight really is consumed by
+both the pre-process lookup and the post-process projection, and adding a consumer
+that is not there would be an over-declaration.
+
+Every `FsdpModule` in the chunk gets its own declaration, so the arithmetic does not
+depend on which unit happens to own the shared weight.
+
+### The scheduler must not import MTP at module scope
+
+`combined_1f1b_mfsdp_scheduler.py` is imported from
+`mcore_fsdp_adapter.py`, which `megatron/core/optimizer/__init__.py` pulls in while
+`megatron/core/__init__.py` is still executing -- `:8` imports `distributed`, and
+`:9` binds `InferenceParams`. A module-level
+`from megatron.core.transformer.multi_token_prediction import ...` therefore closes
+the cycle
+
+```text
+mcore_fsdp_adapter -> combined_1f1b_mfsdp_scheduler -> multi_token_prediction
+  -> from megatron.core import InferenceParams   # not bound yet
+```
+
+and breaks `import megatron.core` for the entire repository at pytest collection
+time. The provider above is written to need nothing from that module: it reads the
+MTP depth from the model's own block, so the cycle cannot recur through it.
+`tests/unit_tests/distributed/mfsdp_v2/test_mfsdp_v2_scheduler_import.py` pins this
+both statically (AST: no module-level import of `multi_token_prediction`, runnable
+anywhere) and dynamically (the imports succeed, with `pytest.fail` rather than a
+skip marker so it cannot degrade quietly).
 
 ### What is NOT covered
 
@@ -120,10 +158,12 @@ no-MTP combined case.
   own layer edge and every one of its parameters is consumed by exactly one node of
   that layer, so its declaration is empty. If that is ever untrue the unit
   over-fires loudly.
-* **`--mtp-use-repeated-layer` with `mtp_num_layers > 1`.** One
-  `MultiTokenPredictionLayer` object is applied several times while
-  `len(model.mtp.layers) == 1`, so `_active_mtp_layers` undercounts the embedding
-  consumers. That direction is the loud one (over-fire), not the silent one.
+* **`--mtp-use-repeated-layer` with `mtp_num_layers > 1`.** Not reachable in the
+  combined path: `transformer_config.py:3316-3320` rejects it before any model is
+  built, and at depth 1 the flag is a no-op. There is no depth>1 machinery, and
+  `_active_mtp_layers` raises if it ever sees more than one MTP layer. (The
+  root-cause study's "class C", where the plan counts `len(model.mtp.layers) == 1`
+  while the loss depth is `config.mtp_num_layers`, is therefore unreachable too.)
 * **A parameter consumed outside the plan's node set.** Any consumer the
   enumeration does not know about over-fires; any declared consumer that never runs
   under-fires. Neither is silent.
@@ -161,9 +201,43 @@ unchanged.
 * `tests/unit_tests/distributed/mfsdp_v2/test_mfsdp_v2_grad_readiness.py` extended
   with `TestMultiplicityReadiness` (exact-once, shared consumer, under-fire,
   over-fire before and at the close edge, unknown key, reset, five identical
-  windows, declaration-too-small) and with `FsdpModule`-level tests for the loud
-  under-fire and over-fire reports and the end-of-chunk raise. Existing tests were
-  kept and adapted to the new signal, not deleted.
+  windows, declaration-too-small), with `FsdpModule`-level tests for the loud
+  under-fire and over-fire reports and the end-of-chunk raise, and with
+  `TestReportedGradWindowMessage`, which asserts the report text against the real
+  `FsdpModule`. Existing tests were kept and adapted to the new signal, not
+  deleted.
+* `tests/unit_tests/distributed/mfsdp_v2/test_mfsdp_v2_scheduler_import.py` is new:
+  it pins the module-scope import ban statically (AST, runnable on any host) and
+  asserts the imports succeed, failing rather than skipping.
 * `multiplicity_readiness_study.py` now loads `MultiplicityReadiness` from
   `countdown.py` itself and reproduces the original comparison table verdicts.
-* `tools/autoformat.sh` (CHECK_ONLY) passes on the branch file set.
+* `tools/autoformat.sh` (CHECK_ONLY) passes on the branch file set, as does
+  `compileall`.
+* **h100 GPU unit tests** (`mcore-devtoolkit unit-test`, cw-mtp, 1 node x 8 GPUs,
+  `unit-tests` recipe, `run_ci_test.sh`): re-run against the exact pushed tree after
+  the verification incident below. On that stack every GPU-stack test runs instead
+  of skipping, and the recorded warnings confirm the accounting fires: an under-fire
+  report naming `(('unit.param0',), 0, 2)` and an over-fire report naming
+  `(('unit.param0',), 2, 1)`. The exact counts for this revision are in the pull
+  request body, so this note never states a number that was measured on an earlier
+  tree.
+
+### Verification incident (recorded because it changed the outcome)
+
+An earlier revision of this branch was pushed with the cycle described in section 4
+still present, and it broke `import megatron.core`. The lazy-import fix and the
+provider correction had only ever existed in the working tree: a history rewrite
+restored the files from a pre-fix commit, and the "nothing changed" check compared
+against a backup that pointed at that same pre-fix commit, so it could not detect
+the loss. Compounding it, this host's torch is old enough that `import megatron.core`
+fails earlier, inside `mxfp8_tensor.py`, so the local runs never reached the cycle
+and the GPU runs that did were not repeated after the rewrite. The lesson is in the
+test file above: the guard is a static property of the source, not an environment
+probe, so it holds on every host including the ones that cannot import the stack.
+
+### Deliberately not verified here
+
+No GPU training step was run. In particular, the no-MTP combined loss parity and
+the MTP step that previously raised `Missing gradient for FSDP parameter
+('module.decoder.final_layernorm.weight',)` are not re-measured; the completion
+signal is covered at the mechanism level only.

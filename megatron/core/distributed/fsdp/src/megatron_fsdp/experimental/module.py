@@ -511,9 +511,7 @@ class FsdpModule:
         over_fired = readiness.over_fired()
         if over_fired and not getattr(self, "_warned_over_fire", False):
             self._warned_over_fire = True
-            log_single_rank(
-                logger,
-                logging.WARNING,
+            self._log_grad_window_report(
                 "MFSDP module %s observed MORE gradient contributions than its declared "
                 "multiplicity for %d parameter(s): %s. The multiplicity was under-declared, "
                 "so its backward window closed before the surplus contribution arrived; the "
@@ -528,9 +526,7 @@ class FsdpModule:
         missing = readiness.missing()
         if missing and not getattr(self, "_warned_missing_grads", False):
             self._warned_missing_grads = True
-            log_single_rank(
-                logger,
-                logging.WARNING,
+            self._log_grad_window_report(
                 "MFSDP module %s closed its backward with %d of %d parameters under their "
                 "declared multiplicity and zero-filled them: %r. Expected for a parameter "
                 "unused in this window; an over-declaration or a schedule node that never ran "
@@ -540,6 +536,17 @@ class FsdpModule:
                 len(readiness.expected),
                 self._describe_grad_shortfall(readiness),
             )
+
+    @staticmethod
+    def _log_grad_window_report(message: str, *args: object) -> None:
+        """Emit one window report on the reporting rank.
+
+        A single choke point keeps the report construction testable without a
+        process group (``log_single_rank`` emits on rank 0 only, while a multi-rank CI
+        run may execute the test on any rank) and still logs through the module's
+        normal logger in production.
+        """
+        log_single_rank(logger, logging.WARNING, message, *args)
 
     def finalize_scheduled_backward(self) -> None:
         """Close this module's backward window and reduce its gradients.

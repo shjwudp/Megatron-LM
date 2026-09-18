@@ -9,7 +9,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantization 
     COLWISE,
     ROWWISE,
 )
-from megatron.core.transformer.multi_token_prediction import get_mtp_layer_offset
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
@@ -69,26 +68,23 @@ def finalize_fsdp_backward(module) -> None:
 def _active_mtp_layers(model) -> int:
     """Return how many MTP layers this pipeline stage actually runs.
 
-    A pipeline stage can hold an MTP block without running all of its layers: the
-    main model shifts the MTP depth by ``get_mtp_layer_offset`` so the layers it
-    expects another stage to run are skipped. Only the layers with an offset inside
-    this stage's block execute, and each of them consumes the shared embedding once.
-
-    This mirrors the offset that ``fine_grained_callables.submodule_mtp_pre_dispatch_forward``
-    uses to select ``node.chunk_state.mtp_hidden_states[offset]``.
+    The combined path is reachable only with ``overlap_moe_expert_parallel_comm``,
+    and that configuration asserts ``mtp_num_layers in (None, 0, 1)`` at
+    ``transformer_config.py`` construction time, so this is 0 or 1 by
+    construction. The count is read from the model's MTP block rather than from the
+    config so a pipeline stage that does not own the block reports 0.
     """
     mtp = getattr(model, "mtp", None)
     layers = getattr(mtp, "layers", None)
-    if not layers:
-        return 0
-    config = getattr(model, "config", None)
-    if config is None:
-        return len(layers)
-    pg_collection = getattr(model, "pg_collection", None)
-    pp = getattr(pg_collection, "pp", None)
-    pp_rank = pp.rank() if pp is not None else 0
-    offset = get_mtp_layer_offset(config, getattr(model, "vp_stage", None), pp_rank=pp_rank)
-    return max(0, len(layers) - offset)
+    active = 1 if layers else 0
+    if active > 1:
+        raise AssertionError(
+            "Combined/fine-grained 1F1B only supports one MTP layer "
+            "(overlap_moe_expert_parallel_comm asserts mtp_num_layers <= 1), but this "
+            f"model chunk holds {len(layers)} MTP layers. The per-parameter gradient "
+            "multiplicity enumeration does not model deeper MTP."
+        )
+    return active
 
 
 def _shared_weight(model):
@@ -106,19 +102,24 @@ def _unit_grad_multiplicity(unit: FsdpModule, shared_weight, mtp_depth: int) -> 
 
     In the combined/fine-grained 1F1B path the backward is one autograd GraphTask per
     schedule node over detached node inputs, so a parameter contributes once per
-    *consuming node* rather than once per iteration. The counts below are derived
-    from the plan's node set, not guessed:
+    *consuming node* rather than once per iteration. The whole space is tiny, because
+    ``overlap_moe_expert_parallel_comm`` requires ``mtp_num_layers <= 1``, so the
+    counts are enumerated directly:
 
-    * the shared embedding is consumed by the schedule's ``PreProcessNode`` and again
-      by every MTP pre-dispatch node:
-      ``megatron/core/models/common/fine_grained_callables.py`` calls
+    * the embedding weight is consumed by the schedule's ``PreProcessNode`` and, when
+      the chunk runs MTP, again by the MTP pre-dispatch node:
+      ``megatron/core/models/common/fine_grained_callables.py:74-77`` calls
       ``layer._get_embeddings(..., embedding=node.chunk_state.model.embedding, ...)``
       from ``submodule_mtp_pre_dispatch_forward``, i.e. the MTP node explicitly uses
-      the model's embedding.
-    * a tied embedding/output weight is projected once more by the chunk's post
-      process node, and once per MTP head when the MTP loss is computed with the
-      shared weight (``process_mtp_loss`` calls ``output_layer`` per MTP depth).
-    * every other parameter is consumed by exactly one schedule node of this unit.
+      the model's embedding. That is the recorded desync, so it is 2 with MTP and 1
+      without.
+    * a tied embedding/output weight is the *same object*, so it also picks up the
+      chunk's ``PostProcessNode`` output projection -- one more consumer. It is 3
+      with MTP and 2 without, which keeps the no-MTP chunk exactly as it is today
+      instead of declaring a consumer that is not there.
+    * every other parameter -- including an untied output weight, which its own
+      output projection consumes exactly once -- is consumed by one node of this
+      unit.
 
     Because this is an enumeration, it is deliberately not treated as exhaustive:
     a parameter that this function declares too low over-fires loudly, and one it
@@ -128,18 +129,16 @@ def _unit_grad_multiplicity(unit: FsdpModule, shared_weight, mtp_depth: int) -> 
         Parameter index -> expected number of gradient contributions in one window.
         An index that is absent is expected once.
     """
-    # The embedding lookup runs in the schedule's PreProcessNode and again in every
-    # MTP pre-dispatch node.
-    embedding_consumers = 1 + mtp_depth
-    # A tied embedding/output weight is projected by the post process node and by
-    # each MTP head.
-    shared_weight_consumers = 1 + mtp_depth
-
     multiplicity: dict[int, int] = {}
     for index, fsdp_parameter in enumerate(unit._trainable_fsdp_parameters()):
-        consumers = embedding_consumers
+        # PreProcessNode's embedding lookup, plus one per MTP pre-dispatch node.
+        consumers = 1 + mtp_depth
         if fsdp_parameter.unsharded is shared_weight:
-            consumers += shared_weight_consumers
+            # The same weight object is the output projection's weight, so it also
+            # picks up the PostProcessNode projection. That projection runs with the
+            # MTP loss heads when there are any, and its consumer set does not change
+            # with MTP depth one way or the other, so this adds exactly one.
+            consumers += 1
         if consumers != 1:
             multiplicity[index] = consumers
     return multiplicity

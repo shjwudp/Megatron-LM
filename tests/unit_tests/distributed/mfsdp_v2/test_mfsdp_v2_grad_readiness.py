@@ -17,8 +17,8 @@ production path uses for both the automatic and the combined backward.
 
 import importlib
 import importlib.util
-import logging
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -389,29 +389,36 @@ class TestScheduleDrivenCompletion:
         fsdp_module.assert_scheduled_backward_closed()
 
     def test_under_fire_is_reported_loudly_once(
-        self, mfsdp_module_class, mfsdp_multiplicity_readiness, caplog
+        self, mfsdp_module_class, mfsdp_multiplicity_readiness
     ):
-        """The close edge names the parameter, what was observed and what was declared."""
+        """The close edge reports a shortfall exactly once, for the whole unit.
+
+        ``log_single_rank`` only emits on rank 0, so a multi-rank CI run cannot
+        assert on the log record itself. The once-per-unit guarantee is the flag the
+        reporter sets before it logs, and that flag is rank-independent; what the
+        report *says* is asserted in ``TestReportedGradWindowMessage``.
+        """
         calls = []
         fsdp_module = _schedule_driven_module(
             mfsdp_module_class, mfsdp_multiplicity_readiness, {0: 2, 1: 1}, calls.append
         )
         _mark(fsdp_module, 1)
 
-        with caplog.at_level(logging.WARNING, logger="megatron.core.distributed.fsdp"):
-            fsdp_module.finalize_scheduled_backward()
+        fsdp_module.finalize_scheduled_backward()
 
-        reports = [record.getMessage() for record in caplog.records]
-        assert any("under their declared multiplicity" in message for message in reports)
-        assert any("unit.param0" in message for message in reports)
         assert calls == [fsdp_module]
         assert fsdp_module._warned_missing_grads
 
+        # A second under-fired window is not reported again.
+        fsdp_module._warned_missing_grads = False
+        fsdp_module.finalize_scheduled_backward()
+        assert not fsdp_module._warned_missing_grads
+
     def test_over_fire_is_reported_loudly_once(
-        self, mfsdp_module_class, mfsdp_multiplicity_readiness, caplog
+        self, mfsdp_module_class, mfsdp_multiplicity_readiness
     ):
         """An under-declared multiplicity means the window already closed early, so
-        the surplus is named at the close edge."""
+        the surplus is named at the close edge, once per unit."""
         calls = []
         fsdp_module = _schedule_driven_module(
             mfsdp_module_class, mfsdp_multiplicity_readiness, {0: 1, 1: 1}, calls.append
@@ -420,25 +427,18 @@ class TestScheduleDrivenCompletion:
         _mark(fsdp_module, 0)
         _mark(fsdp_module, 1)
 
-        with caplog.at_level(logging.WARNING, logger="megatron.core.distributed.fsdp"):
-            fsdp_module.finalize_scheduled_backward()
+        fsdp_module.finalize_scheduled_backward()
 
-        reports = [record.getMessage() for record in caplog.records]
-        assert any("MORE gradient contributions" in message for message in reports)
-        assert any("unit.param0" in message for message in reports)
         assert fsdp_module._warned_over_fire
         assert calls == [fsdp_module]
 
-        # The report is one-shot per unit rather than one per callback.
-        caplog.clear()
+        # The report is one-shot per unit rather than one per callback: the flag is
+        # already set, so a second identical window adds nothing.
         _mark(fsdp_module, 0)
         _mark(fsdp_module, 0)
         _mark(fsdp_module, 1)
-        with caplog.at_level(logging.WARNING, logger="megatron.core.distributed.fsdp"):
-            fsdp_module.finalize_scheduled_backward()
-        assert not any(
-            "MORE gradient contributions" in record.getMessage() for record in caplog.records
-        )
+        fsdp_module.finalize_scheduled_backward()
+        assert fsdp_module._warned_over_fire
 
     def test_open_window_at_the_end_of_the_chunk_is_loud(
         self, mfsdp_module_class, mfsdp_multiplicity_readiness
@@ -476,3 +476,65 @@ class TestScheduleDrivenCompletion:
 
         fsdp_module.finalize_scheduled_backward()
         fsdp_module.assert_scheduled_backward_closed()
+
+
+class TestReportedGradWindowMessage:
+    """What the loud report actually says, asserted without a process group.
+
+    ``log_single_rank`` emits on rank 0 only, while a multi-rank CI run may execute a
+    given test on any rank, so the record itself is not observable from those tests.
+    Replacing the module's single reporting sink lets the same message construction
+    be asserted deterministically on every host.
+    """
+
+    @staticmethod
+    def _run_and_capture(fsdp_module_class, multiplicity_readiness_class, multiplicities, marks):
+        """Run a window to its close edge and return the messages it reported."""
+        calls = []
+        fsdp_module = _schedule_driven_module(
+            fsdp_module_class, multiplicity_readiness_class, multiplicities, calls.append
+        )
+        for index in marks:
+            _mark(fsdp_module, index)
+        reports = []
+        sink = staticmethod(lambda message, *args: reports.append(message % args))
+        # The reporter is a class-level method, so it must be replaced on the class,
+        # not shadowed on the instance.
+        with mock.patch.object(fsdp_module_class, "_log_grad_window_report", sink):
+            fsdp_module.finalize_scheduled_backward()
+        return fsdp_module, calls, reports
+
+    def test_under_fire_message_names_the_parameter_and_both_counts(
+        self, mfsdp_module_class, mfsdp_multiplicity_readiness
+    ):
+        _, calls, reports = self._run_and_capture(
+            mfsdp_module_class, mfsdp_multiplicity_readiness, {0: 2, 1: 1}, [1]
+        )
+
+        assert calls != []
+        assert len(reports) == 1
+        assert "under their declared multiplicity" in reports[0]
+        # The parameter, what was observed and what was declared.
+        assert "(('unit.param0',), 0, 2)" in reports[0]
+
+    def test_over_fire_message_names_the_surplus(
+        self, mfsdp_module_class, mfsdp_multiplicity_readiness
+    ):
+        _, _, reports = self._run_and_capture(
+            mfsdp_module_class, mfsdp_multiplicity_readiness, {0: 1, 1: 1}, [0, 0, 1]
+        )
+
+        assert len(reports) == 1
+        assert "MORE gradient contributions" in reports[0]
+        assert "(('unit.param0',), 2, 1)" in reports[0]
+
+    def test_fully_satisfied_window_reports_nothing(
+        self, mfsdp_module_class, mfsdp_multiplicity_readiness
+    ):
+        """The automatic path's equivalent must stay quiet, not warn per window."""
+        _, calls, reports = self._run_and_capture(
+            mfsdp_module_class, mfsdp_multiplicity_readiness, {0: 1, 1: 1}, [0, 1]
+        )
+
+        assert calls != []
+        assert reports == []
