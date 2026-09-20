@@ -55,6 +55,7 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     absorbed_input_layernorm_key,
     flatten_state_dict,
     get_expert_index_from_key,
+    get_local_to_global_layer_prefixes,
     get_mla_fused_down_proj_splits,
     get_model_sections,
     get_mtp_inner_layer_paths,
@@ -64,6 +65,7 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     is_model_section_key,
     match_mla_fused_down_proj_key,
     partition_optimizer_state_dict_by_model_chunk,
+    rename_layer_indices_to_global,
     rename_mtp_inner_layer_keys,
     split_fused_fsdp_param,
     validate_fsdp_dtensor_model_load,
@@ -1510,6 +1512,115 @@ class TestModelSections:
     )
     def test_is_model_section_key(self, key, expected):
         assert is_model_section_key(key) is expected
+
+
+class _NumberedLayer(torch.nn.Module):
+    """A stand-in transformer layer: only ``layer_number`` matters here."""
+
+    def __init__(self, layer_number):
+        super().__init__()
+        self.layer_number = layer_number
+
+
+class _LayerBlockStub(torch.nn.Module):
+    """Stands in for a ``TransformerBlock``/``MultiTokenPredictionBlock`` layer list."""
+
+    def __init__(self, first_layer_number, count):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            [_NumberedLayer(first_layer_number + i) for i in range(count)]
+        )
+
+
+class _LayerChunkStub(torch.nn.Module):
+    """One model chunk owning a numbered ``decoder.layers`` list.
+
+    ``first_layer_number`` is the global 1-based number of its first layer, which is what a
+    real ``TransformerLayer`` gets from ``get_transformer_layer_offset`` at construction time.
+    """
+
+    def __init__(self, first_layer_number=1, count=2):
+        super().__init__()
+        self.decoder = _LayerBlockStub(first_layer_number, count)
+
+
+class TestLocalToGlobalLayerPrefixes:
+    """``state_dict_for_save_checkpoint`` numbers layers by *local* ModuleList index, which
+    is a property of this rank's pipeline split rather than of the model. The checkpoint
+    convention is the *global* index -- ``layer.layer_number - 1``, which is what every
+    ``sharded_state_dict`` that publishes layer keys uses."""
+
+    def test_local_index_is_rebased_onto_the_layer_number(self):
+        chunk = _LayerChunkStub(first_layer_number=5, count=2)
+        assert get_local_to_global_layer_prefixes(chunk) == {
+            'decoder.layers.0': 'decoder.layers.4',
+            'decoder.layers.1': 'decoder.layers.5',
+        }
+
+    def test_interleaved_vpp_chunks_get_their_own_mapping(self):
+        # Interleaved VPP: this rank's chunks hold global layers 0-1 and 8-9.
+        chunk0 = _LayerChunkStub(first_layer_number=1, count=2)
+        chunk1 = _LayerChunkStub(first_layer_number=9, count=2)
+        assert get_local_to_global_layer_prefixes(chunk0) == {
+            'decoder.layers.0': 'decoder.layers.0',
+            'decoder.layers.1': 'decoder.layers.1',
+        }
+        assert get_local_to_global_layer_prefixes(chunk1) == {
+            'decoder.layers.0': 'decoder.layers.8',
+            'decoder.layers.1': 'decoder.layers.9',
+        }
+
+    def test_mtp_layers_use_their_own_layer_number(self):
+        """MTP keys are ``mtp.layers.<depth>`` and the depth is numbered by
+        ``get_mtp_layer_offset``; the inner ``mtp_model_layer`` TransformerLayer is numbered
+        per depth, so it must not contribute a mapping of its own."""
+        chunk = torch.nn.Module()
+        chunk.mtp = _LayerBlockStub(first_layer_number=3, count=1)
+        chunk.mtp.layers[0].mtp_model_layer = _NumberedLayer(1)
+        assert get_local_to_global_layer_prefixes(chunk) == {'mtp.layers.0': 'mtp.layers.2'}
+
+    def test_model_without_numbered_layers_has_no_mapping(self):
+        assert get_local_to_global_layer_prefixes(torch.nn.Linear(2, 2)) == {}
+
+
+class TestRenameLayerIndicesToGlobal:
+    def test_rebases_every_layer_key_of_the_chunk(self):
+        chunk = _LayerChunkStub(first_layer_number=9, count=2)
+        state_dict = {
+            'module.decoder.layers.0.input_layernorm.weight': 'a',
+            'module.decoder.layers.1.mlp.linear_fc1.weight_w': 'b',
+            'module.embedding.word_embeddings.weight': 'c',
+        }
+        assert rename_layer_indices_to_global(chunk, state_dict) == {
+            'module.decoder.layers.8.input_layernorm.weight': 'a',
+            'module.decoder.layers.9.mlp.linear_fc1.weight_w': 'b',
+            'module.embedding.word_embeddings.weight': 'c',
+        }
+
+    def test_rebases_keys_of_a_chunk_that_owns_its_model_as_module(self):
+        """Megatron-FSDP v1 nests the bare model under ``module``, so the module paths carry
+        the same level the state-dict keys do."""
+
+        class _Wrapper(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.module = _LayerChunkStub(first_layer_number=9, count=1)
+
+        assert rename_layer_indices_to_global(
+            _Wrapper(), {'module.module.decoder.layers.0.weight': 'a'}
+        ) == {'module.module.decoder.layers.8.weight': 'a'}
+
+    def test_no_numbered_layers_returns_the_same_dict(self):
+        state_dict = {'module.embedding.word_embeddings.weight': 'c'}
+        assert rename_layer_indices_to_global(torch.nn.Linear(2, 2), state_dict) is state_dict
+
+    def test_keys_outside_any_layer_are_untouched(self):
+        chunk = _LayerChunkStub(first_layer_number=9, count=1)
+        state_dict = {
+            'module.decoder.final_layernorm.weight': 'a',
+            'module.output_layer.weight': 'b',
+        }
+        assert rename_layer_indices_to_global(chunk, state_dict) == state_dict
 
 
 class _NamedParamModel(torch.nn.Module):

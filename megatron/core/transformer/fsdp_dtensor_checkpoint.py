@@ -983,9 +983,85 @@ def print_diff_in_state_dicts(state_dict_metadata, load_state_dict, limit=100):
             logger.info(f"  {k}: meta shape={meta_shape}, load shape={load_shape}")
 
 
-# Top-level sections holding model weights: "model" for a single chunk, "model0", "model1",
-# ... with virtual pipeline parallelism.
+# Top-level sections holding model weights. ``generate_state_dict`` builds 'model' for a
+# single chunk and 'model0', 'model1', ... under virtual pipeline parallelism, but
+# ``preprocess_fsdp_dtensor_state_dict`` flattens those into the single 'model' section that
+# is written to and read from disk, so the on-disk convention never depends on the layout.
+# The pattern accepts both because it answers "is this key a model weight?", not "which
+# convention produced it?".
 _MODEL_SECTION_PATTERN = re.compile(r'^model\d*\.')
+
+
+def get_local_to_global_layer_prefixes(model_chunk):
+    """Map every local layer-module path of one chunk to its global layer-index path.
+
+    ``state_dict_for_save_checkpoint`` publishes each layer under its *local* ModuleList
+    index (``transformer_block.py`` builds ``self.layers`` per rank), which is a property of
+    how this rank happens to split the model rather than of the model. A reshardable
+    checkpoint format must not encode that split, so the keys must carry the *global* layer
+    index instead -- the same index every ``sharded_state_dict`` in the repo publishes as
+    ``<list>.<layer.layer_number - 1>`` (``transformer_block.py:845``,
+    ``multi_token_prediction.py:2533``, ``hybrid_block.py:694``).
+
+    ``TransformerLayer.layer_number`` and ``MultiTokenPredictionLayer.layer_number`` are
+    global and 1-based because both add their own chunk's pipeline offset at construction
+    time, so rebasing local index ``i`` onto ``layer_number - 1`` covers pipeline parallelism
+    (``pp_rank * layers_per_rank``) and virtual pipeline parallelism
+    (``vp_stage * total_virtual_chunks``) together, and stays correct per chunk: under
+    interleaved VPP this rank's first chunk may hold global layers 0-3 while its second holds
+    8-11, so a single per-rank offset would be wrong.
+
+    Reuses :func:`megatron.core.resharding.utils._build_layer_module_prefix_map`, the
+    local->global layer-index mapping the refit/resharding path already applies to parameter
+    names, so the two paths cannot drift apart.
+
+    Args:
+        model_chunk: one model chunk of the current rank.
+
+    Returns:
+        Dict[str, str]: ``{'<local layer path>': '<global layer path>'}``, e.g.
+        ``{'decoder.layers.0': 'decoder.layers.4'}``. Empty when the chunk has no numbered
+        layer modules, which makes the rebase a no-op.
+    """
+    # Imported here, not at module scope: ``megatron.core.resharding.__init__`` pulls in
+    # ``refit`` -> the model stack -> ``optimizer.distrib_optimizer``, which imports this
+    # module, so a top-level import is circular.
+    from megatron.core.resharding.utils import _build_layer_module_prefix_map
+
+    return {
+        _strip_wrapper_prefixes(local): _strip_wrapper_prefixes(global_path)
+        for local, global_path in _build_layer_module_prefix_map(model_chunk).items()
+    }
+
+
+def rename_layer_indices_to_global(model_chunk, model_state_dict):
+    """Rebase every layer key of one chunk onto its global layer index.
+
+    Runs on the chunk's state dict after the per-chunk handlers, because those handlers match
+    keys against live module paths and therefore need the local indices the module tree has.
+
+    State-dict keys carry the DDP/FSDP ``module.`` level that the live module paths only have
+    when the chunk is wrapped (Megatron-FSDP v1 owns the bare model as ``module``; v2 shards
+    the bare model in place), so both the key and the mapping's paths are normalised with
+    ``_strip_wrapper_prefixes`` before matching, and the key's own wrapper is put back
+    afterwards. Rebasing ``i -> <layer_number - 1>`` is injective, so this cannot merge two
+    keys of one chunk.
+    """
+    local_to_global = get_local_to_global_layer_prefixes(model_chunk)
+    if not local_to_global:
+        return model_state_dict
+
+    # Lazy for the same circular-import reason as ``get_local_to_global_layer_prefixes``.
+    from megatron.core.resharding.utils import _resolve_global_layer_number_in_name
+
+    renamed = {}
+    for key, value in model_state_dict.items():
+        normalized = _strip_wrapper_prefixes(key)
+        wrapper = key[: len(key) - len(normalized)]
+        global_key = _resolve_global_layer_number_in_name(normalized, local_to_global)
+        renamed[f'{wrapper}{global_key}'] = value
+    return renamed
+
 
 # The section keys themselves, without the trailing dot: "model", "model0", "model1", ...
 _MODEL_SECTION_KEY_PATTERN = re.compile(r'^model\d*$')
@@ -994,8 +1070,10 @@ _MODEL_SECTION_KEY_PATTERN = re.compile(r'^model\d*$')
 def is_model_section_key(key):
     """Whether ``key`` names a top-level model-weight section.
 
-    ``generate_state_dict`` writes ``model`` for a single model chunk and ``model0``,
+    ``generate_state_dict`` builds ``model`` for a single model chunk and ``model0``,
     ``model1``, ... (one per chunk, in chunk order) under virtual pipeline parallelism.
+    Those sectioned keys are an intermediate representation: ``preprocess`` flattens them
+    into one ``model`` section before anything is written to or read from disk.
     """
     return bool(_MODEL_SECTION_KEY_PATTERN.match(key))
 
@@ -1007,6 +1085,10 @@ def get_model_sections(state_dict, model_chunks):
     and ``model0``, ``model1``, ... for virtual pipeline parallelism -- in the same order
     as the model chunk list, so section ``model{i}`` belongs to ``model_chunks[i]`` and a
     lone ``model`` belongs to ``model_chunks[0]``.
+
+    This reads the sectioned state dict ``generate_state_dict`` produces, not the flattened
+    one that ``preprocess_fsdp_dtensor_state_dict`` turns it into, so the per-chunk handlers
+    can each be handed the chunk they resolve keys against.
 
     Args:
         state_dict: state dict whose top-level keys may include model sections.

@@ -663,17 +663,48 @@ class TestPreprocessFsdpDtensorStateDictSections:
     """``generate_state_dict`` sections the model per chunk (``model`` for one chunk and
     ``model0``/``model1``/... for virtual pipeline parallelism). The preprocess used to
     index ``state_dict['model']`` unconditionally and raised ``KeyError`` for a VPP state
-    dict; these tests pin the replacement: every section is handled with the chunk that
-    owns it, and the single-section call sequence is unchanged."""
+    dict. These tests pin the replacement: every section is handled with the chunk that
+    owns it, the sections are then flattened into one ``model`` section whose layer keys
+    carry the global layer index -- so the on-disk convention does not encode the pipeline
+    layout -- and the single-section call sequence is unchanged."""
 
     class _Chunk:
-        """Model chunk stub whose ``get_parameter`` always fails, i.e. owns no optimizer key."""
+        """Model chunk stub with no layer lists: owns no optimizer key and nothing to rebase."""
 
         def __init__(self, name):
             self.name = name
 
+        def named_modules(self):
+            return []
+
         def get_parameter(self, name):
             raise AttributeError(name)
+
+    class _NumberedLayer(torch.nn.Module):
+        """A stand-in transformer layer: only ``layer_number`` matters here."""
+
+        def __init__(self, layer_number):
+            super().__init__()
+            self.layer_number = layer_number
+
+    class _NumberedChunk(torch.nn.Module):
+        """Model chunk stub holding a numbered ``decoder.layers`` list, like a rank's chunk.
+
+        ``first_layer_number`` is the global 1-based number of its first layer, i.e. what a
+        real ``TransformerLayer`` gets from ``get_transformer_layer_offset`` at construction.
+        """
+
+        def __init__(self, first_layer_number, count):
+            super().__init__()
+            self.decoder = torch.nn.Module()
+            self.decoder.layers = torch.nn.ModuleList(
+                [
+                    TestPreprocessFsdpDtensorStateDictSections._NumberedLayer(
+                        first_layer_number + i
+                    )
+                    for i in range(count)
+                ]
+            )
 
     @staticmethod
     def _args(swiglu=False, num_experts=None):
@@ -717,12 +748,73 @@ class TestPreprocessFsdpDtensorStateDictSections:
 
         out = preprocess_fsdp_dtensor_state_dict(self._args(), state_dict, chunks)
 
-        assert set(out) == {'model0', 'model1', 'iteration'}
-        assert out['model0'] == {'a': 0}
-        assert out['model1'] == {'b': 0}
+        # One flat model section, not one section per virtual chunk.
+        assert set(out) == {'model', 'iteration'}
+        assert out['model'] == {'a': 0, 'b': 0}
         for handler_name in ('mla', 'mtp'):
             assert [chunk for (name, chunk, _keys) in calls if name == handler_name] == chunks
         assert [keys for (name, _chunk, keys) in calls if name == 'fp8'] == [('a',), ('b',)]
+
+    def test_vpp_layer_keys_are_rebased_onto_global_indices(self, monkeypatch):
+        """Interleaved VPP: chunk 0 holds global layers 0-1 and chunk 1 holds layers 4-5, so
+        the flattened request must ask for 0,1,4,5 rather than 0,0,1,1."""
+        chunks = [
+            self._NumberedChunk(first_layer_number=1, count=2),
+            self._NumberedChunk(first_layer_number=5, count=2),
+        ]
+        state_dict = {
+            'model0': {
+                'module.decoder.layers.0.input_layernorm.weight': 'a',
+                'module.decoder.layers.1.input_layernorm.weight': 'b',
+                'module.embedding.word_embeddings.weight': 'e',
+            },
+            'model1': {
+                'module.decoder.layers.0.input_layernorm.weight': 'c',
+                'module.decoder.layers.1.input_layernorm.weight': 'd',
+            },
+        }
+        calls = []
+        self._patch_handlers(monkeypatch, calls)
+
+        out = preprocess_fsdp_dtensor_state_dict(self._args(), state_dict, chunks)
+
+        assert set(out) == {'model'}
+        assert out['model'] == {
+            'module.decoder.layers.0.input_layernorm.weight': 'a',
+            'module.decoder.layers.1.input_layernorm.weight': 'b',
+            'module.decoder.layers.4.input_layernorm.weight': 'c',
+            'module.decoder.layers.5.input_layernorm.weight': 'd',
+            'module.embedding.word_embeddings.weight': 'e',
+        }
+        # The handlers still saw the local indices the module tree has.
+        assert [keys for (name, _chunk, keys) in calls if name == 'fp8'] == [
+            (
+                'module.decoder.layers.0.input_layernorm.weight',
+                'module.decoder.layers.1.input_layernorm.weight',
+                'module.embedding.word_embeddings.weight',
+            ),
+            (
+                'module.decoder.layers.0.input_layernorm.weight',
+                'module.decoder.layers.1.input_layernorm.weight',
+            ),
+        ]
+
+    def test_sections_that_rebase_onto_the_same_key_raise(self, monkeypatch):
+        """A layout whose chunks overlap would let one chunk's weights silently overwrite the
+        other's, so the merge must abort instead."""
+        chunks = [
+            self._NumberedChunk(first_layer_number=1, count=1),
+            self._NumberedChunk(first_layer_number=1, count=1),
+        ]
+        state_dict = {
+            'model0': {'module.decoder.layers.0.weight': 'a'},
+            'model1': {'module.decoder.layers.0.weight': 'b'},
+        }
+        calls = []
+        self._patch_handlers(monkeypatch, calls)
+
+        with pytest.raises(ValueError, match="disjoint"):
+            preprocess_fsdp_dtensor_state_dict(self._args(), state_dict, chunks)
 
     def test_single_section_keeps_the_historical_call_sequence(self, monkeypatch):
         chunks = [self._Chunk('only')]

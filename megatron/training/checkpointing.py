@@ -87,6 +87,7 @@ try:
         is_model_section_key,
         partition_optimizer_state_dict_by_model_chunk,
         print_diff_in_state_dicts,
+        rename_layer_indices_to_global,
         validate_fsdp_dtensor_model_load,
     )
 
@@ -1791,6 +1792,11 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
         optimizer_slices = [optimizer_state_dict]
         unowned_optimizer_state = {}
 
+    # Under virtual pipeline parallelism the sections are collapsed into one flat ``model``
+    # section, so this rank's on-disk key space does not depend on how many virtual chunks it
+    # happens to hold. None means "one section, keep it exactly as it is".
+    merged_model_state_dict = {} if len(sections) > 1 else None
+
     merged_optimizer_state = {}
     for index, (section_key, model_chunk) in enumerate(sections):
         model_state_dict = state_dict[section_key]
@@ -1813,9 +1819,24 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
         model_state_dict, optimizer_slice = handle_mtp_in_state_dict(
             model_chunk, model_state_dict, optimizer_slice
         )
+        # The handlers above need the local ModuleList indices the module tree has, but the
+        # checkpoint must not encode this rank's pipeline layout, so rebase the layer keys
+        # onto the global layer indices ``torch_dist`` publishes. No-op at PP=1 (offset 0).
+        model_state_dict = rename_layer_indices_to_global(model_chunk, model_state_dict)
 
-        state_dict[section_key] = model_state_dict
         optimizer_slices[index] = optimizer_slice
+        if merged_model_state_dict is None:
+            state_dict[section_key] = model_state_dict
+        else:
+            del state_dict[section_key]
+            for key, value in model_state_dict.items():
+                if key in merged_model_state_dict:
+                    raise ValueError(
+                        f"Model sections {section_key!r} and an earlier section of this rank "
+                        f"both produce the key {key!r} after the global layer-index rebase. "
+                        f"The sections must hold disjoint layers."
+                    )
+                merged_model_state_dict[key] = value
 
     for optimizer_slice in optimizer_slices:
         if optimizer_slice is not None:
@@ -1826,6 +1847,12 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
             **optimizer_state_dict,
             'state': {**unowned_optimizer_state, **merged_optimizer_state},
         }
+
+    if merged_model_state_dict is not None:
+        # One flat, globally-indexed model section -- the convention both sides of the
+        # fsdp_dtensor save/load path use, so a checkpoint written under one pipeline layout
+        # loads under another.
+        state_dict['model'] = merged_model_state_dict
 
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
