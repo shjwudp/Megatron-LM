@@ -59,6 +59,38 @@ def _strip_wrapper_prefixes(path):
     return '.'.join(parts)
 
 
+def _get_model_parameter(model, key):
+    """Resolve a model state-dict key to the live (distributed) parameter.
+
+    ``key`` is a ``state_dict_for_save_checkpoint`` key, whose ``module.`` level is
+    contributed by the DDP/FSDP wrapper that owns the bare model, while the live
+    parameter path depends on the wrapper ``unwrap_model`` stopped at:
+
+    * Megatron-FSDP v1 unwraps to ``MegatronFSDP``, which itself owns the bare model as
+      ``self.module``, so its keys already start with ``module.`` and its parameters are
+      addressed as ``module.<key>``.
+    * Megatron-FSDP v2 shards the bare model in place and is unwrapped to that bare
+      model, so its parameters are addressed directly.
+
+    Try the key as given, then the ``module.``-prefixed form, then the key with its
+    wrapper prefixes stripped, so every wrapper layout resolves to the same parameter
+    object.
+    """
+    candidates = [key, f'module.{key}']
+    stripped = _strip_wrapper_prefixes(key)
+    if stripped != key:
+        candidates.append(stripped)
+    for candidate in candidates:
+        try:
+            return model.get_parameter(candidate)
+        except AttributeError:
+            continue
+    raise AttributeError(
+        f"Could not resolve parameter {key!r} on {type(model).__name__}: it is none of "
+        f"{candidates!r}."
+    )
+
+
 def _intersect_slice(s1, s2):
     """Intersection of two step-1 slices, or an empty slice when they do not overlap."""
     start = max(s1.start, s2.start)
@@ -286,6 +318,28 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             f"got {data.shape[swiglu_shard_axis]}"
         )
 
+        # Megatron-FSDP v2 installs one plain DTensor parameter per module and does not
+        # publish v1's flat-shard bookkeeping (`megatron_fsdp_slice` /
+        # `megatron_fsdp_dist_index`). The whole fused projection is already a DTensor on
+        # the FSDP mesh, so split the DTensor itself -- the same split the converter
+        # applies when it writes `_w`/`_v` to disk. `split_dtensor` keeps the DTensor's
+        # mesh and placements and records the true chunk offsets, which is what the DCP
+        # load planner consumes.
+        if not hasattr(dist_param, 'megatron_fsdp_slice'):
+            assert isinstance(data, DTensor), (
+                "A parameter without `megatron_fsdp_slice` must be a DTensor, got "
+                f"{type(data).__name__}."
+            )
+            half = data.shape[swiglu_shard_axis] // 2
+            return tuple(
+                split_dtensor(
+                    data,
+                    [half, half],
+                    dim=swiglu_shard_axis,
+                    update_uneven_dtensor_chunk_meta=True,
+                )
+            )
+
         fsdp_slice = dist_param.megatron_fsdp_slice
         megatron_fsdp_dist_index = dist_param.megatron_fsdp_dist_index
 
@@ -346,7 +400,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             if not _key_in_glu_layer(key):
                 _swiglu_skip_count += 1
                 continue
-            dist_param = model.get_parameter(f"module.{key}")
+            dist_param = _get_model_parameter(model, key)
             weight_w, weight_v = split_swiglu_linear_fc1(
                 model_state_dict[key],
                 dist_param,
@@ -378,8 +432,8 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
                 new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(
-                        expert_param_local_key(key[len("module.") :], num_experts)
+                    dist_param = _get_model_parameter(
+                        model, expert_param_local_key(_strip_wrapper_prefixes(key), num_experts)
                     )
                     weight_w, weight_v = split_swiglu_linear_fc1(
                         opt_state_dict[key][subkey],
@@ -518,7 +572,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         if match is None:
             continue
         sizes, names, dim = match
-        dist_param = model.get_parameter(f"module.{key}")
+        dist_param = _get_model_parameter(model, key)
         sub_tensors = split_gdn_fused(model_state_dict[key], dist_param, sizes, dim)
         for sub_name, tensor in zip(names, sub_tensors):
             model_state_dict[f"{key}.{sub_name}"] = tensor
@@ -546,7 +600,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
-                    dist_param = model.get_parameter(key[len("module.") :])
+                    dist_param = _get_model_parameter(model, _strip_wrapper_prefixes(key))
                     sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
                         new_opt_state[f"{key}.{sub_name}"][subkey] = tensor
@@ -569,6 +623,28 @@ def split_fused_fsdp_param(data, dist_param, split_sizes, is_expert_param=False,
     even two-way split to arbitrary section sizes.
     """
     assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
+
+    # Megatron-FSDP v2 keeps the whole fused projection in one DTensor and has no
+    # `megatron_fsdp_slice` / `megatron_fsdp_dist_index` to rebase it onto a flat
+    # shard, so split the DTensor directly (see handle_swiglu_in_state_dict).
+    if not hasattr(dist_param, 'megatron_fsdp_slice'):
+        assert isinstance(data, DTensor), (
+            "A parameter without `megatron_fsdp_slice` must be a DTensor, got "
+            f"{type(data).__name__}."
+        )
+        total_full = sum(split_sizes)
+        assert data.shape[split_dim] == total_full, (
+            f"Fused parameter is {data.shape[split_dim]} wide along dim {split_dim}, "
+            f"but the requested sections sum to {total_full}"
+        )
+        return list(
+            split_dtensor(
+                data,
+                list(split_sizes),
+                dim=split_dim,
+                update_uneven_dtensor_chunk_meta=True,
+            )
+        )
 
     fsdp_slice = dist_param.megatron_fsdp_slice
     dist_index = dist_param.megatron_fsdp_dist_index
@@ -731,7 +807,7 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
             continue
 
         sections = split_fused_fsdp_param(
-            model_state_dict[key], model.get_parameter(f'module.{key}'), split_sizes
+            model_state_dict[key], _get_model_parameter(model, key), split_sizes
         )
         for proj_name, section in zip(MLA_UNFUSED_DOWN_PROJS, sections):
             model_state_dict[f'{wrapper}{attention_path}.{proj_name}.{leaf}'] = section
@@ -767,7 +843,7 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
             ]
             for new_key in new_keys:
                 new_optimizer_state[new_key] = optimizer_state[key].copy()
-            dist_param = model.get_parameter(key[len("module.") :])
+            dist_param = _get_model_parameter(model, _strip_wrapper_prefixes(key))
             for subkey in ["exp_avg", "exp_avg_sq"]:
                 sections = split_fused_fsdp_param(
                     optimizer_state[key][subkey], dist_param, split_sizes
@@ -907,9 +983,199 @@ def print_diff_in_state_dicts(state_dict_metadata, load_state_dict, limit=100):
             logger.info(f"  {k}: meta shape={meta_shape}, load shape={load_shape}")
 
 
-# Top-level sections holding model weights: "model" for a single chunk, "model0", "model1",
-# ... with virtual pipeline parallelism.
+# Top-level sections holding model weights. ``generate_state_dict`` builds 'model' for a
+# single chunk and 'model0', 'model1', ... under virtual pipeline parallelism, but
+# ``preprocess_fsdp_dtensor_state_dict`` flattens those into the single 'model' section that
+# is written to and read from disk, so the on-disk convention never depends on the layout.
+# The pattern accepts both because it answers "is this key a model weight?", not "which
+# convention produced it?".
 _MODEL_SECTION_PATTERN = re.compile(r'^model\d*\.')
+
+
+def get_local_to_global_layer_prefixes(model_chunk):
+    """Map every local layer-module path of one chunk to its global layer-index path.
+
+    ``state_dict_for_save_checkpoint`` publishes each layer under its *local* ModuleList
+    index (``transformer_block.py`` builds ``self.layers`` per rank), which is a property of
+    how this rank happens to split the model rather than of the model. A reshardable
+    checkpoint format must not encode that split, so the keys must carry the *global* layer
+    index instead -- the same index every ``sharded_state_dict`` in the repo publishes as
+    ``<list>.<layer.layer_number - 1>`` (``transformer_block.py:845``,
+    ``multi_token_prediction.py:2533``, ``hybrid_block.py:694``).
+
+    ``TransformerLayer.layer_number`` and ``MultiTokenPredictionLayer.layer_number`` are
+    global and 1-based because both add their own chunk's pipeline offset at construction
+    time, so rebasing local index ``i`` onto ``layer_number - 1`` covers pipeline parallelism
+    (``pp_rank * layers_per_rank``) and virtual pipeline parallelism
+    (``vp_stage * total_virtual_chunks``) together, and stays correct per chunk: under
+    interleaved VPP this rank's first chunk may hold global layers 0-3 while its second holds
+    8-11, so a single per-rank offset would be wrong.
+
+    Reuses :func:`megatron.core.resharding.utils._build_layer_module_prefix_map`, the
+    local->global layer-index mapping the refit/resharding path already applies to parameter
+    names, so the two paths cannot drift apart.
+
+    Args:
+        model_chunk: one model chunk of the current rank.
+
+    Returns:
+        Dict[str, str]: ``{'<local layer path>': '<global layer path>'}``, e.g.
+        ``{'decoder.layers.0': 'decoder.layers.4'}``. Empty when the chunk has no numbered
+        layer modules, which makes the rebase a no-op.
+    """
+    # Imported here, not at module scope: ``megatron.core.resharding.__init__`` pulls in
+    # ``refit`` -> the model stack -> ``optimizer.distrib_optimizer``, which imports this
+    # module, so a top-level import is circular.
+    from megatron.core.resharding.utils import _build_layer_module_prefix_map
+
+    return {
+        _strip_wrapper_prefixes(local): _strip_wrapper_prefixes(global_path)
+        for local, global_path in _build_layer_module_prefix_map(model_chunk).items()
+    }
+
+
+def rename_layer_indices_to_global(model_chunk, model_state_dict):
+    """Rebase every layer key of one chunk onto its global layer index.
+
+    Runs on the chunk's state dict after the per-chunk handlers, because those handlers match
+    keys against live module paths and therefore need the local indices the module tree has.
+
+    State-dict keys carry the DDP/FSDP ``module.`` level that the live module paths only have
+    when the chunk is wrapped (Megatron-FSDP v1 owns the bare model as ``module``; v2 shards
+    the bare model in place), so both the key and the mapping's paths are normalised with
+    ``_strip_wrapper_prefixes`` before matching, and the key's own wrapper is put back
+    afterwards. Rebasing ``i -> <layer_number - 1>`` is injective, so this cannot merge two
+    keys of one chunk.
+    """
+    local_to_global = get_local_to_global_layer_prefixes(model_chunk)
+    if not local_to_global:
+        return model_state_dict
+
+    # Lazy for the same circular-import reason as ``get_local_to_global_layer_prefixes``.
+    from megatron.core.resharding.utils import _resolve_global_layer_number_in_name
+
+    renamed = {}
+    for key, value in model_state_dict.items():
+        normalized = _strip_wrapper_prefixes(key)
+        wrapper = key[: len(key) - len(normalized)]
+        global_key = _resolve_global_layer_number_in_name(normalized, local_to_global)
+        renamed[f'{wrapper}{global_key}'] = value
+    return renamed
+
+
+# The section keys themselves, without the trailing dot: "model", "model0", "model1", ...
+_MODEL_SECTION_KEY_PATTERN = re.compile(r'^model\d*$')
+
+
+def is_model_section_key(key):
+    """Whether ``key`` names a top-level model-weight section.
+
+    ``generate_state_dict`` builds ``model`` for a single model chunk and ``model0``,
+    ``model1``, ... (one per chunk, in chunk order) under virtual pipeline parallelism.
+    Those sectioned keys are an intermediate representation: ``preprocess`` flattens them
+    into one ``model`` section before anything is written to or read from disk.
+    """
+    return bool(_MODEL_SECTION_KEY_PATTERN.match(key))
+
+
+def get_model_sections(state_dict, model_chunks):
+    """Pair every top-level model-weight section with the model chunk that owns it.
+
+    ``generate_state_dict`` sections the model per chunk -- ``model`` for a single chunk
+    and ``model0``, ``model1``, ... for virtual pipeline parallelism -- in the same order
+    as the model chunk list, so section ``model{i}`` belongs to ``model_chunks[i]`` and a
+    lone ``model`` belongs to ``model_chunks[0]``.
+
+    This reads the sectioned state dict ``generate_state_dict`` produces, not the flattened
+    one that ``preprocess_fsdp_dtensor_state_dict`` turns it into, so the per-chunk handlers
+    can each be handed the chunk they resolve keys against.
+
+    Args:
+        state_dict: state dict whose top-level keys may include model sections.
+        model_chunks: this rank's model chunks, in ``generate_state_dict`` order.
+
+    Returns:
+        List[Tuple[str, torch.nn.Module]]: ``(section_key, chunk)`` pairs, in chunk order.
+    """
+    if 'model' in state_dict:
+        # Single-chunk checkpoints keep the historical ``model`` key.
+        return [('model', model_chunks[0])]
+
+    sections = []
+    for key in sorted(
+        (key for key in state_dict if is_model_section_key(key)),
+        key=lambda key: int(key[len('model') :]),
+    ):
+        index = int(key[len('model') :])
+        if index >= len(model_chunks):
+            raise ValueError(
+                f"Model section {key!r} has no matching model chunk: only "
+                f"{len(model_chunks)} model chunk(s) are present. The state dict sections "
+                f"and the model chunk list must be in the same order."
+            )
+        sections.append((key, model_chunks[index]))
+    return sections
+
+
+def _optimizer_key_resolves_on_chunk(model_chunk, key, num_experts=None):
+    """Whether an optimizer state key names a parameter of ``model_chunk``.
+
+    Tries the same normalized forms the optimizer-aware handlers use: the key as-is
+    (``_get_model_parameter`` also retries it with its ``module.`` wrapper prefix) and,
+    for expert parameters, the expert-localized form, whose global expert index differs
+    from the live per-rank module path.
+    """
+    normalized = _strip_wrapper_prefixes(key)
+    candidates = [key, normalized]
+    if get_expert_index_from_key(normalized) is not None:
+        candidates.append(expert_param_local_key(normalized, num_experts))
+    for candidate in candidates:
+        try:
+            _get_model_parameter(model_chunk, candidate)
+            return True
+        except AttributeError:
+            continue
+    return False
+
+
+def partition_optimizer_state_dict_by_model_chunk(
+    optimizer_state_dict, model_chunks, num_experts=None
+):
+    """Split the single, unsectioned optimizer state across the model chunks.
+
+    ``generate_state_dict`` sections only the *model* (``model0``, ``model1``, ...); the
+    optimizer stays one top-level ``optimizer`` entry whose ``state`` is keyed by
+    globally-unique parameter names (``DistributedOptimizer._param_name``). A handler run
+    for one chunk would therefore be handed optimizer entries that only resolve on
+    another chunk, so resolve each ``state`` key against each chunk and return only the
+    entries that chunk owns. Entries that resolve on no chunk are returned separately so
+    the caller can copy them through unchanged instead of silently dropping them.
+
+    Args:
+        optimizer_state_dict: the single optimizer section (``state`` plus non-state
+            entries such as ``param_to_group_meta``), or ``None`` when absent.
+        model_chunks: this rank's model chunks, in model-section order.
+        num_experts: total expert count, used to localize expert parameter names.
+
+    Returns:
+        Tuple[List[Optional[dict]], dict]: ``(slices, unowned_state)``. ``slices[i]`` is
+        ``optimizer_state_dict`` restricted to the ``state`` entries owned by
+        ``model_chunks[i]`` (``None`` when there is no optimizer state dict), and
+        ``unowned_state`` holds the entries owned by no chunk.
+    """
+    if optimizer_state_dict is None:
+        return [None] * len(model_chunks), {}
+
+    slices = [{**optimizer_state_dict, 'state': {}} for _ in model_chunks]
+    unowned_state = {}
+    for key, value in (optimizer_state_dict.get('state') or {}).items():
+        for index, model_chunk in enumerate(model_chunks):
+            if _optimizer_key_resolves_on_chunk(model_chunk, key, num_experts):
+                slices[index]['state'][key] = value
+                break
+        else:
+            unowned_state[key] = value
+    return slices, unowned_state
 
 
 def get_unexpected_model_keys(state_dict_metadata, load_state_dict):

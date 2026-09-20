@@ -264,11 +264,71 @@ torch_save_to_dcp(TORCH_SAVE_CHECKPOINT_PATH, f"{CHECKPOINT_DIR}_new")
 ```
 Torch Save checkpoints can then be converted into HuggingFace SafeTensors or other checkpoint formats for distribution.
 
-> ℹ️ Megatron-FSDP checkpoints have a `module.` prefix pre-pended to all model parameter names in the state dictionary, and converting a Torch Save checkpoint to a Megatron-FSDP Torch DCP checkpoint requires testing. Work-in-progress!
+> ℹ️ Megatron-FSDP `fsdp_dtensor` checkpoints pre-pend a `module.` prefix to all model parameter names in the state dictionary, so converted model weights are stored as `model.module.<param>`. This namespace is no longer an untested work-in-progress for the `torch_dist` → `fsdp_dtensor` route: the converter emits it and the Megatron-FSDP v2 loader matches it, verified end-to-end (see [Loading a Converted Checkpoint](#loading-a-converted-checkpoint)). On 8×H100 (EOS, `lr=0`, same mock batch), Megatron-FSDP v2 loading the converted checkpoint reproduced the source `torch_dist` run's iteration-5 `lm loss` exactly (`1.150956E+01`), versus `1.196782E+01` before the compute-weight sync and `1.196736E+01` for a random-init no-load control. The reverse direction (Torch Save → Megatron-FSDP DCP) is not covered by that verification.
 
 #### Converting N-D Parallel (`torch_dist`) to Megatron-FSDP (`fsdp_dtensor`) Checkpoints
 
-As a pre-requisite for checkpoint conversion, dump the parameter group mapping when training with 3D-parallel (DDP, TP, PP) and/or EP:
+The converter builds a CUDA `DeviceMesh` and initializes NCCL, so it must run inside a GPU allocation, one process per GPU (launched below with `torchrun --nproc_per_node=8`). It must not be run on CPU.
+
+#### Model Weights Only (Recommended for Megatron-FSDP v2)
+
+Megatron-FSDP v2 **cannot checkpoint its optimizer state**: `FullyShardedOptimizer.state_dict`, `load_state_dict`, and `sharded_state_dict` all raise `NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")` (`megatron/core/optimizer/fully_sharded_optimizer.py`). Two consequences follow:
+
+- a Megatron-FSDP v2 run cannot save a checkpoint at all unless `--no-save-optim` is passed, because `generate_state_dict` calls `optimizer.sharded_state_dict(...)` for `--ckpt-format fsdp_dtensor`; and
+- converting the optimizer section of an existing `torch_dist` checkpoint serves no purpose, because a v2 run cannot load it.
+
+Pass `--model-weights-only` to emit only `model.*` weights plus the non-optimizer common state (`args`, `iteration`, `checkpoint_version`):
+
+```bash
+torchrun --nproc_per_node=8 --nnodes=1 \
+    tools/checkpoint/checkpoint_inspector.py \
+    convert-torch-dist-to-fsdp-dtensor --model-weights-only --loadable-layout \
+    /path/to/input_torch_dist_checkpoint/ \
+    /path/to/output_fsdp_dtensor_checkpoint/
+```
+
+- `--model-weights-only` drops every `optimizer.*` entry and never materializes optimizer tensors, so the often much larger optimizer state does not have to fit in GPU memory. It matches `optimizer` as a **dotted path component**, so distributed-optimizer keys such as `chained_<i>.optimizer.*` are dropped too instead of leaking out as model weights. The output contains no optimizer state of any kind.
+- `--loadable-layout` writes the result as `<output_dir>/iter_<iteration>/` plus `<output_dir>/latest_checkpointed_iteration.txt` — the directory shape `--load` requires.
+- `--swiglu` **is required when the model configuration has `swiglu: true`** (for example `deepseek_v3_proxy`) and must be added to the command above. The loader calls `handle_swiglu_in_state_dict` only under `if args.swiglu:` and therefore requests split `linear_fc1_w` / `linear_fc1_v` keys; without `--swiglu`, the converted checkpoint keeps a single `linear_fc1` key and those weights do not load. It is not auto-detected. Use `--swiglu-modules` instead if only some modules use SwiGLU.
+- `--dump-param-to-param-group-map` is **not** needed for weights-only output. The param-group map only reconstructs `optimizer.param_groups` metadata, which `--model-weights-only` omits entirely, so there is nothing to pass with `--param-to-param-group-map-json`.
+
+> ℹ️ **The key layout is pipeline-layout independent.** An `fsdp_dtensor` model section is one flat `model.module.<param>` namespace whose layer indices are **global** (`model.module.decoder.layers.<global>`), not the per-rank `ModuleList` index that `state_dict_for_save_checkpoint` produces. Both the save and the load path rebase through `rename_layer_indices_to_global`, and the per-chunk `model<i>.` sections `generate_state_dict` builds under virtual pipeline parallelism are flattened into that single section, so a checkpoint written under one pipeline layout loads under another. The global index is `layer.layer_number - 1`, the same index `TransformerBlock` / `MultiTokenPredictionBlock` / `HybridStack` publish through `sharded_state_dict`.
+>
+> The converter copies whatever layer indices its `torch_dist` source has. A source that built `non_homogeneous_layers=False` keeps **local** layer indices in its keys, because it records the pipeline offset in `sharded_offsets` rather than in the key, so converting such a checkpoint from a `PP>1` source does not yet yield global indices. Check that the emitted `decoder.layers.{...}` indices span `0..num_layers-1` before relying on such a conversion.
+
+> ⚠️ **Flat-directory trap.** Without `--loadable-layout`, the converter writes the raw DCP files straight into `<output_dir>`. That is a valid raw DCP checkpoint but **not** a Megatron checkpoint directory: `--load <flat dir>` cannot find `latest_checkpointed_iteration.txt`, so it prints only a warning and **silently starts from random weights** while still reporting success. Always pass `--loadable-layout`, and confirm the output contains an `iter_<7-digit iteration>/` subdirectory and a `latest_checkpointed_iteration.txt` before trusting a load.
+
+#### Loading a Converted Checkpoint
+
+Load the weights-only checkpoint into a Megatron-FSDP v2 run with:
+
+```bash
+torchrun --nproc_per_node=8 --nnodes=1 pretrain_gpt.py \
+    <training config> \
+    --use-megatron-fsdp \
+    --megatron-fsdp-version 2 \
+    --ckpt-format fsdp_dtensor \
+    --load /path/to/output_fsdp_dtensor_checkpoint/ \
+    --no-load-optim \
+    --no-save-optim \
+    --no-load-rng \
+    --data-parallel-sharding-strategy optim_grads_params \
+    --outer-dp-sharding-strategy no_shard \
+    --no-gradient-accumulation-fusion \
+    --no-align-grad-reduce
+```
+
+- `--no-load-optim` keeps the loader from requesting the `optimizer.*` entries a weights-only checkpoint does not contain. `--no-save-optim` does **not** affect loading; `--no-load-optim` (or `--finetune`) is the flag that matters.
+- `--no-save-optim` is required for the v2 run to be able to save a checkpoint at all (`FullyShardedOptimizer.sharded_state_dict` raises `NotImplementedError`).
+- `--no-load-rng` is required because the converter drops `rng_state*` from the output.
+- `--use-distributed-optimizer` must be **absent**: it is mutually exclusive with `--megatron-fsdp-version 2`.
+- `--train-iters` must be greater than the loaded iteration, otherwise no training steps run (silently).
+
+> ℹ️ If the converted output is missing `args` / `iteration` / `checkpoint_version` or any model weight, loading may additionally require `--no-strict-fsdp-dtensor-load` and `--dist-ckpt-strictness ignore_all`.
+
+#### Converting Model and Optimizer State
+
+To convert the optimizer state as well, dump the parameter group mapping when training with 3D-parallel (DDP, TP, PP) and/or EP:
 
 ```bash
 --dump-param-to-param-group-map /path/to/param_to_param_group_map
@@ -282,7 +342,7 @@ python tools/checkpoint/checkpoint_inspector.py print-torch-dcp-in-json /path/to
 
 > ℹ️ If you already have a `torch_dist` checkpoint, simply specify the `--dump-param-to-param-group-map /path/to/param_to_param_group_map` flag and run a trivial training or checkpointing experiment to create the `param_to_param_group_map` you need without full pretraining.
 
-Finally, convert your `torch_dist` checkpoint to the `fsdp_dtensor` format using the `param_to_param_group_map.json`:
+Then convert your `torch_dist` checkpoint to the `fsdp_dtensor` format using the `param_to_param_group_map.json`:
 
 ```bash
 torchrun --nproc_per_node=8 --nnodes=1 \
@@ -293,6 +353,8 @@ torchrun --nproc_per_node=8 --nnodes=1 \
     --param-to-param-group-map-json /path/to/param_to_param_group_map.json
 ```
 
+> ⚠️ This optimizer-inclusive path is **not** usable with Megatron-FSDP v2, whose optimizer checkpointing raises `NotImplementedError`; use the weights-only route above. The upstream work that would add v2 optimizer DCP checkpointing (NVIDIA/Megatron-LM #6215, stacked on #6024) refuses expert parallelism and was **not tested** here, so do not assume that path works.
+
 > ℹ️ For multi-node conversion tasks, please refer to the DeepSeek-V3 example script (`sbatch_checkpoint_convert.sh`) in [Megatron-LM/examples/megatron_fsdp](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/megatron_fsdp).
 
 ## Megatron-FSDP Feature Guide & API
@@ -300,7 +362,8 @@ torchrun --nproc_per_node=8 --nnodes=1 \
 | Optimization | Description | `Megatron-Core` Config | `fully_shard` Config |
 |--------------|-------------|----------------------|----------------------|
 | **Megatron-FSDP** | Use Megatron-FSDP in Megatron-LM. |  `--use-megatron-fsdp` | `fully_shard_model(module)` |
-| **Megatron-FSDP Checkpointing** | Save and load un-even DTensor checkpoints using [Torch Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). | `--ckpt-format fsdp_dtensor` | `preproc_state_dict_for_dcp_ckpt=True` |
+| **Megatron-FSDP Checkpointing** | Save and load un-even DTensor checkpoints using [Torch Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). Megatron-FSDP v2 cannot save or load optimizer state, so a v2 run must pass `--no-save-optim` and load weights-only checkpoints with `--no-load-optim`. | `--ckpt-format fsdp_dtensor` | `preproc_state_dict_for_dcp_ckpt=True` |
+| **`torch_dist` → `fsdp_dtensor` Conversion** | Convert an N-D-parallel `torch_dist` checkpoint to a Megatron-FSDP `fsdp_dtensor` checkpoint. Use `--model-weights-only --loadable-layout` to produce a checkpoint Megatron-FSDP v2 can load. | `python tools/checkpoint/checkpoint_inspector.py convert-torch-dist-to-fsdp-dtensor` | N/A |
 | **Meta Device Initialization** | Megatron-FSDP initializes a meta-initialized model to the CUDA device in shards to avoid OOM on large models. Requires implementation of `Module.reset_parameters()` for per-Module sharded initialization. | `--init-model-with-meta-device` | `init_model_with_meta_device=True` |
 | **Distributed Optimizer** | Megatron-FSDP uses Megatron-Core's `DistributedOptimizer`. Automatically set when using Megatron-FSDP. | `--use-distributed-optimizer` | `fully_shard_optimizer(optimizer)` |
 

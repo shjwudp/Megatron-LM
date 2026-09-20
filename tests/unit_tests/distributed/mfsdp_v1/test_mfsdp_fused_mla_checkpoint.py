@@ -304,7 +304,9 @@ def preprocess(sharded, state_dict):
     from megatron.training.checkpointing import preprocess_fsdp_dtensor_state_dict
 
     args = SimpleNamespace(swiglu=False, num_experts=None)
-    return preprocess_fsdp_dtensor_state_dict(args, state_dict, sharded)
+    # The real save/load call sites pass the model *chunk list*: preprocess pairs each
+    # top-level model section (`model`, or `model0`/`model1`/... under VPP) with its chunk.
+    return preprocess_fsdp_dtensor_state_dict(args, state_dict, [sharded])
 
 
 def save_checkpoint(sharded, path):
