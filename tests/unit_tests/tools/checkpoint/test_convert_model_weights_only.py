@@ -692,34 +692,6 @@ def run_case(
     dist.barrier()
 
 
-def _build_vpp_source_model_state_dict(num_layers, hidden_size, vocab_size, dtype):
-    """Split a GPT state dict into the two VPP model sections the converter must preserve.
-
-    Chunk 0 owns the embedding plus the first half of the layers; chunk 1 owns the second
-    half plus the final norm and the output layer. The keys carry the ``model0.`` /
-    ``model1.`` section prefix the VPP source layout uses; the bare keys are otherwise
-    identical to the single-section fixture.
-
-    Returns ``(sections, chunk0, chunk1)`` where ``sections`` is what gets written to the
-    source checkpoint and ``chunk*`` are the per-chunk bare dicts to verify against.
-    """
-    full = _build_model_state_dict(num_layers, hidden_size, vocab_size, dtype)
-    half = num_layers // 2
-    chunk0, chunk1 = OrderedDict(), OrderedDict()
-    for key, tensor in full.items():
-        match = re.search(r'decoder\.layers\.(\d+)\.', key)
-        first_chunk = key == 'embedding.word_embeddings.weight' or (
-            match is not None and int(match.group(1)) < half
-        )
-        (chunk0 if first_chunk else chunk1)[key] = tensor
-
-    sections = OrderedDict()
-    for prefix, chunk in (('model0.', chunk0), ('model1.', chunk1)):
-        for key, tensor in chunk.items():
-            sections[f'{prefix}{key}'] = tensor
-    return sections, chunk0, chunk1
-
-
 # ---------------------------------------------------------------------------
 # pytest entry points
 # ---------------------------------------------------------------------------
@@ -772,74 +744,6 @@ def test_is_optimizer_key_matches_dotted_components(key, expected):
     assert is_optimizer_key(key) is expected
 
 
-# ---------------------------------------------------------------------------
-# VPP model-section key layout (pure; needs neither CUDA nor a process group)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    'source_key, expected',
-    [
-        # Single-section source: the historical `<prefix>.<param>` layout, unchanged.
-        (
-            'decoder.layers.0.mlp.linear_fc1.weight',
-            'model.module.decoder.layers.0.mlp.linear_fc1.weight',
-        ),
-        # VPP source: the section index must lead the output key.
-        (
-            'model0.decoder.layers.0.mlp.linear_fc1.weight',
-            'model0.module.decoder.layers.0.mlp.linear_fc1.weight',
-        ),
-        (
-            'model1.decoder.layers.4.mlp.linear_fc1.weight',
-            'model1.module.decoder.layers.4.mlp.linear_fc1.weight',
-        ),
-        (
-            'model0.embedding.word_embeddings.weight',
-            'model0.module.embedding.word_embeddings.weight',
-        ),
-        # A padded section index is normalized.
-        ('model007.x', 'model7.module.x'),
-        # `model` as a substring / without a numeric section is not a section.
-        ('module0.weight', 'model.module.module0.weight'),
-        ('model.0.weight', 'model.module.model.0.weight'),
-    ],
-)
-def test_model_weight_output_key(source_key, expected):
-    """The converter must preserve a VPP section index.
-
-    The bug emitted ``model.module.model{i}.<param>`` for a ``model{i}.<param>``
-    source, which matches nothing the ``fsdp_dtensor`` loader requests. This pure
-    check needs no GPU, so the key layout is covered even where the end-to-end
-    conversion cannot run.
-    """
-    from model_weight_keys import model_weight_output_key
-
-    assert model_weight_output_key(source_key) == expected
-
-
-@pytest.mark.parametrize(
-    'prefix, expected',
-    [
-        ('model.module', 'model0.module'),
-        ('model.foo.bar', 'model0.foo.bar'),
-        ('model', 'model0'),
-        ('wrapped', 'model0.wrapped'),
-        ('wrapped.module', 'model0.wrapped.module'),
-    ],
-)
-def test_sectioned_model_weight_prefix_honours_a_custom_prefix(prefix, expected):
-    """``--output-model-weight-prefix`` still selects the wrapper namespace for VPP.
-
-    The section replaces the prefix's leading ``model`` component (the loader
-    always wants the section first); a prefix without one is appended after the
-    section.
-    """
-    from model_weight_keys import sectioned_model_weight_prefix
-
-    assert sectioned_model_weight_prefix('model0', prefix) == expected
-
-
 @pytest.mark.usefixtures('_require_cuda_nccl')
 @pytest.mark.parametrize('common_state_format', _COMMON_STATE_FORMATS)
 def test_model_weights_only_drops_all_optimizer_state(common_state_format):
@@ -862,65 +766,6 @@ def test_default_conversion_keeps_optimizer_state(common_state_format):
         _shared_root(),
         common_state_format=common_state_format,
     )
-
-
-@pytest.mark.usefixtures('_require_cuda_nccl')
-def test_vpp_source_keeps_the_section_index():
-    """A VPP source (``model0.``/``model1.``) converts to ``model{i}.module.<param>``.
-
-    This is the end-to-end guard for the key-layout fix: the unconditional
-    single-section prefix used to produce ``model.module.model{i}.<param>``, which
-    matches nothing the VPP ``fsdp_dtensor`` loader requests. Requires CUDA/NCCL
-    because ``convert_checkpoint`` builds a CUDA ``DeviceMesh``.
-    """
-    from checkpoint_inspector import convert_checkpoint
-
-    rank = dist.get_rank()
-    case_dir = os.path.join(_shared_root(), 'vpp_sections')
-    src_dir = os.path.join(case_dir, 'torch_dist_src', 'iter_0000100')
-    dst_dir = os.path.join(case_dir, 'fsdp_dtensor_dst')
-    if rank == 0 and os.path.isdir(case_dir):
-        shutil.rmtree(case_dir, ignore_errors=True)
-    dist.barrier()
-    os.makedirs(os.path.dirname(src_dir), exist_ok=True)
-    dist.barrier()
-
-    num_layers, hidden_size, vocab_size = 4, 32, 64
-    sections, chunk0, chunk1 = _build_vpp_source_model_state_dict(
-        num_layers, hidden_size, vocab_size, torch.float32
-    )
-    _save_source_checkpoint(
-        sections,
-        _build_common_state(num_layers, hidden_size, vocab_size),
-        src_dir,
-        common_state_format='current',
-        model_prefix='',
-    )
-    dist.barrier()
-
-    convert_checkpoint(
-        src_dir,
-        dst_dir,
-        False,
-        process_group=dist.group.WORLD,
-        model_weights_only=True,
-    )
-    dist.barrier()
-
-    dst_keys = _metadata_keys(dst_dir)
-    assert 'model0.module.embedding.word_embeddings.weight' in dst_keys
-    assert 'model1.module.output_layer.weight' in dst_keys
-    nested = [key for key in dst_keys if key.startswith('model.module.model')]
-    assert not nested, sorted(dst_keys)[:5]
-
-    loaded = _load_full_tensors(dst_dir)
-    for section, chunk in (('model0', chunk0), ('model1', chunk1)):
-        for param, tensor in chunk.items():
-            key = f'{section}.module.{param}'
-            assert key in loaded, f"[vpp_sections] missing {key}"
-            assert torch.equal(loaded[key].to(tensor.dtype), tensor), key
-
-    _log(rank, f"[vpp_sections] PASS: {len(dst_keys)} output keys keep the section index")
 
 
 # ---------------------------------------------------------------------------

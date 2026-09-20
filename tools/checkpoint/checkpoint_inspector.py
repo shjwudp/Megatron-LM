@@ -22,7 +22,6 @@ import click
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from model_weight_keys import model_weight_output_key, split_model_section
 from torch.distributed.checkpoint import (
     DefaultLoadPlanner,
     DefaultSavePlanner,
@@ -458,16 +457,6 @@ def convert_checkpoint(
     is dropped as before, so loading may also need '--no-load-rng'.
 
     \b
-    Virtual pipeline parallelism (VPP)
-    ==================================
-    A VPP 'torch_dist' source sections the model per chunk: its keys are
-    'model0.<param>', 'model1.<param>', ... (the fsdp_dtensor loader requests
-    'model0.module.<param>', ...). Such a key keeps its section index, which
-    replaces the leading 'model' component of 'model_weight_prefix' -- see
-    'model_weight_keys.model_weight_output_key'. Single-section sources are
-    unchanged.
-
-    \b
     Examples
     ========
     Qwen3.5-VL (SWiGLU in language_model only, has GDN + MTP):
@@ -709,12 +698,8 @@ def convert_checkpoint(
                 new_key = f"{optimizer_state_prefix}.{'.'.join(key_list[3:])}.{key_list[2]}"
                 is_param = False
             else:
-                # Special handling for module parameters. A virtual-pipeline-parallelism
-                # source carries a `model{i}.` section prefix, which must lead the output
-                # key (`model{i}.module.<param>`) because that is the section the
-                # fsdp_dtensor loader requests. Single-section sources keep the plain
-                # `<model_weight_prefix>.<param>` layout.
-                new_key = model_weight_output_key(key, model_weight_prefix)
+                # Special handling for module parameters
+                new_key = f"{model_weight_prefix}.{key}"
                 is_param = True
 
             # Handle dist-opt flatten tensors
@@ -911,14 +896,7 @@ def convert_checkpoint(
         and ckpt_param_groups is not None
     ):
         for name in list(fsdp_dtensor_state_dict.keys()):
-            # A VPP output key is 'model{i}.module.<param>' while `model_weight_prefix` is
-            # the unsectioned 'model.module'; strip the section before matching so both
-            # layouts are covered instead of silently skipping the whole model.
-            _section, name_without_section = split_model_section(name)
-            if (
-                not name_without_section.startswith(model_weight_prefix)
-                or name_without_section.endswith(".expert_bias")
-            ):
+            if not name.startswith(model_weight_prefix) or name.endswith(".expert_bias"):
                 continue
 
             assert name in param_to_param_group_map, f"Missing param group for {name}"
@@ -927,7 +905,7 @@ def convert_checkpoint(
             # `name` is `<model_weight_prefix>.<param>`, so strip the prefix
             # *including* its leading dot: otherwise the f-string below adds a
             # second separator and produces a double-dot key.
-            name_without_prefix = name_without_section[len(model_weight_prefix):].lstrip(".")
+            name_without_prefix = name[len(model_weight_prefix):].lstrip(".")
             fsdp_dtensor_state_dict[
                 f"{optimizer_param_to_group_prefix}.{name_without_prefix}"
             ] = ckpt_param_groups[param_group_id]
@@ -974,11 +952,7 @@ def convert_checkpoint(
 @click.option(
     "--output-model-weight-prefix",
     default="model.module",
-    help="Prefix for model weight keys in the checkpoint. For a single-section source "
-         "the output key is '<prefix>.<param>'. A virtual-pipeline-parallelism source "
-         "key 'model{i}.<param>' keeps its section index, which replaces the prefix's "
-         "leading 'model' component, so the default 'model.module' yields "
-         "'model{i}.module.<param>' -- the section the fsdp_dtensor loader requests.",
+    help="Prefix for model weight keys in the checkpoint.",
 )
 @click.option(
     "--param-to-param-group-map-json",
