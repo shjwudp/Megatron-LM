@@ -115,17 +115,35 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
         getattr(getattr(model, 'embedding', None), 'word_embeddings', None), 'weight', None
     )
     output_weight = getattr(getattr(model, 'output_layer', None), 'weight', None)
-    # The output projection and each MTP layer's own weights are contributed to
-    # twice on the interleaved schedule: the nodes that consume them run as their own
-    # GraphTasks there, while the PP=1 no-pipelining schedule keeps them inside an
-    # existing GraphTask. The extra consumer must therefore not be declared at PP=1.
-    # When the output projection runs against the embedding weight, that weight is in
-    # this set as well and picks the extra consumer up on top of the embedding's own
-    # terms; ``_unit_grad_multiplicity`` applies both.
+    # The weights below are contributed to twice per window on the interleaved
+    # schedule: the nodes that consume them run as their own GraphTasks there, while
+    # the PP=1 no-pipelining schedule keeps them inside an existing GraphTask, so the
+    # extra consumer must not be declared at PP=1. They are the modules on the path
+    # from the last decoder layer to the loss -- the decoder's final layernorm, the
+    # output projection, and the MTP layer's own weights -- because that path is
+    # scheduled as ``post_process``/``mtp_post_process`` nodes, each of which consumes
+    # its module once per window. The decoder's final layernorm is easy to miss: it is
+    # an ordinary decoder parameter, but with MTP it feeds both the main loss path and
+    # the MTP head, so it is consumed twice like the projection is. Declaring it once
+    # was measured to be one short -- PP2/VPP2 with MTP over-fired on it ``2 > 1``
+    # (job 19052914) and completes once it is declared twice (job 19055665). When the
+    # output projection runs against the embedding weight, that weight is in this set
+    # as well and picks the extra consumer up on top of the embedding's own terms;
+    # ``_unit_grad_multiplicity`` applies both.
     mtp_post_weights = ()
     if mtp_depth and interleaved:
         mtp_post_weights = tuple(
-            weight for weight in (output_weight, *_mtp_layer_weights(model)) if weight is not None
+            weight
+            for weight in (
+                output_weight,
+                *_mtp_layer_weights(model),
+                getattr(
+                    getattr(getattr(model, 'decoder', None), 'final_layernorm', None),
+                    'weight',
+                    None,
+                ),
+            )
+            if weight is not None
         )
     for submodule in module.modules():
         if not isinstance(submodule, FsdpModule):
