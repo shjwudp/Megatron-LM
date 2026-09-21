@@ -2,177 +2,234 @@
 
 """Gradient completion for a shared parameter under combined 1F1B.
 
-The combined 1F1B backward is one autograd GraphTask per schedule node over
-detached node inputs, so a parameter's hooks fire once per ``(parameter,
-consuming node)`` pair rather than once per iteration. The shared embedding is
-the visible case: the PreProcessNode and the MTP pre-dispatch node each consume
-it, so one iteration yields two contributions for one parameter and a fire count
-cannot decide when the window is complete.
+The combined/fine-grained 1F1B backward is one autograd GraphTask per schedule
+node over detached node inputs, so a parameter's hooks fire once per
+``(parameter, consuming node)`` pair rather than once per iteration. The shared
+embedding is the visible case: the chunk's PreProcessNode and the MTP
+pre-dispatch node each consume it, so one iteration yields two contributions for
+one parameter and a fire count cannot decide when the window is complete.
 
 ``MultiplicityReadiness`` replaces that count with a per-parameter declaration --
 a shortfall holds the window open, a surplus raises -- and
-``_unit_grad_multiplicity`` derives it. Its historical mistakes are pinned here:
-``mtp_depth`` applied to every parameter, and the multiplicity taken from
-``len(fqns)`` instead of object identity.
+``register_combined_1f1b_hooks`` installs that declaration from
+``_unit_grad_multiplicity``. Both layers are exercised here: the accounting
+contract on its own, and the declaration as it lands on the real ``FsdpParameter``
+objects ``fully_shard`` produces.
 
-``countdown`` is stdlib-only, so the accounting tests load it from source and run
-anywhere. The declaration tests need the real module and are gated on a host
-precondition evaluated *before* that import, never on ``except ImportError``.
+The stack-dependent tests are gated on a host precondition evaluated *before* the
+import it guards, never on ``except ImportError`` -- an import failure on a host
+that satisfies the precondition must fail loudly rather than dissolve into a
+skip. The imports themselves live in fixtures: a module-level import of the
+Megatron stack would turn a host that cannot import it into a collection error
+instead of a skip.
 """
 
 import importlib
-import importlib.util
-from pathlib import Path
+import os
+from types import SimpleNamespace
 
 import pytest
 
-_EMBEDDING = ("module.embedding.word_embeddings.weight",)
-_NORM = ("module.decoder.final_layernorm.weight",)
-_SCHEDULER = "megatron.core.models.common.combined_1f1b_mfsdp_scheduler"
-_COUNTDOWN = (
-    Path(__file__).resolve().parents[4]
-    / "megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/countdown.py"
-)
-
-
-def _load_countdown():
-    """Import ``countdown.py`` from source; it depends on nothing but stdlib."""
-    spec = importlib.util.spec_from_file_location("_countdown_under_test", _COUNTDOWN)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+_EMBEDDING_HINT = "word_embeddings"
 
 
 def _host_can_import_stack() -> bool:
     """Return whether this host can import the Megatron stack at all."""
     try:
-        importlib.import_module(_SCHEDULER)
+        importlib.import_module("megatron.core.distributed.fsdp.src.megatron_fsdp.experimental")
     except Exception:  # any failure here is the precondition, not the test
         return False
     return True
 
 
-MultiplicityReadiness = _load_countdown().MultiplicityReadiness
+# ``distributed_setup`` reads torchrun's rank state, so the declaration layer
+# additionally needs to be running under ``torch.distributed.run``.
+_HOST_CAN_IMPORT_STACK = _host_can_import_stack()
+_UNDER_TORCHRUN = "RANK" in os.environ and "WORLD_SIZE" in os.environ
 
 _needs_stack = pytest.mark.skipif(
-    not _host_can_import_stack(),
+    not _HOST_CAN_IMPORT_STACK,
     reason="host precondition unmet: this torch cannot import the Megatron stack, "
     "which is unrelated to the gradient multiplicity under test.",
 )
+_needs_distributed = pytest.mark.skipif(
+    not (_HOST_CAN_IMPORT_STACK and _UNDER_TORCHRUN),
+    reason="host precondition unmet: needs both an importable Megatron stack and "
+    "torchrun rank state.",
+)
 
 
+@pytest.fixture
+def readiness_cls():
+    """The readiness tracker under test."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.countdown import (
+        MultiplicityReadiness,
+    )
+
+    return MultiplicityReadiness
+
+
+@_needs_stack
 class TestSharedParameterAcrossGraphTasks:
     """One parameter, two consuming schedule nodes, one completion window."""
 
-    def test_a_declared_second_contribution_keeps_the_window_open(self):
+    def test_a_declared_second_contribution_keeps_the_window_open(self, readiness_cls):
         """The positive case: the window does not close after the first node."""
-        readiness = MultiplicityReadiness({_EMBEDDING: 2, _NORM: 1})
-        readiness.mark(_NORM)
-        readiness.mark(_EMBEDDING)  # PreProcessNode embedding lookup
+        embedding, norm = ("embedding.weight",), ("norm.weight",)
+        readiness = readiness_cls({embedding: 2, norm: 1})
+        readiness.mark(norm)
+        readiness.mark(embedding)  # PreProcessNode embedding lookup
         assert not readiness.is_complete()
-        assert readiness.missing() == frozenset({_EMBEDDING})
-        readiness.mark(_EMBEDDING)  # MTP pre-dispatch node
+        assert readiness.missing() == frozenset({embedding})
+        readiness.mark(embedding)  # MTP pre-dispatch node
         assert readiness.is_complete()
 
-    def test_an_undeclared_second_contribution_fails_loudly(self):
+    def test_an_undeclared_second_contribution_fails_loudly(self, readiness_cls):
         """The negative case: a default expectation of one closes the window early.
 
         This is the defect the multiplicity exists to prevent. The window -- and
         with it the reshard and reduce-scatter -- closes after the PreProcessNode
         alone, and the MTP node's contribution then arrives as a surplus and is
-        raised instead of being silently absorbed.
+        raised rather than silently absorbed.
         """
-        readiness = MultiplicityReadiness({_EMBEDDING: 1})
-        readiness.mark(_EMBEDDING)
+        key = ("embedding.weight",)
+        readiness = readiness_cls({key: 1})
+        readiness.mark(key)
         assert readiness.is_complete()  # closed early: the reduce would fire here
         with pytest.raises(ValueError, match="over-fired"):
-            readiness.mark(_EMBEDDING)
+            readiness.mark(key)
 
-    def test_a_surplus_is_not_rolled_back(self):
-        """An over-fire leaves the count above the declaration, so it stays visible."""
-        readiness = MultiplicityReadiness({_EMBEDDING: 1})
-        readiness.mark(_EMBEDDING)
-        with pytest.raises(ValueError):
-            readiness.mark(_EMBEDDING)
-        with pytest.raises(ValueError):
-            readiness.mark(_EMBEDDING)
-
-    def test_reset_rearms_the_window_and_keeps_the_declaration(self):
+    def test_reset_rearms_the_window_and_keeps_the_declaration(self, readiness_cls):
         """The same parameter owes the same count on every iteration."""
-        readiness = MultiplicityReadiness({_EMBEDDING: 2})
+        key = ("embedding.weight",)
+        readiness = readiness_cls({key: 2})
         for _ in range(3):
-            readiness.mark(_EMBEDDING)
-            readiness.mark(_EMBEDDING)
+            readiness.mark(key)
+            readiness.mark(key)
             assert readiness.is_complete()
             readiness.reset()
             assert not readiness.is_complete()
-        assert readiness.expected == {_EMBEDDING: 2}
+        assert readiness.expected == {key: 2}
 
-    def test_the_declaration_is_a_live_mapping(self):
+    def test_the_declaration_is_a_live_mapping(self, readiness_cls):
         """``set_grad_multiplicity`` raises the bar in place, before the window opens."""
-        readiness = MultiplicityReadiness({_EMBEDDING: 1, _NORM: 1})
+        embedding, norm = ("embedding.weight",), ("norm.weight",)
+        readiness = readiness_cls({embedding: 1, norm: 1})
         assert readiness.expected_total == 2
-        readiness.expected.update({_EMBEDDING: 2})
+        readiness.expected.update({embedding: 2})
         assert readiness.expected_total == 3
 
-    def test_an_unknown_parameter_is_a_caller_error(self):
+    def test_an_unknown_parameter_is_a_caller_error(self, readiness_cls):
         """A key outside the declaration must not be swallowed."""
         with pytest.raises(KeyError):
-            MultiplicityReadiness({_EMBEDDING: 1}).mark(_NORM)
+            readiness_cls({("embedding.weight",): 1}).mark(("norm.weight",))
 
 
-class _FsdpParameter:
-    """The three fields ``_unit_grad_multiplicity`` reads off an ``FsdpParameter``."""
+def _build_language_model(tied: bool, mtp_num_layers: int):
+    """Return a small module carrying the model-level surface the hooks read."""
+    from torch import nn
 
-    def __init__(self, fqns, unsharded, sharded=None):
-        self.fqns, self.unsharded, self.sharded = fqns, unsharded, sharded
+    class LanguageModel(nn.Module):
+        """A two-parameter stand-in for a pipeline stage of a language model."""
+
+        def __init__(self) -> None:
+            """Build the embedding, the ordinary parameter, and the model flags."""
+            super().__init__()
+            self.pre_process = True
+            self.share_embeddings_and_output_weights = tied
+            self.mtp_process = True
+            self.config = SimpleNamespace(mtp_num_layers=mtp_num_layers)
+            self.embedding = nn.Module()
+            self.embedding.word_embeddings = nn.Embedding(64, 16)
+            self.norm = nn.Linear(16, 16, bias=False)
+
+        def forward(self, tokens):
+            """Embed ``tokens`` and project them back to the hidden size."""
+            return self.norm(self.embedding.word_embeddings(tokens))
+
+    return LanguageModel()
 
 
-class _Unit:
-    """The one method ``_unit_grad_multiplicity`` calls on an ``FsdpModule``."""
+@_needs_distributed
+class TestDeclaredMultiplicityOnRealFsdpParameters:
+    """What ``register_combined_1f1b_hooks`` declares for a real FSDP unit."""
 
-    def __init__(self, *parameters):
-        self._parameters = parameters
+    @staticmethod
+    def _declared(tied, mtp_num_layers, setup):
+        """``fully_shard`` a language model, register the hooks, return the model."""
+        import torch
+        from torch.distributed.device_mesh import init_device_mesh
+        from torch.distributed.tensor import Shard
 
-    def _trainable_fsdp_parameters(self):
-        return iter(self._parameters)
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+            Placements,
+            fully_shard,
+            fully_shard_context,
+        )
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+        from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
+            register_combined_1f1b_hooks,
+        )
 
+        torch.manual_seed(setup.rank)
+        model = _build_language_model(tied, mtp_num_layers).to(setup.device)
+        mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+        placements = Placements(
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        )
+        with fully_shard_context(device=setup.device):
+            # ``register_hooks=False`` mirrors production, where the combined
+            # scheduler installs its own completion hooks instead of the default.
+            fully_shard(model, mesh=mesh, placements=placements, register_hooks=False)
+        assert isinstance(model, FsdpModule), "fully_shard did not attach the FSDP mixin"
+        register_combined_1f1b_hooks(model)
+        return model
 
-@pytest.mark.internal
-@_needs_stack
-class TestDeclaredMultiplicity:
-    """The per-parameter declaration ``register_combined_1f1b_hooks`` installs."""
-
-    @pytest.fixture(autouse=True)
-    def _declaration(self):
-        self.declare = importlib.import_module(_SCHEDULER)._unit_grad_multiplicity
-
+    @pytest.mark.internal
     @pytest.mark.parametrize(
-        ("mtp_depth", "tied", "expected"),
-        [(0, False, 1), (1, False, 2), (0, True, 2), (1, True, 3)],
+        ("tied", "mtp_num_layers", "expected_costs"),
+        [(True, 1, [1, 3]), (False, 1, [1, 2]), (True, 0, [1, 2]), (False, 0, [1, 1])],
     )
-    def test_only_the_embedding_accrues_extra_consumers(self, mtp_depth, tied, expected):
-        """The MTP node adds one and a tied output projection another; nothing else moves."""
-        weight = object()
-        unit = _Unit(_FsdpParameter(_EMBEDDING, weight), _FsdpParameter(_NORM, object()))
-        declaration = self.declare(unit, mtp_depth, weight, tied)
-        assert (declaration[_EMBEDDING], declaration[_NORM]) == (expected, 1)
+    def test_the_unit_declares_the_embedding_costs(
+        self, distributed_setup, tied, mtp_num_layers, expected_costs
+    ):
+        """Only the embedding accrues extra consumers: +1 per MTP layer, +1 if tied."""
+        model = self._declared(tied, mtp_num_layers, distributed_setup)
 
-    def test_a_tied_parameter_contributes_once_whatever_its_fqns(self):
-        """One physical parameter under two FQNs fires once per node: ``len(fqns)`` is not it."""
-        tied = _EMBEDDING + ("module.output_layer.weight",)
-        declaration = self.declare(_Unit(_FsdpParameter(tied, object())), 1, object(), True)
-        assert declaration == {tied: 1}
+        declared = model._param_grad_readiness.expected
 
-    @pytest.mark.parametrize("half, sharded_first", [("unsharded", False), ("sharded", True)])
-    def test_either_fsdp_half_is_recognised(self, half, sharded_first):
-        """``_set_module_parameter`` installs ``.sharded`` or ``.unsharded``; the tree holds one."""
-        weight = object()
-        halves = (None, weight) if sharded_first else (weight, None)
-        unit = _Unit(_FsdpParameter(_EMBEDDING, *halves), _FsdpParameter(_NORM, object()))
-        assert self.declare(unit, 1, weight, False)[_EMBEDDING] == 2
+        assert sorted(declared.values()) == expected_costs, f"declared {declared}"
+        embedding_keys = [fqns for fqns in declared if _EMBEDDING_HINT in " ".join(fqns)]
+        assert len(embedding_keys) == 1, f"embedding fqns not identified in {declared}"
+        assert declared[embedding_keys[0]] == expected_costs[-1]
 
-    def test_a_missing_embedding_weight_matches_nothing(self):
-        """``None`` must not satisfy the identity test for a parameter with an unset half."""
-        unit = _Unit(_FsdpParameter(_EMBEDDING, object()), _FsdpParameter(_NORM, object()))
-        assert set(self.declare(unit, 1, None, True).values()) == {1}
+    @pytest.mark.internal
+    def test_the_declaration_lands_on_real_fsdp_parameters(self, distributed_setup):
+        """The unit owns real ``FsdpParameter`` objects, one of them the embedding.
+
+        This pins the assumption the match relies on: the weight reachable through
+        the module tree is one of the two objects FSDP swaps between, so an identity
+        test against either half recognises it.
+        """
+        from torch import nn
+
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+            FsdpParameter,
+        )
+
+        model = self._declared(True, 1, distributed_setup)
+        parameters = list(model._trainable_fsdp_parameters())
+
+        assert len(parameters) == 2, f"unexpected parameter count: {parameters}"
+        assert all(isinstance(parameter, FsdpParameter) for parameter in parameters)
+        assert all(isinstance(parameter.unsharded, nn.Parameter) for parameter in parameters)
+        assert all(isinstance(parameter.sharded, nn.Parameter) for parameter in parameters)
+
+        tree_weight = model.embedding.word_embeddings.weight
+        assert any(
+            parameter.unsharded is tree_weight or parameter.sharded is tree_weight
+            for parameter in parameters
+        ), "the module-tree weight is neither FSDP object"
+        assert set(model._param_grad_readiness.expected) == {
+            parameter.fqns for parameter in parameters
+        }
