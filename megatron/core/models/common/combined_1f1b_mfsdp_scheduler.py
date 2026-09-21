@@ -123,11 +123,17 @@ def _unit_grad_multiplicity(unit, mtp_depth: int, embedding_weight, tied: bool) 
     an unshard. Matching only ``unsharded`` therefore never fires in practice: an
     MTP run declared the embedding once while its hook fired twice (PreProcessNode
     plus the MTP pre-dispatch node) and the over-fire guard raised.
+
+    A stage that does not own this chunk's embedding resolves to ``None``, and
+    ``None`` must match nothing. It is ruled out explicitly rather than left to the
+    identity tests, because a parameter whose ``sharded``/``unsharded`` is unset
+    would otherwise compare equal to it and hand every parameter the extra
+    consumers.
     """
     multiplicity = {}
     for fsdp_parameter in unit._trainable_fsdp_parameters():
         consumers = 1
-        if (
+        if embedding_weight is not None and (
             fsdp_parameter.unsharded is embedding_weight
             or fsdp_parameter.sharded is embedding_weight
         ):

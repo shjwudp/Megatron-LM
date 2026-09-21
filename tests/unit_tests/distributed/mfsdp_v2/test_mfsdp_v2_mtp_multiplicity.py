@@ -408,7 +408,9 @@ class _FakeFsdpParameter:
 
     ``sharded`` and ``unsharded`` are the two objects FSDP swaps into the module
     tree (``_set_module_parameter`` installs one or the other). ``sharded``
-    defaults to ``None`` because most cases only exercise the unsharded half.
+    defaults to ``None`` -- a fake-only "not installed" state; the real field is
+    always a concrete ``nn.Parameter`` -- because most cases only exercise the
+    unsharded half.
     """
 
     def __init__(self, fqns, unsharded, sharded=None):
@@ -611,7 +613,15 @@ class TestUnitGradMultiplicity:
     @pytest.mark.internal
     @pytest.mark.skipif(not HOST_CAN_IMPORT_MEGATRON_STACK, reason=_MEGATRON_STACK_SKIP_REASON)
     def test_a_missing_embedding_weight_leaves_every_parameter_at_one(self, unit_grad_multiplicity):
-        """A model without an embedding on this stage resolves to ``None``."""
+        """REGRESSION GUARD: ``None`` must match nothing.
+
+        A model without an embedding on this stage resolves the weight to ``None``.
+        Comparing it only through the identity tests let ``None is None`` succeed
+        against a parameter whose ``sharded``/``unsharded`` is unset, which handed
+        *every* parameter the extra consumers (``1 + mtp_depth + tied``) instead of
+        leaving them at one. ``_unit_grad_multiplicity`` therefore rules ``None`` out
+        explicitly.
+        """
         unit = _unit_with(object(), object())
 
         declaration = unit_grad_multiplicity(unit, 1, None, True)
