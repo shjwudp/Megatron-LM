@@ -63,14 +63,17 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     model = _language_model_of(module)
     tied = model.share_embeddings_and_output_weights and model.pre_process
     mtp_depth = _active_mtp_layers(model)
-    embedding_weight = getattr(
-        getattr(getattr(model, 'embedding', None), 'word_embeddings', None), 'weight', None
-    )
+    embedding_weight_module = getattr(getattr(model, 'embedding', None), 'word_embeddings', None)
     for submodule in module.modules():
         if not isinstance(submodule, FsdpModule):
             continue
         submodule.set_grad_multiplicity(
-            multiplicity=_unit_grad_multiplicity(submodule, mtp_depth, embedding_weight, tied)
+            multiplicity=_unit_grad_multiplicity(
+                submodule,
+                mtp_depth,
+                _embedding_weight_fqns(submodule, embedding_weight_module),
+                tied,
+            )
         )
         submodule.register_post_backward_hook(_module_post_backward_hook)
 
@@ -123,7 +126,32 @@ def _active_mtp_layers(module) -> int:
     return 1
 
 
-def _unit_grad_multiplicity(unit, mtp_depth: int, embedding_weight, tied: bool) -> dict:
+def _embedding_weight_fqns(unit, embedding_weight_module) -> frozenset[str]:
+    """Return the FQNs under which ``unit`` owns the shared embedding weight.
+
+    The embedding is matched by FQN, not by parameter identity, because the
+    Parameter objects FSDP tracks are deliberately not the ones reachable through
+    the module tree: ``parameter_group._materialize_unsharded_parameter`` swaps
+    tensor state for meta parameters, and ``_set_module_parameter`` re-installs the
+    owning module's parameter, so ``model.embedding.word_embeddings.weight`` is a
+    different object from the ``FsdpParameter.unsharded`` that carries the FQN.
+    Module objects are never swapped, so naming the weight through the module tree
+    is sound.
+    """
+    if embedding_weight_module is None:
+        return frozenset()
+    fqns = set()
+    for module_name, module in unit.named_modules():
+        if module is not embedding_weight_module:
+            continue
+        for parameter_name, _ in module.named_parameters(recurse=False):
+            fqns.add(f"{module_name}.{parameter_name}" if module_name else parameter_name)
+    return frozenset(fqns)
+
+
+def _unit_grad_multiplicity(
+    unit, mtp_depth: int, embedding_fqns: frozenset[str], tied: bool
+) -> dict:
     """Per-parameter backward contribution counts for the combined 1F1B path.
 
     Nearly every parameter's gradient comes from exactly one schedule node, so the
@@ -137,7 +165,7 @@ def _unit_grad_multiplicity(unit, mtp_depth: int, embedding_weight, tied: bool) 
     multiplicity = {}
     for fsdp_parameter in unit._trainable_fsdp_parameters():
         consumers = 1
-        if fsdp_parameter.unsharded is embedding_weight:
+        if embedding_fqns.intersection(fsdp_parameter.fqns):
             consumers += mtp_depth + (1 if tied else 0)
         multiplicity[fsdp_parameter.fqns] = consumers
     return multiplicity
