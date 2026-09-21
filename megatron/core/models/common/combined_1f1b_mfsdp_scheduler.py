@@ -5,6 +5,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantization 
     COLWISE,
     ROWWISE,
 )
+from megatron.core.utils import get_attr_wrapped_model
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
@@ -60,49 +61,26 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     assert isinstance(module, FsdpModule), "Owner must be an FsdpModule."
     register_hooks(module, module)
 
-    model = _language_model_of(module)
+    # The FSDP unit is an ``ExperimentalFsdpFloat16Module``: MCore applies the
+    # mixed-precision wrapper before FSDP, and ``Float16Module`` defines no
+    # ``__getattr__``, so the real GPTModel stays at ``.module``. The model-level
+    # attributes the multiplicity contract needs -- ``pre_process``,
+    # ``share_embeddings_and_output_weights``, ``mtp_process`` and ``embedding`` --
+    # live on that inner model, so resolve it through the shared unwrapping helper
+    # instead of reading them off the wrapper.
+    model = get_attr_wrapped_model(module, "pre_process", return_model_obj=True)
     tied = model.share_embeddings_and_output_weights and model.pre_process
     mtp_depth = _active_mtp_layers(model)
-    embedding_weight_module = getattr(getattr(model, 'embedding', None), 'word_embeddings', None)
+    embedding_weight = getattr(
+        getattr(getattr(model, 'embedding', None), 'word_embeddings', None), 'weight', None
+    )
     for submodule in module.modules():
         if not isinstance(submodule, FsdpModule):
             continue
         submodule.set_grad_multiplicity(
-            multiplicity=_unit_grad_multiplicity(
-                submodule,
-                mtp_depth,
-                _embedding_weight_fqns(submodule, embedding_weight_module),
-                tied,
-            )
+            multiplicity=_unit_grad_multiplicity(submodule, mtp_depth, embedding_weight, tied)
         )
         submodule.register_post_backward_hook(_module_post_backward_hook)
-
-
-def _language_model_of(fsdp_unit):
-    """Return the language model whose parameters this FSDP unit owns.
-
-    ``fully_shard`` composes the FsdpModule mixin onto whatever class it wraps
-    (``fully_shard.py``: ``type(f"ExperimentalFsdp{cls.__name__}", (FsdpModule, cls), {})``),
-    and MCore applies the mixed-precision wrapper *before* FSDP. The top-level FSDP
-    unit is therefore an ``ExperimentalFsdpFloat16Module`` -- a ``Float16Module``
-    whose ``.module`` holds the real GPTModel -- and the model-level attributes the
-    multiplicity contract needs (``pre_process``, ``share_embeddings_and_output_weights``,
-    ``mtp_process`` and ``embedding``) live on that inner model. Reading them off the
-    mixed-precision wrapper either raises ``AttributeError`` or, worse, silently
-    yields nothing and under-declares the embedding's multiplicity.
-    """
-    model = fsdp_unit
-    while not hasattr(model, 'pre_process'):
-        inner = getattr(model, 'module', None)
-        if inner is None or inner is model:
-            raise AssertionError(
-                f"cannot find a language model inside FSDP unit {type(fsdp_unit).__name__}: "
-                "expected a mixed-precision wrapper around a GPTModel. The gradient "
-                "multiplicity needs model.pre_process and model.embedding, and guessing "
-                "would produce a wrong per-parameter count."
-            )
-        model = inner
-    return model
 
 
 def _active_mtp_layers(module) -> int:
@@ -126,32 +104,7 @@ def _active_mtp_layers(module) -> int:
     return 1
 
 
-def _embedding_weight_fqns(unit, embedding_weight_module) -> frozenset[str]:
-    """Return the FQNs under which ``unit`` owns the shared embedding weight.
-
-    The embedding is matched by FQN, not by parameter identity, because the
-    Parameter objects FSDP tracks are deliberately not the ones reachable through
-    the module tree: ``parameter_group._materialize_unsharded_parameter`` swaps
-    tensor state for meta parameters, and ``_set_module_parameter`` re-installs the
-    owning module's parameter, so ``model.embedding.word_embeddings.weight`` is a
-    different object from the ``FsdpParameter.unsharded`` that carries the FQN.
-    Module objects are never swapped, so naming the weight through the module tree
-    is sound.
-    """
-    if embedding_weight_module is None:
-        return frozenset()
-    fqns = set()
-    for module_name, module in unit.named_modules():
-        if module is not embedding_weight_module:
-            continue
-        for parameter_name, _ in module.named_parameters(recurse=False):
-            fqns.add(f"{module_name}.{parameter_name}" if module_name else parameter_name)
-    return frozenset(fqns)
-
-
-def _unit_grad_multiplicity(
-    unit, mtp_depth: int, embedding_fqns: frozenset[str], tied: bool
-) -> dict:
+def _unit_grad_multiplicity(unit, mtp_depth: int, embedding_weight, tied: bool) -> dict:
     """Per-parameter backward contribution counts for the combined 1F1B path.
 
     Nearly every parameter's gradient comes from exactly one schedule node, so the
@@ -161,11 +114,23 @@ def _unit_grad_multiplicity(
       * one MTP pre-dispatch node per MTP layer              -> +mtp_depth
       * the PostProcessNode output projection, but ONLY when the output layer
         runs against this very weight object                 -> +1 if tied
+
+    The embedding is recognised by object identity against *both* objects FSDP
+    swaps between. ``parameter_group._set_module_parameter`` is the only writer of
+    ``module._parameters``, and it installs either ``FsdpParameter.sharded`` or
+    ``FsdpParameter.unsharded``, so the weight read through the module tree is one
+    of those two -- which one depends on whether the last switch was a reshard or
+    an unshard. Matching only ``unsharded`` therefore never fires in practice: an
+    MTP run declared the embedding once while its hook fired twice (PreProcessNode
+    plus the MTP pre-dispatch node) and the over-fire guard raised.
     """
     multiplicity = {}
     for fsdp_parameter in unit._trainable_fsdp_parameters():
         consumers = 1
-        if embedding_fqns.intersection(fsdp_parameter.fqns):
+        if (
+            fsdp_parameter.unsharded is embedding_weight
+            or fsdp_parameter.sharded is embedding_weight
+        ):
             consumers += mtp_depth + (1 if tied else 0)
         multiplicity[fsdp_parameter.fqns] = consumers
     return multiplicity
