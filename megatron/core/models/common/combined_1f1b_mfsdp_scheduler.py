@@ -60,10 +60,11 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     assert isinstance(module, FsdpModule), "Owner must be an FsdpModule."
     register_hooks(module, module)
 
-    tied = module.share_embeddings_and_output_weights and module.pre_process
-    mtp_depth = _active_mtp_layers(module)
+    model = _language_model_of(module)
+    tied = model.share_embeddings_and_output_weights and model.pre_process
+    mtp_depth = _active_mtp_layers(model)
     embedding_weight = getattr(
-        getattr(getattr(module, 'embedding', None), 'word_embeddings', None), 'weight', None
+        getattr(getattr(model, 'embedding', None), 'word_embeddings', None), 'weight', None
     )
     for submodule in module.modules():
         if not isinstance(submodule, FsdpModule):
@@ -72,6 +73,33 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
             multiplicity=_unit_grad_multiplicity(submodule, mtp_depth, embedding_weight, tied)
         )
         submodule.register_post_backward_hook(_module_post_backward_hook)
+
+
+def _language_model_of(fsdp_unit):
+    """Return the language model whose parameters this FSDP unit owns.
+
+    ``fully_shard`` composes the FsdpModule mixin onto whatever class it wraps
+    (``fully_shard.py``: ``type(f"ExperimentalFsdp{cls.__name__}", (FsdpModule, cls), {})``),
+    and MCore applies the mixed-precision wrapper *before* FSDP. The top-level FSDP
+    unit is therefore an ``ExperimentalFsdpFloat16Module`` -- a ``Float16Module``
+    whose ``.module`` holds the real GPTModel -- and the model-level attributes the
+    multiplicity contract needs (``pre_process``, ``share_embeddings_and_output_weights``,
+    ``mtp_process`` and ``embedding``) live on that inner model. Reading them off the
+    mixed-precision wrapper either raises ``AttributeError`` or, worse, silently
+    yields nothing and under-declares the embedding's multiplicity.
+    """
+    model = fsdp_unit
+    while not hasattr(model, 'pre_process'):
+        inner = getattr(model, 'module', None)
+        if inner is None or inner is model:
+            raise AssertionError(
+                f"cannot find a language model inside FSDP unit {type(fsdp_unit).__name__}: "
+                "expected a mixed-precision wrapper around a GPTModel. The gradient "
+                "multiplicity needs model.pre_process and model.embedding, and guessing "
+                "would produce a wrong per-parameter count."
+            )
+        model = inner
+    return model
 
 
 def _active_mtp_layers(module) -> int:
