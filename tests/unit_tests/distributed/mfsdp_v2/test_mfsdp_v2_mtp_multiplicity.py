@@ -31,6 +31,7 @@ from types import SimpleNamespace
 import pytest
 
 _EMBEDDING_HINT = "word_embeddings"
+_OUTPUT_HINT = "output_layer"
 
 
 def _host_can_import_stack() -> bool:
@@ -125,7 +126,7 @@ class TestSharedParameterAcrossGraphTasks:
             readiness_cls({("embedding.weight",): 1}).mark(("norm.weight",))
 
 
-def _build_language_model(tied: bool, mtp_num_layers: int):
+def _build_language_model(tied: bool, mtp_num_layers: int, pipeline_parallel: int = 1):
     """Return a small module carrying the model-level surface the hooks read."""
     from torch import nn
 
@@ -138,7 +139,9 @@ def _build_language_model(tied: bool, mtp_num_layers: int):
             self.pre_process = True
             self.share_embeddings_and_output_weights = tied
             self.mtp_process = True
-            self.config = SimpleNamespace(mtp_num_layers=mtp_num_layers)
+            self.config = SimpleNamespace(
+                mtp_num_layers=mtp_num_layers, pipeline_model_parallel_size=pipeline_parallel
+            )
             self.embedding = nn.Module()
             self.embedding.word_embeddings = nn.Embedding(64, 16)
             self.norm = nn.Linear(16, 16, bias=False)
@@ -163,7 +166,9 @@ def _build_tied_language_model(mtp_num_layers: int):
             self.pre_process = True
             self.share_embeddings_and_output_weights = True
             self.mtp_process = True
-            self.config = SimpleNamespace(mtp_num_layers=mtp_num_layers)
+            self.config = SimpleNamespace(
+                mtp_num_layers=mtp_num_layers, pipeline_model_parallel_size=1
+            )
             self.embedding = nn.Module()
             self.embedding.word_embeddings = nn.Embedding(64, 16)
             self.output_layer = nn.Linear(16, 64, bias=False)
@@ -174,6 +179,43 @@ def _build_tied_language_model(mtp_num_layers: int):
             return self.output_layer(self.embedding.word_embeddings(tokens))
 
     return TiedLanguageModel()
+
+
+def _build_mtp_stage_model(
+    tied: bool, mtp_num_layers: int, pipeline_parallel: int, pre_process: bool = False
+):
+    """Return a model shaped like the pipeline stage that owns the MTP loss head.
+
+    That stage owns the output projection and runs MTP, but it is *not* the
+    pre-process stage, which is what made the stage flags matter.
+    """
+    from torch import nn
+
+    class MtpStageModel(nn.Module):
+        """An embedding, a distinct output projection, and the MTP flags."""
+
+        def __init__(self) -> None:
+            """Build the two weights and the stage flags."""
+            super().__init__()
+            self.pre_process = pre_process
+            self.post_process = True
+            self.share_embeddings_and_output_weights = tied
+            self.mtp_process = True
+            self.config = SimpleNamespace(
+                mtp_num_layers=mtp_num_layers, pipeline_model_parallel_size=pipeline_parallel
+            )
+            self.embedding = nn.Module()
+            self.embedding.word_embeddings = nn.Embedding(64, 16)
+            self.output_layer = nn.Linear(16, 64, bias=False)
+            self.norm = nn.Linear(16, 16, bias=False)
+            if tied:
+                self.output_layer.weight = self.embedding.word_embeddings.weight
+
+        def forward(self, tokens):
+            """Run the embedding through the output projection."""
+            return self.output_layer(self.embedding.word_embeddings(tokens))
+
+    return MtpStageModel()
 
 
 @_needs_distributed
@@ -277,3 +319,59 @@ class TestDeclaredMultiplicityOnRealFsdpParameters:
         assert set(model._param_grad_readiness.expected) == {
             parameter.fqns for parameter in parameters
         }
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        ("pipeline_parallel", "mtp_num_layers", "expected_output_cost"),
+        [(1, 1, 1), (2, 1, 2), (2, 0, 1)],
+    )
+    def test_the_output_projection_costs_two_on_the_interleaved_schedule(
+        self, distributed_setup, pipeline_parallel, mtp_num_layers, expected_output_cost
+    ):
+        """The MTP loss head is its own schedule node only when the schedule is interleaved.
+
+        ``model_chunk_schedule_plan`` builds ``mtp_post_process`` -- which contains the
+        output projection -- for every MTP layer. On the interleaved schedule that
+        node's backward is its own GraphTask, so the projection's weight is consumed
+        twice per window; on the PP=1 no-pipelining path it shares one GraphTask with
+        the main projection and is consumed once. Declaring the extra consumer at
+        PP=1 would hold the window open forever.
+        """
+        model = self._declared(
+            lambda: _build_mtp_stage_model(
+                False, mtp_num_layers, pipeline_parallel, pre_process=True
+            ),
+            distributed_setup,
+        )
+
+        declared = model._param_grad_readiness.expected
+        output_keys = [fqns for fqns in declared if _OUTPUT_HINT in " ".join(fqns)]
+
+        assert len(output_keys) == 1, f"output layer fqns not identified in {declared}"
+        assert declared[output_keys[0]] == expected_output_cost
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(("pipeline_parallel", "expected_cost"), [(1, 3), (2, 4)])
+    def test_a_tied_weight_on_an_mtp_stage_pays_for_the_projection(
+        self, distributed_setup, pipeline_parallel, expected_cost
+    ):
+        """``pre_process`` alone is the wrong gate for ``tied``.
+
+        The MTP stage owns the output projection and drives it through
+        ``mtp_process`` while ``pre_process`` is False. Gating ``tied`` on
+        ``pre_process`` dropped the projection's contribution, and the embedding
+        over-fired ``3 > 2`` on a PP2/VPP2 run. On the interleaved schedule the
+        projection is contributed to a second time, and because it runs against this
+        very weight object the embedding pays for that as well.
+        """
+        model = self._declared(
+            lambda: _build_mtp_stage_model(True, 1, pipeline_parallel), distributed_setup
+        )
+
+        declared = model._param_grad_readiness.expected
+        embedding_keys = [fqns for fqns in declared if _EMBEDDING_HINT in " ".join(fqns)]
+
+        assert len(embedding_keys) == 1, f"embedding fqns not identified in {declared}"
+        # 1 base + 1 MTP pre-dispatch node + 1 tied output projection, plus the
+        # projection's second interleaved contribution when the schedule is split.
+        assert declared[embedding_keys[0]] == expected_cost
