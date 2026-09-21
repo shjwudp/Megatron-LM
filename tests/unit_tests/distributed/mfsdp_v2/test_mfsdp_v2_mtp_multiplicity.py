@@ -150,12 +150,38 @@ def _build_language_model(tied: bool, mtp_num_layers: int):
     return LanguageModel()
 
 
+def _build_tied_language_model(mtp_num_layers: int):
+    """Return a language model whose output projection aliases the embedding weight."""
+    from torch import nn
+
+    class TiedLanguageModel(nn.Module):
+        """A language model with one physical weight under two module paths."""
+
+        def __init__(self) -> None:
+            """Tie the output projection to the embedding weight."""
+            super().__init__()
+            self.pre_process = True
+            self.share_embeddings_and_output_weights = True
+            self.mtp_process = True
+            self.config = SimpleNamespace(mtp_num_layers=mtp_num_layers)
+            self.embedding = nn.Module()
+            self.embedding.word_embeddings = nn.Embedding(64, 16)
+            self.output_layer = nn.Linear(16, 64, bias=False)
+            self.output_layer.weight = self.embedding.word_embeddings.weight
+
+        def forward(self, tokens):
+            """Project embedded tokens back to the vocabulary."""
+            return self.output_layer(self.embedding.word_embeddings(tokens))
+
+    return TiedLanguageModel()
+
+
 @_needs_distributed
 class TestDeclaredMultiplicityOnRealFsdpParameters:
     """What ``register_combined_1f1b_hooks`` declares for a real FSDP unit."""
 
     @staticmethod
-    def _declared(tied, mtp_num_layers, setup):
+    def _declared(builder, setup):
         """``fully_shard`` a language model, register the hooks, return the model."""
         import torch
         from torch.distributed.device_mesh import init_device_mesh
@@ -172,7 +198,7 @@ class TestDeclaredMultiplicityOnRealFsdpParameters:
         )
 
         torch.manual_seed(setup.rank)
-        model = _build_language_model(tied, mtp_num_layers).to(setup.device)
+        model = builder().to(setup.device)
         mesh = init_device_mesh(setup.device.type, (setup.world_size,))
         placements = Placements(
             dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
@@ -194,7 +220,9 @@ class TestDeclaredMultiplicityOnRealFsdpParameters:
         self, distributed_setup, tied, mtp_num_layers, expected_costs
     ):
         """Only the embedding accrues extra consumers: +1 per MTP layer, +1 if tied."""
-        model = self._declared(tied, mtp_num_layers, distributed_setup)
+        model = self._declared(
+            lambda: _build_language_model(tied, mtp_num_layers), distributed_setup
+        )
 
         declared = model._param_grad_readiness.expected
 
@@ -202,6 +230,22 @@ class TestDeclaredMultiplicityOnRealFsdpParameters:
         embedding_keys = [fqns for fqns in declared if _EMBEDDING_HINT in " ".join(fqns)]
         assert len(embedding_keys) == 1, f"embedding fqns not identified in {declared}"
         assert declared[embedding_keys[0]] == expected_costs[-1]
+
+    @pytest.mark.internal
+    def test_a_tied_weight_is_one_parameter_and_costs_three(self, distributed_setup):
+        """A tied weight is one ``FsdpParameter`` under two FQNs, so ``len(fqns)`` is not its cost.
+
+        This is the second historical defect: counting the physical parameter once
+        per FQN would declare two contributions per consuming node and hold the
+        window open forever.
+        """
+        model = self._declared(lambda: _build_tied_language_model(1), distributed_setup)
+        parameters = list(model._trainable_fsdp_parameters())
+
+        assert len(parameters) == 1, f"the tied weight split into {parameters}"
+        assert len(parameters[0].fqns) == 2, f"expected two FQNs, got {parameters[0].fqns}"
+        # 1 base + 1 MTP pre-dispatch node + 1 tied output projection.
+        assert model._param_grad_readiness.expected == {parameters[0].fqns: 3}
 
     @pytest.mark.internal
     def test_the_declaration_lands_on_real_fsdp_parameters(self, distributed_setup):
@@ -217,7 +261,7 @@ class TestDeclaredMultiplicityOnRealFsdpParameters:
             FsdpParameter,
         )
 
-        model = self._declared(True, 1, distributed_setup)
+        model = self._declared(lambda: _build_language_model(True, 1), distributed_setup)
         parameters = list(model._trainable_fsdp_parameters())
 
         assert len(parameters) == 2, f"unexpected parameter count: {parameters}"
