@@ -60,6 +60,56 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     assert isinstance(module, FsdpModule), "Owner must be an FsdpModule."
     register_hooks(module, module)
 
+    tied = module.share_embeddings_and_output_weights and module.pre_process
+    mtp_depth = _active_mtp_layers(module)
+    embedding_weight = getattr(
+        getattr(getattr(module, 'embedding', None), 'word_embeddings', None), 'weight', None
+    )
     for submodule in module.modules():
-        if isinstance(submodule, FsdpModule):
-            submodule.register_post_backward_hook(_module_post_backward_hook)
+        if not isinstance(submodule, FsdpModule):
+            continue
+        submodule.set_grad_multiplicity(
+            multiplicity=_unit_grad_multiplicity(submodule, mtp_depth, embedding_weight, tied)
+        )
+        submodule.register_post_backward_hook(_module_post_backward_hook)
+
+
+def _active_mtp_layers(module) -> int:
+    """Return whether THIS pipeline stage runs MTP (0 or 1)."""
+    depth = getattr(module.config, 'mtp_num_layers', None) or 0
+    if depth == 0:
+        return 0
+    if not hasattr(module, 'mtp_process'):
+        raise AssertionError(
+            "config.mtp_num_layers is set but the model exposes no `mtp_process`; "
+            "cannot tell whether this pipeline stage runs MTP, and guessing would "
+            "produce a wrong gradient multiplicity."
+        )
+    if not module.mtp_process:
+        return 0
+    assert depth == 1, (
+        "overlap_moe_expert_parallel_comm requires mtp_num_layers <= 1 "
+        "(transformer_config.py:3316-3320); per-parameter multiplicity does not "
+        f"model deeper MTP (got {depth})."
+    )
+    return 1
+
+
+def _unit_grad_multiplicity(unit, mtp_depth: int, embedding_weight, tied: bool) -> dict:
+    """Per-parameter backward contribution counts for the combined 1F1B path.
+
+    Nearly every parameter's gradient comes from exactly one schedule node, so the
+    default is 1. The embedding is the only parameter with extra consumers:
+
+      * this chunk's PreProcessNode embedding lookup          -> the base 1
+      * one MTP pre-dispatch node per MTP layer              -> +mtp_depth
+      * the PostProcessNode output projection, but ONLY when the output layer
+        runs against this very weight object                 -> +1 if tied
+    """
+    multiplicity = {}
+    for fsdp_parameter in unit._trainable_fsdp_parameters():
+        consumers = 1
+        if fsdp_parameter.unsharded is embedding_weight:
+            consumers += mtp_depth + (1 if tied else 0)
+        multiplicity[fsdp_parameter.fqns] = consumers
+    return multiplicity
