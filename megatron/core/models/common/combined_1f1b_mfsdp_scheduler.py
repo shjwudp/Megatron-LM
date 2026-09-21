@@ -71,6 +71,29 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     # This runs once per model chunk, so the declaration below is derived from that
     # chunk's own ``pre_process``/``post_process``/``mtp_process``.
     model = get_attr_wrapped_model(module, "pre_process", return_model_obj=True)
+    # Tied embeddings/output are rejected here rather than left to fail deep inside the
+    # backward. On a pre_process chunk the output projection borrows the embedding
+    # weight and owns no parameter of its own -- ``gpt_model`` passes
+    # ``skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights``
+    # and builds the projection with ``bias=False`` -- so the ``register_hooks`` below,
+    # which only visits modules owning a direct parameter, registers no unshard hook
+    # for it. Nothing then re-materializes the shared weight before the
+    # PostProcessNode's backward, which is the first backward consumer, so that
+    # backward runs against storage the post-forward reshard already released:
+    # ``RuntimeError: The tensor has a non-zero number of elements, but its data is not
+    # allocated yet`` at ``tensor_parallel/layers.py:748``. The release path is not at
+    # fault -- ``dbuffer.release_storage`` keeps the Storage object precisely so a later
+    # reallocate restores it; the missing piece is the re-unshard, which the per-module
+    # hook registration cannot express for a module that owns nothing. Pre-existing
+    # limitation of combined 1F1B + MFSDP v2 (it reproduces on the base revision without
+    # MTP), so it is rejected loudly instead of failing in the middle of backward.
+    assert not model.share_embeddings_and_output_weights, (
+        "MFSDP v2 combined/fine-grained 1F1B does not support tied embeddings and output "
+        "weights: the output projection borrows the embedding weight while owning no "
+        "parameter of its own, so nothing re-unshards it for the PostProcessNode's "
+        "backward. Pass --untie-embeddings-and-output-weights; the tied path fails in "
+        "backward with 'its data is not allocated yet' instead."
+    )
     mtp_depth = _active_mtp_layers(model)
     # The output projection runs against the shared embedding weight whenever this
     # chunk feeds that weight to the projection, so the projection's contribution
