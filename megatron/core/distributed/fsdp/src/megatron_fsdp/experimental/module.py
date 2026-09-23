@@ -30,7 +30,17 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
-from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
+from .parameter_group import (
+    BOTH,
+    COLWISE,
+    ROWWISE,
+    FsdpParameterGroup,
+    PayloadOrientation,
+    effective_dtype,
+    get_containing_parameter_group,
+    merge_orientations,
+    orientation_directions,
+)
 from .placement import BlockAtomic, Flat
 from .schedule import SchedulePolicy
 
@@ -182,6 +192,12 @@ class FsdpModule:
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
     # already prefetched this module.
     _unshard_event: torch.cuda.Event | None
+    # Widen the payload gather for modules left unsharded after a dispatch (for
+    # example a recomputed forward whose backward then consumes the same
+    # materialization). The next unshard needs a superset of what the earlier
+    # pass required. ``None`` means nothing is materialized; this is cleared
+    # together with ``_unshard_event`` at reshard.
+    _materialized_orientation: PayloadOrientation | None
     # ``phase`` is FORWARD between pre_forward() and post_forward(), BACKWARD
     # between pre_backward() and post_backward(), and RESTING otherwise. The only
     # exception is non-reentrant activation recomputation: it runs between pre_backward()
@@ -200,12 +216,14 @@ class FsdpModule:
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
         register_hooks: bool = True,
+        subgroup_size: int | None = None,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
         self._is_root = False
         self._name = None
         self._unshard_event = None
+        self._materialized_orientation = None
         self._phase = FsdpModule.Phase.RESTING
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
@@ -230,6 +248,7 @@ class FsdpModule:
                     mixed_precision_policy=mixed_precision_policy,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
+                    subgroup_size=subgroup_size,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
@@ -399,9 +418,13 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
-        self.unshard(prefetch="forward" if not is_recomputing else "none")
+        self.unshard(prefetch="forward" if not is_recomputing else "none", orientation=ROWWISE)
 
-    def unshard(self, prefetch: Literal["forward", "backward", "none"] = "none") -> None:
+    def unshard(
+        self,
+        prefetch: Literal["forward", "backward", "none"] = "none",
+        orientation: PayloadOrientation = BOTH,
+    ) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
 
         External schedulers invoking this directly (rather than through the
@@ -410,9 +433,19 @@ class FsdpModule:
         ``context.allgather_stream.wait_stream(context.current_stream())``
         before this when ``self.is_root()``; the automatic forward path
         performs that root sync in ``pre_forward()`` immediately before this.
+
+        Args:
+            prefetch: Static order to prefetch successors from, if any.
+            orientation: Payload orientation to materialize for MXFP8 primary
+                weights -- ``"rowwise"`` on a forward pass, ``"colwise"`` on a
+                backward pass, ``"both"`` when one materialization has to serve
+                both. Ignored by regular parameter groups. The automatic
+                forward/backward paths narrow this; the ``"both"`` default is the
+                safe superset for a caller that does not know the pass, and a
+                request narrower than what is already materialized is a no-op.
         """
         with self._nvtx_range("unshard"):
-            self._unshard_parameter_groups()
+            self._unshard_parameter_groups(orientation)
             assert self._unshard_event is not None
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
@@ -421,45 +454,75 @@ class FsdpModule:
             context = self.context
             if prefetch == "forward":
                 self._prefetch_parameter_groups(
-                    context.forward_order, self._schedule_policy.forward_prefetch_size
+                    context.forward_order, self._schedule_policy.forward_prefetch_size, orientation
                 )
             elif prefetch == "backward":
                 self._prefetch_parameter_groups(
-                    context.backward_order, self._schedule_policy.backward_prefetch_size
+                    context.backward_order,
+                    self._schedule_policy.backward_prefetch_size,
+                    orientation,
                 )
 
     def _prefetch_parameter_groups(
-        self, order: IndexedOrder["FsdpModule"], prefetch_size: int | None
+        self,
+        order: IndexedOrder["FsdpModule"],
+        prefetch_size: int | None,
+        orientation: PayloadOrientation = BOTH,
     ) -> None:
-        """Prefetch successors from ``order`` according to this module's budget."""
+        """Prefetch successors from ``order`` according to this module's budget.
+
+        ``orientation`` is the payload those successors will be consumed with: a
+        module prefetched from the forward order is about to run its forward
+        (row-wise), and one prefetched from the backward order its backward
+        (column-wise). Using the consumer's orientation keeps the later demand
+        unshard a no-op instead of a second, redundant all-gather.
+        """
         next_module = order.next_item(self)
         if prefetch_size is None:
             if next_module is not None:
-                next_module._unshard_parameter_groups()
+                next_module._unshard_parameter_groups(orientation)
             return
 
         prefetched_size = 0
         while next_module is not None and prefetched_size < prefetch_size:
-            next_module._unshard_parameter_groups()
+            next_module._unshard_parameter_groups(orientation)
             prefetched_size += next_module.num_parameter_elements
             next_module = order.next_item(next_module)
 
-    def _unshard_parameter_groups(self) -> None:
+    def _unshard_parameter_groups(self, orientation: PayloadOrientation = BOTH) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
 
-        If ``_unshard_event`` is already set, this FsdpModule was already
-        unsharded or prefetched and this method is a no-op. Otherwise, this
-        method records ``_unshard_event`` after materialization so compute
-        can wait without depending on later release work.
+        If a compatible materialization is already resident, this method is a
+        no-op: a request no wider than what was materialized (a demand unshard
+        after a same-orientation prefetch, or a backward after a forward that was
+        not resharded) is served as is. A request for a direction that is *not*
+        resident widens the materialization, because a module's forward and
+        backward unshards can share one residency window (activation
+        recomputation runs a forward between ``pre_backward`` and
+        ``post_backward``). Otherwise this method records ``_unshard_event`` after
+        materialization so compute can wait without depending on later release
+        work.
+
+        Args:
+            orientation: Payload orientation to gather for MXFP8 groups --
+                ``"rowwise"`` on a forward pass, ``"colwise"`` on a backward
+                pass, ``"both"`` when one materialization has to serve both.
+                Ignored by regular groups.
         """
+        requested = orientation_directions(orientation)
         if self._unshard_event is not None:
-            return
+            resident = orientation_directions(self._materialized_orientation or BOTH)
+            if requested <= resident:
+                return
+            # Widen in place: the groups gather only the directions still missing.
+            orientation = merge_orientations(resident | requested)
 
         allgather_stream = self.context.allgather_stream
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
-                group.unshard_parameters()
+                group.unshard_parameters(orientation)
             self._unshard_event = allgather_stream.record_event()
+            self._materialized_orientation = merge_orientations(orientation_directions(orientation))
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
@@ -482,7 +545,8 @@ class FsdpModule:
         """Reshard parameter groups and release unsharded storage after compute.
 
         This method clears ``_unshard_event`` after queuing the release, so
-        future users enqueue a fresh all-gather.
+        future users enqueue a fresh all-gather. ``_materialized_orientation``
+        is cleared with it because the payload bindings were detached.
         """
         for group in self._parameter_groups:
             group.reshard_parameters()
@@ -495,6 +559,7 @@ class FsdpModule:
             for group in self._parameter_groups:
                 group.release_unsharded_storage()
             self._unshard_event = None
+            self._materialized_orientation = None
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
@@ -513,7 +578,7 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self.unshard(prefetch="backward")
+        self.unshard(prefetch="backward", orientation=COLWISE)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""

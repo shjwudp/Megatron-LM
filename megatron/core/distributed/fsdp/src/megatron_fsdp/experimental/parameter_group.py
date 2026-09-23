@@ -17,6 +17,7 @@
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
+from typing import Literal
 from weakref import ReferenceType, ref
 
 import torch
@@ -33,7 +34,7 @@ from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
 
 if HAVE_TE:
-    from .quantized_dbuffer import QuantizedDBuffer, effective_dtype
+    from .quantized_dbuffer import QuantizedDBuffer, clear_payloads, effective_dtype
 else:
 
     class QuantizedDBuffer:
@@ -42,6 +43,50 @@ else:
     def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
         """Without TE, all parameters use their native storage dtype."""
         return tensor.dtype
+
+    def clear_payloads(tensor: torch.Tensor) -> None:
+        """Fallback; only reachable for QuantizedDBuffer groups, which require TE."""
+
+
+# PORT-NOTE: the payload-orientation vocabulary lives here because dev homes it
+# in `experimental/quantization.py`, a dev-only new file whose storage helpers
+# (`set_rowwise_payload`, `set_columnwise_payload`, `allocate_quantize_temp`,
+# `te_cast_master_weights_to_fp8`) are superseded by main's `QuantizedDBuffer` +
+# `effective_dtype` and dropped from this port. This lane may not create new
+# files, so the vocabulary sits next to its consumer. LANES-PLUMB and
+# LANES-MUON call sites should import these names from
+# `megatron_fsdp.experimental.parameter_group` (dev imported them from
+# `experimental.quantization`).
+#: One payload orientation request for an unshard. Regular (non-FP8) parameter
+#: groups ignore the value; MXFP8 groups honour it.
+ROWWISE = "rowwise"
+COLWISE = "colwise"
+BOTH = "both"
+PayloadOrientation = Literal["rowwise", "colwise", "both"]
+
+
+def orientation_directions(orientation: str) -> frozenset[str]:
+    """Return the payload directions ``orientation`` materializes."""
+    if orientation == BOTH:
+        return frozenset((ROWWISE, COLWISE))
+    return frozenset((orientation,))
+
+
+def merge_orientations(directions: Iterable[str], default: str = ROWWISE) -> str:
+    """Return the narrowest orientation covering every direction in ``directions``.
+
+    Used to widen a materialization that has to serve more than one unshard of the
+    same module -- e.g. a recomputed forward and the backward that consumes it
+    with no reshard in between, which needs ``"both"``.
+    """
+    requested = frozenset(directions)
+    if not requested:
+        return default
+    if requested == frozenset((ROWWISE,)):
+        return ROWWISE
+    if requested == frozenset((COLWISE,)):
+        return COLWISE
+    return BOTH
 
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
@@ -101,6 +146,13 @@ class FsdpParameterGroup:
     # sync_model_weight_from_main_weight() updates only this rank's optimizer-layout
     # view; the remaining model_weight slices must be all-gathered before compute.
     _model_weight_is_stale: bool
+    # Quantized (MXFP8) groups track staleness per payload orientation instead of
+    # for the whole buffer, so one materialization neither moves nor clears the
+    # other orientation's staleness.
+    _rowwise_is_stale: bool
+    _colwise_is_stale: bool
+    # Only these payload directions are bound to the unsharded parameter tensors.
+    _materialized_directions: frozenset[str] = frozenset()
     main_grad: DBuffer | None
     # Optimizer-layout view into main_grad storage, avoiding a second allocation.
     # This is None exactly when main_grad is None.
@@ -124,6 +176,7 @@ class FsdpParameterGroup:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        subgroup_size: int | None = None,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -139,6 +192,8 @@ class FsdpParameterGroup:
                 NCCL symmetric-memory pool.
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
+            subgroup_size: Optional contiguous DP parameter-placement subgroup size.
+                The value is already normalized to this parameter group's mesh.
         """
         parameter_to_fqns, self.dtype, self.requires_grad = self._collect_parameter_metadata(
             fqn_to_parameter
@@ -146,6 +201,7 @@ class FsdpParameterGroup:
         self._owning_module = ref(owning_module)
         self.mesh = mesh
         self.grad_divisor = grad_divisor
+        self.subgroup_size = subgroup_size
         parameters = tuple(parameter_to_fqns)
 
         self._initialize_buffers(
@@ -210,6 +266,7 @@ class FsdpParameterGroup:
             (parameter.shape for parameter in parameters),
             dp_size=self.mesh.size(),
             block_size=32 if self.dtype == torch.uint8 else 1,
+            subgroup_size=self.subgroup_size,
         )
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
 
@@ -219,6 +276,7 @@ class FsdpParameterGroup:
             layout=layout,
             dtype=main_weight_dtype,
             device=self.mesh.device_type,
+            subgroup_size=self.subgroup_size,
         )
         for index, parameter in enumerate(parameters):
             if self.dtype == torch.uint8:
@@ -248,7 +306,11 @@ class FsdpParameterGroup:
             with self._symmetric_memory_context():
                 if self.dtype == torch.uint8:
                     self.model_weight = QuantizedDBuffer(
-                        self.mesh, model_weight_placements, layout, self.main_weight.device
+                        self.mesh,
+                        model_weight_placements,
+                        layout,
+                        self.main_weight.device,
+                        subgroup_size=self.subgroup_size,
                     )
                 else:
                     # Keep the configured compute-weight layout alive for the lifetime of this
@@ -261,6 +323,7 @@ class FsdpParameterGroup:
                         layout=layout,
                         dtype=self.dtype,
                         device=self.main_weight.device,
+                        subgroup_size=self.subgroup_size,
                     )
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         self.sync_model_weight_from_main_weight()
@@ -272,10 +335,15 @@ class FsdpParameterGroup:
                     layout=layout,
                     dtype=self.dtype,
                     device=self.main_weight.device,
+                    subgroup_size=self.subgroup_size,
                 )
             else:
                 self._unsharded_model_weight = QuantizedDBuffer(
-                    self.mesh, [Replicate()] * self.mesh.ndim, layout, self.main_weight.device
+                    self.mesh,
+                    [Replicate()] * self.mesh.ndim,
+                    layout,
+                    self.main_weight.device,
+                    subgroup_size=self.subgroup_size,
                 )
 
         self.main_grad = None
@@ -296,6 +364,7 @@ class FsdpParameterGroup:
             layout=layout,
             dtype=grad_dtype,
             device=self.main_weight.device,
+            subgroup_size=self.subgroup_size,
         )
         self.pre_optimizer_main_grad = self.main_grad.view(main_weight_placements)
 
@@ -368,14 +437,102 @@ class FsdpParameterGroup:
             self.main_weight.cast(
                 self.post_optimizer_model_weight.dtype, out=self.post_optimizer_model_weight
             )
-        else:
-            self.post_optimizer_model_weight.quantize_(self.main_weight)
-        self._model_weight_is_stale = (
-            self.post_optimizer_model_weight.placements != self.model_weight.placements
+            self._model_weight_is_stale = (
+                self.post_optimizer_model_weight.placements != self.model_weight.placements
+            )
+            return
+        # PORT-NOTE: dev's `Fp8ParameterGroup` re-quantizes the `post_optimizer_rowwise`
+        # and `post_optimizer_colwise` views through TE's
+        # `cast_master_weights_to_fp8`; this port re-quantizes through main's
+        # `QuantizedDBuffer.quantize_`, which fills both orientation views in one
+        # pass (it has no per-direction mode -- see the TODO in
+        # quantized_dbuffer.py). Per-direction staleness below then gates which
+        # orientation `unshard_parameters` moves back into the model_weight planes.
+        self.post_optimizer_model_weight.quantize_(self.main_weight)
+        self._update_payload_staleness()
+
+    @property
+    def post_optimizer_rowwise(self) -> tuple[DBuffer, DBuffer]:
+        """The row-wise (data, scale) optimizer-layout views.
+
+        Dev's `Fp8ParameterGroup.post_optimizer_rowwise` is one DBuffer view;
+        on main's 4-plane QuantizedDBuffer it is the row-wise plane pair of
+        `post_optimizer_model_weight` (the analogue of `post_optimizer_model_weight`:
+        quantization fills the view and unshard redistributes the view back into
+        the storage). Quantized groups only.
+        """
+        return self.post_optimizer_model_weight.rowwise_planes
+
+    @property
+    def post_optimizer_colwise(self) -> tuple[DBuffer, DBuffer]:
+        """The column-wise (data, scale) optimizer-layout views.
+
+        Dev's `Fp8ParameterGroup.post_optimizer_colwise`; see
+        :attr:`post_optimizer_rowwise`. Quantized groups only.
+        """
+        return self.post_optimizer_model_weight.columnwise_planes
+
+    def _update_payload_staleness(self) -> None:
+        """Track per-orientation redistribution staleness after re-quantization.
+
+        Sets both orientations' flags together because QuantizedDBuffer's
+        quantize_ refreshes both views in one pass (see
+        `sync_model_weight_from_main_weight`); `unshard_parameters` clears them
+        per orientation as it moves views back into storage. Quantized groups only.
+        """
+        self._rowwise_is_stale = any(
+            view.placements != plane.placements
+            for view, plane in zip(self.post_optimizer_rowwise, self.model_weight.rowwise_planes)
+        )
+        self._colwise_is_stale = any(
+            view.placements != plane.placements
+            for view, plane in zip(self.post_optimizer_colwise, self.model_weight.columnwise_planes)
         )
 
-    def unshard_parameters(self) -> None:
-        """Install full parameters for local compute."""
+    def _redistribute_payloads_into_storage(self, directions: frozenset[str]) -> None:
+        """Move refreshed optimizer-layout views back into parameter-layout storage.
+
+        A pass that materializes a single orientation neither moves nor clears
+        the staleness of the other one. Quantized groups only.
+        """
+        if ROWWISE in directions and self._rowwise_is_stale:
+            for view, plane in zip(self.post_optimizer_rowwise, self.model_weight.rowwise_planes):
+                view.redistribute(plane.placements, out=plane)
+            self._rowwise_is_stale = False
+        if COLWISE in directions and self._colwise_is_stale:
+            for view, plane in zip(
+                self.post_optimizer_colwise, self.model_weight.columnwise_planes
+            ):
+                view.redistribute(plane.placements, out=plane)
+            self._colwise_is_stale = False
+
+    def _gather_payload(
+        self, source: tuple[DBuffer, DBuffer], target: tuple[DBuffer, DBuffer]
+    ) -> None:
+        """All-gather one payload orientation's planes into ``target``.
+
+        Without a changed mesh axis the planes share the same local layout and
+        `redistribute` copies locally instead. Quantized groups only.
+        """
+        for source_plane, target_plane in zip(source, target):
+            source_plane.redistribute(target_plane.placements, out=target_plane)
+
+    def unshard_parameters(self, orientation: PayloadOrientation = BOTH) -> None:
+        """Install full parameters for local compute.
+
+        Args:
+            orientation: Which MXFP8 payload orientations to make available for the
+                upcoming compute. Regular groups store their full parameter in one
+                buffer and ignore this value; MXFP8 groups gather only what the pass
+                needs (row-wise for forward, column-wise for backward).
+        """
+        # PORT-NOTE: `orientation` defaults to BOTH, dev's documented safe
+        # superset for a caller that does not know the pass. Dev's signatures
+        # default to "rowwise", but every dev call site passes the value
+        # explicitly; BOTH only widens a direct call's materialization.
+        if isinstance(self.model_weight, QuantizedDBuffer):
+            self._unshard_quantized_parameters(orientation)
+            return
         if self._model_weight_is_stale:
             self.post_optimizer_model_weight.redistribute(
                 self.model_weight.placements, out=self.model_weight
@@ -388,10 +545,43 @@ class FsdpParameterGroup:
             unsharded_model_weight = self._unsharded_model_weight
             with self._symmetric_memory_context():
                 unsharded_model_weight.reallocate_storage()
-            preserved_tensors = (
+            # This buffer backs unsharded Parameters whose views may be saved by autograd.
+            # Autograd records a tensor's version counter when saving it for backward, and
+            # in-place writes like the out= redistribution below increment that counter even
+            # under no_grad. Without preserving it, backward can fail with "modified by an
+            # inplace operation" even though FSDP only materialized internal storage.
+            with torch.autograd._unsafe_preserve_version_counter(
                 unsharded_model_weight.local_buffer
-                if isinstance(unsharded_model_weight, DBuffer)
-                else tuple(plane.local_buffer for plane in unsharded_model_weight.planes)
+            ):
+                self.model_weight.redistribute(
+                    unsharded_model_weight.placements, out=unsharded_model_weight
+                )
+
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            fsdp_parameter.unsharded.data = unsharded_model_weight.get_tensor_view(index)
+        self._switch_to_unsharded_parameters()
+
+    def _unshard_quantized_parameters(self, orientation: PayloadOrientation) -> None:
+        """Install full MXFP8 parameters, gathering only ``orientation``'s payloads.
+
+        Dev's `Fp8ParameterGroup.unshard_parameters` semantics adapted to main's
+        4-plane QuantizedDBuffer: per-orientation staleness moves, per-orientation
+        gathers, per-orientation payload binding, and quantizer usage kept equal
+        to the payloads actually bound (TE's `update_usage` raises rather than
+        deriving a direction that has no data).
+        """
+        directions = orientation_directions(orientation)
+        missing = directions - self._materialized_directions
+        if ROWWISE in missing:
+            self._redistribute_payloads_into_storage(frozenset((ROWWISE,)))
+        if COLWISE in missing:
+            self._redistribute_payloads_into_storage(frozenset((COLWISE,)))
+        materialized = self._materialized_directions | directions
+        if missing:
+            with self._symmetric_memory_context():
+                self._unsharded_model_weight.reallocate_storage()
+            preserved_tensors = tuple(
+                plane.local_buffer for plane in self._unsharded_model_weight.planes
             )
             # This buffer backs unsharded Parameters whose views may be saved by autograd.
             # Autograd records a tensor's version counter when saving it for backward, and
@@ -399,19 +589,43 @@ class FsdpParameterGroup:
             # under no_grad. Without preserving it, backward can fail with "modified by an
             # inplace operation" even though FSDP only materialized internal storage.
             with torch.autograd._unsafe_preserve_version_counter(preserved_tensors):
-                # TODO: Gather only rowwise MXFP8 weights and scales for forward, and
-                # columnwise weights and scales for backward. Currently both are gathered
-                # in each phase, increasing communication and temporary storage.
-                self.model_weight.redistribute(
-                    unsharded_model_weight.placements, out=unsharded_model_weight
-                )
-
+                # Gather only the payload planes the pass needs: row-wise
+                # (forward GEMM) and/or column-wise (backward GEMM).
+                if ROWWISE in missing:
+                    self._gather_payload(
+                        self.model_weight.rowwise_planes,
+                        self._unsharded_model_weight.rowwise_planes,
+                    )
+                if COLWISE in missing:
+                    self._gather_payload(
+                        self.model_weight.columnwise_planes,
+                        self._unsharded_model_weight.columnwise_planes,
+                    )
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.unsharded.data = (
-                unsharded_model_weight.get_tensor_view(index)
-                if isinstance(unsharded_model_weight, DBuffer)
-                else unsharded_model_weight.get_tensor(index)
-            )
+            tensor = fsdp_parameter.unsharded
+            if missing:
+                # Rebinding installs every materialized orientation's payloads onto
+                # the stable parameter object (MXFP8Tensor._set_data copies the
+                # wrapper's attributes), so references autograd saved keep seeing
+                # current bindings when a residency window is widened. Dev binds
+                # only the missing orientations in place with
+                # set_rowwise_payload/set_columnwise_payload; this covers the whole
+                # materialized set with equivalent bindings for the same effect.
+                tensor.data = self._unsharded_model_weight.get_tensor(
+                    index,
+                    rowwise=ROWWISE in materialized,
+                    columnwise=COLWISE in materialized,
+                )
+            quantizer = getattr(tensor, "_quantizer", None)
+            if quantizer is not None:
+                # TE propagates the tensor's quantizer usage into `update_usage` when
+                # it takes a primary fp8 weight as a GEMM operand, and MXFP8
+                # `update_usage` raises rather than deriving a direction that has no
+                # data. Keep the flags equal to the payloads actually bound.
+                quantizer.set_usage(
+                    rowwise=ROWWISE in materialized, columnwise=COLWISE in materialized
+                )
+        self._materialized_directions = materialized
         self._switch_to_unsharded_parameters()
 
     def reshard_parameters(self) -> None:
@@ -428,6 +642,14 @@ class FsdpParameterGroup:
         # That alternative is not much cleaner, and splitting post-forward and
         # post-backward reshard behavior would make the caller code less clean,
         # so keep the shared storage-release path.
+        if isinstance(self._unsharded_model_weight, QuantizedDBuffer):
+            # Detach the fp8 tensor payloads and forget the materialized directions;
+            # the sharded payloads rest in this group's planes until the next
+            # unshard rebinds them. Dev's Fp8ParameterGroup.release_unsharded_storage
+            # semantics kept.
+            for fsdp_parameter in self.fsdp_parameters:
+                clear_payloads(fsdp_parameter.unsharded)
+            self._materialized_directions = frozenset()
         self._unsharded_model_weight.release_storage()
 
     def allocate_partial_grad_buffer(self) -> DBuffer:
@@ -446,6 +668,7 @@ class FsdpParameterGroup:
                 layout=self.main_weight.layout,
                 dtype=grads[0].dtype,
                 device=grads[0].device,
+                subgroup_size=self.subgroup_size,
             )
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
