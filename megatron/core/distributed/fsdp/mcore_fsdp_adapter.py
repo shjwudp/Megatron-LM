@@ -625,8 +625,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             # There is no HSDP/HFSDP special case:
             # each axis takes the placements of its own strategy, so no_shard outer over
             # ZeRO-3 inner is HSDP and ZeRO-1 outer over ZeRO-3 inner is HFSDP.
+            # PORT-NOTE: flattened_group records the flat DP domain for distributed-Muon
+            # owner comms / amax reduce (mesh._mfsdp_flattened_group; see
+            # _build_hybrid_dp_mesh).
             dp_mesh = _build_hybrid_dp_mesh(
-                pg_collection.inter_dist_opt, pg_collection.intra_dp_cp, device_type
+                pg_collection.inter_dist_opt,
+                pg_collection.intra_dp_cp,
+                device_type,
+                flattened_group=pg_collection.dp_cp,
             )
             outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.outer_dp_sharding_strategy]
             inner = _DATA_PARALLEL_PLACEMENTS[ddp_config.data_parallel_sharding_strategy]
@@ -807,12 +813,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if (
             ddp_config.expert_outer_dp_sharding_strategy != "no_shard"
-            and ddp_config.num_distributed_optimizer_instances <= 1
+            and ddp_config.expert_num_distributed_optimizer_instances <= 1
         ):
             raise ValueError(
                 "MFSDP v2 expert_outer_dp_sharding_strategy="
                 f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires "
-                "num_distributed_optimizer_instances > 1."
+                "expert_num_distributed_optimizer_instances > 1."
             )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
@@ -947,11 +953,15 @@ def _build_expert_mesh_and_placements(
 
     inner_strategy = get_sharding_strategy(ddp_config, is_expert_param=True)
 
-    if ddp_config.num_distributed_optimizer_instances > 1:
-        # Match v1 topology: dense and expert parameters share the outer DP axis,
-        # while experts use the existing expert-DP inner group. Only placements differ.
+    # PORT-NOTE: expert instances are decoupled from the dense instance count
+    # (expert_num_distributed_optimizer_instances), and the expert outer axis comes from
+    # the expert inter-instance group (inter_expt_dp), not the dense one.
+    if ddp_config.expert_num_distributed_optimizer_instances > 1:
         dp_mesh = _build_hybrid_dp_mesh(
-            pg_collection.inter_dist_opt, pg_collection.intra_expt_dp, device_type
+            pg_collection.inter_expt_dp,
+            pg_collection.intra_expt_dp,
+            device_type,
+            flattened_group=pg_collection.expt_dp,
         )
         inner = _DATA_PARALLEL_PLACEMENTS[inner_strategy]
         outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.expert_outer_dp_sharding_strategy]
@@ -976,8 +986,44 @@ def _build_expert_mesh_and_placements(
     return dp_mesh, placements
 
 
-def _build_hybrid_dp_mesh(outer_group, inner_group, device_type):
-    """Build the ("dp_outer", "dp_shard") mesh for a hybrid data-parallel domain."""
+def expert_main_weight_is_sharded(ddp_config: DistributedDataParallelConfig) -> bool:
+    """Whether the expert optimizer buffer keeps a sharded axis.
+
+    MFSDP v2's owner-compute Muon derives its shard plans from each parameter group's
+    ``main_weight``, which takes the *optimizer* placement of every expert DP axis (see
+    ``_build_expert_mesh_and_placements``). When no expert axis shards it, ``main_weight``
+    is fully replicated and no shard plan can be derived. Adam and other non-Muon
+    optimizers do not need this property, so callers must gate on the optimizer.
+
+    # PORT-NOTE: exported for the MFSDP v2 Muon wiring in megatron/core/optimizer
+    # (LANES-MUON lane); keep the name/signature identical to
+    # origin/jianbinc/mfsdp_v2_dev.
+    """
+    strategies = [get_sharding_strategy(ddp_config, is_expert_param=True)]
+    if ddp_config.expert_num_distributed_optimizer_instances > 1:
+        strategies.append(ddp_config.expert_outer_dp_sharding_strategy)
+    return any(
+        isinstance(_DATA_PARALLEL_PLACEMENTS[strategy].optimizer, Shard) for strategy in strategies
+    )
+
+
+def _build_hybrid_dp_mesh(outer_group, inner_group, device_type, flattened_group=None):
+    """Build the ("dp_outer", "dp_shard") mesh for a hybrid data-parallel domain.
+
+    DeviceMesh.from_group requires an explicit rank table when given more than one group,
+    since no single argument spans the mesh. parallel_state cuts the data-parallel domain
+    into num_distributed_optimizer_instances contiguous chunks, so the table is world
+    ranks reshaped to (outer, inner).
+
+    The assumption is checked rather than trusted, because the position of a rank in the
+    table is its mesh coordinate: a table with the right members in the wrong order would
+    keep reducing over valid groups while assigning every shard index to the wrong rank.
+
+    ``flattened_group`` is the full data-parallel group that these two axes partition
+    (``dp_cp`` for dense parameters, ``expt_dp`` for experts). DeviceMesh cannot recover
+    the union of two axes, so it is recorded on the mesh for distributed Muon, which
+    builds its owner communication groups over the whole flat DP domain.
+    """
     if outer_group is None or inner_group is None:
         raise ValueError(
             "MFSDP v2 hybrid sharding requires inter- and intra-instance process groups."
@@ -1006,12 +1052,15 @@ def _build_hybrid_dp_mesh(outer_group, inner_group, device_type):
             f"distributed-optimizer group {outer_ranks}."
         )
 
-    return DeviceMesh.from_group(
+    mesh = DeviceMesh.from_group(
         [outer_group, inner_group],
         device_type=device_type,
         mesh=layout,
         mesh_dim_names=("dp_outer", "dp_shard"),
     )
+    if flattened_group is not None:
+        mesh._mfsdp_flattened_group = flattened_group
+    return mesh
 
 
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
