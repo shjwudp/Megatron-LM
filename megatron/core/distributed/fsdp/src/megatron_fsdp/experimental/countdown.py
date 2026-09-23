@@ -83,6 +83,9 @@ class MultiplicityReadiness:
         A clean window -- never started, or complete and already closed by the
         finalize path -- seals silently; a key with ``0 < count < expected`` is a
         contribution in flight that must not slide into the next window.
+
+        Call this at the per-step gradient boundary; the production seam is the
+        MFSDP v2 adapter's ``finish_grad_sync``.
         """
         partial = {
             key: (count, self._expected[key])

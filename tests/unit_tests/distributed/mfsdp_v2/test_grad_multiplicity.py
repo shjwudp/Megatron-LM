@@ -58,7 +58,7 @@ def _sharded_unit(setup, multiplicity: int):
         # ``register_hooks=False`` mirrors production, where the combined
         # scheduler installs its own completion hooks instead of the default.
         fully_shard(model, mesh=mesh, placements=placements, register_hooks=False)
-    model.set_grad_multiplicity(
+    model.param_grad_readiness.expected.update(
         {parameter.fqns: multiplicity for parameter in model._trainable_fsdp_parameters()}
     )
     finalized = []
@@ -124,7 +124,7 @@ class TestSharedParameterAcrossGraphTasks:
         assert readiness.expected == {key: 2}
 
     def test_the_declaration_is_a_live_mapping(self):
-        """``set_grad_multiplicity`` raises the bar in place, before the window opens."""
+        """The declaration updates in place, before the window opens."""
         embedding, norm = ("embedding.weight",), ("norm.weight",)
         readiness = MultiplicityReadiness({embedding: 1, norm: 1})
         assert readiness.expected_total == 2
@@ -171,10 +171,10 @@ class TestPostBackwardHookAcrossGraphTasks:
         _graph_task(model, distributed_setup)  # first schedule node
         assert finalized == [], "the window closed after the first GraphTask"
         with pytest.raises(ValueError, match="1/2"):
-            model.seal_grad_multiplicity_window()  # both keys are in flight at half
+            model.param_grad_readiness.seal()  # both keys are in flight at half
         _graph_task(model, distributed_setup)  # second schedule node
         assert len(finalized) == 1, f"expected one finalize, got {len(finalized)}"
-        model.seal_grad_multiplicity_window()  # closed window: nothing in flight
+        model.param_grad_readiness.seal()  # closed window: nothing in flight
 
     def test_an_undeclared_second_graph_task_fails_loudly(self, distributed_setup):
         """An undeclared second contribution over-fires the declaration of one.
@@ -192,8 +192,8 @@ class TestPostBackwardHookAcrossGraphTasks:
         _graph_task(model, distributed_setup)
         assert len(finalized) == 1
 
-        key = next(iter(model._param_grad_readiness.expected))
-        readiness = model._param_grad_readiness
+        key = next(iter(model.param_grad_readiness.expected))
+        readiness = model.param_grad_readiness
         readiness.mark(key)  # the re-armed window's declared contribution
         with pytest.raises(ValueError, match="over-fired"):
             readiness.mark(key)  # the undeclared second GraphTask's surplus

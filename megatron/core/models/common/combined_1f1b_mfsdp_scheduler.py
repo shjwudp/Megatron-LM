@@ -79,7 +79,7 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     for submodule in module.modules():
         if not isinstance(submodule, FsdpModule):
             continue
-        submodule.set_grad_multiplicity(_unit_grad_multiplicity(submodule, extras))
+        submodule.param_grad_readiness.expected.update(_unit_grad_multiplicity(submodule, extras))
         submodule.register_post_backward_hook(_module_post_backward_hook)
 
 

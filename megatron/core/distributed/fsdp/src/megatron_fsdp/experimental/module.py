@@ -15,7 +15,7 @@
 """Module mixin for the minimal Megatron-FSDP path."""
 
 import enum
-from collections.abc import Callable, Hashable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Literal, cast
 from weakref import ref
@@ -197,7 +197,7 @@ class FsdpModule:
     _name: str | None
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
-    _param_grad_readiness: MultiplicityReadiness
+    param_grad_readiness: MultiplicityReadiness
     _is_root: bool
     _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
@@ -278,7 +278,7 @@ class FsdpModule:
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
-        self._param_grad_readiness = MultiplicityReadiness(
+        self.param_grad_readiness = MultiplicityReadiness(
             {p.fqns: 1 for p in self._trainable_fsdp_parameters()}
         )
         # The state-dict safety hook is registered unconditionally. It is still
@@ -355,7 +355,7 @@ class FsdpModule:
                 trainable parameters have accumulated gradients.
         """
         module = cast(nn.Module, self)
-        if self._param_grad_readiness.expected_total == 0:
+        if self.param_grad_readiness.expected_total == 0:
             module.register_full_backward_hook(
                 lambda hooked_module, _grad_input, _grad_output: post_backward_hook(
                     cast(FsdpModule, hooked_module)
@@ -374,10 +374,10 @@ class FsdpModule:
                 module = module_ref()
                 if module is None:
                     return
-                module._param_grad_readiness.mark(fqns)
-                if module._param_grad_readiness.is_complete():
+                module.param_grad_readiness.mark(fqns)
+                if module.param_grad_readiness.is_complete():
                     post_backward_hook(module)
-                    module._param_grad_readiness.reset()
+                    module.param_grad_readiness.reset()
 
             return hook
 
@@ -409,18 +409,6 @@ class FsdpModule:
             if not group.requires_grad:
                 continue
             yield from group.fsdp_parameters
-
-    def set_grad_multiplicity(self, multiplicity: Mapping[Hashable, int]) -> None:
-        """Set the expected multiplicity for gradient readiness."""
-        self._param_grad_readiness.expected.update(multiplicity)
-
-    def seal_grad_multiplicity_window(self) -> None:
-        """Raise if any gradient-contribution window is sealed part-way counted.
-
-        The natural production boundary is ``mcore_fsdp_adapter``'s
-        ``finish_grad_sync`` (one call per step); wiring there is a deferred follow-up.
-        """
-        self._param_grad_readiness.seal()
 
     @staticmethod
     def _pre_load_state_dict(
