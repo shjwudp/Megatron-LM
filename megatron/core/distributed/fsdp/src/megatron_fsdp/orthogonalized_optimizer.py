@@ -199,6 +199,18 @@ def _require_sharded_main_weight(parameter_group: FsdpParameterGroup) -> None:
     )
 
 
+def _data_plane(view) -> DBuffer:
+    """Resolve a quantized compute-weight view to its data plane.
+
+    PORT-NOTE (LANES-CORE x LANES-MUON seam): mainline's
+    `post_optimizer_rowwise` / `post_optimizer_colwise` are QuantizedDBuffer
+    `(data, scale)` plane pairs (LANES-CORE deviation 4), where dev's
+    `Fp8ParameterGroup` exposed the bare row-wise / column-wise data buffer.
+    Read the data plane in either shape.
+    """
+    return view[0] if isinstance(view, tuple) else view
+
+
 def _compute_weight_local_views(parameter_group: FsdpParameterGroup) -> list[tuple[str, DBuffer]]:
     """Name the compute-weight views whose local shapes must match `main_weight`.
 
@@ -220,9 +232,9 @@ def _compute_weight_local_views(parameter_group: FsdpParameterGroup) -> list[tup
     # consumed here optionally so a group exposing neither (main's plain `FsdpParameterGroup`)
     # contributes no compute-weight comparison — exactly dev's behavior via `getattr`.
     for name in ("post_optimizer_rowwise", "post_optimizer_colwise"):
-        buffer = getattr(parameter_group, name, None)
-        if buffer is not None:
-            views.append((name, buffer))
+        view = getattr(parameter_group, name, None)
+        if view is not None:
+            views.append((name, _data_plane(view)))
     return views
 
 
