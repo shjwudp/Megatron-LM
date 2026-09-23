@@ -19,7 +19,7 @@ Pure parameter layout and owner-compute packing logic for MFSDP v2's all-`Flat`
 """
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Self
 
 import torch
@@ -148,7 +148,10 @@ def ns_cost_fn(num_ns_steps: int) -> Callable[[ParameterLayout], int]:
 
 
 def assign_owner_work(
-    layouts: dict[int, ParameterLayout], cost_fn: Callable[[ParameterLayout], float] | None = None
+    layouts: dict[int, ParameterLayout],
+    cost_fn: Callable[[ParameterLayout], float] | None = None,
+    *,
+    chunks: Sequence[Sequence[int]] | None = None,
 ) -> dict[int, int]:
     """Assign one owner rank to each parameter, keyed by tensor index.
 
@@ -165,6 +168,19 @@ def assign_owner_work(
             should reflect the relative compute weight of owning each parameter (e.g., an
             orthogonalization cost estimate). When `None`, defaults to a compute estimate for
             orthogonalization via Newton-Schulz with 5 iterations/steps.
+        chunks: Optional parameter keys grouped by communication chunk (each chunk is a sequence
+            of keys of `layouts`, mutually sortable). When given, assignment is **chunk-local**:
+            for each chunk, boundary parameters are processed in descending estimated cost and
+            greedily given to the eligible rank with the smallest `(running total including this
+            chunk, this-chunk running total, rank)` — that is, the minimum cumulative cost,
+            counting fixed fully-local work and owner work from preceding chunks, with ties broken
+            toward the rank doing the least work in the current chunk and then the lowest rank.
+            The per-chunk key splits fixed fully-local work (which runs before boundary
+            Newton-Schulz and shifts when each rank can start producing boundary updates) from
+            reassignable chunk work, balancing the actual per-rank critical path rather than
+            boundary work in isolation. Parameters not covered by any chunk receive no assignment.
+            When `None`, all parameters are balanced as one population with the plain greedy
+            rule above.
 
     Returns:
         Mapping from tensor index to owner rank.
@@ -176,6 +192,54 @@ def assign_owner_work(
     if not layouts:
         return assignments
     dp_size = next(iter(layouts.values())).dp_size
+
+    if chunks is not None:
+        # PORT-NOTE (LANES-MUON): chunk-local owner balancing, ported verbatim from the
+        # prototype's `shard_plan.assign_owner_work` (dev:experimental/shard_plan.py:134-210,
+        # the `muon_max_params_per_owner_chunk` feature). It has no upstream counterpart, so it
+        # lives here as an opt-in mode of the shared balancer rather than a second planner.
+        costs: dict[int, float] = {key: float(cost_fn(layout)) for key, layout in layouts.items()}
+        total_running: dict[int, float] = {rank: 0.0 for rank in range(dp_size)}
+        # Fully-local work cannot be reassigned, but it runs before boundary NS and
+        # therefore shifts when each rank can start producing boundary updates.
+        # Seed the owner loads with that fixed work so boundary assignment balances
+        # the actual per-rank critical path rather than boundary work in isolation.
+        for key, layout in layouts.items():
+            candidates = layout.owner_candidates()
+            if not candidates:
+                raise RuntimeError(
+                    f"No eligible owner for tensor {key} with shape {layout.full_shape}; "
+                    "no rank owns a shard."
+                )
+            if layout.is_boundary():
+                continue
+            owner = candidates[0]
+            assignments[key] = owner
+            total_running[owner] += costs[key]
+
+        for chunk in chunks:
+            chunk_running: dict[int, float] = {rank: 0.0 for rank in total_running}
+            ordered_keys = sorted(
+                (key for key in chunk if layouts[key].is_boundary()),
+                key=lambda key: (-costs[key], key),
+            )
+            for key in ordered_keys:
+                candidates = layouts[key].owner_candidates()
+                owner = min(
+                    candidates,
+                    key=lambda rank: (
+                        total_running[rank] + chunk_running[rank],
+                        chunk_running[rank],
+                        rank,
+                    ),
+                )
+                assignments[key] = owner
+                chunk_running[owner] += costs[key]
+
+            for rank, chunk_cost in chunk_running.items():
+                total_running[rank] += chunk_cost
+
+        return assignments
     running: dict[int, float] = {r: 0.0 for r in range(dp_size)}
     # Non-boundary parameters are assigned to their sole holder; account for their cost.
     for tensor_index, layout in layouts.items():
