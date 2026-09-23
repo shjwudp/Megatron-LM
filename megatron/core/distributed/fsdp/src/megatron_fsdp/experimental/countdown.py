@@ -77,6 +77,24 @@ class MultiplicityReadiness:
         """Return the keys that have contributed fewer times than expected."""
         return frozenset(key for key, count in self._counts.items() if count < self._expected[key])
 
+    def seal(self) -> None:
+        """Check the window at its boundary, raising for any part-way counted key.
+
+        A clean window -- never started, or complete and already closed by the
+        finalize path -- seals silently; a key with ``0 < count < expected`` is a
+        contribution in flight that must not slide into the next window.
+        """
+        partial = {
+            key: (count, self._expected[key])
+            for key, count in self._counts.items()
+            if 0 < count < self._expected[key]
+        }
+        if partial:
+            detail = ", ".join(
+                f"{key!r}: {count}/{expected}" for key, (count, expected) in partial.items()
+            )
+            raise ValueError(f"gradient window sealed mid-flight: {detail}")
+
     def is_complete(self) -> bool:
         """Return whether every key reached its declared multiplicity."""
         return not self.missing()

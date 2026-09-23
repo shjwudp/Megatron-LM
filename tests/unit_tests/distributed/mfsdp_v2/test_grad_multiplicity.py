@@ -136,6 +136,24 @@ class TestSharedParameterAcrossGraphTasks:
         with pytest.raises(KeyError):
             MultiplicityReadiness({("embedding.weight",): 1}).mark(("norm.weight",))
 
+    def test_sealing_a_clean_window_is_silent(self):
+        """A window with nothing in flight -- never started or already closed -- seals silently."""
+        key = ("embedding.weight",)
+        MultiplicityReadiness({key: 2}).seal()
+        readiness = MultiplicityReadiness({key: 2})
+        readiness.mark(key)
+        readiness.mark(key)
+        readiness.reset()  # what the finalize path does when the window completes
+        readiness.seal()
+
+    def test_sealing_a_partial_window_fails_loudly(self):
+        """Sealing a window mid-flight names each part-way key and its count."""
+        key = ("embedding.weight",)
+        readiness = MultiplicityReadiness({key: 2})
+        readiness.mark(key)
+        with pytest.raises(ValueError, match=r"embedding\.weight.*1/2"):
+            readiness.seal()
+
 
 class TestPostBackwardHookAcrossGraphTasks:
     """``register_post_backward_hook`` with one GraphTask per schedule node."""
@@ -152,8 +170,11 @@ class TestPostBackwardHookAcrossGraphTasks:
 
         _graph_task(model, distributed_setup)  # first schedule node
         assert finalized == [], "the window closed after the first GraphTask"
+        with pytest.raises(ValueError, match="1/2"):
+            model.seal_grad_multiplicity_window()  # both keys are in flight at half
         _graph_task(model, distributed_setup)  # second schedule node
         assert len(finalized) == 1, f"expected one finalize, got {len(finalized)}"
+        model.seal_grad_multiplicity_window()  # closed window: nothing in flight
 
     def test_an_undeclared_second_graph_task_fails_loudly(self, distributed_setup):
         """An undeclared second contribution over-fires the declaration of one.

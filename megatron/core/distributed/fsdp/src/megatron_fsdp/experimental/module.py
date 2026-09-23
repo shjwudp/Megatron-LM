@@ -414,6 +414,14 @@ class FsdpModule:
         """Set the expected multiplicity for gradient readiness."""
         self._param_grad_readiness.expected.update(multiplicity)
 
+    def seal_grad_multiplicity_window(self) -> None:
+        """Raise if any gradient-contribution window is sealed part-way counted.
+
+        The natural production boundary is ``mcore_fsdp_adapter``'s
+        ``finish_grad_sync`` (one call per step); wiring there is a deferred follow-up.
+        """
+        self._param_grad_readiness.seal()
+
     @staticmethod
     def _pre_load_state_dict(
         _module: nn.Module,
