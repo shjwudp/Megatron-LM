@@ -155,19 +155,25 @@ class TestPostBackwardHookAcrossGraphTasks:
         _graph_task(model, distributed_setup)  # second schedule node
         assert len(finalized) == 1, f"expected one finalize, got {len(finalized)}"
 
-    def test_a_late_second_contribution_fails_loudly(self, distributed_setup):
-        """A contribution arriving after the window closed raises instead of sliding.
+    def test_an_undeclared_second_graph_task_fails_loudly(self, distributed_setup):
+        """An undeclared second contribution over-fires the declaration of one.
 
-        The declared once-and-only window finalizes after the first GraphTask; a
-        second contribution then arrives at the closed window and is raised rather
-        than silently accumulated into the next one. The surplus is delivered at
-        the readiness API rather than from inside a distributed backward -- a raise
-        in the autograd engine would leave peer ranks stuck in collectives.
+        The declared window finalizes after the first GraphTask and re-arms, so
+        the surplus is staged against the re-armed window: a key's declared fire
+        followed by the undeclared second GraphTask's fire of the same key. Both
+        are delivered at the readiness API rather than from inside a distributed
+        backward -- a raise in the autograd engine would leave peer ranks stuck
+        in collectives. The surplus must raise over-fired without triggering
+        another finalize.
         """
         model, finalized = _sharded_unit(distributed_setup, multiplicity=1)
 
         _graph_task(model, distributed_setup)
         assert len(finalized) == 1
+
+        key = next(iter(model._param_grad_readiness.expected))
+        readiness = model._param_grad_readiness
+        readiness.mark(key)  # the re-armed window's declared contribution
         with pytest.raises(ValueError, match="over-fired"):
-            model._param_grad_readiness.mark(next(iter(model._param_grad_readiness.expected)))
+            readiness.mark(key)  # the undeclared second GraphTask's surplus
         assert len(finalized) == 1, "the surplus must not trigger another finalize"
