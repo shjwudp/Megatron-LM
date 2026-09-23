@@ -124,6 +124,7 @@ class FsdpParameterGroup:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        subgroup_size: int | None = None,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -139,6 +140,8 @@ class FsdpParameterGroup:
                 NCCL symmetric-memory pool.
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
+            subgroup_size: Optional contiguous DP parameter-placement subgroup size.
+                The value is already normalized to this parameter group's mesh.
         """
         parameter_to_fqns, self.dtype, self.requires_grad = self._collect_parameter_metadata(
             fqn_to_parameter
@@ -146,6 +149,7 @@ class FsdpParameterGroup:
         self._owning_module = ref(owning_module)
         self.mesh = mesh
         self.grad_divisor = grad_divisor
+        self.subgroup_size = subgroup_size
         parameters = tuple(parameter_to_fqns)
 
         self._initialize_buffers(
@@ -210,6 +214,7 @@ class FsdpParameterGroup:
             (parameter.shape for parameter in parameters),
             dp_size=self.mesh.size(),
             block_size=32 if self.dtype == torch.uint8 else 1,
+            subgroup_size=self.subgroup_size,
         )
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
 
@@ -219,6 +224,7 @@ class FsdpParameterGroup:
             layout=layout,
             dtype=main_weight_dtype,
             device=self.mesh.device_type,
+            subgroup_size=self.subgroup_size,
         )
         for index, parameter in enumerate(parameters):
             if self.dtype == torch.uint8:
@@ -248,7 +254,11 @@ class FsdpParameterGroup:
             with self._symmetric_memory_context():
                 if self.dtype == torch.uint8:
                     self.model_weight = QuantizedDBuffer(
-                        self.mesh, model_weight_placements, layout, self.main_weight.device
+                        self.mesh,
+                        model_weight_placements,
+                        layout,
+                        self.main_weight.device,
+                        subgroup_size=self.subgroup_size,
                     )
                 else:
                     # Keep the configured compute-weight layout alive for the lifetime of this
@@ -261,6 +271,7 @@ class FsdpParameterGroup:
                         layout=layout,
                         dtype=self.dtype,
                         device=self.main_weight.device,
+                        subgroup_size=self.subgroup_size,
                     )
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         self.sync_model_weight_from_main_weight()
@@ -272,10 +283,15 @@ class FsdpParameterGroup:
                     layout=layout,
                     dtype=self.dtype,
                     device=self.main_weight.device,
+                    subgroup_size=self.subgroup_size,
                 )
             else:
                 self._unsharded_model_weight = QuantizedDBuffer(
-                    self.mesh, [Replicate()] * self.mesh.ndim, layout, self.main_weight.device
+                    self.mesh,
+                    [Replicate()] * self.mesh.ndim,
+                    layout,
+                    self.main_weight.device,
+                    subgroup_size=self.subgroup_size,
                 )
 
         self.main_grad = None
@@ -296,6 +312,7 @@ class FsdpParameterGroup:
             layout=layout,
             dtype=grad_dtype,
             device=self.main_weight.device,
+            subgroup_size=self.subgroup_size,
         )
         self.pre_optimizer_main_grad = self.main_grad.view(main_weight_placements)
 
@@ -446,6 +463,7 @@ class FsdpParameterGroup:
                 layout=self.main_weight.layout,
                 dtype=grads[0].dtype,
                 device=grads[0].device,
+                subgroup_size=self.subgroup_size,
             )
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
