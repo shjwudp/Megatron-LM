@@ -1160,8 +1160,11 @@ def validate_args(args, defaults={}):
                 "GroupedTensor param buffers."
             )
         # Optimizer compatibility check.
-        assert args.optimizer in ('sgd', 'adam'), \
-            f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
+        # PORT-NOTE: MFSDP v2 admits the Muon optimizer (jianbinc/mfsdp_v2_dev);
+        # its wiring lives in megatron/core/optimizer (LANES-MUON lane).
+        assert args.optimizer in ('sgd', 'adam') or (
+            args.optimizer == 'muon' and args.megatron_fsdp_version == 2
+        ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         # Expert parameters may be sharded differently from non-expert parameters, in which
         # case both strategies have to be considered by model-wide checks.
@@ -1801,7 +1804,9 @@ def validate_args(args, defaults={}):
 
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
-    if args.optimizer not in ('sgd', 'adam'):
+    # PORT-NOTE: Megatron-FSDP runs emerging optimizers (Muon under MFSDP v2) through
+    # the mcore optimizer path, not the LayerWise path (jianbinc/mfsdp_v2_dev).
+    if args.optimizer not in ('sgd', 'adam') and not args.use_megatron_fsdp:
         if args.optimizer == 'dist_muon':
             warn_rank_0(
                 "optimizer='dist_muon' is deprecated. "
@@ -1815,7 +1820,8 @@ def validate_args(args, defaults={}):
             args.use_distributed_optimizer = False
 
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
+        # PORT-NOTE: dev drops the use_megatron_fsdp rejection here; Megatron-FSDP is
+        # excluded from this block's condition above (MFSDP v2 + Muon enablement).
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
     assert not (
@@ -2779,6 +2785,12 @@ def _add_regularization_args(parser):
                        'Validated at optimizer creation time.')
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
+    group.add_argument('--muon-dp-subgroup-size', type=int, default=None,
+                       help='Maximum number of same-node DP ranks across which one parameter may be '
+                       'sharded by Megatron-FSDP v2 Muon. Defaults to the full DP group.')
+    group.add_argument('--muon-max-params-per-owner-chunk', type=int, default=16,
+                       help='Maximum number of parameters in each Megatron-FSDP v2 Muon owner '
+                       'communication chunk. Defaults to 16 parameters per chunk.')
     group.add_argument('--muon-tp-mode', type=str, default='duplicated',
                        choices=['blockwise', 'duplicated', 'distributed', 'auto'],
                        help='How to perform NS calculation for tensor model parallel weights. '
@@ -3390,6 +3402,10 @@ def _add_distributed_args(parser):
                        help='If set, enable full sharding in megatron-fsdp Hybrid Sharded Data Parallel (HSDP) mode.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
+    group.add_argument('--expert-num-distributed-optimizer-instances', type=int, default=None,
+                       help='Number of expert-DP instances in Megatron-FSDP v2. '
+                            'Defaults to --num-distributed-optimizer-instances. '
+                            'Set to 1 to use the full expert-DP group independently of dense HSDP.')
     group.add_argument('--torch-fsdp2-no-reshard-after-forward', action='store_false', dest='torch_fsdp2_reshard_after_forward',
                        help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
                        'Set to enable FSDP ZeRO-2.')

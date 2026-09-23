@@ -407,6 +407,11 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 hybrid_context_parallel=args.hybrid_context_parallel,
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
+                # PORT-NOTE: expert DistOpt instances decoupled from the dense count
+                # (jianbinc/mfsdp_v2_dev); None defaults to the dense count.
+                expert_num_distributed_optimizer_instances=(
+                    args.expert_num_distributed_optimizer_instances
+                ),
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
                 distributed_timeout_minutes=args.distributed_timeout_minutes,
                 nccl_communicator_config_path=args.nccl_communicator_config_path,
