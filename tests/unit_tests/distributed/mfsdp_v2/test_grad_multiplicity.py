@@ -19,7 +19,7 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
@@ -48,7 +48,7 @@ class TwoNodeUnit(nn.Module):
 
 def _sharded_unit(setup, multiplicity: int):
     """Fully shard a ``TwoNodeUnit`` and install a completion hook behind a spy."""
-    torch.manual_seed(setup.rank)
+    torch.manual_seed(0)  # identical across ranks: the test is rank-symmetric
     model = TwoNodeUnit().to(setup.device)
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     placements = Placements(
@@ -63,18 +63,23 @@ def _sharded_unit(setup, multiplicity: int):
     )
     finalized = []
     model.register_post_backward_hook(lambda hooked_module: finalized.append(hooked_module))
-    return model, mesh, finalized
+    return model, finalized
 
 
-def _graph_task(model: FsdpModule, mesh, setup) -> None:
+def _graph_task(model: FsdpModule, setup) -> None:
     """Run one forward-backward: one independent autograd GraphTask.
 
-    The schedule hands each node a detached DTensor, so the input is a DTensor
-    too -- the unit's weights are sharded DTensors and cannot mix with a plain
-    tensor inside ``aten.mm``.
+    Drives the unit the way the combined schedule's per-node hooks do: unshard
+    for the node's compute over a local activation, reshard after it. With
+    ``register_hooks=False`` that driving belongs to the caller -- a forward over
+    the resting sharded state would instead dispatch a weight all-gather.
     """
-    inputs = DTensor.from_local(torch.randn(4, 16, device=setup.device), mesh, [Replicate()])
+    if model.is_root():
+        model.context.allgather_stream.wait_stream(model.context.current_stream())
+    model.unshard()
+    inputs = torch.randn(4, 16, device=setup.device)
     model(inputs).sum().backward()
+    model.reshard()
 
 
 class TestSharedParameterAcrossGraphTasks:
@@ -143,23 +148,26 @@ class TestPostBackwardHookAcrossGraphTasks:
         second node's contribution. The declared multiplicity holds the window
         open until every GraphTask has landed.
         """
-        model, mesh, finalized = _sharded_unit(distributed_setup, multiplicity=2)
+        model, finalized = _sharded_unit(distributed_setup, multiplicity=2)
 
-        _graph_task(model, mesh, distributed_setup)  # first schedule node
+        _graph_task(model, distributed_setup)  # first schedule node
         assert finalized == [], "the window closed after the first GraphTask"
-        _graph_task(model, mesh, distributed_setup)  # second schedule node
+        _graph_task(model, distributed_setup)  # second schedule node
         assert len(finalized) == 1, f"expected one finalize, got {len(finalized)}"
 
-    def test_an_undeclared_second_graph_task_fails_loudly(self, distributed_setup):
-        """A declaration of one under two GraphTasks raises instead of double-reducing.
+    def test_a_late_second_contribution_fails_loudly(self, distributed_setup):
+        """A contribution arriving after the window closed raises instead of sliding.
 
-        The first GraphTask completes the window and finalizes; the second's
-        contribution then arrives as a surplus and is raised rather than
-        silently accumulated into the next window.
+        The declared once-and-only window finalizes after the first GraphTask; a
+        second contribution then arrives at the closed window and is raised rather
+        than silently accumulated into the next one. The surplus is delivered at
+        the readiness API rather than from inside a distributed backward -- a raise
+        in the autograd engine would leave peer ranks stuck in collectives.
         """
-        model, mesh, finalized = _sharded_unit(distributed_setup, multiplicity=1)
+        model, finalized = _sharded_unit(distributed_setup, multiplicity=1)
 
-        _graph_task(model, mesh, distributed_setup)
+        _graph_task(model, distributed_setup)
         assert len(finalized) == 1
-        with pytest.raises(Exception, match="over-fired"):
-            _graph_task(model, mesh, distributed_setup)
+        with pytest.raises(ValueError, match="over-fired"):
+            model._param_grad_readiness.mark(next(iter(model._param_grad_readiness.expected)))
+        assert len(finalized) == 1, "the surplus must not trigger another finalize"
