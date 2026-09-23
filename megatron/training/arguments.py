@@ -1160,8 +1160,11 @@ def validate_args(args, defaults={}):
                 "GroupedTensor param buffers."
             )
         # Optimizer compatibility check.
-        assert args.optimizer in ('sgd', 'adam'), \
-            f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
+        # PORT-NOTE: MFSDP v2 admits the Muon optimizer (jianbinc/mfsdp_v2_dev);
+        # its wiring lives in megatron/core/optimizer (LANES-MUON lane).
+        assert args.optimizer in ('sgd', 'adam') or (
+            args.optimizer == 'muon' and args.megatron_fsdp_version == 2
+        ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         # Expert parameters may be sharded differently from non-expert parameters, in which
         # case both strategies have to be considered by model-wide checks.
@@ -1801,7 +1804,9 @@ def validate_args(args, defaults={}):
 
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
-    if args.optimizer not in ('sgd', 'adam'):
+    # PORT-NOTE: Megatron-FSDP runs emerging optimizers (Muon under MFSDP v2) through
+    # the mcore optimizer path, not the LayerWise path (jianbinc/mfsdp_v2_dev).
+    if args.optimizer not in ('sgd', 'adam') and not args.use_megatron_fsdp:
         if args.optimizer == 'dist_muon':
             warn_rank_0(
                 "optimizer='dist_muon' is deprecated. "
@@ -1815,7 +1820,8 @@ def validate_args(args, defaults={}):
             args.use_distributed_optimizer = False
 
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
+        # PORT-NOTE: dev drops the use_megatron_fsdp rejection here; Megatron-FSDP is
+        # excluded from this block's condition above (MFSDP v2 + Muon enablement).
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
     assert not (
