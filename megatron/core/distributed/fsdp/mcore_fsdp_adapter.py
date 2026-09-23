@@ -824,8 +824,23 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
         if config.calculate_per_token_loss:
             raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
-        if config.fp8 or config.fp4 or ddp_config.fp8_param_gather or ddp_config.fp4_param_gather:
-            raise ValueError("MFSDP v2 does not currently support FP8 or FP4.")
+        if config.fp4 or ddp_config.fp4_param_gather:
+            raise ValueError("MFSDP v2 does not currently support FP4.")
+        # PORT-NOTE: MFSDP v2 FP8 admission (jianbinc/mfsdp_v2_dev): MXFP8 primary
+        # weights (--fp8-format e4m3 --fp8-recipe mxfp8 --fp8-param-gather) are
+        # admitted with precise guards; every other FP8 usage stays rejected.
+        if ddp_config.fp8_param_gather and config.fp8_recipe != "mxfp8":
+            raise ValueError(
+                "MFSDP v2 currently supports fp8_param_gather only with --fp8-recipe mxfp8."
+            )
+        # fp8 primary weights (fp8_param_gather) require fp8 mode (--fp8), whose
+        # autocast context the MXFP8 primary-weight path is validated for; any
+        # other fp8/fp4 usage stays rejected.
+        if config.fp8 and not (ddp_config.fp8_param_gather and config.fp8_recipe == "mxfp8"):
+            raise ValueError(
+                "MFSDP v2 fp8 autocast is only supported together with "
+                "--fp8-param-gather and --fp8-recipe mxfp8."
+            )
 
         if ddp_config.fsdp_db_use_persist_buf_on_alloc_fail:
             raise ValueError(
