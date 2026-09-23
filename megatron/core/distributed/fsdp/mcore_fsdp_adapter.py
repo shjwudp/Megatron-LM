@@ -692,6 +692,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
                             grad_divisor=config.expert_model_parallel_size,
+                            # PORT-NOTE: subgroup_size is LANES-CORE's
+                            # fully_shard(..., subgroup_size=) surface (Muon DP-subgroup
+                            # layout); name/signature verbatim from jianbinc/mfsdp_v2_dev.
+                            subgroup_size=ddp_config.muon_dp_subgroup_size,
                             **common_fully_shard_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
@@ -706,12 +710,17 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
+                        subgroup_size=ddp_config.muon_dp_subgroup_size,
                         **common_fully_shard_kwargs,
                     )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
             fully_shard(
-                module, mesh=dp_mesh, placements=dense_placements, **common_fully_shard_kwargs
+                module,
+                mesh=dp_mesh,
+                placements=dense_placements,
+                subgroup_size=ddp_config.muon_dp_subgroup_size,
+                **common_fully_shard_kwargs,
             )
         super().__init__(config=config, module=module)
 
