@@ -916,10 +916,22 @@ def _get_megatron_emerging_optimizer(
             # Use one mixed dense/expert Muon bucket; each parameter retains its own
             # expert metadata and MFSDP communication group.
             is_expert = False
-        # PORT-NOTE (LANES-MUON): dev keyed this bucket map with a third, always-`None`
-        # `_mesh_ranks` element; main's 2-tuple key shape is kept (RISK-3 "main's
-        # parameter-group shapes"). The mixed dense/expert Muon bucket above is the only
-        # functional delta.
+        # PORT-NOTE (LANES-MUON), rewritten by FIX-C after F-1 forensics: dev keyed this
+        # bucket map with a third `_mesh_ranks` element, but dev's insertion site passes a
+        # literal `None` (dev:optimizer/__init__.py:895) and `_mesh_ranks` never holds a
+        # value anywhere in dev (only an unused unpack at dev:optimizer/__init__.py:955),
+        # so main's 2-tuple key shape (RISK-3 "main's parameter-group shapes") is
+        # behaviorally neutral: the bucket partition and iteration order are identical.
+        # The mixed dense/expert Muon bucket above is likewise identical in dev
+        # (dev merges `is_expert = False` the same way). FIX-C initially suspected this
+        # key of merging params bound to different device meshes and causing F-1 (the
+        # `get_data_parallel_group_if_dtensor` assert at the first Muon optimizer step);
+        # that hypothesis is FALSIFIED -- restoring the 3-tuple changes nothing. F-1's
+        # real cause was the dropped `FullyShardedOptimizer.requires_individual_grad_stats`
+        # opt-out, which routed this bucket's multi-mesh DTensor grads into
+        # ChainedOptimizer's single-mesh combined `get_grad_norm_fp32` path; fixed in
+        # fully_sharded_optimizer.py and optimizer.py
+        # (`grads_states_parallel_group_is_shared`).
         grouped_param_groups[(opt_name, is_expert)].append(group)
 
     # Set up DistOpt process groups + filtered buffers once, only if we'll
