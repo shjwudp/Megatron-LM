@@ -40,6 +40,11 @@ class DistributedDataParallelConfig:
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
     """
 
+    expert_num_distributed_optimizer_instances: Optional[int] = None
+    """Number of expert-DP instances in MFSDP v2. Defaults to the dense instance count.
+    Set to 1 to use the entire expert-DP group independently of dense HSDP.
+    """
+
     check_for_nan_in_grad: bool = False
     """
     If true, check for NaNs and Infs in gradients _before_ communication collective.
@@ -277,6 +282,12 @@ class DistributedDataParallelConfig:
     Only effective with ``outer_dp_sharding_strategy='optim'``.
     """
 
+    muon_dp_subgroup_size: Optional[int] = None
+    """Maximum number of contiguous DP ranks across which one parameter may be sharded for
+    MFSDP v2 Muon. Values larger than a parameter mesh are capped to that mesh; otherwise
+    the mesh size must be divisible by this value.
+    """
+
     @property
     def param_sync_via_bucket_group(self) -> bool:
         """Whether DP parameter synchronization is dispatched through DDP bucket groups.
@@ -309,6 +320,20 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        # PORT-NOTE: expert DistOpt instance count decoupled from the dense one
+        # (jianbinc/mfsdp_v2_dev). Defaults to num_distributed_optimizer_instances.
+        if self.expert_num_distributed_optimizer_instances is None:
+            self.expert_num_distributed_optimizer_instances = (
+                self.num_distributed_optimizer_instances
+            )
+        if self.expert_num_distributed_optimizer_instances < 1:
+            raise ValueError("expert_num_distributed_optimizer_instances must be positive.")
+        if (
+            self.expert_num_distributed_optimizer_instances
+            != self.num_distributed_optimizer_instances
+        ):
+            if not self.use_megatron_fsdp or self.megatron_fsdp_version != 2:
+                raise ValueError("Independent expert optimizer instances require MFSDP v2.")
         if self.expert_data_parallel_sharding_strategy is None:
             self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
         if self.expert_outer_dp_sharding_strategy is None:

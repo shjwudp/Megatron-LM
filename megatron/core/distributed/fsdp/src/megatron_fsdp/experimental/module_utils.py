@@ -29,10 +29,37 @@ def get_parameter_owner(root_module: nn.Module, parameter_fqn: str) -> tuple[nn.
 #   exclude them from Muon.
 # - is_embedding_or_output_parameter and is_embedding_parameter identify embedding
 #   weights. The Muon optimizer needs to exclude these weights.
+# - grad_norm_group, group, expert_tp, is_qkv, and qkv_split_shapes feed the Muon
+#   and gradient-statistics optimizer paths and must survive parameter
+#   materialization and sharded-parameter construction.
+# - shared, partition_dim, and the tensor-parallel markers keep tied and
+#   TP-sharded weights identifiable after their storage is replaced.
+# PORT-NOTE: widened from 3 entries to the full model-parameter contract that
+# `jianbinc/mfsdp_v2_dev` preserves via `save_parameter_attributes`/
+# `restore_parameter_attributes`; main's `copy_parameter_attributes` API and
+# behavior are kept unchanged.
 _PARAMETER_ATTRIBUTES_TO_PRESERVE = (
+    "requires_grad",
+    "sequence_parallel",
+    "shared",
+    "shared_embedding",
+    "tensor_model_parallel",
+    "partition_dim",
+    "partition_stride",
+    "_tensor_parallel_mode",
+    "allreduce",
+    "grad_norm_group",
     "is_embedding_or_output_parameter",
     "is_embedding_parameter",
     "use_muon",
+    "expert_tp",
+    "is_qkv",
+    "qkv_split_shapes",
+    "skip_backward_post_hook",
+    "is_gtp_weight_remat",
+    "gtp_replica_group",
+    "pad_length",
+    "group",
 )
 
 

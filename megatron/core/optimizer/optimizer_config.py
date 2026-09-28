@@ -280,6 +280,17 @@ class OptimizerConfig:
     muon_num_ns_steps: int = 5
     """The number of iteration steps to use in the Newton-Schulz iteration."""
 
+    # PORT-NOTE (LANES-MUON -> LANES-PLUMB): MFSDP v2 distributed-Muon fields, verbatim from
+    # dev:optimizer_config.py:282-288. LANES-PLUMB's CLI (--muon-dp-subgroup-size,
+    # --muon-max-params-per-owner-chunk) flows into these by field name.
+    muon_dp_subgroup_size: int | None = None
+    """Maximum number of same-node DP ranks across which one parameter may be sharded for
+    MFSDP v2 Muon. None uses the full DP group."""
+
+    muon_max_params_per_owner_chunk: int | None = 16
+    """Maximum number of parameters in an MFSDP v2 Muon owner-communication chunk.
+    Defaults to 16; None places every compatible parameter in one chunk."""
+
     muon_tp_mode: str = "duplicated"
     """How to perform NS calculation for tensor parallel weights. "blockwise" orthogonalizes
     each shard independently, which makes the update rule depend on the parallelism config;

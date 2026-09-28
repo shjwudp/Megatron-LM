@@ -62,6 +62,10 @@ Download = "https://github.com/NVIDIA/Megatron-LM/releases"
 Homepage = "https://github.com/NVIDIA/Megatron-LM"
 
 
+[project.optional-dependencies]
+emerging-optimizers = ["emerging-optimizers>=0.2"]
+
+
 [tool.uv]
 
 [tool.uv.sources]
