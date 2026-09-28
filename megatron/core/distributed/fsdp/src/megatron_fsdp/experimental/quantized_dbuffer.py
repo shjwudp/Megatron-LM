@@ -363,3 +363,39 @@ def clear_payloads(tensor: torch.Tensor) -> None:
         tensor._data = None
     if hasattr(tensor, "_columnwise_data"):
         tensor._columnwise_data = None
+
+
+def prime_payload_binding(tensor: torch.Tensor, payload: torch.Tensor) -> None:
+    """Restore the ``tensor.data = payload`` precondition on a detached tensor.
+
+    # FIX-NOTE (FIX-E, F-3): TE's ``MXFP8Tensor._set_data`` (the ``data``
+    property setter) starts its MXFP8-to-MXFP8 branch with ``self.size()`` before
+    copying anything, and ``MXFP8TensorStorage.size`` dereferences the payload
+    planes unconditionally (falls through to ``self._columnwise_data.size()``
+    when the row-wise plane is ``None``). A tensor detached by
+    :func:`clear_payloads` has neither plane, so the very rebind that re-attaches
+    fresh payloads raised ``AttributeError: 'NoneType' object has no attribute
+    'size'`` before ``_set_data`` could copy them -- the F-3 crash. TE supports
+    raw per-plane binding on a detached tensor (``fp8_set_raw_data``), but the
+    ``.data`` assignment contract this path uses requires a target with at least
+    one live plane.
+
+    Transiently attach one of ``payload``'s own live planes to satisfy the
+    contract: ``_set_data`` overwrites every payload slot from ``payload``
+    immediately afterwards, so the placeholder never outlives the assignment and
+    costs no allocation. A target that already carries a live plane (e.g. its
+    construction-time binding) is left untouched, keeping main's first bind
+    behaviour byte-identical.
+    """
+    if (
+        getattr(tensor, "_rowwise_data", None) is not None
+        or getattr(tensor, "_columnwise_data", None) is not None
+        or getattr(tensor, "_data", None) is not None
+    ):
+        return
+    for slot in ("_rowwise_data", "_columnwise_data", "_data"):
+        live_plane = getattr(payload, slot, None)
+        if live_plane is not None:
+            setattr(tensor, slot, live_plane)
+            return
+    raise ValueError("Cannot bind a payload with no data plane to attach.")

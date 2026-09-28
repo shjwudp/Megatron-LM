@@ -34,7 +34,12 @@ from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
 
 if HAVE_TE:
-    from .quantized_dbuffer import QuantizedDBuffer, clear_payloads, effective_dtype
+    from .quantized_dbuffer import (
+        QuantizedDBuffer,
+        clear_payloads,
+        effective_dtype,
+        prime_payload_binding,
+    )
 else:
 
     class QuantizedDBuffer:
@@ -46,6 +51,11 @@ else:
 
     def clear_payloads(tensor: torch.Tensor) -> None:
         """Fallback; only reachable for QuantizedDBuffer groups, which require TE."""
+
+    def prime_payload_binding(tensor: torch.Tensor, payload: torch.Tensor) -> None:
+        """Fallback; only reachable for QuantizedDBuffer groups, which require TE."""
+        # FIX-NOTE (FIX-E, F-3): fallback twin of quantized_dbuffer's binding
+        # precondition helper. See the FIX-NOTE on the real implementation.
 
 
 # PORT-NOTE: the payload-orientation vocabulary lives here because dev homes it
@@ -623,11 +633,21 @@ class FsdpParameterGroup:
                 # only the missing orientations in place with
                 # set_rowwise_payload/set_columnwise_payload; this covers the whole
                 # materialized set with equivalent bindings for the same effect.
-                tensor.data = self._unsharded_model_weight.get_tensor(
+                payload = self._unsharded_model_weight.get_tensor(
                     index,
                     rowwise=ROWWISE in materialized,
                     columnwise=COLWISE in materialized,
                 )
+                # FIX-NOTE (FIX-E, F-3): release_unsharded_storage() detaches the
+                # parameter's payload planes (dev's clear_payloads contract), and
+                # TE's MXFP8Tensor._set_data size-guard dereferences the target's
+                # own planes before copying anything -- a detached target could
+                # not receive this assignment at all (F-3: AttributeError inside
+                # MXFP8TensorStorage.size). Prime the target with one of the
+                # payload's live planes so the assignment can run; _set_data then
+                # replaces every slot from `payload` immediately.
+                prime_payload_binding(tensor, payload)
+                tensor.data = payload
             quantizer = getattr(tensor, "_quantizer", None)
             if quantizer is not None:
                 # TE propagates the tensor's quantizer usage into `update_usage` when
