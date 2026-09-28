@@ -857,7 +857,10 @@ def _make_mixed_dtype_fsdp_model(device: torch.device, mesh, seed: int = 1234):
 
 
 # PORT-NOTE (FIX-D, PRESERVED DEV-SIDE LIMITATION — known failure, not fixed here): this test
-# fails identically on dev (fc85a8cd4) and in the port. The failure is NOT in the FSDP step:
+# is not green on dev (fc85a8cd4) either — dev control run (job 19462418) fails EARLIER, at
+# model construction (`fully_shard must run inside fully_shard_context`, the stale usage FIX-B
+# scoped in this port) — and in the port it fails at the reference step below. The failure is
+# NOT in the FSDP step:
 # `FsdpMuon`'s only Newton-Schulz entry casts to fp32 (`orthogonalized_optimizer.
 # _orthogonalize_with_precision`), and `_group_updates` separates mixed-dtype boundary chunks
 # by (shard.dtype, param.dtype). The throw comes from the single-rank *reference* below:

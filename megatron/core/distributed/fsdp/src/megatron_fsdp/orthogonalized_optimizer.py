@@ -820,8 +820,11 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             # Newton-Schulz entry of `step()`, so fp32+bf16 parameter groups never feed bf16
             # into the fp32-only kernel (`emerging_optimizers` `newton_schulz` raises
             # `ValueError: Input tensor x must be in float32`). The prototype's mixed-dtype
-            # unit test still fails identically on dev (fc85a8cd4): its single-rank reference
-            # steps the stock `emerging_optimizers` Muon directly, whose
+            # unit test is not green on dev (fc85a8cd4) either — dev control run (job 19462418)
+            # fails EARLIER at model construction (`fully_shard must run inside
+            # fully_shard_context`, the stale usage FIX-B scoped in this port) — and at the step
+            # the port does reach, the test's single-rank reference steps the stock
+            # `emerging_optimizers` Muon directly, whose
             # `OrthogonalizedOptimizer.step` keeps momentum in the parameter dtype and calls
             # `newton_schulz` without a cast in every release through v0.4.0, so the bf16
             # reference parameter raises there. Dev carries no cast/dispatch that this port
