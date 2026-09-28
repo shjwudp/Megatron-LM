@@ -856,6 +856,18 @@ def _make_mixed_dtype_fsdp_model(device: torch.device, mesh, seed: int = 1234):
     return model
 
 
+# PORT-NOTE (FIX-D, PRESERVED DEV-SIDE LIMITATION — known failure, not fixed here): this test
+# fails identically on dev (fc85a8cd4) and in the port. The failure is NOT in the FSDP step:
+# `FsdpMuon`'s only Newton-Schulz entry casts to fp32 (`orthogonalized_optimizer.
+# _orthogonalize_with_precision`), and `_group_updates` separates mixed-dtype boundary chunks
+# by (shard.dtype, param.dtype). The throw comes from the single-rank *reference* below:
+# `base_opt.step()` runs the stock `emerging_optimizers` Muon, whose
+# `OrthogonalizedOptimizer.step` keeps momentum in the parameter dtype and calls
+# `newton_schulz` without an fp32 cast in every release through v0.4.0, so the bf16 `fc2`
+# raises `ValueError: Input tensor x must be in float32` (image EO v0.2.0:
+# muon_utils.py:158-159). Preserved verbatim per the faithful-rebuild policy; an upstream fix
+# needs an fp32 cast/per-dtype dispatch in emerging_optimizers' Muon step (or an fp32
+# reference parameter group here).
 def test_step_mixed_dtypes_bitwise_matches_reference(distributed_setup):
     """The FSDP Muon step must handle a param group with mixed dtypes (fp32 + bf16).
 
