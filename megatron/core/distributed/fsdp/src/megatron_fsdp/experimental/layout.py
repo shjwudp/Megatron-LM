@@ -284,10 +284,22 @@ def non_leading_numel(shape: torch.Size) -> int:
 # PORT-NOTE: subgroup-local packing ported verbatim from `jianbinc/mfsdp_v2_dev`
 # (the Muon DP-subgroup placement feature). Dev only ever packs with
 # ``block_size == 1`` (its placements are Flat-only); on main, MXFP8 groups use
-# ``block_size == 32`` and their offsets are block-aligned by
-# ``GlobalLayout.__post_init__``, so combining ``subgroup_size`` with a quantized
-# group raises there. That combination is the preserved "Muon + MXFP8" known
-# limitation, not a supported configuration.
+# ``block_size == 32`` and ``GlobalLayout.__post_init__`` requires every tensor
+# offset to be a multiple of ``block_size * row_size``. Subgroup-local packing
+# pads to row granularity only, so combining ``subgroup_size`` with a quantized
+# group CAN land a packed offset off block alignment and raise "not aligned to
+# block size" there. That misalignment risk is the preserved "Muon + MXFP8"
+# known limitation, not a supported configuration.
+# FIX-NOTE (FIX-B, cluster 3b): the note above used to say the combination
+# "raises" unconditionally; the actual boundary is configuration dependent.
+# This builder runs only when ``subgroup_size < dp_size`` (see `build`'s
+# dispatch, and note ``subgroup_size >= dp_size`` falls back to the regular
+# packer, which block-aligns every offset), and a subgroup-packed layout whose
+# offsets happen to stay block-aligned builds fine: e.g. shapes
+# ``((32, 96), (32, 64))`` at ``dp_size=4, subgroup_size=2`` pack aligned,
+# while ``((32, 96), (32, 96), (32, 64))`` at the same sizes puts tensor 2 at
+# offset 3072 against its ``32 * 64 = 2048`` alignment and raises. Pinned by
+# ``test_subgroup_layout_with_mxfp8_blocks_raises``.
 def _build_subgroup_layout(
     tensor_shapes: tuple[torch.Size, ...], chunk_size: int, dp_size: int, subgroup_size: int
 ) -> tuple[tuple[int, ...], int]:

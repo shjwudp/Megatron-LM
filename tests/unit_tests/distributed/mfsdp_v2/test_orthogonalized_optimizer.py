@@ -17,7 +17,11 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import Placements, fully_shard
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    Placements,
+    fully_shard,
+    fully_shard_context,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     _CONTAINING_PARAMETER_GROUP_ATTR,
 )
@@ -264,8 +268,20 @@ class NonMatrixModel(nn.Module):
 def _make_fsdp_model(device: torch.device, mesh, seed: int = 1234) -> TinyModel:
     torch.manual_seed(seed)
     model = TinyModel().to(device)
-    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    # FIX-NOTE (FIX-B, cluster 1): `fully_shard` requires an active
+    # `fully_shard_context` (experimental/fully_shard.py:172-173; the explicit
+    # scope replaced lazy context init in #6190 / commit 59b72fa57). The dev
+    # original of this file never opened one, and dev's local `distributed_setup`
+    # fixture override did NOT provide a context either (it only pinned
+    # `set_device(local_rank % device_count)` for single-GPU dev boxes), so the
+    # retarget notes' "identical on CI" fixture drop is not the cause: the dev
+    # tests are stale against #6190's lazy->explicit context change. Wrap every
+    # build in the suite's standard build-time scope (cf. test_optimizer.py:46);
+    # the scope finalizes root/prefetch-order metadata at exit and the model and
+    # optimizer remain usable afterwards.
+    with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     return model
 
 
@@ -423,7 +439,10 @@ def test_step_explicit_boundary_param_bitwise_matches_reference(distributed_setu
 
     torch.manual_seed(1234)
     model = BoundaryModel(rows, in_features).to(device)
-    fully_shard(model.fc, mesh=mesh, placements=_flat_placements())
+    # FIX-NOTE (FIX-B, cluster 1): build-time `fully_shard_context` scope; see
+    # the cluster-1 note at `_make_fsdp_model`.
+    with fully_shard_context(device=device):
+        fully_shard(model.fc, mesh=mesh, placements=_flat_placements())
 
     # Assert the single parameter is a boundary parameter on this rank.
     plan = compute_shard_plan(
@@ -505,7 +524,10 @@ def test_step_reconstruct_full_param_bitwise_matches_reference(distributed_setup
 
     torch.manual_seed(1234)
     model = BoundaryModel(rows, in_features).to(device)
-    fully_shard(model.fc, mesh=mesh, placements=_flat_placements())
+    # FIX-NOTE (FIX-B, cluster 1): build-time `fully_shard_context` scope; see
+    # the cluster-1 note at `_make_fsdp_model`.
+    with fully_shard_context(device=device):
+        fully_shard(model.fc, mesh=mesh, placements=_flat_placements())
 
     plan = compute_shard_plan(
         torch.Size((rows, in_features)),
@@ -592,7 +614,10 @@ def test_step_non_matrix_param_matches_reference(distributed_setup):
 
     torch.manual_seed(1234)
     model = NonMatrixModel().to(device)
-    fully_shard(model.bias_mod, mesh=mesh, placements=_flat_placements())
+    # FIX-NOTE (FIX-B, cluster 1): build-time `fully_shard_context` scope; see
+    # the cluster-1 note at `_make_fsdp_model`.
+    with fully_shard_context(device=device):
+        fully_shard(model.bias_mod, mesh=mesh, placements=_flat_placements())
 
     torch.manual_seed(1234)
     baseline = NonMatrixModel().to(device)
@@ -668,8 +693,11 @@ def test_step_mixed_paths_matches_reference(distributed_setup):
 
     torch.manual_seed(1234)
     model = MixedModel().to(device)
-    fully_shard(model.fc, mesh=mesh, placements=_flat_placements())
-    fully_shard(model.bias_mod, mesh=mesh, placements=_flat_placements())
+    # FIX-NOTE (FIX-B, cluster 1): build-time `fully_shard_context` scope; see
+    # the cluster-1 note at `_make_fsdp_model`.
+    with fully_shard_context(device=device):
+        fully_shard(model.fc, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.bias_mod, mesh=mesh, placements=_flat_placements())
 
     torch.manual_seed(1234)
     baseline = MixedModel().to(device)
@@ -820,8 +848,11 @@ def _make_mixed_dtype_fsdp_model(device: torch.device, mesh, seed: int = 1234):
     """Sharded `MixedDtypeModel`: `fc1` in fp32, `fc2` in bf16, both Flat-sharded."""
     torch.manual_seed(seed)
     model = MixedDtypeModel().to(device)
-    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    # FIX-NOTE (FIX-B, cluster 1): build-time `fully_shard_context` scope; see
+    # the cluster-1 note at `_make_fsdp_model`.
+    with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     return model
 
 

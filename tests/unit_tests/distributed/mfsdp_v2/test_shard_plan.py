@@ -58,8 +58,23 @@ def test_compute_shard_plan_classifies_locality():
 
 def test_assign_owner_work_balances_by_cost():
     """Boundary parameters go to the eligible rank with the lowest running load."""
-    plan0 = ShardPlan(torch.Size((8, 8)), ((0, 4), (0, 4), (0, 4), (0, 4)), 8)  # cost 64*41
-    plan1 = ShardPlan(torch.Size((4, 4)), ((0, 2), (0, 2), (0, 2), (0, 2)), 4)  # cost 16*21
+    # FIX-NOTE (FIX-B, cluster 2): dev's original fixtures here were
+    # `((0, 4),) * 4` for the (8, 8) matrix and `((0, 2),) * 4` for the (4, 4)
+    # one -- each rank was given the two-way-split row share (`rows / 2`) instead
+    # of `rows / world_size`, so the plans claimed 2x the row space (16 of 8
+    # rows; 8 of 4) and `parameter_layout_from_shard_plan`'s
+    # `ParameterLayout` correctly rejected them ("flat_counts sum 128 !=
+    # full_shape numel 64"): a `ShardPlan` whose `rank_rows` do not tile the
+    # matrix describes no realizable sharding and is rejected loudly by design
+    # (shard_plan.py PORT-NOTE: "rejected loudly here, where the prototype
+    # would have silently dropped rows"). Dev's balancer never noticed because
+    # it reads row counts only as zero/nonzero (`owner_candidates`/
+    # `is_boundary`) and costs only `full_shape` (`64*41`, `16*21` below), so
+    # the count values were balancer-inert filler. Corrected to true even row
+    # partitions; eligibility (all 4 ranks), boundary status, costs, and the
+    # expected greedy assignment are unchanged.
+    plan0 = ShardPlan(torch.Size((8, 8)), ((0, 2), (2, 2), (4, 2), (6, 2)), 8)  # cost 64*41
+    plan1 = ShardPlan(torch.Size((4, 4)), ((0, 1), (1, 1), (2, 1), (3, 1)), 4)  # cost 16*21
     owners = assign_owner_work([plan0, plan1], num_ns_steps=5)
     # Greedy min running cost: first param -> rank0 (cost 2624), second -> rank1 (cost 336).
     assert owners == {0: 0, 1: 1}

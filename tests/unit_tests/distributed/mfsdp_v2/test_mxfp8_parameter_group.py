@@ -249,14 +249,32 @@ def test_optimizer_layout_views_alias_storage_and_gate_staleness(distributed_set
     assert group._colwise_is_stale is True
 
     # Muon's shard-shape check reads the compute-weight views, not the storage.
+    # FIX-NOTE (FIX-B, cluster 3a): two distinct contracts are pinned together
+    # here. (1) The `FsdpParameterGroup` attributes are the (data, scale) plane
+    # pairs of `post_optimizer_model_weight` (LANES-CORE deviation 4 over the
+    # 4-plane QuantizedDBuffer; dev's `Fp8ParameterGroup` had one buffer) — the
+    # staleness machinery zips those pairs against the storage planes.
+    # (2) `_compute_weight_local_views`, the surface Muon's shard-shape check
+    # consumes, resolves each pair to its DATA plane (the cb94b1a12 seam fix):
+    # dev pinned `buffer is view` there (dev's
+    # `test_optimizer_checks_payload_views_not_storage`), and
+    # `_require_matching_local_shards` compares `get_tensor_view(index)` shapes
+    # against the parameter's local shard, which a blockwise scale grid can
+    # never match. Pre-cb94b1a12 this helper passed the pair through and this
+    # test pinned that seam bug (`== (data, scale)`); the true contract is the
+    # resolved data plane, dev's bare payload buffer.
     views = dict(_compute_weight_local_views(group))
     assert list(views) == [
         "post_optimizer_model_weight",
         "post_optimizer_rowwise",
         "post_optimizer_colwise",
     ]
-    assert views["post_optimizer_rowwise"] == (view.rowwise_data, view.rowwise_scale)
-    assert views["post_optimizer_colwise"] == (view.columnwise_data, view.columnwise_scale)
+    # (1) Attribute contract: (data, scale) plane pairs.
+    assert group.post_optimizer_rowwise == (view.rowwise_data, view.rowwise_scale)
+    assert group.post_optimizer_colwise == (view.columnwise_data, view.columnwise_scale)
+    # (2) Helper contract: resolved to the data plane, as dev's bare buffer.
+    assert views["post_optimizer_rowwise"] is view.rowwise_data
+    assert views["post_optimizer_colwise"] is view.columnwise_data
 
     # ZeRO-3: storage and view share placements, so the view is the storage.
     zero3_storage = QuantizedDBuffer(mesh, (Flat(),), layout, device)
@@ -271,14 +289,37 @@ def test_optimizer_layout_views_alias_storage_and_gate_staleness(distributed_set
 def test_subgroup_layout_with_mxfp8_blocks_raises():
     """``subgroup_size`` with MXFP8 block placement is a preserved known limitation.
 
-    Subgroup-local packing pads to row granularity only, so with block-atomic
-    (32) placement some tensor offsets land off block alignment and
-    ``GlobalLayout``'s block-alignment check raises. Either feature alone packs
-    fine; together they are not a supported configuration (see the PORT-NOTE at
-    ``layout._build_subgroup_layout``).
+    Subgroup-local packing (entered only when ``subgroup_size < dp_size``) pads
+    to row granularity only, so with block-atomic (32) placement a packed tensor
+    offset can land off ``block_size * row_size`` alignment and
+    ``GlobalLayout``'s block-alignment check (``__post_init__``) raises. The
+    boundary is configuration dependent: whether the check fires depends on the
+    shapes and subgroup geometry, and subgroup-packed layouts whose offsets stay
+    block-aligned build -- as does every ``subgroup_size >= dp_size`` case, which
+    falls back to the regular block-aligning packer. Either feature alone always
+    packs fine (see the PORT-NOTE at ``layout._build_subgroup_layout``).
     """
     shapes = (torch.Size((32, 96)), torch.Size((32, 64)))
+    # Either feature alone packs fine.
     GlobalLayout.build(shapes, dp_size=2, block_size=32)
     GlobalLayout.build(shapes, dp_size=2, block_size=1, subgroup_size=2)
+    # FIX-NOTE (FIX-B, cluster 3b): this test's pre-fix expected-raises input
+    # (`subgroup_size == dp_size`) never enters `_build_subgroup_layout`:
+    # `build` dispatches to it only when `subgroup_size < dp_size`
+    # (layout.py dispatch), and the regular packer block-aligns every offset, so
+    # the layout is valid and builds. The predicted misalignment ("offset 3072
+    # vs 32*64=2048") occurs only once the subgroup packer actually runs.
+    GlobalLayout.build(shapes, dp_size=2, block_size=32, subgroup_size=2)
+    # Together with subgroup packing actually entered, still block-aligned here:
+    # the limitation is not a categorical rejection of the combination.
+    GlobalLayout.build(shapes, dp_size=4, block_size=32, subgroup_size=2)
+    # Together with subgroup packing entered and offsets drifted off block
+    # alignment (tensor 2 lands at 3072 vs its 2048 alignment): the preserved
+    # limitation raises loudly.
     with pytest.raises(AssertionError, match="not aligned to block size"):
-        GlobalLayout.build(shapes, dp_size=2, block_size=32, subgroup_size=2)
+        GlobalLayout.build(
+            (torch.Size((32, 96)), torch.Size((32, 96)), torch.Size((32, 64))),
+            dp_size=4,
+            block_size=32,
+            subgroup_size=2,
+        )
