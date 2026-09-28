@@ -511,6 +511,16 @@ class FsdpModule:
         """
         requested = orientation_directions(orientation)
         if self._unshard_event is not None:
+            # FIX-NOTE: payload orientation only exists for MXFP8
+            # (``QuantizedDBuffer``) parameter groups; ordinary floating-point
+            # groups ignore ``orientation`` (``unshard_parameters`` consults it
+            # only in its quantized branch). Main returns unconditionally here
+            # for every group, reusing whatever is already materialized. Keep
+            # that exact contract whenever this module owns no quantized group,
+            # so the default (non-FP8) path stays behaviourally identical to main
+            # instead of issuing a redundant widening re-unshard.
+            if not any(group.is_quantized for group in self._parameter_groups):
+                return
             resident = orientation_directions(self._materialized_orientation or BOTH)
             if requested <= resident:
                 return

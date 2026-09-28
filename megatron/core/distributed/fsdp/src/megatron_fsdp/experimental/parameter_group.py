@@ -219,6 +219,18 @@ class FsdpParameterGroup:
         self._unsharded_model_weight.release_storage()
         self._switch_to_sharded_parameters()
 
+    @property
+    def is_quantized(self) -> bool:
+        """Whether this group stores orientation-sensitive MXFP8 payloads.
+
+        # FIX-NOTE: exposed so ``FsdpModule`` can keep the payload-orientation
+        # machinery scoped to MXFP8 groups. Ordinary floating-point groups ignore
+        # ``orientation`` entirely (``unshard_parameters`` only consults it in the
+        # ``QuantizedDBuffer`` branch), so any orientation-driven re-unshard of a
+        # module that owns no quantized group is a behavioural divergence from main.
+        """
+        return isinstance(self.model_weight, QuantizedDBuffer)
+
     @staticmethod
     def _collect_parameter_metadata(
         fqn_to_parameter: dict[str, nn.Parameter],
