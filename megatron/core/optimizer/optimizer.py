@@ -1852,6 +1852,16 @@ class ChainedOptimizer(MegatronOptimizer):
 
     def grads_states_parallel_group_is_shared(self):
         """Check if all optimizers share the same gradient statistics parallel group."""
+        # FIX-NOTE (FIX-C, F-1): restored from dev (fc85a8cd4) verbatim. A chained
+        # FullyShardedOptimizer owns DTensors from more than one device mesh (dense vs
+        # expert), so its grads must be normed by its own multi-mesh-aware
+        # ``get_grad_norm`` rather than the combined ``get_grad_norm_fp32`` path, whose
+        # ``get_data_parallel_group_if_dtensor`` assert requires one mesh per call.
+        if any(
+            getattr(optimizer, 'requires_individual_grad_stats', False)
+            for optimizer in self.chained_optimizers
+        ):
+            return False
         reference_group = self.chained_optimizers[0].get_grad_stats_parallel_group()
         return all(
             optimizer.get_grad_stats_parallel_group() == reference_group
