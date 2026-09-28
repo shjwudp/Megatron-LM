@@ -51,6 +51,18 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     MFSDP-specific storage operations explicit.
     """
 
+    # FIX-NOTE (FIX-C, F-1): restored from dev (fc85a8cd4) verbatim. The prototype dropped
+    # this opt-out, so ChainedOptimizer's combined gradient-statistics path fed the Muon
+    # bucket's mixed dense/expert DTensor grads into the single-mesh ``get_grad_norm_fp32``
+    # and tripped ``get_data_parallel_group_if_dtensor``'s assert at the first optimizer
+    # step (M-FSDP v2 + Muon). See also
+    # ``ChainedOptimizer.grads_states_parallel_group_is_shared``.
+    # ChainedOptimizer's combined gradient-statistics path requires every DTensor
+    # to use the same device mesh. MFSDP needs the per-optimizer implementation
+    # below so dense and expert parameters on different meshes are counted
+    # correctly, even when their final reduction process group is the same.
+    requires_individual_grad_stats = True
+
     @override
     def __init__(
         self,
