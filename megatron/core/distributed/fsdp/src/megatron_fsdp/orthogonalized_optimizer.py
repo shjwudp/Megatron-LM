@@ -813,6 +813,23 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             # accept `None`, so keep that internal flexibility while narrowing the call type here.
             param = cast(torch.Tensor, param)
             # The Newton-Schulz kernel is FP32-only, so cast accordingly.
+            #
+            # PORT-NOTE (FIX-D, PRESERVED DEV-SIDE LIMITATION): this cast is the mixed-dtype
+            # boundary of the owner-compute step. `_group_updates` already separates chunks by
+            # (shard.dtype, param.dtype) (see its chunk key above), and this is the sole
+            # Newton-Schulz entry of `step()`, so fp32+bf16 parameter groups never feed bf16
+            # into the fp32-only kernel (`emerging_optimizers` `newton_schulz` raises
+            # `ValueError: Input tensor x must be in float32`). The prototype's mixed-dtype
+            # unit test still fails identically on dev (fc85a8cd4): its single-rank reference
+            # steps the stock `emerging_optimizers` Muon directly, whose
+            # `OrthogonalizedOptimizer.step` keeps momentum in the parameter dtype and calls
+            # `newton_schulz` without a cast in every release through v0.4.0, so the bf16
+            # reference parameter raises there. Dev carries no cast/dispatch that this port
+            # lost (dev:experimental/orthogonalized_optimizer.py is byte-identical at this
+            # site), so the limitation is preserved verbatim per the faithful-rebuild policy.
+            # A future upstream fix needs either an fp32 cast (or per-dtype dispatch) inside
+            # emerging_optimizers' `Muon.scaled_orthogonalize_fn`/`OrthogonalizedOptimizer.step`,
+            # or the test's reference path to upcast its bf16 parameter group.
             return self._inner.orthogonalize(param, pre_ns.to(torch.float32), **kwargs)
 
     def _apply_update(self, param: DTensor, update_shard: torch.Tensor, lr: float) -> None:
