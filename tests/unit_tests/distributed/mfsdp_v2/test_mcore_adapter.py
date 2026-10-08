@@ -771,12 +771,9 @@ class TestMcoreAdapterExpertParallel:
         for model_layer, reference_layer in zip(
             model.decoder.layers, reference_model.decoder.layers
         ):
-<<<<<<< HEAD
             if isinstance(model_layer, ShortcutMoEBlock):
                 model_layer = model_layer.moe_layer
                 reference_layer = reference_layer.moe_layer
-=======
->>>>>>> integration/pr7819
             if not isinstance(model_layer.mlp, MoELayer):
                 continue
             for fc in ("linear_fc1", "linear_fc2"):

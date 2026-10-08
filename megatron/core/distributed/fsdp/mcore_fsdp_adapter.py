@@ -747,8 +747,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     # The root is always sharded after selected child units so it is not
                     # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
-                if isinstance(submodule, ShortcutMoEBlock) or submodule in recompute_units or any(
-                    isinstance(submodule, module_type) for module_type in fsdp_unit_modules
+                if (
+                    isinstance(submodule, ShortcutMoEBlock)
+                    or submodule in recompute_units
+                    or any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules)
                 ):
                     if config.init_model_with_meta_device:
                         _materialize_owned_meta_modules(submodule, device)
