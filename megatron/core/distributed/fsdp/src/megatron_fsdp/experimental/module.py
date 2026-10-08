@@ -30,6 +30,7 @@ from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
+    FsdpParameter,
     FsdpParameterGroup,
     Phase,
     effective_dtype,
@@ -237,11 +238,7 @@ class FsdpModule:
             )
         self._parameter_groups = tuple(parameter_groups)
         self._trainable_parameter_countdown = Countdown(
-            sum(
-                len(group.fsdp_parameters)
-                for group in self._parameter_groups
-                if group.requires_grad
-            )
+            sum(1 for _ in self._trainable_fsdp_parameters())
         )
         # The state-dict safety hook is registered unconditionally. It is still
         # required to keep loading a state dict safe when ``register_hooks`` is
@@ -303,20 +300,37 @@ class FsdpModule:
         self.register_post_backward_hook(FsdpModule.post_backward)
 
     def register_post_backward_hook(
-        self, post_backward_hook: Callable[["FsdpModule"], None]
+        self,
+        post_backward_hook: Callable[["FsdpModule"], None],
+        *,
+        grad_accumulation_count: int | None = None,
     ) -> None:
         """Register a post-backward hook to run after this module's backward completes.
 
         The hook runs when this module's backward is complete, so it can reshard
         this module's parameters and reduce their gradients. It is invoked once
-        all of this module's trainable parameters have accumulated gradients, or
+        all expected gradient-accumulation callbacks have arrived, or
         via a full-backward hook when the module owns no trainable parameters.
 
         Args:
             post_backward_hook: Callback receiving this FSDP module after all of its
                 trainable parameters have accumulated gradients.
+            grad_accumulation_count: Total parameter-gradient callbacks per reduction
+                window. Defaults to one per owned trainable parameter. A scheduler
+                with multiple GraphTasks must include every shared-parameter
+                contribution, including delayed TE weight-gradient callbacks. The
+                count must be zero exactly when there are no trainable parameters.
         """
         module = cast(nn.Module, self)
+        if grad_accumulation_count is not None:
+            has_trainable_parameters = any(self._trainable_fsdp_parameters())
+            if bool(grad_accumulation_count) != has_trainable_parameters:
+                raise ValueError(
+                    "grad_accumulation_count must be zero exactly when the module "
+                    "owns no trainable parameters."
+                )
+            self._trainable_parameter_countdown.check_complete()
+            self._trainable_parameter_countdown = Countdown(grad_accumulation_count)
         if self._trainable_parameter_countdown.initial_value == 0:
             module.register_full_backward_hook(
                 lambda hooked_module, _grad_input, _grad_output: post_backward_hook(
@@ -358,6 +372,13 @@ class FsdpModule:
                 parameter_module.register_wgrad_accumulation_and_reduce_hooks(
                     lambda parameter=parameter: grad_hook(parameter)
                 )
+
+    def _trainable_fsdp_parameters(self) -> Iterator[FsdpParameter]:
+        """Iterate this module's trainable parameters in a stable order."""
+        for group in self._parameter_groups:
+            if not group.requires_grad:
+                continue
+            yield from group.fsdp_parameters
 
     @staticmethod
     def _pre_load_state_dict(
