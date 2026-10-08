@@ -680,11 +680,25 @@ class TestMcoreAdapterExpertParallel:
         _destroy_model_parallel()
 
     @pytest.mark.parametrize(
-        "shortcut, custom_units",
-        [(False, False), (True, False), (True, True)],
-        ids=["standard", "shortcut", "shortcut-custom-units"],
+        "shortcut, custom_units, overlap, recompute_norms",
+        [
+            (False, False, False, False),
+            (True, False, False, False),
+            (True, True, False, False),
+            (True, True, True, False),
+            (True, True, False, True),
+            (True, True, True, True),
+        ],
+        ids=[
+            "standard",
+            "shortcut",
+            "shortcut-custom-units",
+            "shortcut-custom-units-overlap",
+            "shortcut-custom-units-recompute",
+            "shortcut-custom-units-overlap-recompute",
+        ],
     )
-    def test_build_train_step_and_clip(self, shortcut, custom_units):
+    def test_build_train_step_and_clip(self, shortcut, custom_units, overlap, recompute_norms):
         """Shard experts over expert-DP and clip their combined gradients."""
         # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
         # initialization instead uses the globally configured EP=2 rank in its RNG seed.
@@ -700,6 +714,7 @@ class TestMcoreAdapterExpertParallel:
             moe_grouped_gemm=True,
             moe_ffn_hidden_size=128,
             moe_shortcut_connection=shortcut,
+            moe_shortcut_parallel=overlap,
             moe_shortcut_post_norm=shortcut,
             moe_shared_expert_intermediate_size=128 if shortcut else None,
             add_bias_linear=False,
@@ -709,6 +724,10 @@ class TestMcoreAdapterExpertParallel:
             hidden_dropout=0.0,
             gradient_accumulation_fusion=False,
             attention_backend=AttnBackend.unfused,
+            recompute_granularity="selective" if recompute_norms else None,
+            recompute_modules=(
+                ["layernorm", "shortcut_pre_mlp_layernorm"] if recompute_norms else None
+            ),
         )
         # Pair CPU initialization with an explicit common seed for the reference and EP model.
         torch.manual_seed(123)
@@ -751,13 +770,11 @@ class TestMcoreAdapterExpertParallel:
                             model_parameter.data.copy_(reference_parameter.data)
         reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
         fsdp_unit_modules = None
-        if custom_units:
-            fsdp_unit_modules = [
-                TransformerLayer,
-                MoETransformerLayer,
-                MoELayer,
-                type(model.decoder.layers[0].shortcut_pre_mlp_layernorm),
-            ]
+        if shortcut:
+            # Select boundaries explicitly; default shortcut wrapping is covered by #7781.
+            fsdp_unit_modules = [ShortcutMoEBlock]
+            if custom_units:
+                fsdp_unit_modules.append(type(model.decoder.layers[0].shortcut_pre_mlp_layernorm))
         model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
@@ -835,6 +852,11 @@ class TestMcoreAdapterExpertParallel:
                 targets[input_slice],
             )
             loss.backward()
+            assert all(
+                unit._unshard_event is None
+                for unit in model.module.modules()
+                if isinstance(unit, FsdpModule)
+            ), "Static prefetch must not leave unused full weights after backward."
             success, _, _ = optimizer.step()
             assert success
             loss = loss.detach()
