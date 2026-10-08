@@ -128,7 +128,7 @@ def fully_shard(
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
-    grad_divisor: int = 1,
+    grad_scale: float = 1.0,
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     register_hooks: bool = True,
 ) -> None:
@@ -143,8 +143,7 @@ def fully_shard(
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
-        grad_divisor: Additional divisor applied to the reduced gradient, on top of the
-            averaging the mesh already performs. Defaults to 1, which is correct whenever
+        grad_scale: Multiplier applied after mesh averaging. Defaults to 1, which is correct when
             each mesh rank contributes exactly one term to the gradient.
 
             Expert parallelism is the motivating case. A rank's experts process tokens
@@ -152,8 +151,12 @@ def fully_shard(
             pass routes those tokens' gradients back, so a rank's expert gradient already
             sums over ``ep_size`` ranks' data before any reduction happens. Averaging over
             the expert-data-parallel mesh alone therefore divides by too little, and
-            ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
-            their own rank's tokens and need no divisor.
+            ``grad_scale=1 / ep_size`` makes up the difference. Dense parameters see only
+            their own rank's tokens and need no additional scaling.
+
+            For per-token loss, ``grad_scale=mesh.size()`` cancels mesh averaging
+            so gradients are summed. Normalize once by the global token count after
+            accumulating all microbatches and before clipping or updating weights.
         schedule_policy: Communication scheduling policy for this FSDP module.
         register_hooks: Whether to register the automatic forward and backward execution
             hooks on ``module``. Disable this when an external scheduler invokes the
@@ -186,7 +189,7 @@ def fully_shard(
             main_grad_placements=tuple(placements.gradient),
             main_weight_placements=tuple(placements.optimizer),
             mixed_precision_policy=mixed_precision_policy,
-            grad_divisor=grad_divisor,
+            grad_scale=grad_scale,
             schedule_policy=schedule_policy,
             use_symmetric_memory=context.use_symmetric_memory,
             register_hooks=register_hooks,
