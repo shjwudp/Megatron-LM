@@ -41,7 +41,11 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_block import TransformerBlock
-from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
+from megatron.core.transformer.transformer_config import (
+    MLATransformerConfig,
+    TransformerConfig,
+    WideResidualConfig,
+)
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
@@ -132,6 +136,70 @@ class TestMcoreAdapterDense:
                 for parameter in group.fsdp_parameters:
                     parameters.append(parameter.unsharded)
         assert any(isinstance(p, MXFP8Tensor) for p in parameters)
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(
+        torch.cuda.get_device_capability()[0] < 10,
+        reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
+    )
+    def test_dsv4_mxfp8_up_projection_recompute(self, distributed_setup):
+        """Selective up-projection replay gathers forward weights during backward."""
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=16,
+            ffn_hidden_size=512,
+            q_lora_rank=64,
+            kv_lora_rank=32,
+            qk_head_dim=32,
+            qk_pos_emb_head_dim=32,
+            v_head_dim=64,
+            output_projection_groups=8,
+            output_projection_lora_rank=64,
+            multi_latent_attention=True,
+            experimental_attention_variant="dsv4_hybrid",
+            dsa_kernel_backend="none",
+            csa_window_size=8,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            add_bias_linear=False,
+            gradient_accumulation_fusion=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            recompute_granularity="selective",
+            recompute_modules=["mla_up_proj"],
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=128,
+            hybrid_layer_pattern="W",
+            pg_collection=self.pg_collection,
+        ).cuda()
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                data_parallel_sharding_strategy="optim_grads_params",
+                fp8_param_gather=True,
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+        optimizer = get_megatron_optimizer(OptimizerConfig(lr=1e-3, bf16=True), [model])
+        optimizer.reload_model_params()
+        input_ids = torch.arange(128, device="cuda").unsqueeze(0)
+        for iteration in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            output = model(input_ids, input_ids, attention_mask=None)
+            assert torch.isfinite(output).all(), f"Nonfinite output at iteration {iteration}"
+            output.float().square().mean().backward()
+            assert optimizer.step()[0]
 
     def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(self):
         """init_model_with_meta_device should materialize FSDP v2 parameters with configured values."""

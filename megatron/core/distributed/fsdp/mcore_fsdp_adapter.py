@@ -45,6 +45,9 @@ from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConn
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+    DSv4HybridAttention,
+)
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
@@ -622,6 +625,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
 
         recompute_units = set()
+        if config.recompute_granularity == "selective" and "mla_up_proj" in (
+            config.recompute_modules or []
+        ):
+            for attention in module.modules():
+                if isinstance(attention, DSv4HybridAttention):
+                    for name in ("linear_q_up_proj", "linear_kv_proj", "kv_layernorm"):
+                        child = getattr(attention, name, None)
+                        if child is not None and next(child.parameters(), None) is not None:
+                            recompute_units.add(child)
         if config.recompute_granularity == "selective" and "residual_stream" in (
             config.recompute_modules or []
         ):
