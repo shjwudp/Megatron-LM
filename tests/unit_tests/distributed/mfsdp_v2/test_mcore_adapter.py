@@ -31,6 +31,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     wide_residual_hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
@@ -271,6 +272,77 @@ class TestMcoreAdapterDense:
         )
 
         assert fully_shard_context_calls == [True]
+
+    def test_mhc_fast_path_keeps_inner_weights_unsharded(self):
+        """The mHC wrapper owns parameters accessed without inner-layer call hooks."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            ffn_hidden_size=64,
+            mtp_num_layers=1,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=2,
+            use_cpu_initialization=True,
+            params_dtype=torch.float32,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            add_bias_linear=False,
+            gradient_accumulation_fusion=False,
+        )
+
+        def build_model():
+            return HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=8,
+                hybrid_layer_pattern="-/-",
+                parallel_output=False,
+                pg_collection=self.pg_collection,
+            ).cuda()
+
+        reference_model = build_model()
+        model = build_model()
+        model.load_state_dict(reference_model.state_dict())
+        reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+        wrappers = [
+            module
+            for module in model.module.modules()
+            if isinstance(module, HyperConnectionHybridLayer)
+        ]
+        assert len(wrappers) == 2
+        assert all(isinstance(wrapper, FsdpModule) for wrapper in wrappers)
+        assert all(not isinstance(wrapper.inner_layer, FsdpModule) for wrapper in wrappers)
+
+        optimizer_config = OptimizerConfig(lr=1e-3, weight_decay=0.0, clip_grad=0.0)
+        reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
+        optimizer = get_megatron_optimizer(optimizer_config, [model])
+        optimizer.reload_model_params()
+        input_ids = torch.arange(8, device="cuda").repeat(2, 1)
+        position_ids = torch.arange(8, device="cuda").repeat(2, 1)
+
+        for _ in range(3):
+            reference_optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
+            reference_output = reference_model(input_ids, position_ids, attention_mask=None)
+            output = model(input_ids, position_ids, attention_mask=None)
+            torch.testing.assert_close(output, reference_output, rtol=1e-4, atol=1e-5)
+            reference_output.square().mean().backward()
+            output.square().mean().backward()
+            assert reference_optimizer.step()[0]
+            assert optimizer.step()[0]
 
     def test_build_train_and_step(self):
         """Match eager training against an MFSDP v2 train-and-step sequence."""

@@ -41,6 +41,7 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -735,21 +736,26 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             # FSDP shards. The block gathers their weights around its own forward/backward.
             # Experts keep their expert-DP units above; other explicitly selected children
             # (e.g. a norm called through __call__) can still be separate units.
-            shortcut_inner_modules = {
+            hook_bypassed_modules = {
                 child
                 for block in module.modules()
                 if isinstance(block, ShortcutMoEBlock)
                 for child in (block.compute_layer, block.moe_layer, block.moe_layer.mlp)
             }
+            hook_bypassed_modules.update(
+                submodule.inner_layer
+                for submodule in module.modules()
+                if isinstance(submodule, HyperConnectionHybridLayer)
+            )
             for submodule in reversed(list(module.modules())):
-                if submodule in shortcut_inner_modules:
+                if submodule in hook_bypassed_modules:
                     continue
                 if submodule is module:
                     # The root is always sharded after selected child units so it is not
                     # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
                 if (
-                    isinstance(submodule, ShortcutMoEBlock)
+                    isinstance(submodule, (ShortcutMoEBlock, HyperConnectionHybridLayer))
                     or submodule in recompute_units
                     or any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules)
                 ):
