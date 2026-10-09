@@ -302,6 +302,7 @@ class TestMcoreAdapterDense:
                 pg_collection=self.pg_collection,
             ).cuda()
 
+        torch.manual_seed(1234)
         reference_model = build_model()
         model = build_model()
         model.load_state_dict(reference_model.state_dict())
