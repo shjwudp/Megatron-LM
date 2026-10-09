@@ -269,6 +269,11 @@ def _set_train_state():
     _GLOBAL_TRAIN_STATE = TrainState()
 
 
+def initialize_tokenizer(args):
+    """Initialize tokenizer and vocabulary fields before model config construction."""
+    return _build_tokenizer(args)
+
+
 def _build_tokenizer(args):
     """Initialize tokenizer."""
     global _GLOBAL_TOKENIZER

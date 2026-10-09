@@ -99,8 +99,9 @@ def test_moe_norm_flag_reaches_transformer_config():
 
 
 @pytest.mark.parametrize('explicit_hash_vocab_size', [None, 100007])
+@pytest.mark.parametrize('raw_vocab_size', [None, 100000])
 def test_hash_moe_vocab_is_initialized_before_config_conversion(
-    monkeypatch, explicit_hash_vocab_size
+    monkeypatch, explicit_hash_vocab_size, raw_vocab_size
 ):
     from megatron.training import global_vars
 
@@ -110,19 +111,19 @@ def test_hash_moe_vocab_is_initialized_before_config_conversion(
     args.params_dtype = torch.float32
     args.moe_num_hash_layers = 1
     args.hash_moe_vocab_size = explicit_hash_vocab_size
-    args.vocab_size = 100000
+    args.vocab_size = raw_vocab_size
     args.padded_vocab_size = 100352
     tokenizer = SimpleNamespace(vocab_size=100003)
     monkeypatch.setattr(global_vars, '_GLOBAL_TOKENIZER', None)
     monkeypatch.setattr(global_vars, 'build_tokenizer', lambda _args: tokenizer)
 
-    global_vars._build_tokenizer(args)
+    global_vars.initialize_tokenizer(args)
     config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
 
     expected = 100003 if explicit_hash_vocab_size is None else explicit_hash_vocab_size
     assert config.hash_moe_vocab_size == expected
     assert args.hash_moe_vocab_size == expected
-    assert args.vocab_size == 100000
+    assert args.vocab_size == raw_vocab_size
     assert args.padded_vocab_size == 100352
 
 
