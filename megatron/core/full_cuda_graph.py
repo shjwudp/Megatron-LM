@@ -257,7 +257,8 @@ class FullCudaGraphWrapper:
         """Increment current training/validation iteration."""
         FullCudaGraphWrapper.curr_iteration[stage] += 1
 
-    def reset_cuda_graph(self, stage=None):
+    @staticmethod
+    def reset_cuda_graph(stage=None):
         """Reset CUDA graph."""
         if stage is None or stage == 'training':
             if FullCudaGraphWrapper.cuda_graph['training'] is not None:

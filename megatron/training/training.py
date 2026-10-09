@@ -2287,6 +2287,10 @@ def pretrain(
         # process groups are destroyed make NCCL abort.
         deregister_and_clear_gtp_symm_pools()
 
+    if args.cuda_graph_impl == "full_iteration":
+        torch.cuda.synchronize()
+        FullCudaGraphWrapper.reset_cuda_graph()
+
     ft_integration.shutdown()
     one_logger_utils.finish()
 
@@ -5608,6 +5612,9 @@ def train(
         # tore down the provider (nothing left to export into). _end_otel_job_spans()
         # ends the spans first, then shuts down, so it must be this call, not a
         # standalone get_telemetry().shutdown().
+        if args.cuda_graph_impl == "full_iteration":
+            torch.cuda.synchronize()
+            FullCudaGraphWrapper.reset_cuda_graph()
         _end_otel_job_spans()
         sys.exit(exit_code)
 

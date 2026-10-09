@@ -812,6 +812,8 @@ class TestMcoreAdapterCudaGraph:
         # operates on. Remove the wrapper to break this cycle so the optimizer's
         # GPU memory can be released when the test returns.
         del graph_optimizer.step
+        FullCudaGraphWrapper.reset_cuda_graph()
+        assert FullCudaGraphWrapper.cuda_graph["training"] is None
 
 
 class TestMcoreAdapterExpertParallel:
