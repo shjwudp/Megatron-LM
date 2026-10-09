@@ -1542,6 +1542,13 @@ class MultiTokenPredictionLayer(MegatronModule):
                 setattr(self.hc_head_scale, "sequence_parallel", True)
         self.offload_context = nullcontext()
 
+    def reset_parameters(self) -> None:
+        """Initialize direct mHC readout parameters without resetting the nested model."""
+        if self.mhc_enabled:
+            nn.init.xavier_uniform_(self.hc_head_fn)
+            nn.init.zeros_(self.hc_head_base)
+            nn.init.ones_(self.hc_head_scale)
+
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained MTP execution."""
         if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:

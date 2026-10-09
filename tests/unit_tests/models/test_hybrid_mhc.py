@@ -155,6 +155,36 @@ class TestHybridStackMHC:
         assert torch.isfinite(stack.hc_head_fn).all()
         assert torch.count_nonzero(stack.hc_head_fn) > 0
 
+    def test_meta_initialization_includes_mtp_readout(self):
+        """Materializing a complete mHC HybridModel also initializes the MTP readout."""
+        from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+            _materialize_owned_meta_modules,
+        )
+
+        config = _get_config(num_layers=1, mtp_num_layers=1)
+        with torch.device("meta"):
+            model = HybridModel(
+                config=config,
+                hybrid_stack_spec=_get_dummy_stack_spec(),
+                vocab_size=64,
+                max_sequence_length=8,
+                hybrid_layer_pattern="-/-",
+                parallel_output=False,
+            )
+        mtp_layers = [
+            module for module in model.modules() if isinstance(module, MultiTokenPredictionLayer)
+        ]
+        assert len(mtp_layers) == 1
+        assert mtp_layers[0].hc_head_fn.is_meta
+
+        _materialize_owned_meta_modules(model, torch.device("cuda"))
+        assert all(not parameter.is_meta for parameter in model.parameters())
+        for layer in mtp_layers:
+            torch.testing.assert_close(layer.hc_head_base, torch.zeros_like(layer.hc_head_base))
+            torch.testing.assert_close(layer.hc_head_scale, torch.ones_like(layer.hc_head_scale))
+            assert torch.isfinite(layer.hc_head_fn).all()
+            assert torch.count_nonzero(layer.hc_head_fn) > 0
+
     def test_constructor_and_sharded_state(self):
         config = _get_config(num_layers=3)
         stack = _get_stack(config, num_local_layers=3)
