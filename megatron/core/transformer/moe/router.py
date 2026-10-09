@@ -319,7 +319,8 @@ class TopKRouter(Router):
                 "Load a trained table from a checkpoint or provide a workload-aware "
                 "initialization before training.",
             )
-            token_ids = torch.arange(self.config.hash_moe_vocab_size, device=self.weight.device)
+            table_device = torch.device("cpu") if self.weight.is_meta else self.weight.device
+            token_ids = torch.arange(self.config.hash_moe_vocab_size, device=table_device)
             expert_offsets = torch.arange(self.topk, device=token_ids.device)
             self.tid2eid = ((token_ids[:, None] + expert_offsets) % self.num_experts).to(
                 torch.int32

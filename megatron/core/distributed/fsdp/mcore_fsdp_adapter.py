@@ -132,6 +132,8 @@ def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | No
     """
     for submodule in module.modules():
         _materialize_meta_module(submodule, device)
+        for name, buffer in submodule.named_buffers(recurse=False):
+            submodule._buffers[name] = buffer.to(device=device or torch.device("cpu"))
 
 
 class FullyShardedDataParallelV1(_BaseDataParallel):
@@ -717,12 +719,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             if active_context is not None
             else fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub)
         )
-        with construction_context:
+        with construction_context as fsdp_context:
+            materialization_device = fsdp_context.allgather_stream.device
             if expert_dp_mesh is not None:
                 for submodule in module.modules():
                     if isinstance(submodule, MoELayer):
                         if config.init_model_with_meta_device:
-                            _materialize_owned_meta_modules(submodule.experts, device)
+                            _materialize_owned_meta_modules(submodule.experts, materialization_device)
                         fully_shard(
                             submodule.experts,
                             mesh=expert_dp_mesh,
@@ -760,7 +763,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     or any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules)
                 ):
                     if config.init_model_with_meta_device:
-                        _materialize_owned_meta_modules(submodule, device)
+                        _materialize_owned_meta_modules(submodule, materialization_device)
                     fully_shard(
                         submodule,
                         mesh=dp_mesh,
@@ -769,7 +772,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         **common_fully_shard_kwargs,
                     )
             if config.init_model_with_meta_device:
-                _materialize_owned_meta_modules(module, device)
+                _materialize_owned_meta_modules(module, materialization_device)
             fully_shard(
                 module,
                 mesh=dp_mesh,

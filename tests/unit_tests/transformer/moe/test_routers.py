@@ -1256,6 +1256,37 @@ class TestHashRouting:
         Utils.destroy_model_parallel()
         RouterReplay.clear_global_router_replay_instances()
 
+    @pytest.mark.parametrize("custom_table", [False, True])
+    def test_meta_hash_table_materialization_preserves_values(self, custom_table):
+        """MFSDP moves real hash buffers to the compute device without losing assignments."""
+        from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+            _materialize_owned_meta_modules,
+        )
+
+        config = _hash_routing_config(init_model_with_meta_device=True, use_cpu_initialization=False)
+        with torch.device("meta"):
+            router = _make_hash_router(config, layer_number=1)
+        assert router.weight.is_meta
+        expected_table = (
+            torch.arange(config.hash_moe_vocab_size, device="cpu")[:, None]
+            + torch.arange(config.moe_router_topk, device="cpu")
+        ) % config.num_moe_experts
+        if custom_table:
+            expected_table = (expected_table + 1) % config.num_moe_experts
+            router.tid2eid.copy_(expected_table.to(torch.int32))
+        torch.testing.assert_close(router.tid2eid, expected_table.to(torch.int32))
+
+        _materialize_owned_meta_modules(router, torch.device("cuda"))
+        assert router.tid2eid.device == router.weight.device
+        torch.testing.assert_close(router.tid2eid.cpu(), expected_table.to(torch.int32))
+        input_ids = torch.arange(8, device="cuda").reshape(2, 4)
+        logits = torch.randn(8, config.num_moe_experts, device="cuda")
+        probs, routing_map = router._hash_routing(logits, input_ids)
+        assert torch.isfinite(probs).all()
+        expected_indices = router.tid2eid[input_ids.T.reshape(-1)].long()
+        expected_map = torch.zeros_like(routing_map).scatter(1, expected_indices, True)
+        assert torch.equal(routing_map, expected_map)
+
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
