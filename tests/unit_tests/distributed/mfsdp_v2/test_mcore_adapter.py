@@ -159,6 +159,7 @@ class TestMcoreAdapterDense:
             multi_latent_attention=True,
             experimental_attention_variant="dsv4_hybrid",
             dsa_kernel_backend="none",
+            csa_compress_ratios=[0],
             csa_window_size=8,
             bf16=True,
             params_dtype=torch.bfloat16,
