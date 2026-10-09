@@ -338,14 +338,22 @@ class TestMcoreAdapterDense:
 
         reference_parameters = dict(reference_model.named_parameters())
         for iteration in range(3):
-            for name, parameter in model.module.named_parameters():
-                torch.testing.assert_close(
-                    parameter.full_tensor(),
-                    reference_parameters[name],
-                    rtol=1e-5,
-                    atol=1e-6,
-                    msg=f"{name} differs before iteration {iteration}",
-                )
+            for module_name, unit in model.module.named_modules():
+                if not isinstance(unit, FsdpModule):
+                    continue
+                for group in unit.parameter_groups:
+                    full_weight = group.main_weight.allgather(0)
+                    for index, parameter in enumerate(group.fsdp_parameters):
+                        name = parameter.fqns[0]
+                        if module_name:
+                            name = f"{module_name}.{name}"
+                        torch.testing.assert_close(
+                            full_weight.get_tensor_view(index),
+                            reference_parameters[name],
+                            rtol=1e-5,
+                            atol=1e-6,
+                            msg=f"{name} differs before iteration {iteration}",
+                        )
             reference_optimizer.zero_grad(set_to_none=True)
             optimizer.zero_grad(set_to_none=True)
             reference_output = reference_model(input_ids, position_ids, attention_mask=None)
