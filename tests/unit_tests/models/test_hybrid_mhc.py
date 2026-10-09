@@ -165,7 +165,7 @@ class TestHybridStackMHC:
         with torch.device("meta"):
             model = HybridModel(
                 config=config,
-                hybrid_stack_spec=_get_dummy_stack_spec(),
+                hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=64,
                 max_sequence_length=8,
                 hybrid_layer_pattern="-/-",
