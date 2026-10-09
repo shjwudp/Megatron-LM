@@ -273,8 +273,10 @@ class TestMcoreAdapterDense:
 
         assert fully_shard_context_calls == [True]
 
-    def test_mhc_fast_path_keeps_inner_weights_unsharded(self):
+    def test_mhc_fast_path_keeps_inner_weights_unsharded(self, monkeypatch):
         """The mHC wrapper owns parameters accessed without inner-layer call hooks."""
+        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+        monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
         config = TransformerConfig(
             num_layers=1,
             hidden_size=32,
@@ -334,12 +336,27 @@ class TestMcoreAdapterDense:
         input_ids = torch.arange(8, device="cuda").repeat(2, 1)
         position_ids = torch.arange(8, device="cuda").repeat(2, 1)
 
-        for _ in range(3):
+        reference_parameters = dict(reference_model.named_parameters())
+        for iteration in range(3):
+            for name, parameter in model.module.named_parameters():
+                torch.testing.assert_close(
+                    parameter.full_tensor(),
+                    reference_parameters[name],
+                    rtol=1e-5,
+                    atol=1e-6,
+                    msg=f"{name} differs before iteration {iteration}",
+                )
             reference_optimizer.zero_grad(set_to_none=True)
             optimizer.zero_grad(set_to_none=True)
             reference_output = reference_model(input_ids, position_ids, attention_mask=None)
             output = model(input_ids, position_ids, attention_mask=None)
-            torch.testing.assert_close(output, reference_output, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(
+                output,
+                reference_output,
+                rtol=1e-4,
+                atol=1e-5,
+                msg=f"Outputs differ at iteration {iteration}",
+            )
             reference_output.square().mean().backward()
             output.square().mean().backward()
             assert reference_optimizer.step()[0]
