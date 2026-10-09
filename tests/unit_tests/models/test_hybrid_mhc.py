@@ -161,7 +161,8 @@ class TestHybridStackMHC:
             _materialize_owned_meta_modules,
         )
 
-        config = _get_config(num_layers=1, mtp_num_layers=1)
+        config = _get_config(num_layers=1, mtp_num_layers=1, init_model_with_meta_device=True)
+        config.use_cpu_initialization = False
         with torch.device("meta"):
             model = HybridModel(
                 config=config,
