@@ -129,6 +129,32 @@ class TestHybridStackMHC:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    def test_meta_initialization_restores_gates_and_readout(self):
+        """MFSDP can materialize mHC gates and readout without changing their initializers."""
+        from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+            _materialize_owned_meta_modules,
+        )
+
+        config = _get_config(num_layers=1, mhc_init_gating_factor=0.25)
+        with torch.device("meta"):
+            stack = _get_stack(config, num_local_layers=1)
+        assert all(parameter.is_meta for parameter in stack.parameters())
+
+        _materialize_owned_meta_modules(stack, torch.device("cuda"))
+        assert all(not parameter.is_meta for parameter in stack.parameters())
+        hyper_connection = stack.layers[0].hyper_connection
+        for parameter in (
+            hyper_connection.alpha_pre,
+            hyper_connection.alpha_post,
+            hyper_connection.alpha_res,
+        ):
+            torch.testing.assert_close(parameter, torch.full_like(parameter, 0.25))
+        torch.testing.assert_close(hyper_connection.bias, torch.zeros_like(hyper_connection.bias))
+        torch.testing.assert_close(stack.hc_head_base, torch.zeros_like(stack.hc_head_base))
+        torch.testing.assert_close(stack.hc_head_scale, torch.ones_like(stack.hc_head_scale))
+        assert torch.isfinite(stack.hc_head_fn).all()
+        assert torch.count_nonzero(stack.hc_head_fn) > 0
+
     def test_constructor_and_sharded_state(self):
         config = _get_config(num_layers=3)
         stack = _get_stack(config, num_local_layers=3)

@@ -430,6 +430,13 @@ class HybridStack(MegatronModule):
             pairs.append((layer.attn_local_idx, layer.moe_local_idx))
         return tuple(pairs)
 
+    def reset_parameters(self) -> None:
+        """Initialize the direct mHC readout parameters after meta materialization."""
+        if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
+            nn.init.xavier_uniform_(self.hc_head_fn)
+            nn.init.zeros_(self.hc_head_base)
+            nn.init.ones_(self.hc_head_scale)
+
     @property
     def layer_type_list(self) -> list[str]:
         """Return layer symbols derived from the per-layer configs.

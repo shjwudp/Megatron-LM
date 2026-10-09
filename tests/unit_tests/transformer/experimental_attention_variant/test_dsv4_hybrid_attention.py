@@ -492,6 +492,32 @@ class TestDSv4HybridAttentionConstructor:
         yield
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize("compress_ratio", [0, 4, 128])
+    def test_meta_attention_sink_initialization(self, compress_ratio):
+        """MFSDP materialization restores sink values and FP32 parameter attributes."""
+        from megatron.core.distributed.fsdp.mcore_fsdp_adapter import _materialize_meta_module
+        from megatron.core.transformer.experimental_attention_variant.csa import (
+            CompressedSparseAttention,
+            CompressedSparseAttentionSubmodules,
+        )
+
+        config = _make_config()
+        with torch.device("meta"):
+            attention = CompressedSparseAttention(
+                config=config,
+                submodules=CompressedSparseAttentionSubmodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type="self",
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                compress_ratio=compress_ratio,
+            )
+        assert attention.attn_sink.is_meta
+        _materialize_meta_module(attention, torch.device("cuda"))
+        assert attention.attn_sink.dtype == torch.float32
+        assert attention.attn_sink.requires_grad
+        torch.testing.assert_close(attention.attn_sink, torch.zeros_like(attention.attn_sink))
+
     def test_basic_construction(self):
         """Verify the layer builds and has the expected sub-modules."""
         from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (

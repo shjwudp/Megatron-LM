@@ -294,6 +294,13 @@ class HyperConnectionModule(MegatronModule):
             setattr(self.alpha_res, 'sequence_parallel', True)
             setattr(self.bias, 'sequence_parallel', True)
 
+    def reset_parameters(self) -> None:
+        """Initialize direct gating parameters without resetting child projections."""
+        nn.init.constant_(self.alpha_pre, self.config.mhc_init_gating_factor)
+        nn.init.constant_(self.alpha_post, self.config.mhc_init_gating_factor)
+        nn.init.constant_(self.alpha_res, self.config.mhc_init_gating_factor)
+        nn.init.zeros_(self.bias)
+
     def _projection_and_get_norm(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         """
         Projection + RMS normalization.

@@ -943,6 +943,10 @@ class CompressedSparseAttention(MegatronModule):
         else:
             self.indexer = None
 
+    def reset_parameters(self) -> None:
+        """Initialize the direct attention-sink parameter after meta materialization."""
+        nn.init.zeros_(self.attn_sink)
+
     def backward_dw(self):
         """Compute deferred gradients for the optional compressor and indexer projections."""
         if self.compressor is not None:
