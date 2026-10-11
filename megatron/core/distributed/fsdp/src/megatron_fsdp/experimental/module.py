@@ -146,8 +146,10 @@ class FsdpContext:
         return torch.cuda.current_stream(self.allgather_stream.device)
 
     def post_backward(self) -> None:
-        """Order current-stream consumers after this context's gradient reductions."""
+        """Order consumers after gradient reductions and outstanding parameter reads."""
         self.current_stream().wait_stream(self.reduce_scatter_stream)
+        if self.allgather_stream != self.reduce_scatter_stream:
+            self.current_stream().wait_stream(self.allgather_stream)
         self._post_backward_hook_registered = False
 
     def register_post_backward_hook(self) -> None:

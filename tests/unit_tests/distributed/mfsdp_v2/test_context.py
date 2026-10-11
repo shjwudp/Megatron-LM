@@ -157,6 +157,46 @@ def test_sibling_roots_enqueue_one_post_backward_wait(distributed_setup, monkeyp
     post_backward.assert_called_once_with()
 
 
+@pytest.mark.parametrize("unify_communication_stream", [False, True])
+@pytest.mark.parametrize("capture", [False, True])
+def test_post_backward_orders_optimizer_after_parameter_reads(
+    distributed_setup, unify_communication_stream, capture
+):
+    """Complete outstanding parameter reads before eager or captured optimizer writes."""
+    device = distributed_setup.device
+    with fully_shard_context(
+        device=device, unify_communication_stream=unify_communication_stream
+    ) as context:
+        pass
+    weight = torch.ones(1024, device=device)
+    observed = torch.empty_like(weight)
+    current_stream = context.current_stream()
+
+    def step():
+        weight.fill_(1)
+        step_stream = context.current_stream()
+        context.allgather_stream.wait_stream(step_stream)
+        context.reduce_scatter_stream.wait_stream(step_stream)
+        with torch.cuda.stream(context.allgather_stream):
+            torch.cuda._sleep(200_000_000)
+            observed.copy_(weight)
+        context.post_backward()
+        weight.fill_(2)
+
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        current_stream.synchronize()
+        with torch.cuda.graph(graph):
+            step()
+        for _ in range(3):
+            graph.replay()
+    else:
+        step()
+    current_stream.synchronize()
+    torch.testing.assert_close(observed, torch.ones_like(observed), rtol=0, atol=0)
+    torch.testing.assert_close(weight, torch.full_like(weight, 2), rtol=0, atol=0)
+
+
 def test_nested_prefetch_orders_use_dfs(distributed_setup):
     """Nested FsdpModules should use DFS orders for one-step prefetch."""
     device = distributed_setup.device
