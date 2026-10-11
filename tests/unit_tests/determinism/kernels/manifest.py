@@ -103,6 +103,16 @@ K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
+    KernelEntry(
+        name="mfsdp_mxfp8_quantization",
+        sources=(
+            "megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/quantized_dbuffer.py",
+        ),
+        tests=(K + "test_mfsdp_quantization.py",),
+        kind="dispatch",
+        notes="Replay all compact data and scale outputs under side-stream contention after "
+        "quantization through TE's padded scale views.",
+    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",

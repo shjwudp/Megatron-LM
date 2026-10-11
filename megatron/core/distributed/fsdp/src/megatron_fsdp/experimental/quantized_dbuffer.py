@@ -116,7 +116,7 @@ class QuantizedDBuffer:
     The data layout owns the parameter-to-rank partition. Scale planes use its
     compact MXFP8 coordinates, so every plane on a rank describes the same
     local data rows. TE-only padding is added when materializing a wrapper for
-    compute, not to distributed storage.
+    compute or quantization, not to distributed storage.
     """
 
     rowwise_data: DBuffer
@@ -234,7 +234,7 @@ class QuantizedDBuffer:
         )
 
     def get_tensor(self, index: int) -> MXFP8Tensor:
-        """Return an unswizzled compute tensor with scales padded for TE's GEMM path.
+        """Return an unswizzled tensor with scales padded for TE's compute paths.
 
         Only allocated planes are included. Data planes remain views. Scale planes
         alias storage only when no padding is needed; otherwise they are copied into
@@ -258,7 +258,17 @@ class QuantizedDBuffer:
             if actual != expected:
                 raise ValueError(f"Expected main_weight {attribute} {expected!r}, got {actual!r}.")
         for index in range(len(self.rowwise_data.layout.tensor_shapes)):
-            self.get_tensor_view(index).quantize_(main_weight.get_tensor_view(index))
+            source = main_weight.get_tensor_view(index)
+            if source.numel() == 0:
+                continue
+            padded = self.get_tensor(index)
+            padded.quantize_(source)
+            compact = self.get_tensor_view(index)
+            for attribute in ("_rowwise_scale_inv", "_columnwise_scale_inv"):
+                destination = getattr(compact, attribute)
+                if destination is not None:
+                    scale = getattr(padded, attribute)
+                    destination.copy_(scale[: destination.shape[0], : destination.shape[1]])
 
     @property
     def planes(self) -> tuple[DBuffer, DBuffer, DBuffer, DBuffer]:

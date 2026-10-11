@@ -29,68 +29,84 @@ if not is_mxfp8_available():
     pytest.skip("MXFP8 quantization is not available.", allow_module_level=True)
 
 
-def test_quantized_dbuffer_quantization_matches_te(distributed_setup):
+@pytest.mark.parametrize(
+    "shapes",
+    [[(128, 128), (128, 128), (64, 64), (32, 64)], [(128, 4096)], [(32, 4096)]],
+    ids=["fused", "short-shards", "empty-shards"],
+)
+def test_quantized_dbuffer_quantization_matches_te(distributed_setup, shapes):
     """Quantized tensor views match TE's data and scales."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    shapes = [(128, 128), (128, 128), (64, 64), (32, 64)]
     quantized = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, device)
     main_weight = DBuffer(
         mesh, [BlockAtomic(32)], quantized.rowwise_data.layout, torch.float32, device
     )
     torch.manual_seed(1234 + distributed_setup.rank)
     main_weight.local_buffer.normal_()
-    quantized.quantize_(main_weight)
+    for update in range(3):
+        if update:
+            main_weight.local_buffer.add_(1e-6)
+        quantized.quantize_(main_weight)
 
-    for index in range(len(shapes)):
-        view = quantized.get_tensor_view(index)
-        assert view._rowwise_scale_inv.shape == (view.shape[0], view.shape[1] // 32)
-        assert view._columnwise_scale_inv.shape == (view.shape[0] // 32, view.shape[1])
-        reference = MXFP8Quantizer(tex.DType.kFloat8E4M3)(main_weight.get_tensor_view(index))
-        assert view.shape == reference.shape
-        for attribute in (
-            "_rowwise_data",
-            "_columnwise_data",
-            "_rowwise_scale_inv",
-            "_columnwise_scale_inv",
-        ):
-            actual = getattr(view, attribute)
-            expected = getattr(reference, attribute)
-            # TE's allocating quantizer pads scales; our views keep them compact.
-            # Ignore the padding. GEMM support for compact scales is tracked in:
-            # https://github.com/NVIDIA/TransformerEngine/issues/3518
-            torch.testing.assert_close(
-                actual, expected[: actual.shape[0], : actual.shape[1]], rtol=0, atol=0
-            )
+        for index in range(len(shapes)):
+            view = quantized.get_tensor_view(index)
+            assert view._rowwise_scale_inv.shape == (view.shape[0], view.shape[1] // 32)
+            assert view._columnwise_scale_inv.shape == (view.shape[0] // 32, view.shape[1])
+            if view.numel() == 0:
+                continue
+            reference = MXFP8Quantizer(tex.DType.kFloat8E4M3)(main_weight.get_tensor_view(index))
+            assert view.shape == reference.shape
+            for attribute in (
+                "_rowwise_data",
+                "_columnwise_data",
+                "_rowwise_scale_inv",
+                "_columnwise_scale_inv",
+            ):
+                actual = getattr(view, attribute)
+                expected = getattr(reference, attribute)
+                # TE's allocating quantizer pads scales; our views keep them compact.
+                # Ignore the padding. GEMM support for compact scales is tracked in:
+                # https://github.com/NVIDIA/TransformerEngine/issues/3518
+                torch.testing.assert_close(
+                    actual, expected[: actual.shape[0], : actual.shape[1]], rtol=0, atol=0
+                )
 
 
-def test_quantized_dbuffer_get_tensor_supports_gemm(distributed_setup):
+@pytest.mark.parametrize(
+    "shapes",
+    [[(128, 128), (128, 128), (64, 64), (32, 64)], [(128, 4096)], [(32, 4096)]],
+    ids=["fused", "short-shards", "empty-shards"],
+)
+def test_quantized_dbuffer_get_tensor_supports_gemm(distributed_setup, shapes):
     """Compute tensors prepare gathered scales for rowwise and columnwise GEMMs."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    shapes = [(128, 128), (128, 128), (64, 64), (32, 64)]
     quantized = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, device)
     main_weight = DBuffer(
         mesh, [BlockAtomic(32)], quantized.rowwise_data.layout, torch.float32, device
     )
     torch.manual_seed(1234 + distributed_setup.rank)
     main_weight.local_buffer.normal_()
-    quantized.quantize_(main_weight)
-    gathered = quantized.redistribute([Replicate()])
-    gathered_main = main_weight.redistribute([Replicate()])
     quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
-    for index, shape in enumerate(shapes):
-        compute_tensor = gathered.get_tensor(index)
-        reference = quantizer(gathered_main.get_tensor_view(index))
-        for layout, inner_dim in (("TN", shape[1]), ("NN", shape[0])):
-            activation = quantizer(torch.randn((64, inner_dim), device=device))
-            actual = general_gemm(
-                compute_tensor, activation, out_dtype=torch.bfloat16, layout=layout
-            )[0]
-            expected = general_gemm(reference, activation, out_dtype=torch.bfloat16, layout=layout)[
-                0
-            ]
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for update in range(3):
+        if update:
+            main_weight.local_buffer.add_(1e-6)
+        quantized.quantize_(main_weight)
+        gathered = quantized.redistribute([Replicate()])
+        gathered_main = main_weight.redistribute([Replicate()])
+        for index, shape in enumerate(shapes):
+            compute_tensor = gathered.get_tensor(index)
+            reference = quantizer(gathered_main.get_tensor_view(index))
+            for layout, inner_dim in (("TN", shape[1]), ("NN", shape[0])):
+                activation = quantizer(torch.randn((64, inner_dim), device=device))
+                actual = general_gemm(
+                    compute_tensor, activation, out_dtype=torch.bfloat16, layout=layout
+                )[0]
+                expected = general_gemm(
+                    reference, activation, out_dtype=torch.bfloat16, layout=layout
+                )[0]
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_quantized_dbuffer_redistributes_every_plane(distributed_setup):
