@@ -133,6 +133,7 @@ class FsdpParameterGroup:
     _unsharded_model_weight: "DBuffer | QuantizedDBuffer"
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_scale: float
+    _grad_comm_dtype: torch.dtype | None
 
     def __init__(
         self,
@@ -173,6 +174,7 @@ class FsdpParameterGroup:
         self._owning_module = ref(owning_module)
         self.mesh = mesh
         self.grad_scale = grad_scale
+        self._grad_comm_dtype = mixed_precision_policy.grad_comm_dtype
         parameters = tuple(parameter_to_fqns)
 
         if parameter_to_owner is not None and _contains_any_placement_type(
@@ -570,7 +572,7 @@ class FsdpParameterGroup:
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 layout=self.main_weight.layout,
-                dtype=grads[0].dtype,
+                dtype=self._grad_comm_dtype or self.main_grad.dtype,
                 device=grads[0].device,
             )
 
