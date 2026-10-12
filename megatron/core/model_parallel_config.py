@@ -434,6 +434,16 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
+    mfsdp_cache_pipeline_group: bool = field(
+        default=False,
+        metadata={"argparse_meta": {"arg_names": ["--mfsdp-cache-pipeline-group"]}},
+    )
+    """Experimental MFSDP v2 storage retention across interleaved microbatch groups.
+
+    Pins every unit in participating chunks, without a cache-byte cap. Intended
+    for controlled experiments; forward/backward windows can overlap.
+    """
+
     microbatch_group_size_per_vp_stage: Optional[int] = field(
         default=None,
         metadata={

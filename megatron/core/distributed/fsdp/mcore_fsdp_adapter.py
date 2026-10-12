@@ -991,6 +991,26 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if grads:
             torch._foreach_mul_(grads, scaling_factor)
 
+    def begin_parameter_cache_window(self, direction: str) -> None:
+        """Pin this chunk's gathered storage for an experimental reuse window."""
+        if direction not in ("forward", "backward"):
+            raise ValueError(f"Invalid cache direction: {direction}.")
+        units = [unit for unit in self.module.modules() if isinstance(unit, FsdpModule)]
+        if any(direction in unit._parameter_cache_windows for unit in units):
+            raise RuntimeError(f"Parameter cache window already open: {direction}.")
+        for unit in units:
+            unit._parameter_cache_windows.add(direction)
+
+    def end_parameter_cache_window(self, direction: str) -> None:
+        """Release a chunk once neither direction has an active reuse window."""
+        units = [unit for unit in self.module.modules() if isinstance(unit, FsdpModule)]
+        if any(direction not in unit._parameter_cache_windows for unit in units):
+            raise RuntimeError(f"Parameter cache window not open: {direction}.")
+        for unit in units:
+            unit._parameter_cache_windows.remove(direction)
+            if not unit._parameter_cache_windows:
+                unit.reshard()
+
     def start_param_sync(self, *unused, **unused_kwargs) -> None:
         """No-op: MFSDP v2 gathers parameters from its forward pre-hooks."""
 
@@ -999,6 +1019,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
         """Wait on all submitted reductions, including delayed weight gradients."""
+        if any(
+            unit._parameter_cache_windows
+            for unit in self.module.modules()
+            if isinstance(unit, FsdpModule)
+        ):
+            raise RuntimeError("Parameter cache window remains open at gradient finalization.")
         self.module.context.finish_grad_sync()
 
         for submodule in self.module.modules():

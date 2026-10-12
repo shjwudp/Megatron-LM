@@ -83,6 +83,7 @@ class FsdpModule:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
         self._unshard_event = None
+        self._parameter_cache_windows = set()
         self._phase = Phase.RESTING
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
@@ -365,6 +366,10 @@ class FsdpModule:
             # Skip only if this module was unsharded since its last reshard and no group
             # lacks what ``phase`` reads. MXFP8 groups can still lack planes, e.g. during
             # recomputation, which needs rowwise planes after backward gathered columnwise.
+            # Cached storage survives resharding, but module parameters still switch
+            # back to their optimizer-facing shards after each use. Reinstall full views.
+            for group in self._parameter_groups:
+                group.unshard_parameters(phase)
             return
 
         allgather_stream = self.context.allgather_stream
@@ -398,6 +403,9 @@ class FsdpModule:
         """
         for group in self._parameter_groups:
             group.reshard_parameters()
+
+        if self._parameter_cache_windows:
+            return
 
         allgather_stream = self.context.allgather_stream
         allgather_stream.wait_stream(self.context.current_stream())

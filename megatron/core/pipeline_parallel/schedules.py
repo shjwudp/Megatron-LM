@@ -1383,6 +1383,28 @@ def forward_backward_pipelining_with_interleaving(
 
         return
 
+    if config.mfsdp_cache_pipeline_group:
+        if config.overlap_moe_expert_parallel_comm:
+            raise ValueError("Pipeline parameter caching requires the ordinary interleaved schedule.")
+        for chunk in model:
+            get_attr_wrapped_model(chunk, "begin_parameter_cache_window")
+
+    def parameter_cache_boundary(virtual_microbatch_id, forward, begin):
+        """Open/close a chunk's directional reuse window at group boundaries."""
+        if not config.mfsdp_cache_pipeline_group:
+            return
+        microbatch_id = get_microbatch_id_in_model_chunk(virtual_microbatch_id, forward)
+        group_size = config.microbatch_group_size_per_vp_stage
+        at_boundary = (
+            microbatch_id % group_size == 0
+            if begin
+            else (microbatch_id + 1) % group_size == 0 or microbatch_id == num_microbatches - 1
+        )
+        if at_boundary:
+            chunk_id = get_model_chunk_id(virtual_microbatch_id, forward)
+            method = "begin_parameter_cache_window" if begin else "end_parameter_cache_window"
+            get_attr_wrapped_model(model[chunk_id], method)("forward" if forward else "backward")
+
     def forward_step_helper(virtual_microbatch_id, checkpoint_activations_microbatch):
         """Helper method to run forward step with model split into chunks"""
         model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=True)
@@ -1392,6 +1414,7 @@ def forward_backward_pipelining_with_interleaving(
             virtual_microbatch_id, model_chunk_id, microbatch_id
         )
 
+        parameter_cache_boundary(virtual_microbatch_id, forward=True, begin=True)
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator[model_chunk_id],
@@ -1413,6 +1436,7 @@ def forward_backward_pipelining_with_interleaving(
             is_last_stage=_is_vp_last_stage(vp_stage=model_chunk_id) and is_pp_last_stage(pp_group),
         )
 
+        parameter_cache_boundary(virtual_microbatch_id, forward=True, begin=False)
         forward_step_helper_postprocess(model_chunk_id, output_tensor, num_tokens)
 
         return output_tensor
@@ -1465,7 +1489,9 @@ def forward_backward_pipelining_with_interleaving(
             virtual_microbatch_id, model_chunk_id
         )
 
+        parameter_cache_boundary(virtual_microbatch_id, forward=False, begin=True)
         input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+        parameter_cache_boundary(virtual_microbatch_id, forward=False, begin=False)
 
         backward_step_helper_postprocess(virtual_microbatch_id)
 
