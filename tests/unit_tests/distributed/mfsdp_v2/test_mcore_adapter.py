@@ -209,6 +209,7 @@ class TestMcoreAdapterDense:
             output = model(input_ids, input_ids, attention_mask=None)
             assert torch.isfinite(output).all(), f"Nonfinite output at iteration {iteration}"
             output.float().square().mean().backward()
+            model.finish_grad_sync()
             assert optimizer.step()[0]
 
     def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(self):
@@ -445,6 +446,7 @@ class TestMcoreAdapterDense:
             )
             reference_output.square().mean().backward()
             output.square().mean().backward()
+            model.finish_grad_sync()
             assert reference_optimizer.step()[0]
             assert optimizer.step()[0]
 
