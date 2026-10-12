@@ -1393,7 +1393,8 @@ def forward_backward_pipelining_with_interleaving(
         """Open/close a chunk's directional reuse window at group boundaries."""
         if not config.mfsdp_cache_pipeline_group:
             return
-        microbatch_id = get_microbatch_id_in_model_chunk(virtual_microbatch_id, forward)
+        # Both directions use the same microbatch table; backward reverses chunk IDs.
+        microbatch_id = microbatch_id_table[virtual_microbatch_id]
         group_size = config.microbatch_group_size_per_vp_stage
         at_boundary = (
             microbatch_id % group_size == 0
