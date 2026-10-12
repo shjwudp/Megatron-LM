@@ -64,6 +64,7 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.global_vars import (
+    get_run_config,
     initialize_runtime_services,
     initialize_tokenizer,
     set_run_config,
@@ -382,6 +383,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 
 def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     """Build the GPT dataset config from parsed CLI args."""
+    cfg = get_run_config()
     tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
@@ -395,7 +397,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
             sequences_per_dataset = json.load(f)
 
     return GPTDatasetConfig(
-        random_seed=args.seed,
+        random_seed=cfg.rng.seed,
         sequence_length=args.seq_length,
         blend=blend,
         blend_per_split=blend_per_split,
@@ -573,7 +575,7 @@ if __name__ == "__main__":
         model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
-    initialize_runtime_services(args, build_tokenizer=False)
+    initialize_runtime_services(args, build_tokenizer=False, training=True)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,

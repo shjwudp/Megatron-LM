@@ -48,6 +48,7 @@ from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
     DSv4HybridAttention,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
@@ -175,6 +176,15 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> Tuple[Type[nn.Module], ...]:
         """Module classes needing ``parameters(recurse=True)`` for fine-grained hooks."""
+        recurse_types: List[Type[nn.Module]] = []
+
+        if config.dsa_indexer_weights_proj_output_dtype == "fp32":
+            # BF16 calls linear_weights_proj as a module and uses its leaf FSDP hooks. FP32 invokes
+            # custom autograd with the weight directly, and its forward readiness check cannot
+            # provide a pre-backward unshard hook. Since DSAttention also calls the indexer method
+            # directly, recurse from the enclosing DSAttention boundary for both passes.
+            recurse_types.append(DSAttention)
+
         if config.overlap_moe_expert_parallel_comm and any_sharding_strategy_in(
             ddp_config, ["optim_grads_params"]
         ):
@@ -182,8 +192,8 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
             from megatron.core.transformer.moe.experts import TEGroupedMLP
             from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 
-            return (TEGroupedMLP, SharedExpertMLP)
-        return ()
+            recurse_types.extend((TEGroupedMLP, SharedExpertMLP))
+        return tuple(recurse_types)
 
     def __init__(
         self,
@@ -724,13 +734,22 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             register_hooks=not config.overlap_moe_expert_parallel_comm,
         )
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
-        # open and finalize our own.
+        # open and finalize our own. MCore's finalize_model_grads() owns the wait
+        # after the schedule completes, including delayed wgrad and custom 1F1B work.
         active_context = current_fully_shard_context()
-        construction_context = (
-            nullcontext(active_context)
-            if active_context is not None
-            else fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub)
-        )
+        if active_context is None:
+            construction_context = fully_shard_context(
+                device=device,
+                use_symmetric_memory=ddp_config.nccl_ub,
+                caller_managed_grad_sync=True,
+            )
+        else:
+            if not active_context.caller_managed_grad_sync:
+                raise ValueError(
+                    "MCore MFSDP v2 requires shared contexts to be constructed with "
+                    "caller_managed_grad_sync=True."
+                )
+            construction_context = nullcontext(active_context)
         with construction_context as fsdp_context:
             materialization_device = fsdp_context.allgather_stream.device
             if expert_dp_mesh is not None:
@@ -979,12 +998,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """MFSDP v2 reduces gradients during backward."""
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
-        """MFSDP v2 gradient reduction is complete when backward returns."""
-        if self.config.overlap_moe_expert_parallel_comm:
-            # Under the custom schedule like 1F1B, post_backward_final_callback is not invoked.
-            # Synchronize gradients here to ensure it is safe to call optimizer.step().
-            context = self.module.context
-            context.current_stream().wait_stream(context.reduce_scatter_stream)
+        """Wait on all submitted reductions, including delayed weight gradients."""
+        self.module.context.finish_grad_sync()
 
         for submodule in self.module.modules():
             if isinstance(submodule, FsdpModule):
@@ -1000,7 +1015,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
 
     def stop_communication(self) -> None:
-        """MFSDP v2 communication is complete when backward returns."""
+        """Wait for any pending gradient reductions."""
+        self.finish_grad_sync()
 
 
 def FullyShardedDataParallel(
