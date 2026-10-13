@@ -12,34 +12,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Weakly held module occurrences in runtime execution order."""
+"""Weakly held construction or recorded module execution sequences."""
 
 from collections.abc import Iterator
 from typing import Generic, TypeVar
-from weakref import ref
+from weakref import WeakKeyDictionary, ref
 
 T = TypeVar("T")
 
 
 class ExecutionOrder(Generic[T]):
-    """Record repeated calls and look ahead from the current occurrence.
+    """Store inferred construction order or recorded runtime occurrences.
 
-    Unlike an identity index, the demand-call cursor distinguishes repeated
-    uses of the same module. Prefetch lookahead never advances that cursor.
+    Construction order contains unique modules and looks up successors from the
+    module being called, tolerating skipped or reordered execution. Recorded
+    order preserves repeated calls and validates each occurrence with a cursor.
+    Prefetch lookahead never advances the demand-call cursor.
     """
 
-    def __init__(self) -> None:
-        """Create an empty execution sequence."""
+    def __init__(self, *, recorded: bool = False) -> None:
+        """Create an empty construction order or a strict recorded sequence.
+
+        Args:
+            recorded: Preserve repeated occurrences and validate demand-call order.
+                Otherwise, index unique modules for construction-order lookahead.
+        """
         self._items: list[ref[T]] = []
+        self._index_by_item: WeakKeyDictionary[T, int] | None = (
+            None if recorded else WeakKeyDictionary()
+        )
         self._position = 0
 
     def append(self, item: T) -> None:
-        """Record one call, including repeated calls to the same item."""
+        """Append a module; repeated occurrences are allowed only in recorded order."""
+        if self._index_by_item is not None:
+            if item in self._index_by_item:
+                raise ValueError("Construction execution order does not support duplicate items.")
+            self._index_by_item[item] = len(self._items)
         self._items.append(ref(item))
 
     def clear(self) -> None:
         """Discard an interrupted recording and reset the demand-call cursor."""
         self._items.clear()
+        if self._index_by_item is not None:
+            self._index_by_item.clear()
         self._position = 0
 
     def __iter__(self) -> Iterator[T]:
@@ -50,14 +66,20 @@ class ExecutionOrder(Generic[T]):
                 yield item
 
     def advance(self, item: T) -> None:
-        """Consume a demand call, restarting after the sequence is consumed."""
+        """Consume a recorded demand call; construction orders need no cursor."""
+        if self._index_by_item is not None:
+            return
         if not self._items or self._items[self._position]() is not item:
             raise RuntimeError("FSDP module calls diverged from the recorded prefetch order.")
         self._position = (self._position + 1) % len(self._items)
 
     def next_item(self, item: T, offset: int = 1) -> T | None:
-        """Look ahead from the last consumed occurrence without moving the cursor."""
-        index = (self._position - 1) % len(self._items)
+        """Look ahead from a module or its last consumed recorded occurrence."""
+        index = (
+            self._index_by_item[item]
+            if self._index_by_item is not None
+            else (self._position - 1) % len(self._items)
+        )
         next_index = index + offset
         if next_index >= len(self._items):
             return None

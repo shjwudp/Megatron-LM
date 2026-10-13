@@ -23,7 +23,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionOrder,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.indexed_order import IndexedOrder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
     FsdpContext,
     FsdpModule,
@@ -44,7 +43,7 @@ def test_prefetch_replays_occurrences(budget):
         modules.append(module)
     first, second, third = modules
     sequence = [first, second, first, third]
-    order = ExecutionOrder()
+    order = ExecutionOrder(recorded=True)
     for module in sequence:
         order.append(module)
     expected = [[second], [first], [third], []]
@@ -66,7 +65,7 @@ def test_prefetch_replays_occurrences(budget):
 def test_static_order_lookup():
     """Construction orders remain unique and independent of demand-call order."""
     first, second, third = (object.__new__(FsdpModule) for _ in range(3))
-    order = IndexedOrder()
+    order = ExecutionOrder()
     for module in (first, second, third):
         order.append(module)
     with pytest.raises(ValueError, match='duplicate'):
@@ -77,15 +76,40 @@ def test_static_order_lookup():
     assert order.next_item(third) is None
 
 
+@pytest.mark.parametrize('budget', [None, 0, 2])
+def test_construction_prefetch_tolerates_reordered_calls(budget):
+    """Inferred order remains a prefetch hint when calls skip or reorder modules."""
+    first, second, third = (object.__new__(FsdpModule) for _ in range(3))
+    prefetched = []
+    order = ExecutionOrder()
+    for module in (first, second, third):
+        parameter = SimpleNamespace(unsharded=torch.empty(1))
+        module._parameter_groups = (SimpleNamespace(fsdp_parameters=[parameter]),)
+        module._unshard_parameter_groups = Mock(
+            side_effect=lambda target=module: prefetched.append(target)
+        )
+        order.append(module)
+    # Start at the last module, skip the middle module, and reuse the first.
+    for module in (third, first, first, second):
+        prefetched.clear()
+        module._prefetch_parameter_groups(order, budget)
+        expected = []
+        if budget != 0:
+            if module is first:
+                expected = [second, third] if budget == 2 else [second]
+            elif module is second:
+                expected = [third]
+        assert prefetched == expected
+
+
 @pytest.mark.parametrize('record', [False, True])
 def test_context_selects_prefetch_order(monkeypatch, record):
-    """The construction option selects static indices or occurrence sequences."""
+    """Both construction and recording use the same execution-order type."""
     monkeypatch.setattr(torch.cuda, 'Stream', Mock())
     context = FsdpContext(torch.device('cuda'), record_prefetch_order=record)
     context.finalize()
-    expected = ExecutionOrder if record else IndexedOrder
-    assert isinstance(context.forward_order, expected)
-    assert isinstance(context.backward_order, expected)
+    assert isinstance(context.forward_order, ExecutionOrder)
+    assert isinstance(context.backward_order, ExecutionOrder)
 
 
 def test_recording_reuses_orders_and_excludes_recomputation(monkeypatch):

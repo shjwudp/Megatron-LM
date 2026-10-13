@@ -29,7 +29,6 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
 from .execution_order import ExecutionOrder
-from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
 from .placement import BlockAtomic, RowAtomic
@@ -60,8 +59,8 @@ class FsdpContext:
     """
     # Construction orders or recorded runtime occurrences. Each FsdpModule tracks
     # its own materialized state via ``FsdpModule._unshard_event``.
-    forward_order: IndexedOrder["FsdpModule"] | ExecutionOrder["FsdpModule"]
-    backward_order: IndexedOrder["FsdpModule"] | ExecutionOrder["FsdpModule"]
+    forward_order: ExecutionOrder["FsdpModule"]
+    backward_order: ExecutionOrder["FsdpModule"]
     # The optimizer runs on the current stream and must wait for reductions on
     # this context's reduce-scatter stream. Each context owns its own stream, so
     # independent roots sharing a context need only one completion callback.
@@ -95,9 +94,8 @@ class FsdpContext:
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
-        order_type = ExecutionOrder if record_prefetch_order else IndexedOrder
-        self.forward_order = order_type()
-        self.backward_order = order_type()
+        self.forward_order = ExecutionOrder(recorded=record_prefetch_order)
+        self.backward_order = ExecutionOrder(recorded=record_prefetch_order)
         self._needs_prefetch_order_recording = record_prefetch_order
         self._recording_prefetch_order = False
         self._iteration_active = False
@@ -137,10 +135,10 @@ class FsdpContext:
                 if not isinstance(module, FsdpModule):
                     continue
                 module._name = name
-                if isinstance(self.forward_order, IndexedOrder):
+                if not self._needs_prefetch_order_recording:
                     self.forward_order.append(module)
 
-        if isinstance(self.backward_order, IndexedOrder):
+        if not self._needs_prefetch_order_recording:
             for root in reversed(roots):
                 _collect_backward_order(cast(nn.Module, root), self.backward_order)
 
@@ -192,8 +190,8 @@ class FsdpContext:
                 self._needs_prefetch_order_recording = False
         except BaseException:
             if self._recording_prefetch_order:
-                cast(ExecutionOrder, self.forward_order).clear()
-                cast(ExecutionOrder, self.backward_order).clear()
+                self.forward_order.clear()
+                self.backward_order.clear()
             raise
         finally:
             self._recording_prefetch_order = False
@@ -526,9 +524,7 @@ class FsdpModule:
                 )
 
     def _prefetch_parameter_groups(
-        self,
-        order: IndexedOrder["FsdpModule"] | ExecutionOrder["FsdpModule"],
-        prefetch_size: int | None,
+        self, order: ExecutionOrder["FsdpModule"], prefetch_size: int | None
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
         order.advance(self)
@@ -680,7 +676,7 @@ class FsdpModule:
             torch.cuda.nvtx.range_pop()
 
 
-def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]) -> None:
+def _collect_backward_order(module: nn.Module, order: ExecutionOrder["FsdpModule"]) -> None:
     """Collect one root's static backward prefetch order."""
     if isinstance(module, FsdpModule):
         order.append(module)
