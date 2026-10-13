@@ -20,8 +20,13 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_optimizer,
     microbatch,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.indexed_order import IndexedOrder
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionOrder,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
+    FsdpContext,
+    FsdpModule,
+)
 
 
 @pytest.mark.parametrize('budget', [None, 0, 2])
@@ -38,7 +43,7 @@ def test_prefetch_replays_occurrences(budget):
         modules.append(module)
     first, second, third = modules
     sequence = [first, second, first, third]
-    order = IndexedOrder(sequence)
+    order = ExecutionOrder(sequence, recorded=True)
     expected = [[second], [first], [third], []]
     if budget == 0:
         expected = [[], [], [], []]
@@ -53,6 +58,75 @@ def test_prefetch_replays_occurrences(budget):
         order.advance(third)
     order.advance(first)
     assert order.next_item(first) is second
+
+
+def test_static_order_lookup():
+    """Construction orders remain unique and independent of demand-call order."""
+    first, second, third = (object.__new__(FsdpModule) for _ in range(3))
+    order = ExecutionOrder()
+    for module in (first, second, third):
+        order.append(module)
+    with pytest.raises(ValueError, match='duplicate'):
+        order.append(first)
+    order.advance(third)
+    assert order.next_item(first) is second
+    assert order.next_item(first, offset=2) is third
+    assert order.next_item(third) is None
+
+
+@pytest.mark.parametrize('budget', [None, 0, 2])
+def test_construction_prefetch_tolerates_reordered_calls(budget):
+    """Inferred order remains a prefetch hint when calls skip or reorder modules."""
+    first, second, third = (object.__new__(FsdpModule) for _ in range(3))
+    prefetched = []
+    order = ExecutionOrder()
+    for module in (first, second, third):
+        parameter = SimpleNamespace(unsharded=torch.empty(1))
+        module._parameter_groups = (SimpleNamespace(fsdp_parameters=[parameter]),)
+        module._unshard_parameter_groups = Mock(
+            side_effect=lambda target=module: prefetched.append(target)
+        )
+        order.append(module)
+    # Start at the last module, skip the middle module, and reuse the first.
+    for module in (third, first, first, second):
+        prefetched.clear()
+        module._prefetch_parameter_groups(order, budget)
+        expected = []
+        if budget != 0:
+            if module is first:
+                expected = [second, third] if budget == 2 else [second]
+            elif module is second:
+                expected = [third]
+        assert prefetched == expected
+
+
+def test_recording_installs_execution_orders(monkeypatch):
+    """The existing recording scope installs repeated calls into ExecutionOrder."""
+    monkeypatch.setattr(torch.cuda, 'Stream', Mock())
+    context = FsdpContext(torch.device('cuda'))
+    context.finalize()
+    context.current_stream = Mock()
+    module = object.__new__(FsdpModule)
+    module._context = context
+    module._unshard_event = object()
+    module._nvtx_range = Mock(return_value=nullcontext())
+    module._unshard_parameter_groups = Mock()
+    module._prefetch_parameter_groups = Mock()
+    module._schedule_policy = SimpleNamespace(
+        forward_prefetch_size=None, backward_prefetch_size=None
+    )
+    with context.record_prefetch_order():
+        for phase in ('forward', 'forward', 'none', 'backward', 'backward'):
+            module.unshard(prefetch=phase)
+        module._prefetch_parameter_groups.assert_not_called()
+    assert isinstance(context.forward_order, ExecutionOrder)
+    assert isinstance(context.backward_order, ExecutionOrder)
+    for order in (context.forward_order, context.backward_order):
+        assert list(order) == [module, module]
+        order.advance(module)
+        assert order.next_item(module) is module
+        order.advance(module)
+        assert order.next_item(module) is None
 
 
 def test_shared_module_recording_matches_dense_training(distributed_setup):
