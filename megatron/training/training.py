@@ -2348,6 +2348,7 @@ def wrap_model_chunks_with_ddp(
     pg_collection=None,
     bucket_sizes=None,
     disable_bucketing_per_chunk=None,
+    record_prefetch_order=False,
 ):
     """Wrap each model chunk in DDP, pre-computing per-chunk param layouts as needed.
 
@@ -2389,6 +2390,8 @@ def wrap_model_chunks_with_ddp(
             ``[ddp_config.bucket_size] * len(model_chunks)``.
         disable_bucketing_per_chunk: Optional per-chunk disable_bucketing flag;
             defaults to ``[False] * len(model_chunks)``.
+        record_prefetch_order: Record MFSDP v2 runtime module order in the first
+            training iteration instead of using construction order.
 
     Returns:
         List of DDP-wrapped chunks.
@@ -2466,7 +2469,11 @@ def wrap_model_chunks_with_ddp(
         DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
     ) and ddp_config.megatron_fsdp_version == 2
     construction_context = (
-        fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True)
+        fully_shard_context(
+            use_symmetric_memory=ddp_config.nccl_ub,
+            caller_managed_grad_sync=True,
+            record_prefetch_order=record_prefetch_order,
+        )
         if is_mfsdp_v2
         else nullcontext()
     )
@@ -2752,6 +2759,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 pg_collection=pg_collection if args.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
+                record_prefetch_order=getattr(args, 'megatron_fsdp_record_prefetch_order', False),
             )
         # Ensure side-stream initialization completes before touching params on the current stream.
         if ddp_stream is not current_stream:
@@ -3299,14 +3307,13 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
     return samples_seen_in_iteration
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None, record_prefetch_order: bool = False):
+def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior. Reductions source per-rank groups from the model.
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
-    record_prefetch_order: record this step's module calls for MFSDP v2 prefetch.
     """
     args = get_args()
     timers = get_timers()
@@ -3410,11 +3417,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None else nullcontext()
         )
         with grad_context, _fb_cm, ExitStack() as prefetch_recording:
-            if record_prefetch_order:
+            if getattr(args, 'megatron_fsdp_record_prefetch_order', False):
                 # VPP chunks share a context; enter each distinct context only once.
                 contexts = dict.fromkeys(model_chunk.module.context for model_chunk in model)
                 for context in contexts:
-                    prefetch_recording.enter_context(context.record_prefetch_order())
+                    prefetch_recording.enter_context(context.iteration())
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
@@ -4882,7 +4889,6 @@ def train(
     should_exit = False
     exit_code = 0
     is_first_iteration = True
-    record_prefetch_order = getattr(args, 'megatron_fsdp_record_prefetch_order', False)
 
     if args.manual_gc:
         # Disable the default garbage collector and perform the collection manually.
@@ -5234,9 +5240,7 @@ def train(
                     forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
                     pg_collection=pg_collection,
                     p2p_communicator=p2p_communicator,
-                    record_prefetch_order=record_prefetch_order,
                 )
-                record_prefetch_order = False
                 ft_integration.on_training_step_end()
                 if _maybe_raise_workload_exception is not None and iteration != start_iteration:
                     _maybe_raise_workload_exception()

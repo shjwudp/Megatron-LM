@@ -20,8 +20,14 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_optimizer,
     microbatch,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionOrder,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.indexed_order import IndexedOrder
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
+    FsdpContext,
+    FsdpModule,
+)
 
 
 @pytest.mark.parametrize('budget', [None, 0, 2])
@@ -38,7 +44,9 @@ def test_prefetch_replays_occurrences(budget):
         modules.append(module)
     first, second, third = modules
     sequence = [first, second, first, third]
-    order = IndexedOrder(sequence)
+    order = ExecutionOrder()
+    for module in sequence:
+        order.append(module)
     expected = [[second], [first], [third], []]
     if budget == 0:
         expected = [[], [], [], []]
@@ -53,6 +61,89 @@ def test_prefetch_replays_occurrences(budget):
         order.advance(third)
     order.advance(first)
     assert order.next_item(first) is second
+
+
+def test_static_order_lookup():
+    """Construction orders remain unique and independent of demand-call order."""
+    first, second, third = (object.__new__(FsdpModule) for _ in range(3))
+    order = IndexedOrder()
+    for module in (first, second, third):
+        order.append(module)
+    with pytest.raises(ValueError, match='duplicate'):
+        order.append(first)
+    order.advance(third)
+    assert order.next_item(first) is second
+    assert order.next_item(first, offset=2) is third
+    assert order.next_item(third) is None
+
+
+@pytest.mark.parametrize('record', [False, True])
+def test_context_selects_prefetch_order(monkeypatch, record):
+    """The construction option selects static indices or occurrence sequences."""
+    monkeypatch.setattr(torch.cuda, 'Stream', Mock())
+    context = FsdpContext(torch.device('cuda'), record_prefetch_order=record)
+    context.finalize()
+    expected = ExecutionOrder if record else IndexedOrder
+    assert isinstance(context.forward_order, expected)
+    assert isinstance(context.backward_order, expected)
+
+
+def test_recording_reuses_orders_and_excludes_recomputation(monkeypatch):
+    """Demand calls write directly to the context orders, without speculative gathers."""
+    monkeypatch.setattr(torch.cuda, 'Stream', Mock())
+    context = FsdpContext(torch.device('cuda'), record_prefetch_order=True)
+    context.finalize()
+    context.current_stream = Mock()
+    module = object.__new__(FsdpModule)
+    module._context = context
+    module._unshard_event = object()
+    module._nvtx_range = Mock(return_value=nullcontext())
+    module._unshard_parameter_groups = Mock()
+    module._prefetch_parameter_groups = Mock()
+    module._schedule_policy = SimpleNamespace(
+        forward_prefetch_size=None, backward_prefetch_size=None
+    )
+    forward, backward = context.forward_order, context.backward_order
+    # Evaluation before the first training iteration must not populate the orders.
+    module.unshard(prefetch='forward')
+    assert list(forward) == []
+    with context.iteration():
+        for phase in ('forward', 'forward', 'none', 'backward', 'backward'):
+            module.unshard(prefetch=phase)
+        assert list(forward) == [module, module]
+        assert list(backward) == [module, module]
+        module._prefetch_parameter_groups.assert_not_called()
+    assert context.forward_order is forward
+    assert context.backward_order is backward
+    with context.iteration():
+        module.unshard(prefetch='forward')
+        module.unshard(prefetch='backward')
+    assert list(forward) == [module, module]
+    assert list(backward) == [module, module]
+    assert module._prefetch_parameter_groups.call_count == 2
+
+
+@pytest.mark.parametrize('failure', ['exception', 'empty_backward', 'nested'])
+def test_interrupted_recording_is_discarded(monkeypatch, failure):
+    """A failed or incomplete first batch cannot become the prefetch sequence."""
+    monkeypatch.setattr(torch.cuda, 'Stream', Mock())
+    context = FsdpContext(torch.device('cuda'), record_prefetch_order=True)
+    context.finalize()
+    module = object.__new__(FsdpModule)
+    with pytest.raises(RuntimeError):
+        with context.iteration():
+            context.forward_order.append(module)
+            if failure == 'exception':
+                raise RuntimeError('interrupted')
+            if failure == 'nested':
+                with context.iteration():
+                    pass
+    assert list(context.forward_order) == []
+    assert list(context.backward_order) == []
+    with context.iteration():
+        context.forward_order.append(module)
+        context.backward_order.append(module)
+    assert not context._needs_prefetch_order_recording
 
 
 def test_shared_module_recording_matches_dense_training(distributed_setup):
@@ -78,7 +169,7 @@ def test_shared_module_recording_matches_dense_training(distributed_setup):
     dense, model = Model().to(device), Model()
     model.load_state_dict(dense.state_dict())
     placements = Placements([0], [Shard(0)], [Shard(0)], [Shard(0)])
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(device=device, record_prefetch_order=True) as context:
         fully_shard(model.first, mesh=mesh, placements=placements)
         fully_shard(model.second, mesh=mesh, placements=placements)
         fully_shard(model, mesh=mesh, placements=placements)
@@ -90,8 +181,7 @@ def test_shared_module_recording_matches_dense_training(distributed_setup):
     for iteration in range(2):
         dense_optimizer.zero_grad(set_to_none=True)
         optimizer.zero_grad(set_to_none=True)
-        recording = context.record_prefetch_order() if iteration == 0 else nullcontext()
-        with recording:
+        with context.iteration():
             for index in range(num_microbatches):
                 inputs = base_inputs + 0.1 * distributed_setup.rank + 0.02 * (iteration + index)
                 expected = dense(inputs)

@@ -28,6 +28,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
+from .execution_order import ExecutionOrder
 from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
@@ -57,10 +58,10 @@ class FsdpContext:
     The caller must call ``finish_grad_sync()`` after all gradient producers,
     including delayed weight-gradient computation, and before consuming gradients.
     """
-    # Construction orders, replaced by runtime order after recording. Each FsdpModule tracks
+    # Construction orders or recorded runtime occurrences. Each FsdpModule tracks
     # its own materialized state via ``FsdpModule._unshard_event``.
-    forward_order: IndexedOrder["FsdpModule"]
-    backward_order: IndexedOrder["FsdpModule"]
+    forward_order: IndexedOrder["FsdpModule"] | ExecutionOrder["FsdpModule"]
+    backward_order: IndexedOrder["FsdpModule"] | ExecutionOrder["FsdpModule"]
     # The optimizer runs on the current stream and must wait for reductions on
     # this context's reduce-scatter stream. Each context owns its own stream, so
     # independent roots sharing a context need only one completion callback.
@@ -73,6 +74,7 @@ class FsdpContext:
         unify_communication_stream: bool = False,
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         caller_managed_grad_sync: bool = False,
+        record_prefetch_order: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -86,14 +88,19 @@ class FsdpContext:
                 ``fully_shard_context``.
             caller_managed_grad_sync: Disable the automatic autograd completion callback.
                 The caller must synchronize gradient reductions with ``finish_grad_sync()``.
+            record_prefetch_order: Record runtime orders in the first ``iteration()`` scope
+                instead of computing construction orders.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
-        self.forward_order = IndexedOrder()
-        self.backward_order = IndexedOrder()
-        self._recorded_orders: tuple[list[FsdpModule], list[FsdpModule]] | None = None
+        order_type = ExecutionOrder if record_prefetch_order else IndexedOrder
+        self.forward_order = order_type()
+        self.backward_order = order_type()
+        self._needs_prefetch_order_recording = record_prefetch_order
+        self._recording_prefetch_order = False
+        self._iteration_active = False
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
@@ -130,10 +137,12 @@ class FsdpContext:
                 if not isinstance(module, FsdpModule):
                     continue
                 module._name = name
-                self.forward_order.append(module)
+                if isinstance(self.forward_order, IndexedOrder):
+                    self.forward_order.append(module)
 
-        for root in reversed(roots):
-            _collect_backward_order(cast(nn.Module, root), self.backward_order)
+        if isinstance(self.backward_order, IndexedOrder):
+            for root in reversed(roots):
+                _collect_backward_order(cast(nn.Module, root), self.backward_order)
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -151,41 +160,44 @@ class FsdpContext:
         return torch.cuda.current_stream(self.allgather_stream.device)
 
     @contextmanager
-    def record_prefetch_order(self) -> Iterator[None]:
-        """Replace prefetch orders with the module calls observed in this scope.
+    def iteration(self) -> Iterator[None]:
+        """Scope one complete, repeatable training iteration, including all microbatches.
 
-        Include one complete, repeatable execution pattern, such as all forward
-        and backward calls of a global batch. Demand unshards are recorded;
-        recomputation with ``prefetch="none"`` is excluded. Prefetch is disabled
-        while recording, and successful exit installs the observed orders for
-        subsequent runs. Repeated module calls retain distinct successors.
-
-        All ranks must record and replay collective-compatible module orders.
-        Replay requires the same call sequence in each phase; record again when
-        that pattern changes. An empty phase keeps its existing order, and an
-        interrupted scope leaves both orders unchanged. Nested scopes are rejected.
+        With ``fully_shard_context(record_prefetch_order=True)``, the first successful
+        scope records forward/backward calls directly in this context's orders.
+        Prefetch is disabled until that scope completes; recomputation with
+        ``prefetch="none"`` is excluded. Later scopes use the recorded order.
+        All ranks must follow collective-compatible, repeatable call sequences.
+        An interrupted recording is discarded and retried in the next scope.
 
         Example:
-            After exiting ``fully_shard_context``, record a training batch::
+            After construction, run each training batch as::
 
-                with context.record_prefetch_order():
+                with context.iteration():
                     model(inputs).sum().backward()
-                # Subsequent batches prefetch in the observed execution order.
+                    context.finish_grad_sync()
         """
         self.ensure_finalized()
-        if self._recorded_orders is not None:
-            raise RuntimeError("An FSDP prefetch-order recording is already active.")
-        forward: list[FsdpModule] = []
-        backward: list[FsdpModule] = []
-        self._recorded_orders = (forward, backward)
+        if self._iteration_active:
+            raise RuntimeError("An FSDP iteration is already active.")
+        self._iteration_active = True
+        self._recording_prefetch_order = self._needs_prefetch_order_recording
         try:
             yield
-            if forward:
-                self.forward_order = IndexedOrder(forward)
-            if backward:
-                self.backward_order = IndexedOrder(backward)
+            if self._recording_prefetch_order:
+                if not list(self.forward_order) or not list(self.backward_order):
+                    raise RuntimeError(
+                        "Prefetch-order recording requires forward and backward calls."
+                    )
+                self._needs_prefetch_order_recording = False
+        except BaseException:
+            if self._recording_prefetch_order:
+                cast(ExecutionOrder, self.forward_order).clear()
+                cast(ExecutionOrder, self.backward_order).clear()
+            raise
         finally:
-            self._recorded_orders = None
+            self._recording_prefetch_order = False
+            self._iteration_active = False
 
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""
@@ -490,21 +502,20 @@ class FsdpModule:
         performs that root sync in ``pre_forward()`` immediately before this.
         """
         with self._nvtx_range("unshard"):
-            recorded_orders = self.context._recorded_orders
-            if recorded_orders is not None:
+            context = self.context
+            if context._recording_prefetch_order:
                 if prefetch == "forward":
-                    recorded_orders[0].append(self)
+                    context.forward_order.append(self)
                 elif prefetch == "backward":
-                    recorded_orders[1].append(self)
+                    context.backward_order.append(self)
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
             self.context.current_stream().wait_event(self._unshard_event)
 
-            if recorded_orders is not None:
+            if context._needs_prefetch_order_recording:
                 return
-            context = self.context
             if prefetch == "forward":
                 self._prefetch_parameter_groups(
                     context.forward_order, self._schedule_policy.forward_prefetch_size
@@ -515,7 +526,9 @@ class FsdpModule:
                 )
 
     def _prefetch_parameter_groups(
-        self, order: IndexedOrder["FsdpModule"], prefetch_size: int | None
+        self,
+        order: IndexedOrder["FsdpModule"] | ExecutionOrder["FsdpModule"],
+        prefetch_size: int | None,
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
         order.advance(self)

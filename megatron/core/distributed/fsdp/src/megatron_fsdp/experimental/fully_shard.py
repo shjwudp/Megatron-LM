@@ -80,6 +80,7 @@ def fully_shard_context(
     unify_communication_stream: bool = False,
     parameter_to_owner: dict[nn.Parameter, int] | None = None,
     caller_managed_grad_sync: bool = False,
+    record_prefetch_order: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -103,6 +104,10 @@ def fully_shard_context(
             allowing delayed weight gradients or custom backward schedules. The caller must
             call ``context.finish_grad_sync()`` after all backward work and before reading
             or modifying gradients.
+        record_prefetch_order: Record runtime module calls in the first successful
+            ``context.iteration()`` scope instead of using construction order. Include
+            all microbatches and backward work; subsequent iterations must repeat
+            the recorded, collective-compatible call pattern.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
@@ -117,6 +122,7 @@ def fully_shard_context(
         unify_communication_stream=unify_communication_stream,
         parameter_to_owner=parameter_to_owner,
         caller_managed_grad_sync=caller_managed_grad_sync,
+        record_prefetch_order=record_prefetch_order,
     )
     token = _FSDP_CONTEXT.set(context)
     try:
