@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Instrument a standalone MFSDP PP experiment; run with normal pretrain_gpt flags.
+"""Instrument a standalone MFSDP PP experiment; run with normal pretrain_hybrid flags.
 
 PP_CACHE_OUTPUT selects the output directory. PP_CACHE_CHECK=1 saves every local
 parameter/gradient shard after each update for matching cached/uncached runs.
@@ -86,6 +86,6 @@ training.train_step = train_step
 torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
 stream = torch.cuda.Stream()
 with torch.cuda.stream(stream):
-    runpy.run_path(str(root / 'pretrain_gpt.py'), run_name='__main__')
+    runpy.run_path(str(root / 'pretrain_hybrid.py'), run_name='__main__')
 torch.cuda.current_stream().wait_stream(stream)
 torch.cuda.synchronize()
