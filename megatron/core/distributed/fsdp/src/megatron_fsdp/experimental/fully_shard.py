@@ -71,6 +71,8 @@ def fully_shard(
     grad_scale: float = 1.0,
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     register_hooks: bool = True,
+    precompute_parameter_bindings: bool = False,
+    enable_nvtx: bool = True,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -102,6 +104,9 @@ def fully_shard(
             hooks on ``module``. Disable this when an external scheduler invokes the
             corresponding FSDP lifecycle methods explicitly. The state-dict safety hook
             is registered independently.
+        precompute_parameter_bindings: Resolve parameter owners once during construction.
+            Requires a fixed module tree after fully_shard. Uses weak references to owners.
+        enable_nvtx: Emit FSDP lifecycle NVTX ranges. Does not control other model ranges.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -133,6 +138,8 @@ def fully_shard(
             schedule_policy=schedule_policy,
             use_symmetric_memory=context.use_symmetric_memory,
             register_hooks=register_hooks,
+            precompute_parameter_bindings=precompute_parameter_bindings,
+            enable_nvtx=enable_nvtx,
         )
     except Exception:
         module.__class__ = original_cls

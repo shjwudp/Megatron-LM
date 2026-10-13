@@ -435,14 +435,24 @@ class ModelParallelConfig:
     """
 
     mfsdp_cache_pipeline_group: bool = field(
-        default=False,
-        metadata={"argparse_meta": {"arg_names": ["--mfsdp-cache-pipeline-group"]}},
+        default=False, metadata={"argparse_meta": {"arg_names": ["--mfsdp-cache-pipeline-group"]}}
     )
     """Experimental MFSDP v2 storage retention across interleaved microbatch groups.
 
     Pins every unit in participating chunks, without a cache-byte cap. Intended
     for controlled experiments; forward/backward windows can overlap.
     """
+
+    mfsdp_precompute_parameter_bindings: bool = field(
+        default=False,
+        metadata={"argparse_meta": {"arg_names": ["--mfsdp-precompute-parameter-bindings"]}},
+    )
+    """Experimental MFSDP v2 parameter-owner lookup caching for fixed module trees."""
+
+    mfsdp_disable_nvtx: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--mfsdp-disable-nvtx"]}}
+    )
+    """Disable MFSDP v2 lifecycle NVTX calls for low-overhead experiments."""
 
     microbatch_group_size_per_vp_stage: Optional[int] = field(
         default=None,

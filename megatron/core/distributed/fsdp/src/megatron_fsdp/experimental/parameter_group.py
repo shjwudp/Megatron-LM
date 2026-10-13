@@ -148,6 +148,7 @@ class FsdpParameterGroup:
         use_symmetric_memory: bool = False,
         # TODO: Revisit passing owner assignments into the group constructor in a future PR.
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
+        precompute_parameter_bindings: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -167,11 +168,17 @@ class FsdpParameterGroup:
             parameter_to_owner: Construction-time mapping from original parameters to
                 owner ranks in ``mesh``. Every TensorAtomic parameter needs an entry;
                 entries for other parameters and non-TensorAtomic groups are ignored.
+            precompute_parameter_bindings: Cache owner lookups for the fixed module tree.
+                Parameter references are still switched on every lifecycle transition.
         """
         parameter_to_fqns, self.dtype, self.requires_grad = self._collect_parameter_metadata(
             fqn_to_parameter
         )
         self._owning_module = ref(owning_module)
+        # Owners are weak: a strong backedge would retain the module/FSDP/CUDA tree.
+        self._parameter_bindings: (
+            dict[tuple[str, ...], tuple[tuple[ReferenceType[nn.Module], str], ...]] | None
+        ) = ({} if precompute_parameter_bindings else None)
         self.mesh = mesh
         self.grad_scale = grad_scale
         self._grad_comm_dtype = mixed_precision_policy.grad_comm_dtype
@@ -202,7 +209,7 @@ class FsdpParameterGroup:
 
     @staticmethod
     def _collect_parameter_metadata(
-        fqn_to_parameter: dict[str, nn.Parameter],
+        fqn_to_parameter: dict[str, nn.Parameter]
     ) -> tuple[dict[nn.Parameter, list[str]], torch.dtype, bool]:
         """Group tied parameters and validate their shared metadata."""
         if not fqn_to_parameter:
@@ -429,6 +436,21 @@ class FsdpParameterGroup:
         owning_module = self._owning_module()
         if owning_module is None:
             raise RuntimeError("FSDP parameter group outlived its owning module.")
+        bindings = self._parameter_bindings
+        if bindings is not None:
+            if fqns not in bindings:
+                bindings[fqns] = tuple(
+                    (ref(module), parameter_name)
+                    for module, parameter_name in (
+                        get_parameter_owner(owning_module, fqn) for fqn in fqns
+                    )
+                )
+            for module_ref, parameter_name in bindings[fqns]:
+                module = module_ref()
+                if module is None:
+                    raise RuntimeError("FSDP parameter binding outlived its module.")
+                module._parameters[parameter_name] = parameter
+            return
         for fqn in fqns:
             module, parameter_name = get_parameter_owner(owning_module, fqn)
             module._parameters[parameter_name] = parameter

@@ -732,6 +732,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             mixed_precision_policy=self.mp_policy,
             schedule_policy=schedule_policy,
             register_hooks=not config.overlap_moe_expert_parallel_comm,
+            precompute_parameter_bindings=config.mfsdp_precompute_parameter_bindings,
+            enable_nvtx=not config.mfsdp_disable_nvtx,
         )
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
@@ -756,7 +758,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 for submodule in module.modules():
                     if isinstance(submodule, MoELayer):
                         if config.init_model_with_meta_device:
-                            _materialize_owned_meta_modules(submodule.experts, materialization_device)
+                            _materialize_owned_meta_modules(
+                                submodule.experts, materialization_device
+                            )
                         fully_shard(
                             submodule.experts,
                             mesh=expert_dp_mesh,

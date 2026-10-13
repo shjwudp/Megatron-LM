@@ -79,9 +79,12 @@ class FsdpModule:
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
         register_hooks: bool = True,
+        precompute_parameter_bindings: bool = False,
+        enable_nvtx: bool = True,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
+        self._nvtx_enabled = enable_nvtx
         self._unshard_event = None
         self._parameter_cache_windows = set()
         self._phase = Phase.RESTING
@@ -109,6 +112,7 @@ class FsdpModule:
                     grad_scale=grad_scale,
                     use_symmetric_memory=use_symmetric_memory,
                     parameter_to_owner=context.parameter_to_owner,
+                    precompute_parameter_bindings=precompute_parameter_bindings,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
@@ -290,7 +294,8 @@ class FsdpModule:
         # forward/backward each span multiple lifecycle methods (pre_forward ->
         # post_forward and pre_backward -> post_backward), so they keep explicit
         # push/pop instead of a single context scope.
-        torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
+        if self._nvtx_enabled:
+            torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
 
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
@@ -388,7 +393,8 @@ class FsdpModule:
             self.reshard()
         if self.phase is Phase.FORWARD:
             self.phase = Phase.RESTING
-        torch.cuda.nvtx.range_pop()
+        if self._nvtx_enabled:
+            torch.cuda.nvtx.range_pop()
 
     def reshard(self) -> None:
         """Reshard this FsdpModule's parameter groups."""
@@ -437,7 +443,8 @@ class FsdpModule:
         if self.phase is Phase.BACKWARD:
             return
         self.phase = Phase.BACKWARD
-        torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
+        if self._nvtx_enabled:
+            torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
@@ -459,7 +466,8 @@ class FsdpModule:
         self.context.validate_grad_sync()
         self._reduce_gradient_groups()
         self.phase = Phase.RESTING
-        torch.cuda.nvtx.range_pop()
+        if self._nvtx_enabled:
+            torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
         """Pack gradients and immediately launch their reduce-scatters."""
@@ -504,7 +512,10 @@ class FsdpModule:
 
     @contextmanager
     def _nvtx_range(self, operation: str) -> Iterator[None]:
-        """Scope an nvtx range to this context so an early return still pops it."""
+        """Scope an optional range, preserving balanced push/pop on early returns."""
+        if not self._nvtx_enabled:
+            yield
+            return
         torch.cuda.nvtx.range_push(self._nvtx_label(operation))
         try:
             yield
