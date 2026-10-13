@@ -86,6 +86,8 @@ training.train_step = train_step
 torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
 stream = torch.cuda.Stream()
 with torch.cuda.stream(stream):
+    if runtime_hook := os.environ.get('PP_CACHE_RUNTIME_HOOK'):
+        runpy.run_path(runtime_hook, run_name='__main__')
     runpy.run_path(str(root / 'pretrain_hybrid.py'), run_name='__main__')
 torch.cuda.current_stream().wait_stream(stream)
 torch.cuda.synchronize()
