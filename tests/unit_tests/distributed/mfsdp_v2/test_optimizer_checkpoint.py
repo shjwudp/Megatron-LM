@@ -22,7 +22,7 @@ from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimize
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -118,6 +118,7 @@ def _build_model_and_optimizer(
     *,
     zero_init: bool,
     precision_aware: bool = False,
+    inner_float16: bool = False,
 ) -> tuple[FullyShardedDataParallel, FullyShardedOptimizer]:
     """Build an MFSDP v2 sharded transformer block and its :class:`FullyShardedOptimizer`."""
     block = TransformerBlock(config=config, spec=get_gpt_layer_local_spec()).to(
@@ -127,6 +128,8 @@ def _build_model_and_optimizer(
         # Zero the destination weights so they are obviously different from the saved
         # (trained) source; a correct load must overwrite them.
         _zero_parameters(block)
+    if inner_float16:
+        block = Float16Module(config, block)
     return _shard_and_build_optimizer(config, pg_collection, block, precision_aware=precision_aware)
 
 
@@ -274,7 +277,10 @@ class TestOptimizerCheckpoint:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("precision_aware", [False, True], ids=["fp32_state", "bf16_state"])
-    def test_checkpoint_roundtrip(self, tmp_path_dist_ckpt: Path, precision_aware: bool) -> None:
+    @pytest.mark.parametrize("inner_float16", [False, True])
+    def test_checkpoint_roundtrip(
+        self, tmp_path_dist_ckpt: Path, precision_aware: bool, inner_float16: bool
+    ) -> None:
         """Model weights and optimizer state survive an ``fsdp_dtensor`` round trip.
 
         The source trains a few steps and is checkpointed the way the training loop does it
@@ -297,7 +303,11 @@ class TestOptimizerCheckpoint:
         source_steps, destination_steps = 3, 1
 
         source_model, source_optimizer = _build_model_and_optimizer(
-            config, self.pg_collection, zero_init=False, precision_aware=precision_aware
+            config,
+            self.pg_collection,
+            zero_init=False,
+            precision_aware=precision_aware,
+            inner_float16=inner_float16,
         )
         for _ in range(source_steps):
             _train_step(config, source_model, source_optimizer)
@@ -342,7 +352,11 @@ class TestOptimizerCheckpoint:
             dcp.save(save_state_dict, checkpoint_id=ckpt_dir)
 
             destination_model, destination_optimizer = _build_model_and_optimizer(
-                config, self.pg_collection, zero_init=True, precision_aware=precision_aware
+                config,
+                self.pg_collection,
+                zero_init=True,
+                precision_aware=precision_aware,
+                inner_float16=inner_float16,
             )
             for _ in range(destination_steps):
                 _train_step(config, destination_model, destination_optimizer)

@@ -825,6 +825,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         state_dict = super().state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
         for name, parameter in named_checkpoint_parameters(self.module):
             key = prefix + name
+            while key not in state_dict and name.startswith("module."):
+                name = name[len("module.") :]
+                key = prefix + name
             if key in state_dict:
                 state_dict[key] = parameter
         return state_dict
