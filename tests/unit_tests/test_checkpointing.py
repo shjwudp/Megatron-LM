@@ -169,6 +169,28 @@ def test_fsdp_global_param_name_uses_owning_model_chunk(owning_chunk):
             model_chunk.modules.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "ckpt_format,version,preserve_adapter",
+    [("fsdp_dtensor", 2, True), ("fsdp_dtensor", 1, False), ("torch_dist", 2, False)],
+)
+def test_fsdp_dtensor_preserves_checkpoint_adapter(ckpt_format, version, preserve_adapter):
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
+    from megatron.core.transformer.module import Float16Module
+
+    inner = torch.nn.Linear(2, 2)
+    adapter = FullyShardedDataParallelV2.__new__(FullyShardedDataParallelV2)
+    torch.nn.Module.__init__(adapter)
+    adapter.module = inner
+    outer = Float16Module.__new__(Float16Module)
+    torch.nn.Module.__init__(outer)
+    outer.module = adapter
+    ddp_config = DistributedDataParallelConfig(megatron_fsdp_version=version)
+
+    result = checkpointing._unwrap_checkpoint_model([outer], ckpt_format, ddp_config)
+
+    assert result[0] is (adapter if preserve_adapter else inner)
+
+
 @pytest.fixture
 def fsdp_dtensor_checkpoint_case(monkeypatch):
     def split_handler(chunk, model_state, optimizer_state):
@@ -216,8 +238,9 @@ def fsdp_dtensor_checkpoint_case(monkeypatch):
 
     def make_case(num_chunks, optimizer_layout, experts=False):
         config = SimpleNamespace(
-            gated_linear_unit=True, activation_func=torch.nn.functional.silu,
-            num_moe_experts=4 if experts else None
+            gated_linear_unit=True,
+            activation_func=torch.nn.functional.silu,
+            num_moe_experts=4 if experts else None,
         )
         state_dict = {"iteration": 17}
         chunks = []

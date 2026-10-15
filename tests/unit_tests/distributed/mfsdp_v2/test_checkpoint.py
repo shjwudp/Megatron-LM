@@ -664,9 +664,9 @@ def test_fused_checkpoint_split_aliases_local_storage(
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     torch.manual_seed(123)
-    model = _PackedModel()
-    expected = model.get_parameter(parameter_name).detach().clone().to(device)
-    model, _ = _build_sharded(model, mesh, device)
+    model, _ = _build_packed_sharded(mesh, device)
+    torch.manual_seed(123)
+    expected = _PackedModel().get_parameter(parameter_name).detach().clone().to(device)
     parameter = model.get_parameter(parameter_name)
     data = _fused_checkpoint_parameter(parameter)
     local_state = data.to_local().detach().to(dtype=torch.bfloat16).clone()
@@ -745,7 +745,7 @@ def test_fused_checkpoint_handler_uses_v2_layout(distributed_setup, kind):
         parameter_name = "layer.self_attention.linear_qkv_down_proj.weight"
         handler = handle_mla_down_proj_in_state_dict
     inner = inner.to(device)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(inner, mesh=mesh, placements=_default_placements())
     model = nn.Module()
     model.module = inner
@@ -772,7 +772,7 @@ def test_fused_checkpoint_split_rejects_invalid_sections(distributed_setup, spli
     """Invalid sections cannot silently omit, overlap or invent checkpoint rows."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model, _ = _build_sharded(_PackedModel(), mesh, device)
+    model, _ = _build_packed_sharded(mesh, device)
     parameter = model.get_parameter("block.regular")
     data = _fused_checkpoint_parameter(parameter)
     with pytest.raises(ValueError, match="split sizes"):

@@ -747,6 +747,26 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
     )
 
 
+def _unwrap_checkpoint_model(model, ckpt_format, ddp_config):
+    """Keep MFSDP v2 checkpoint adapters while removing outer training wrappers."""
+    if ckpt_format != "fsdp_dtensor" or ddp_config is None or ddp_config.megatron_fsdp_version != 2:
+        return unwrap_model(model)
+
+    from megatron.core.distributed import DistributedDataParallel, TorchFullyShardedDataParallel
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
+    from megatron.core.transformer.module import Float16Module
+
+    return unwrap_model(
+        model,
+        module_instances=(
+            DistributedDataParallel,
+            TorchFullyShardedDataParallel,
+            FullyShardedDataParallelV1,
+            Float16Module,
+        ),
+    )
+
+
 def save_checkpoint(
     iteration,
     model,
@@ -833,7 +853,7 @@ def save_checkpoint(
     ft_integration.on_checkpointing_start()
 
     # Only rank zero of the data parallel writes to the disk.
-    model = unwrap_model(model)
+    model = _unwrap_checkpoint_model(model, save_format, cfg.ddp)
 
     # --freeze-all-layers: weights are frozen, so skip the weight write and its finalizers; dump
     # progress is recorded separately via the post-logits finalize (see the async block below).
@@ -1094,7 +1114,9 @@ def save_checkpoint(
                 ensure_directory_exists(checkpoint_name, check_parent=False)
 
             if ckpt_format == 'fsdp_dtensor':
-                state_dict = preprocess_fsdp_dtensor_state_dict(cfg.model.transformer, state_dict, model)
+                state_dict = preprocess_fsdp_dtensor_state_dict(
+                    cfg.model.transformer, state_dict, model
+                )
 
             if checkpoint.async_save:
                 from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
@@ -2039,7 +2061,9 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
         for handler in handlers:
             model_state_dict, _ = handler(chunk, model_state_dict, None)
         if config.num_moe_experts:
-            model_state_dict = handle_experts_in_state_dict(model_state_dict, config.num_moe_experts)
+            model_state_dict = handle_experts_in_state_dict(
+                model_state_dict, config.num_moe_experts
+            )
         state_dict[model_key] = {
             _map_fsdp_dtensor_layer_name(name, layer_names): value
             for name, value in model_state_dict.items()
@@ -3018,7 +3042,6 @@ def load_checkpoint(
         if train_state is not None:
             train_state.effective_finetune = finetune
 
-    model = unwrap_model(ddp_model)
     # Inference has no training wrapper, but can still load an MFSDP checkpoint.
     use_megatron_fsdp = (
         cfg.ddp.use_megatron_fsdp
@@ -3030,7 +3053,7 @@ def load_checkpoint(
         if hasattr(cfg, "ddp")
         else any(
             get_model_config(chunk).fp8_param or get_model_config(chunk).fp4_param
-            for chunk in model
+            for chunk in ddp_model
         )
     )
 
@@ -3067,6 +3090,8 @@ def load_checkpoint(
             '--inference-shards is incompatible with legacy torch checkpoints; '
             'convert the checkpoint to torch_dist first'
         )
+
+    model = _unwrap_checkpoint_model(ddp_model, ckpt_format, getattr(cfg, "ddp", None))
 
     if model_sharded_state_dict_modifier is not None and ckpt_format != 'torch_dist':
         raise NotImplementedError(
