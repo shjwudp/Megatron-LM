@@ -17,13 +17,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     preprocess_state_dict_for_uneven_dtensor,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -151,6 +148,7 @@ def _train_step(
     optimizer.zero_grad(set_to_none=True)
     batch = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
     model(hidden_states=batch, attention_mask=None).square().mean().backward()
+    model.finish_grad_sync()
     success, _, _ = optimizer.step()
     assert success
 
@@ -203,6 +201,8 @@ def _snapshot_optimizer_state(optimizer: FullyShardedOptimizer) -> dict[str, dic
     """Clone this rank's optimizer state, keyed by globally unique parameter name."""
     snapshot: dict[str, dict[str, Any]] = {}
     for param, state in optimizer.optimizer.state.items():
+        assert not isinstance(param, DTensor), "Checkpoint wrapper leaked into runtime parameters"
+        assert all(not isinstance(value, DTensor) for value in state.values())
         fqn = get_global_unique_param_name(optimizer.model_chunks, param)
         snapshot[fqn] = {
             key: (value.clone() if torch.is_tensor(value) else value)
@@ -303,6 +303,10 @@ class TestOptimizerCheckpoint:
             _train_step(config, source_model, source_optimizer)
 
         model_snapshot = _snapshot_model_state(source_model)
+        assert model_snapshot and all(
+            isinstance(model_snapshot[name], DTensor)
+            for name, _ in source_model.module.named_parameters()
+        )
         state_snapshot = _snapshot_optimizer_state(source_optimizer)
         param_group_snapshot = _snapshot_param_group_hyperparameters(source_optimizer)
         assert {group["step"] for group in param_group_snapshot} == {source_steps}
@@ -315,9 +319,7 @@ class TestOptimizerCheckpoint:
             empty_local = sum(
                 1
                 for param in source_model.parameters()
-                if param.requires_grad
-                and isinstance(param, DTensor)
-                and param.to_local().numel() == 0
+                if param.requires_grad and _local_numel(param) == 0
             )
             empty_local_counts = [None] * world_size
             torch.distributed.all_gather_object(empty_local_counts, empty_local)
@@ -332,6 +334,10 @@ class TestOptimizerCheckpoint:
                 "model": source_model.state_dict_for_save_checkpoint(),
                 "optimizer": source_optimizer.sharded_state_dict({}),
             }
+            expected_dtype = torch.bfloat16 if precision_aware else torch.float32
+            for state in save_state_dict["optimizer"]["state"].values():
+                assert state["exp_avg"].dtype == expected_dtype
+                assert state["exp_avg_sq"].dtype == expected_dtype
             preprocess_state_dict_for_uneven_dtensor(save_state_dict)
             dcp.save(save_state_dict, checkpoint_id=ckpt_dir)
 
@@ -350,13 +356,13 @@ class TestOptimizerCheckpoint:
             # optimizer's momentum buffers are restored by this call alone; load_state_dict
             # then reinstalls the param-group hyperparameters.
             dcp.load(load_state_dict, checkpoint_id=ckpt_dir)
+            destination_model.load_state_dict(load_state_dict["model"])
             destination_optimizer.load_state_dict(load_state_dict["optimizer"])
 
         local_nonempty = _assert_model_matches_snapshot(destination_model, model_snapshot)
         _assert_optimizer_matches_snapshot(
             destination_optimizer, state_snapshot, param_group_snapshot
         )
-
         # At least one rank must have held non-empty local shards for the check to be meaningful.
         nonempty_flags = [None] * world_size
         torch.distributed.all_gather_object(nonempty_flags, local_nonempty)
@@ -404,6 +410,10 @@ class TestOptimizerCheckpoint:
             _train_step(config, source_model, source_optimizer)
 
         model_snapshot = _snapshot_model_state(source_model)
+        assert model_snapshot and all(
+            isinstance(model_snapshot[name], DTensor)
+            for name, _ in source_model.module.named_parameters()
+        )
         state_snapshot = _snapshot_optimizer_state(source_optimizer)
         param_group_snapshot = _snapshot_param_group_hyperparameters(source_optimizer)
 
@@ -441,84 +451,10 @@ class TestOptimizerCheckpoint:
             }
             preprocess_state_dict_for_uneven_dtensor(load_state_dict)
             dcp.load(load_state_dict, checkpoint_id=ckpt_dir)
+            destination_model.load_state_dict(load_state_dict["model"])
             destination_optimizer.load_state_dict(load_state_dict["optimizer"])
 
         _assert_model_matches_snapshot(destination_model, model_snapshot)
         _assert_optimizer_matches_snapshot(
             destination_optimizer, state_snapshot, param_group_snapshot
         )
-
-
-class TestOptimizerCheckpointExpertParallel:
-    """Expert parallelism is refused, until implemented, rather than mis-checkpointed."""
-
-    def setup_method(self):
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        if world_size < 2 or world_size % 2:
-            pytest.skip("MFSDP v2 EP requires an even world size of at least two.")
-        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=2)
-        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        model_parallel_cuda_manual_seed(1234)
-
-    def teardown_method(self):
-        Utils.destroy_model_parallel()
-
-    def test_sharded_state_dict_rejects_expert_parallelism(self) -> None:
-        """Building the state dict raises instead of writing a rank-inconsistent checkpoint.
-
-        MFSDP v2 shards expert parameters over the expert-DP mesh and everything else over the
-        DP mesh, and expert parallelism gives each rank a different set of expert FQNs, so the
-        rank-identical DTensor keyspace this format needs cannot be assembled by gathering over
-        one mesh. Until that is implemented, a save has to fail loudly: the alternative is a
-        rank-dependent keyspace, which deadlocks the uneven-DTensor preprocessing.
-        """
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=64,
-            num_attention_heads=4,
-            num_moe_experts=4,
-            expert_model_parallel_size=2,
-            moe_layer_freq=[0, 1],
-            moe_token_dispatcher_type="alltoall",
-            moe_router_topk=2,
-            moe_grouped_gemm=True,
-            moe_ffn_hidden_size=128,
-            add_bias_linear=False,
-            use_cpu_initialization=True,
-            params_dtype=torch.float32,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-            gradient_accumulation_fusion=False,
-            attention_backend=AttnBackend.unfused,
-        )
-        model = HybridModel(
-            config=config,
-            hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=128,
-            max_sequence_length=8,
-            hybrid_layer_pattern="*E",
-            pg_collection=self.pg_collection,
-        ).cuda()
-        model = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
-                fsdp_all_gather_in_start_param_sync=False,
-            ),
-            module=model,
-            pg_collection=self.pg_collection,
-        )
-        optimizer = get_megatron_optimizer(
-            OptimizerConfig(
-                lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=0.0
-            ),
-            [model],
-            use_gloo_process_groups=False,
-        )
-        assert isinstance(optimizer, FullyShardedOptimizer)
-
-        with pytest.raises(NotImplementedError, match="expert parallelism"):
-            optimizer.sharded_state_dict({})

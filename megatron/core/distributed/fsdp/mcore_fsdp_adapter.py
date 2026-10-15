@@ -32,7 +32,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import Partial, Replicate, Shard
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from megatron.core import parallel_state, tensor_parallel
@@ -67,6 +67,9 @@ try:
         fully_shard_context,
         microbatch,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.checkpoint import (
+        named_checkpoint_parameters,
+    )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
         current_fully_shard_context,
     )
@@ -75,6 +78,7 @@ try:
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
         get_containing_parameter_group,
+        sync_model_weights_from_main_weights,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
         all_sharding_strategies_in,
@@ -815,6 +819,27 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if config.overlap_moe_expert_parallel_comm:
             register_combined_1f1b_hooks(self.module)
+
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
+        """Expose global DTensor views only at the checkpoint boundary."""
+        state_dict = super().state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
+        for name, parameter in named_checkpoint_parameters(self.module):
+            key = prefix + name
+            if key in state_dict:
+                state_dict[key] = parameter
+        return state_dict
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Load main weights and refresh the buffers used for forward compute."""
+        local_state_dict = state_dict.copy()
+        for key, value in state_dict.items():
+            if isinstance(value, DTensor):
+                local_state_dict[key] = value.to_local()
+        if hasattr(state_dict, "_metadata"):
+            local_state_dict._metadata = state_dict._metadata
+        result = self.module.load_state_dict(local_state_dict, strict=strict)
+        sync_model_weights_from_main_weights(self.module.parameters())
+        return result
 
     @staticmethod
     def _validate_config(

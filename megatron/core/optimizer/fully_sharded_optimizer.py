@@ -6,12 +6,16 @@ from collections.abc import Iterator
 from typing import Any, Callable, List, Optional, override
 
 import torch
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..distributed.fsdp.src.megatron_fsdp.experimental import init_optimizer_state
+from ..distributed.fsdp.src.megatron_fsdp.experimental.checkpoint import wrap_optimizer_state
+from ..distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    FsdpParameterGroup,
     get_containing_parameter_group,
     sync_model_weights_from_main_weights,
 )
@@ -133,6 +137,13 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             "(--ckpt-format fsdp_dtensor)."
         )
 
+    def _parameter_groups(self) -> Iterator[FsdpParameterGroup]:
+        """Yield the FSDP parameter groups owned by the model chunks."""
+        for model_chunk in self.model_chunks:
+            for module in model_chunk.modules():
+                if isinstance(module, FsdpModule):
+                    yield from module.parameter_groups
+
     def _trainable_parameters(self) -> Iterator[torch.nn.Parameter]:
         """Yield the parameters the base optimizer owns before the empty-shard filter.
 
@@ -147,74 +158,46 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 if param.requires_grad:
                     yield param
 
-    def _shard_process_groups(self) -> list[torch.distributed.ProcessGroup]:
-        """Return the process groups across which the parameters are sharded.
-
-        Every sharded dimension of the parameter device mesh contributes one group.
-        Replicated dimensions are skipped: replicas hold identical shards, hence an
-        identical keyspace. These are the groups ``preprocess_state_dict_for_uneven_dtensor``
-        gathers over, so a collective run here reaches the same ranks the save and load
-        collectives do.
-
-        Raises:
-            NotImplementedError: If the parameters do not all share one device mesh, which
-                is what expert parallelism produces. Not yet supported rather than refused
-                on principle; training under expert parallelism is unaffected.
-        """
-        sharded_parameters = [
-            param for param in self._trainable_parameters() if isinstance(param, DTensor)
-        ]
-        if len({param.device_mesh for param in sharded_parameters}) > 1:
-            # MFSDP v2 shards expert parameters over the expert-DP mesh and everything else
-            # over the DP mesh (see FullyShardedDataParallelV2). Expert parallelism also gives
-            # each rank a different set of expert FQNs, so the DTensor keyspace this method
-            # exists to equalize is rank-dependent for a reason no gather can repair.
-            # TODO: not a contract, just unimplemented -- describing an expert-parallel model
-            # needs a keyspace built per mesh instead of one gather over one mesh.
-            raise NotImplementedError(
-                "MFSDP v2 optimizer checkpointing does not support expert parallelism yet: "
-                "its parameters span more than one device mesh."
-            )
-        if not sharded_parameters:
-            return []
-
-        # Union over every parameter rather than reading the first one's layout: a mesh
-        # dimension that one parameter replicates and another sharded still has to be gathered
-        # over, or the rank that solely describes an FQN never reaches the ranks that need it.
-        mesh = sharded_parameters[0].device_mesh
-        sharded_dims = set()
-        for param in sharded_parameters:
-            for mesh_dim, placement in enumerate(param.placements):
-                if isinstance(placement, Shard) and mesh.size(mesh_dim) > 1:
-                    sharded_dims.add(mesh_dim)
-        return [mesh.get_group(mesh_dim) for mesh_dim in sorted(sharded_dims)]
-
-    def _gather_state_keys_by_fqn(self) -> dict[str, list[str]]:
-        """Map every parameter's FQN to the keys of its ``DTensor`` optimizer state entries.
-
-        The keys are read off live state (``exp_avg``/``exp_avg_sq`` for Adam) rather than
-        hard-coded, so any base optimizer works. They are gathered because a parameter that
-        the TE < 2.18 empty-shard filter dropped from this rank's optimizer is only described
-        by the rank that owns a non-empty shard of it, which is what lets every rank
-        synthesize a placeholder with exactly the owning rank's keys. A parameter that has no
-        state anywhere (nothing has stepped yet) is simply absent.
-
-        Which key set a parameter has is a property of the base optimizer, not of the shard,
-        so ranks that both describe an FQN describe it identically and the merge below can
-        let any of them win. Sorting is what makes that hold as stated rather than by luck:
-        it turns each entry into a canonical list, so two ranks whose state dicts happened to
-        insert the keys in different orders still produce equal values.
-        """
-        state_keys_by_fqn = {
-            self._param_to_fqn[param]: sorted(
-                key for key, value in state.items() if isinstance(value, DTensor)
-            )
+    def _gather_state_keys_by_fqn(self) -> dict[str, dict[str, torch.dtype]]:
+        """Map every parameter's FQN to the keys of its elementwise optimizer state entries."""
+        local_keys = {
+            self._param_to_fqn[param]: {
+                key: value.dtype
+                for key, value in state.items()
+                if isinstance(value, torch.Tensor) and value.ndim > 0
+            }
             for param, state in self.optimizer.state.items()
         }
-        for group in self._shard_process_groups():
-            gathered = [None] * torch.distributed.get_world_size(group)
-            torch.distributed.all_gather_object(gathered, state_keys_by_fqn, group=group)
-            state_keys_by_fqn = {fqn: keys for rank in gathered for fqn, keys in rank.items()}
+        buffers_by_mesh: dict[DeviceMesh, list[Any]] = {}
+        for group in self._parameter_groups():
+            if group.requires_grad:
+                buffers_by_mesh.setdefault(group.main_weight.mesh, []).append(group.main_weight)
+        state_keys_by_fqn = {}
+        for mesh in sorted(
+            buffers_by_mesh, key=lambda mesh: (tuple(mesh.mesh.flatten().tolist()), mesh.shape)
+        ):
+            buffers = buffers_by_mesh[mesh]
+            fqns = {
+                self._param_to_fqn[parameter.sharded]
+                for group in self._parameter_groups()
+                if group.requires_grad and group.main_weight.mesh == mesh
+                for parameter in group.fsdp_parameters
+            }
+            mesh_keys = {fqn: local_keys[fqn] for fqn in fqns if fqn in local_keys}
+            sharded_dims = sorted(
+                {
+                    axis
+                    for buffer in buffers
+                    for axis, placement in enumerate(buffer.placements)
+                    if isinstance(placement, Shard) and mesh.size(axis) > 1
+                }
+            )
+            for axis in sharded_dims:
+                group = mesh.get_group(axis)
+                gathered: list[Any] = [None] * torch.distributed.get_world_size(group)
+                torch.distributed.all_gather_object(gathered, mesh_keys, group=group)
+                mesh_keys = {fqn: keys for rank in gathered for fqn, keys in rank.items()}
+            state_keys_by_fqn.update(mesh_keys)
         return state_keys_by_fqn
 
     def _param_to_group_meta(self) -> dict[str, Any]:
@@ -277,10 +260,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """Load optimizer state produced by :meth:`sharded_state_dict`.
 
         By the time this runs DCP has already written the checkpoint's tensors into the
-        resting optimizer-state DTensors in place, since ``sharded_state_dict(is_loading=True)``
-        exposed them as the load destinations. What is left is to restore the param-group
-        hyperparameters (including the group-level ``step``) and re-bind the FQN-keyed state
-        to the current parameters, mirroring the Megatron-FSDP branch of
+        checkpoint DTensor views of the local optimizer state in place, since
+        ``sharded_state_dict(is_loading=True)`` exposed them as the load destinations.
+        Unwrap those views before reinstalling the state, restore the param-group
+        hyperparameters (including the group-level ``step``), and re-bind the FQN-keyed
+        state to the current parameters, mirroring the Megatron-FSDP branch of
         :meth:`DistributedOptimizer.load_state_dict`.
         """
         param_groups = self._param_groups_from_group_meta(state_dict["param_to_group_meta"])
@@ -290,7 +274,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 # Drop the empty-local placeholders synthesized for save-time rank
                 # consistency; keep only what this rank's optimizer owns.
                 "state": {
-                    fqn: param_state
+                    fqn: {
+                        key: value.to_local() if isinstance(value, DTensor) else value
+                        for key, value in param_state.items()
+                    }
                     for fqn, param_state in state_dict["state"].items()
                     if fqn in owned_fqns
                 },
@@ -338,50 +325,48 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         Returns:
             The optimizer state dict, in the ``fsdp_dtensor`` format described above.
         """
-        if any(not isinstance(param, DTensor) for param in self._trainable_parameters()):
-            # This development branch keeps optimizer parameters as local tensors;
-            # upstream's MCore checkpoint adapter requires optimizer-visible DTensors.
-            # Native MFSDP CheckpointState remains the supported local-tensor path.
-            raise NotImplementedError(
-                "MFSDP v2 MCore optimizer checkpoints require DTensor parameters; "
-                "use the native MFSDP checkpoint helpers for local tensors."
-            )
         if is_loading:
             init_optimizer_state(self.optimizer)
 
-        state_keys_by_fqn = self._gather_state_keys_by_fqn()
+        state_keys_by_fqn = (
+            self._gather_state_keys_by_fqn() if not is_te_min_version("2.18.0") else {}
+        )
         state_by_fqn = {
             self._param_to_fqn[param]: param_state
             for param, param_state in self.optimizer.state.items()
         }
 
         packed_state: dict[str, Any] = {}
-        for param in self._trainable_parameters():
-            fqn = self._param_to_fqn[param]
-            if fqn in state_by_fqn:
-                packed_state[fqn] = state_by_fqn[fqn]
-            elif fqn in state_keys_by_fqn:
-                # Filtered out of this rank's optimizer because its local shard is empty. The
-                # rank owning a non-empty shard saves the real state; this placeholder has the
-                # same global shape and dtype but no local rows, so it contributes no data and
-                # only keeps the DTensor keyspace identical on every rank.
-                # TODO: delete this branch, together with _gather_state_keys_by_fqn and the
-                # owned_fqns filter in load_state_dict, once MFSDP v2 drops support for
-                # TE < 2.18. The filter that makes them necessary is applied only there
-                # (see get_megatron_optimizer), working around
-                # https://github.com/NVIDIA/TransformerEngine/issues/3207, which
-                # https://github.com/NVIDIA/TransformerEngine/pull/3212 fixed in 2.18. On a
-                # newer TE every rank already holds every parameter, so no placeholder is
-                # ever synthesized and this branch is dead -- it is left unconditional
-                # rather than version-gated so there is one keyspace to reason about
-                # instead of two.
-                packed_state[fqn] = {key: torch.zeros_like(param) for key in state_keys_by_fqn[fqn]}
-            # A parameter absent from the gathered keyspace has no state on any rank, because
-            # nothing has stepped yet. Emitting it as an empty mapping would be rank-consistent
-            # but wrong in a subtler way: the fsdp_dtensor handlers in fsdp_dtensor_checkpoint
-            # test ``state`` for emptiness as a whole and then index ``exp_avg`` per entry, so
-            # a dict of empty dicts raises where an empty dict is handled. v1 emits nothing
-            # here for the same reason, so nothing is emitted here either.
+        for group in self._parameter_groups():
+            if not group.requires_grad:
+                continue
+            for index, parameter in enumerate(group.fsdp_parameters):
+                param = parameter.sharded
+                fqn = self._param_to_fqn[param]
+                if fqn in state_by_fqn:
+                    state = state_by_fqn[fqn]
+                elif fqn in state_keys_by_fqn:
+                    # Filtered out of this rank's optimizer because its local shard is empty.
+                    # The owning rank saves the real state; this placeholder contributes no
+                    # data and keeps the DTensor keyspace identical on every rank.
+                    # TODO: remove this branch, _gather_state_keys_by_fqn and the owned_fqns
+                    # filter in load_state_dict when MFSDP v2 drops TE < 2.18 support.
+                    # get_megatron_optimizer filters empty shards only for those versions:
+                    # https://github.com/NVIDIA/TransformerEngine/issues/3207 was fixed by
+                    # https://github.com/NVIDIA/TransformerEngine/pull/3212 in TE 2.18.
+                    if param.numel() != 0:
+                        raise ValueError("Missing optimizer state for a non-empty parameter shard.")
+                    state = {
+                        key: torch.zeros_like(param, dtype=dtype)
+                        for key, dtype in state_keys_by_fqn[fqn].items()
+                    }
+                else:
+                    # No rank has state for this parameter yet. The checkpoint handlers
+                    # expect an empty state dict, not entries with empty per-parameter dicts.
+                    continue
+                packed_state[fqn] = wrap_optimizer_state(
+                    state, group.main_weight.get_dtensor(index)
+                )
 
         return {"state": packed_state, "param_to_group_meta": self._param_to_group_meta()}
 

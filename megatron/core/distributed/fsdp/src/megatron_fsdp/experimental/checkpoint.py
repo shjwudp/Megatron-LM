@@ -24,6 +24,7 @@ assumes canonical ``Shard(0)`` offsets and silently corrupts the checkpoint.
 """
 
 import os
+from collections.abc import Iterator
 from typing import Any
 
 import torch
@@ -34,7 +35,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     set_optimizer_state_dict,
 )
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor
 
 from .module import FsdpModule
 from .optimizer import init_optimizer_state
@@ -42,6 +43,41 @@ from .parameter_group import sync_model_weights_from_main_weights
 from .uneven_dtensor import attach_uneven_dtensor_metadata
 
 __all__ = ["save_checkpoint", "load_checkpoint"]
+
+
+def named_checkpoint_parameters(model: torch.nn.Module) -> Iterator[tuple[str, DTensor]]:
+    """Yield FQNs and checkpoint views directly from the model's FSDP parameter groups."""
+    checkpoint_parameters: dict[torch.nn.Parameter, DTensor] = {}
+    for module in model.modules():
+        if not isinstance(module, FsdpModule):
+            continue
+        for group in module.parameter_groups:
+            for index, parameter in enumerate(group.fsdp_parameters):
+                checkpoint_parameters[parameter.sharded] = group.main_weight.get_dtensor(index)
+    # Use the model's names so aliases of both parameters and modules appear in the checkpoint.
+    for fqn, parameter in model.named_parameters(remove_duplicate=False):
+        if parameter in checkpoint_parameters:
+            yield fqn, checkpoint_parameters[parameter]
+
+
+def wrap_optimizer_state(state: dict[str, Any], parameter: DTensor) -> dict[str, Any]:
+    """Give elementwise optimizer state the parameter's checkpoint layout."""
+    local_shape = parameter.to_local().shape
+    result = dict(state)
+    for key, value in state.items():
+        if not isinstance(value, torch.Tensor) or value.ndim == 0:
+            continue
+        if value.shape != local_shape or value.device != parameter.device:
+            raise ValueError("Optimizer state must match the parameter shard's shape and device.")
+        result[key] = DTensor.from_local(
+            value,
+            device_mesh=parameter.device_mesh,
+            placements=parameter.placements,
+            run_check=False,
+            shape=parameter.shape,
+            stride=parameter.stride(),
+        )
+    return result
 
 
 class CheckpointState:
@@ -60,38 +96,16 @@ class CheckpointState:
         """Build checkpoint dictionaries with global shapes and uneven-shard metadata."""
         model_state_dict = get_model_state_dict(self.model)
         optimizer_state_dict = get_optimizer_state_dict(self.model, self.optimizer)
-        # Optimizer.state_dict() can share these nested dictionaries with live state.
-        optimizer_state_dict["state"] = {
-            fqn: dict(state) for fqn, state in optimizer_state_dict.get("state", {}).items()
-        }
-        layouts = {}
-        for module in self.model.modules():
-            if isinstance(module, FsdpModule):
-                for group in module.parameter_groups:
-                    for index, parameter in enumerate(group.fsdp_parameters):
-                        layouts[parameter.sharded] = (group.main_weight, index)
         self._local_fqns = set()
-        for fqn, parameter in self.model.named_parameters(remove_duplicate=False):
-            if parameter not in layouts:
-                continue
-            buffer, index = layouts[parameter]
-            self._local_fqns.add(fqn)
-            model_state_dict[fqn] = buffer.get_dtensor(index)
-            for key, value in optimizer_state_dict.get("state", {}).get(fqn, {}).items():
-                if not isinstance(value, torch.Tensor) or value.ndim == 0:
-                    continue
-                if value.shape != parameter.shape:
-                    raise NotImplementedError(
-                        "Local-tensor checkpoints require parameter-shaped optimizer state."
-                    )
-                shape = buffer.layout.tensor_shapes[index]
-                optimizer_state_dict["state"][fqn][key] = DTensor.from_local(
-                    value,
-                    buffer.mesh,
-                    tuple(Shard(p.dim) if isinstance(p, Shard) else p for p in buffer.placements),
-                    run_check=False,
-                    shape=shape,
-                    stride=torch.empty(shape, device="meta").stride(),
+        # Optimizer.state_dict() can share nested dictionaries with live state.
+        optimizer_state_dict["state"] = dict(optimizer_state_dict.get("state", {}))
+        for fqn, checkpoint_parameter in named_checkpoint_parameters(self.model):
+            if fqn in model_state_dict:
+                model_state_dict[fqn] = checkpoint_parameter
+                self._local_fqns.add(fqn)
+            if fqn in optimizer_state_dict["state"]:
+                optimizer_state_dict["state"][fqn] = wrap_optimizer_state(
+                    optimizer_state_dict["state"][fqn], checkpoint_parameter
                 )
         attach_uneven_dtensor_metadata(self.model, model_state_dict, optimizer_state_dict)
         return {"model": model_state_dict, "optimizer": optimizer_state_dict}
@@ -105,9 +119,10 @@ class CheckpointState:
         }
         for fqn in self._local_fqns:
             model_state_dict[fqn] = model_state_dict[fqn].to_local()
-            for key, value in optimizer_state_dict["state"].get(fqn, {}).items():
+        for state in optimizer_state_dict["state"].values():
+            for key, value in state.items():
                 if isinstance(value, DTensor):
-                    optimizer_state_dict["state"][fqn][key] = value.to_local()
+                    state[key] = value.to_local()
         set_model_state_dict(self.model, model_state_dict)
         set_optimizer_state_dict(self.model, self.optimizer, optimizer_state_dict)
 
