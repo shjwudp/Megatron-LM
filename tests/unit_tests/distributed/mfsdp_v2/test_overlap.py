@@ -155,7 +155,7 @@ def test_overlaps_communication_and_compute(
         """Run one optimizer step consuming two microbatches."""
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index in range(2):
-            with microbatch(context, is_last=microbatch_index == 1):
+            with context.iteration(), microbatch(context, is_last=microbatch_index == 1):
                 model(x).sum().backward()
         optimizer.step()
 
@@ -283,7 +283,7 @@ def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
     def train_one_step() -> None:
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index in range(2):
-            with microbatch(context, is_last=microbatch_index == 1):
+            with context.iteration(), microbatch(context, is_last=microbatch_index == 1):
                 model(x).sum().backward()
         optimizer.step()
 

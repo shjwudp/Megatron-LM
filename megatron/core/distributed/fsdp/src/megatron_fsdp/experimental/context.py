@@ -14,6 +14,8 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from weakref import WeakKeyDictionary
 
@@ -42,13 +44,10 @@ class FsdpContext:
     The caller must call ``finish_grad_sync()`` after all gradient producers,
     including delayed weight-gradient computation, and before consuming gradients.
     """
-    # Static orders used to drive all-gather prefetch. We may want to switch to
-    # capturing runtime order if static module order proves too fragile. Each
-    # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
-    forward_order: ExecutionOrder[nn.Module]
-    backward_order: ExecutionOrder[nn.Module]
-    # Topology metadata must not keep modules alive after construction.
-    _roots: ExecutionOrder[nn.Module]
+    # Unavailable until an iteration is recorded. These refer to the active phase's trace.
+    forward_order: ExecutionOrder[nn.Module] | None
+    backward_order: ExecutionOrder[nn.Module] | None
+    _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
     _module_names: WeakKeyDictionary[nn.Module, str]
     # The optimizer runs on the current stream and must wait for reductions on
@@ -95,12 +94,18 @@ class FsdpContext:
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
-        self.forward_order = ExecutionOrder()
-        self.backward_order = ExecutionOrder()
+        self.forward_order = None
+        self.backward_order = None
+        # Keep only the latest training and forward-only schedule patterns.
+        self._iteration_traces: dict[
+            bool, tuple[object, ExecutionOrder[nn.Module], ExecutionOrder[nn.Module] | None]
+        ] = {}
+        self._iteration_active = False
+        self._recording = False
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
-        self._roots = ExecutionOrder()
+        self._roots = WeakKeyDictionary()
         self._module_names = WeakKeyDictionary()
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
@@ -139,7 +144,7 @@ class FsdpContext:
         self._registered_modules.append(module)
 
     def finalize(self) -> None:
-        """Finalize roots, names, and cross-root prefetch orders."""
+        """Finalize roots and names; runtime execution orders are recorded later."""
         if self._is_finalized:
             raise RuntimeError("FSDP context is already finalized.")
 
@@ -153,19 +158,83 @@ class FsdpContext:
         for root in self._registered_modules:
             if root in children:
                 continue
-            self._roots.append(root)
+            self._roots[root] = None
             for name, module in root.named_modules():
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
-                self.forward_order.append(module)
-
-        for root in reversed(self._roots):
-            _collect_backward_order(root, registered_modules, self.backward_order)
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
         self._is_finalized = True
+
+    @contextmanager
+    def iteration(self, *, key: object = None, forward_only: bool = False) -> Iterator[None]:
+        """Record or replay a complete schedule, including every VPP chunk and microbatch.
+
+        A new pattern records demand calls with speculative prefetch disabled.
+        Successful recording installs the trace; replay resets both cursors once
+        at entry and requires complete consumption at exit. Forward-only calls
+        have their own trace and never replace the training trace. Change ``key``
+        when the schedule changes. All ranks must follow collective-compatible,
+        repeatable patterns. Outside this scope, parameters are loaded on demand.
+
+        Failed scopes do not install a new trace. A failed forward/backward may
+        still leave model state or collectives incomplete; discard that work.
+        This Python-hook prototype requires CUDA graphs to be disabled.
+        """
+        self.ensure_finalized()
+        if self._iteration_active:
+            raise RuntimeError("An FSDP iteration is already active.")
+        previous = self.forward_order, self.backward_order
+        cached = self._iteration_traces.get(forward_only)
+        recording = cached is None or cached[0] != key
+        if recording:
+            forward_order = ExecutionOrder()
+            backward_order = None if forward_only else ExecutionOrder()
+        else:
+            _, forward_order, backward_order = cached
+            forward_order.reset()
+            if backward_order is not None:
+                backward_order.reset()
+        self.forward_order, self.backward_order = forward_order, backward_order
+        self._iteration_active = True
+        self._recording = recording
+        try:
+            yield
+            orders = [forward_order]
+            if backward_order is not None:
+                orders.append(backward_order)
+            if recording:
+                if any(not list(order) for order in orders):
+                    raise RuntimeError("An FSDP recording must observe every requested phase.")
+                self._iteration_traces[forward_only] = (key, forward_order, backward_order)
+            elif any(not order.is_complete() for order in orders):
+                raise RuntimeError("FSDP iteration ended before its execution order was consumed.")
+        except BaseException:
+            self.forward_order, self.backward_order = previous
+            raise
+        finally:
+            self._iteration_active = False
+            self._recording = False
+
+    def execution_order(
+        self, module: nn.Module, *, backward: bool = False
+    ) -> ExecutionOrder[nn.Module] | None:
+        """Observe a demand call and return its ready-to-prefetch order, if any."""
+        if not self._iteration_active:
+            return None
+        order = self.backward_order if backward else self.forward_order
+        if order is None:
+            raise RuntimeError("Backward calls are not allowed in a forward-only iteration.")
+        if self._recording:
+            order.append(module)
+            return None
+        # Validate the next occurrence; the sequence itself never looks up a module.
+        if order.next_item() is not module:
+            raise RuntimeError("FSDP module calls diverged from the recorded execution order.")
+        order.advance()
+        return order
 
     def is_root(self, module: nn.Module) -> bool:
         """Return whether ``module`` is an outermost FSDP module in this context."""
@@ -247,17 +316,6 @@ def current_fully_shard_context() -> FsdpContext | None:
     second one.
     """
     return _FSDP_CONTEXT.get()
-
-
-def _collect_backward_order(
-    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[nn.Module]
-) -> None:
-    """Collect one root's static backward prefetch order."""
-    if module in registered_modules:
-        order.append(module)
-
-    for child in reversed(list(module.children())):
-        _collect_backward_order(child, registered_modules, order)
 
 
 def _collect_fsdp_children(

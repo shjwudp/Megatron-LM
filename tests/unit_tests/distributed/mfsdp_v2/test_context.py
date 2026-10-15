@@ -2,7 +2,7 @@
 
 """Unit tests for experimental Megatron-FSDP runtime contexts.
 
-Test prefetch-order construction here; test communication/computation overlap
+Test runtime prefetch-order recording here; test communication/computation overlap
 in ``test_overlap.py``.
 """
 
@@ -134,8 +134,8 @@ def test_context_does_not_keep_modules_alive(distributed_setup):
 
     assert model_ref() is None
     assert child_ref() is None
-    assert list(context.forward_order) == []
-    assert list(context.backward_order) == []
+    assert context.forward_order is None
+    assert context.backward_order is None
 
 
 def test_two_child_subtrees_then_parent_share_one_context(distributed_setup):
@@ -157,8 +157,8 @@ def test_two_child_subtrees_then_parent_share_one_context(distributed_setup):
     assert model.layers[1].context is model.context
 
 
-def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
-    """Independent roots should share streams and follow construction order."""
+def test_sibling_roots_record_runtime_orders(distributed_setup):
+    """Independent roots share streams and record forward/backward calls."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -168,10 +168,10 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
         fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
 
-    with torch.no_grad():
-        model(torch.ones(2, 4, device=device))
-
     context = model.layers[0].context
+    with context.iteration():
+        model(torch.ones(2, 4, device=device)).sum().backward()
+
     assert model.layers[1].context is context
     assert model.layers[0].is_root()
     assert model.layers[1].is_root()
@@ -197,8 +197,8 @@ def test_sibling_roots_enqueue_one_post_backward_wait(distributed_setup, monkeyp
     post_backward.assert_called_once_with()
 
 
-def test_nested_prefetch_orders_use_dfs(distributed_setup):
-    """Nested FsdpModules should use DFS orders for one-step prefetch."""
+def test_nested_prefetch_orders_are_recorded(distributed_setup):
+    """Nested FsdpModules record actual forward/backward execution."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -210,10 +210,10 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
         fully_shard(model.right, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
-    with torch.no_grad():
-        model(torch.ones(2, 4, device=device))
-
     context = model.context
+    with context.iteration():
+        model(torch.ones(2, 4, device=device)).sum().backward()
+
     assert list(context.forward_order) == [model, model.left, model.left.inner, model.right]
     assert list(context.backward_order) == [model, model.right, model.left, model.left.inner]
 
@@ -235,7 +235,7 @@ def test_register_post_backward_hook_handles_parameterless_module(distributed_se
 
 
 def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):
-    """Context orders should concatenate nested roots at construction boundaries."""
+    """One iteration captures execution across nested and independent roots."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = NestedSiblingModel(dim=4).to(device)
@@ -246,6 +246,8 @@ def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):
         fully_shard(model.right, mesh=mesh, placements=_default_placements())
 
     context = model.left.context
+    with context.iteration():
+        model(torch.ones(2, 4, device=device)).sum().backward()
     assert model.left.is_root()
     assert model.right.is_root()
     assert not model.left.inner.is_root()

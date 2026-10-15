@@ -12,71 +12,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Weakly held construction or recorded module execution sequences."""
+"""Weakly held execution occurrences with a pure replay cursor."""
 
 from collections.abc import Iterable, Iterator
 from typing import Generic, TypeVar
-from weakref import WeakKeyDictionary, ref
+from weakref import ref
 
 T = TypeVar("T")
 
 
 class ExecutionOrder(Generic[T]):
-    """Look up unique modules and validate repeated module-call occurrences.
-
-    A module appearing once can unambiguously select its position, preserving
-    construction-order prefetch for reordered or repeated demand calls. Modules
-    appearing more than once must match the next occurrence at the cursor.
-    Prefetch lookahead never advances that cursor.
-    """
+    """Record occurrences and replay them without identity lookup or automatic wrapping."""
 
     def __init__(self, items: Iterable[T] = ()) -> None:
-        """Create a weak execution sequence, preserving repeated occurrences."""
-        self._items: list[ref[T]] = []
-        # An index identifies a unique item; None marks an ambiguous repeated item.
-        self._unique_index: WeakKeyDictionary[T, int | None] = WeakKeyDictionary()
+        """Create an execution sequence, preserving repeated occurrences."""
+        self._items: list[ref[T]] = [ref(item) for item in items]
         self._position = 0
-        for item in items:
-            self.append(item)
 
     def append(self, item: T) -> None:
-        """Append an occurrence and mark previously seen items as repeated."""
-        self._unique_index[item] = None if item in self._unique_index else len(self._items)
+        """Append one observed execution occurrence."""
         self._items.append(ref(item))
 
-    def __contains__(self, item: object) -> bool:
-        """Return whether the sequence contains a live item."""
-        return item in self._unique_index
-
     def __iter__(self) -> Iterator[T]:
-        """Iterate over live occurrences in execution order."""
+        """Iterate over live recorded occurrences."""
         for item_ref in self._items:
             item = item_ref()
             if item is not None:
                 yield item
 
-    def __reversed__(self) -> Iterator[T]:
-        """Iterate over live occurrences in reverse order."""
-        for item_ref in reversed(self._items):
-            item = item_ref()
-            if item is not None:
-                yield item
+    def reset(self) -> None:
+        """Restart replay at the iteration boundary."""
+        self._position = 0
 
-    def advance(self, item: T) -> None:
-        """Locate a unique demand call or consume the next expected repeated call."""
-        index = self._unique_index.get(item)
-        if index is None:
-            if not self._items or self._items[self._position]() is not item:
-                raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
-            index = self._position
-        self._position = (index + 1) % len(self._items)
+    def is_complete(self) -> bool:
+        """Return whether replay consumed every recorded occurrence."""
+        return self._position == len(self._items)
+
+    def advance(self) -> T:
+        """Consume and return the next occurrence without searching by module identity."""
+        if self.is_complete():
+            raise RuntimeError("FSDP execution order is exhausted.")
+        item = self._items[self._position]()
+        if item is None:
+            raise RuntimeError("A recorded FSDP module has been deleted.")
+        self._position += 1
+        return item
 
     def next_item(self, offset: int = 1) -> T | None:
         """Look ahead from the last consumed occurrence without moving the cursor."""
-        if not self._items:
-            return None
-        index = (self._position - 1) % len(self._items)
-        next_index = index + offset
+        next_index = self._position + offset - 1
         if next_index >= len(self._items):
             return None
         return self._items[next_index]()

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
-from functools import partial
+from functools import partial, wraps
 from itertools import chain
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
@@ -49,6 +49,44 @@ except ImportError:
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+def _mfsdp_iteration(schedule):
+    """Scope a complete MFSDP v2 schedule, not an individual root or microbatch."""
+
+    @wraps(schedule)
+    def wrapped(*, model, num_microbatches, forward_only=False, **kwargs):
+        chunks = model if isinstance(model, list) else [model]
+        contexts = dict.fromkeys(
+            chunk.module.context
+            for chunk in chunks
+            if getattr(getattr(chunk, 'ddp_config', None), 'use_megatron_fsdp', False)
+            and getattr(chunk.ddp_config, 'megatron_fsdp_version', 1) == 2
+        )
+        with contextlib.ExitStack() as stack:
+            if contexts:
+                config = get_model_config(chunks[0])
+                if getattr(config, 'cuda_graph_impl', 'none') != 'none':
+                    raise ValueError("Iteration tracing prototype requires CUDA graphs disabled.")
+                if getattr(config, 'overlap_moe_expert_parallel_comm', False):
+                    raise ValueError("Iteration tracing prototype requires automatic FSDP hooks.")
+                key = (
+                    schedule.__name__,
+                    num_microbatches,
+                    len(chunks),
+                    getattr(config, 'microbatch_group_size_per_vp_stage', None),
+                    tuple(chunk.module.training for chunk in chunks),
+                    kwargs.get('collect_non_loss_data', False),
+                    kwargs.get('seq_length'),
+                    kwargs.get('micro_batch_size'),
+                )
+                for context in contexts:
+                    stack.enter_context(context.iteration(key=key, forward_only=forward_only))
+            return schedule(
+                model=model, num_microbatches=num_microbatches, forward_only=forward_only, **kwargs
+            )
+
+    return wrapped
 
 
 def get_forward_backward_func(
@@ -721,6 +759,7 @@ def _reset_activation_offload(
     off_interface.reset(process_group=pg_collection.tp_dp_cp)
 
 
+@_mfsdp_iteration
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -1017,6 +1056,7 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
     return schedule_table
 
 
+@_mfsdp_iteration
 def forward_backward_pipelining_with_interleaving(
     *,
     forward_step_func,
@@ -2173,6 +2213,7 @@ def _prepare_forward_data_iterator(data_iterator, p2p_communicator, *, is_multim
     return chain((batch,), data_iterator)
 
 
+@_mfsdp_iteration
 def forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,

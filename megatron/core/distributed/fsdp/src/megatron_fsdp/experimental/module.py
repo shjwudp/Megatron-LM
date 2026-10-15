@@ -287,28 +287,29 @@ class FsdpModule:
         performs that root sync in ``pre_forward()`` immediately before this.
         """
         with self._nvtx_range("unshard"):
+            order = (
+                self.context.execution_order(cast(nn.Module, self), backward=prefetch == "backward")
+                if prefetch != "none"
+                else None
+            )
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
             self.context.current_stream().wait_event(self._unshard_event)
 
-            context = self.context
-            if prefetch == "forward":
-                self._prefetch_parameter_groups(
-                    context.forward_order, self._schedule_policy.forward_prefetch_size
+            if order is not None:
+                budget = (
+                    self._schedule_policy.forward_prefetch_size
+                    if prefetch == "forward"
+                    else self._schedule_policy.backward_prefetch_size
                 )
-            elif prefetch == "backward":
-                self._prefetch_parameter_groups(
-                    context.backward_order, self._schedule_policy.backward_prefetch_size
-                )
+                self._prefetch_parameter_groups(order, budget)
 
     def _prefetch_parameter_groups(
         self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
-        module = cast(nn.Module, self)
-        order.advance(module)
         next_module = order.next_item()
         if prefetch_size is None:
             if next_module is not None:
@@ -378,8 +379,10 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
-        self.phase = FsdpModule.Phase.BACKWARD
-        torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
+        # Shared parameters accumulate gradients once after all of their uses.
+        if self.phase is not FsdpModule.Phase.BACKWARD:
+            self.phase = FsdpModule.Phase.BACKWARD
+            torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():

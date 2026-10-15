@@ -287,13 +287,14 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = CheckpointedTinyModel(use_reentrant=use_reentrant).to(device)
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device) as context:
         fully_shard(model.fc1, mesh=mesh, placements=_default_placements())
         fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.randn(2, 8, device=device, requires_grad=True)
-    model(x).sum().backward()
+    with context.iteration():
+        model(x).sum().backward()
 
     # Without the forward-prefetch suppression, ``fc1``'s recomputed forward
     # would unshard ``fc2`` after ``fc2``'s backward already resharded it,
@@ -309,7 +310,8 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
     # A second forward after backward runs in the forward phase again, so
     # forward-order prefetch resumes and the module phases return to resting.
-    model(x).sum().backward()
+    with context.iteration():
+        model(x).sum().backward()
     assert model.phase is FsdpModule.Phase.RESTING
     assert model.fc1.phase is FsdpModule.Phase.RESTING
     assert model.fc2.phase is FsdpModule.Phase.RESTING

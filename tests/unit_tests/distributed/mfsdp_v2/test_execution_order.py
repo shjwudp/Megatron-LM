@@ -37,64 +37,42 @@ def test_prefetch_replays_occurrences(budget, expected):
         order.append(module)
     # A second cycle checks cursor reset; each lookahead must leave demand calls intact.
     for _ in range(2):
+        order.reset()
         for module, targets, successor in zip(sequence, expected, sequence[1:] + [None]):
             prefetched.clear()
+            assert order.advance() is module
             FsdpModule._prefetch_parameter_groups(module, order, budget)
             assert prefetched == [modules[index] for index in targets]
             assert order.next_item() is successor
 
 
-def test_unique_calls_resynchronize_and_repeated_calls_validate():
-    """Unique VPP chunk calls select their position; ambiguous repeats stay strict."""
-    chunk0, layer0, chunk1, layer1 = (nn.Module() for _ in range(4))
-    order = ExecutionOrder([chunk0, layer0, chunk1, layer1])
-    # Grouped VPP repeats chunk 0 before switching to chunk 1, in one shared order.
-    for chunk in (chunk0, chunk0, chunk0, chunk1, chunk1, chunk0):
-        layer = layer0 if chunk is chunk0 else layer1
-        order.advance(chunk)
-        assert order.next_item() is layer
-        order.advance(layer)
-        assert order.next_item() is (chunk1 if chunk is chunk0 else None)
-
-    order = ExecutionOrder([chunk0, layer0, chunk0])
-    order.advance(chunk0)
-    assert order.next_item() is layer0
-    with pytest.raises(RuntimeError, match='diverged'):
-        order.advance(chunk0)
-    # A rejected repeated call must not consume the expected occurrence.
-    order.advance(layer0)
-    assert order.next_item() is chunk0
-    order.advance(chunk0)
-    assert order.next_item() is None
-    # Unique calls remain valid anchors even when the sequence also has repeats.
-    order.advance(layer0)
-    order.advance(chunk0)
-    assert order.next_item() is None
-
-    empty = ExecutionOrder()
-    assert empty.next_item() is None
-    with pytest.raises(RuntimeError, match='diverged'):
-        empty.advance(chunk0)
-
-
-def test_membership_reverse_and_weak_references():
-    """Traversal preserves repeated occurrences without retaining deleted modules."""
+def test_cursor_is_explicit_and_checks_completion():
+    """The caller owns iteration resets; exhausted replay never silently wraps."""
     first, second = nn.Module(), nn.Module()
-    order = ExecutionOrder([first, second, first, second])
-    assert first in order
-    assert second in order
-    assert list(order) == [first, second, first, second]
-    assert list(reversed(order)) == [second, first, second, first]
+    order = ExecutionOrder([first, second, first])
+    assert not order.is_complete()
+    assert order.advance() is first
+    assert order.next_item() is second
+    assert order.next_item(2) is first
+    assert order.advance() is second
+    assert order.advance() is first
+    assert order.is_complete()
+    assert order.next_item() is None
+    with pytest.raises(RuntimeError, match='exhausted'):
+        order.advance()
+    order.reset()
+    assert order.advance() is first
 
+
+def test_order_does_not_retain_modules():
+    """Inspection skips dead references; replay cannot silently skip an occurrence."""
+    first, second = nn.Module(), nn.Module()
+    order = ExecutionOrder([first, second, first])
     second_ref = ref(second)
     del second
     gc.collect()
     assert second_ref() is None
-    assert None not in order
     assert list(order) == [first, first]
-    assert list(reversed(order)) == [first, first]
-    order.advance(first)
-    assert order.next_item() is None
-    # Traversal skips dead references, but the demand cursor must not skip a call.
-    with pytest.raises(RuntimeError, match='diverged'):
-        order.advance(first)
+    assert order.advance() is first
+    with pytest.raises(RuntimeError, match='deleted'):
+        order.advance()
