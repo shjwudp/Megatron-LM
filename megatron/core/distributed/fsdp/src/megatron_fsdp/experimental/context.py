@@ -21,6 +21,7 @@ import torch
 from torch import nn
 
 from .execution_order import ExecutionOrder
+from .execution_trace import ExecutionTrace
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -95,6 +96,7 @@ class FsdpContext:
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
+        self.execution_trace: ExecutionTrace[nn.Module] = ExecutionTrace()
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
         self._post_backward_hook_registered = False

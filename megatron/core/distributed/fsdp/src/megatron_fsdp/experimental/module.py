@@ -276,7 +276,12 @@ class FsdpModule:
 
         self.unshard(prefetch="forward" if not is_recomputing else "none")
 
-    def unshard(self, prefetch: Literal["forward", "backward", "none"] = "none") -> None:
+    def unshard(
+        self,
+        prefetch: Literal["forward", "backward", "none"] = "none",
+        *,
+        execution_phase: str | None = None,
+    ) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
 
         External schedulers invoking this directly (rather than through the
@@ -285,8 +290,18 @@ class FsdpModule:
         ``context.allgather_stream.wait_stream(context.current_stream())``
         before this when ``self.is_root()``; the automatic forward path
         performs that root sync in ``pre_forward()`` immediately before this.
+
+        An active execution trace owns prefetch decisions, including custom calls
+        with ``prefetch="none"``. ``execution_phase`` labels custom scheduler calls
+        without enabling construction-order prefetch outside a trace scope.
         """
         with self._nvtx_range("unshard"):
+            trace = self.context.execution_trace
+            trace.observe(
+                cast(nn.Module, self),
+                'unshard',
+                phase=execution_phase or (prefetch if prefetch != 'none' else None),
+            )
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
@@ -294,7 +309,25 @@ class FsdpModule:
             self.context.current_stream().wait_event(self._unshard_event)
 
             context = self.context
-            if prefetch == "forward":
+            if trace.active:
+                budget = (
+                    self._schedule_policy.backward_prefetch_size
+                    if execution_phase == 'backward' or prefetch == 'backward'
+                    else self._schedule_policy.forward_prefetch_size
+                )
+                prefetched = 0
+                if budget != 0:
+                    for candidate in trace.prefetch_candidates():
+                        candidate = cast(FsdpModule, candidate)
+                        if candidate._unshard_event is not None:
+                            continue
+                        candidate._unshard_parameter_groups()
+                        if budget is None:
+                            break
+                        prefetched += candidate.num_parameter_elements
+                        if prefetched >= budget:
+                            break
+            elif prefetch == "forward":
                 self._prefetch_parameter_groups(
                     context.forward_order, self._schedule_policy.forward_prefetch_size
                 )
@@ -356,6 +389,7 @@ class FsdpModule:
     def reshard(self) -> None:
         """Reshard this FsdpModule's parameter groups."""
         with self._nvtx_range("reshard"):
+            self.context.execution_trace.observe(cast(nn.Module, self), 'reshard')
             self._reshard_parameter_groups()
 
     def _reshard_parameter_groups(self) -> None:
@@ -378,8 +412,10 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
-        self.phase = FsdpModule.Phase.BACKWARD
-        torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
+        # Shared modules may receive several pre-hooks before parameter gradients accumulate.
+        if self.phase is not FsdpModule.Phase.BACKWARD:
+            self.phase = FsdpModule.Phase.BACKWARD
+            torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
