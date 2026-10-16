@@ -57,3 +57,36 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     for submodule in module.modules():
         if isinstance(submodule, FsdpModule):
             submodule.register_post_backward_hook(_module_post_backward_hook)
+
+
+def prefetch_fsdp_parameters(module, *, backward, compute_stream):
+    """Queue the next scheduled node's MFSDP v2 gathers without a compute wait.
+
+    Demand hooks wait on each owner's event inside the node's CUDA stream.
+    Parameter release and gradient completion remain with the existing hooks.
+    The target subtree and phase are selected by the combined scheduler rather
+    than inferred from independent forward/backward construction orders.
+    """
+    units = []
+
+    def collect(submodule):
+        if isinstance(submodule, FsdpModule):
+            units.append(submodule)
+        children = list(submodule.children())
+        for child in reversed(children) if backward else children:
+            collect(child)
+
+    collect(module)
+    if not units:
+        return
+    policy = units[0]._schedule_policy
+    budget = policy.backward_prefetch_size if backward else policy.forward_prefetch_size
+    if budget == 0:
+        return
+    size = 0
+    for unit in units:
+        unit.context.allgather_stream.wait_stream(compute_stream)
+        unit._unshard_parameter_groups()
+        size += unit.num_parameter_elements
+        if budget is None or size >= budget:
+            break

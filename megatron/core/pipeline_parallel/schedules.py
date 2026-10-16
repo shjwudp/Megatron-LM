@@ -9,6 +9,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.models.common.vpp_mfsdp_scheduler import VppMfsdpScheduler
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -1049,6 +1050,7 @@ def forward_backward_pipelining_with_interleaving(
     # virtual_microbatch_id in [0, total_num_microbatches)
 
     config = get_model_config(model[0])
+    mfsdp_scheduler = VppMfsdpScheduler(model)
     if p2p_communicator is None and pg_collection is None:
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
@@ -1392,26 +1394,28 @@ def forward_backward_pipelining_with_interleaving(
             virtual_microbatch_id, model_chunk_id, microbatch_id
         )
 
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator[model_chunk_id],
-            model[model_chunk_id],
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            cp_group_size=cp_size,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=check_first_val_step(
-                first_val_step,
-                forward_only,
-                is_first_microbatch_for_model_chunk(virtual_microbatch_id),
-            ),
-            current_microbatch=microbatch_id,
-            vp_stage=model_chunk_id,
-            is_last_stage=_is_vp_last_stage(vp_stage=model_chunk_id) and is_pp_last_stage(pp_group),
-        )
+        with mfsdp_scheduler.pass_context(model_chunk_id):
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator[model_chunk_id],
+                model[model_chunk_id],
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size=cp_size,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step,
+                    forward_only,
+                    is_first_microbatch_for_model_chunk(virtual_microbatch_id),
+                ),
+                current_microbatch=microbatch_id,
+                vp_stage=model_chunk_id,
+                is_last_stage=_is_vp_last_stage(vp_stage=model_chunk_id)
+                and is_pp_last_stage(pp_group),
+            )
 
         forward_step_helper_postprocess(model_chunk_id, output_tensor, num_tokens)
 
@@ -1465,7 +1469,10 @@ def forward_backward_pipelining_with_interleaving(
             virtual_microbatch_id, model_chunk_id
         )
 
-        input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+        with mfsdp_scheduler.pass_context(model_chunk_id):
+            input_tensor_grad = backward_step(
+                input_tensor, output_tensor, output_tensor_grad, config
+            )
 
         backward_step_helper_postprocess(virtual_microbatch_id)
 

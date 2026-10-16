@@ -6,7 +6,10 @@ import torch
 from torch import Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import reshard_fsdp_module
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
+    prefetch_fsdp_parameters,
+    reshard_fsdp_module,
+)
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -248,13 +251,30 @@ class TransformerLayerSchedulePlan:
             Functions or values for next iteration's computation
         """
 
+        if f_layer is not None:
+            prefetch_fsdp_parameters(
+                f_layer.layer, backward=False, compute_stream=f_layer.comp_stream()
+            )
+
         if b_layer is not None:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
 
+        if b_layer is not None:
+            # Gather backward weights while the forward attention node computes.
+            prefetch_fsdp_parameters(
+                b_layer.layer, backward=True, compute_stream=b_layer.comp_stream()
+            )
+
         if f_layer is not None:
             with f_layer.get_low_precision_context():
                 f_input = f_layer.pre_dispatch_computation.forward(f_input)
+
+        if f_layer is not None:
+            # Expert units can be separate FSDP owners from the attention unit.
+            mlp = getattr(f_layer.layer, "mlp", None)
+            if mlp is not None:
+                prefetch_fsdp_parameters(mlp, backward=False, compute_stream=f_layer.comp_stream())
 
         if b_layer is not None:
             b_grad = b_layer.mlp.backward(b_grad)
