@@ -102,3 +102,34 @@ assuming adapter bookkeeping recovers model state.
 The proposed review boundary is these separate scheduling policies and their
 runtime callback contract. Actual scheduler wiring, hook replacement, CUDA graph
 support, and performance validation are later integration work.
+
+## Production integration branch
+
+The production implementations are separate from this callback demo:
+
+- `megatron/core/models/common/vpp_mfsdp_scheduler.py` scopes the shared FSDP
+  context's forward/backward orders to the chunk selected by the real VPP
+  helper. Each pass gets fresh cursors; both orders are restored on exit,
+  including exceptions. Ordinary FSDP hooks still perform communication.
+- `combined_1f1b_mfsdp_scheduler.py` queues nonblocking gathers at the
+  boundaries in `TransformerLayerSchedulePlan.run`: forward weights before
+  backward communication, backward weights before forward attention, and
+  forward expert weights before backward MLP compute. Existing demand hooks
+  wait on the owning unit's event. Parameter-completion hooks retain sole
+  ownership of gradient reduction, including delayed weight gradients.
+
+This integration leaves `ExecutionOrder`, `FsdpContext`, and `FsdpModule`
+unchanged. It does not remove `_unique_index` or introduce order recording.
+The VPP policy conservatively stops prefetch at chunk boundaries.
+
+`tests/unit_tests/distributed/mfsdp_v2/test_pipeline_schedulers.py` exercises
+real PP2/VPP2 training/validation and the combined MoE schedule with three
+microbatches, with and without delayed weight gradients. Run with eight GPUs:
+
+```bash
+python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
+  tests/unit_tests/distributed/mfsdp_v2/test_pipeline_schedulers.py
+```
+
+These numerical tests do not establish throughput, peak-memory improvements,
+CUDA graph compatibility, or coverage of every combined-VPP configuration.

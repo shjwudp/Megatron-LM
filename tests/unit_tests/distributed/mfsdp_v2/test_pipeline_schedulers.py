@@ -193,7 +193,8 @@ def test_combined_1f1b_training_matches_eager(distributed_setup, delay_wgrad):
                 expected = []
                 for batch in data:
                     output = reference(**batch).float().sum()
-                    expected.append(output.detach())
+                    # The scheduler logs the same loss tensor it scales for backward.
+                    expected.append(output.detach() / len(data))
                     (output / len(data)).backward()
                 reference.finish_grad_sync()
                 ref_optimizer.step()
