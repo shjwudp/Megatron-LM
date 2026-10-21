@@ -41,9 +41,9 @@ class ExecutionOrder(Generic[T]):
         """Append one occurrence."""
         self._items.append(item)
 
-    def reset_cursor(self) -> None:
+    def reset_cursor(self, position: int = 0) -> None:
         """Reset traversal position without changing the recorded sequence."""
-        self._position = 0
+        self._position = position
 
     def __len__(self) -> int:
         return len(self._items)
@@ -79,6 +79,7 @@ class IterationOrder(ExecutionOrder[Demand]):
 
     ``mode`` selects the order source. In ``record_replay`` mode, ``captured``
     distinguishes initial recording from replay of the completed sequence.
+    ``active`` tracks the iteration scope independently of the selected strategy.
     State lives on FsdpContext because autograd hooks can run on another thread.
     The scheduler owns iteration boundaries and must explicitly recapture when
     the training schedule changes.
@@ -86,13 +87,17 @@ class IterationOrder(ExecutionOrder[Demand]):
 
     def __init__(self) -> None:
         super().__init__()
+        # Only construction-defined orders have separate F/B sections.
+        self.backward_start = 0
         self.captured = False
+        self.active = False
         self.mode: Literal["static", "record_replay", "demand"] = "static"
 
-    @property
-    def active(self) -> bool:
-        return self.mode != "static"
+    def append(self, item: Demand) -> None:
+        """Append an occurrence before the recorded sequence is complete."""
+        assert not self.captured, "Cannot append to an already captured order."
+        super().append(item)
 
     @property
     def recording(self) -> bool:
-        return self.mode == "record_replay" and not self.captured
+        return self.active and self.mode == "record_replay" and not self.captured

@@ -35,15 +35,20 @@ def test_prefetch_replays_occurrences(budget, expected, recorded):
             target
         )
     sequence = [modules[index] for index in (0, 1, 0, 0, 2)]
-    order = IterationOrder() if recorded else ExecutionOrder()
-    context = Mock(iteration_order=order if recorded else IterationOrder(), forward_order=order)
+    order = IterationOrder()
+    context = Mock(iteration_order=order)
     for module in modules:
         module.context = context
     for module in sequence:
-        order.append((ref(module), "forward") if recorded else ref(module))
+        order.append((ref(module), "forward"))
     if recorded:
         order.mode = "record_replay"
+        order.active = True
         order.captured = True
+    else:
+        order.backward_start = len(order)
+        order.append((ref(modules[0]), "backward"))
+        order.append((ref(modules[1]), "backward"))
     # A second cycle checks cursor reset; each lookahead must leave demand calls intact.
     for _ in range(2):
         order.reset_cursor()
@@ -53,10 +58,16 @@ def test_prefetch_replays_occurrences(budget, expected, recorded):
             FsdpModule._prefetch_parameter_groups(module, order, budget)
             assert prefetched == [modules[index] for index in targets]
             assert order.position == index + 1
-            remaining = [order[i] for i in range(order.position, len(order))]
-            assert [(item[0] if recorded else item)() for item in remaining] == sequence[
-                index + 1 :
-            ]
+            end = len(order) if recorded else order.backward_start
+            remaining = [order[i][0]() for i in range(order.position, end)]
+            assert remaining == sequence[index + 1 :]
+        if not recorded:
+            order.reset_cursor(order.backward_start)
+            FsdpContext._advance_order(context, modules[0], "backward")
+            prefetched.clear()
+            FsdpModule._prefetch_parameter_groups(modules[0], order, budget)
+            assert prefetched == ([] if budget == 0 else [modules[1]])
+            assert order.position == order.backward_start + 1
 
 
 def test_explicit_reset_and_exhaustion():
@@ -74,6 +85,8 @@ def test_explicit_reset_and_exhaustion():
         assert list(order)[order.position :] == []
         with pytest.raises(RuntimeError, match='exceeded'):
             order.advance()
+    order.reset_cursor(1)
+    assert order.advance() is b
     empty = ExecutionOrder()
     assert list(empty) == []
     with pytest.raises(RuntimeError, match='exceeded'):
@@ -99,8 +112,10 @@ def test_iteration_and_weak_references():
     assert order.position == 2 and len(order) == 4
 
     # Static FSDP callers detect a destroyed owner without skipping its occurrence.
-    static = ExecutionOrder([ref(first), second_ref])
-    context = Mock(iteration_order=IterationOrder(), forward_order=static)
+    static = IterationOrder()
+    static.append((ref(first), "forward"))
+    static.append((second_ref, "forward"))
+    context = Mock(iteration_order=static)
     FsdpContext._advance_order(context, first, "forward")
     with pytest.raises(RuntimeError, match='destroyed'):
         FsdpContext._advance_order(context, first, "forward")

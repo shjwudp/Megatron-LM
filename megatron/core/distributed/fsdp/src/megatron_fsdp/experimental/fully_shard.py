@@ -203,17 +203,21 @@ def iteration(context: FsdpContext, *, forward_only: bool = False) -> Iterator[I
     All model chunks share this boundary. Forward-only scopes gather on demand
     without consuming the training order. The caller still owns finish_grad_sync
     after all backward producers; changed training schedules need a fresh order.
+    Once captured, the runtime order replaces the construction order. Outside
+    iteration scopes it is retained without advancing or speculative prefetch.
     """
     context.ensure_finalized()
     if context.iteration_order.active:
         raise RuntimeError("Cannot enter an already active FSDP iteration.")
     order = context.iteration_order
+    previous_mode = order.mode
     recording = not forward_only and not order.captured
     if recording:
         order = context.iteration_order = IterationOrder()
     elif not forward_only:
         order.reset_cursor()
     order.mode = "demand" if forward_only else "record_replay"
+    order.active = True
     try:
         context.allgather_stream.wait_stream(context.current_stream())
         yield order
@@ -226,7 +230,9 @@ def iteration(context: FsdpContext, *, forward_only: bool = False) -> Iterator[I
             order.captured = False
         raise
     finally:
-        order.mode = "static"
+        order.active = False
+        if forward_only:
+            order.mode = previous_mode
 
 
 def _attach_mixin(module: nn.Module) -> None:

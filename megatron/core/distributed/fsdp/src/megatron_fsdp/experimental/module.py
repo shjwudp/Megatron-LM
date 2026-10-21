@@ -30,9 +30,9 @@ from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .context import FsdpContext, PrefetchOrder
+from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import DemandPhase
+from .execution_order import DemandPhase, IterationOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,
@@ -299,11 +299,11 @@ class FsdpModule:
             # separately sharded siblings whose parent is not sharded. Reset only
             # at the first root so later roots continue the shared static cursor.
             if (
-                not context.iteration_order.active
+                context.iteration_order.mode == "static"
                 and not is_recomputing
-                and next(iter(context.forward_order))() is self
+                and context.iteration_order[0][0]() is self
             ):
-                context.forward_order.reset_cursor()
+                context.iteration_order.reset_cursor()
 
         self.unshard(prefetch="forward" if not is_recomputing else "recompute")
 
@@ -335,14 +335,16 @@ class FsdpModule:
                 )
                 self._prefetch_parameter_groups(order, budget)
 
-    def _prefetch_parameter_groups(self, order: PrefetchOrder, prefetch_size: int | None) -> None:
+    def _prefetch_parameter_groups(self, order: IterationOrder, prefetch_size: int | None) -> None:
         """Prefetch successors of the consumed demand in a static or captured order."""
         if prefetch_size == 0:
             return
         size = 0
+        phase = order[order.position - 1][1]
         for index in range(order.position, len(order)):
-            item = order[index]
-            module_ref = item[0] if isinstance(item, tuple) else item
+            module_ref, next_phase = order[index]
+            if order.mode == "static" and next_phase != phase:
+                break
             module = module_ref()
             if module is None:
                 raise RuntimeError("A module in the FSDP execution order was destroyed.")
@@ -419,8 +421,9 @@ class FsdpModule:
         if self.is_root():
             # Backward has its own first root, in reverse construction order.
             # Resetting at every root would restart the shared cursor mid-pass.
-            if not context.iteration_order.active and next(iter(context.backward_order))() is self:
-                context.backward_order.reset_cursor()
+            order = context.iteration_order
+            if order.mode == "static" and order[order.backward_start][0]() is self:
+                order.reset_cursor(order.backward_start)
             context.register_post_backward_hook()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is

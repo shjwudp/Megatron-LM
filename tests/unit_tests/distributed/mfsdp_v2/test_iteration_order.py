@@ -126,6 +126,13 @@ def test_capture_replay_and_validation(context):
         assert order[4][1] == "recompute"
         run([a, b], forward_only=True)
         assert context.iteration_order is order and order.position == len(events)
+        assert order.mode == "record_replay"
+        # The construction order was replaced; out-of-scope calls must not
+        # consume the saved training trace (e.g. ordinary validation).
+        before = len(gathers.mock_calls)
+        FsdpModule.unshard(b, prefetch="forward")
+        assert [call[0] for call in gathers.mock_calls[before:]] == ["b", "wait"]
+        assert order.position == len(events)
     prefetched.clear()
     run(a, budget=0)
     assert not prefetched
@@ -201,6 +208,7 @@ def test_repeated_backward_keeps_static_guard(mode, captured, monkeypatch):
     context = Mock(iteration_order=IterationOrder())
     context.iteration_order.mode = mode
     context.iteration_order.captured = captured
+    context.iteration_order.active = mode != "static"
     module = Mock(spec=FsdpModule, context=context, phase=FsdpModule.Phase.BACKWARD)
     module.is_root.return_value = False
     push = Mock()
@@ -245,10 +253,8 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iterat
         fully_shard(model.fc1, mesh=mesh, placements=placements)
         fully_shard(model.fc2, mesh=mesh, placements=placements)
         fully_shard(model, mesh=mesh, placements=placements)
-    forward_reset = Mock(wraps=context.forward_order.reset_cursor)
-    backward_reset = Mock(wraps=context.backward_order.reset_cursor)
-    monkeypatch.setattr(context.forward_order, "reset_cursor", forward_reset)
-    monkeypatch.setattr(context.backward_order, "reset_cursor", backward_reset)
+    reset = Mock(wraps=context.iteration_order.reset_cursor)
+    monkeypatch.setattr(context.iteration_order, "reset_cursor", reset)
     ref_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.01)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     fully_shard_optimizer(optimizer)
@@ -278,8 +284,12 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iterat
     for _ in range(2):
         with torch.no_grad():
             torch.testing.assert_close(run(model, forward_only=True), baseline(x))
-    assert forward_reset.call_count == (2 if record_iteration else 5)
-    assert backward_reset.call_count == (0 if record_iteration else 3)
+    assert reset.call_count == (0 if record_iteration else 8)
+    if not record_iteration:
+        assert [call.args for call in reset.call_args_list] == [
+            (),
+            (context.iteration_order.backward_start,),
+        ] * 3 + [(), ()]
     if record_iteration:
         demands = context.iteration_order
         assert "recompute" in [phase for _, phase in demands]
