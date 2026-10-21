@@ -22,18 +22,17 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.context import FsdpContext
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.iteration import IterationOrder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.common import mfsdp_iteration
 from megatron.core.models.common.mfsdp_iteration import with_mfsdp_iteration
 
 
-def _demand(order, module, phase):
-    if order.recording:
-        order.append((ref(module), phase))
-    expected, expected_phase = order.advance()
-    if expected() is not module or expected_phase != phase:
-        raise RuntimeError("Demand diverged from the captured iteration order.")
+def _demand(context, module, phase, budget=0):
+    order = FsdpContext._advance_order(context, module, phase)
+    if order is not None:
+        FsdpModule._prefetch_parameter_groups(module, order, budget)
 
 
 class _Unit(nn.Module):
@@ -53,17 +52,23 @@ class _Unit(nn.Module):
     def _nvtx_range(self, name):
         return nullcontext()
 
+    _prefetch_parameter_groups = FsdpModule._prefetch_parameter_groups
+
 
 @pytest.fixture
 def context(monkeypatch):
     # Exercise the production schedule wrapper without allocating CUDA resources.
     monkeypatch.setattr(mfsdp_iteration, "FsdpModule", _Unit)
-    return Mock(
+    context = Mock(
         ensure_finalized=Mock(),
         iteration_order=IterationOrder(),
         allgather_stream=Mock(),
         current_stream=Mock(),
     )
+    context._advance_order = lambda module, phase: FsdpContext._advance_order(
+        context, module, phase
+    )
+    return context
 
 
 def test_capture_replay_and_validation(context):
@@ -80,6 +85,8 @@ def test_capture_replay_and_validation(context):
     gathers = Mock()
     gathers.attach_mock(a._unshard_parameter_groups, "a")
     gathers.attach_mock(b._unshard_parameter_groups, "b")
+    gathers.attach_mock(context.current_stream.return_value.wait_event, "wait")
+    prefetched = []
 
     @with_mfsdp_iteration
     def run(model, forward_only=False, budget=None):
@@ -91,29 +98,34 @@ def test_capture_replay_and_validation(context):
             assert b._unshard_parameter_groups.call_count == before + 1
             return
         for module, phase in events:
-            _demand(order, module, phase)
-            order.prefetch(budget)
+            module._schedule_policy.forward_prefetch_size = budget
+            module._schedule_policy.backward_prefetch_size = budget
+            before = len(gathers.mock_calls)
+            FsdpModule.unshard(module, prefetch=phase)
+            calls = gathers.mock_calls[before:]
+            assert calls[0][0] == ("a" if module is a else "b")
+            assert calls[1][0] == "wait"
+            prefetched.extend(call[0] for call in calls[2:])
 
     run(a, forward_only=True)
     assert not context.iteration_order.captured
     nested = with_mfsdp_iteration(run)
     for schedule, replay in ((run, False), (nested, True), (run, True)):
         gathers.reset_mock()
+        prefetched.clear()
         schedule(a)
-        assert [call[0] for call in gathers.mock_calls] == (
-            ["a", "b", "b", "a", "a"] if replay else []
-        )
+        assert prefetched == (["a", "b", "b", "a", "a"] if replay else [])
         order = context.iteration_order
         assert order.captured and not order.active
         assert order.position == len(events)
         run(a, forward_only=True)
         assert context.iteration_order is order and order.position == len(events)
-    gathers.reset_mock()
+    prefetched.clear()
     run(a, budget=0)
-    assert not gathers.mock_calls
+    assert not prefetched
     run(a, budget=2)
     # An independent prefetch cursor visits each future occurrence only once.
-    assert [call[0] for call in gathers.mock_calls] == ["a", "b", "b", "a", "a"]
+    assert prefetched == ["a", "b", "b", "a", "a"]
 
 
 def test_failed_or_changed_iterations_require_capture(context):
@@ -124,14 +136,14 @@ def test_failed_or_changed_iterations_require_capture(context):
     @with_mfsdp_iteration
     def run(model, fail=False):
         for module, phase in events:
-            _demand(context.iteration_order, module, phase)
+            _demand(context, module, phase)
         if fail:
             raise ValueError("failed compute")
 
     for changed in ([(b, "forward")], [(a, "backward")], [], [(a, "forward"), (a, "forward")]):
         events = [(a, "forward")]
         with capture(context):
-            _demand(context.iteration_order, a, "forward")
+            _demand(context, a, "forward")
         events = changed
         with pytest.raises(RuntimeError):
             run(a)
@@ -143,7 +155,7 @@ def test_failed_or_changed_iterations_require_capture(context):
         with pytest.raises(RuntimeError, match="active"):
             with capture(context):
                 pass
-        _demand(context.iteration_order, b, "forward")
+        _demand(context, b, "forward")
     events = [(b, "forward")]
     run(a)
     assert context.iteration_order.captured
@@ -158,8 +170,8 @@ def test_capture_does_not_retain_modules(context):
     """Captured occurrences keep weak references and reject a destroyed owner."""
     a, b = _Unit(context), _Unit(context)
     with capture(context):
-        _demand(context.iteration_order, a, "forward")
-        _demand(context.iteration_order, b, "backward")
+        _demand(context, a, "forward")
+        _demand(context, b, "backward")
     b_ref = ref(b)
     del b
     gc.collect()
@@ -167,8 +179,7 @@ def test_capture_does_not_retain_modules(context):
 
     @with_mfsdp_iteration
     def run(model):
-        _demand(context.iteration_order, model, "forward")
-        context.iteration_order.prefetch(None)
+        _demand(context, model, "forward", budget=None)
 
     with pytest.raises(RuntimeError, match="destroyed"):
         run(a)

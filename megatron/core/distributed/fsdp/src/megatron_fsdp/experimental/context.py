@@ -22,7 +22,9 @@ import torch
 from torch import nn
 
 from .execution_order import ExecutionOrder
-from .iteration import IterationOrder
+from .iteration import Demand, DemandPhase, IterationOrder
+
+PrefetchOrder = ExecutionOrder[ref[nn.Module]] | ExecutionOrder[Demand]
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -100,6 +102,9 @@ class FsdpContext:
         self.iteration_order = IterationOrder()
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
+        # First demand after an order reset also resets this independent cursor.
+        # Keep progress across calls so larger budgets do not revisit occurrences.
+        self._prefetch_position = 0
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -189,6 +194,37 @@ class FsdpContext:
             raise RuntimeError(
                 "FSDP context is not finalized. Exit fully_shard_context to complete construction."
             )
+
+    def _advance_order(self, module: nn.Module, phase: DemandPhase) -> PrefetchOrder | None:
+        """Consume and validate a demand, returning its order when prefetch is enabled."""
+        iteration = self.iteration_order
+        if iteration.active:
+            if iteration.mode == "demand":
+                return None
+            order: PrefetchOrder = iteration
+            if iteration.recording:
+                iteration.append((ref(module), phase))
+        elif phase == "forward":
+            order = self.forward_order
+        elif phase == "backward":
+            order = self.backward_order
+        else:
+            return None
+        if order.position == 0:
+            self._prefetch_position = 0
+        item = order.advance()
+        if isinstance(item, tuple):
+            expected, expected_phase = item
+            if expected_phase != phase:
+                raise RuntimeError("FSDP module phase diverged from the captured iteration order.")
+        else:
+            expected = item
+        owner = expected()
+        if owner is None:
+            raise RuntimeError("A module in the FSDP execution order was destroyed.")
+        if owner is not module:
+            raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
+        return None if iteration.recording or phase == "none" else order
 
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""

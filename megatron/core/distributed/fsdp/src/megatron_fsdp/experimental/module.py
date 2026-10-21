@@ -30,9 +30,8 @@ from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .context import FsdpContext
+from .context import FsdpContext, PrefetchOrder
 from .countdown import Countdown
-from .execution_order import ExecutionOrder
 from .iteration import DemandPhase
 from .module_utils import get_parameter_owner
 from .parameter_group import (
@@ -319,14 +318,8 @@ class FsdpModule:
         # Combined hooks may run forward recomputation inside backward.
         if prefetch == "forward" and _is_in_backward():
             prefetch = "recompute"
-        order = self.context.iteration_order
-        scoped = order.active
-        if order.mode in ("capture", "replay"):
-            if order.recording:
-                order.append((ref(self), prefetch))
-            expected, phase = order.advance()
-            if expected() is not self or phase != prefetch:
-                raise RuntimeError("FSDP module calls diverged from the recorded iteration order.")
+        context = self.context
+        order = context._advance_order(cast(nn.Module, self), prefetch)
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
@@ -334,48 +327,35 @@ class FsdpModule:
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
             self.context.current_stream().wait_event(self._unshard_event)
 
-            context = self.context
-            if scoped:
+            if order is not None:
                 budget = (
                     self._schedule_policy.forward_prefetch_size
                     if prefetch == "forward"
                     else self._schedule_policy.backward_prefetch_size
                 )
-                context.iteration_order.prefetch(0 if prefetch == "none" else budget)
-            elif prefetch == "forward":
-                self._prefetch_parameter_groups(
-                    context.forward_order, self._schedule_policy.forward_prefetch_size
-                )
-            elif prefetch == "backward":
-                self._prefetch_parameter_groups(
-                    context.backward_order, self._schedule_policy.backward_prefetch_size
-                )
+                self._prefetch_parameter_groups(order, budget)
 
-    def _prefetch_parameter_groups(
-        self, order: ExecutionOrder[ref[nn.Module]], prefetch_size: int | None
-    ) -> None:
-        """Prefetch successors from ``order`` according to this module's budget."""
-        module = order.advance()()
-        if module is None:
-            raise RuntimeError("A module in the FSDP execution order was destroyed.")
-        if module is not self:
-            raise RuntimeError("FSDP module calls diverged from the static prefetch order.")
-        next_ref = order.next_item()
-        next_module = next_ref() if next_ref is not None else None
-        if prefetch_size is None:
-            if next_module is not None:
-                cast(FsdpModule, next_module)._unshard_parameter_groups()
+    def _prefetch_parameter_groups(self, order: PrefetchOrder, prefetch_size: int | None) -> None:
+        """Prefetch successors of the consumed demand in a static or captured order."""
+        if prefetch_size == 0:
             return
-
-        prefetched_size = 0
-        offset = 1
-        while next_module is not None and prefetched_size < prefetch_size:
-            fsdp_module = cast(FsdpModule, next_module)
+        context = self.context
+        context._prefetch_position = max(context._prefetch_position, order.position)
+        size = 0
+        while True:
+            item = order.next_item(context._prefetch_position - order.position + 1)
+            if item is None:
+                break
+            module_ref = item[0] if isinstance(item, tuple) else item
+            module = module_ref()
+            if module is None:
+                raise RuntimeError("A module in the FSDP execution order was destroyed.")
+            context._prefetch_position += 1
+            fsdp_module = cast(FsdpModule, module)
             fsdp_module._unshard_parameter_groups()
-            prefetched_size += fsdp_module.num_parameter_elements
-            offset += 1
-            next_ref = order.next_item(offset)
-            next_module = next_ref() if next_ref is not None else None
+            size += fsdp_module.num_parameter_elements
+            if prefetch_size is None or size >= prefetch_size:
+                break
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.

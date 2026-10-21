@@ -9,9 +9,11 @@ from weakref import ref
 import pytest
 from torch import nn
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.context import FsdpContext
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionOrder,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.iteration import IterationOrder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
 
@@ -20,10 +22,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import
     [
         (None, [[1], [0], [0], [2], []]),
         (0, [[], [], [], [], []]),
-        (2, [[1, 0], [0, 0], [0, 2], [2], []]),
+        (2, [[1, 0], [0, 2], [], [], []]),
     ],
 )
-def test_prefetch_replays_occurrences(budget, expected):
+@pytest.mark.parametrize("recorded", [False, True], ids=["static", "captured"])
+def test_prefetch_replays_occurrences(budget, expected, recorded):
     """Reused modules have occurrence-specific successors under every prefetch budget."""
     modules = [Mock(spec=FsdpModule, num_parameter_elements=1) for _ in range(3)]
     prefetched = []
@@ -32,17 +35,24 @@ def test_prefetch_replays_occurrences(budget, expected):
             target
         )
     sequence = [modules[index] for index in (0, 1, 0, 0, 2)]
-    order = ExecutionOrder()
+    order = IterationOrder() if recorded else ExecutionOrder()
+    context = Mock(iteration_order=order if recorded else IterationOrder(), forward_order=order)
+    for module in modules:
+        module.context = context
     for module in sequence:
-        order.append(ref(module))
+        order.append((ref(module), "forward") if recorded else ref(module))
+    if recorded:
+        order.mode = "replay"
     # A second cycle checks cursor reset; each lookahead must leave demand calls intact.
     for _ in range(2):
         order.reset()
         for module, targets, successor in zip(sequence, expected, sequence[1:] + [None]):
             prefetched.clear()
+            assert FsdpContext._advance_order(context, module, "forward") is order
             FsdpModule._prefetch_parameter_groups(module, order, budget)
             assert prefetched == [modules[index] for index in targets]
-            next_ref = order.next_item()
+            item = order.next_item()
+            next_ref = item[0] if recorded and item is not None else item
             assert (next_ref() if next_ref is not None else None) is successor
 
 
@@ -87,6 +97,7 @@ def test_iteration_and_weak_references():
 
     # Static FSDP callers detect a destroyed owner without skipping its occurrence.
     static = ExecutionOrder([ref(first), second_ref])
-    FsdpModule._prefetch_parameter_groups(first, static, None)
+    context = Mock(iteration_order=IterationOrder(), forward_order=static)
+    FsdpContext._advance_order(context, first, "forward")
     with pytest.raises(RuntimeError, match='destroyed'):
-        FsdpModule._prefetch_parameter_groups(first, static, None)
+        FsdpContext._advance_order(context, first, "forward")

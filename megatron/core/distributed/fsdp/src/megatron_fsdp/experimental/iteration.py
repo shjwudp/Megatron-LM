@@ -30,7 +30,7 @@ Demand = tuple[ref["FsdpModule"], DemandPhase]
 
 
 class IterationOrder(ExecutionOrder[Demand]):
-    """One captured order with separate execution and prefetch progress.
+    """One captured demand order with scheduler-owned capture/replay state.
 
     State lives on FsdpContext because autograd hooks can run on another thread.
     The scheduler owns iteration boundaries and must explicitly recapture when
@@ -41,7 +41,6 @@ class IterationOrder(ExecutionOrder[Demand]):
         super().__init__()
         self.captured = False
         self.mode: Literal["static", "capture", "replay", "demand"] = "static"
-        self._prefetch_position = 0
 
     @property
     def active(self) -> bool:
@@ -50,33 +49,6 @@ class IterationOrder(ExecutionOrder[Demand]):
     @property
     def recording(self) -> bool:
         return self.mode == "capture"
-
-    def reset(self) -> None:
-        super().reset()
-        self._prefetch_position = 0
-
-    def prefetch(self, budget: int | None) -> None:
-        """Prefetch occurrences without advancing the execution cursor.
-
-        Targets depend on order and budget, not materialization state. Demand
-        still rechecks materialization after any intervening parameter release.
-        """
-        if self.mode != "replay" or budget == 0:
-            return
-        self._prefetch_position = max(self._prefetch_position, self.position)
-        size = 0
-        while True:
-            demand = self.next_item(self._prefetch_position - self.position + 1)
-            if demand is None:
-                break
-            module = demand[0]()
-            if module is None:
-                raise RuntimeError("A module in the captured FSDP iteration was destroyed.")
-            self._prefetch_position += 1
-            module._unshard_parameter_groups()
-            size += module.num_parameter_elements
-            if budget is None or size >= budget:
-                break
 
 
 @contextmanager
