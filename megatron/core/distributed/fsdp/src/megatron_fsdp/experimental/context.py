@@ -21,8 +21,7 @@ from weakref import WeakKeyDictionary, ref
 import torch
 from torch import nn
 
-from .execution_order import ExecutionOrder
-from .iteration import Demand, DemandPhase, IterationOrder
+from .execution_order import Demand, DemandPhase, ExecutionOrder, IterationOrder
 
 PrefetchOrder = ExecutionOrder[ref[nn.Module]] | ExecutionOrder[Demand]
 

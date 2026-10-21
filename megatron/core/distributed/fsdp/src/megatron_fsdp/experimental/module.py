@@ -32,7 +32,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext, PrefetchOrder
 from .countdown import Countdown
-from .iteration import DemandPhase
+from .execution_order import DemandPhase
 from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,
@@ -303,7 +303,7 @@ class FsdpModule:
                 and not is_recomputing
                 and next(iter(context.forward_order))() is self
             ):
-                context.forward_order.reset()
+                context.forward_order.reset_cursor()
 
         self.unshard(prefetch="forward" if not is_recomputing else "recompute")
 
@@ -420,7 +420,7 @@ class FsdpModule:
             # Backward has its own first root, in reverse construction order.
             # Resetting at every root would restart the shared cursor mid-pass.
             if not context.iteration_order.active and next(iter(context.backward_order))() is self:
-                context.backward_order.reset()
+                context.backward_order.reset_cursor()
             context.register_post_backward_hook()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is

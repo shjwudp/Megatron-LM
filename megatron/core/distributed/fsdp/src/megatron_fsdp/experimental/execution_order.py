@@ -15,7 +15,11 @@
 """Generic execution sequences with occurrence-based traversal."""
 
 from collections.abc import Iterable, Iterator
-from typing import Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, Literal, TypeVar
+from weakref import ref
+
+if TYPE_CHECKING:
+    from .module import FsdpModule
 
 T = TypeVar("T")
 
@@ -37,8 +41,8 @@ class ExecutionOrder(Generic[T]):
         """Append one occurrence."""
         self._items.append(item)
 
-    def reset(self) -> None:
-        """Start a new traversal."""
+    def reset_cursor(self) -> None:
+        """Reset traversal position without changing the recorded sequence."""
         self._position = 0
 
     def __len__(self) -> int:
@@ -56,7 +60,7 @@ class ExecutionOrder(Generic[T]):
     def advance(self) -> T:
         """Consume the next occurrence without lookup or automatic wrapping."""
         if self._position >= len(self._items):
-            raise RuntimeError("Calls exceeded the execution order; reset it first.")
+            raise RuntimeError("Calls exceeded the execution order; reset its cursor first.")
         item = self._items[self._position]
         self._position += 1
         return item
@@ -64,3 +68,29 @@ class ExecutionOrder(Generic[T]):
     def __getitem__(self, index: int) -> T:
         """Read an occurrence without changing execution progress."""
         return self._items[index]
+
+
+DemandPhase = Literal["forward", "backward", "recompute", "none"]
+Demand = tuple[ref["FsdpModule"], DemandPhase]
+
+
+class IterationOrder(ExecutionOrder[Demand]):
+    """One captured demand order with scheduler-owned capture/replay state.
+
+    State lives on FsdpContext because autograd hooks can run on another thread.
+    The scheduler owns iteration boundaries and must explicitly recapture when
+    the training schedule changes.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.captured = False
+        self.mode: Literal["static", "capture", "replay", "demand"] = "static"
+
+    @property
+    def active(self) -> bool:
+        return self.mode != "static"
+
+    @property
+    def recording(self) -> bool:
+        return self.mode == "capture"

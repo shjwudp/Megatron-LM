@@ -12,8 +12,8 @@ from torch import nn
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.context import FsdpContext
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionOrder,
+    IterationOrder,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.iteration import IterationOrder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
 
@@ -45,7 +45,7 @@ def test_prefetch_replays_occurrences(budget, expected, recorded):
         order.mode = "replay"
     # A second cycle checks cursor reset; each lookahead must leave demand calls intact.
     for _ in range(2):
-        order.reset()
+        order.reset_cursor()
         for index, (module, targets) in enumerate(zip(sequence, expected)):
             prefetched.clear()
             assert FsdpContext._advance_order(context, module, "forward") is order
@@ -63,7 +63,7 @@ def test_explicit_reset_and_exhaustion():
     a, b = nn.Module(), nn.Module()
     order = ExecutionOrder([a, b, a])
     for _ in range(2):
-        order.reset()
+        order.reset_cursor()
         assert order.advance() is a
         assert order[order.position] is b
         assert order[order.position] is b

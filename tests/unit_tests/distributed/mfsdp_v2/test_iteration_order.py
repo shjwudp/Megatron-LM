@@ -17,13 +17,15 @@ from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
-    capture,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
+    iteration,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.context import FsdpContext
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.iteration import IterationOrder
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    IterationOrder,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.common import mfsdp_iteration
 from megatron.core.models.common.mfsdp_iteration import with_mfsdp_iteration
@@ -145,7 +147,7 @@ def test_failed_or_changed_iterations_require_capture(context):
 
     for changed in ([(b, "forward")], [(a, "backward")], [], [(a, "forward"), (a, "forward")]):
         events = [(a, "forward")]
-        with capture(context):
+        with iteration(context):
             _demand(context, a, "forward")
         events = changed
         with pytest.raises(RuntimeError):
@@ -154,9 +156,9 @@ def test_failed_or_changed_iterations_require_capture(context):
     with pytest.raises(ValueError):
         run(a, fail=True)
     assert not context.iteration_order.captured
-    with capture(context):
+    with iteration(context):
         with pytest.raises(RuntimeError, match="active"):
-            with capture(context):
+            with iteration(context):
                 pass
         _demand(context, b, "forward")
     events = [(b, "forward")]
@@ -164,7 +166,7 @@ def test_failed_or_changed_iterations_require_capture(context):
     assert context.iteration_order.captured
     context.allgather_stream.wait_stream.side_effect = ValueError("failed stream sync")
     with pytest.raises(ValueError):
-        with capture(context):
+        with iteration(context):
             pass
     assert not context.iteration_order.active and not context.iteration_order.captured
 
@@ -172,7 +174,7 @@ def test_failed_or_changed_iterations_require_capture(context):
 def test_capture_does_not_retain_modules(context):
     """Captured occurrences keep weak references and reject a destroyed owner."""
     a, b = _Unit(context), _Unit(context)
-    with capture(context):
+    with iteration(context):
         _demand(context, a, "forward")
         _demand(context, b, "backward")
     b_ref = ref(b)
@@ -238,10 +240,10 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iterat
         fully_shard(model.fc1, mesh=mesh, placements=placements)
         fully_shard(model.fc2, mesh=mesh, placements=placements)
         fully_shard(model, mesh=mesh, placements=placements)
-    forward_reset = Mock(wraps=context.forward_order.reset)
-    backward_reset = Mock(wraps=context.backward_order.reset)
-    monkeypatch.setattr(context.forward_order, "reset", forward_reset)
-    monkeypatch.setattr(context.backward_order, "reset", backward_reset)
+    forward_reset = Mock(wraps=context.forward_order.reset_cursor)
+    backward_reset = Mock(wraps=context.backward_order.reset_cursor)
+    monkeypatch.setattr(context.forward_order, "reset_cursor", forward_reset)
+    monkeypatch.setattr(context.backward_order, "reset_cursor", backward_reset)
     ref_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.01)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     fully_shard_optimizer(optimizer)
@@ -280,7 +282,7 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iterat
         assert not context.iteration_order.captured
     # Group-packed shards need the FSDP layout to reconstruct parameters;
     # DTensor.full_tensor() assumes ordinary per-tensor chunking instead.
-    with capture(context):
+    with iteration(context, forward_only=True):
         for unit in (model, model.fc1, model.fc2):
             unit.unshard()
         try:

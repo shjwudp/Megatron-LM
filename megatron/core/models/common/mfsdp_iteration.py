@@ -2,13 +2,13 @@
 
 """Iteration boundary shared by MFSDP v2 pipeline schedule entry points."""
 
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from functools import wraps
 from inspect import signature
 
 import torch
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.iteration import capture
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import iteration
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
 
@@ -34,11 +34,7 @@ def _mfsdp_iteration(model, forward_only=False):
         yield
         return
     config = getattr(chunks[0], "config", None)
-    if getattr(config, "cuda_graph_impl", "none") != "none":
-        yield
-        return
-    order = context.iteration_order
-    if order.active:
+    if getattr(config, "cuda_graph_impl", "none") != "none" or context.iteration_order.active:
         yield
         return
     forward_only = forward_only or not torch.is_grad_enabled()
@@ -50,29 +46,8 @@ def _mfsdp_iteration(model, forward_only=False):
         # Ordinary validation retains static forward prefetch.
         yield
         return
-    # VPP validation has a different schedule. Gather on demand without
-    # consuming or replacing the single captured training order.
-    recording = not forward_only and not order.captured
-    scope = capture(context) if recording else nullcontext(order)
-    with scope as order:
-        try:
-            if not recording:
-                context.ensure_finalized()
-                context.allgather_stream.wait_stream(context.current_stream())
-                if forward_only:
-                    order.mode = "demand"
-                else:
-                    order.reset()
-                    order.mode = "replay"
-            yield
-            if not forward_only and order.position != len(order):
-                raise RuntimeError("FSDP iteration ended before consuming its captured order.")
-        except BaseException:
-            if not forward_only:
-                order.captured = False
-            raise
-        finally:
-            order.mode = "static"
+    with iteration(context, forward_only=forward_only):
+        yield
 
 
 def with_mfsdp_iteration(schedule):
@@ -84,6 +59,7 @@ def with_mfsdp_iteration(schedule):
         arguments = parameters.bind(*args, **kwargs)
         arguments.apply_defaults()
         values = arguments.arguments
+        assert "model" in values, "The schedule function must have a 'model' argument."
         with _mfsdp_iteration(values["model"], values.get("forward_only", False)):
             return schedule(*args, **kwargs)
 
