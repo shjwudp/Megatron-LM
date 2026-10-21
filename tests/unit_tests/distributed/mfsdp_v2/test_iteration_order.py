@@ -79,7 +79,7 @@ def test_capture_replay_and_validation(context):
         (a, "forward"),
         (b, "forward"),
         (b, "backward"),
-        (a, "forward"),
+        (a, "recompute"),
         (a, "backward"),
     ]
     gathers = Mock()
@@ -105,6 +105,8 @@ def test_capture_replay_and_validation(context):
             calls = gathers.mock_calls[before:]
             assert calls[0][0] == ("a" if module is a else "b")
             assert calls[1][0] == "wait"
+            if phase == "recompute":
+                assert len(calls) == 2  # Demand gather and wait, without successor prefetch.
             prefetched.extend(call[0] for call in calls[2:])
 
     run(a, forward_only=True)
@@ -113,19 +115,20 @@ def test_capture_replay_and_validation(context):
     for schedule, replay in ((run, False), (nested, True), (run, True)):
         gathers.reset_mock()
         prefetched.clear()
-        schedule(a)
-        assert prefetched == (["a", "b", "b", "a", "a"] if replay else [])
+        schedule([a, b])
+        assert prefetched == (["a", "b", "b", "a"] if replay else [])
         order = context.iteration_order
         assert order.captured and not order.active
         assert order.position == len(events)
-        run(a, forward_only=True)
+        assert order[4][1] == "recompute"
+        run([a, b], forward_only=True)
         assert context.iteration_order is order and order.position == len(events)
     prefetched.clear()
     run(a, budget=0)
     assert not prefetched
     run(a, budget=2)
     # Each demand scans its own window, including overlapping occurrences.
-    assert prefetched == ["a", "b", "b", "b", "b", "a", "a", "a", "a"]
+    assert prefetched == ["a", "b", "b", "b", "b", "a", "a", "a"]
 
 
 def test_failed_or_changed_iterations_require_capture(context):

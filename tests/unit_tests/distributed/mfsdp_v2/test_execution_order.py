@@ -46,14 +46,16 @@ def test_prefetch_replays_occurrences(budget, expected, recorded):
     # A second cycle checks cursor reset; each lookahead must leave demand calls intact.
     for _ in range(2):
         order.reset()
-        for module, targets, successor in zip(sequence, expected, sequence[1:] + [None]):
+        for index, (module, targets) in enumerate(zip(sequence, expected)):
             prefetched.clear()
             assert FsdpContext._advance_order(context, module, "forward") is order
             FsdpModule._prefetch_parameter_groups(module, order, budget)
             assert prefetched == [modules[index] for index in targets]
-            item = order.next_item()
-            next_ref = item[0] if recorded and item is not None else item
-            assert (next_ref() if next_ref is not None else None) is successor
+            assert order.position == index + 1
+            remaining = [order[i] for i in range(order.position, len(order))]
+            assert [(item[0] if recorded else item)() for item in remaining] == sequence[
+                index + 1 :
+            ]
 
 
 def test_explicit_reset_and_exhaustion():
@@ -63,16 +65,16 @@ def test_explicit_reset_and_exhaustion():
     for _ in range(2):
         order.reset()
         assert order.advance() is a
-        assert order.next_item() is b
-        assert order.next_item() is b
+        assert order[order.position] is b
+        assert order[order.position] is b
         assert list(order) == [a, b, a]
         assert order.advance() is b
         assert order.advance() is a
-        assert order.next_item() is None
+        assert list(order)[order.position :] == []
         with pytest.raises(RuntimeError, match='exceeded'):
             order.advance()
     empty = ExecutionOrder()
-    assert empty.next_item() is None
+    assert list(empty) == []
     with pytest.raises(RuntimeError, match='exceeded'):
         empty.advance()
 
@@ -84,8 +86,8 @@ def test_iteration_and_weak_references():
     order = ExecutionOrder([a, b, a, b])
     assert list(order) == [a, b, a, b]
     assert order.advance() is a
-    assert order.next_item() is b
-    assert order.next_item(2) is a
+    assert order[order.position] is b
+    assert order[order.position + 1] is a
 
     second_ref = ref(second)
     del second

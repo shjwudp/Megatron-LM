@@ -219,7 +219,8 @@ class FsdpContext:
             raise RuntimeError("A module in the FSDP execution order was destroyed.")
         if owner is not module:
             raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
-        return None if iteration.recording or phase == "none" else order
+        # Recompute still consumes its captured occurrence and gathers on demand.
+        return None if iteration.recording or phase in ("none", "recompute") else order
 
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""

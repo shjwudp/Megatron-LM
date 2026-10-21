@@ -2,7 +2,7 @@
 
 """Iteration boundary shared by MFSDP v2 pipeline schedule entry points."""
 
-from contextlib import ExitStack
+from contextlib import nullcontext
 from functools import wraps
 from inspect import signature
 
@@ -28,20 +28,23 @@ def with_mfsdp_iteration(schedule):
         values = arguments.arguments
         models = values["model"]
         chunks = models if isinstance(models, list) else [models]
-        contexts = dict.fromkeys(
-            module.context
-            for chunk in chunks
-            for module in chunk.modules()
-            if isinstance(module, FsdpModule)
+        # PP constructs every VPP chunk inside the same fully_shard_context.
+        context = next(
+            (
+                module.context
+                for chunk in chunks
+                for module in chunk.modules()
+                if isinstance(module, FsdpModule)
+            ),
+            None,
         )
-        if not contexts:
+        if context is None:
             return schedule(*args, **kwargs)
         config = getattr(chunks[0], "config", None)
         if getattr(config, "cuda_graph_impl", "none") != "none":
             return schedule(*args, **kwargs)
-        if any(context.iteration_order.active for context in contexts):
-            if not all(context.iteration_order.active for context in contexts):
-                raise RuntimeError("All FSDP contexts must join the same outer iteration scope.")
+        order = context.iteration_order
+        if order.active:
             return schedule(*args, **kwargs)
         forward_only = values.get("forward_only", False) or not torch.is_grad_enabled()
         if (
@@ -53,33 +56,27 @@ def with_mfsdp_iteration(schedule):
             return schedule(*args, **kwargs)
         # VPP validation has a different schedule. Gather on demand without
         # consuming or replacing the single captured training order.
-        with ExitStack() as stack:
-            orders = []
+        recording = not forward_only and not order.captured
+        scope = capture(context) if recording else nullcontext(order)
+        with scope as order:
             try:
-                for context in contexts:
+                if not recording:
                     context.ensure_finalized()
-                    order = context.iteration_order
-                    if not forward_only and not order.captured:
-                        order = stack.enter_context(capture(context))
+                    context.allgather_stream.wait_stream(context.current_stream())
+                    if forward_only:
+                        order.mode = "demand"
                     else:
-                        context.allgather_stream.wait_stream(context.current_stream())
-                        if forward_only:
-                            order.mode = "demand"
-                        else:
-                            order.reset()
-                            order.mode = "replay"
-                    orders.append(order)
+                        order.reset()
+                        order.mode = "replay"
                 result = schedule(*args, **kwargs)
-                if not forward_only and any(order.position != len(order) for order in orders):
+                if not forward_only and order.position != len(order):
                     raise RuntimeError("FSDP iteration ended before consuming its captured order.")
                 return result
             except BaseException:
                 if not forward_only:
-                    for order in orders:
-                        order.captured = False
+                    order.captured = False
                 raise
             finally:
-                for order in orders:
-                    order.mode = "static"
+                order.mode = "static"
 
     return wrapped

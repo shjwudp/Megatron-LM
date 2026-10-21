@@ -61,9 +61,6 @@ class ExecutionOrder(Generic[T]):
         self._position += 1
         return item
 
-    def next_item(self, offset: int = 1) -> T | None:
-        """Look ahead from the last consumed occurrence without moving the cursor."""
-        next_index = self._position - 1 + offset
-        if next_index < 0 or next_index >= len(self._items):
-            return None
-        return self._items[next_index]
+    def __getitem__(self, index: int) -> T:
+        """Read an occurrence without changing execution progress."""
+        return self._items[index]
