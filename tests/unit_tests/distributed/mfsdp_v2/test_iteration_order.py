@@ -99,6 +99,7 @@ def test_capture_replay_and_validation(context):
             FsdpModule.unshard(b, prefetch="forward")
             assert b._unshard_parameter_groups.call_count == before + 1
             return
+        assert order.mode == "record_replay"
         for module, phase in events:
             module._schedule_policy.forward_prefetch_size = budget
             module._schedule_policy.backward_prefetch_size = budget
@@ -191,11 +192,15 @@ def test_capture_does_not_retain_modules(context):
     assert not context.iteration_order.active and not context.iteration_order.captured
 
 
-@pytest.mark.parametrize("mode", ["static", "capture", "replay"])
-def test_repeated_backward_keeps_static_guard(mode, monkeypatch):
-    """Only active capture/replay observes an already-entered backward occurrence."""
+@pytest.mark.parametrize(
+    "mode, captured",
+    [("static", False), ("record_replay", False), ("record_replay", True), ("demand", True)],
+)
+def test_repeated_backward_keeps_static_guard(mode, captured, monkeypatch):
+    """Active scopes observe repeated backward calls; static mode keeps its guard."""
     context = Mock(iteration_order=IterationOrder())
     context.iteration_order.mode = mode
+    context.iteration_order.captured = captured
     module = Mock(spec=FsdpModule, context=context, phase=FsdpModule.Phase.BACKWARD)
     module.is_root.return_value = False
     push = Mock()

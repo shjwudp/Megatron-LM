@@ -75,8 +75,10 @@ Demand = tuple[ref["FsdpModule"], DemandPhase]
 
 
 class IterationOrder(ExecutionOrder[Demand]):
-    """One captured demand order with scheduler-owned capture/replay state.
+    """Select static, recorded, or demand-only prefetch for a shared context.
 
+    ``mode`` selects the order source. In ``record_replay`` mode, ``captured``
+    distinguishes initial recording from replay of the completed sequence.
     State lives on FsdpContext because autograd hooks can run on another thread.
     The scheduler owns iteration boundaries and must explicitly recapture when
     the training schedule changes.
@@ -85,7 +87,7 @@ class IterationOrder(ExecutionOrder[Demand]):
     def __init__(self) -> None:
         super().__init__()
         self.captured = False
-        self.mode: Literal["static", "capture", "replay", "demand"] = "static"
+        self.mode: Literal["static", "record_replay", "demand"] = "static"
 
     @property
     def active(self) -> bool:
@@ -93,4 +95,4 @@ class IterationOrder(ExecutionOrder[Demand]):
 
     @property
     def recording(self) -> bool:
-        return self.mode == "capture"
+        return self.mode == "record_replay" and not self.captured

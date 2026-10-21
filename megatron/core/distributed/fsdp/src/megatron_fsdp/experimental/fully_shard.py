@@ -213,7 +213,7 @@ def iteration(context: FsdpContext, *, forward_only: bool = False) -> Iterator[I
         order = context.iteration_order = IterationOrder()
     elif not forward_only:
         order.reset_cursor()
-    order.mode = "demand" if forward_only else "capture" if recording else "replay"
+    order.mode = "demand" if forward_only else "record_replay"
     try:
         context.allgather_stream.wait_stream(context.current_stream())
         yield order

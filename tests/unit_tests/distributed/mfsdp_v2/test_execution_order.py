@@ -42,7 +42,8 @@ def test_prefetch_replays_occurrences(budget, expected, recorded):
     for module in sequence:
         order.append((ref(module), "forward") if recorded else ref(module))
     if recorded:
-        order.mode = "replay"
+        order.mode = "record_replay"
+        order.captured = True
     # A second cycle checks cursor reset; each lookahead must leave demand calls intact.
     for _ in range(2):
         order.reset_cursor()
