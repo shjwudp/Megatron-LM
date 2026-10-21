@@ -72,7 +72,7 @@ def context(monkeypatch):
 
 
 def test_capture_replay_and_validation(context):
-    """One training order survives validation; replay resets both cursors each step."""
+    """One training order survives validation; replay resets its execution cursor."""
     a, b = _Unit(context), _Unit(context)
     events = [
         (a, "forward"),
@@ -124,8 +124,8 @@ def test_capture_replay_and_validation(context):
     run(a, budget=0)
     assert not prefetched
     run(a, budget=2)
-    # An independent prefetch cursor visits each future occurrence only once.
-    assert prefetched == ["a", "b", "b", "a", "a"]
+    # Each demand scans its own window, including overlapping occurrences.
+    assert prefetched == ["a", "b", "b", "b", "b", "a", "a", "a", "a"]
 
 
 def test_failed_or_changed_iterations_require_capture(context):

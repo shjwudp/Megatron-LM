@@ -339,18 +339,17 @@ class FsdpModule:
         """Prefetch successors of the consumed demand in a static or captured order."""
         if prefetch_size == 0:
             return
-        context = self.context
-        context._prefetch_position = max(context._prefetch_position, order.position)
+        offset = 1
         size = 0
         while True:
-            item = order.next_item(context._prefetch_position - order.position + 1)
+            item = order.next_item(offset)
             if item is None:
                 break
             module_ref = item[0] if isinstance(item, tuple) else item
             module = module_ref()
             if module is None:
                 raise RuntimeError("A module in the FSDP execution order was destroyed.")
-            context._prefetch_position += 1
+            offset += 1
             fsdp_module = cast(FsdpModule, module)
             fsdp_module._unshard_parameter_groups()
             size += fsdp_module.num_parameter_elements

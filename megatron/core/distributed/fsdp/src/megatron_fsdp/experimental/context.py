@@ -102,9 +102,6 @@ class FsdpContext:
         self.iteration_order = IterationOrder()
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
-        # First demand after an order reset also resets this independent cursor.
-        # Keep progress across calls so larger budgets do not revisit occurrences.
-        self._prefetch_position = 0
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -210,8 +207,6 @@ class FsdpContext:
             order = self.backward_order
         else:
             return None
-        if order.position == 0:
-            self._prefetch_position = 0
         item = order.advance()
         if isinstance(item, tuple):
             expected, expected_phase = item

@@ -22,7 +22,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import
     [
         (None, [[1], [0], [0], [2], []]),
         (0, [[], [], [], [], []]),
-        (2, [[1, 0], [0, 2], [], [], []]),
+        (2, [[1, 0], [0, 0], [0, 2], [2], []]),
     ],
 )
 @pytest.mark.parametrize("recorded", [False, True], ids=["static", "captured"])
