@@ -70,11 +70,11 @@ class ExecutionOrder(Generic[T]):
         return self._items[index]
 
 
-DemandPhase = Literal["forward", "backward", "recompute", "demand"]
-Demand = tuple[ref["FsdpModule"], DemandPhase]
+ExecutionPhase = Literal["forward", "backward", "recompute"]
+ExecutionEvent = tuple[ref["FsdpModule"], ExecutionPhase]
 
 
-class IterationOrder(ExecutionOrder[Demand]):
+class IterationOrder(ExecutionOrder[ExecutionEvent]):
     """Select static, recorded, or demand-only prefetch for a shared context.
 
     ``mode`` selects the order source. In ``record_replay`` mode, ``captured``
@@ -93,7 +93,7 @@ class IterationOrder(ExecutionOrder[Demand]):
         self.active = False
         self.mode: Literal["static", "record_replay", "demand"] = "static"
 
-    def append(self, item: Demand) -> None:
+    def append(self, item: ExecutionEvent) -> None:
         """Append an occurrence before the recorded sequence is complete."""
         assert not self.captured, "Cannot append to an already captured order."
         super().append(item)

@@ -21,7 +21,7 @@ from weakref import WeakKeyDictionary, ref
 import torch
 from torch import nn
 
-from .execution_order import DemandPhase, IterationOrder
+from .execution_order import ExecutionPhase, IterationOrder
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -185,10 +185,12 @@ class FsdpContext:
                 "FSDP context is not finalized. Exit fully_shard_context to complete construction."
             )
 
-    def _advance_order(self, module: nn.Module, phase: DemandPhase) -> IterationOrder | None:
+    def _advance_order(
+        self, module: nn.Module, phase: ExecutionPhase | None
+    ) -> IterationOrder | None:
         """Consume and validate a demand, returning its order when prefetch is enabled."""
         order = self.iteration_order
-        if phase == "demand" or order.mode == "demand":
+        if phase is None or order.mode == "demand":
             return None
         if order.mode == "record_replay":
             # A recorded sequence needs the scheduler's complete iteration boundary.

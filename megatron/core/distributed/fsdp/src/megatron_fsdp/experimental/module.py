@@ -32,7 +32,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import DemandPhase, IterationOrder
+from .execution_order import ExecutionPhase, IterationOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,
@@ -306,7 +306,7 @@ class FsdpModule:
 
         self.unshard("forward" if not is_recomputing else "recompute")
 
-    def unshard(self, phase: DemandPhase = "demand") -> None:
+    def unshard(self, phase: ExecutionPhase | None = None) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
 
         The default demand-only call leaves the execution order unchanged.
