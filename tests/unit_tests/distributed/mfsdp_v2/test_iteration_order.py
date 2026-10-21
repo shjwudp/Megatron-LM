@@ -189,6 +189,24 @@ def test_capture_does_not_retain_modules(context):
     assert not context.iteration_order.active and not context.iteration_order.captured
 
 
+@pytest.mark.parametrize("mode", ["static", "capture", "replay"])
+def test_repeated_backward_keeps_static_guard(mode, monkeypatch):
+    """Only active capture/replay observes an already-entered backward occurrence."""
+    context = Mock(iteration_order=IterationOrder())
+    context.iteration_order.mode = mode
+    module = Mock(spec=FsdpModule, context=context, phase=FsdpModule.Phase.BACKWARD)
+    module.is_root.return_value = False
+    push = Mock()
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", push)
+    FsdpModule.pre_backward(module)
+    if mode == "static":
+        module.unshard.assert_not_called()
+        context.current_stream.assert_not_called()
+    else:
+        module.unshard.assert_called_once_with(prefetch="backward")
+    push.assert_not_called()
+
+
 @pytest.mark.parametrize("reentrant", [False, True])
 @pytest.mark.parametrize("record_iteration", [False, True], ids=["static", "recorded"])
 def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iteration, monkeypatch):

@@ -2,7 +2,7 @@
 
 """Iteration boundary shared by MFSDP v2 pipeline schedule entry points."""
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 from inspect import signature
 
@@ -12,13 +12,71 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.iteration imp
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
 
-def with_mfsdp_iteration(schedule):
-    """Record/replay hooks across the complete schedule, including every VPP chunk.
+@contextmanager
+def _mfsdp_iteration(model, forward_only=False):
+    """Manage one shared context across a complete scheduler invocation.
 
-    Nested combined calls join the outer scope. Non-MFSDP models and CUDA graph
-    schedules retain their existing behavior; graph replay bypasses Python hooks
-    and needs a separate recording lifecycle.
+    Nested calls join the active scope. CUDA graph schedules bypass capture
+    because their replay does not execute Python hooks.
     """
+    chunks = model if isinstance(model, list) else [model]
+    # PP constructs every VPP chunk inside the same fully_shard_context.
+    context = next(
+        (
+            module.context
+            for chunk in chunks
+            for module in chunk.modules()
+            if isinstance(module, FsdpModule)
+        ),
+        None,
+    )
+    if context is None:
+        yield
+        return
+    config = getattr(chunks[0], "config", None)
+    if getattr(config, "cuda_graph_impl", "none") != "none":
+        yield
+        return
+    order = context.iteration_order
+    if order.active:
+        yield
+        return
+    forward_only = forward_only or not torch.is_grad_enabled()
+    if (
+        forward_only
+        and len(chunks) == 1
+        and not getattr(config, "virtual_pipeline_model_parallel_size", None)
+    ):
+        # Ordinary validation retains static forward prefetch.
+        yield
+        return
+    # VPP validation has a different schedule. Gather on demand without
+    # consuming or replacing the single captured training order.
+    recording = not forward_only and not order.captured
+    scope = capture(context) if recording else nullcontext(order)
+    with scope as order:
+        try:
+            if not recording:
+                context.ensure_finalized()
+                context.allgather_stream.wait_stream(context.current_stream())
+                if forward_only:
+                    order.mode = "demand"
+                else:
+                    order.reset()
+                    order.mode = "replay"
+            yield
+            if not forward_only and order.position != len(order):
+                raise RuntimeError("FSDP iteration ended before consuming its captured order.")
+        except BaseException:
+            if not forward_only:
+                order.captured = False
+            raise
+        finally:
+            order.mode = "static"
+
+
+def with_mfsdp_iteration(schedule):
+    """Give a pipeline scheduler an MFSDP capture/replay boundary."""
     parameters = signature(schedule)
 
     @wraps(schedule)
@@ -26,57 +84,7 @@ def with_mfsdp_iteration(schedule):
         arguments = parameters.bind(*args, **kwargs)
         arguments.apply_defaults()
         values = arguments.arguments
-        models = values["model"]
-        chunks = models if isinstance(models, list) else [models]
-        # PP constructs every VPP chunk inside the same fully_shard_context.
-        context = next(
-            (
-                module.context
-                for chunk in chunks
-                for module in chunk.modules()
-                if isinstance(module, FsdpModule)
-            ),
-            None,
-        )
-        if context is None:
+        with _mfsdp_iteration(values["model"], values.get("forward_only", False)):
             return schedule(*args, **kwargs)
-        config = getattr(chunks[0], "config", None)
-        if getattr(config, "cuda_graph_impl", "none") != "none":
-            return schedule(*args, **kwargs)
-        order = context.iteration_order
-        if order.active:
-            return schedule(*args, **kwargs)
-        forward_only = values.get("forward_only", False) or not torch.is_grad_enabled()
-        if (
-            forward_only
-            and len(chunks) == 1
-            and not getattr(config, "virtual_pipeline_model_parallel_size", None)
-        ):
-            # Ordinary validation retains static forward prefetch.
-            return schedule(*args, **kwargs)
-        # VPP validation has a different schedule. Gather on demand without
-        # consuming or replacing the single captured training order.
-        recording = not forward_only and not order.captured
-        scope = capture(context) if recording else nullcontext(order)
-        with scope as order:
-            try:
-                if not recording:
-                    context.ensure_finalized()
-                    context.allgather_stream.wait_stream(context.current_stream())
-                    if forward_only:
-                        order.mode = "demand"
-                    else:
-                        order.reset()
-                        order.mode = "replay"
-                result = schedule(*args, **kwargs)
-                if not forward_only and order.position != len(order):
-                    raise RuntimeError("FSDP iteration ended before consuming its captured order.")
-                return result
-            except BaseException:
-                if not forward_only:
-                    order.captured = False
-                raise
-            finally:
-                order.mode = "static"
 
     return wrapped

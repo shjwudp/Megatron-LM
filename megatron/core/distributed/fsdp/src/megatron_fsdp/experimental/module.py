@@ -406,12 +406,14 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
-        # Shared layers can enter backward several times before their gradients
-        # accumulate and post_backward() resets the phase. Record/replay every
-        # occurrence, but open the shared phase and NVTX range only once.
-        if self.phase is not FsdpModule.Phase.BACKWARD:
-            self.phase = FsdpModule.Phase.BACKWARD
-            torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
+        # Keep the existing shared-layer return, but let capture/replay observe
+        # each occurrence without reopening the backward phase and NVTX range.
+        if self.phase is FsdpModule.Phase.BACKWARD:
+            if self.context.iteration_order.active:
+                self.unshard(prefetch="backward")
+            return
+        self.phase = FsdpModule.Phase.BACKWARD
+        torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
