@@ -44,9 +44,9 @@ class FsdpContext:
     The caller must call ``finish_grad_sync()`` after all gradient producers,
     including delayed weight-gradient computation, and before consuming gradients.
     """
-    # Static orders used to drive all-gather prefetch. We may want to switch to
-    # capturing runtime order if static module order proves too fragile. Each
-    # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
+    # Static orders drive prefetch outside scheduler-owned iterations. Captured
+    # iterations use one mixed-phase order instead. Each FsdpModule tracks its
+    # materialized state via ``FsdpModule._unshard_event``.
     forward_order: ExecutionOrder[ref[nn.Module]]
     backward_order: ExecutionOrder[ref[nn.Module]]
     # Topology metadata must not keep modules alive after construction.

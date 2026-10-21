@@ -321,11 +321,11 @@ class FsdpModule:
             prefetch = "recompute"
         order = self.context.iteration_order
         scoped = order.active
-        if scoped:
+        if order.mode in ("capture", "replay"):
             if order.recording:
-                order.record(self, prefetch)
+                order.append((ref(self), prefetch))
             expected, phase = order.advance()
-            if expected is not self or phase != prefetch:
+            if expected() is not self or phase != prefetch:
                 raise RuntimeError("FSDP module calls diverged from the recorded iteration order.")
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups()

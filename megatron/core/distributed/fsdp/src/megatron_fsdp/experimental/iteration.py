@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Record and replay demand occurrences over a complete FSDP iteration."""
+"""Capture one FSDP iteration and replay its demand occurrences."""
 
-from collections.abc import Hashable, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Literal
 from weakref import ref
@@ -29,92 +29,49 @@ DemandPhase = Literal["forward", "backward", "recompute", "none"]
 Demand = tuple[ref["FsdpModule"], DemandPhase]
 
 
-class IterationOrder:
-    """Own recorded occurrences and independent execution/prefetch cursors.
+class IterationOrder(ExecutionOrder[Demand]):
+    """One captured order with separate execution and prefetch progress.
 
-    State lives on FsdpContext, not a ContextVar, since autograd hooks may run
-    on another thread. One context cannot execute overlapping iteration scopes.
+    State lives on FsdpContext because autograd hooks can run on another thread.
+    The scheduler owns iteration boundaries and must explicitly recapture when
+    the training schedule changes.
     """
 
     def __init__(self) -> None:
-        self._orders: dict[Hashable, ExecutionOrder[Demand]] = {}
-        self._order: ExecutionOrder[Demand] | None = None
-        self._recording = False
+        super().__init__()
+        self.captured = False
+        self.mode: Literal["static", "capture", "replay", "demand"] = "static"
         self._prefetch_position = 0
 
     @property
     def active(self) -> bool:
-        return self._order is not None
+        return self.mode != "static"
 
     @property
     def recording(self) -> bool:
-        return self._recording
+        return self.mode == "capture"
 
-    @contextmanager
-    def iteration(self, key: Hashable, *, rerecord: bool = False) -> Iterator[None]:
-        """Record once per schedule key, then validate complete cursor replay."""
-        if self.active:
-            raise RuntimeError("FSDP iteration scopes cannot overlap on the same context.")
-        self._recording = rerecord or key not in self._orders
-        if self._recording:
-            self._order = ExecutionOrder()
-        else:
-            self._order = self._orders[key]
-        self._order.reset()
+    def reset(self) -> None:
+        super().reset()
         self._prefetch_position = 0
-        try:
-            yield
-            if self._order.position != len(self._order):
-                raise RuntimeError(
-                    "FSDP iteration ended before consuming its recorded demand order."
-                )
-            if self._recording:
-                self._orders[key] = self._order
-        except BaseException:
-            self._orders.pop(key, None)
-            raise
-        finally:
-            self._prefetch_position = 0
-            self._order = None
-            self._recording = False
-
-    def record(self, module: "FsdpModule", phase: DemandPhase) -> None:
-        """Observe a demand only during the initial recording iteration."""
-        if not self._recording or self._order is None:
-            raise RuntimeError("No FSDP iteration recording is active.")
-        self._order.append((ref(module), phase))
-
-    def advance(self) -> tuple["FsdpModule", DemandPhase]:
-        """Consume the next occurrence; the caller validates its observed demand."""
-        if self._order is None:
-            raise RuntimeError("No FSDP iteration is active.")
-        module_ref, phase = self._order.advance()
-        return self._resolve(module_ref), phase
-
-    @staticmethod
-    def _resolve(module_ref: ref["FsdpModule"]) -> "FsdpModule":
-        module = module_ref()
-        if module is None:
-            raise RuntimeError("A module in the recorded FSDP iteration was destroyed.")
-        return module
 
     def prefetch(self, budget: int | None) -> None:
-        """Advance a separate, monotonic cursor over upcoming demand occurrences.
+        """Prefetch occurrences without advancing the execution cursor.
 
-        Targets depend only on order and budget, not materialization state.
-        The gather helper owns idempotence. An intervening release can still
-        invalidate a speculative gather; demand must recheck and wait normally.
+        Targets depend on order and budget, not materialization state. Demand
+        still rechecks materialization after any intervening parameter release.
         """
-        if not self.active or self._recording or budget == 0:
+        if self.mode != "replay" or budget == 0:
             return
-        self._prefetch_position = max(self._prefetch_position, self._order.position)
+        self._prefetch_position = max(self._prefetch_position, self.position)
         size = 0
         while True:
-            offset = self._prefetch_position - self._order.position + 1
-            demand = self._order.next_item(offset)
+            demand = self.next_item(self._prefetch_position - self.position + 1)
             if demand is None:
                 break
-            module = self._resolve(demand[0])
+            module = demand[0]()
+            if module is None:
+                raise RuntimeError("A module in the captured FSDP iteration was destroyed.")
             self._prefetch_position += 1
             module._unshard_parameter_groups()
             size += module.num_parameter_elements
@@ -123,19 +80,21 @@ class IterationOrder:
 
 
 @contextmanager
-def iteration(
-    context: "FsdpContext", *, key: Hashable = "default", rerecord: bool = False
-) -> Iterator[None]:
-    """Scope the complete local schedule, including every VPP model chunk.
+def capture(context: "FsdpContext") -> Iterator[IterationOrder]:
+    """Replace the order by capturing one complete, repeatable training iteration.
 
-    All DP peers must follow compatible stable schedules. Use separate keys
-    for training/validation and changed configurations, or rerecord explicitly.
-    Failures invalidate the cache but do not roll back computation. The caller
-    still owns finish_grad_sync after all backward/delayed-wgrad producers.
+    Capture disables speculative prefetch. The scheduler resets the resulting
+    order before each replay; forward-only schedules must bypass this F/B order.
+    The caller still owns finish_grad_sync after all backward producers.
     """
     context.ensure_finalized()
-    with context.iteration_order.iteration(key, rerecord=rerecord):
-        # Covers optimizer updates and parameter initialization before any
-        # speculative gather, including roots bypassed by combined execution.
+    if context.iteration_order.active:
+        raise RuntimeError("Cannot capture inside an active FSDP iteration.")
+    order = context.iteration_order = IterationOrder()
+    order.mode = "capture"
+    try:
         context.allgather_stream.wait_stream(context.current_stream())
-        yield
+        yield order
+        order.captured = True
+    finally:
+        order.mode = "static"
