@@ -70,7 +70,7 @@ class ExecutionOrder(Generic[T]):
         return self._items[index]
 
 
-DemandPhase = Literal["forward", "backward", "recompute", "none"]
+DemandPhase = Literal["forward", "backward", "recompute", "demand"]
 Demand = tuple[ref["FsdpModule"], DemandPhase]
 
 

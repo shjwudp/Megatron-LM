@@ -28,6 +28,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_ord
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.common import mfsdp_iteration
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
+    _make_unshard_backward_hook,
+    _make_unshard_forward_hook,
+)
 from megatron.core.models.common.mfsdp_iteration import with_mfsdp_iteration
 
 
@@ -54,6 +58,7 @@ class _Unit(nn.Module):
     def _nvtx_range(self, name):
         return nullcontext()
 
+    unshard = FsdpModule.unshard
     _prefetch_parameter_groups = FsdpModule._prefetch_parameter_groups
 
 
@@ -96,7 +101,7 @@ def test_capture_replay_and_validation(context):
         if forward_only:
             assert order.mode == "demand"
             before = b._unshard_parameter_groups.call_count
-            FsdpModule.unshard(b, prefetch="forward")
+            FsdpModule.unshard(b, "forward")
             assert b._unshard_parameter_groups.call_count == before + 1
             return
         assert order.mode == "record_replay"
@@ -104,12 +109,10 @@ def test_capture_replay_and_validation(context):
             module._schedule_policy.forward_prefetch_size = budget
             module._schedule_policy.backward_prefetch_size = budget
             before = len(gathers.mock_calls)
-            FsdpModule.unshard(module, prefetch=phase)
+            FsdpModule.unshard(module, phase)
             calls = gathers.mock_calls[before:]
             assert calls[0][0] == ("a" if module is a else "b")
             assert calls[1][0] == "wait"
-            if phase == "recompute":
-                assert len(calls) == 2  # Demand gather and wait, without successor prefetch.
             prefetched.extend(call[0] for call in calls[2:])
 
     run(a, forward_only=True)
@@ -119,7 +122,7 @@ def test_capture_replay_and_validation(context):
         gathers.reset_mock()
         prefetched.clear()
         schedule([a, b])
-        assert prefetched == (["a", "b", "b", "a"] if replay else [])
+        assert prefetched == (["a", "b", "b", "a", "a"] if replay else [])
         order = context.iteration_order
         assert order.captured and not order.active
         assert order.position == len(events)
@@ -130,7 +133,7 @@ def test_capture_replay_and_validation(context):
         # The construction order was replaced; out-of-scope calls must not
         # consume the saved training trace (e.g. ordinary validation).
         before = len(gathers.mock_calls)
-        FsdpModule.unshard(b, prefetch="forward")
+        FsdpModule.unshard(b, "forward")
         assert [call[0] for call in gathers.mock_calls[before:]] == ["b", "wait"]
         assert order.position == len(events)
     prefetched.clear()
@@ -138,7 +141,99 @@ def test_capture_replay_and_validation(context):
     assert not prefetched
     run(a, budget=2)
     # Each demand scans its own window, including overlapping occurrences.
-    assert prefetched == ["a", "b", "b", "b", "b", "a", "a", "a"]
+    assert prefetched == ["a", "b", "b", "b", "b", "a", "a", "a", "a"]
+
+
+def test_static_recompute_and_manual_unshard_preserve_cursor(context):
+    """Only execution demands consume static order; its phase selects the budget."""
+    a, b = _Unit(context), _Unit(context)
+    order = context.iteration_order
+    for module, phase in ((a, "forward"), (b, "forward"), (b, "backward"), (a, "backward")):
+        order.append((ref(module), phase))
+    order.backward_start = 2
+
+    a.unshard()
+    FsdpModule.unshard(a, "recompute")
+    assert order.position == 0
+    assert a._unshard_parameter_groups.call_count == 2
+    b._unshard_parameter_groups.assert_not_called()
+
+    FsdpModule.unshard(a, "forward")
+    assert order.position == 1
+    b._unshard_parameter_groups.assert_called_once_with()
+
+    # Backward uses its own budget, independently of the forward setting.
+    order.reset_cursor(order.backward_start)
+    b._schedule_policy.backward_prefetch_size = 0
+    a._unshard_parameter_groups.reset_mock()
+    FsdpModule.unshard(b, "backward")
+    assert order.position == 3
+    a._unshard_parameter_groups.assert_not_called()
+
+
+@pytest.mark.parametrize("captured", [False, True], ids=["capturing", "replaying"])
+def test_manual_unshard_preserves_iteration_order(context, captured):
+    """Parameter inspection must neither record demands nor consume the saved trace."""
+    a, b = _Unit(context), _Unit(context)
+    if captured:
+        with iteration(context):
+            a.unshard("forward")
+            b.unshard("backward")
+    with iteration(context):
+        order = context.iteration_order
+        before = list(order), order.position
+        a.unshard()
+        assert (list(order), order.position) == before
+        a.unshard("forward")
+        b.unshard("backward")
+
+
+@pytest.mark.parametrize("phase", ["forward", "backward"])
+@pytest.mark.parametrize("active", [False, True], ids=["static", "capturing"])
+def test_combined_hooks_only_consume_active_order(context, phase, active):
+    """Fine-grained repeated owner demands require an iteration scope."""
+    owner, other = _Unit(context), _Unit(context)
+    owner.is_root = Mock(return_value=True)
+    order = context.iteration_order
+    if active:
+        order.mode = "record_replay"
+        order.active = True
+    else:
+        order.append((ref(owner), phase))
+        order.append((ref(other), phase))
+    before = list(order), order.position
+    if phase == "forward":
+        hook = _make_unshard_forward_hook(owner)
+        for _ in range(2):
+            hook(None, (), {})
+    else:
+        hook = _make_unshard_backward_hook(owner)
+        for _ in range(2):
+            hook(None, ())
+    assert owner._unshard_parameter_groups.call_count == 2
+    if active:
+        assert [(module_ref(), event_phase) for module_ref, event_phase in order] == [
+            (owner, phase),
+            (owner, phase),
+        ]
+        assert order.position == 2
+    else:
+        assert (list(order), order.position) == before
+        other._unshard_parameter_groups.assert_not_called()
+
+
+def test_recorded_root_backward_does_not_read_static_order(context, monkeypatch):
+    """The first captured backward demand need not have a construction-order entry."""
+    order = context.iteration_order
+    order.mode = "record_replay"
+    order.active = True
+    module = Mock(spec=FsdpModule, context=context, phase=FsdpModule.Phase.RESTING)
+    module.is_root.return_value = True
+    module._nvtx_label = Mock(return_value="backward")
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", Mock())
+    FsdpModule.pre_backward(module)
+    module.unshard.assert_called_once_with("backward")
+    context.register_post_backward_hook.assert_called_once_with()
 
 
 def test_failed_or_changed_iterations_require_capture(context):
@@ -218,7 +313,7 @@ def test_repeated_backward_keeps_static_guard(mode, captured, monkeypatch):
         module.unshard.assert_not_called()
         context.current_stream.assert_not_called()
     else:
-        module.unshard.assert_called_once_with(prefetch="backward")
+        module.unshard.assert_called_once_with("backward")
     push.assert_not_called()
 
 

@@ -305,10 +305,12 @@ class FsdpModule:
             ):
                 context.iteration_order.reset_cursor()
 
-        self.unshard(prefetch="forward" if not is_recomputing else "recompute")
+        self.unshard("forward" if not is_recomputing else "recompute")
 
-    def unshard(self, prefetch: DemandPhase = "none") -> None:
+    def unshard(self, phase: DemandPhase = "demand") -> None:
         """Unshard this FsdpModule's parameter groups immediately.
+
+        The default demand-only call leaves the execution order unchanged.
 
         An iteration scope synchronizes the all-gather stream before demands.
         Outside a scope, external schedulers invoking this directly must call
@@ -316,10 +318,9 @@ class FsdpModule:
         roots first, as the automatic ``pre_forward`` hook does.
         """
         # Combined hooks may run forward recomputation inside backward.
-        if prefetch == "forward" and _is_in_backward():
-            prefetch = "recompute"
-        context = self.context
-        order = context._advance_order(cast(nn.Module, self), prefetch)
+        if phase == "forward" and _is_in_backward():
+            phase = "recompute"
+        order = self.context._advance_order(cast(nn.Module, self), phase)
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
@@ -328,9 +329,11 @@ class FsdpModule:
             self.context.current_stream().wait_event(self._unshard_event)
 
             if order is not None:
+                # The consumed occurrence defines the budget for static and replay.
+                _, current_phase = order[order.position - 1]
                 budget = (
                     self._schedule_policy.forward_prefetch_size
-                    if prefetch == "forward"
+                    if current_phase == "forward"
                     else self._schedule_policy.backward_prefetch_size
                 )
                 self._prefetch_parameter_groups(order, budget)
@@ -340,7 +343,7 @@ class FsdpModule:
         if prefetch_size == 0:
             return
         size = 0
-        phase = order[order.position - 1][1]
+        _, phase = order[order.position - 1]
         for index in range(order.position, len(order)):
             module_ref, next_phase = order[index]
             if order.mode == "static" and next_phase != phase:
@@ -412,7 +415,7 @@ class FsdpModule:
         # each occurrence without reopening the backward phase and NVTX range.
         if self.phase is FsdpModule.Phase.BACKWARD:
             if self.context.iteration_order.active:
-                self.unshard(prefetch="backward")
+                self.unshard("backward")
             return
         self.phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
@@ -422,8 +425,10 @@ class FsdpModule:
             # Backward has its own first root, in reverse construction order.
             # Resetting at every root would restart the shared cursor mid-pass.
             order = context.iteration_order
-            if order.mode == "static" and order[order.backward_start][0]() is self:
-                order.reset_cursor(order.backward_start)
+            if order.mode == "static":
+                first_backward_root, _ = order[order.backward_start]
+                if first_backward_root() is self:
+                    order.reset_cursor(order.backward_start)
             context.register_post_backward_hook()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
@@ -434,7 +439,7 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self.unshard(prefetch="backward")
+        self.unshard("backward")
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""

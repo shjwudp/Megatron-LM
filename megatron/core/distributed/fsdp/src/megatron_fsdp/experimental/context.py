@@ -188,7 +188,7 @@ class FsdpContext:
     def _advance_order(self, module: nn.Module, phase: DemandPhase) -> IterationOrder | None:
         """Consume and validate a demand, returning its order when prefetch is enabled."""
         order = self.iteration_order
-        if order.mode == "demand":
+        if phase == "demand" or order.mode == "demand":
             return None
         if order.mode == "record_replay":
             # A recorded sequence needs the scheduler's complete iteration boundary.
@@ -207,8 +207,8 @@ class FsdpContext:
             raise RuntimeError("A module in the FSDP execution order was destroyed.")
         if owner is not module:
             raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
-        # Recompute still consumes its captured occurrence and gathers on demand.
-        return None if order.recording or phase in ("none", "recompute") else order
+        # Recorded recomputation is an ordinary occurrence with known successors.
+        return None if order.recording else order
 
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""
