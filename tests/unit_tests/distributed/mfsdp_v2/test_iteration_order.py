@@ -126,7 +126,8 @@ def test_capture_replay_and_validation(context):
         order = context.iteration_order
         assert order.captured and not order.active
         assert order.position == len(events)
-        assert order[4][1] == "recompute"
+        _, phase = order[4]
+        assert phase == "recompute"
         run([a, b], forward_only=True)
         assert context.iteration_order is order and order.position == len(events)
         assert order.mode == "record_replay"

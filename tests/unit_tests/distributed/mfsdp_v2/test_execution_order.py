@@ -59,7 +59,7 @@ def test_prefetch_replays_occurrences(budget, expected, recorded):
             assert prefetched == [modules[index] for index in targets]
             assert order.position == index + 1
             end = len(order) if recorded else order.backward_start
-            remaining = [order[i][0]() for i in range(order.position, end)]
+            remaining = [module_ref() for module_ref, _ in list(order)[order.position : end]]
             assert remaining == sequence[index + 1 :]
         if not recorded:
             order.reset_cursor(order.backward_start)
@@ -108,7 +108,8 @@ def test_iteration_and_weak_references():
     gc.collect()
     assert second_ref() is None
     assert order.advance() is b
-    assert b[0]() is None
+    module_ref, _ = b
+    assert module_ref() is None
     assert order.position == 2 and len(order) == 4
 
     # Static FSDP callers detect a destroyed owner without skipping its occurrence.

@@ -298,12 +298,11 @@ class FsdpModule:
             # Independent roots can share a context even without VPP, e.g.
             # separately sharded siblings whose parent is not sharded. Reset only
             # at the first root so later roots continue the shared static cursor.
-            if (
-                context.iteration_order.mode == "static"
-                and not is_recomputing
-                and context.iteration_order[0][0]() is self
-            ):
-                context.iteration_order.reset_cursor()
+            order = context.iteration_order
+            if order.mode == "static" and not is_recomputing:
+                first_forward_root, _ = order[0]
+                if first_forward_root() is self:
+                    order.reset_cursor()
 
         self.unshard("forward" if not is_recomputing else "recompute")
 
