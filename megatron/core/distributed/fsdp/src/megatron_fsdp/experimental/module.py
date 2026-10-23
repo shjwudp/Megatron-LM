@@ -32,8 +32,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import ExecutionPhase, IterationOrder
-from .execution_order import ModuleExecutionOrder as ExecutionOrder
+from .execution_order import ExecutionOrder, ExecutionPhase, IterationOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,

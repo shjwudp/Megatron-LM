@@ -24,8 +24,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.context import FsdpContext
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionOrder,
     IterationOrder,
-    ModuleExecutionOrder,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
@@ -76,8 +76,8 @@ def context():
 def test_unscoped_calls_keep_static_prefetch(context):
     """Repeated chunk calls retain construction-order lookup until explicitly captured."""
     a, b = _Unit(context), _Unit(context)
-    context.forward_order = ModuleExecutionOrder([a, b])
-    context.backward_order = ModuleExecutionOrder([b, a])
+    context.forward_order = ExecutionOrder([a, b])
+    context.backward_order = ExecutionOrder([b, a])
     for phase, events in (("forward", (a, a, b, b)), ("backward", (b, b, a, a))):
         for module in events:
             a._unshard_parameter_groups.reset_mock()

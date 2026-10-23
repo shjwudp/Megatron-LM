@@ -15,81 +15,53 @@
 """Weakly held construction or recorded module execution sequences."""
 
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING, Generic, Literal, TypeVar
+from typing import TYPE_CHECKING, Generic, Literal, TypeVar, cast, overload
 from weakref import WeakKeyDictionary, ref
 
 if TYPE_CHECKING:
     from .module import FsdpModule
 
 T = TypeVar("T")
+_NO_ITEM = object()
 
 
-class ModuleExecutionOrder(Generic[T]):
-    """Look up unique modules and validate repeated module-call occurrences.
+class ExecutionOrder(Generic[T]):
+    """Traverse occurrences while preserving the original weak module lookup API.
 
-    A module appearing once can unambiguously select its position, preserving
-    construction-order prefetch for reordered or repeated demand calls. Modules
-    appearing more than once must match the next occurrence at the cursor.
-    Prefetch lookahead never advances that cursor.
+    Construction orders keep ``module_lookup=True`` and use ``advance(module)``.
+    Recorded orders set it to False, own their payload lifetimes, and consume
+    occurrences with ``advance()``. Lookahead never advances either cursor.
     """
 
-    def __init__(self, items: Iterable[T] = ()) -> None:
-        """Create a weak execution sequence, preserving repeated occurrences."""
-        self._items: list[ref[T]] = []
-        # An index identifies a unique item; None marks an ambiguous repeated item.
-        self._unique_index: WeakKeyDictionary[T, int | None] = WeakKeyDictionary()
+    def __init__(self, items: Iterable[T] = (), *, module_lookup: bool = True) -> None:
+        """Create a weak module order or a generic occurrence sequence."""
+        self._items: list[T | ref[T]] = []
+        # Keep the existing lookup until all callers have iteration boundaries.
+        # None selects generic payload storage without an item index.
+        self._unique_index: WeakKeyDictionary[T, int | None] | None = (
+            WeakKeyDictionary() if module_lookup else None
+        )
         self._position = 0
         for item in items:
             self.append(item)
 
     def append(self, item: T) -> None:
-        """Append an occurrence and mark previously seen items as repeated."""
-        self._unique_index[item] = None if item in self._unique_index else len(self._items)
-        self._items.append(ref(item))
+        """Append an occurrence, preserving weak ownership for module orders."""
+        if self._unique_index is None:
+            self._items.append(item)
+        else:
+            self._unique_index[item] = None if item in self._unique_index else len(self._items)
+            self._items.append(ref(item))
 
     def __iter__(self) -> Iterator[T]:
-        """Iterate over live occurrences in execution order."""
-        for item_ref in self._items:
-            item = item_ref()
-            if item is not None:
-                yield item
-
-    def advance(self, item: T) -> None:
-        """Locate a unique demand call or consume the next expected repeated call."""
-        index = self._unique_index.get(item)
-        if index is None:
-            if not self._items or self._items[self._position]() is not item:
-                raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
-            index = self._position
-        self._position = (index + 1) % len(self._items)
-
-    def next_item(self, offset: int = 1) -> T | None:
-        """Look ahead from the last consumed occurrence without moving the cursor."""
-        if not self._items:
-            return None
-        index = (self._position - 1) % len(self._items)
-        next_index = index + offset
-        if next_index >= len(self._items):
-            return None
-        return self._items[next_index]()
-
-
-class ExecutionOrder(Generic[T]):
-    """Consume ordered occurrences with an explicitly reset execution cursor.
-
-    Repeated items are ordinary occurrences. The caller validates each item
-    returned by advance(); lookahead never changes execution progress. Callers
-    own item lifetimes and can store weak references in their payloads.
-    """
-
-    def __init__(self, items: Iterable[T] = ()) -> None:
-        """Create an execution sequence, preserving repeated occurrences."""
-        self._items: list[T] = list(items)
-        self._position = 0
-
-    def append(self, item: T) -> None:
-        """Append one occurrence."""
-        self._items.append(item)
+        """Visit generic occurrences or live modules without moving the cursor."""
+        if self._unique_index is None:
+            yield from cast(list[T], self._items)
+        else:
+            for item_ref in cast(list[ref[T]], self._items):
+                item = item_ref()
+                if item is not None:
+                    yield item
 
     def reset_cursor(self, position: int = 0) -> None:
         """Reset traversal position without changing the recorded sequence."""
@@ -100,24 +72,56 @@ class ExecutionOrder(Generic[T]):
 
     @property
     def position(self) -> int:
-        """Number of occurrences consumed in the current traversal."""
+        """Return the current occurrence cursor."""
         return self._position
 
-    def __iter__(self) -> Iterator[T]:
-        """Iterate over all occurrences without changing execution progress."""
-        return iter(self._items)
-
-    def advance(self) -> T:
-        """Consume the next occurrence without lookup or automatic wrapping."""
-        if self._position >= len(self._items):
-            raise RuntimeError("Calls exceeded the execution order; reset its cursor first.")
-        item = self._items[self._position]
-        self._position += 1
-        return item
-
     def __getitem__(self, index: int) -> T:
-        """Read an occurrence without changing execution progress."""
-        return self._items[index]
+        """Read an occurrence without advancing or skipping a destroyed module."""
+        item = self._items[index]
+        if self._unique_index is None:
+            return cast(T, item)
+        owner = cast(ref[T], item)()
+        if owner is None:
+            raise RuntimeError("A module in the FSDP execution order was destroyed.")
+        return owner
+
+    @overload
+    def advance(self) -> T: ...
+
+    @overload
+    def advance(self, item: T) -> None: ...
+
+    def advance(self, item: T | object = _NO_ITEM) -> T | None:
+        """Consume the next occurrence, or locate a module for existing callers."""
+        if item is _NO_ITEM:
+            if self._position >= len(self._items):
+                raise RuntimeError("Calls exceeded the execution order; reset its cursor first.")
+            result = self[self._position]
+            self._position += 1
+            return result
+        if self._unique_index is None:
+            raise TypeError("Item lookup is unavailable for generic occurrence orders.")
+        index = self._unique_index.get(cast(T, item))
+        if index is None:
+            if (
+                not self._items
+                or cast(ref[T], self._items[self._position % len(self._items)])() is not item
+            ):
+                raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
+            index = self._position % len(self._items)
+        self._position = (index + 1) % len(self._items)
+        return None
+
+    def next_item(self, offset: int = 1) -> T | None:
+        """Look ahead from the last consumed occurrence without moving the cursor."""
+        if not self._items:
+            return None
+        index = (self._position - 1) % len(self._items)
+        next_index = index + offset
+        if next_index >= len(self._items):
+            return None
+        item = self._items[next_index]
+        return cast(T, item) if self._unique_index is None else cast(ref[T], item)()
 
 
 ExecutionPhase = Literal["forward", "backward", "recompute"]
@@ -136,7 +140,7 @@ class IterationOrder(ExecutionOrder[ExecutionEvent]):
     """
 
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(module_lookup=False)
         self.captured = False
         self.active = False
         self.mode: Literal["static", "record_replay", "demand"] = "static"

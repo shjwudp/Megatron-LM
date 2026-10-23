@@ -16,7 +16,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_ord
 def test_explicit_reset_and_exhaustion():
     """Only reset starts another pass; lookahead and iteration never advance it."""
     a, b = nn.Module(), nn.Module()
-    order = ExecutionOrder([a, b, a])
+    order = ExecutionOrder([a, b, a], module_lookup=False)
     for _ in range(2):
         order.reset_cursor()
         assert order.advance() is a
@@ -30,17 +30,24 @@ def test_explicit_reset_and_exhaustion():
             order.advance()
     order.reset_cursor(1)
     assert order.advance() is b
-    empty = ExecutionOrder()
+    empty = ExecutionOrder(module_lookup=False)
     assert list(empty) == []
     with pytest.raises(RuntimeError, match='exceeded'):
         empty.advance()
+
+    # Generic payloads can be non-weak-referenceable, including None.
+    payloads = [None, 0, ("module", "phase")]
+    generic = ExecutionOrder(payloads, module_lookup=False)
+    assert [generic.advance() for _ in payloads] == payloads
+    with pytest.raises(TypeError, match="lookup"):
+        generic.advance(None)
 
 
 def test_iteration_and_weak_references():
     """Tuple payloads preserve occurrences while callers keep module ownership weak."""
     first, second = nn.Module(), nn.Module()
     a, b = (ref(first), 'forward'), (ref(second), 'backward')
-    order = ExecutionOrder([a, b, a, b])
+    order = ExecutionOrder([a, b, a, b], module_lookup=False)
     assert list(order) == [a, b, a, b]
     assert order.advance() is a
     assert order[order.position] is b
@@ -54,3 +61,32 @@ def test_iteration_and_weak_references():
     module_ref, _ = b
     assert module_ref() is None
     assert order.position == 2 and len(order) == 4
+
+
+def test_lookup_and_cursor_share_the_existing_module_order():
+    """Existing lookup can anchor traversal before or after strict cursor calls."""
+    a, b = nn.Module(), nn.Module()
+    order = ExecutionOrder([a, b, a])
+    order.advance(a)
+    assert order.position == 1 and order.next_item() is b
+    assert order.advance() is b
+    order.advance(a)
+    assert order.position == 0 and order.next_item() is None
+    order.reset_cursor(1)
+    assert order.advance() is b
+    assert order.advance() is a
+    with pytest.raises(RuntimeError, match="exceeded"):
+        order.advance()
+    order.advance(a)
+    assert order.position == 1 and order.next_item() is b
+    # Unique lookup still anchors a new pass after cursor exhaustion.
+    order.advance(b)
+    assert order.advance() is a
+    b_ref = ref(b)
+    del b
+    gc.collect()
+    assert b_ref() is None
+    order.reset_cursor(1)
+    with pytest.raises(RuntimeError, match="destroyed"):
+        order.advance()
+    assert order.position == 1
