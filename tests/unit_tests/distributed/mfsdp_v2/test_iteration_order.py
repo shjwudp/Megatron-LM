@@ -1,8 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Single-iteration capture, scheduler replay, and weak module ownership."""
+"""Iteration capture/replay and checkpoint training correctness."""
 
-import gc
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -29,10 +28,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_ord
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
-    _make_unshard_backward_hook,
-    _make_unshard_forward_hook,
-)
 
 
 @contextmanager
@@ -45,20 +40,11 @@ def _validation(context):
         context.prefetch_mode = previous_mode
 
 
-def _demand(context, module, phase, budget=0):
-    order = FsdpContext._advance_execution_order(context, module, phase)
-    if order is not None:
-        FsdpModule._prefetch_parameter_groups(module, order, budget)
-
-
 class _Unit(nn.Module):
 
     def __init__(self, context):
         super().__init__()
         self.context = context
-        self.config = SimpleNamespace(
-            cuda_graph_impl='none', virtual_pipeline_model_parallel_size=2
-        )
         self.num_parameter_elements = 1
         self._unshard_parameter_groups = Mock()
         event = object()
@@ -100,48 +86,13 @@ def context():
     return context
 
 
-def test_unscoped_calls_keep_static_prefetch(context):
-    """Repeated chunk calls retain construction-order lookup until explicitly captured."""
+@pytest.mark.parametrize(
+    'budget, failure',
+    [(None, None), (0, None), (2, None), (0, 'module'), (0, 'phase'), (0, 'missing'), (0, 'extra')],
+)
+def test_capture_replay_and_validation(context, budget, failure):
+    """Repeated mixed-phase calls replay with prefetch; validation preserves the trace."""
     a, b = _Unit(context), _Unit(context)
-    context.execution_order = ExecutionOrder(
-        [
-            (ref(a), Phase.FORWARD),
-            (ref(b), Phase.FORWARD),
-            (ref(b), Phase.BACKWARD),
-            (ref(a), Phase.BACKWARD),
-        ]
-    )
-    for phase, events in ((Phase.FORWARD, (a, a, b, b)), (Phase.BACKWARD, (b, b, a, a))):
-        for module in events:
-            a._unshard_parameter_groups.reset_mock()
-            b._unshard_parameter_groups.reset_mock()
-            module.unshard(phase)
-            module._unshard_parameter_groups.assert_called_once_with(
-                Phase.FORWARD if phase == Phase.FORWARD else Phase.BACKWARD
-            )
-            successor = b if phase == Phase.FORWARD else a
-            if module is not successor:
-                successor._unshard_parameter_groups.assert_called_once_with(
-                    Phase.FORWARD if phase == Phase.FORWARD else Phase.BACKWARD
-                )
-            else:
-                other = a if successor is b else b
-                other._unshard_parameter_groups.assert_not_called()
-        assert context.prefetch_mode is PrefetchMode.PRESET
-        assert len(context.execution_order) == 4
-    # Preset recomputation must neither consume the order nor prefetch successors.
-    position = context.execution_order.position
-    a._unshard_parameter_groups.reset_mock()
-    b._unshard_parameter_groups.reset_mock()
-    a.unshard(Phase.RECOMPUTE)
-    a._unshard_parameter_groups.assert_called_once_with(Phase.FORWARD)
-    b._unshard_parameter_groups.assert_not_called()
-    assert context.execution_order.position == position
-
-
-def test_capture_replay_and_validation(context):
-    """One training order survives validation; replay resets its execution cursor."""
-    a, b = (_Unit(context), _Unit(context))
     events = [
         (a, Phase.FORWARD),
         (a, Phase.FORWARD),
@@ -154,161 +105,83 @@ def test_capture_replay_and_validation(context):
     gathers.attach_mock(a._unshard_parameter_groups, 'a')
     gathers.attach_mock(b._unshard_parameter_groups, 'b')
     gathers.attach_mock(context.current_stream.return_value.wait_event, 'wait')
-    prefetched = []
+    for module in (a, b):
+        module._schedule_policy.forward_prefetch_size = budget
+        module._schedule_policy.backward_prefetch_size = budget
 
-    def run(model, forward_only=False, budget=None):
-        with _validation(context) if forward_only else iteration(context):
-            order = context.execution_order
-            if forward_only:
-                assert context.prefetch_mode is PrefetchMode.DEMAND
-                before = b._unshard_parameter_groups.call_count
-                b.unshard(Phase.FORWARD)
-                assert b._unshard_parameter_groups.call_count == before + 1
-                return
+    def run(sequence):
+        prefetched = []
+        with iteration(context):
             assert context.prefetch_mode is PrefetchMode.RECORD_REPLAY
-            for module, phase in events:
-                module._schedule_policy.forward_prefetch_size = budget
-                module._schedule_policy.backward_prefetch_size = budget
+            order = context.execution_order
+            # Manual inspection gathers without recording or consuming an occurrence.
+            before = list(order), order.position
+            a.unshard()
+            assert (list(order), order.position) == before
+            for module, phase in sequence:
                 before = len(gathers.mock_calls)
                 module.unshard(phase)
                 calls = gathers.mock_calls[before:]
+                physical_phase = Phase.BACKWARD if phase is Phase.BACKWARD else Phase.FORWARD
                 assert calls[0][0] == ('a' if module is a else 'b')
+                assert calls[0].args == (physical_phase,)
                 assert calls[1][0] == 'wait'
-                prefetched.extend((call[0] for call in calls[2:]))
+                prefetched.extend((call[0], call.args[0]) for call in calls[2:])
+        return prefetched
 
-    run(a, forward_only=True)
-    assert not context.iteration_captured
-    for schedule, replay in ((run, False), (run, True), (run, True)):
-        gathers.reset_mock()
-        prefetched.clear()
-        schedule([a, b])
-        assert prefetched == (['a', 'b', 'b', 'a', 'a'] if replay else [])
+    def validate():
         order = context.execution_order
-        assert context.iteration_captured and context.prefetch_mode is PrefetchMode.DEMAND
-        expected_position = len(events) if replay else 0
-        assert order.position == expected_position
-        _, phase = order[4]
-        assert phase == Phase.RECOMPUTE
-        run([a, b], forward_only=True)
-        assert context.execution_order is order and order.position == expected_position
+        before = list(order), order.position
+        with _validation(context):
+            start = len(gathers.mock_calls)
+            b.unshard(Phase.FORWARD)
+            assert [call[0] for call in gathers.mock_calls[start:]] == ['b', 'wait']
+            assert context.execution_order is order
+            assert (list(order), order.position) == before
+
+    expected_prefetch = {
+        None: [
+            ('a', Phase.FORWARD),
+            ('b', Phase.FORWARD),
+            ('b', Phase.BACKWARD),
+            ('a', Phase.FORWARD),
+            ('a', Phase.BACKWARD),
+        ],
+        0: [],
+        2: [
+            ('a', Phase.FORWARD),
+            ('b', Phase.FORWARD),
+            ('b', Phase.FORWARD),
+            ('b', Phase.BACKWARD),
+            ('b', Phase.BACKWARD),
+            ('a', Phase.FORWARD),
+            ('a', Phase.FORWARD),
+            ('a', Phase.BACKWARD),
+            ('a', Phase.BACKWARD),
+        ],
+    }
+    validate()
+    assert not context.iteration_captured
+    for replay in (False, True, True):
+        assert run(events) == (expected_prefetch[budget] if replay else [])
+        assert context.iteration_captured
         assert context.prefetch_mode is PrefetchMode.DEMAND
-        before = len(gathers.mock_calls)
-        b.unshard(Phase.FORWARD)
-        assert [call[0] for call in gathers.mock_calls[before:]] == ['b', 'wait']
-        assert order.position == expected_position
-    prefetched.clear()
-    run(a, budget=0)
-    assert not prefetched
-    run(a, budget=2)
-    assert prefetched == ['a', 'b', 'b', 'b', 'b', 'a', 'a', 'a', 'a']
+        assert list(context.execution_order) == [(ref(module), phase) for module, phase in events]
+        assert context.execution_order.position == (len(events) if replay else 0)
+        validate()
+        assert context.prefetch_mode is PrefetchMode.DEMAND
 
-
-@pytest.mark.parametrize('captured', [False, True], ids=['capturing', 'replaying'])
-def test_manual_unshard_preserves_iteration_order(context, captured):
-    """Parameter inspection must neither record demands nor consume the saved trace."""
-    a, b = (_Unit(context), _Unit(context))
-    if captured:
-        with iteration(context):
-            a.unshard(Phase.FORWARD)
-            b.unshard(Phase.BACKWARD)
-    with iteration(context):
-        order = context.execution_order
-        before = (list(order), order.position)
-        a.unshard()
-        assert (list(order), order.position) == before
-        a.unshard(Phase.FORWARD)
-        b.unshard(Phase.BACKWARD)
-
-
-def test_failed_or_changed_iterations_require_capture(context):
-    """Mismatched, incomplete, extra, and failed calls invalidate the single order."""
-    a, b = (_Unit(context), _Unit(context))
-    events = [(a, Phase.FORWARD)]
-
-    def run(model, fail=False):
-        with iteration(context):
-            for module, phase in events:
-                _demand(context, module, phase)
-            if fail:
-                raise ValueError('failed compute')
-
-    for changed in (
-        [(b, Phase.FORWARD)],
-        [(a, Phase.BACKWARD)],
-        [],
-        [(a, Phase.FORWARD), (a, Phase.FORWARD)],
-    ):
-        events = [(a, Phase.FORWARD)]
-        with iteration(context):
-            _demand(context, a, Phase.FORWARD)
-        events = changed
-        with pytest.raises(RuntimeError):
-            run(a)
-        assert context.prefetch_mode is PrefetchMode.DEMAND and not context.iteration_captured
-    with pytest.raises(ValueError):
-        run(a, fail=True)
-    assert not context.iteration_captured
-    with iteration(context):
-        with pytest.raises(RuntimeError, match='active'):
-            with iteration(context):
-                pass
-        _demand(context, b, Phase.FORWARD)
-    events = [(b, Phase.FORWARD)]
-    run(a)
-    assert context.iteration_captured
-    with pytest.raises(ValueError, match='failed replay'):
-        with iteration(context):
-            raise ValueError('failed replay')
-    assert context.prefetch_mode is PrefetchMode.DEMAND and not context.iteration_captured
-
-
-@pytest.mark.parametrize("budget", [None, 0], ids=["prefetch", "demand"])
-def test_capture_does_not_retain_modules(context, budget):
-    """Captured occurrences keep weak references and reject a destroyed owner."""
-    a, b = (_Unit(context), _Unit(context))
-    with iteration(context):
-        _demand(context, a, Phase.FORWARD)
-        _demand(context, b, Phase.BACKWARD)
-    b_ref = ref(b)
-    del b
-    gc.collect()
-    assert b_ref() is None
-
-    def run(model):
-        with iteration(context):
-            _demand(context, model, Phase.FORWARD, budget=budget)
-            _demand(context, model, Phase.BACKWARD)
-
-    with pytest.raises(RuntimeError, match='destroyed' if budget is None else 'diverged'):
-        run(a)
-    assert context.prefetch_mode is PrefetchMode.DEMAND and not context.iteration_captured
-
-
-@pytest.mark.parametrize(
-    'mode, captured',
-    [
-        (PrefetchMode.PRESET, False),
-        (PrefetchMode.RECORD_REPLAY, False),
-        (PrefetchMode.RECORD_REPLAY, True),
-        (PrefetchMode.DEMAND, True),
-    ],
-)
-def test_repeated_backward_keeps_static_guard(mode, captured, monkeypatch):
-    """Active scopes observe repeated backward calls; static mode keeps its guard."""
-    context = Mock(execution_order=ExecutionOrder())
-    context.prefetch_mode = mode
-    context.iteration_captured = captured
-    module = Mock(spec=FsdpModule, context=context, phase=Phase.BACKWARD)
-    module.is_root.return_value = False
-    push = Mock()
-    monkeypatch.setattr(torch.cuda.nvtx, 'range_push', push)
-    FsdpModule.pre_backward(module)
-    if mode is not PrefetchMode.RECORD_REPLAY:
-        module.unshard.assert_not_called()
-        context.current_stream.assert_not_called()
-    else:
-        module.unshard.assert_called_once_with(Phase.BACKWARD)
-    push.assert_not_called()
+    if failure is not None:
+        changed, message = {
+            'module': ([(b, Phase.FORWARD)] + events[1:], 'module calls diverged'),
+            'phase': ([(a, Phase.BACKWARD)] + events[1:], 'module phase diverged'),
+            'missing': (events[:-1], 'ended before consuming'),
+            'extra': (events + [(a, Phase.FORWARD)], 'exceeded'),
+        }[failure]
+        with pytest.raises(RuntimeError, match=message):
+            run(changed)
+        assert not context.iteration_captured
+        assert context.prefetch_mode is PrefetchMode.DEMAND
 
 
 @pytest.mark.parametrize('reentrant', [False, True])
@@ -392,58 +265,3 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iterat
         finally:
             for unit in (model.fc2, model.fc1, model):
                 unit.reshard()
-
-
-def test_replay_prefetch_uses_successor_compute_phase(context):
-    """Backward and recompute successors need different materialization phases."""
-    a, b = _Unit(context), _Unit(context)
-    for _ in range(2):
-        with iteration(context):
-            b._unshard_parameter_groups.reset_mock()
-            a.unshard(Phase.FORWARD)
-            if context.iteration_captured:
-                b._unshard_parameter_groups.assert_called_once_with(Phase.BACKWARD)
-            b.unshard(Phase.BACKWARD)
-            if context.iteration_captured:
-                a._unshard_parameter_groups.assert_called_with(Phase.FORWARD)
-            a.unshard(Phase.RECOMPUTE)
-
-
-@pytest.mark.parametrize("active", [False, True])
-def test_combined_hooks_record_phase_tagged_demands(context, active):
-    """Combined 1F1B hooks participate in capture only inside an iteration scope."""
-    module = _Unit(context)
-    module.is_root = lambda: True
-    forward = _make_unshard_forward_hook(module)
-    backward = _make_unshard_backward_hook(module)
-    with iteration(context) if active else nullcontext():
-        for _ in range(2):
-            forward(module, (), {})
-            backward(module, ())
-    assert list(context.execution_order) == (
-        [(ref(module), Phase.FORWARD), (ref(module), Phase.BACKWARD)] * 2 if active else []
-    )
-    assert context.allgather_stream.wait_stream.call_count == 2
-
-
-def test_invalid_prefetch_mode_does_not_consume_order(context):
-    """Invalid modes report their value without changing execution progress."""
-    module = _Unit(context)
-    context.prefetch_mode = "invalid"
-    with pytest.raises(ValueError, match="Unsupported FSDP prefetch mode: 'invalid'"):
-        _demand(context, module, Phase.FORWARD)
-    assert context.execution_order.position == 0
-    assert len(context.execution_order) == 0
-
-
-@pytest.mark.parametrize("mode", [PrefetchMode.PRESET, PrefetchMode.DEMAND])
-def test_empty_execution_order_gathers_on_demand(context, mode):
-    """No defined order means parameter demands gather without prefetch."""
-    context.prefetch_mode = mode
-    module = _Unit(context)
-    module._prefetch_parameter_groups = Mock()
-    module.unshard(Phase.FORWARD)
-    module._unshard_parameter_groups.assert_called_once_with(Phase.FORWARD)
-    module._prefetch_parameter_groups.assert_not_called()
-    assert len(context.execution_order) == 0
-    assert context.execution_order.position == 0

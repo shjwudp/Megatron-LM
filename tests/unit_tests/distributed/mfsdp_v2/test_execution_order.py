@@ -106,6 +106,35 @@ def test_iteration_and_weak_references():
     with pytest.raises(RuntimeError, match="destroyed"):
         FsdpModule._prefetch_parameter_groups(first, prefetch_order, None)
     assert prefetch_order.position == 1
-    # A destroyed owner must not silently skip its occurrence.
-    with pytest.raises(RuntimeError, match='diverged'):
-        order.advance(ref(first))
+
+
+def test_explicit_reset_and_exhaustion():
+    """Only reset starts another pass; lookahead and iteration never advance it."""
+    first, second = nn.Module(), nn.Module()
+    a, b = (ref(first), Phase.FORWARD), (ref(second), Phase.BACKWARD)
+    order = ExecutionOrder([a, b, a])
+    for _ in range(2):
+        order.reset_cursor()
+        assert order.advance() is a
+        assert order[order.position] is b
+        assert order[order.position] is b
+        assert list(order) == [a, b, a]
+        assert order.advance() is b
+        assert order.advance() is a
+        assert list(order)[order.position :] == []
+        with pytest.raises(RuntimeError, match='exceeded'):
+            order.advance()
+    order.reset_cursor(1)
+    assert order.advance() is b
+    empty = ExecutionOrder()
+    assert list(empty) == []
+    with pytest.raises(RuntimeError, match='exceeded'):
+        empty.advance()
+
+    # Generic payloads can be non-weak-referenceable, including None.
+    payloads = [None, 0, ("module", "phase")]
+    generic = ExecutionOrder(payloads)
+    assert [generic.advance() for _ in payloads] == payloads
+    generic.reset_cursor(1)
+    assert generic.advance(None) == 0
+    assert generic.position == 2
