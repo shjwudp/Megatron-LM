@@ -15,14 +15,13 @@
 """Generic execution occurrences; callers own payload lifetimes."""
 
 from collections.abc import Hashable, Iterable, Iterator
-from typing import TYPE_CHECKING, Generic, Literal, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Generic, Literal, TypeVar
 from weakref import ref
 
 if TYPE_CHECKING:
     from .module import FsdpModule
 
 T = TypeVar("T", bound=Hashable)
-_NO_ITEM = object()
 
 
 class ExecutionOrder(Generic[T]):
@@ -62,27 +61,22 @@ class ExecutionOrder(Generic[T]):
         """Read an occurrence without advancing the cursor."""
         return self._items[index]
 
-    @overload
-    def advance(self) -> T: ...
-
-    @overload
-    def advance(self, item: T) -> None: ...
-
-    def advance(self, item: T | object = _NO_ITEM) -> T | None:
-        """Consume the next occurrence, or locate an item for static callers."""
-        if item is _NO_ITEM:
-            if self._position >= len(self._items):
-                raise RuntimeError("Calls exceeded the execution order; reset its cursor first.")
-            result = self._items[self._position]
-            self._position += 1
-            return result
-        index = self._unique_index.get(cast(T, item))
-        if index is None:
-            if not self._items or self._items[self._position % len(self._items)] != item:
-                raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
-            index = self._position % len(self._items)
-        self._position = index + 1
-        return None
+    def advance(self, item: T | None = None) -> T:
+        """Consume the next occurrence, locating item first when it is not None."""
+        if item is not None:
+            index = self._unique_index.get(item)
+            if index is None:
+                if not self._items or self._items[self._position % len(self._items)] != item:
+                    raise RuntimeError(
+                        "FSDP module calls diverged from the expected prefetch order."
+                    )
+                index = self._position % len(self._items)
+            self._position = index
+        if self._position >= len(self._items):
+            raise RuntimeError("Calls exceeded the execution order; reset its cursor first.")
+        result = self._items[self._position]
+        self._position += 1
+        return result
 
 
 ExecutionPhase = Literal["forward", "backward", "recompute"]
