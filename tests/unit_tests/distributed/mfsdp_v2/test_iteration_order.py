@@ -34,7 +34,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import 
 def _demand(context, module, phase, budget=0):
     order = FsdpContext._advance_order(context, module, phase)
     if order is not None:
-        FsdpModule._prefetch_iteration_parameter_groups(module, order, budget)
+        FsdpModule._prefetch_parameter_groups(module, order, budget)
 
 
 class _Unit(nn.Module):
@@ -67,7 +67,6 @@ class _Unit(nn.Module):
         )
 
     _prefetch_parameter_groups = FsdpModule._prefetch_parameter_groups
-    _prefetch_iteration_parameter_groups = FsdpModule._prefetch_iteration_parameter_groups
 
 
 @pytest.fixture
@@ -93,8 +92,14 @@ def context():
 def test_unscoped_calls_keep_static_prefetch(context):
     """Repeated chunk calls retain construction-order lookup until explicitly captured."""
     a, b = _Unit(context), _Unit(context)
-    context.forward_order = ExecutionOrder([ref(a), ref(b)])
-    context.backward_order = ExecutionOrder([ref(b), ref(a)])
+    context.iteration_order = ExecutionOrder(
+        [
+            (ref(a), Phase.FORWARD),
+            (ref(b), Phase.FORWARD),
+            (ref(b), Phase.BACKWARD),
+            (ref(a), Phase.BACKWARD),
+        ]
+    )
     for phase, events in ((Phase.FORWARD, (a, a, b, b)), (Phase.BACKWARD, (b, b, a, a))):
         for module in events:
             a._unshard_parameter_groups.reset_mock()
@@ -108,8 +113,19 @@ def test_unscoped_calls_keep_static_prefetch(context):
                 successor._unshard_parameter_groups.assert_called_once_with(
                     Phase.FORWARD if phase == Phase.FORWARD else Phase.BACKWARD
                 )
+            else:
+                other = a if successor is b else b
+                other._unshard_parameter_groups.assert_not_called()
         assert context.prefetch_mode is PrefetchMode.PRESET
-        assert len(context.iteration_order) == 0
+        assert len(context.iteration_order) == 4
+    # Preset recomputation must neither consume the order nor prefetch successors.
+    position = context.iteration_order.position
+    a._unshard_parameter_groups.reset_mock()
+    b._unshard_parameter_groups.reset_mock()
+    a.unshard(Phase.RECOMPUTE)
+    a._unshard_parameter_groups.assert_called_once_with(Phase.FORWARD)
+    b._unshard_parameter_groups.assert_not_called()
+    assert context.iteration_order.position == position
 
 
 def test_capture_replay_and_validation(context):

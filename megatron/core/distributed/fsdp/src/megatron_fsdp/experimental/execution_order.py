@@ -94,8 +94,9 @@ class ExecutionOrder(Generic[T]):
 class PrefetchMode(enum.Enum):
     """Source of the parameter prefetch order.
 
-    PRESET uses forward and backward orders defined during construction, without
-    requiring an iteration scope.
+    PRESET uses a phase-tagged forward/backward order defined during construction,
+    without requiring an iteration scope. Prefetch stays within each phase;
+    recomputation gathers on demand.
     RECORD_REPLAY records phase-tagged module calls in the first training
     iteration scope and prefetches from that order in later scopes. Recording
     gathers on demand; outside a scope the captured order is retained but unused.

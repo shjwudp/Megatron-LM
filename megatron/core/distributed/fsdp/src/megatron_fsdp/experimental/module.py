@@ -289,8 +289,8 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
-        # TODO: Static recomputation gathers MXFP8 rowwise planes on demand, because backward
-        # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
+        # With preset orders, recomputation gathers MXFP8 rowwise planes on demand,
+        # because backward prefetch gathers only columnwise planes.
         self.unshard(Phase.FORWARD, prefetch=not is_recomputing or context.iteration_active)
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
@@ -330,65 +330,38 @@ class FsdpModule:
 
             if not prefetch:
                 return
-            if context.prefetch_mode is PrefetchMode.PRESET:
-                match phase:
-                    case Phase.FORWARD:
-                        self._prefetch_parameter_groups(
-                            context.forward_order, self._schedule_policy.forward_prefetch_size
-                        )
-                    case Phase.BACKWARD:
-                        self._prefetch_parameter_groups(
-                            context.backward_order, self._schedule_policy.backward_prefetch_size
-                        )
-            elif order is not None:
-                _, current_phase = order[order.position - 1]
+            if order is not None:
                 budget = (
                     self._schedule_policy.forward_prefetch_size
-                    if current_phase is Phase.FORWARD
+                    if execution_phase is Phase.FORWARD
                     else self._schedule_policy.backward_prefetch_size
                 )
-                self._prefetch_iteration_parameter_groups(order, budget)
+                self._prefetch_parameter_groups(order, budget)
 
     def _prefetch_parameter_groups(
-        self, order: ExecutionOrder[ref[nn.Module]], prefetch_size: int | None
-    ) -> None:
-        """Prefetch successors from ``order`` according to this module's budget.
-
-        Successors are unsharded for this module's phase, which is the compute they
-        run next in ``order``.
-        """
-        module = cast(nn.Module, self)
-        order.advance(ref(module))
-        if prefetch_size == 0:
-            return
-        prefetched_size = 0
-        for index in range(order.position, len(order)):
-            owner = order[index]()
-            if owner is None:
-                raise RuntimeError("A module in the FSDP execution order was destroyed.")
-            fsdp_module = cast(FsdpModule, owner)
-            fsdp_module._unshard_parameter_groups(self.phase)
-            prefetched_size += fsdp_module.num_parameter_elements
-            if prefetch_size is None or prefetched_size >= prefetch_size:
-                break
-
-    def _prefetch_iteration_parameter_groups(
         self, order: ExecutionOrder[ExecutionEvent], prefetch_size: int | None
     ) -> None:
-        """Prefetch successors of the consumed demand in the captured iteration."""
+        """Prefetch successors of the consumed demand according to its budget."""
         if prefetch_size == 0:
             return
-        size = 0
+        _, current_phase = order[order.position - 1]
+        prefetched_size = 0
         for index in range(order.position, len(order)):
             module_ref, next_phase = order[index]
+            # Preset forward/backward orders retain separate prefetch boundaries.
+            if (
+                self.context.prefetch_mode is PrefetchMode.PRESET
+                and next_phase is not current_phase
+            ):
+                break
             module = module_ref()
             if module is None:
                 raise RuntimeError("A module in the FSDP execution order was destroyed.")
             fsdp_module = cast(FsdpModule, module)
             phase = Phase.BACKWARD if next_phase is Phase.BACKWARD else Phase.FORWARD
             fsdp_module._unshard_parameter_groups(phase)
-            size += fsdp_module.num_parameter_elements
-            if prefetch_size is None or size >= prefetch_size:
+            prefetched_size += fsdp_module.num_parameter_elements
+            if prefetch_size is None or prefetched_size >= prefetch_size:
                 break
 
     def _unshard_parameter_groups(self, phase: Phase | None) -> None:

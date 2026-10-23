@@ -47,8 +47,6 @@ class FsdpContext:
     # Keep construction-order prefetch for callers without an iteration scope.
     # Explicit scopes use phase-tagged runtime occurrences instead.
     iteration_order: ExecutionOrder[ExecutionEvent]
-    forward_order: ExecutionOrder[ref[nn.Module]]
-    backward_order: ExecutionOrder[ref[nn.Module]]
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
@@ -101,8 +99,6 @@ class FsdpContext:
         self.prefetch_mode = PrefetchMode.PRESET
         self.iteration_active = False
         self.iteration_captured = False
-        self.forward_order = ExecutionOrder()
-        self.backward_order = ExecutionOrder()
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -167,10 +163,10 @@ class FsdpContext:
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
-                self.forward_order.append(ref(module))
+                self.iteration_order.append((ref(module), Phase.FORWARD))
 
         for root in reversed(list(self._roots)):
-            _collect_backward_order(root, registered_modules, self.backward_order)
+            _collect_backward_order(root, registered_modules, self.iteration_order)
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -207,8 +203,13 @@ class FsdpContext:
     ) -> ExecutionOrder[ExecutionEvent] | None:
         """Consume and validate a demand, returning its order when prefetch is enabled."""
         order = self.iteration_order
-        if phase is None or self.prefetch_mode in (PrefetchMode.PRESET, PrefetchMode.DEMAND):
+        if phase is None or self.prefetch_mode is PrefetchMode.DEMAND:
             return None
+        if self.prefetch_mode is PrefetchMode.PRESET:
+            if phase is Phase.RECOMPUTE:
+                return None
+            order.advance((ref(module), phase))
+            return order
         # Captured calls must share one complete iteration boundary.
         if not self.iteration_active:
             return None
@@ -300,11 +301,11 @@ def current_fully_shard_context() -> FsdpContext | None:
 
 
 def _collect_backward_order(
-    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[ref[nn.Module]]
+    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[ExecutionEvent]
 ) -> None:
     """Collect one root's static backward prefetch order."""
     if module in registered_modules:
-        order.append(ref(module))
+        order.append((ref(module), Phase.BACKWARD))
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, registered_modules, order)
