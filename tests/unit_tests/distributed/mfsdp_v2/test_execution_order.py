@@ -51,7 +51,7 @@ def test_unique_calls_resynchronize_and_repeated_calls_validate():
     # Grouped VPP repeats chunk 0 before switching to chunk 1, in one shared order.
     for chunk in (chunk0, chunk0, chunk0, chunk1, chunk1, chunk0):
         layer = layer0 if chunk is chunk0 else layer1
-        order.advance(ref(chunk))
+        assert order.advance(ref(chunk)) == ref(chunk)
         assert order[order.position]() is layer
         order.advance(ref(layer))
         if chunk is chunk0:
@@ -60,18 +60,18 @@ def test_unique_calls_resynchronize_and_repeated_calls_validate():
             assert order.position == len(order)
 
     order = ExecutionOrder(map(ref, [chunk0, layer0, chunk0]))
-    order.advance(ref(chunk0))
+    assert order.advance(ref(chunk0)) == ref(chunk0)
     assert order[order.position]() is layer0
     with pytest.raises(RuntimeError, match='diverged'):
         order.advance(ref(chunk0))
     # A rejected repeated call must not consume the expected occurrence.
     order.advance(ref(layer0))
     assert order[order.position]() is chunk0
-    order.advance(ref(chunk0))
+    assert order.advance(ref(chunk0)) == ref(chunk0)
     assert order.position == len(order)
     # Unique calls remain valid anchors even when the sequence also has repeats.
     order.advance(ref(layer0))
-    order.advance(ref(chunk0))
+    assert order.advance(ref(chunk0)) == ref(chunk0)
     assert order.position == len(order)
 
     empty = ExecutionOrder()

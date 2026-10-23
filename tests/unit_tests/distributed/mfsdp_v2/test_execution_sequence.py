@@ -39,6 +39,9 @@ def test_explicit_reset_and_exhaustion():
     payloads = [None, 0, ("module", "phase")]
     generic = ExecutionOrder(payloads)
     assert [generic.advance() for _ in payloads] == payloads
+    generic.reset_cursor(1)
+    assert generic.advance(None) == 0
+    assert generic.position == 2
 
 
 def test_iteration_and_weak_references():
