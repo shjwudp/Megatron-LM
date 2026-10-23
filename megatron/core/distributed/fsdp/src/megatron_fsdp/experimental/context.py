@@ -46,8 +46,8 @@ class FsdpContext:
     # Keep construction-order prefetch for callers without an iteration scope.
     # Explicit scopes use phase-tagged runtime occurrences instead.
     iteration_order: IterationOrder
-    forward_order: ExecutionOrder[nn.Module]
-    backward_order: ExecutionOrder[nn.Module]
+    forward_order: ExecutionOrder[ref[nn.Module]]
+    backward_order: ExecutionOrder[ref[nn.Module]]
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
@@ -163,7 +163,7 @@ class FsdpContext:
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
-                self.forward_order.append(module)
+                self.forward_order.append(ref(module))
 
         for root in reversed(list(self._roots)):
             _collect_backward_order(root, registered_modules, self.backward_order)
@@ -287,11 +287,11 @@ def current_fully_shard_context() -> FsdpContext | None:
 
 
 def _collect_backward_order(
-    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[nn.Module]
+    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[ref[nn.Module]]
 ) -> None:
     """Collect one root's static backward prefetch order."""
     if module in registered_modules:
-        order.append(module)
+        order.append(ref(module))
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, registered_modules, order)

@@ -76,8 +76,8 @@ def context():
 def test_unscoped_calls_keep_static_prefetch(context):
     """Repeated chunk calls retain construction-order lookup until explicitly captured."""
     a, b = _Unit(context), _Unit(context)
-    context.forward_order = ExecutionOrder([a, b])
-    context.backward_order = ExecutionOrder([b, a])
+    context.forward_order = ExecutionOrder([ref(a), ref(b)])
+    context.backward_order = ExecutionOrder([ref(b), ref(a)])
     for phase, events in (("forward", (a, a, b, b)), ("backward", (b, b, a, a))):
         for module in events:
             a._unshard_parameter_groups.reset_mock()
