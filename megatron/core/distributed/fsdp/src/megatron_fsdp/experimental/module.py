@@ -331,20 +331,15 @@ class FsdpModule:
         """Prefetch successors from ``order`` according to this module's budget."""
         module = cast(nn.Module, self)
         order.advance(module)
-        next_module = order.next_item()
-        if prefetch_size is None:
-            if next_module is not None:
-                cast(FsdpModule, next_module)._unshard_parameter_groups()
+        if prefetch_size == 0:
             return
-
-        prefetched_size = 0
-        offset = 1
-        while next_module is not None and prefetched_size < prefetch_size:
-            fsdp_module = cast(FsdpModule, next_module)
+        size = 0
+        for index in range(order.position, len(order)):
+            fsdp_module = cast(FsdpModule, order[index])
             fsdp_module._unshard_parameter_groups()
-            prefetched_size += fsdp_module.num_parameter_elements
-            offset += 1
-            next_module = order.next_item(offset)
+            size += fsdp_module.num_parameter_elements
+            if prefetch_size is None or size >= prefetch_size:
+                break
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.

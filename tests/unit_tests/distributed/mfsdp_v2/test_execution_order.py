@@ -37,11 +37,13 @@ def test_prefetch_replays_occurrences(budget, expected):
         order.append(module)
     # A second cycle checks cursor reset; each lookahead must leave demand calls intact.
     for _ in range(2):
-        for module, targets, successor in zip(sequence, expected, sequence[1:] + [None]):
+        for index, (module, targets) in enumerate(zip(sequence, expected)):
             prefetched.clear()
             FsdpModule._prefetch_parameter_groups(module, order, budget)
             assert prefetched == [modules[index] for index in targets]
-            assert order.next_item() is successor
+            assert order.position == index + 1
+            if order.position < len(order):
+                assert order[order.position] is sequence[index + 1]
 
 
 def test_unique_calls_resynchronize_and_repeated_calls_validate():
@@ -52,27 +54,30 @@ def test_unique_calls_resynchronize_and_repeated_calls_validate():
     for chunk in (chunk0, chunk0, chunk0, chunk1, chunk1, chunk0):
         layer = layer0 if chunk is chunk0 else layer1
         order.advance(chunk)
-        assert order.next_item() is layer
+        assert order[order.position] is layer
         order.advance(layer)
-        assert order.next_item() is (chunk1 if chunk is chunk0 else None)
+        if chunk is chunk0:
+            assert order[order.position] is chunk1
+        else:
+            assert order.position == len(order)
 
     order = ExecutionOrder([chunk0, layer0, chunk0])
     order.advance(chunk0)
-    assert order.next_item() is layer0
+    assert order[order.position] is layer0
     with pytest.raises(RuntimeError, match='diverged'):
         order.advance(chunk0)
     # A rejected repeated call must not consume the expected occurrence.
     order.advance(layer0)
-    assert order.next_item() is chunk0
+    assert order[order.position] is chunk0
     order.advance(chunk0)
-    assert order.next_item() is None
+    assert order.position == len(order)
     # Unique calls remain valid anchors even when the sequence also has repeats.
     order.advance(layer0)
     order.advance(chunk0)
-    assert order.next_item() is None
+    assert order.position == len(order)
 
     empty = ExecutionOrder()
-    assert empty.next_item() is None
+    assert len(empty) == 0
     with pytest.raises(RuntimeError, match='diverged'):
         empty.advance(chunk0)
 
@@ -89,7 +94,9 @@ def test_iteration_and_weak_references():
     assert second_ref() is None
     assert list(order) == [first, first]
     order.advance(first)
-    assert order.next_item() is None
+    with pytest.raises(RuntimeError, match="destroyed"):
+        order[order.position]
+    assert order.position == 1
     # Traversal skips dead references, but the demand cursor must not skip a call.
     with pytest.raises(RuntimeError, match='diverged'):
         order.advance(first)

@@ -68,17 +68,17 @@ def test_lookup_and_cursor_share_the_existing_module_order():
     a, b = nn.Module(), nn.Module()
     order = ExecutionOrder([a, b, a])
     order.advance(a)
-    assert order.position == 1 and order.next_item() is b
+    assert order.position == 1 and order[order.position] is b
     assert order.advance() is b
     order.advance(a)
-    assert order.position == 0 and order.next_item() is None
+    assert order.position == len(order)
     order.reset_cursor(1)
     assert order.advance() is b
     assert order.advance() is a
     with pytest.raises(RuntimeError, match="exceeded"):
         order.advance()
     order.advance(a)
-    assert order.position == 1 and order.next_item() is b
+    assert order.position == 1 and order[order.position] is b
     # Unique lookup still anchors a new pass after cursor exhaustion.
     order.advance(b)
     assert order.advance() is a

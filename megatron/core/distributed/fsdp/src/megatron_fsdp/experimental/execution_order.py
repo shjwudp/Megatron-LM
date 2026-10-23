@@ -69,7 +69,7 @@ class ExecutionOrder(Generic[T]):
 
     @property
     def position(self) -> int:
-        """Return the current occurrence cursor."""
+        """Index of the next occurrence; len(order) means traversal is exhausted."""
         return self._position
 
     def __getitem__(self, index: int) -> T:
@@ -106,16 +106,5 @@ class ExecutionOrder(Generic[T]):
             ):
                 raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
             index = self._position % len(self._items)
-        self._position = (index + 1) % len(self._items)
+        self._position = index + 1
         return None
-
-    def next_item(self, offset: int = 1) -> T | None:
-        """Look ahead from the last consumed occurrence without moving the cursor."""
-        if not self._items:
-            return None
-        index = (self._position - 1) % len(self._items)
-        next_index = index + offset
-        if next_index >= len(self._items):
-            return None
-        item = self._items[next_index]
-        return cast(T, item) if self._unique_index is None else cast(ref[T], item)()
