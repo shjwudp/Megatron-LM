@@ -299,7 +299,7 @@ def current_fully_shard_context() -> FsdpContext | None:
 def _collect_backward_order(
     module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[ExecutionEvent]
 ) -> None:
-    """Collect one root's static backward prefetch order."""
+    """Collect one root's preset backward prefetch order."""
     if module in registered_modules:
         order.append((ref(module), Phase.BACKWARD))
 

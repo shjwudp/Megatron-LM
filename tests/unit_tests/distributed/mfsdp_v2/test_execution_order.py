@@ -31,7 +31,6 @@ def test_prefetch_replays_occurrences(budget, expected):
     modules = [Mock(spec=FsdpModule, num_parameter_elements=1) for _ in range(3)]
     prefetched = []
     for module in modules:
-        module.phase = Phase.FORWARD
         module.context = SimpleNamespace(prefetch_mode=PrefetchMode.RECORD_REPLAY)
         # Prefetch passes the successor's compute phase; record only which module it targets.
         module._unshard_parameter_groups.side_effect = (
@@ -41,7 +40,7 @@ def test_prefetch_replays_occurrences(budget, expected):
     order = ExecutionOrder()
     for module in sequence:
         order.append((ref(module), Phase.FORWARD))
-    # A second cycle checks cursor reset; each lookahead must leave demand calls intact.
+    # A second pass checks repeated occurrence matching after exhaustion.
     for _ in range(2):
         for index, (module, targets) in enumerate(zip(sequence, expected)):
             prefetched.clear()
@@ -54,37 +53,37 @@ def test_prefetch_replays_occurrences(budget, expected):
 def test_unique_calls_resynchronize_and_repeated_calls_validate():
     """Unique VPP chunk calls select their position; ambiguous repeats stay strict."""
     chunk0, layer0, chunk1, layer1 = (nn.Module() for _ in range(4))
-    order = ExecutionOrder(map(ref, [chunk0, layer0, chunk1, layer1]))
+    order = ExecutionOrder([chunk0, layer0, chunk1, layer1])
     # Grouped VPP repeats chunk 0 before switching to chunk 1, in one shared order.
     for chunk in (chunk0, chunk0, chunk0, chunk1, chunk1, chunk0):
         layer = layer0 if chunk is chunk0 else layer1
-        assert order.advance(ref(chunk)) == ref(chunk)
-        assert order[order.position]() is layer
-        order.advance(ref(layer))
+        assert order.advance(chunk) is chunk
+        assert order[order.position] is layer
+        order.advance(layer)
         if chunk is chunk0:
-            assert order[order.position]() is chunk1
+            assert order[order.position] is chunk1
         else:
             assert order.position == len(order)
 
-    order = ExecutionOrder(map(ref, [chunk0, layer0, chunk0]))
-    assert order.advance(ref(chunk0)) == ref(chunk0)
-    assert order[order.position]() is layer0
+    order = ExecutionOrder([chunk0, layer0, chunk0])
+    assert order.advance(chunk0) is chunk0
+    assert order[order.position] is layer0
     with pytest.raises(RuntimeError, match='diverged'):
-        order.advance(ref(chunk0))
+        order.advance(chunk0)
     # A rejected repeated call must not consume the expected occurrence.
-    order.advance(ref(layer0))
-    assert order[order.position]() is chunk0
-    assert order.advance(ref(chunk0)) == ref(chunk0)
+    order.advance(layer0)
+    assert order[order.position] is chunk0
+    assert order.advance(chunk0) is chunk0
     assert order.position == len(order)
     # Unique calls remain valid anchors even when the sequence also has repeats.
-    order.advance(ref(layer0))
-    assert order.advance(ref(chunk0)) == ref(chunk0)
+    order.advance(layer0)
+    assert order.advance(chunk0) is chunk0
     assert order.position == len(order)
 
     empty = ExecutionOrder()
     assert len(empty) == 0
     with pytest.raises(RuntimeError, match='diverged'):
-        empty.advance(ref(chunk0))
+        empty.advance(chunk0)
 
 
 def test_iteration_and_weak_references():
@@ -98,7 +97,7 @@ def test_iteration_and_weak_references():
     gc.collect()
     assert second_ref() is None
     assert [module_ref() for module_ref in order] == [first, None, first, None]
-    order.advance(ref(first))
+    order.advance()
     assert order[order.position]() is None
     first.context = SimpleNamespace(prefetch_mode=PrefetchMode.RECORD_REPLAY)
     prefetch_order = ExecutionOrder((module_ref, Phase.FORWARD) for module_ref in order)
@@ -110,14 +109,13 @@ def test_iteration_and_weak_references():
 
 def test_explicit_reset_and_exhaustion():
     """Only reset starts another pass; lookahead and iteration never advance it."""
-    first, second = nn.Module(), nn.Module()
-    a, b = (ref(first), Phase.FORWARD), (ref(second), Phase.BACKWARD)
+    a, b = nn.Module(), nn.Module()
     order = ExecutionOrder([a, b, a])
     for _ in range(2):
         order.reset_cursor()
         assert order.advance() is a
         assert order[order.position] is b
-        assert order[order.position] is b
+        assert order.position == 1
         assert list(order) == [a, b, a]
         assert order.advance() is b
         assert order.advance() is a

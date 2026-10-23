@@ -448,7 +448,7 @@ class FsdpModule:
         # and gather its weights normally, without this guard. grads_ready would
         # run once, after both depths' local gradient contributions have accumulated,
         # and perform the reduction.
-        # This likely requires addressing static prefetch order for repeated invocations first:
+        # This likely requires addressing preset prefetch order for repeated invocations first:
         # https://github.com/NVIDIA/Megatron-LM/issues/7764
         if self.phase is Phase.BACKWARD:
             # Track every backward occurrence during capture/replay, including

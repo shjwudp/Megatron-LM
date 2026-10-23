@@ -86,26 +86,69 @@ def context():
     return context
 
 
-@pytest.mark.parametrize(
-    'budget, failure',
-    [(None, None), (0, None), (2, None), (0, 'module'), (0, 'phase'), (0, 'missing'), (0, 'extra')],
+_MIXED_PHASE_EVENTS = (
+    ('a', Phase.FORWARD),
+    ('a', Phase.FORWARD),
+    ('b', Phase.FORWARD),
+    ('b', Phase.BACKWARD),
+    ('a', Phase.RECOMPUTE),
+    ('a', Phase.BACKWARD),
 )
-def test_capture_replay_and_validation(context, budget, failure):
+
+
+@pytest.mark.parametrize('events', [_MIXED_PHASE_EVENTS], ids=['mixed-phases'])
+@pytest.mark.parametrize(
+    'budget, expected_prefetch, replay_events, expected_error',
+    [
+        pytest.param(
+            None,
+            [
+                ('a', Phase.FORWARD),
+                ('b', Phase.FORWARD),
+                ('b', Phase.BACKWARD),
+                ('a', Phase.FORWARD),
+                ('a', Phase.BACKWARD),
+            ],
+            None,
+            None,
+            id='one-successor',
+        ),
+        pytest.param(0, [], None, None, id='no-prefetch'),
+        pytest.param(
+            2,
+            [
+                ('a', Phase.FORWARD),
+                ('b', Phase.FORWARD),
+                ('b', Phase.FORWARD),
+                ('b', Phase.BACKWARD),
+                ('b', Phase.BACKWARD),
+                ('a', Phase.FORWARD),
+                ('a', Phase.FORWARD),
+                ('a', Phase.BACKWARD),
+                ('a', Phase.BACKWARD),
+            ],
+            None,
+            None,
+            id='two-successors',
+        ),
+        pytest.param(0, [], [('b', Phase.FORWARD)], 'module calls diverged', id='wrong-module'),
+        pytest.param(0, [], [('a', Phase.BACKWARD)], 'module phase diverged', id='wrong-phase'),
+        pytest.param(0, [], _MIXED_PHASE_EVENTS[:-1], 'ended before consuming', id='missing-call'),
+        pytest.param(
+            0, [], _MIXED_PHASE_EVENTS + (('a', Phase.FORWARD),), 'exceeded', id='extra-call'
+        ),
+    ],
+)
+def test_capture_replay_and_validation(
+    context, events, budget, expected_prefetch, replay_events, expected_error
+):
     """Repeated mixed-phase calls replay with prefetch; validation preserves the trace."""
-    a, b = _Unit(context), _Unit(context)
-    events = [
-        (a, Phase.FORWARD),
-        (a, Phase.FORWARD),
-        (b, Phase.FORWARD),
-        (b, Phase.BACKWARD),
-        (a, Phase.RECOMPUTE),
-        (a, Phase.BACKWARD),
-    ]
+    modules = {name: _Unit(context) for name in ('a', 'b')}
     gathers = Mock()
-    gathers.attach_mock(a._unshard_parameter_groups, 'a')
-    gathers.attach_mock(b._unshard_parameter_groups, 'b')
+    gathers.attach_mock(modules['a']._unshard_parameter_groups, 'a')
+    gathers.attach_mock(modules['b']._unshard_parameter_groups, 'b')
     gathers.attach_mock(context.current_stream.return_value.wait_event, 'wait')
-    for module in (a, b):
+    for module in modules.values():
         module._schedule_policy.forward_prefetch_size = budget
         module._schedule_policy.backward_prefetch_size = budget
 
@@ -116,14 +159,14 @@ def test_capture_replay_and_validation(context, budget, failure):
             order = context.execution_order
             # Manual inspection gathers without recording or consuming an occurrence.
             before = list(order), order.position
-            a.unshard()
+            modules['a'].unshard()
             assert (list(order), order.position) == before
-            for module, phase in sequence:
+            for name, phase in sequence:
                 before = len(gathers.mock_calls)
-                module.unshard(phase)
+                modules[name].unshard(phase)
                 calls = gathers.mock_calls[before:]
                 physical_phase = Phase.BACKWARD if phase is Phase.BACKWARD else Phase.FORWARD
-                assert calls[0][0] == ('a' if module is a else 'b')
+                assert calls[0][0] == name
                 assert calls[0].args == (physical_phase,)
                 assert calls[1][0] == 'wait'
                 prefetched.extend((call[0], call.args[0]) for call in calls[2:])
@@ -134,60 +177,35 @@ def test_capture_replay_and_validation(context, budget, failure):
         before = list(order), order.position
         with _validation(context):
             start = len(gathers.mock_calls)
-            b.unshard(Phase.FORWARD)
+            modules['b'].unshard(Phase.FORWARD)
             assert [call[0] for call in gathers.mock_calls[start:]] == ['b', 'wait']
             assert context.execution_order is order
             assert (list(order), order.position) == before
 
-    expected_prefetch = {
-        None: [
-            ('a', Phase.FORWARD),
-            ('b', Phase.FORWARD),
-            ('b', Phase.BACKWARD),
-            ('a', Phase.FORWARD),
-            ('a', Phase.BACKWARD),
-        ],
-        0: [],
-        2: [
-            ('a', Phase.FORWARD),
-            ('b', Phase.FORWARD),
-            ('b', Phase.FORWARD),
-            ('b', Phase.BACKWARD),
-            ('b', Phase.BACKWARD),
-            ('a', Phase.FORWARD),
-            ('a', Phase.FORWARD),
-            ('a', Phase.BACKWARD),
-            ('a', Phase.BACKWARD),
-        ],
-    }
     validate()
     assert not context.iteration_captured
     for replay in (False, True, True):
-        assert run(events) == (expected_prefetch[budget] if replay else [])
+        assert run(events) == (expected_prefetch if replay else [])
         assert context.iteration_captured
         assert context.prefetch_mode is PrefetchMode.DEMAND
-        assert list(context.execution_order) == [(ref(module), phase) for module, phase in events]
+        assert list(context.execution_order) == [
+            (ref(modules[name]), phase) for name, phase in events
+        ]
         assert context.execution_order.position == (len(events) if replay else 0)
         validate()
         assert context.prefetch_mode is PrefetchMode.DEMAND
 
-    if failure is not None:
-        changed, message = {
-            'module': ([(b, Phase.FORWARD)] + events[1:], 'module calls diverged'),
-            'phase': ([(a, Phase.BACKWARD)] + events[1:], 'module phase diverged'),
-            'missing': (events[:-1], 'ended before consuming'),
-            'extra': (events + [(a, Phase.FORWARD)], 'exceeded'),
-        }[failure]
-        with pytest.raises(RuntimeError, match=message):
-            run(changed)
+    if expected_error is not None:
+        with pytest.raises(RuntimeError, match=expected_error):
+            run(replay_events)
         assert not context.iteration_captured
         assert context.prefetch_mode is PrefetchMode.DEMAND
 
 
 @pytest.mark.parametrize('reentrant', [False, True])
-@pytest.mark.parametrize('record_iteration', [False, True], ids=['static', 'recorded'])
+@pytest.mark.parametrize('record_iteration', [False, True], ids=['preset', 'recorded'])
 def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iteration):
-    """Static and recorded prefetch preserve SGD with both checkpoint variants."""
+    """Preset and recorded prefetch preserve SGD with both checkpoint variants."""
 
     class Model(nn.Module):
 
