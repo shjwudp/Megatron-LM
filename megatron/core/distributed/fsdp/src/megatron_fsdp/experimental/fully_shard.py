@@ -202,11 +202,11 @@ def iteration(context: FsdpContext) -> Iterator[ExecutionOrder[ExecutionEvent]]:
     context.ensure_finalized()
     if context.prefetch_mode is PrefetchMode.RECORD_REPLAY:
         raise RuntimeError("Cannot enter an already active FSDP iteration.")
-    order = context.iteration_order
+    order = context.execution_order
     if context.iteration_captured:
         order.reset_cursor()
     else:
-        order = context.iteration_order = ExecutionOrder[ExecutionEvent]()
+        order = context.execution_order = ExecutionOrder[ExecutionEvent]()
     context.prefetch_mode = PrefetchMode.RECORD_REPLAY
     try:
         yield order

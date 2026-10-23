@@ -276,9 +276,6 @@ class FsdpModule:
         # This is the first MFSDP hook to run, so finalize the context here once
         # before any module begins communication.
         context.ensure_finalized()
-        # A reentrant checkpoint recomputes before the child module's backward-pre
-        # hook runs. The active autograd GraphTask identifies that recomputation.
-        is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
         if self.phase is not Phase.BACKWARD:
             self.phase = Phase.FORWARD
         # forward/backward each span multiple lifecycle methods (pre_forward ->
@@ -291,18 +288,15 @@ class FsdpModule:
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
-        self.unshard(
-            Phase.FORWARD,
-            prefetch=not is_recomputing or context.prefetch_mode is PrefetchMode.RECORD_REPLAY,
-        )
+        self.unshard(Phase.FORWARD)
 
-    def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
+    def unshard(self, phase: Phase | None = None) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
 
         Args:
-            phase: In what phase this module runs. None unshards for every phase.
-            prefetch: Whether to also prefetch successors in the module order of
-                ``phase``, which must then be FORWARD or BACKWARD.
+            phase: In what phase this module runs. FORWARD or BACKWARD calls
+                advance the execution order and prefetch when it is available.
+                None unshards for every phase without advancing the order.
 
         External schedulers invoking this directly (rather than through the
         automatic ``pre_forward`` hook) must first synchronize the all-gather
@@ -313,15 +307,17 @@ class FsdpModule:
         """
         context = self.context
         order = None
-        if prefetch:
+        if phase is not None:
             if phase not in (Phase.FORWARD, Phase.BACKWARD):
                 raise ValueError(
-                    f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
+                    f"Unsharding requires a FORWARD, BACKWARD, or None phase, got {phase!r}."
                 )
             execution_phase = phase
+            # A reentrant checkpoint recomputes before the child module's backward-pre
+            # hook runs. The active autograd GraphTask identifies that recomputation.
             if phase is Phase.FORWARD and (self.phase is Phase.BACKWARD or _is_in_backward()):
                 execution_phase = Phase.RECOMPUTE
-            order = context._advance_order(cast(nn.Module, self), execution_phase)
+            order = context._advance_execution_order(cast(nn.Module, self), execution_phase)
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups(phase)
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
@@ -331,8 +327,6 @@ class FsdpModule:
             for event in dict.fromkeys(self._unshard_events[p] for p in phases):
                 self.context.current_stream().wait_event(event)
 
-            if not prefetch:
-                return
             if order is not None:
                 budget = (
                     self._schedule_policy.forward_prefetch_size
@@ -458,7 +452,7 @@ class FsdpModule:
         # https://github.com/NVIDIA/Megatron-LM/issues/7764
         if self.phase is Phase.BACKWARD:
             if self.context.prefetch_mode is PrefetchMode.RECORD_REPLAY:
-                self.unshard(Phase.BACKWARD, prefetch=True)
+                self.unshard(Phase.BACKWARD)
             return
         self.phase = Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
@@ -475,7 +469,7 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self.unshard(Phase.BACKWARD, prefetch=True)
+        self.unshard(Phase.BACKWARD)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""

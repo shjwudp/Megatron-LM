@@ -16,7 +16,7 @@ def _make_unshard_forward_hook(owner: FsdpModule):
             context = owner.context
             context.allgather_stream.wait_stream(context.current_stream())
         active = owner.context.prefetch_mode is PrefetchMode.RECORD_REPLAY
-        owner.unshard(Phase.FORWARD if active else None, prefetch=active)
+        owner.unshard(Phase.FORWARD if active else None)
 
     return hook
 
@@ -27,7 +27,7 @@ def _make_unshard_backward_hook(owner: FsdpModule):
 
     def hook(submodule, _grad_output):
         active = owner.context.prefetch_mode is PrefetchMode.RECORD_REPLAY
-        owner.unshard(Phase.BACKWARD if active else None, prefetch=active)
+        owner.unshard(Phase.BACKWARD if active else None)
 
     return hook
 

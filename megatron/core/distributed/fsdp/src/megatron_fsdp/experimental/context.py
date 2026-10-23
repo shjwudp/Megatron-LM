@@ -44,9 +44,12 @@ class FsdpContext:
     The caller must call ``finish_grad_sync()`` after all gradient producers,
     including delayed weight-gradient computation, and before consuming gradients.
     """
-    # Keep construction-order prefetch for callers without an iteration scope.
-    # Explicit scopes use phase-tagged runtime occurrences instead.
-    iteration_order: ExecutionOrder[ExecutionEvent]
+
+    # Phase-tagged module execution order, either preset or captured from a full iteration.
+    # Capture records the actual call order; replay validates it and prefetches
+    # subsequent events. DEMAND mode preserves the order without consuming it
+    # or prefetching.
+    execution_order: ExecutionOrder[ExecutionEvent]
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
@@ -95,7 +98,7 @@ class FsdpContext:
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
-        self.iteration_order = ExecutionOrder[ExecutionEvent]()
+        self.execution_order = ExecutionOrder[ExecutionEvent]()
         self.prefetch_mode = PrefetchMode.PRESET
         self.iteration_captured = False
         self._post_backward_hook_registered = False
@@ -162,10 +165,10 @@ class FsdpContext:
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
-                self.iteration_order.append((ref(module), Phase.FORWARD))
+                self.execution_order.append((ref(module), Phase.FORWARD))
 
         for root in reversed(list(self._roots)):
-            _collect_backward_order(root, registered_modules, self.iteration_order)
+            _collect_backward_order(root, registered_modules, self.execution_order)
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -193,13 +196,13 @@ class FsdpContext:
         """Whether the active iteration is recording its execution order."""
         return self.prefetch_mode is PrefetchMode.RECORD_REPLAY and not self.iteration_captured
 
-    def _advance_order(
+    def _advance_execution_order(
         self, module: nn.Module, phase: Phase
     ) -> ExecutionOrder[ExecutionEvent] | None:
         """Consume and validate a demand, returning its order when prefetch is enabled."""
-        order = self.iteration_order
+        order = self.execution_order
         if self.prefetch_mode is PrefetchMode.PRESET:
-            if phase is Phase.RECOMPUTE:
+            if not order or phase is Phase.RECOMPUTE:
                 return None
             order.advance((ref(module), phase))
             return order
