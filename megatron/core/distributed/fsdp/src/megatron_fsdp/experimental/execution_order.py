@@ -12,33 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Generic execution occurrences; callers own payload lifetimes."""
+"""Weakly held construction or recorded module execution sequences."""
 
-from collections.abc import Hashable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from typing import Generic, TypeVar
 
-T = TypeVar("T", bound=Hashable)
+T = TypeVar("T")
 
 
 class ExecutionOrder(Generic[T]):
-    """Traverse hashable occurrences without advancing during indexed lookahead."""
+    """Look up unique modules and validate repeated module-call occurrences.
+
+    A module appearing once can unambiguously select its position, preserving
+    construction-order prefetch for reordered or repeated demand calls. Modules
+    appearing more than once must match the next occurrence at the cursor.
+    Prefetch lookahead never advances that cursor.
+    """
 
     def __init__(self, items: Iterable[T] = ()) -> None:
-        """Preserve every occurrence, including repeated items."""
+        """Create an execution sequence, preserving repeated occurrences."""
         self._items: list[T] = []
-        # Static callers still locate items until iteration scopes replace lookup.
+        # An index identifies a unique item; None marks an ambiguous repeated item.
         self._unique_index: dict[T, int | None] = {}
         self._position = 0
         for item in items:
             self.append(item)
 
     def append(self, item: T) -> None:
-        """Append an occurrence and mark repeated items as ambiguous."""
+        """Append an occurrence and mark previously seen items as repeated."""
         self._unique_index[item] = None if item in self._unique_index else len(self._items)
         self._items.append(item)
 
     def __iter__(self) -> Iterator[T]:
-        """Iterate over stored values without moving the cursor."""
+        """Iterate over occurrences in execution order."""
         return iter(self._items)
 
     def reset_cursor(self, position: int = 0) -> None:
@@ -58,7 +64,10 @@ class ExecutionOrder(Generic[T]):
         return self._items[index]
 
     def advance(self, item: T | None = None) -> T:
-        """Consume the next occurrence, locating item first when it is not None."""
+        """Locate a unique demand call or consume the next expected repeated call.
+
+        With no item, consume the next occurrence without lookup.
+        """
         if item is not None:
             index = self._unique_index.get(item)
             if index is None:
