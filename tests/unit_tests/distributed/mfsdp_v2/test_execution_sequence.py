@@ -16,7 +16,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_ord
 def test_explicit_reset_and_exhaustion():
     """Only reset starts another pass; lookahead and iteration never advance it."""
     a, b = nn.Module(), nn.Module()
-    order = ExecutionOrder([a, b, a], module_lookup=False)
+    order = ExecutionOrder([a, b, a])
     for _ in range(2):
         order.reset_cursor()
         assert order.advance() is a
@@ -30,24 +30,22 @@ def test_explicit_reset_and_exhaustion():
             order.advance()
     order.reset_cursor(1)
     assert order.advance() is b
-    empty = ExecutionOrder(module_lookup=False)
+    empty = ExecutionOrder()
     assert list(empty) == []
     with pytest.raises(RuntimeError, match='exceeded'):
         empty.advance()
 
     # Generic payloads can be non-weak-referenceable, including None.
     payloads = [None, 0, ("module", "phase")]
-    generic = ExecutionOrder(payloads, module_lookup=False)
+    generic = ExecutionOrder(payloads)
     assert [generic.advance() for _ in payloads] == payloads
-    with pytest.raises(TypeError, match="lookup"):
-        generic.advance(None)
 
 
 def test_iteration_and_weak_references():
     """Tuple payloads preserve occurrences while callers keep module ownership weak."""
     first, second = nn.Module(), nn.Module()
     a, b = (ref(first), 'forward'), (ref(second), 'backward')
-    order = ExecutionOrder([a, b, a, b], module_lookup=False)
+    order = ExecutionOrder([a, b, a, b])
     assert list(order) == [a, b, a, b]
     assert order.advance() is a
     assert order[order.position] is b

@@ -326,16 +326,19 @@ class FsdpModule:
                 )
 
     def _prefetch_parameter_groups(
-        self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
+        self, order: ExecutionOrder[ref[nn.Module]], prefetch_size: int | None
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
         module = cast(nn.Module, self)
-        order.advance(module)
+        order.advance(ref(module))
         if prefetch_size == 0:
             return
         size = 0
         for index in range(order.position, len(order)):
-            fsdp_module = cast(FsdpModule, order[index])
+            owner = order[index]()
+            if owner is None:
+                raise RuntimeError("A module in the FSDP execution order was destroyed.")
+            fsdp_module = cast(FsdpModule, owner)
             fsdp_module._unshard_parameter_groups()
             size += fsdp_module.num_parameter_elements
             if prefetch_size is None or size >= prefetch_size:
