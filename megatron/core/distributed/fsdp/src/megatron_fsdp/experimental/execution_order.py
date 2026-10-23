@@ -21,7 +21,7 @@ from weakref import WeakKeyDictionary, ref
 T = TypeVar("T")
 
 
-class ExecutionOrder(Generic[T]):
+class ModuleExecutionOrder(Generic[T]):
     """Look up unique modules and validate repeated module-call occurrences.
 
     A module appearing once can unambiguously select its position, preserving
@@ -69,3 +69,49 @@ class ExecutionOrder(Generic[T]):
         if next_index >= len(self._items):
             return None
         return self._items[next_index]()
+
+
+class ExecutionOrder(Generic[T]):
+    """Consume ordered occurrences with an explicitly reset execution cursor.
+
+    Repeated items are ordinary occurrences. The caller validates each item
+    returned by advance(); lookahead never changes execution progress. Callers
+    own item lifetimes and can store weak references in their payloads.
+    """
+
+    def __init__(self, items: Iterable[T] = ()) -> None:
+        """Create an execution sequence, preserving repeated occurrences."""
+        self._items: list[T] = list(items)
+        self._position = 0
+
+    def append(self, item: T) -> None:
+        """Append one occurrence."""
+        self._items.append(item)
+
+    def reset_cursor(self, position: int = 0) -> None:
+        """Reset traversal position without changing the recorded sequence."""
+        self._position = position
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    @property
+    def position(self) -> int:
+        """Number of occurrences consumed in the current traversal."""
+        return self._position
+
+    def __iter__(self) -> Iterator[T]:
+        """Iterate over all occurrences without changing execution progress."""
+        return iter(self._items)
+
+    def advance(self) -> T:
+        """Consume the next occurrence without lookup or automatic wrapping."""
+        if self._position >= len(self._items):
+            raise RuntimeError("Calls exceeded the execution order; reset its cursor first.")
+        item = self._items[self._position]
+        self._position += 1
+        return item
+
+    def __getitem__(self, index: int) -> T:
+        """Read an occurrence without changing execution progress."""
+        return self._items[index]

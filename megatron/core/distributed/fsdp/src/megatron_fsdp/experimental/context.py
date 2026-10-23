@@ -21,7 +21,7 @@ from weakref import WeakKeyDictionary
 import torch
 from torch import nn
 
-from .execution_order import ExecutionOrder
+from .execution_order import ModuleExecutionOrder as ExecutionOrder
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 

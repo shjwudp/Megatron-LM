@@ -10,7 +10,7 @@ import pytest
 from torch import nn
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
-    ExecutionOrder,
+    ModuleExecutionOrder as ExecutionOrder,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
