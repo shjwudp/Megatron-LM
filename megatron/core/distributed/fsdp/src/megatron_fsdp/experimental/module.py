@@ -31,7 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import ExecutionOrder, ExecutionPhase, IterationOrder
+from .execution_order import ExecutionOrder, ExecutionPhase, IterationOrder, PrefetchMode
 from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,
@@ -315,9 +315,11 @@ class FsdpModule:
                 raise ValueError(
                     f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
                 )
-            execution_phase: ExecutionPhase = "forward" if phase is Phase.FORWARD else "backward"
+            execution_phase = (
+                ExecutionPhase.FORWARD if phase is Phase.FORWARD else ExecutionPhase.BACKWARD
+            )
             if phase is Phase.FORWARD and (self.phase is Phase.BACKWARD or _is_in_backward()):
-                execution_phase = "recompute"
+                execution_phase = ExecutionPhase.RECOMPUTE
             order = context._advance_order(cast(nn.Module, self), execution_phase)
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups(phase)
@@ -330,7 +332,7 @@ class FsdpModule:
 
             if not prefetch:
                 return
-            if context.iteration_order.mode == "static":
+            if context.iteration_order.mode is PrefetchMode.STATIC:
                 match phase:
                     case Phase.FORWARD:
                         self._prefetch_parameter_groups(
@@ -344,7 +346,7 @@ class FsdpModule:
                 _, current_phase = order[order.position - 1]
                 budget = (
                     self._schedule_policy.forward_prefetch_size
-                    if current_phase == "forward"
+                    if current_phase is ExecutionPhase.FORWARD
                     else self._schedule_policy.backward_prefetch_size
                 )
                 self._prefetch_iteration_parameter_groups(order, budget)
@@ -385,7 +387,7 @@ class FsdpModule:
             if module is None:
                 raise RuntimeError("A module in the FSDP execution order was destroyed.")
             fsdp_module = cast(FsdpModule, module)
-            phase = Phase.BACKWARD if next_phase == "backward" else Phase.FORWARD
+            phase = Phase.BACKWARD if next_phase is ExecutionPhase.BACKWARD else Phase.FORWARD
             fsdp_module._unshard_parameter_groups(phase)
             size += fsdp_module.num_parameter_elements
             if prefetch_size is None or size >= prefetch_size:

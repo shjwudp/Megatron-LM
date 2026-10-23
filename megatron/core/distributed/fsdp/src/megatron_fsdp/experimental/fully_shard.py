@@ -25,7 +25,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext, current_fully_shard_context
-from .execution_order import IterationOrder
+from .execution_order import IterationOrder, PrefetchMode
 from .module import FsdpModule
 from .schedule import SchedulePolicy
 
@@ -216,7 +216,7 @@ def iteration(context: FsdpContext, *, forward_only: bool = False) -> Iterator[I
         order = context.iteration_order = IterationOrder()
     elif not forward_only:
         order.reset_cursor()
-    order.mode = "demand" if forward_only else "record_replay"
+    order.mode = PrefetchMode.DEMAND if forward_only else PrefetchMode.RECORD_REPLAY
     order.active = True
     try:
         context.allgather_stream.wait_stream(context.current_stream())

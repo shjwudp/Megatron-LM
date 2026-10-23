@@ -21,7 +21,7 @@ from weakref import WeakKeyDictionary, ref
 import torch
 from torch import nn
 
-from .execution_order import ExecutionOrder, ExecutionPhase, IterationOrder
+from .execution_order import ExecutionOrder, ExecutionPhase, IterationOrder, PrefetchMode
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -194,7 +194,7 @@ class FsdpContext:
     ) -> IterationOrder | None:
         """Consume and validate a demand, returning its order when prefetch is enabled."""
         order = self.iteration_order
-        if phase is None or order.mode in ("static", "demand"):
+        if phase is None or order.mode in (PrefetchMode.STATIC, PrefetchMode.DEMAND):
             return None
         # Captured calls must share one complete iteration boundary.
         if not order.active:

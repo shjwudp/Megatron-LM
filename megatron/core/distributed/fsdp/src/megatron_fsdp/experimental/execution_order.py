@@ -14,8 +14,9 @@
 
 """Weakly held construction or recorded module execution sequences."""
 
+import enum
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING, Generic, Literal, TypeVar
+from typing import TYPE_CHECKING, Generic, TypeVar
 from weakref import ref
 
 if TYPE_CHECKING:
@@ -88,14 +89,29 @@ class ExecutionOrder(Generic[T]):
         return result
 
 
-ExecutionPhase = Literal["forward", "backward", "recompute"]
+class ExecutionPhase(enum.Enum):
+    """Compute represented by an occurrence in the execution order."""
+
+    FORWARD = enum.auto()
+    BACKWARD = enum.auto()
+    RECOMPUTE = enum.auto()
+
+
+class PrefetchMode(enum.Enum):
+    """Source of the parameter prefetch order."""
+
+    STATIC = enum.auto()
+    RECORD_REPLAY = enum.auto()
+    DEMAND = enum.auto()
+
+
 ExecutionEvent = tuple[ref["FsdpModule"], ExecutionPhase]
 
 
 class IterationOrder(ExecutionOrder[ExecutionEvent]):
     """Select static, recorded, or demand-only prefetch for a shared context.
 
-    ``mode`` selects the order source. In ``record_replay`` mode, ``captured``
+    ``mode`` selects the order source. In ``PrefetchMode.RECORD_REPLAY``, ``captured``
     distinguishes initial recording from replay of the completed sequence.
     ``active`` tracks the iteration scope independently of the selected strategy.
     State lives on FsdpContext because autograd hooks can run on another thread.
@@ -107,7 +123,7 @@ class IterationOrder(ExecutionOrder[ExecutionEvent]):
         super().__init__()
         self.captured = False
         self.active = False
-        self.mode: Literal["static", "record_replay", "demand"] = "static"
+        self.mode = PrefetchMode.STATIC
 
     def append(self, item: ExecutionEvent) -> None:
         """Append an occurrence before the recorded sequence is complete."""
@@ -116,4 +132,4 @@ class IterationOrder(ExecutionOrder[ExecutionEvent]):
 
     @property
     def recording(self) -> bool:
-        return self.active and self.mode == "record_replay" and not self.captured
+        return self.active and self.mode is PrefetchMode.RECORD_REPLAY and not self.captured
