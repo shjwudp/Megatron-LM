@@ -197,44 +197,36 @@ def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
 
 
 @contextmanager
-def iteration(
-    context: FsdpContext, *, forward_only: bool = False
-) -> Iterator[ExecutionOrder[ExecutionEvent]]:
+def iteration(context: FsdpContext) -> Iterator[ExecutionOrder[ExecutionEvent]]:
     """Capture one training iteration, then reset and validate each replay.
 
-    All model chunks share this boundary. Forward-only scopes gather on demand
-    without consuming the training order. The caller still owns finish_grad_sync
+    All model chunks share this boundary. The caller still owns finish_grad_sync
     after all backward producers; changed training schedules need a fresh order.
     Once captured, the runtime order replaces the construction order. Outside
     iteration scopes it is retained without advancing or speculative prefetch.
+    Forward-only callers should use PrefetchMode.DEMAND without entering a scope.
     """
     context.ensure_finalized()
     if context.iteration_active:
         raise RuntimeError("Cannot enter an already active FSDP iteration.")
     order = context.iteration_order
-    previous_mode = context.prefetch_mode
-    recording = not forward_only and not context.iteration_captured
-    if recording:
+    if not context.iteration_captured:
         order = context.iteration_order = ExecutionOrder[ExecutionEvent]()
-    elif not forward_only:
+    else:
         order.reset_cursor()
-    context.prefetch_mode = PrefetchMode.DEMAND if forward_only else PrefetchMode.RECORD_REPLAY
+    context.prefetch_mode = PrefetchMode.RECORD_REPLAY
     context.iteration_active = True
     try:
         context.allgather_stream.wait_stream(context.current_stream())
         yield order
-        if not forward_only:
-            if order.position != len(order):
-                raise RuntimeError("FSDP iteration ended before consuming its captured order.")
-            context.iteration_captured = True
+        if order.position != len(order):
+            raise RuntimeError("FSDP iteration ended before consuming its captured order.")
+        context.iteration_captured = True
     except BaseException:
-        if not forward_only:
-            context.iteration_captured = False
+        context.iteration_captured = False
         raise
     finally:
         context.iteration_active = False
-        if forward_only:
-            context.prefetch_mode = previous_mode
 
 
 def _attach_mixin(module: nn.Module) -> None:

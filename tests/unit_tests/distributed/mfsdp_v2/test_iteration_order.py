@@ -3,7 +3,7 @@
 """Single-iteration capture, scheduler replay, and weak module ownership."""
 
 import gc
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 from weakref import ref
@@ -29,6 +29,20 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_ord
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
+    _make_unshard_backward_hook,
+    _make_unshard_forward_hook,
+)
+
+
+@contextmanager
+def _validation(context):
+    previous_mode = context.prefetch_mode
+    context.prefetch_mode = PrefetchMode.DEMAND
+    try:
+        yield
+    finally:
+        context.prefetch_mode = previous_mode
 
 
 def _demand(context, module, phase, budget=0):
@@ -146,7 +160,7 @@ def test_capture_replay_and_validation(context):
     prefetched = []
 
     def run(model, forward_only=False, budget=None):
-        with iteration(context, forward_only=forward_only):
+        with _validation(context) if forward_only else iteration(context):
             order = context.iteration_order
             if forward_only:
                 assert context.prefetch_mode is PrefetchMode.DEMAND
@@ -214,7 +228,7 @@ def test_failed_or_changed_iterations_require_capture(context):
     events = [(a, Phase.FORWARD)]
 
     def run(model, fail=False):
-        with iteration(context, forward_only=False):
+        with iteration(context):
             for module, phase in events:
                 _demand(context, module, phase)
             if fail:
@@ -263,7 +277,7 @@ def test_capture_does_not_retain_modules(context):
     assert b_ref() is None
 
     def run(model):
-        with iteration(context, forward_only=False):
+        with iteration(context):
             _demand(context, model, Phase.FORWARD, budget=None)
 
     with pytest.raises(RuntimeError, match='destroyed'):
@@ -343,7 +357,11 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iterat
         return loss
 
     def run(model, forward_only=False):
-        scope = iteration(context, forward_only=forward_only) if record_iteration else nullcontext()
+        scope = (
+            (_validation(context) if forward_only else iteration(context))
+            if record_iteration
+            else nullcontext()
+        )
         with scope:
             return step(model, forward_only=forward_only)
 
@@ -367,7 +385,7 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iterat
         assert Phase.RECOMPUTE in [phase for _, phase in demands]
     else:
         assert not context.iteration_captured
-    with iteration(context, forward_only=True):
+    with _validation(context):
         for unit in (model, model.fc1, model.fc2):
             unit.unshard()
         try:
@@ -391,3 +409,20 @@ def test_replay_prefetch_uses_successor_compute_phase(context):
             if context.iteration_captured:
                 a._unshard_parameter_groups.assert_called_with(Phase.FORWARD)
             a.unshard(Phase.RECOMPUTE)
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_combined_hooks_record_phase_tagged_demands(context, active):
+    """Combined 1F1B hooks participate in capture only inside an iteration scope."""
+    module = _Unit(context)
+    module.is_root = lambda: True
+    forward = _make_unshard_forward_hook(module)
+    backward = _make_unshard_backward_hook(module)
+    with iteration(context) if active else nullcontext():
+        for _ in range(2):
+            forward(module, (), {})
+            backward(module, ())
+    assert list(context.iteration_order) == (
+        [(ref(module), Phase.FORWARD), (ref(module), Phase.BACKWARD)] * 2 if active else []
+    )
+    assert context.allgather_stream.wait_stream.call_count == (3 if active else 2)

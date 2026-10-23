@@ -101,7 +101,7 @@ class PrefetchMode(enum.Enum):
     iteration scope and prefetches from that order in later scopes. Recording
     gathers on demand; outside a scope the captured order is retained but unused.
     DEMAND gathers parameters only when needed, without recording, replaying, or
-    prefetching. Forward-only scopes temporarily use this mode so validation does
+    prefetching. Forward-only callers temporarily use this mode so validation does
     not consume the training order.
     """
 

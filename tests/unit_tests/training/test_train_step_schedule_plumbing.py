@@ -7,6 +7,9 @@ from unittest import mock
 
 import pytest
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    PrefetchMode,
+)
 from megatron.training import training as training_mod
 
 
@@ -139,3 +142,40 @@ def test_train_step_supports_bare_distributed_optimizer_for_mxfp8_staging():
         _run(model=model, optimizer=optimizer)
 
     optimizer._copy_main_params_to_param_buffer.assert_called_once_with()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("forward_only", [False, True])
+def test_mfsdp_iteration_scope_restores_validation_mode(enabled, forward_only):
+    """The flag gates capture; validation restores the training mode even on failure."""
+    context = SimpleNamespace(prefetch_mode=PrefetchMode.RECORD_REPLAY)
+    model = [SimpleNamespace(module=SimpleNamespace(context=context))]
+    args = SimpleNamespace(megatron_fsdp_record_iteration=enabled)
+    with (
+        mock.patch.object(training_mod, "get_args", return_value=args),
+        mock.patch.object(training_mod, "fsdp_iteration") as capture,
+    ):
+        with pytest.raises(ValueError, match="failed schedule"):
+            with training_mod._mfsdp_iteration(model, forward_only=forward_only):
+                assert context.prefetch_mode is (
+                    PrefetchMode.DEMAND if enabled and forward_only else PrefetchMode.RECORD_REPLAY
+                )
+                raise ValueError("failed schedule")
+        assert context.prefetch_mode is PrefetchMode.RECORD_REPLAY
+        if enabled and not forward_only:
+            capture.assert_called_once_with(context)
+            capture.return_value.__enter__.assert_called_once()
+            capture.return_value.__exit__.assert_called_once()
+        else:
+            capture.assert_not_called()
+
+
+@pytest.mark.parametrize("forward_only", [False, True])
+def test_train_step_enters_mfsdp_iteration_scope(forward_only):
+    """The real train_step scopes the complete schedule, including frozen models."""
+    model = [SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)]
+    with mock.patch.object(training_mod, "_mfsdp_iteration") as scope:
+        _run(model=model, args_overrides={"freeze_all_layers": forward_only})
+    scope.assert_called_once_with(model, forward_only=forward_only)
+    scope.return_value.__enter__.assert_called_once()
+    scope.return_value.__exit__.assert_called_once()
