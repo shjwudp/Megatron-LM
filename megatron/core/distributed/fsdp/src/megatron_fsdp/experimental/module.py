@@ -348,15 +348,15 @@ class FsdpModule:
         order.advance(ref(module))
         if prefetch_size == 0:
             return
-        size = 0
+        prefetched_size = 0
         for index in range(order.position, len(order)):
             owner = order[index]()
             if owner is None:
                 raise RuntimeError("A module in the FSDP execution order was destroyed.")
             fsdp_module = cast(FsdpModule, owner)
             fsdp_module._unshard_parameter_groups()
-            size += fsdp_module.num_parameter_elements
-            if prefetch_size is None or size >= prefetch_size:
+            prefetched_size += fsdp_module.num_parameter_elements
+            if prefetch_size is None or prefetched_size >= prefetch_size:
                 break
 
     def _prefetch_iteration_parameter_groups(
