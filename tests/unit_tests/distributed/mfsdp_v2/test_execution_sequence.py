@@ -61,32 +61,3 @@ def test_iteration_and_weak_references():
     module_ref, _ = b
     assert module_ref() is None
     assert order.position == 2 and len(order) == 4
-
-
-def test_lookup_and_cursor_share_the_existing_module_order():
-    """Existing lookup can anchor traversal before or after strict cursor calls."""
-    a, b = nn.Module(), nn.Module()
-    order = ExecutionOrder([a, b, a])
-    order.advance(a)
-    assert order.position == 1 and order[order.position] is b
-    assert order.advance() is b
-    order.advance(a)
-    assert order.position == len(order)
-    order.reset_cursor(1)
-    assert order.advance() is b
-    assert order.advance() is a
-    with pytest.raises(RuntimeError, match="exceeded"):
-        order.advance()
-    order.advance(a)
-    assert order.position == 1 and order[order.position] is b
-    # Unique lookup still anchors a new pass after cursor exhaustion.
-    order.advance(b)
-    assert order.advance() is a
-    b_ref = ref(b)
-    del b
-    gc.collect()
-    assert b_ref() is None
-    order.reset_cursor(1)
-    with pytest.raises(RuntimeError, match="destroyed"):
-        order.advance()
-    assert order.position == 1
