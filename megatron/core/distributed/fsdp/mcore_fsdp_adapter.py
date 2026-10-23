@@ -50,12 +50,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import DSAtten
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
-from megatron.core.utils import (
-    get_attr_wrapped_model,
-    is_te_min_version,
-    log_single_rank,
-    unwrap_model,
-)
+from megatron.core.utils import is_te_min_version, log_single_rank, unwrap_model
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import (
@@ -696,39 +691,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             forward_prefetch_size=ddp_config.suggested_communication_unit_size,
             backward_prefetch_size=ddp_config.suggested_communication_unit_size,
         )
-        if config.overlap_moe_expert_parallel_comm:
-            model = get_attr_wrapped_model(module, "pre_process", return_model_obj=True)
-            mtp_depth = (config.mtp_num_layers or 0) if model.mtp_process else 0
-            # Count this chunk's embedding consumers. LM and MTP output heads
-            # share one post-process GraphTask, so together they contribute once.
-            embedding_consumers = (
-                int(model.pre_process)
-                + mtp_depth
-                + int(model.post_process and model.share_embeddings_and_output_weights)
-            )
-            embedding_extra_callbacks = max(embedding_consumers - 1, 0)
-
-        def shard_unit(unit, mesh, placements, grad_scale):
-            grad_accumulation_count = None
-            if config.overlap_moe_expert_parallel_comm:
-                word_embeddings = getattr(
-                    getattr(model, "embedding", None), "word_embeddings", None
-                )
-                grad_accumulation_count = get_ep_overlap_grad_accumulation_count(
-                    unit,
-                    embedding_weight=getattr(word_embeddings, "weight", None),
-                    embedding_extra_callbacks=embedding_extra_callbacks,
-                )
-            fully_shard(
-                unit,
-                mesh=mesh,
-                placements=placements,
-                grad_scale=grad_scale,
-                mixed_precision_policy=self.mp_policy,
-                schedule_policy=schedule_policy,
-                register_hooks=not config.overlap_moe_expert_parallel_comm,
-                grad_accumulation_count=grad_accumulation_count,
-            )
+        common_fully_shard_kwargs = dict(
+            mixed_precision_policy=self.mp_policy,
+            schedule_policy=schedule_policy,
+            register_hooks=not config.overlap_moe_expert_parallel_comm,
+        )
 
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
@@ -753,11 +720,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     if isinstance(submodule, MoELayer):
                         if config.init_model_with_meta_device:
                             _materialize_owned_meta_modules(submodule.experts, device)
-                        shard_unit(
+                        fully_shard(
                             submodule.experts,
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
                             grad_scale=expert_grad_scale,
+                            **common_fully_shard_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -767,16 +735,29 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
                     if config.init_model_with_meta_device:
                         _materialize_owned_meta_modules(submodule, device)
-                    shard_unit(
+                    grad_accumulation_count = get_ep_overlap_grad_accumulation_count(
+                        submodule, unwrap_model(module)
+                    )
+                    fully_shard(
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
                         grad_scale=dense_grad_scale,
+                        grad_accumulation_count=grad_accumulation_count,
+                        **common_fully_shard_kwargs,
                     )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
-            shard_unit(
-                module, mesh=dp_mesh, placements=dense_placements, grad_scale=dense_grad_scale
+            grad_accumulation_count = get_ep_overlap_grad_accumulation_count(
+                module, unwrap_model(module)
+            )
+            fully_shard(
+                module,
+                mesh=dp_mesh,
+                placements=dense_placements,
+                grad_scale=dense_grad_scale,
+                grad_accumulation_count=grad_accumulation_count,
+                **common_fully_shard_kwargs,
             )
         super().__init__(config=config, module=module)
 
@@ -826,13 +807,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if not hasattr(pg_collection, 'dp_cp'):
             raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
 
-        if config.overlap_moe_expert_parallel_comm and (config.mtp_num_layers or 0) not in (0, 1):
+        mtp_number_layers = 0 if config.mtp_num_layers is None else config.mtp_num_layers
+        if config.overlap_moe_expert_parallel_comm and mtp_number_layers not in (0, 1):
             raise ValueError(
                 "overlap_moe_expert_parallel_comm requires mtp_num_layers <= 1 "
-                f"(got {config.mtp_num_layers})."
+                f"(got {mtp_number_layers})."
             )
 
-        if config.pipeline_model_parallel_size > 1 and (config.mtp_num_layers or 0) > 0:
+        if config.pipeline_model_parallel_size > 1 and mtp_number_layers > 0:
             model = unwrap_model(module)
             if getattr(model, "share_embeddings_and_output_weights", False):
                 # Check global topology, rather than rank-local mtp_process, so
@@ -998,13 +980,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         for submodule in self.module.modules():
             if isinstance(submodule, FsdpModule):
-                countdown = submodule._trainable_parameter_countdown
-                if not countdown.is_complete:
-                    raise ValueError(
-                        f"gradient window sealed mid-flight for FSDP module "
-                        f"{submodule.name or '<root>'!r}: expected "
-                        f"{countdown.initial_value} callbacks per window"
-                    )
+                submodule.validate_grad_accumulation()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""

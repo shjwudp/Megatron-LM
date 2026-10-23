@@ -163,6 +163,16 @@ class FsdpModule:
         """Return whether this module is an outermost FsdpModule in its context."""
         return self.context.is_root(cast(nn.Module, self))
 
+    def validate_grad_accumulation(self) -> None:
+        """Raise if a gradient-accumulation window is partially complete."""
+        countdown = self._trainable_parameter_countdown
+        if not countdown.is_complete:
+            raise ValueError(
+                f"gradient window sealed mid-flight for FSDP module "
+                f"{self.name or '<root>'!r}: expected "
+                f"{countdown.initial_value} callbacks per window"
+            )
+
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
         # Use PyTorch's callback module argument instead of capturing self so

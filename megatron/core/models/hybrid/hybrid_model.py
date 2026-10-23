@@ -459,6 +459,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
 
+    def get_mtp_depth(self) -> int:
+        """Return the MTP depth on this model chunk, or zero if it has no MTP."""
+        return self.mtp_num_depths if self.mtp_process else 0
+
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
 

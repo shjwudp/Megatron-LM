@@ -31,6 +31,12 @@ def _make_unshard_backward_hook(owner: FsdpModule):
     return hook
 
 
+def _module_post_forward_hook(module: FsdpModule, _args, _output) -> None:
+    """Reshard after evaluation, which bypasses the combined schedule's release hooks."""
+    if not module.training:
+        module.reshard()
+
+
 def _module_post_backward_hook(module: FsdpModule) -> None:
     module.reshard()
     module._reduce_gradient_groups()
@@ -62,16 +68,31 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
 
     for submodule in module.modules():
         if isinstance(submodule, FsdpModule):
+            submodule.register_forward_hook(_module_post_forward_hook)
             submodule.register_post_backward_hook(_module_post_backward_hook)
 
 
-def get_ep_overlap_grad_accumulation_count(
-    unit: nn.Module, embedding_weight: nn.Parameter | None, embedding_extra_callbacks: int
-) -> int:
+def get_ep_overlap_grad_accumulation_count(fsdp_unit: nn.Module, model: nn.Module) -> int | None:
     """Count owned trainable parameters plus extra callbacks for the embedding."""
+    config = getattr(model, "config", None)
+    if config is None or not config.overlap_moe_expert_parallel_comm:
+        return None
+
+    # Count this chunk's embedding consumers. LM and MTP output heads
+    # share one post-process GraphTask, so together they contribute once.
+    embedding_consumers = (
+        int(model.pre_process)
+        + model.get_mtp_depth()
+        + int(model.post_process and model.share_embeddings_and_output_weights)
+    )
+    embedding_extra_callbacks = max(embedding_consumers - 1, 0)
+
+    word_embeddings = getattr(getattr(model, "embedding", None), "word_embeddings", None)
+    embedding_weight = getattr(word_embeddings, "weight", None)
+
     parameters = {
         id(parameter)
-        for parameter in _collect_owned_parameters(unit).values()
+        for parameter in _collect_owned_parameters(fsdp_unit).values()
         if parameter.requires_grad
     }
     return len(parameters) + (
