@@ -31,7 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import ExecutionOrder, ExecutionPhase, IterationOrder, PrefetchMode
+from .execution_order import ExecutionEvent, ExecutionOrder, PrefetchMode
 from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,
@@ -291,7 +291,7 @@ class FsdpModule:
 
         # TODO: Static recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
-        self.unshard(Phase.FORWARD, prefetch=not is_recomputing or context.iteration_order.active)
+        self.unshard(Phase.FORWARD, prefetch=not is_recomputing or context.iteration_active)
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
@@ -315,11 +315,9 @@ class FsdpModule:
                 raise ValueError(
                     f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
                 )
-            execution_phase = (
-                ExecutionPhase.FORWARD if phase is Phase.FORWARD else ExecutionPhase.BACKWARD
-            )
+            execution_phase = phase
             if phase is Phase.FORWARD and (self.phase is Phase.BACKWARD or _is_in_backward()):
-                execution_phase = ExecutionPhase.RECOMPUTE
+                execution_phase = Phase.RECOMPUTE
             order = context._advance_order(cast(nn.Module, self), execution_phase)
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups(phase)
@@ -332,7 +330,7 @@ class FsdpModule:
 
             if not prefetch:
                 return
-            if context.iteration_order.mode is PrefetchMode.STATIC:
+            if context.prefetch_mode is PrefetchMode.PRESET:
                 match phase:
                     case Phase.FORWARD:
                         self._prefetch_parameter_groups(
@@ -346,7 +344,7 @@ class FsdpModule:
                 _, current_phase = order[order.position - 1]
                 budget = (
                     self._schedule_policy.forward_prefetch_size
-                    if current_phase is ExecutionPhase.FORWARD
+                    if current_phase is Phase.FORWARD
                     else self._schedule_policy.backward_prefetch_size
                 )
                 self._prefetch_iteration_parameter_groups(order, budget)
@@ -375,7 +373,7 @@ class FsdpModule:
                 break
 
     def _prefetch_iteration_parameter_groups(
-        self, order: IterationOrder, prefetch_size: int | None
+        self, order: ExecutionOrder[ExecutionEvent], prefetch_size: int | None
     ) -> None:
         """Prefetch successors of the consumed demand in the captured iteration."""
         if prefetch_size == 0:
@@ -387,7 +385,7 @@ class FsdpModule:
             if module is None:
                 raise RuntimeError("A module in the FSDP execution order was destroyed.")
             fsdp_module = cast(FsdpModule, module)
-            phase = Phase.BACKWARD if next_phase is ExecutionPhase.BACKWARD else Phase.FORWARD
+            phase = Phase.BACKWARD if next_phase is Phase.BACKWARD else Phase.FORWARD
             fsdp_module._unshard_parameter_groups(phase)
             size += fsdp_module.num_parameter_elements
             if prefetch_size is None or size >= prefetch_size:
@@ -483,7 +481,7 @@ class FsdpModule:
         # This likely requires addressing static prefetch order for repeated invocations first:
         # https://github.com/NVIDIA/Megatron-LM/issues/7764
         if self.phase is Phase.BACKWARD:
-            if self.context.iteration_order.active:
+            if self.context.iteration_active:
                 self.unshard(Phase.BACKWARD, prefetch=True)
             return
         self.phase = Phase.BACKWARD

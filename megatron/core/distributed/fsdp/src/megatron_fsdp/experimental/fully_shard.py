@@ -25,7 +25,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext, current_fully_shard_context
-from .execution_order import IterationOrder, PrefetchMode
+from .execution_order import ExecutionEvent, ExecutionOrder, PrefetchMode
 from .module import FsdpModule
 from .schedule import SchedulePolicy
 
@@ -197,7 +197,9 @@ def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
 
 
 @contextmanager
-def iteration(context: FsdpContext, *, forward_only: bool = False) -> Iterator[IterationOrder]:
+def iteration(
+    context: FsdpContext, *, forward_only: bool = False
+) -> Iterator[ExecutionOrder[ExecutionEvent]]:
     """Capture one training iteration, then reset and validate each replay.
 
     All model chunks share this boundary. Forward-only scopes gather on demand
@@ -207,32 +209,32 @@ def iteration(context: FsdpContext, *, forward_only: bool = False) -> Iterator[I
     iteration scopes it is retained without advancing or speculative prefetch.
     """
     context.ensure_finalized()
-    if context.iteration_order.active:
+    if context.iteration_active:
         raise RuntimeError("Cannot enter an already active FSDP iteration.")
     order = context.iteration_order
-    previous_mode = order.mode
-    recording = not forward_only and not order.captured
+    previous_mode = context.prefetch_mode
+    recording = not forward_only and not context.iteration_captured
     if recording:
-        order = context.iteration_order = IterationOrder()
+        order = context.iteration_order = ExecutionOrder[ExecutionEvent]()
     elif not forward_only:
         order.reset_cursor()
-    order.mode = PrefetchMode.DEMAND if forward_only else PrefetchMode.RECORD_REPLAY
-    order.active = True
+    context.prefetch_mode = PrefetchMode.DEMAND if forward_only else PrefetchMode.RECORD_REPLAY
+    context.iteration_active = True
     try:
         context.allgather_stream.wait_stream(context.current_stream())
         yield order
         if not forward_only:
             if order.position != len(order):
                 raise RuntimeError("FSDP iteration ended before consuming its captured order.")
-            order.captured = True
+            context.iteration_captured = True
     except BaseException:
         if not forward_only:
-            order.captured = False
+            context.iteration_captured = False
         raise
     finally:
-        order.active = False
+        context.iteration_active = False
         if forward_only:
-            order.mode = previous_mode
+            context.prefetch_mode = previous_mode
 
 
 def _attach_mixin(module: nn.Module) -> None:

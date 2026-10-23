@@ -21,7 +21,8 @@ from weakref import WeakKeyDictionary, ref
 import torch
 from torch import nn
 
-from .execution_order import ExecutionOrder, ExecutionPhase, IterationOrder, PrefetchMode
+from .execution_order import ExecutionEvent, ExecutionOrder, PrefetchMode
+from .phase import Phase
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
 
@@ -45,7 +46,7 @@ class FsdpContext:
     """
     # Keep construction-order prefetch for callers without an iteration scope.
     # Explicit scopes use phase-tagged runtime occurrences instead.
-    iteration_order: IterationOrder
+    iteration_order: ExecutionOrder[ExecutionEvent]
     forward_order: ExecutionOrder[ref[nn.Module]]
     backward_order: ExecutionOrder[ref[nn.Module]]
     # Topology metadata must not keep modules alive after construction.
@@ -96,7 +97,10 @@ class FsdpContext:
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
         self.caller_managed_grad_sync = caller_managed_grad_sync
-        self.iteration_order = IterationOrder()
+        self.iteration_order = ExecutionOrder[ExecutionEvent]()
+        self.prefetch_mode = PrefetchMode.PRESET
+        self.iteration_active = False
+        self.iteration_captured = False
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
         self._post_backward_hook_registered = False
@@ -189,17 +193,26 @@ class FsdpContext:
                 "FSDP context is not finalized. Exit fully_shard_context to complete construction."
             )
 
+    @property
+    def iteration_recording(self) -> bool:
+        """Whether the active iteration is recording its execution order."""
+        return (
+            self.iteration_active
+            and self.prefetch_mode is PrefetchMode.RECORD_REPLAY
+            and not self.iteration_captured
+        )
+
     def _advance_order(
-        self, module: nn.Module, phase: ExecutionPhase | None
-    ) -> IterationOrder | None:
+        self, module: nn.Module, phase: Phase | None
+    ) -> ExecutionOrder[ExecutionEvent] | None:
         """Consume and validate a demand, returning its order when prefetch is enabled."""
         order = self.iteration_order
-        if phase is None or order.mode in (PrefetchMode.STATIC, PrefetchMode.DEMAND):
+        if phase is None or self.prefetch_mode in (PrefetchMode.PRESET, PrefetchMode.DEMAND):
             return None
         # Captured calls must share one complete iteration boundary.
-        if not order.active:
+        if not self.iteration_active:
             return None
-        if order.recording:
+        if self.iteration_recording:
             order.append((ref(module), phase))
         expected, expected_phase = order.advance()
         if expected_phase != phase:
@@ -210,7 +223,7 @@ class FsdpContext:
         if owner is not module:
             raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
         # Recorded recomputation is an ordinary occurrence with known successors.
-        return None if order.recording else order
+        return None if self.iteration_recording else order
 
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""

@@ -19,6 +19,8 @@ from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, Generic, TypeVar
 from weakref import ref
 
+from .phase import Phase
+
 if TYPE_CHECKING:
     from .module import FsdpModule
 
@@ -89,47 +91,22 @@ class ExecutionOrder(Generic[T]):
         return result
 
 
-class ExecutionPhase(enum.Enum):
-    """Compute represented by an occurrence in the execution order."""
-
-    FORWARD = enum.auto()
-    BACKWARD = enum.auto()
-    RECOMPUTE = enum.auto()
-
-
 class PrefetchMode(enum.Enum):
-    """Source of the parameter prefetch order."""
+    """Source of the parameter prefetch order.
 
-    STATIC = enum.auto()
+    PRESET uses forward and backward orders defined during construction, without
+    requiring an iteration scope.
+    RECORD_REPLAY records phase-tagged module calls in the first training
+    iteration scope and prefetches from that order in later scopes. Recording
+    gathers on demand; outside a scope the captured order is retained but unused.
+    DEMAND gathers parameters only when needed, without recording, replaying, or
+    prefetching. Forward-only scopes temporarily use this mode so validation does
+    not consume the training order.
+    """
+
+    PRESET = enum.auto()
     RECORD_REPLAY = enum.auto()
     DEMAND = enum.auto()
 
 
-ExecutionEvent = tuple[ref["FsdpModule"], ExecutionPhase]
-
-
-class IterationOrder(ExecutionOrder[ExecutionEvent]):
-    """Select static, recorded, or demand-only prefetch for a shared context.
-
-    ``mode`` selects the order source. In ``PrefetchMode.RECORD_REPLAY``, ``captured``
-    distinguishes initial recording from replay of the completed sequence.
-    ``active`` tracks the iteration scope independently of the selected strategy.
-    State lives on FsdpContext because autograd hooks can run on another thread.
-    The scheduler owns iteration boundaries and must explicitly recapture when
-    the training schedule changes.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.captured = False
-        self.active = False
-        self.mode = PrefetchMode.STATIC
-
-    def append(self, item: ExecutionEvent) -> None:
-        """Append an occurrence before the recorded sequence is complete."""
-        assert not self.captured, "Cannot append to an already captured order."
-        super().append(item)
-
-    @property
-    def recording(self) -> bool:
-        return self.active and self.mode is PrefetchMode.RECORD_REPLAY and not self.captured
+ExecutionEvent = tuple[ref["FsdpModule"], Phase]
