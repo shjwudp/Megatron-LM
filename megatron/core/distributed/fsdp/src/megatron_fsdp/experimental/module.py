@@ -451,6 +451,8 @@ class FsdpModule:
         # This likely requires addressing static prefetch order for repeated invocations first:
         # https://github.com/NVIDIA/Megatron-LM/issues/7764
         if self.phase is Phase.BACKWARD:
+            # Track every backward occurrence during capture/replay, including
+            # duplicate calls from shared-layer MTP.
             if self.context.prefetch_mode is PrefetchMode.RECORD_REPLAY:
                 self.unshard(Phase.BACKWARD)
             return
