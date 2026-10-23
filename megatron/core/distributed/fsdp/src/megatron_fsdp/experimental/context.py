@@ -97,7 +97,6 @@ class FsdpContext:
         self.caller_managed_grad_sync = caller_managed_grad_sync
         self.iteration_order = ExecutionOrder[ExecutionEvent]()
         self.prefetch_mode = PrefetchMode.PRESET
-        self.iteration_active = False
         self.iteration_captured = False
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
@@ -192,39 +191,33 @@ class FsdpContext:
     @property
     def iteration_recording(self) -> bool:
         """Whether the active iteration is recording its execution order."""
-        return (
-            self.iteration_active
-            and self.prefetch_mode is PrefetchMode.RECORD_REPLAY
-            and not self.iteration_captured
-        )
+        return self.prefetch_mode is PrefetchMode.RECORD_REPLAY and not self.iteration_captured
 
     def _advance_order(
-        self, module: nn.Module, phase: Phase | None
+        self, module: nn.Module, phase: Phase
     ) -> ExecutionOrder[ExecutionEvent] | None:
         """Consume and validate a demand, returning its order when prefetch is enabled."""
         order = self.iteration_order
-        if phase is None or self.prefetch_mode is PrefetchMode.DEMAND:
-            return None
         if self.prefetch_mode is PrefetchMode.PRESET:
             if phase is Phase.RECOMPUTE:
                 return None
             order.advance((ref(module), phase))
             return order
-        # Captured calls must share one complete iteration boundary.
-        if not self.iteration_active:
+        elif self.prefetch_mode is PrefetchMode.DEMAND:
             return None
-        if self.iteration_recording:
-            order.append((ref(module), phase))
-        expected, expected_phase = order.advance()
-        if expected_phase != phase:
-            raise RuntimeError("FSDP module phase diverged from the expected execution order.")
-        owner = expected()
-        if owner is None:
-            raise RuntimeError("A module in the FSDP execution order was destroyed.")
-        if owner is not module:
-            raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
-        # Recorded recomputation is an ordinary occurrence with known successors.
-        return None if self.iteration_recording else order
+        elif self.prefetch_mode is PrefetchMode.RECORD_REPLAY:
+            if self.iteration_recording:
+                order.append((ref(module), phase))
+                return None
+            expected, expected_phase = order.advance()
+            if expected_phase != phase:
+                raise RuntimeError("FSDP module phase diverged from the expected execution order.")
+            owner = expected()
+            if owner is not module:
+                raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
+            return order
+        else:
+            raise ValueError(f"Unsupported FSDP prefetch mode: {self.prefetch_mode!r}.")
 
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""

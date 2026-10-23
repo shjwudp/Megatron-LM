@@ -289,9 +289,12 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
-        # With preset orders, recomputation gathers MXFP8 rowwise planes on demand,
-        # because backward prefetch gathers only columnwise planes.
-        self.unshard(Phase.FORWARD, prefetch=not is_recomputing or context.iteration_active)
+        # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
+        # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
+        self.unshard(
+            Phase.FORWARD,
+            prefetch=not is_recomputing or context.prefetch_mode is PrefetchMode.RECORD_REPLAY,
+        )
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
@@ -454,7 +457,7 @@ class FsdpModule:
         # This likely requires addressing static prefetch order for repeated invocations first:
         # https://github.com/NVIDIA/Megatron-LM/issues/7764
         if self.phase is Phase.BACKWARD:
-            if self.context.iteration_active:
+            if self.context.prefetch_mode is PrefetchMode.RECORD_REPLAY:
                 self.unshard(Phase.BACKWARD, prefetch=True)
             return
         self.phase = Phase.BACKWARD

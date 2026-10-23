@@ -198,35 +198,26 @@ def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
 
 @contextmanager
 def iteration(context: FsdpContext) -> Iterator[ExecutionOrder[ExecutionEvent]]:
-    """Capture one training iteration, then reset and validate each replay.
-
-    All model chunks share this boundary. The caller still owns finish_grad_sync
-    after all backward producers; changed training schedules need a fresh order.
-    Once captured, the runtime order replaces the construction order. Outside
-    iteration scopes it is retained without advancing or speculative prefetch.
-    Forward-only callers should use PrefetchMode.DEMAND without entering a scope.
-    """
+    """Capture one training iteration, then reset and validate each replay."""
     context.ensure_finalized()
-    if context.iteration_active:
+    if context.prefetch_mode is PrefetchMode.RECORD_REPLAY:
         raise RuntimeError("Cannot enter an already active FSDP iteration.")
     order = context.iteration_order
-    if not context.iteration_captured:
-        order = context.iteration_order = ExecutionOrder[ExecutionEvent]()
-    else:
+    if context.iteration_captured:
         order.reset_cursor()
+    else:
+        order = context.iteration_order = ExecutionOrder[ExecutionEvent]()
     context.prefetch_mode = PrefetchMode.RECORD_REPLAY
-    context.iteration_active = True
     try:
-        context.allgather_stream.wait_stream(context.current_stream())
         yield order
-        if order.position != len(order):
+        if context.iteration_captured and order.position != len(order):
             raise RuntimeError("FSDP iteration ended before consuming its captured order.")
         context.iteration_captured = True
     except BaseException:
         context.iteration_captured = False
         raise
     finally:
-        context.iteration_active = False
+        context.prefetch_mode = PrefetchMode.DEMAND
 
 
 def _attach_mixin(module: nn.Module) -> None:

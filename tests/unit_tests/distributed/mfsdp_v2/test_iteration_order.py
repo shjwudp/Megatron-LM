@@ -92,7 +92,6 @@ def context():
         ensure_finalized=Mock(),
         iteration_order=ExecutionOrder(),
         prefetch_mode=PrefetchMode.PRESET,
-        iteration_active=False,
         iteration_captured=False,
         allgather_stream=Mock(),
         current_stream=Mock(),
@@ -187,17 +186,18 @@ def test_capture_replay_and_validation(context):
         schedule([a, b])
         assert prefetched == (['a', 'b', 'b', 'a', 'a'] if replay else [])
         order = context.iteration_order
-        assert context.iteration_captured and (not context.iteration_active)
-        assert order.position == len(events)
+        assert context.iteration_captured and context.prefetch_mode is PrefetchMode.DEMAND
+        expected_position = len(events) if replay else 0
+        assert order.position == expected_position
         _, phase = order[4]
         assert phase == Phase.RECOMPUTE
         run([a, b], forward_only=True)
-        assert context.iteration_order is order and order.position == len(events)
-        assert context.prefetch_mode is PrefetchMode.RECORD_REPLAY
+        assert context.iteration_order is order and order.position == expected_position
+        assert context.prefetch_mode is PrefetchMode.DEMAND
         before = len(gathers.mock_calls)
         b.unshard(Phase.FORWARD)
         assert [call[0] for call in gathers.mock_calls[before:]] == ['b', 'wait']
-        assert order.position == len(events)
+        assert order.position == expected_position
     prefetched.clear()
     run(a, budget=0)
     assert not prefetched
@@ -246,7 +246,7 @@ def test_failed_or_changed_iterations_require_capture(context):
         events = changed
         with pytest.raises(RuntimeError):
             run(a)
-        assert not context.iteration_active and (not context.iteration_captured)
+        assert context.prefetch_mode is PrefetchMode.DEMAND and not context.iteration_captured
     with pytest.raises(ValueError):
         run(a, fail=True)
     assert not context.iteration_captured
@@ -258,14 +258,14 @@ def test_failed_or_changed_iterations_require_capture(context):
     events = [(b, Phase.FORWARD)]
     run(a)
     assert context.iteration_captured
-    context.allgather_stream.wait_stream.side_effect = ValueError('failed stream sync')
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match='failed replay'):
         with iteration(context):
-            pass
-    assert not context.iteration_active and (not context.iteration_captured)
+            raise ValueError('failed replay')
+    assert context.prefetch_mode is PrefetchMode.DEMAND and not context.iteration_captured
 
 
-def test_capture_does_not_retain_modules(context):
+@pytest.mark.parametrize("budget", [None, 0], ids=["prefetch", "demand"])
+def test_capture_does_not_retain_modules(context, budget):
     """Captured occurrences keep weak references and reject a destroyed owner."""
     a, b = (_Unit(context), _Unit(context))
     with iteration(context):
@@ -278,11 +278,12 @@ def test_capture_does_not_retain_modules(context):
 
     def run(model):
         with iteration(context):
-            _demand(context, model, Phase.FORWARD, budget=None)
+            _demand(context, model, Phase.FORWARD, budget=budget)
+            _demand(context, model, Phase.BACKWARD)
 
-    with pytest.raises(RuntimeError, match='destroyed'):
+    with pytest.raises(RuntimeError, match='destroyed' if budget is None else 'diverged'):
         run(a)
-    assert not context.iteration_active and (not context.iteration_captured)
+    assert context.prefetch_mode is PrefetchMode.DEMAND and not context.iteration_captured
 
 
 @pytest.mark.parametrize(
@@ -299,13 +300,12 @@ def test_repeated_backward_keeps_static_guard(mode, captured, monkeypatch):
     context = Mock(iteration_order=ExecutionOrder())
     context.prefetch_mode = mode
     context.iteration_captured = captured
-    context.iteration_active = mode is not PrefetchMode.PRESET
     module = Mock(spec=FsdpModule, context=context, phase=Phase.BACKWARD)
     module.is_root.return_value = False
     push = Mock()
     monkeypatch.setattr(torch.cuda.nvtx, 'range_push', push)
     FsdpModule.pre_backward(module)
-    if mode is PrefetchMode.PRESET:
+    if mode is not PrefetchMode.RECORD_REPLAY:
         module.unshard.assert_not_called()
         context.current_stream.assert_not_called()
     else:
@@ -425,4 +425,14 @@ def test_combined_hooks_record_phase_tagged_demands(context, active):
     assert list(context.iteration_order) == (
         [(ref(module), Phase.FORWARD), (ref(module), Phase.BACKWARD)] * 2 if active else []
     )
-    assert context.allgather_stream.wait_stream.call_count == (3 if active else 2)
+    assert context.allgather_stream.wait_stream.call_count == 2
+
+
+def test_invalid_prefetch_mode_does_not_consume_order(context):
+    """Invalid modes report their value without changing execution progress."""
+    module = _Unit(context)
+    context.prefetch_mode = "invalid"
+    with pytest.raises(ValueError, match="Unsupported FSDP prefetch mode: 'invalid'"):
+        _demand(context, module, Phase.FORWARD)
+    assert context.iteration_order.position == 0
+    assert len(context.iteration_order) == 0

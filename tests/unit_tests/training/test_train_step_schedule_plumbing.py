@@ -146,9 +146,10 @@ def test_train_step_supports_bare_distributed_optimizer_for_mxfp8_staging():
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("forward_only", [False, True])
-def test_mfsdp_iteration_scope_restores_validation_mode(enabled, forward_only):
+@pytest.mark.parametrize("initial_mode", [PrefetchMode.PRESET, PrefetchMode.DEMAND])
+def test_mfsdp_iteration_scope_restores_validation_mode(enabled, forward_only, initial_mode):
     """The flag gates capture; validation restores the training mode even on failure."""
-    context = SimpleNamespace(prefetch_mode=PrefetchMode.RECORD_REPLAY)
+    context = SimpleNamespace(prefetch_mode=initial_mode)
     model = [SimpleNamespace(module=SimpleNamespace(context=context))]
     args = SimpleNamespace(megatron_fsdp_record_iteration=enabled)
     with (
@@ -158,10 +159,10 @@ def test_mfsdp_iteration_scope_restores_validation_mode(enabled, forward_only):
         with pytest.raises(ValueError, match="failed schedule"):
             with training_mod._mfsdp_iteration(model, forward_only=forward_only):
                 assert context.prefetch_mode is (
-                    PrefetchMode.DEMAND if enabled and forward_only else PrefetchMode.RECORD_REPLAY
+                    PrefetchMode.DEMAND if enabled and forward_only else initial_mode
                 )
                 raise ValueError("failed schedule")
-        assert context.prefetch_mode is PrefetchMode.RECORD_REPLAY
+        assert context.prefetch_mode is initial_mode
         if enabled and not forward_only:
             capture.assert_called_once_with(context)
             capture.return_value.__enter__.assert_called_once()
