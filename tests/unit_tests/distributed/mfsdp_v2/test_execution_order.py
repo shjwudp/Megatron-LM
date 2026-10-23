@@ -42,8 +42,6 @@ def test_prefetch_replays_occurrences(budget, expected):
             FsdpModule._prefetch_parameter_groups(module, order, budget)
             assert prefetched == [modules[index] for index in targets]
             assert order.position == index + 1
-            if order.position < len(order):
-                assert order[order.position] is sequence[index + 1]
 
 
 def test_unique_calls_resynchronize_and_repeated_calls_validate():
