@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
@@ -8,10 +9,11 @@ def _make_unshard_forward_hook(owner: FsdpModule):
     forward."""
 
     def hook(submodule, _args, _kwargs):
-        if owner.is_root():
-            context = owner.context
+        context = owner.context
+        active = context.iteration_order.active
+        if owner.is_root() and not active:
             context.allgather_stream.wait_stream(context.current_stream())
-        owner.unshard()
+        owner.unshard(Phase.FORWARD if active else None, prefetch=active)
 
     return hook
 
@@ -21,7 +23,8 @@ def _make_unshard_backward_hook(owner: FsdpModule):
     backward."""
 
     def hook(submodule, _grad_output):
-        owner.unshard()
+        active = owner.context.iteration_order.active
+        owner.unshard(Phase.BACKWARD if active else None, prefetch=active)
 
     return hook
 

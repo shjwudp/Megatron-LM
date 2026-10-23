@@ -648,3 +648,28 @@ def test_gradient_clipping_reaches_global_norm(
     torch.testing.assert_close(
         global_norm([p.grad.to_local() for p in parameters]), clip_grad, rtol=1e-3, atol=0
     )
+
+
+@pytest.mark.parametrize(
+    "cuda_graph_impl", ["none", "local", "transformer_engine", "full_iteration"]
+)
+def test_cuda_graph_prefetch_mode_is_selected_during_construction(
+    process_group_collection, cuda_graph_impl
+):
+    """Graph warmups can run before entering a pipeline schedule."""
+    config = TransformerConfig(
+        num_layers=1, hidden_size=16, num_attention_heads=4, cuda_graph_impl=cuda_graph_impl
+    )
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            data_parallel_sharding_strategy="optim_grads_params",
+        ),
+        module=torch.nn.Linear(16, 16, device="cuda"),
+        pg_collection=process_group_collection,
+    )
+    order = model.module.context.iteration_order
+    assert order.mode == ("static" if cuda_graph_impl == "none" else "demand")
+    assert not order.active and not order.captured
