@@ -32,6 +32,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
+from .execution_order import ExecutionPhase, IterationOrder
 from .execution_order import ModuleExecutionOrder as ExecutionOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
@@ -296,9 +297,9 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
-        self.unshard(prefetch="forward" if not is_recomputing else "none")
+        self.unshard("forward" if not is_recomputing else "recompute")
 
-    def unshard(self, prefetch: Literal["forward", "backward", "none"] = "none") -> None:
+    def unshard(self, prefetch: ExecutionPhase | Literal["none"] = "none") -> None:
         """Unshard this FsdpModule's parameter groups immediately.
 
         External schedulers invoking this directly (rather than through the
@@ -308,6 +309,10 @@ class FsdpModule:
         before this when ``self.is_root()``; the automatic forward path
         performs that root sync in ``pre_forward()`` immediately before this.
         """
+        phase = None if prefetch == "none" else prefetch
+        if phase == "forward" and _is_in_backward():
+            phase = "recompute"
+        order = self.context._advance_order(cast(nn.Module, self), phase)
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
@@ -316,14 +321,25 @@ class FsdpModule:
             self.context.current_stream().wait_event(self._unshard_event)
 
             context = self.context
-            if prefetch == "forward":
-                self._prefetch_parameter_groups(
-                    context.forward_order, self._schedule_policy.forward_prefetch_size
+            if context.iteration_order.mode == "static":
+                # Keep the existing construction-order path until scheduler
+                # iteration boundaries are integrated for every VPP chunk.
+                if phase == "forward":
+                    self._prefetch_parameter_groups(
+                        context.forward_order, self._schedule_policy.forward_prefetch_size
+                    )
+                elif phase == "backward":
+                    self._prefetch_parameter_groups(
+                        context.backward_order, self._schedule_policy.backward_prefetch_size
+                    )
+            elif order is not None:
+                _, current_phase = order[order.position - 1]
+                budget = (
+                    self._schedule_policy.forward_prefetch_size
+                    if current_phase == "forward"
+                    else self._schedule_policy.backward_prefetch_size
                 )
-            elif prefetch == "backward":
-                self._prefetch_parameter_groups(
-                    context.backward_order, self._schedule_policy.backward_prefetch_size
-                )
+                self._prefetch_iteration_parameter_groups(order, budget)
 
     def _prefetch_parameter_groups(
         self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
@@ -345,6 +361,24 @@ class FsdpModule:
             prefetched_size += fsdp_module.num_parameter_elements
             offset += 1
             next_module = order.next_item(offset)
+
+    def _prefetch_iteration_parameter_groups(
+        self, order: IterationOrder, prefetch_size: int | None
+    ) -> None:
+        """Prefetch successors of the consumed demand in the captured iteration."""
+        if prefetch_size == 0:
+            return
+        size = 0
+        for index in range(order.position, len(order)):
+            module_ref, _ = order[index]
+            module = module_ref()
+            if module is None:
+                raise RuntimeError("A module in the FSDP execution order was destroyed.")
+            fsdp_module = cast(FsdpModule, module)
+            fsdp_module._unshard_parameter_groups()
+            size += fsdp_module.num_parameter_elements
+            if prefetch_size is None or size >= prefetch_size:
+                break
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
@@ -417,6 +451,8 @@ class FsdpModule:
         # This likely requires addressing static prefetch order for repeated invocations first:
         # https://github.com/NVIDIA/Megatron-LM/issues/7764
         if self.phase is FsdpModule.Phase.BACKWARD:
+            if self.context.iteration_order.active:
+                self.unshard("backward")
             return
         self.phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
@@ -433,7 +469,7 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self.unshard(prefetch="backward")
+        self.unshard("backward")
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
