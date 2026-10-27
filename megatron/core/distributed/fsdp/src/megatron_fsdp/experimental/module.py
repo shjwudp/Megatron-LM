@@ -330,6 +330,9 @@ class FsdpModule:
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
         module = cast(nn.Module, self)
+        if self.context._recording_execution_order:
+            order.append(module)
+            return
         order.advance(module)
         next_module = order.next_item()
         if prefetch_size is None:

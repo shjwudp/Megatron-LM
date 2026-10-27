@@ -3,16 +3,28 @@
 """Coverage for occurrence-based FSDP prefetch and weak module ownership."""
 
 import gc
+from types import SimpleNamespace
 from unittest.mock import Mock
 from weakref import ref
 
 import pytest
 from torch import nn
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import capture_execution_order
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionOrder,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+
+
+@pytest.fixture
+def context():
+    return SimpleNamespace(
+        ensure_finalized=Mock(),
+        forward_order=ExecutionOrder(),
+        backward_order=ExecutionOrder(),
+        _recording_execution_order=False,
+    )
 
 
 @pytest.mark.parametrize(
@@ -23,18 +35,25 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import
         (2, [[1, 0], [0, 0], [0, 2], [2], []]),
     ],
 )
-def test_prefetch_replays_occurrences(budget, expected):
+def test_prefetch_replays_occurrences(context, budget, expected):
     """Reused modules have occurrence-specific successors under every prefetch budget."""
     modules = [Mock(spec=FsdpModule, num_parameter_elements=1) for _ in range(3)]
     prefetched = []
     for module in modules:
+        module.context = context
         module._unshard_parameter_groups.side_effect = lambda target=module: prefetched.append(
             target
         )
     sequence = [modules[index] for index in (0, 1, 0, 0, 2)]
-    order = ExecutionOrder()
-    for module in sequence:
-        order.append(module)
+    backward = list(reversed(sequence))
+    with capture_execution_order(context):
+        for order, calls in ((context.forward_order, sequence), (context.backward_order, backward)):
+            for module in calls:
+                FsdpModule._prefetch_parameter_groups(module, order, budget)
+    assert list(context.forward_order) == sequence
+    assert list(context.backward_order) == backward
+    assert not prefetched
+    order = context.forward_order
     # A second cycle checks cursor reset; each lookahead must leave demand calls intact.
     for _ in range(2):
         for module, targets, successor in zip(sequence, expected, sequence[1:] + [None]):
@@ -42,6 +61,24 @@ def test_prefetch_replays_occurrences(budget, expected):
             FsdpModule._prefetch_parameter_groups(module, order, budget)
             assert prefetched == [modules[index] for index in targets]
             assert order.next_item() is successor
+
+    for module, successor in zip(backward, backward[1:] + [None]):
+        context.backward_order.advance(module)
+        assert context.backward_order.next_item() is successor
+
+
+def test_capture_restores_orders_on_failure(context):
+    """Nested captures are rejected; failed capture preserves the previous orders."""
+    forward, backward = context.forward_order, context.backward_order
+    with pytest.raises(ValueError, match='failed compute'):
+        with capture_execution_order(context):
+            with pytest.raises(RuntimeError, match='nest'):
+                with capture_execution_order(context):
+                    pass
+            assert context._recording_execution_order
+            raise ValueError('failed compute')
+    assert context.forward_order is forward and context.backward_order is backward
+    assert not context._recording_execution_order
 
 
 def test_unique_calls_resynchronize_and_repeated_calls_validate():

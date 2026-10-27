@@ -25,6 +25,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext, current_fully_shard_context
+from .execution_order import ExecutionOrder
 from .module import FsdpModule
 from .schedule import SchedulePolicy
 
@@ -193,6 +194,25 @@ def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
         yield
     finally:
         context.is_last_microbatch = previous_state
+
+
+@contextmanager
+def capture_execution_order(context: FsdpContext) -> Iterator[None]:
+    """Capture one representative forward/backward pass for subsequent prefetch."""
+    context.ensure_finalized()
+    if context._recording_execution_order:
+        raise RuntimeError("Cannot nest execution-order captures.")
+    # shortcut: fixed per-pass order; recapture when the schedule changes.
+    previous = context.forward_order, context.backward_order
+    context.forward_order, context.backward_order = ExecutionOrder(), ExecutionOrder()
+    context._recording_execution_order = True
+    try:
+        yield
+    except BaseException:
+        context.forward_order, context.backward_order = previous
+        raise
+    finally:
+        context._recording_execution_order = False
 
 
 def _attach_mixin(module: nn.Module) -> None:
