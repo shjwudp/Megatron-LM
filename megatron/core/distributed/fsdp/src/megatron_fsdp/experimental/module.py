@@ -333,6 +333,8 @@ class FsdpModule:
         if self.context._recording_execution_order:
             order.append(module)
             return
+        if not order:
+            return
         order.advance(module)
         next_module = order.next_item()
         if prefetch_size is None:

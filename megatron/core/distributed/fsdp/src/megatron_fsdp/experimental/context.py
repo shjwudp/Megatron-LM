@@ -98,6 +98,7 @@ class FsdpContext:
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
         self._recording_execution_order = False
+        self._execution_order_captured = False
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]

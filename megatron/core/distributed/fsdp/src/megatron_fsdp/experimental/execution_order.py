@@ -51,6 +51,9 @@ class ExecutionOrder(Generic[T]):
             if item is not None:
                 yield item
 
+    def __bool__(self) -> bool:
+        return bool(self._items)
+
     def advance(self, item: T) -> None:
         """Locate a unique demand call or consume the next expected repeated call."""
         index = self._unique_index.get(item)

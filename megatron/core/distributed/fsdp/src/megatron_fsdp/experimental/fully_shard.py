@@ -198,16 +198,17 @@ def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
 
 @contextmanager
 def capture_execution_order(context: FsdpContext) -> Iterator[None]:
-    """Capture one representative forward/backward pass for subsequent prefetch."""
+    """Capture a representative pass, or a full pipeline iteration, for prefetch."""
     context.ensure_finalized()
     if context._recording_execution_order:
         raise RuntimeError("Cannot nest execution-order captures.")
-    # shortcut: fixed per-pass order; recapture when the schedule changes.
+    # shortcut: fixed schedule; recapture when the call order changes.
     previous = context.forward_order, context.backward_order
     context.forward_order, context.backward_order = ExecutionOrder(), ExecutionOrder()
     context._recording_execution_order = True
     try:
         yield
+        context._execution_order_captured = True
     except BaseException:
         context.forward_order, context.backward_order = previous
         raise
