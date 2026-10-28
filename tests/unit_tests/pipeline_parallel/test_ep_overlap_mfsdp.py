@@ -165,7 +165,7 @@ def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad):
         wrapped.finish_grad_sync()
         assert reductions == expected_reductions
         for unit in units:
-            unit.validate_grad_accumulation()
+            unit.ensure_grad_accumulation_is_complete()
     finally:
         destroy_model_parallel()
 
@@ -215,7 +215,7 @@ def test_train_validate_train_reshards_and_matches_dense(distributed_setup):
                 reference_optimizer.step()
         for unit in units:
             assert not unit._unshard_events
-            unit.validate_grad_accumulation()
+            unit.ensure_grad_accumulation_is_complete()
 
 
 @pytest.mark.parametrize("repeated", [False, True])

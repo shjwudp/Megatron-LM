@@ -155,7 +155,7 @@ class FsdpModule:
         """Return whether this module is an outermost FsdpModule in its context."""
         return self.context.is_root(cast(nn.Module, self))
 
-    def validate_grad_accumulation(self) -> None:
+    def ensure_grad_accumulation_is_complete(self) -> None:
         """Raise if a gradient-accumulation window is partially complete."""
         countdown = self._trainable_parameter_countdown
         if not countdown.is_complete:
