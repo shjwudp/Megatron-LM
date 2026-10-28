@@ -49,7 +49,7 @@ class FsdpContext:
     execution_order: ExecutionOrder
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
-    # Preset execution-order entry offsets for each root and compute phase.
+    # Forward/backward entry offsets for each root in the construction order.
     _root_execution_offsets: WeakKeyDictionary[nn.Module, dict[Phase, int]]
     # Names are relative to each FSDP root and absent until finalization.
     _module_names: WeakKeyDictionary[nn.Module, str]
@@ -180,7 +180,7 @@ class FsdpContext:
         return module in self._roots
 
     def reset_execution_order(self, root: nn.Module, phase: Phase) -> None:
-        """Restart a preset pass at this root's phase-specific offset.
+        """Reset the cursor to this root's entry in the construction order.
 
         VPP chunks share a context but may run repeatedly before another chunk.
         Reset to this root's entry rather than the beginning of the shared order.
