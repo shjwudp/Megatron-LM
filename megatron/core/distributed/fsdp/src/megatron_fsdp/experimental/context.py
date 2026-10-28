@@ -48,7 +48,7 @@ class FsdpContext:
     # Phase-tagged preset forward/backward execution order.
     execution_order: ExecutionOrder
     # Topology metadata must not keep modules alive after construction.
-    _roots: WeakKeyDictionary[nn.Module, None]
+    _roots: WeakKeyDictionary[nn.Module, dict[Phase, int]]
     # Names are relative to each FSDP root and absent until finalization.
     _module_names: WeakKeyDictionary[nn.Module, str]
     # The optimizer runs on the current stream and must wait for reductions on
@@ -155,7 +155,7 @@ class FsdpContext:
         for root in self._registered_modules:
             if root in children:
                 continue
-            self._roots[root] = None
+            self._roots[root] = {Phase.FORWARD: len(self.execution_order)}
             for name, module in root.named_modules():
                 if module not in registered_modules:
                     continue
@@ -163,6 +163,7 @@ class FsdpContext:
                 self.execution_order.append((module, Phase.FORWARD))
 
         for root in reversed(list(self._roots)):
+            self._roots[root][Phase.BACKWARD] = len(self.execution_order)
             _collect_backward_order(root, registered_modules, self.execution_order)
 
         self._registered_modules.clear()
@@ -173,6 +174,15 @@ class FsdpContext:
         """Return whether ``module`` is an outermost FSDP module in this context."""
         self.ensure_finalized()
         return module in self._roots
+
+    def reset_execution_order(self, root: nn.Module, phase: Phase) -> None:
+        """Restart a preset pass at this root's phase-specific offset.
+
+        VPP chunks share a context but may run repeatedly before another chunk.
+        Reset to this root's entry rather than the beginning of the shared order.
+        Schedulers bypassing root hooks must manage their own traversal lifecycle.
+        """
+        self.execution_order.reset_cursor(self._roots[root][phase])
 
     def module_name(self, module: nn.Module) -> str:
         """Return ``module``'s name relative to its FSDP root."""

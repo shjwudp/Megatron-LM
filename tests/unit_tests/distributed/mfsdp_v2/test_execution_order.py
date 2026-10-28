@@ -4,7 +4,7 @@
 
 import gc
 from unittest.mock import Mock
-from weakref import ref
+from weakref import WeakKeyDictionary, ref
 
 import pytest
 from torch import nn
@@ -12,7 +12,10 @@ from torch import nn
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionOrder,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
+    FsdpContext,
+    FsdpModule,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 
@@ -38,8 +41,9 @@ def test_prefetch_replays_occurrences(budget, expected):
     order = ExecutionOrder()
     for module in sequence:
         order.append((module, Phase.FORWARD))
-    # A second pass checks repeated occurrence matching after exhaustion.
+    # A new pass must explicitly reset before replaying repeated occurrences.
     for _ in range(2):
+        order.reset_cursor()
         for index, (module, targets) in enumerate(zip(sequence, expected)):
             prefetched.clear()
             FsdpModule._prefetch_parameter_groups(module, order, budget)
@@ -47,40 +51,21 @@ def test_prefetch_replays_occurrences(budget, expected):
             assert order.position == index + 1
 
 
-def test_unique_calls_resynchronize_and_repeated_calls_validate():
-    """Unique VPP chunk calls select their position; ambiguous repeats stay strict."""
-    chunk0, layer0, chunk1, layer1 = ((nn.Module(), Phase.FORWARD) for _ in range(4))
-    order = ExecutionOrder([chunk0, layer0, chunk1, layer1])
-    # Grouped VPP repeats chunk 0 before switching to chunk 1, in one shared order.
-    for chunk in (chunk0, chunk0, chunk0, chunk1, chunk1, chunk0):
-        layer = layer0 if chunk == chunk0 else layer1
-        assert order.advance(chunk) == chunk
-        assert order[order.position] == layer
-        order.advance(layer)
-        if chunk == chunk0:
-            assert order[order.position] == chunk1
-        else:
-            assert order.position == len(order)
-
-    order = ExecutionOrder([chunk0, layer0, chunk0])
-    assert order.advance(chunk0) == chunk0
-    assert order[order.position] == layer0
+def test_demand_calls_validate_module_and_phase():
+    """A rejected demand leaves the expected occurrence available for retry."""
+    first, second = [Mock(spec=FsdpModule, phase=Phase.FORWARD) for _ in range(2)]
+    order = ExecutionOrder([(first, Phase.FORWARD), (second, Phase.BACKWARD)])
     with pytest.raises(RuntimeError, match='diverged'):
-        order.advance(chunk0)
-    # A rejected repeated call must not consume the expected occurrence.
-    order.advance(layer0)
-    assert order[order.position] == chunk0
-    assert order.advance(chunk0) == chunk0
-    assert order.position == len(order)
-    # Unique calls remain valid anchors even when the sequence also has repeats.
-    order.advance(layer0)
-    assert order.advance(chunk0) == chunk0
-    assert order.position == len(order)
-
-    empty = ExecutionOrder()
-    assert len(empty) == 0
+        FsdpModule._prefetch_parameter_groups(second, order, 0)
+    assert order.position == 0
+    FsdpModule._prefetch_parameter_groups(first, order, 0)
     with pytest.raises(RuntimeError, match='diverged'):
-        empty.advance(chunk0)
+        FsdpModule._prefetch_parameter_groups(second, order, 0)
+    assert order.position == 1
+    second.phase = Phase.BACKWARD
+    FsdpModule._prefetch_parameter_groups(second, order, 0)
+    with pytest.raises(RuntimeError, match='exceeded'):
+        FsdpModule._prefetch_parameter_groups(second, order, 0)
 
 
 def test_iteration_and_weak_references():
@@ -120,8 +105,60 @@ def test_explicit_reset_and_exhaustion():
         with pytest.raises(RuntimeError, match='exceeded'):
             order.advance()
     order.reset_cursor(1)
-    assert order.advance(b) == b
+    assert order.advance() == b
     empty = ExecutionOrder()
     assert list(empty) == []
     with pytest.raises(RuntimeError, match='exceeded'):
         empty.advance()
+
+
+@pytest.mark.parametrize('roots', [(0, 0, 0), (0, 0, 1, 0, 1)])
+def test_root_hooks_reset_preset_cursor(monkeypatch, roots):
+    """Root entries restart each chunk's pass, including validation and recompute."""
+    monkeypatch.setattr('torch.cuda.nvtx.range_push', lambda _: None)
+    monkeypatch.setitem(FsdpModule.pre_forward.__globals__, '_is_in_backward', lambda: False)
+    context = object.__new__(FsdpContext)
+    chunks = [nn.Sequential(nn.Module()) for _ in range(2)]
+    context._is_finalized = False
+    context._registered_modules = [unit for root in chunks for unit in (root, root[0])]
+    context._roots = WeakKeyDictionary()
+    context._module_names = WeakKeyDictionary()
+    context.execution_order = ExecutionOrder()
+    context.allgather_stream = Mock()
+    context.reduce_scatter_stream = Mock()
+    context.current_stream = Mock()
+    context.register_post_backward_hook = Mock()
+    context.finalize()
+
+    def unshard(unit, phase, prefetch=False):
+        if prefetch:
+            FsdpModule._prefetch_parameter_groups(unit, context.execution_order, None)
+
+    for root in chunks:
+        for unit in (root, root[0]):
+            unit.context = context
+            unit.is_root = Mock(return_value=unit is root)
+            unit._nvtx_label = Mock(return_value='test')
+            unit.num_parameter_elements = 1
+            unit._unshard_parameter_groups = Mock()
+            unit.unshard = lambda phase, prefetch=False, unit=unit: unshard(unit, phase, prefetch)
+
+    # Grouped VPP calls and F/B interleaving both restart at a chunk's own offset.
+    events = [(index, Phase.FORWARD) for index in roots]
+    events += [
+        (index, phase) for index in reversed(roots) for phase in (Phase.BACKWARD, Phase.FORWARD)
+    ]
+    for index, phase in events:
+        root = chunks[index]
+        for unit in (root, root[0]):
+            unit.phase = Phase.RESTING
+            if phase is Phase.FORWARD:
+                FsdpModule.pre_forward(unit)
+            else:
+                FsdpModule.pre_backward(unit)
+        position = context._roots[root][phase] + 2
+        assert context.execution_order.position == position
+        if phase is Phase.BACKWARD:
+            # Checkpoint recomputation must leave the interrupted backward cursor alone.
+            FsdpModule.pre_forward(root)
+            assert context.execution_order.position == position
