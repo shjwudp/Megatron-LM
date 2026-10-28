@@ -27,11 +27,7 @@ ExecutionEvent = tuple["FsdpModule", Phase]
 
 
 class ExecutionOrder:
-    """Traverse module/phase occurrences without retaining the modules.
-
-    The caller resets the cursor at each root's forward/backward entry and
-    validates demand calls against the sequence. Lookahead never advances it.
-    """
+    """An ordered sequence of module/phase occurrences."""
 
     def __init__(self, items: Iterable[ExecutionEvent] = ()) -> None:
         """Create an execution sequence, preserving repeated occurrences."""
