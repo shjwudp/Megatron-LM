@@ -18,7 +18,7 @@ def _make_unshard_forward_hook(owner: FsdpModule, weight_module: nn.Module | Non
             context.allgather_stream.wait_stream(context.current_stream())
         owner.unshard()
         if weight_module is not None:
-            # The caller may have read the sharded parameter before this hook.
+            # The caller may have passed the sharded embedding weight before this hook runs.
             _kwargs["weight"] = weight_module.weight
             return _args, _kwargs
 
