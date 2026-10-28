@@ -77,6 +77,8 @@ def register_fsdp_schedule_hooks(model: nn.Module, layer_plans) -> tuple[FsdpMod
         2. Visit layers in forward order and assign each unit once, so shared
            units finish at their last backward use (after delayed wgrad).
         3. Return the remaining units for completion after pre-process backward.
+           These are typically root units owning embeddings, tied/untied output
+           heads, final normalization, and MTP projections/norms.
     """
     remaining = dict.fromkeys(unit for unit in model.modules() if isinstance(unit, FsdpModule))
     if not remaining:
