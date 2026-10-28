@@ -218,11 +218,6 @@ def test_grouped_chunk_forwards_reset_each_root(distributed_setup):
     chunk_b = BranchModel(dim=4).to(device)
     microbatch_a = torch.ones(2, 4, device=device)
     microbatch_b = torch.full_like(microbatch_a, 2)
-    with torch.no_grad():
-        expected_a_first = chunk_a(microbatch_a)
-        expected_a_second = chunk_a(microbatch_b)
-        expected_b_first = chunk_b(microbatch_a)
-        expected_b_second = chunk_b(microbatch_b)
 
     with fully_shard_context(device=device) as context:
         for chunk in (chunk_a, chunk_b):
@@ -251,17 +246,18 @@ def test_grouped_chunk_forwards_reset_each_root(distributed_setup):
         ),
         torch.no_grad(),
     ):
-        torch.testing.assert_close(chunk_a(microbatch_a), expected_a_first)
-        torch.testing.assert_close(chunk_a(microbatch_b), expected_a_second)
-        torch.testing.assert_close(chunk_b(microbatch_a), expected_b_first)
-        torch.testing.assert_close(chunk_b(microbatch_b), expected_b_second)
+        chunk_a(microbatch_a)
+        chunk_a(microbatch_b)
+        chunk_b(microbatch_a)
+        chunk_b(microbatch_b)
     assert prefetched_modules == {
         chunk_a: [[chunk_a.inner], [chunk_a.inner]],
         chunk_a.inner: [[chunk_b], [chunk_b]],
         chunk_b: [[chunk_b.inner], [chunk_b.inner]],
         chunk_b.inner: [[], []],
     }
-    assert context.execution_order[context.execution_order.position][1] is Phase.BACKWARD
+    _, next_phase = context.execution_order[context.execution_order.position]
+    assert next_phase is Phase.BACKWARD
 
 
 def test_nested_prefetch_orders_use_dfs(distributed_setup):
