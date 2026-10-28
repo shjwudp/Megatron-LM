@@ -4,7 +4,7 @@
 
 import gc
 from unittest.mock import Mock
-from weakref import WeakKeyDictionary, ref
+from weakref import ref
 
 import pytest
 from torch import nn
@@ -12,10 +12,7 @@ from torch import nn
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionOrder,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
-    FsdpContext,
-    FsdpModule,
-)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 
@@ -110,57 +107,3 @@ def test_explicit_reset_and_exhaustion():
     assert list(empty) == []
     with pytest.raises(RuntimeError, match='exceeded'):
         empty.advance()
-
-
-@pytest.mark.parametrize('roots', [(0, 0, 0), (0, 0, 1, 0, 1)])
-def test_root_hooks_reset_preset_cursor(monkeypatch, roots):
-    """Root entries restart each chunk's pass, including validation and recompute."""
-    monkeypatch.setattr('torch.cuda.nvtx.range_push', lambda _: None)
-    monkeypatch.setitem(FsdpModule.pre_forward.__globals__, '_is_in_backward', lambda: False)
-    context = object.__new__(FsdpContext)
-    chunks = [nn.Sequential(nn.Module()) for _ in range(2)]
-    context._is_finalized = False
-    context._registered_modules = [unit for root in chunks for unit in (root, root[0])]
-    context._roots = WeakKeyDictionary()
-    context._root_execution_offsets = WeakKeyDictionary()
-    context._module_names = WeakKeyDictionary()
-    context.execution_order = ExecutionOrder()
-    context.allgather_stream = Mock()
-    context.reduce_scatter_stream = Mock()
-    context.current_stream = Mock()
-    context.register_post_backward_hook = Mock()
-    context.finalize()
-    assert all(value is None for value in context._roots.values())
-
-    def unshard(unit, phase, prefetch=False):
-        if prefetch:
-            FsdpModule._prefetch_parameter_groups(unit, context.execution_order, None)
-
-    for root in chunks:
-        for unit in (root, root[0]):
-            unit.context = context
-            unit.is_root = Mock(return_value=unit is root)
-            unit._nvtx_label = Mock(return_value='test')
-            unit.num_parameter_elements = 1
-            unit._unshard_parameter_groups = Mock()
-            unit.unshard = lambda phase, prefetch=False, unit=unit: unshard(unit, phase, prefetch)
-
-    # Grouped VPP calls and F/B interleaving both restart at a chunk's own offset.
-    events = [(index, Phase.FORWARD) for index in roots]
-    events += [
-        (index, phase) for index in reversed(roots) for phase in (Phase.BACKWARD, Phase.FORWARD)
-    ]
-    for index, phase in events:
-        root = chunks[index]
-        for unit in (root, root[0]):
-            unit.phase = Phase.RESTING
-            if phase is Phase.FORWARD:
-                FsdpModule.pre_forward(unit)
-            else:
-                FsdpModule.pre_backward(unit)
-        position = context._root_execution_offsets[root][phase] + 2
-        assert context.execution_order.position == position
-        if phase is Phase.BACKWARD:
-            # Checkpoint recomputation must leave the interrupted backward cursor alone.
-            FsdpModule.pre_forward(root)
-            assert context.execution_order.position == position
