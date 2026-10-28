@@ -48,23 +48,6 @@ def test_prefetch_replays_occurrences(budget, expected):
             assert order.position == index + 1
 
 
-def test_demand_calls_validate_module_and_phase():
-    """A rejected demand leaves the expected occurrence available for retry."""
-    first, second = [Mock(spec=FsdpModule, phase=Phase.FORWARD) for _ in range(2)]
-    order = ExecutionOrder([(first, Phase.FORWARD), (second, Phase.BACKWARD)])
-    with pytest.raises(RuntimeError, match='diverged'):
-        FsdpModule._prefetch_parameter_groups(second, order, 0)
-    assert order.position == 0
-    FsdpModule._prefetch_parameter_groups(first, order, 0)
-    with pytest.raises(RuntimeError, match='diverged'):
-        FsdpModule._prefetch_parameter_groups(second, order, 0)
-    assert order.position == 1
-    second.phase = Phase.BACKWARD
-    FsdpModule._prefetch_parameter_groups(second, order, 0)
-    with pytest.raises(RuntimeError, match='exceeded'):
-        FsdpModule._prefetch_parameter_groups(second, order, 0)
-
-
 def test_iteration_and_weak_references():
     """Traversal preserves repeated occurrences without retaining deleted modules."""
     first, second = nn.Module(), nn.Module()

@@ -206,6 +206,35 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(distributed_s
     finish_grad_sync.assert_called_once_with()
 
 
+def test_grouped_chunk_forwards_reset_each_root(distributed_setup):
+    """Each chunk can run multiple microbatches before the next chunk starts."""
+    torch.manual_seed(1234)
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    chunk_a = BranchModel(dim=4).to(device)
+    chunk_b = BranchModel(dim=4).to(device)
+    microbatch_a = torch.ones(2, 4, device=device)
+    microbatch_b = torch.full_like(microbatch_a, 2)
+    with torch.no_grad():
+        expected_a_first = chunk_a(microbatch_a)
+        expected_a_second = chunk_a(microbatch_b)
+        expected_b_first = chunk_b(microbatch_a)
+        expected_b_second = chunk_b(microbatch_b)
+
+    with fully_shard_context(device=device) as context:
+        for chunk in (chunk_a, chunk_b):
+            fully_shard(chunk.inner, mesh=mesh, placements=_default_placements())
+            fully_shard(chunk, mesh=mesh, placements=_default_placements())
+
+    # Construction order is A -> a -> B -> b; calls below repeat each chunk.
+    with torch.no_grad():
+        torch.testing.assert_close(chunk_a(microbatch_a), expected_a_first)
+        torch.testing.assert_close(chunk_a(microbatch_b), expected_a_second)
+        torch.testing.assert_close(chunk_b(microbatch_a), expected_b_first)
+        torch.testing.assert_close(chunk_b(microbatch_b), expected_b_second)
+    assert context.execution_order[context.execution_order.position][1] is Phase.BACKWARD
+
+
 def test_nested_prefetch_orders_use_dfs(distributed_setup):
     """Nested FsdpModules should use DFS orders for one-step prefetch."""
     device = distributed_setup.device
