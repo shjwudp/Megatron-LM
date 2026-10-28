@@ -209,22 +209,18 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(distributed_s
     finish_grad_sync.assert_called_once_with()
 
 
-def test_grouped_chunk_forwards_reset_each_root(distributed_setup):
-    """Each chunk can run multiple microbatches before the next chunk starts."""
-    torch.manual_seed(1234)
+def test_forward_backward_prefetch_stays_in_phase(distributed_setup):
+    """Forward/backward prefetch follows its phase's construction order."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    chunk_a = BranchModel(dim=4).to(device)
-    chunk_b = BranchModel(dim=4).to(device)
-    microbatch_a = torch.ones(2, 4, device=device)
-    microbatch_b = torch.full_like(microbatch_a, 2)
-
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+    first_layer, second_layer = model.layers
     with fully_shard_context(device=device) as context:
-        for chunk in (chunk_a, chunk_b):
-            fully_shard(chunk.inner, mesh=mesh, placements=_default_placements())
-            fully_shard(chunk, mesh=mesh, placements=_default_placements())
+        fully_shard(first_layer, mesh=mesh, placements=_default_placements())
+        fully_shard(second_layer, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
-    prefetched_modules = {}
+    prefetch_calls = []
     original_prefetch = FsdpModule._prefetch_parameter_groups
 
     def capture_prefetch(module, order, prefetch_size):
@@ -235,29 +231,27 @@ def test_grouped_chunk_forwards_reset_each_root(distributed_setup):
             side_effect=FsdpModule._unshard_parameter_groups,
         ) as unshard:
             original_prefetch(module, order, prefetch_size)
-        prefetched_modules.setdefault(module, []).append(
-            [call.args[0] for call in unshard.call_args_list]
+        prefetch_calls.append(
+            (module, module.phase, [call.args[0] for call in unshard.call_args_list])
         )
 
-    # Construction order is A -> a -> B -> b; calls below repeat each chunk.
-    with (
-        patch.object(
-            FsdpModule, "_prefetch_parameter_groups", autospec=True, side_effect=capture_prefetch
-        ),
-        torch.no_grad(),
+    with patch.object(
+        FsdpModule, "_prefetch_parameter_groups", autospec=True, side_effect=capture_prefetch
     ):
-        chunk_a(microbatch_a)
-        chunk_a(microbatch_b)
-        chunk_b(microbatch_a)
-        chunk_b(microbatch_b)
-    assert prefetched_modules == {
-        chunk_a: [[chunk_a.inner], [chunk_a.inner]],
-        chunk_a.inner: [[chunk_b], [chunk_b]],
-        chunk_b: [[chunk_b.inner], [chunk_b.inner]],
-        chunk_b.inner: [[], []],
-    }
-    _, next_phase = context.execution_order[context.execution_order.position]
-    assert next_phase is Phase.BACKWARD
+        output = model(torch.ones(2, 4, device=device, requires_grad=True))
+        _, next_phase = context.execution_order[context.execution_order.position]
+        assert next_phase is Phase.BACKWARD
+        output.sum().backward()
+
+    assert prefetch_calls == [
+        (model, Phase.FORWARD, [first_layer]),
+        (first_layer, Phase.FORWARD, [second_layer]),
+        (second_layer, Phase.FORWARD, []),
+        (model, Phase.BACKWARD, [second_layer]),
+        (second_layer, Phase.BACKWARD, [first_layer]),
+        (first_layer, Phase.BACKWARD, []),
+    ]
+    assert context.execution_order.position == len(context.execution_order)
 
 
 def test_nested_prefetch_orders_use_dfs(distributed_setup):
