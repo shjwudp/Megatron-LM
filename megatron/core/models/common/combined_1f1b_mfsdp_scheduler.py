@@ -3,9 +3,6 @@
 from torch import nn
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
-    get_containing_parameter_group,
-)
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
@@ -76,8 +73,8 @@ def register_fsdp_schedule_hooks(model: nn.Module, layer_plans) -> tuple[FsdpMod
     """Reduce each unit after its last scheduled backward use, including delayed wgrad.
 
     Operations:
-        1. Collect FSDP units and parameter owners, including an outer wrapper
-           that is absent from ``model.modules()``.
+        1. Collect FSDP units from the current chunk's outer model, including
+           any FSDP-owned wrappers.
         2. Visit layer plans in forward order and assign each unit once. Since
            backward reverses this order, the first forward occurrence identifies
            the shared unit's last backward use.
@@ -87,12 +84,6 @@ def register_fsdp_schedule_hooks(model: nn.Module, layer_plans) -> tuple[FsdpMod
            projections) for completion after the chunk's pre-process backward.
     """
     remaining = dict.fromkeys(unit for unit in model.modules() if isinstance(unit, FsdpModule))
-    # The schedule may receive GPTModel inside an FSDP-owned Float16Module.
-    # Its parameter owners include that outer root, which model.modules() omits.
-    for parameter in model.parameters():
-        group = get_containing_parameter_group(parameter)
-        if group is not None and (owner := group._owning_module()) is not None:
-            remaining.setdefault(owner, None)
     if not remaining:
         return ()
     for plan in layer_plans:

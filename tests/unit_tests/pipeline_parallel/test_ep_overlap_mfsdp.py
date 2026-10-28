@@ -4,7 +4,7 @@
 
 import copy
 from collections import Counter
-from weakref import ref
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -28,7 +28,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_gro
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
     finish_fsdp_backward,
     register_combined_1f1b_hooks,
-    register_fsdp_schedule_hooks,
 )
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -36,6 +35,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.pipeline_parallel.combined_1f1b import combined_forward_backward_step
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -126,27 +126,42 @@ def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad):
             MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0, device=setup.device)
         )
         set_streams()
-        previous_plan = previous_loss = None
-        for microbatch in range(3):
-            reductions.clear()
-            plan = model.build_schedule_plan(
+
+        def forward_step(_iterator, inner_model, return_schedule_plan):
+            assert return_schedule_plan
+            assert inner_model is model
+            plan = inner_model.build_schedule_plan(
                 input_ids=torch.randint(0, 128, (1, 16), device=setup.device),
                 labels=torch.randint(0, 128, (1, 16), device=setup.device),
                 position_ids=torch.arange(16, device=setup.device).unsqueeze(0),
                 attention_mask=None,
             )
+            return plan, lambda output: (output.mean(), {})
+
+        def run_step(forward, previous_loss):
+            loss, _, _ = combined_forward_backward_step(
+                forward_step_func=forward_step,
+                data_iterator=None,
+                f_model=wrapped if forward else None,
+                num_microbatches=3,
+                input_tensor=None,
+                forward_data_store=[],
+                b_model=wrapped if previous_loss is not None else None,
+                b_input_tensor=None,
+                b_output_tensor=previous_loss,
+                b_output_tensor_grad=None,
+                config=config,
+            )
+            return loss
+
+        previous_loss = None
+        for microbatch in range(3):
+            reductions.clear()
             with wrapped.no_sync():
-                loss = TransformerModelChunkSchedulePlan.run(
-                    plan,
-                    previous_plan,
-                    b_grad=torch.ones_like(previous_loss) if microbatch else None,
-                )
+                previous_loss = run_step(True, previous_loss)
             assert reductions == (expected_reductions if microbatch else {})
-            previous_plan, previous_loss = plan, loss
         reductions.clear()
-        TransformerModelChunkSchedulePlan.run(
-            None, previous_plan, b_grad=torch.ones_like(previous_loss)
-        )
+        run_step(False, previous_loss)
         wrapped.finish_grad_sync()
         assert reductions == expected_reductions
         for unit in units:
@@ -248,12 +263,12 @@ def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
     model.add_module("shared", shared)
     model.add_module("other", other)
     root.add_module("model", model)
-    group = object.__new__(FsdpParameterGroup)
-    group._owning_module = ref(root)
-    root.weight._mfsdp_parameter_group = ref(group)
     register_combined_1f1b_hooks(root)
     plans = [Plan(shared), Plan(other)] + ([Plan(shared)] if repeated else [])
-    remaining = register_fsdp_schedule_hooks(model if wrapped else root, plans)
+    outer_model = nn.Sequential(root) if wrapped else root
+    chunk_plan = SimpleNamespace(_transformer_layers=plans)
+    TransformerModelChunkSchedulePlan.register_fsdp_hooks(chunk_plan, outer_model)
+    remaining = chunk_plan._fsdp_remaining_modules
     assert remaining == (root,)
     for unit in root.modules():
         if isinstance(unit, FsdpModule):

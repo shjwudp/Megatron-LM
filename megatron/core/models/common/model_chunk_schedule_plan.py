@@ -662,7 +662,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 model, self._model_chunk_state, self._event, get_comp_stream
             )
 
-        self._fsdp_remaining_modules = register_fsdp_schedule_hooks(model, self._transformer_layers)
+        self._fsdp_remaining_modules: tuple[FsdpModule, ...] = ()
 
         output_layer = getattr(model, "output_layer", None)
         embedding = getattr(model, "embedding", None)
@@ -782,6 +782,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         """Waits for the event to complete on the current CUDA stream."""
         stream = torch.cuda.current_stream()
         self.event.wait(stream)
+
+    def register_fsdp_hooks(self, model: torch.nn.Module) -> None:
+        """Configure FSDP completion using this chunk's outer model and wrappers."""
+        self._fsdp_remaining_modules = register_fsdp_schedule_hooks(model, self._transformer_layers)
 
     def get_layer(self, i):
         """Gets the transformer layer at the specified index."""
