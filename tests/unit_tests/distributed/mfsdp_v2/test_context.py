@@ -6,7 +6,7 @@ Test prefetch-order construction here; test communication/computation overlap
 in ``test_overlap.py``.
 """
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from weakref import ref
 
 import pytest
@@ -21,7 +21,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     microbatch,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpContext
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
+    FsdpContext,
+    FsdpModule,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 
@@ -226,12 +229,38 @@ def test_grouped_chunk_forwards_reset_each_root(distributed_setup):
             fully_shard(chunk.inner, mesh=mesh, placements=_default_placements())
             fully_shard(chunk, mesh=mesh, placements=_default_placements())
 
+    prefetched_modules = {}
+    original_prefetch = FsdpModule._prefetch_parameter_groups
+
+    def capture_prefetch(module, order, prefetch_size):
+        with patch.object(
+            FsdpModule,
+            "_unshard_parameter_groups",
+            autospec=True,
+            side_effect=FsdpModule._unshard_parameter_groups,
+        ) as unshard:
+            original_prefetch(module, order, prefetch_size)
+        prefetched_modules.setdefault(module, []).append(
+            [call.args[0] for call in unshard.call_args_list]
+        )
+
     # Construction order is A -> a -> B -> b; calls below repeat each chunk.
-    with torch.no_grad():
+    with (
+        patch.object(
+            FsdpModule, "_prefetch_parameter_groups", autospec=True, side_effect=capture_prefetch
+        ),
+        torch.no_grad(),
+    ):
         torch.testing.assert_close(chunk_a(microbatch_a), expected_a_first)
         torch.testing.assert_close(chunk_a(microbatch_b), expected_a_second)
         torch.testing.assert_close(chunk_b(microbatch_a), expected_b_first)
         torch.testing.assert_close(chunk_b(microbatch_b), expected_b_second)
+    assert prefetched_modules == {
+        chunk_a: [[chunk_a.inner], [chunk_a.inner]],
+        chunk_a.inner: [[chunk_b], [chunk_b]],
+        chunk_b: [[chunk_b.inner], [chunk_b.inner]],
+        chunk_b.inner: [[], []],
+    }
     assert context.execution_order[context.execution_order.position][1] is Phase.BACKWARD
 
 
