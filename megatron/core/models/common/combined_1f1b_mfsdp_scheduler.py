@@ -2,9 +2,9 @@
 
 from torch import nn
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
-    FsdpModule,
-    _collect_owned_parameters,
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    get_containing_parameter_group,
 )
 
 
@@ -37,7 +37,8 @@ def _module_post_forward_hook(module: FsdpModule, _args, _output) -> None:
         module.reshard()
 
 
-def _module_post_backward_hook(module: FsdpModule) -> None:
+def finish_fsdp_backward(module: FsdpModule) -> None:
+    """Release weights and reduce gradients after all scheduled consumers finish."""
     module.reshard()
     module._reduce_gradient_groups()
 
@@ -49,7 +50,7 @@ def reshard_fsdp_module(module: FsdpModule) -> None:
 
 
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:
-    """Install execution hooks for units whose callback counts are set at construction."""
+    """Install demand-gather and evaluation-release hooks for the EP schedule."""
 
     def register_hooks(submodule, owner):
         if isinstance(submodule, FsdpModule):
@@ -69,32 +70,39 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     for submodule in module.modules():
         if isinstance(submodule, FsdpModule):
             submodule.register_forward_hook(_module_post_forward_hook)
-            submodule.register_post_backward_hook(_module_post_backward_hook)
 
 
-def get_ep_overlap_grad_accumulation_count(fsdp_unit: nn.Module, model: nn.Module) -> int | None:
-    """Count owned trainable parameters plus extra callbacks for the embedding."""
-    config = getattr(model, "config", None)
-    if config is None or not config.overlap_moe_expert_parallel_comm:
-        return None
+def register_fsdp_schedule_hooks(model: nn.Module, layer_plans) -> tuple[FsdpModule, ...]:
+    """Reduce each unit after its last scheduled backward use, including delayed wgrad.
 
-    # Count this chunk's embedding consumers. LM and MTP output heads
-    # share one post-process GraphTask, so together they contribute once.
-    embedding_consumers = (
-        int(model.pre_process)
-        + model.get_mtp_depth()
-        + int(model.post_process and model.share_embeddings_and_output_weights)
-    )
-    embedding_extra_callbacks = max(embedding_consumers - 1, 0)
+    Operations:
+        1. Collect FSDP units and parameter owners, including an outer wrapper
+           that is absent from ``model.modules()``.
+        2. Visit layer plans in forward order and assign each unit once. Since
+           backward reverses this order, the first forward occurrence identifies
+           the shared unit's last backward use.
+        3. Register callbacks that finish nested units before their parents,
+           after the layer's backward and any delayed weight gradients complete.
+        4. Return unassigned units (e.g. owners of tied embeddings and MTP
+           projections) for completion after the chunk's pre-process backward.
+    """
+    remaining = dict.fromkeys(unit for unit in model.modules() if isinstance(unit, FsdpModule))
+    # The schedule may receive GPTModel inside an FSDP-owned Float16Module.
+    # Its parameter owners include that outer root, which model.modules() omits.
+    for parameter in model.parameters():
+        group = get_containing_parameter_group(parameter)
+        if group is not None and (owner := group._owning_module()) is not None:
+            remaining.setdefault(owner, None)
+    if not remaining:
+        return ()
+    for plan in layer_plans:
+        units = tuple(unit for unit in plan.layer.modules() if unit in remaining)
+        for unit in units:
+            del remaining[unit]
 
-    word_embeddings = getattr(getattr(model, "embedding", None), "word_embeddings", None)
-    embedding_weight = getattr(word_embeddings, "weight", None)
+        def finish_layer(_module, units=units):
+            for unit in reversed(units):
+                finish_fsdp_backward(unit)
 
-    parameters = {
-        id(parameter)
-        for parameter in _collect_owned_parameters(fsdp_unit).values()
-        if parameter.requires_grad
-    }
-    return len(parameters) + (
-        embedding_extra_callbacks if id(embedding_weight) in parameters else 0
-    )
+        plan.set_fsdp_reshard_hooks(reshard_fsdp_module, finish_layer)
+    return tuple(reversed(remaining))

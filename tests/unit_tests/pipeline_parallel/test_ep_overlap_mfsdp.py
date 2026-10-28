@@ -4,6 +4,7 @@
 
 import copy
 from collections import Counter
+from weakref import ref
 
 import pytest
 import torch
@@ -24,7 +25,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     FsdpParameterGroup,
 )
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
+    finish_fsdp_backward,
+    register_combined_1f1b_hooks,
+    register_fsdp_schedule_hooks,
+)
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -45,7 +50,8 @@ from tests.unit_tests.test_utilities import Utils
 pytestmark = pytest.mark.mfsdp
 
 
-def test_ep_overlap_mtp(distributed_setup, monkeypatch):
+@pytest.mark.parametrize("delay_wgrad", [False, True])
+def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad):
     """Reduce every trainable weight once per backward, including tied and MTP uses."""
     setup = distributed_setup
     if setup.world_size < 2 or setup.world_size % 2:
@@ -68,6 +74,7 @@ def test_ep_overlap_mtp(distributed_setup, monkeypatch):
             moe_grouped_gemm=True,
             moe_ffn_hidden_size=128,
             mtp_num_layers=1,
+            delay_wgrad_compute=delay_wgrad,
             mtp_loss_scaling_factor=0.1,
             overlap_moe_expert_parallel_comm=True,
             add_bias_linear=False,
@@ -184,6 +191,8 @@ def test_train_validate_train_reshards_and_matches_dense(distributed_setup):
                     unit.reshard()
                 actual.square().mean().backward()
                 expected.square().mean().backward()
+                for unit in units:
+                    finish_fsdp_backward(unit)
                 model.context.finish_grad_sync()
                 for parameter in reference.parameters():
                     dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
@@ -192,3 +201,83 @@ def test_train_validate_train_reshards_and_matches_dense(distributed_setup):
         for unit in units:
             assert not unit._unshard_events
             unit.validate_grad_accumulation()
+
+
+@pytest.mark.parametrize("repeated", [False, True])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
+    """Schedule boundaries own completion across GraphTasks, not parameter hooks."""
+    reductions = []
+
+    class Unit(nn.Module, FsdpModule):
+        def __init__(self, name):
+            nn.Module.__init__(self)
+            self.label = name
+            self.weight = nn.Parameter(torch.ones(()))
+
+        def forward(self, x):
+            x = x * self.weight
+            for child in self.children():
+                x = child(x)
+            return x
+
+        def is_root(self):
+            return False
+
+        def unshard(self):
+            pass
+
+        def reshard(self):
+            pass
+
+        def _reduce_gradient_groups(self):
+            reductions.append((self.label, self.weight.grad.item()))
+            self.weight.grad = None
+
+    class Plan:
+        def __init__(self, layer):
+            self.layer = layer
+
+        def set_fsdp_reshard_hooks(self, forward, backward):
+            self.finish = lambda: backward(self.layer)
+
+    root, shared, expert, other = [Unit(name) for name in ("root", "shared", "expert", "other")]
+    shared.add_module("expert", expert)
+    model = nn.Module()
+    model.register_parameter("weight", root.weight)
+    model.add_module("shared", shared)
+    model.add_module("other", other)
+    root.add_module("model", model)
+    group = object.__new__(FsdpParameterGroup)
+    group._owning_module = ref(root)
+    root.weight._mfsdp_parameter_group = ref(group)
+    register_combined_1f1b_hooks(root)
+    plans = [Plan(shared), Plan(other)] + ([Plan(shared)] if repeated else [])
+    remaining = register_fsdp_schedule_hooks(model if wrapped else root, plans)
+    assert remaining == (root,)
+    for unit in root.modules():
+        if isinstance(unit, FsdpModule):
+            assert not unit._backward_hooks
+            assert not unit.weight._post_accumulate_grad_hooks
+
+    # The tied root weight receives contributions before and after layer backward.
+    (root.weight * 2).backward()
+    if repeated:
+        shared(torch.tensor(5.0)).backward()
+        plans[-1].finish()
+        assert reductions == []
+    other(torch.tensor(4.0)).backward()
+    plans[1].finish()
+    assert reductions == [("other", 4.0)]
+    shared(torch.tensor(3.0)).backward()
+    plans[0].finish()
+    (root.weight * 7).backward()
+    for unit in remaining:
+        finish_fsdp_backward(unit)
+    expected_shared = 8.0 if repeated else 3.0
+    assert reductions == [
+        ("other", 4.0),
+        ("expert", expected_shared),
+        ("shared", expected_shared),
+        ("root", 9.0),
+    ]

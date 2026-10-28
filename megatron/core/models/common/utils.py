@@ -334,7 +334,8 @@ class TransformerLayerNode(ScheduleNode):
         """
         grads = super().backward(*output_grad)
         if not self.delay_wgrad_compute and self.is_layer_first_node:
-            self._post_backward_hook()
+            with torch.cuda.stream(self.stream):
+                self._post_backward_hook()
         return grads
 
     def backward_dw(self):
@@ -371,7 +372,8 @@ class TransformerLayerNode(ScheduleNode):
                     hook()
 
         if self.is_layer_first_node:
-            self._post_backward_hook()
+            with torch.cuda.stream(self.stream):
+                self._post_backward_hook()
         self.bwd_dw_callables = None
 
     def set_post_forward_hook(self, hook):

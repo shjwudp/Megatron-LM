@@ -343,11 +343,6 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
 
-    def get_mtp_depth(self) -> int:
-        """Return the MTP depth on this model chunk, or zero if it has no MTP."""
-        mtp_number_layers = 0 if self.config.mtp_num_layers is None else self.config.mtp_num_layers
-        return mtp_number_layers if self.mtp_process else 0
-
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
 

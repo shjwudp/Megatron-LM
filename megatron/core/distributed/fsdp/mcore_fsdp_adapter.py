@@ -40,10 +40,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
-    get_ep_overlap_grad_accumulation_count,
-    register_combined_1f1b_hooks,
-)
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
@@ -735,28 +732,20 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
                     if config.init_model_with_meta_device:
                         _materialize_owned_meta_modules(submodule, device)
-                    grad_accumulation_count = get_ep_overlap_grad_accumulation_count(
-                        submodule, unwrap_model(module)
-                    )
                     fully_shard(
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
                         grad_scale=dense_grad_scale,
-                        grad_accumulation_count=grad_accumulation_count,
                         **common_fully_shard_kwargs,
                     )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
-            grad_accumulation_count = get_ep_overlap_grad_accumulation_count(
-                module, unwrap_model(module)
-            )
             fully_shard(
                 module,
                 mesh=dp_mesh,
                 placements=dense_placements,
                 grad_scale=dense_grad_scale,
-                grad_accumulation_count=grad_accumulation_count,
                 **common_fully_shard_kwargs,
             )
         super().__init__(config=config, module=module)
