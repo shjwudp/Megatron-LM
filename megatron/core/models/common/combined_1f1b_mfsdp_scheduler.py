@@ -73,15 +73,10 @@ def register_fsdp_schedule_hooks(model: nn.Module, layer_plans) -> tuple[FsdpMod
     """Reduce each unit after its last scheduled backward use, including delayed wgrad.
 
     Operations:
-        1. Collect FSDP units from the current chunk's outer model, including
-           any FSDP-owned wrappers.
-        2. Visit layer plans in forward order and assign each unit once. Since
-           backward reverses this order, the first forward occurrence identifies
-           the shared unit's last backward use.
-        3. Register callbacks that finish nested units before their parents,
-           after the layer's backward and any delayed weight gradients complete.
-        4. Return unassigned units (e.g. owners of tied embeddings and MTP
-           projections) for completion after the chunk's pre-process backward.
+        1. Collect FSDP units from the current chunk's outer model.
+        2. Visit layers in forward order and assign each unit once, so shared
+           units finish at their last backward use (after delayed wgrad).
+        3. Return the remaining units for completion after pre-process backward.
     """
     remaining = dict.fromkeys(unit for unit in model.modules() if isinstance(unit, FsdpModule))
     if not remaining:
@@ -92,8 +87,8 @@ def register_fsdp_schedule_hooks(model: nn.Module, layer_plans) -> tuple[FsdpMod
             del remaining[unit]
 
         def finish_layer(_module, units=units):
-            for unit in reversed(units):
+            for unit in units:
                 finish_fsdp_backward(unit)
 
         plan.set_fsdp_reshard_hooks(reshard_fsdp_module, finish_layer)
-    return tuple(reversed(remaining))
+    return tuple(remaining)

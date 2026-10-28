@@ -292,7 +292,7 @@ def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
     expected_shared = 8.0 if repeated else 3.0
     assert reductions == [
         ("other", 4.0),
-        ("expert", expected_shared),
         ("shared", expected_shared),
+        ("expert", expected_shared),
         ("root", 9.0),
     ]
