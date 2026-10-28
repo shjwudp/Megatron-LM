@@ -266,7 +266,11 @@ def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
     register_combined_1f1b_hooks(root)
     plans = [Plan(shared), Plan(other)] + ([Plan(shared)] if repeated else [])
     outer_model = nn.Sequential(root) if wrapped else root
-    chunk_plan = SimpleNamespace(_transformer_layers=plans)
+    chunk_plan = SimpleNamespace(
+        _transformer_layers=plans,
+        _model_chunk_state=SimpleNamespace(model=model),
+        post_process=None,
+    )
     TransformerModelChunkSchedulePlan.register_fsdp_hooks(chunk_plan, outer_model)
     remaining = chunk_plan._fsdp_remaining_modules
     assert remaining == (root,)

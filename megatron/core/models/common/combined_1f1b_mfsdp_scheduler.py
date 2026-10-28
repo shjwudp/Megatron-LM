@@ -3,6 +3,9 @@
 from torch import nn
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    get_containing_parameter_group,
+)
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
@@ -94,3 +97,34 @@ def register_fsdp_schedule_hooks(model: nn.Module, layer_plans) -> tuple[FsdpMod
 
         plan.set_fsdp_reshard_hooks(reshard_fsdp_module, finish_layer)
     return tuple(remaining)
+
+
+def register_fsdp_post_process_hooks(model: nn.Module, post_process) -> None:
+    """Gather a tied output weight before post-process reads or uses it."""
+    output_layer = getattr(model, "output_layer", None)
+    embedding = getattr(model, "embedding", None)
+    if (
+        post_process is not None
+        and model.share_embeddings_and_output_weights
+        and output_layer is not None
+        and not list(output_layer.parameters(recurse=False))
+        and embedding is not None
+    ):
+        group = get_containing_parameter_group(embedding.word_embeddings.weight)
+        owner = group._owning_module() if group is not None else None
+        if owner is not None:
+            # The parameter-free output head has no demand hooks. Gather before
+            # post-process reads the tied weight, rather than at output_layer(),
+            # where the weight argument has already been evaluated.
+            def unshard_before(func):
+                def wrapped(*args, **kwargs):
+                    if owner.is_root():
+                        context = owner.context
+                        context.allgather_stream.wait_stream(context.current_stream())
+                    owner.unshard()
+                    return func(*args, **kwargs)
+
+                return wrapped
+
+            post_process.forward_func = unshard_before(post_process.forward_func)
+            post_process.backward_func = unshard_before(post_process.backward_func)
