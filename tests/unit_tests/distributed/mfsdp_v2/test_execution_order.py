@@ -73,7 +73,7 @@ def test_iteration_and_weak_references():
 
 
 def test_explicit_reset_and_exhaustion():
-    """Sequential traversal requires reset; unique events can select their position."""
+    """Sequential traversal requires reset before replay."""
     module = nn.Module()
     a = ExecutionEvent(module=module, phase=Phase.FORWARD)
     b = ExecutionEvent(module=module, phase=Phase.BACKWARD)
@@ -89,14 +89,35 @@ def test_explicit_reset_and_exhaustion():
         assert list(order)[order.position :] == []
         with pytest.raises(RuntimeError, match='exceeded'):
             order.advance()
-    assert order.advance(b) == b
-    assert order.advance(a) == a
-    order.reset_cursor(1)
-    with pytest.raises(RuntimeError, match="diverged"):
-        order.advance(a)
-    assert order.position == 1
-    assert order.advance() == b
     empty = ExecutionOrder()
     assert list(empty) == []
     with pytest.raises(RuntimeError, match='exceeded'):
         empty.advance()
+
+
+@pytest.mark.parametrize("phase", [Phase.FORWARD, Phase.BACKWARD])
+def test_adjacent_shared_calls_reuse_prefetch_position(phase):
+    """A shared MTP block reuses its successor until the next distinct call."""
+    first, shared, last = [
+        Mock(spec=FsdpModule, phase=phase, num_parameter_elements=1) for _ in range(3)
+    ]
+    prefetched = []
+    for module in [first, shared, last]:
+        module._unshard_parameter_groups.side_effect = (
+            lambda _phase, target=module: prefetched.append(target)
+        )
+    order = ExecutionOrder(
+        ExecutionEvent(module=module, phase=phase) for module in [first, shared, last]
+    )
+    for _ in range(2):
+        order.reset_cursor()
+        for module, targets, position in [
+            (first, [shared], 1),
+            (shared, [last], 2),
+            (shared, [last], 2),
+            (last, [], 3),
+        ]:
+            prefetched.clear()
+            FsdpModule._prefetch_parameter_groups(module, order, 1)
+            assert prefetched == targets
+            assert order.position == position
