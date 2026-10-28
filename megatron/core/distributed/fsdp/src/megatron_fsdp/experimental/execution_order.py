@@ -15,15 +15,19 @@
 """Weakly held construction or recorded module execution sequences."""
 
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING
+from typing import NamedTuple
 from weakref import ref
+
+from torch import nn
 
 from .phase import Phase
 
-if TYPE_CHECKING:
-    from .module import FsdpModule
 
-ExecutionEvent = tuple["FsdpModule", Phase]
+class ExecutionEvent(NamedTuple):
+    """A module and its compute phase."""
+
+    module: nn.Module
+    phase: Phase
 
 
 class ExecutionOrder:
@@ -31,15 +35,14 @@ class ExecutionOrder:
 
     def __init__(self, items: Iterable[ExecutionEvent] = ()) -> None:
         """Create an execution sequence, preserving repeated occurrences."""
-        self._items: list[tuple[ref["FsdpModule"], Phase]] = []
+        self._items: list[tuple[ref[nn.Module], Phase]] = []
         self._position = 0
         for item in items:
             self.append(item)
 
     def append(self, item: ExecutionEvent) -> None:
         """Append an occurrence."""
-        module, phase = item
-        self._items.append((ref(module), phase))
+        self._items.append((ref(item.module), item.phase))
 
     def __iter__(self) -> Iterator[ExecutionEvent]:
         """Iterate over occurrences in execution order."""
@@ -64,7 +67,7 @@ class ExecutionOrder:
         module = module_ref()
         if module is None:
             raise RuntimeError("A module in the FSDP execution order was destroyed.")
-        return module, phase
+        return ExecutionEvent(module=module, phase=phase)
 
     def advance(self) -> ExecutionEvent:
         """Consume the next occurrence; the caller owns cursor resets."""

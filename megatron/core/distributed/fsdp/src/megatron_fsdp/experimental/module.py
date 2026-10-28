@@ -31,7 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import ExecutionOrder
+from .execution_order import ExecutionEvent, ExecutionOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,
@@ -339,17 +339,20 @@ class FsdpModule:
         """
         if not order:
             return
-        if order.position < len(order) and order[order.position] != (self, self.phase):
+        if order.position < len(order) and order[order.position] != ExecutionEvent(
+            module=cast(nn.Module, self), phase=self.phase
+        ):
             raise RuntimeError("FSDP module calls diverged from the expected prefetch order.")
         order.advance()
         if prefetch_size == 0:
             return
         prefetched_size = 0
         for index in range(order.position, len(order)):
-            fsdp_module, phase = order[index]
+            event = order[index]
             # Forward and backward retain their separate prefetch boundaries.
-            if phase is not self.phase:
+            if event.phase is not self.phase:
                 break
+            fsdp_module = cast(FsdpModule, event.module)
             fsdp_module._unshard_parameter_groups(self.phase)
             prefetched_size += fsdp_module.num_parameter_elements
             if prefetch_size is None or prefetched_size >= prefetch_size:

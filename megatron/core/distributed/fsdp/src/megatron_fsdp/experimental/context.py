@@ -21,7 +21,7 @@ from weakref import WeakKeyDictionary
 import torch
 from torch import nn
 
-from .execution_order import ExecutionOrder
+from .execution_order import ExecutionEvent, ExecutionOrder
 from .phase import Phase
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
@@ -164,7 +164,7 @@ class FsdpContext:
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
-                self.execution_order.append((module, Phase.FORWARD))
+                self.execution_order.append(ExecutionEvent(module=module, phase=Phase.FORWARD))
 
         for root in reversed(list(self._roots)):
             self._root_execution_offsets[root][Phase.BACKWARD] = len(self.execution_order)
@@ -279,7 +279,7 @@ def _collect_backward_order(
 ) -> None:
     """Collect one root's preset backward prefetch order."""
     if module in registered_modules:
-        order.append((module, Phase.BACKWARD))
+        order.append(ExecutionEvent(module=module, phase=Phase.BACKWARD))
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, registered_modules, order)

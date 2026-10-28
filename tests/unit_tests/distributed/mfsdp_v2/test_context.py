@@ -21,6 +21,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     microbatch,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionEvent,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
     FsdpContext,
     FsdpModule,
@@ -180,10 +183,10 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     assert model.layers[0].is_root()
     assert model.layers[1].is_root()
     assert list(context.execution_order) == [
-        (model.layers[0], Phase.FORWARD),
-        (model.layers[1], Phase.FORWARD),
-        (model.layers[1], Phase.BACKWARD),
-        (model.layers[0], Phase.BACKWARD),
+        ExecutionEvent(module=model.layers[0], phase=Phase.FORWARD),
+        ExecutionEvent(module=model.layers[1], phase=Phase.FORWARD),
+        ExecutionEvent(module=model.layers[1], phase=Phase.BACKWARD),
+        ExecutionEvent(module=model.layers[0], phase=Phase.BACKWARD),
     ]
 
 
@@ -272,8 +275,12 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
 
     context = model.context
     assert list(context.execution_order) == [
-        (module, Phase.FORWARD) for module in [model, model.left, model.left.inner, model.right]
-    ] + [(module, Phase.BACKWARD) for module in [model, model.right, model.left, model.left.inner]]
+        ExecutionEvent(module=module, phase=Phase.FORWARD)
+        for module in [model, model.left, model.left.inner, model.right]
+    ] + [
+        ExecutionEvent(module=module, phase=Phase.BACKWARD)
+        for module in [model, model.right, model.left, model.left.inner]
+    ]
 
 
 def test_register_post_backward_hook_handles_parameterless_module(distributed_setup):
@@ -308,8 +315,12 @@ def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):
     assert model.right.is_root()
     assert not model.left.inner.is_root()
     assert list(context.execution_order) == [
-        (module, Phase.FORWARD) for module in [model.left, model.left.inner, model.right]
-    ] + [(module, Phase.BACKWARD) for module in [model.right, model.left, model.left.inner]]
+        ExecutionEvent(module=module, phase=Phase.FORWARD)
+        for module in [model.left, model.left.inner, model.right]
+    ] + [
+        ExecutionEvent(module=module, phase=Phase.BACKWARD)
+        for module in [model.right, model.left, model.left.inner]
+    ]
 
 
 def test_fully_shard_requires_context(distributed_setup):

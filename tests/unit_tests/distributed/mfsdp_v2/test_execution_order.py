@@ -10,6 +10,7 @@ import pytest
 from torch import nn
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionEvent,
     ExecutionOrder,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
@@ -37,7 +38,7 @@ def test_prefetch_replays_occurrences(budget, expected):
     sequence = [modules[index] for index in (0, 1, 0, 0, 2)]
     order = ExecutionOrder()
     for module in sequence:
-        order.append((module, Phase.FORWARD))
+        order.append(ExecutionEvent(module=module, phase=Phase.FORWARD))
     # A new pass must explicitly reset before replaying repeated occurrences.
     for _ in range(2):
         order.reset_cursor()
@@ -51,8 +52,11 @@ def test_prefetch_replays_occurrences(budget, expected):
 def test_iteration_and_weak_references():
     """Traversal preserves repeated occurrences without retaining deleted modules."""
     first, second = nn.Module(), nn.Module()
-    order = ExecutionOrder((module, Phase.FORWARD) for module in [first, second, first, second])
-    assert [module for module, _ in order] == [first, second, first, second]
+    order = ExecutionOrder(
+        ExecutionEvent(module=module, phase=Phase.FORWARD)
+        for module in [first, second, first, second]
+    )
+    assert [event.module for event in order] == [first, second, first, second]
 
     second_ref = ref(second)
     del second
@@ -71,7 +75,8 @@ def test_iteration_and_weak_references():
 def test_explicit_reset_and_exhaustion():
     """Only reset starts another pass; lookahead and iteration never advance it."""
     module = nn.Module()
-    a, b = (module, Phase.FORWARD), (module, Phase.BACKWARD)
+    a = ExecutionEvent(module=module, phase=Phase.FORWARD)
+    b = ExecutionEvent(module=module, phase=Phase.BACKWARD)
     order = ExecutionOrder([a, b, a])
     for _ in range(2):
         order.reset_cursor()
