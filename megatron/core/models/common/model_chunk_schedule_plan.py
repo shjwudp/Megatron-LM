@@ -8,7 +8,6 @@ from torch import Tensor
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
     finish_fsdp_backward,
-    register_fsdp_post_process_hooks,
     register_fsdp_schedule_hooks,
 )
 from megatron.core.pipeline_parallel.utils import (
@@ -755,9 +754,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self.event.wait(stream)
 
     def register_fsdp_hooks(self, model: torch.nn.Module) -> None:
-        """Configure this chunk's FSDP demand and completion hooks."""
+        """Configure FSDP completion using this chunk's outer model and wrappers."""
         self._fsdp_remaining_modules = register_fsdp_schedule_hooks(model, self._transformer_layers)
-        register_fsdp_post_process_hooks(self._model_chunk_state.model, self.post_process)
 
     def get_layer(self, i):
         """Gets the transformer layer at the specified index."""

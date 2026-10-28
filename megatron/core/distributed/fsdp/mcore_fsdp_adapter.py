@@ -39,7 +39,6 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -966,10 +965,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
         """Wait on all submitted reductions, including delayed weight gradients."""
         self.module.context.finish_grad_sync()
-
-        for submodule in self.module.modules():
-            if isinstance(submodule, FsdpModule):
-                submodule.ensure_grad_accumulation_is_complete()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""

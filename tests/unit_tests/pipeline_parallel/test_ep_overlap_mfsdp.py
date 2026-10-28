@@ -164,21 +164,41 @@ def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad):
         run_step(False, previous_loss)
         wrapped.finish_grad_sync()
         assert reductions == expected_reductions
-        for unit in units:
-            unit.ensure_grad_accumulation_is_complete()
     finally:
         destroy_model_parallel()
 
 
-def test_train_validate_train_reshards_and_matches_dense(distributed_setup):
-    """Evaluation releases every unit's full weights and preserves subsequent updates."""
+@pytest.mark.parametrize("tied", [False, True])
+def test_train_validate_train_reshards_and_matches_dense(distributed_setup, tied):
+    """Train/eval preserve dense updates, including externally supplied tied weights."""
     setup = distributed_setup
     torch.manual_seed(0)
-    reference = nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 16)).to(setup.device)
+
+    class OutputHead(nn.Module):
+        def forward(self, inputs, weight):
+            return torch.nn.functional.linear(inputs, weight)
+
+    class TiedModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.share_embeddings_and_output_weights = True
+            self.embedding = nn.Module()
+            self.embedding.word_embeddings = nn.Embedding(16, 16)
+            self.layer = nn.Linear(16, 16)
+            self.output_layer = OutputHead()
+
+        def forward(self, inputs):
+            return self.output_layer(
+                self.layer(inputs), weight=self.embedding.word_embeddings.weight
+            )
+
+    reference = (TiedModel() if tied else nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 16))).to(
+        setup.device
+    )
     model = copy.deepcopy(reference)
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     placements = Placements([0], [Shard(0)], [Shard(0)], [Shard(0)])
-    units = (model[1], model)
+    units = (model.layer if tied else model[1], model)
     with fully_shard_context(device=setup.device, caller_managed_grad_sync=True):
         for unit in units:
             fully_shard(unit, mesh=mesh, placements=placements, register_hooks=False)
@@ -215,7 +235,6 @@ def test_train_validate_train_reshards_and_matches_dense(distributed_setup):
                 reference_optimizer.step()
         for unit in units:
             assert not unit._unshard_events
-            unit.ensure_grad_accumulation_is_complete()
 
 
 @pytest.mark.parametrize("repeated", [False, True])
@@ -266,11 +285,7 @@ def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
     register_combined_1f1b_hooks(root)
     plans = [Plan(shared), Plan(other)] + ([Plan(shared)] if repeated else [])
     outer_model = nn.Sequential(root) if wrapped else root
-    chunk_plan = SimpleNamespace(
-        _transformer_layers=plans,
-        _model_chunk_state=SimpleNamespace(model=model),
-        post_process=None,
-    )
+    chunk_plan = SimpleNamespace(_transformer_layers=plans)
     TransformerModelChunkSchedulePlan.register_fsdp_hooks(chunk_plan, outer_model)
     remaining = chunk_plan._fsdp_remaining_modules
     assert remaining == (root,)

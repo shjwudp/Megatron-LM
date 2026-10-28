@@ -8,7 +8,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_gro
 )
 
 
-def _make_unshard_forward_hook(owner: FsdpModule):
+def _make_unshard_forward_hook(owner: FsdpModule, weight_module: nn.Module | None = None):
     """Create a forward pre-hook that unshards the owning FSDP module before the submodule
     forward."""
 
@@ -17,6 +17,10 @@ def _make_unshard_forward_hook(owner: FsdpModule):
             context = owner.context
             context.allgather_stream.wait_stream(context.current_stream())
         owner.unshard()
+        if weight_module is not None:
+            # The caller may have read the sharded parameter before this hook.
+            _kwargs["weight"] = weight_module.weight
+            return _args, _kwargs
 
     return hook
 
@@ -52,7 +56,14 @@ def reshard_fsdp_module(module: FsdpModule) -> None:
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     """Install demand-gather and evaluation-release hooks for the EP schedule."""
 
+    tied_outputs: dict[nn.Module, nn.Module] = {}
+
     def register_hooks(submodule, owner):
+        if getattr(submodule, "share_embeddings_and_output_weights", False):
+            embedding = getattr(submodule, "embedding", None)
+            output_layer = getattr(submodule, "output_layer", None)
+            if embedding is not None and output_layer is not None:
+                tied_outputs[output_layer] = embedding.word_embeddings
         if isinstance(submodule, FsdpModule):
             owner = submodule  # BEFORE registering: an FSDP unit owns itself
         if len(list(submodule.parameters(recurse=False))) > 0:
@@ -60,6 +71,17 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
                 _make_unshard_forward_hook(owner), prepend=True, with_kwargs=True
             )
             submodule.register_full_backward_pre_hook(_make_unshard_backward_hook(owner))
+        elif submodule in tied_outputs:
+            weight_module = tied_outputs[submodule]
+            group = get_containing_parameter_group(weight_module.weight)
+            weight_owner = group._owning_module() if group is not None else None
+            if weight_owner is not None:
+                submodule.register_forward_pre_hook(
+                    _make_unshard_forward_hook(weight_owner, weight_module),
+                    prepend=True,
+                    with_kwargs=True,
+                )
+                submodule.register_full_backward_pre_hook(_make_unshard_backward_hook(weight_owner))
         for child in submodule.children():
             register_hooks(child, owner)
 
@@ -97,34 +119,3 @@ def register_fsdp_schedule_hooks(model: nn.Module, layer_plans) -> tuple[FsdpMod
 
         plan.set_fsdp_reshard_hooks(reshard_fsdp_module, finish_layer)
     return tuple(remaining)
-
-
-def register_fsdp_post_process_hooks(model: nn.Module, post_process) -> None:
-    """Gather a tied output weight before post-process reads or uses it."""
-    output_layer = getattr(model, "output_layer", None)
-    embedding = getattr(model, "embedding", None)
-    if (
-        post_process is not None
-        and model.share_embeddings_and_output_weights
-        and output_layer is not None
-        and not list(output_layer.parameters(recurse=False))
-        and embedding is not None
-    ):
-        group = get_containing_parameter_group(embedding.word_embeddings.weight)
-        owner = group._owning_module() if group is not None else None
-        if owner is not None:
-            # The parameter-free output head has no demand hooks. Gather before
-            # post-process reads the tied weight, rather than at output_layer(),
-            # where the weight argument has already been evaluated.
-            def unshard_before(func):
-                def wrapped(*args, **kwargs):
-                    if owner.is_root():
-                        context = owner.context
-                        context.allgather_stream.wait_stream(context.current_stream())
-                    owner.unshard()
-                    return func(*args, **kwargs)
-
-                return wrapped
-
-            post_process.forward_func = unshard_before(post_process.forward_func)
-            post_process.backward_func = unshard_before(post_process.backward_func)
