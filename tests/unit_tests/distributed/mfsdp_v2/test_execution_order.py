@@ -122,6 +122,7 @@ def test_root_hooks_reset_preset_cursor(monkeypatch, roots):
     context._is_finalized = False
     context._registered_modules = [unit for root in chunks for unit in (root, root[0])]
     context._roots = WeakKeyDictionary()
+    context._root_execution_offsets = WeakKeyDictionary()
     context._module_names = WeakKeyDictionary()
     context.execution_order = ExecutionOrder()
     context.allgather_stream = Mock()
@@ -129,6 +130,7 @@ def test_root_hooks_reset_preset_cursor(monkeypatch, roots):
     context.current_stream = Mock()
     context.register_post_backward_hook = Mock()
     context.finalize()
+    assert all(value is None for value in context._roots.values())
 
     def unshard(unit, phase, prefetch=False):
         if prefetch:
@@ -156,7 +158,7 @@ def test_root_hooks_reset_preset_cursor(monkeypatch, roots):
                 FsdpModule.pre_forward(unit)
             else:
                 FsdpModule.pre_backward(unit)
-        position = context._roots[root][phase] + 2
+        position = context._root_execution_offsets[root][phase] + 2
         assert context.execution_order.position == position
         if phase is Phase.BACKWARD:
             # Checkpoint recomputation must leave the interrupted backward cursor alone.
