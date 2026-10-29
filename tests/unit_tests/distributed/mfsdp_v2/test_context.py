@@ -164,8 +164,8 @@ def test_two_child_subtrees_then_parent_share_one_context(distributed_setup):
     assert model.layers[1].context is model.context
 
 
-def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
-    """Independent roots should share streams and follow construction order."""
+def test_sibling_roots_share_context_without_prefetch(distributed_setup):
+    """Independent roots share streams and gather parameters on demand."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -182,12 +182,7 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     assert model.layers[1].context is context
     assert model.layers[0].is_root()
     assert model.layers[1].is_root()
-    assert list(context.execution_order) == [
-        ExecutionEvent(module=model.layers[0], phase=Phase.FORWARD),
-        ExecutionEvent(module=model.layers[1], phase=Phase.FORWARD),
-        ExecutionEvent(module=model.layers[1], phase=Phase.BACKWARD),
-        ExecutionEvent(module=model.layers[0], phase=Phase.BACKWARD),
-    ]
+    assert not context.execution_order
 
 
 def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(distributed_setup, monkeypatch):
@@ -299,8 +294,8 @@ def test_register_post_backward_hook_handles_parameterless_module(distributed_se
     assert callback_modules == [model]
 
 
-def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):
-    """Context orders should concatenate nested roots at construction boundaries."""
+def test_nested_and_sibling_roots_disable_prefetch(distributed_setup):
+    """Nested children do not enable prefetch in a context with multiple roots."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = NestedSiblingModel(dim=4).to(device)
@@ -314,13 +309,7 @@ def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):
     assert model.left.is_root()
     assert model.right.is_root()
     assert not model.left.inner.is_root()
-    assert list(context.execution_order) == [
-        ExecutionEvent(module=module, phase=Phase.FORWARD)
-        for module in [model.left, model.left.inner, model.right]
-    ] + [
-        ExecutionEvent(module=module, phase=Phase.BACKWARD)
-        for module in [model.right, model.left, model.left.inner]
-    ]
+    assert not context.execution_order
 
 
 def test_fully_shard_requires_context(distributed_setup):
