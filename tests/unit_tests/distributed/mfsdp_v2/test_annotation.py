@@ -13,7 +13,6 @@ from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
-    SchedulePolicy,
     fully_shard,
     fully_shard_context,
 )
@@ -131,12 +130,9 @@ def test_fsdp_sibling_roots_emit_root_nvtx_ranges_after_training_step(
     _setup_nvtx_recording(monkeypatch, events)
     model = NestedLinearModel(dim=4).to(distributed_setup.device)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    shard_kwargs = dict(
-        mesh=mesh, placements=_default_placements(), schedule_policy=SchedulePolicy(0, 0)
-    )
     with fully_shard_context(device=distributed_setup.device):
-        fully_shard(model.layers[0], **shard_kwargs)
-        fully_shard(model.layers[1], **shard_kwargs)
+        fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
+        fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 

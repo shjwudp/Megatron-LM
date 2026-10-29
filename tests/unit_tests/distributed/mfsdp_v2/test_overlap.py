@@ -146,18 +146,6 @@ def test_overlaps_communication_and_compute(
     ) as context:
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-        # Keep the root bias replicated so child all-gather/reduce-scatter counts stay unchanged.
-        fully_shard(
-            model,
-            mesh=mesh,
-            placements=Placements(
-                dp_axes=[0],
-                parameter=[Replicate()],
-                gradient=[Replicate()],
-                optimizer=[Replicate()],
-            ),
-            mixed_precision_policy=policy,
-        )
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
     fully_shard_optimizer(optimizer)

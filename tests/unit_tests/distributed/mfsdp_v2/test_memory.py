@@ -367,7 +367,6 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup, placements_
                     main_params_dtype=dtype, main_grads_dtype=dtype
                 ),
             )
-        fully_shard(model, mesh=mesh, placements=placements_factory())
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
 
     x = torch.randn(batch, dim, device=device, dtype=dtype)

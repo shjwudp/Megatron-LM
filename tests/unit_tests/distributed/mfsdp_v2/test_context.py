@@ -195,13 +195,9 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(distributed_s
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
 
-    shard_kwargs = dict(
-        mesh=mesh, placements=_default_placements(), schedule_policy=SchedulePolicy(0, 0)
-    )
-
     with fully_shard_context(device=device) as context:
-        fully_shard(model.layers[0], **shard_kwargs)
-        fully_shard(model.layers[1], **shard_kwargs)
+        fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
+        fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
 
     finish_grad_sync = Mock(wraps=context.finish_grad_sync)
     monkeypatch.setattr(context, "finish_grad_sync", finish_grad_sync)
