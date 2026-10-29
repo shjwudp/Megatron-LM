@@ -77,6 +77,9 @@ class TestMfsdpV2PipelineSharedContext:
             num_layers=4,
             hidden_size=16,
             num_attention_heads=1,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
             pipeline_model_parallel_size=2,
             virtual_pipeline_model_parallel_size=2 if num_chunks == 2 else None,
         )
