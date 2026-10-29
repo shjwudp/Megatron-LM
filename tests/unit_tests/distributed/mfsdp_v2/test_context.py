@@ -17,6 +17,7 @@ from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
+    SchedulePolicy,
     fully_shard,
     fully_shard_context,
     microbatch,
@@ -165,15 +166,18 @@ def test_two_child_subtrees_then_parent_share_one_context(distributed_setup):
 
 
 def test_sibling_roots_share_context_without_prefetch(distributed_setup):
-    """Independent roots share streams and gather parameters on demand."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
 
+    shard_kwargs = dict(
+        mesh=mesh, placements=_default_placements(), schedule_policy=SchedulePolicy(0, 0)
+    )
+
     with fully_shard_context(device=device):
-        fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
-        fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
+        fully_shard(model.layers[0], **shard_kwargs)
+        fully_shard(model.layers[1], **shard_kwargs)
 
     with torch.no_grad():
         model(torch.ones(2, 4, device=device))
@@ -191,9 +195,13 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(distributed_s
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
 
+    shard_kwargs = dict(
+        mesh=mesh, placements=_default_placements(), schedule_policy=SchedulePolicy(0, 0)
+    )
+
     with fully_shard_context(device=device) as context:
-        fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
-        fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
+        fully_shard(model.layers[0], **shard_kwargs)
+        fully_shard(model.layers[1], **shard_kwargs)
 
     finish_grad_sync = Mock(wraps=context.finish_grad_sync)
     monkeypatch.setattr(context, "finish_grad_sync", finish_grad_sync)
@@ -294,16 +302,19 @@ def test_register_post_backward_hook_handles_parameterless_module(distributed_se
     assert callback_modules == [model]
 
 
-def test_nested_and_sibling_roots_disable_prefetch(distributed_setup):
-    """Nested children do not enable prefetch in a context with multiple roots."""
+def test_nested_and_sibling_roots_respect_prefetch_policy(distributed_setup):
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = NestedSiblingModel(dim=4).to(device)
 
+    shard_kwargs = dict(
+        mesh=mesh, placements=_default_placements(), schedule_policy=SchedulePolicy(0, 0)
+    )
+
     with fully_shard_context(device=device):
-        fully_shard(model.left.inner, mesh=mesh, placements=_default_placements())
-        fully_shard(model.left, mesh=mesh, placements=_default_placements())
-        fully_shard(model.right, mesh=mesh, placements=_default_placements())
+        fully_shard(model.left.inner, **shard_kwargs)
+        fully_shard(model.left, **shard_kwargs)
+        fully_shard(model.right, **shard_kwargs)
 
     context = model.left.context
     assert model.left.is_root()

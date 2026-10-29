@@ -165,8 +165,7 @@ class FsdpContext:
         for root in reversed(list(self._roots)):
             _collect_backward_order(root, registered_modules, self.execution_order)
 
-        # Disabled prefetch and multi-root schedules gather parameters on demand.
-        if len(self._roots) > 1 or all(
+        if all(
             module._schedule_policy.forward_prefetch_size == 0
             and module._schedule_policy.backward_prefetch_size == 0
             for module in registered_modules
