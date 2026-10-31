@@ -4909,12 +4909,14 @@ def train(
     forward_backward_func = get_forward_backward_func(
         schedule_pg_collection=pg_collection
     )
+    full_cuda_graph_wrapper = None
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
         )
+        full_cuda_graph_wrapper = forward_backward_func
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
         copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
@@ -5515,6 +5517,12 @@ def train(
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph
     if args.optimizer_cuda_graph:
         del optimizer.step
+
+    # Release collective graphs while their model storage and process groups are alive.
+    # Keep the original wrapper above even when PagedStashRunner wraps the schedule.
+    if full_cuda_graph_wrapper is not None:
+        torch.cuda.synchronize()
+        full_cuda_graph_wrapper.reset_cuda_graph()
 
     one_logger_utils.track_e2e_metrics()
 
