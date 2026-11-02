@@ -210,7 +210,10 @@ class FsdpContext:
         current_stream = self.current_stream()
         current_stream.wait_stream(self.reduce_scatter_stream)
         for module in self._module_names:
-            if any(group.is_unsharded for group in module.parameter_groups):
+            # Delayed wgrad can keep an owner active after autograd has finished.
+            if module.phase is Phase.RESTING and any(
+                group.is_unsharded for group in module.parameter_groups
+            ):
                 module._reshard_parameter_groups()
         current_stream.wait_stream(self.allgather_stream)
         if self.caller_managed_grad_sync:
