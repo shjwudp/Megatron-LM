@@ -31,7 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import ExecutionOrder
+from .execution_order import ExecutionEvent, ExecutionOrder
 from .module_utils import get_parameter_owner, is_in_backward
 from .parameter_group import (
     FsdpParameter,
@@ -313,45 +313,57 @@ class FsdpModule:
 
             if not prefetch:
                 return
-            context = self.context
-            match phase:
-                case Phase.FORWARD:
-                    self._prefetch_parameter_groups(
-                        context.forward_order, self._schedule_policy.forward_prefetch_size
-                    )
-                case Phase.BACKWARD:
-                    self._prefetch_parameter_groups(
-                        context.backward_order, self._schedule_policy.backward_prefetch_size
-                    )
-                case _:
-                    raise ValueError(
-                        f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
-                    )
+            self.prefetch(phase)
+
+    def prefetch(self, phase: Phase) -> None:
+        """Record a compute event or prefetch its successors in the selected order."""
+        match phase:
+            case Phase.FORWARD:
+                budget = self._schedule_policy.forward_prefetch_size
+            case Phase.BACKWARD:
+                budget = self._schedule_policy.backward_prefetch_size
+            case _:
+                raise ValueError(
+                    f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
+                )
+        context = self.context
+        if not cast(nn.Module, self).training:
+            # Evaluation has a different (forward-only) schedule. Gather on demand
+            # without modifying the training trace or its cursor.
+            return
+        if context.is_recording_execution_order:
+            context.execution_order.append(ExecutionEvent(cast(nn.Module, self), phase))
+            return
+        self._prefetch_parameter_groups(context.execution_order, budget, phase)
 
     def _prefetch_parameter_groups(
-        self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
+        self, order: ExecutionOrder, prefetch_size: int | None, phase: Phase
     ) -> None:
-        """Prefetch successors from ``order`` according to this module's budget.
-
-        Successors are unsharded for this module's phase, which is the compute they
-        run next in ``order``.
-        """
-        module = cast(nn.Module, self)
-        order.advance(module)
-        next_module = order.next_item()
-        if prefetch_size is None:
-            if next_module is not None:
-                cast(FsdpModule, next_module)._unshard_parameter_groups(self.phase)
-            return
-
+        """Validate the current event, prefetch successors, and advance once."""
+        event = ExecutionEvent(cast(nn.Module, self), phase)
+        if order.peek() != event:
+            raise RuntimeError(
+                "FSDP module calls diverged from the expected execution order "
+                f"at position {order.position}: expected {order.peek()}, got {event}."
+            )
+        self.context._consume_prefetch(cast(nn.Module, self))
         prefetched_size = 0
-        offset = 1
-        while next_module is not None and prefetched_size < prefetch_size:
-            fsdp_module = cast(FsdpModule, next_module)
-            fsdp_module._unshard_parameter_groups(self.phase)
+        for offset, next_event in enumerate(order.successors(), start=1):
+            if prefetch_size is not None and prefetched_size >= prefetch_size:
+                break
+            fsdp_module = cast(FsdpModule, next_event.module)
+            if fsdp_module.phase is Phase.RESTING:
+                fsdp_module._unshard_parameter_groups(next_event.phase)
+            else:
+                # The owner's current post hook would otherwise free a prefetched
+                # buffer. Retry after its full reshard, before launching gradient RS.
+                self.context._defer_prefetch(
+                    next_event.module, order.position + offset, next_event.phase
+                )
+            if prefetch_size is None:
+                break
             prefetched_size += fsdp_module.num_parameter_elements
-            offset += 1
-            next_module = order.next_item(offset)
+        order.advance()
 
     def _unshard_parameter_groups(self, phase: Phase | None) -> None:
         """Ask each group to gather missing weights on the all-gather stream."""
@@ -389,6 +401,9 @@ class FsdpModule:
         for group in self._parameter_groups:
             group.reshard_parameters()
         self._release_unsharded_storage()
+        phase = self.context._prefetch_after_reshard(cast(nn.Module, self))
+        if phase is not None:
+            self._unshard_parameter_groups(phase)
 
     def _release_unsharded_storage(self, *, rowwise_only: bool = False) -> None:
         """Select and release gathered storage after the current compute finishes."""

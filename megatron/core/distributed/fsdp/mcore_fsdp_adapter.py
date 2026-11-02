@@ -58,6 +58,7 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
         FsdpContext,
         Placements,
+        PrefetchOrder,
         RuntimePolicy,
         SchedulePolicy,
         ShardLayout,
@@ -730,6 +731,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             construction_context = fully_shard_context(
                 FsdpContext(
                     device=device,
+                    prefetch_order=PrefetchOrder.RECORDED,
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
                     ),
