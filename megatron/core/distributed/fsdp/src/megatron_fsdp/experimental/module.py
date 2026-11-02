@@ -482,11 +482,11 @@ class FsdpModule:
                 if not group.requires_grad:
                     continue
 
-                with torch.cuda.stream(reduce_scatter_stream):
-                    partial_grad = group.allocate_partial_grad_buffer()
-
-                current_stream.wait_stream(reduce_scatter_stream)
+                # Pack on compute without waiting for earlier gradient reductions.
+                # The allocator must keep this storage alive through its RS-stream use.
+                partial_grad = group.allocate_partial_grad_buffer()
                 group.copy_gradients_to_partial_buffer(partial_grad)
+                partial_grad.local_buffer.record_stream(reduce_scatter_stream)
 
                 reduce_scatter_stream.wait_stream(current_stream)
                 with torch.cuda.stream(reduce_scatter_stream):
