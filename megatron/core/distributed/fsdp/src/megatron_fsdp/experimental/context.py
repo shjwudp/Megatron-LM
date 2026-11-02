@@ -200,16 +200,19 @@ class FsdpContext:
         )
 
     def finish_grad_sync(self) -> None:
-        """Wait on submitted gradient reductions.
+        """Finish gradient synchronization and release remaining gathered weights.
 
         Call after all backward work, including delayed weight-gradient computation,
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
+        Join speculative all-gathers before the optimizer can update their source weights.
         """
-        self.current_stream().wait_stream(self.reduce_scatter_stream)
+        current_stream = self.current_stream()
+        current_stream.wait_stream(self.reduce_scatter_stream)
         for module in self._module_names:
             if any(group.is_unsharded for group in module.parameter_groups):
                 module._reshard_parameter_groups()
+        current_stream.wait_stream(self.allgather_stream)
         if self.caller_managed_grad_sync:
             self._finish_execution_order()
 
