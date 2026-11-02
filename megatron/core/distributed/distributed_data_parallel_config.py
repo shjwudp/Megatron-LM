@@ -97,6 +97,9 @@ class DistributedDataParallelConfig:
     megatron_fsdp_version: int = 1
     """Megatron-FSDP implementation version. Valid values are 1 and 2."""
 
+    megatron_fsdp_retain_weights: bool = False
+    """Keep weights across adjacent recorded reshard/unshard pairs in MFSDP v2."""
+
     use_custom_fsdp: bool = False
     """
     NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
@@ -343,6 +346,8 @@ class DistributedDataParallelConfig:
                 )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
+        if self.megatron_fsdp_retain_weights and self.megatron_fsdp_version != 2:
+            raise ValueError("megatron_fsdp_retain_weights requires Megatron-FSDP v2")
 
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."

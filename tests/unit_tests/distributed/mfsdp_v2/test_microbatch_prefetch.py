@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Cross-microbatch prefetch lifetime, collective submission order, and SGD parity.
+"""Cross-microbatch collective counts, optional weight retention, and SGD parity.
 
 These small distributed GPU tests check scheduling and values, not elapsed-time
 overlap. The collective observers delegate to the real distributed operations.
@@ -27,6 +27,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionEvent,
+    Operation,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
@@ -59,11 +60,12 @@ class NestedRoot(nn.Module):
 class RootCollectives:
     """Observe real root collectives and demand without changing their dependencies."""
 
-    def __init__(self, model, context, monkeypatch) -> None:
+    def __init__(self, model, context, monkeypatch, *, retain_weights: bool) -> None:
         self.model = model
         self.context = context
         self.step = 0
         self.microbatch = 0
+        self.retain_weights = retain_weights
         self.events = []
         self.in_root_reduction = False
         (self.group,) = model.parameter_groups
@@ -107,9 +109,9 @@ class RootCollectives:
         self.events.append((kind, self.step, self.microbatch, self.model.phase))
 
     def before_demand(self, module, inputs) -> None:
-        """Check that speculative weights survived the preceding backward cleanup."""
+        """Check that retained weights survived the preceding backward cleanup."""
         self.record("demand")
-        if self.step > 0 and self.microbatch > 0:
+        if self.retain_weights and self.step > 0 and self.microbatch > 0:
             assert Phase.FORWARD in self.group._unshard_events
             assert self.group._unsharded_model_weight.is_allocated
             assert module.weight is self.parameter.unsharded
@@ -119,37 +121,25 @@ class RootCollectives:
         self.record("ready")
 
     def assert_window(self) -> None:
-        """Require real AG-before-tail-RS submissions for each replayed MB transition."""
+        """Retention reuses root weights without gathering at later forward demands."""
         events = [event for event in self.events if event[1] == self.step]
         assert sum(event[0] == "demand" for event in events) == _NUM_MICROBATCHES
         assert sum(event[0] == "ready" for event in events) == _NUM_MICROBATCHES
         assert sum(event[0] == "rs" for event in events) == _NUM_MICROBATCHES
-        assert sum(event[0] == "ag" for event in events) == 2 * _NUM_MICROBATCHES
-        if self.step == 0:
-            # Recording gathers on demand; no speculative next-MB AG is available yet.
+        retaining = self.retain_weights and self.step > 0
+        assert sum(event[0] == "ag" for event in events) == (
+            1 if retaining else 2 * _NUM_MICROBATCHES
+        )
+        if not retaining:
             return
         for mb in range(_NUM_MICROBATCHES - 1):
-            tail_rs = [i for i, event in enumerate(events) if event[0] == "rs" and event[2] == mb]
-            # The deferred next-forward AG is submitted while the owner is
-            # still in backward, before its tail RS and the next root demand.
-            gathers = [
-                i
-                for i, event in enumerate(events)
-                if event[0] == "ag" and event[2] == mb and event[3] is Phase.BACKWARD
-            ]
-            assert len(tail_rs) == 1
-            assert gathers, events
-            gather = gathers[-1]
             next_demand = next(
                 i for i, event in enumerate(events) if event[0] == "demand" and event[2] == mb + 1
             )
-            assert gather < tail_rs[0] < next_demand, events
             next_ready = next(
                 i for i, event in enumerate(events) if event[0] == "ready" and event[2] == mb + 1
             )
             assert next_demand < next_ready, events
-            # Demand must reuse the prefetched weights. Later forward work may
-            # legitimately gather this root's weights for backward.
             assert not any(
                 event[0] == "ag" for event in events[next_demand + 1 : next_ready]
             ), events
@@ -188,7 +178,9 @@ def _assert_owned_values(model, reference, *, gradients: bool) -> None:
     assert seen == set(expected_parameters)
 
 
-def _train_and_compare(distributed_setup, monkeypatch, *, shared: bool) -> None:
+def _train_and_compare(
+    distributed_setup, monkeypatch, *, shared: bool, retain_weights: bool
+) -> None:
     device = distributed_setup.device
     world_size = distributed_setup.world_size
     if world_size < 2:
@@ -206,6 +198,7 @@ def _train_and_compare(distributed_setup, monkeypatch, *, shared: bool) -> None:
             device=device,
             runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
             prefetch_order=PrefetchOrder.RECORDED,
+            retain_weights=retain_weights,
         )
     ) as context:
         fully_shard(model.first, mesh=mesh, placements=placements)
@@ -215,7 +208,7 @@ def _train_and_compare(distributed_setup, monkeypatch, *, shared: bool) -> None:
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     fully_shard_optimizer(optimizer)
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
-    observer = RootCollectives(model, context, monkeypatch)
+    observer = RootCollectives(model, context, monkeypatch, retain_weights=retain_weights)
     torch.manual_seed(5678 + distributed_setup.rank)
     inputs = torch.randn(_NUM_UPDATES, _NUM_MICROBATCHES, 2, width, device=device)
     targets = torch.randn_like(inputs)
@@ -245,20 +238,36 @@ def _train_and_compare(distributed_setup, monkeypatch, *, shared: bool) -> None:
                 # A first backward must not truncate a caller-owned recorded window.
                 assert context.is_recording_execution_order == (step == 0)
 
+            window_order = list(context.execution_order)
             context.finish_grad_sync()
             assert not context.is_recording_execution_order
             assert context.execution_order.position == 0
-            assert not context._deferred_prefetches
             order = list(context.execution_order)
+            assert order == window_order
+            for owner in (model, model.first, model.second):
+                for group in owner.parameter_groups:
+                    assert not group._unshard_events
+                    assert not group._unsharded_model_weight.is_allocated
             if recorded_order is None:
                 recorded_order = order
                 assert order.count(ExecutionEvent(model, Phase.FORWARD)) == _NUM_MICROBATCHES
                 assert order.count(ExecutionEvent(model, Phase.BACKWARD)) == _NUM_MICROBATCHES
+                for phase in (Phase.FORWARD, Phase.BACKWARD):
+                    assert order.count(ExecutionEvent(model, phase, Operation.RESHARD)) == (
+                        _NUM_MICROBATCHES
+                    )
                 assert order.count(ExecutionEvent(model.first, Phase.FORWARD)) == (
                     _NUM_MICROBATCHES * (2 if shared else 1)
                 )
                 # A reused layer accumulates both uses before its one completion hook.
                 assert order.count(ExecutionEvent(model.first, Phase.BACKWARD)) == _NUM_MICROBATCHES
+                assert order.count(
+                    ExecutionEvent(model.first, Phase.FORWARD, Operation.RESHARD)
+                ) == _NUM_MICROBATCHES * (2 if shared else 1)
+                assert (
+                    order.count(ExecutionEvent(model.first, Phase.BACKWARD, Operation.RESHARD))
+                    == _NUM_MICROBATCHES
+                )
             else:
                 assert order == recorded_order
             observer.assert_window()
@@ -284,15 +293,17 @@ def _train_and_compare(distributed_setup, monkeypatch, *, shared: bool) -> None:
         torch.cuda.synchronize(device)
 
 
-def test_nested_root_prefetches_next_microbatch_before_tail_reduce_scatter(
-    distributed_setup, monkeypatch
+@pytest.mark.parametrize("retain_weights", [False, True], ids=["reshard", "retain"])
+def test_nested_root_microbatch_prefetch_preserves_gradients_and_updates(
+    distributed_setup, monkeypatch, retain_weights
 ):
-    """A live root must defer next-MB AG until reshard, then submit it before tail RS."""
-    _train_and_compare(distributed_setup, monkeypatch, shared=False)
+    """Root collective counts follow retention without changing gradients or SGD."""
+    _train_and_compare(distributed_setup, monkeypatch, shared=False, retain_weights=retain_weights)
 
 
+@pytest.mark.parametrize("retain_weights", [False, True], ids=["reshard", "retain"])
 def test_shared_layer_microbatch_prefetch_preserves_gradients_and_updates(
-    distributed_setup, monkeypatch
+    distributed_setup, monkeypatch, retain_weights
 ):
     """Two forward uses of one child preserve accumulated gradients and fresh weights."""
-    _train_and_compare(distributed_setup, monkeypatch, shared=True)
+    _train_and_compare(distributed_setup, monkeypatch, shared=True, retain_weights=retain_weights)

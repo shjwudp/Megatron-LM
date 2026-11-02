@@ -50,8 +50,9 @@ def process_group_collection(distributed_setup, outer_dp_size):
     [(1, "optim_grads_params"), (2, "optim_grads")],
     ids=["zero3", "hybrid_zero2"],
 )
+@pytest.mark.parametrize("retain_weights", [False, True])
 def test_full_iteration_and_optimizer_cuda_graph_match_eager(
-    process_group_collection, outer_dp_size, inner_strategy
+    process_group_collection, outer_dp_size, inner_strategy, retain_weights
 ):
     """Compare graph replay with an otherwise identical eager MFSDP v2 run."""
     eager_config = TransformerConfig(
@@ -76,6 +77,7 @@ def test_full_iteration_and_optimizer_cuda_graph_match_eager(
             ddp_config=DistributedDataParallelConfig(
                 use_megatron_fsdp=True,
                 megatron_fsdp_version=2,
+                megatron_fsdp_retain_weights=retain_weights,
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy=inner_strategy,
                 num_distributed_optimizer_instances=outer_dp_size,
@@ -89,6 +91,7 @@ def test_full_iteration_and_optimizer_cuda_graph_match_eager(
             module=model,
             pg_collection=process_group_collection,
         )
+        assert model.module.context.retain_weights == retain_weights
         optimizer = get_megatron_optimizer(
             OptimizerConfig(
                 optimizer="adam",

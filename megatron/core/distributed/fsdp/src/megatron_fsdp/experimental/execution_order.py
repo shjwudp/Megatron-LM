@@ -14,6 +14,7 @@
 
 """Weak, phase-tagged execution sequences with a sequential cursor."""
 
+import enum
 from collections.abc import Iterable, Iterator
 from typing import NamedTuple
 from weakref import ref
@@ -23,11 +24,19 @@ from torch import nn
 from .phase import Phase
 
 
+class Operation(enum.Enum):
+    """Parameter-lifetime operations recorded during execution."""
+
+    UNSHARD = enum.auto()
+    RESHARD = enum.auto()
+
+
 class ExecutionEvent(NamedTuple):
-    """A module and its compute phase."""
+    """A module operation and the compute phase that requested it."""
 
     module: nn.Module
     phase: Phase
+    operation: Operation = Operation.UNSHARD
 
 
 class ExecutionOrder:
@@ -35,7 +44,7 @@ class ExecutionOrder:
 
     def __init__(self, items: Iterable[ExecutionEvent] = ()) -> None:
         """Create a weak sequence, preserving every repeated occurrence."""
-        self._items: list[tuple[ref[nn.Module], Phase]] = []
+        self._items: list[tuple[ref[nn.Module], Phase, Operation]] = []
         self._position = 0
         for item in items:
             self.append(item)
@@ -47,23 +56,23 @@ class ExecutionOrder:
 
     def append(self, item: ExecutionEvent) -> None:
         """Append an event without consuming it."""
-        self._items.append((ref(item.module), item.phase))
+        self._items.append((ref(item.module), item.phase, item.operation))
 
     def __iter__(self) -> Iterator[ExecutionEvent]:
         """Iterate over live occurrences without retaining their modules."""
-        for module_ref, phase in self._items:
+        for module_ref, phase, operation in self._items:
             module = module_ref()
             if module is not None:
-                yield ExecutionEvent(module, phase)
+                yield ExecutionEvent(module, phase, operation)
 
     def peek(self, offset: int = 0) -> ExecutionEvent | None:
         """Read an event relative to the cursor without wrapping or advancing."""
         index = self._position + offset
         if not 0 <= index < len(self._items):
             return None
-        module_ref, phase = self._items[index]
+        module_ref, phase, operation = self._items[index]
         module = module_ref()
-        return None if module is None else ExecutionEvent(module, phase)
+        return None if module is None else ExecutionEvent(module, phase, operation)
 
     def successors(self) -> Iterator[ExecutionEvent]:
         """Look ahead from the current occurrence without wrapping or advancing."""
@@ -74,8 +83,12 @@ class ExecutionOrder:
 
     def seek(self, event: ExecutionEvent) -> None:
         """Align a best-effort registration order with the current demand call."""
-        for index, (module_ref, phase) in enumerate(self._items):
-            if module_ref() is event.module and phase is event.phase:
+        for index, (module_ref, phase, operation) in enumerate(self._items):
+            if (
+                module_ref() is event.module
+                and phase is event.phase
+                and operation is event.operation
+            ):
                 self._position = index
                 return
         raise RuntimeError("FSDP demand call is absent from the registration order.")

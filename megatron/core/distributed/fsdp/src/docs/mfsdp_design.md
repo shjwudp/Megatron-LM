@@ -267,7 +267,7 @@ teardown. See https://github.com/NVIDIA/Megatron-LM/pull/6230.
 
 ### FsdpContext
 
-Context-wide options are grouped in an immutable `RuntimePolicy`:
+Communication and gradient-synchronization options are grouped in an immutable `RuntimePolicy`:
 
 ```python
 context = FsdpContext(
@@ -286,6 +286,13 @@ with fully_shard_context(context):
 `FsdpContext` arguments. All runtime-policy flags default to `False`. When the caller manages
 gradient synchronization, call `context.finish_grad_sync()` after all backward
 work and before consuming gradients.
+
+Use `prefetch_order=PrefetchOrder.RECORDED` to record module unshard and reshard
+events over the first execution window and prefetch from that trace on replay.
+With `retain_weights=True`, adjacent reshard/unshard events for the same module
+reuse its gathered weights. Retain defaults to off and never crosses an optimizer
+update: `finish_grad_sync()` releases any remaining materialized weights, including
+unused prefetches. MCore exposes this option as `--megatron-fsdp-retain-weights`.
 
 - Pass an `FsdpContext` to `fully_shard_context(context)` to share it with every
   `FsdpModule` constructed in that scope. On exit, the scope finalizes the FSDP roots

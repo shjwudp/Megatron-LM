@@ -18,6 +18,8 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    PrefetchOrder,
+    RuntimePolicy,
     SchedulePolicy,
     fully_shard,
     fully_shard_context,
@@ -185,6 +187,7 @@ def _check_mxfp8_mlp_matches_reference(
     placements,
     num_microbatches,
     shard_layout: ShardLayout = ShardLayout.PADDED,
+    retain_weights: bool = False,
 ):
     """Train an MXFP8 MLP with MFSDP and check its losses track an unsharded reference."""
     device = distributed_setup.device
@@ -194,7 +197,14 @@ def _check_mxfp8_mlp_matches_reference(
         model = _make_mlp(device)
         torch.manual_seed(2026)
         reference = _make_mlp(device)
-    with fully_shard_context(FsdpContext(device=device)) as context:
+    with fully_shard_context(
+        FsdpContext(
+            device=device,
+            prefetch_order=PrefetchOrder.RECORDED,
+            retain_weights=retain_weights,
+            runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
+        )
+    ) as context:
         fully_shard(model, mesh=mesh, placements=placements, shard_layout=shard_layout)
 
     # MLP weights share one quantized group; biases use a regular DBuffer.
@@ -249,6 +259,8 @@ def _check_mxfp8_mlp_matches_reference(
             if model is reference:
                 for parameter in model.parameters():
                     dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
+            else:
+                context.finish_grad_sync()
 
             optimizer.step()
         return losses
@@ -267,7 +279,10 @@ def _check_mxfp8_mlp_matches_reference(
 @pytest.mark.parametrize(
     "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
 )
-def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements, shard_layout):
+@pytest.mark.parametrize("retain_weights", [False, True])
+def test_mxfp8_mlp_training_matches_reference(
+    distributed_setup, placements, shard_layout, retain_weights
+):
     """MXFP8 MLP losses track an independently trained unsharded model.
 
     With ``ShardLayout.UNPADDED`` the two weights (128x64 and 32x128) pack into 12288 elements
@@ -277,7 +292,12 @@ def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements, sha
         pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     _check_mxfp8_mlp_matches_reference(
-        distributed_setup, mesh, placements, num_microbatches=1, shard_layout=shard_layout
+        distributed_setup,
+        mesh,
+        placements,
+        num_microbatches=3,
+        shard_layout=shard_layout,
+        retain_weights=retain_weights,
     )
 
 

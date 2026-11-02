@@ -732,6 +732,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 FsdpContext(
                     device=device,
                     prefetch_order=PrefetchOrder.RECORDED,
+                    retain_weights=ddp_config.megatron_fsdp_retain_weights,
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
                     ),

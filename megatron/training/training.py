@@ -2455,6 +2455,7 @@ def wrap_model_chunks_with_ddp(
         fully_shard_context(
             FsdpContext(
                 prefetch_order=PrefetchOrder.RECORDED,
+                retain_weights=ddp_config.megatron_fsdp_retain_weights,
                 runtime_policy=RuntimePolicy(
                     use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
                 )

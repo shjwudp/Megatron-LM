@@ -3144,6 +3144,9 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--megatron-fsdp-version', type=int, default=1, choices=[1, 2],
                        help='Megatron-FSDP implementation version. Defaults to 1.')
+    group.add_argument('--megatron-fsdp-retain-weights', action='store_true',
+                       help='Megatron-FSDP v2 only: retain weights across adjacent recorded '
+                       'reshard/unshard pairs for the same module.')
     group.add_argument('--no-use-layer-wise-param-layout',
                        action='store_false',
                        dest='use_layer_wise_param_layout',

@@ -11,6 +11,7 @@ from torch import nn
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionEvent,
     ExecutionOrder,
+    Operation,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
@@ -21,11 +22,14 @@ def test_cursor_wraps_across_phases():
     events = [
         ExecutionEvent(first, Phase.FORWARD),
         ExecutionEvent(first, Phase.FORWARD),
+        ExecutionEvent(first, Phase.FORWARD, Operation.RESHARD),
         ExecutionEvent(second, Phase.FORWARD),
         ExecutionEvent(first, Phase.BACKWARD),
         ExecutionEvent(second, Phase.BACKWARD),
         ExecutionEvent(first, Phase.BACKWARD),
     ]
+    assert events[0].operation is Operation.UNSHARD
+    assert events[2].operation is Operation.RESHARD
     order = ExecutionOrder(events)
     for _ in range(2):
         for index, event in enumerate(events):

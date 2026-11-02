@@ -461,6 +461,11 @@ class FsdpParameterGroup:
         )
 
     @property
+    def is_unsharded(self) -> bool:
+        """Whether any compute phase has materialized parameters."""
+        return bool(self._unshard_events)
+
+    @property
     def is_rowwise_unsharded(self) -> bool:
         """Whether MXFP8 rowwise planes occupy temporary gathered storage."""
         buffer = self._unsharded_model_weight

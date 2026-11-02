@@ -97,6 +97,8 @@ def test_context_defaults_to_current_cuda_device(distributed_setup, unify_commun
     )
     assert context.allgather_stream.device == torch.device("cuda", torch.cuda.current_device())
     assert (context.allgather_stream is context.reduce_scatter_stream) == unify_communication_stream
+    with pytest.raises(ValueError, match="RECORDED"):
+        FsdpContext(retain_weights=True)
 
 
 def test_context_rejects_non_cuda_device(distributed_setup):
@@ -195,10 +197,11 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
 def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
     distributed_setup, monkeypatch, caller_managed_grad_sync
 ):
-    """Sibling roots should share one final wait across accumulated microbatches."""
+    """One final wait also releases a prefetched root that never ran."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
+    unused = nn.Linear(4, 4, bias=False).to(device)
 
     with fully_shard_context(
         FsdpContext(
@@ -208,6 +211,10 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
     ) as context:
         fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
+        fully_shard(unused, mesh=mesh, placements=_default_placements())
+
+    (unused_group,) = unused.parameter_groups
+    (unused_parameter,) = unused_group.fsdp_parameters
 
     finish_grad_sync = Mock(wraps=context.finish_grad_sync)
     monkeypatch.setattr(context, "finish_grad_sync", finish_grad_sync)
@@ -215,6 +222,9 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
     with microbatch(context, is_last=False):
         model(torch.ones(2, 4, device=device)).sum().backward()
     finish_grad_sync.assert_not_called()
+    assert Phase.FORWARD in unused_group._unshard_events
+    assert unused_group._unsharded_model_weight.is_allocated
+    assert unused.weight is unused_parameter.unsharded
 
     model(torch.ones(2, 4, device=device)).sum().backward()
 
@@ -222,6 +232,11 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
         finish_grad_sync.assert_not_called()
         context.finish_grad_sync()
     finish_grad_sync.assert_called_once_with()
+    for root in (model.layers[0], model.layers[1], unused):
+        for group in root.parameter_groups:
+            assert not group._unshard_events
+            assert not group._unsharded_model_weight.is_allocated
+    assert unused.weight is unused_parameter.sharded
 
 
 def test_nested_prefetch_orders_use_dfs(distributed_setup):

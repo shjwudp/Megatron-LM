@@ -21,7 +21,7 @@ from weakref import WeakKeyDictionary
 import torch
 from torch import nn
 
-from .execution_order import ExecutionEvent, ExecutionOrder
+from .execution_order import ExecutionEvent, ExecutionOrder, Operation
 from .phase import Phase
 from .runtime_policy import RuntimePolicy
 
@@ -62,6 +62,7 @@ class FsdpContext:
         runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION,
+        retain_weights: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -83,23 +84,24 @@ class FsdpContext:
                 ``finish_grad_sync()`` instead. Subsequent
                 schedules must repeat the trace consistently across data-parallel ranks.
                 Discard the context if recording fails.
+            retain_weights: Skip adjacent recorded reshard/unshard pairs for the same
+                module. Requires ``RECORDED`` order and retains no weights across updates.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         if device.type != "cuda":
             raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
+        if retain_weights and prefetch_order is not PrefetchOrder.RECORDED:
+            raise ValueError("Weight retain requires PrefetchOrder.RECORDED.")
 
         self.is_last_microbatch = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.unify_communication_stream = runtime_policy.unify_communication_stream
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
         self.prefetch_order = prefetch_order
+        self.retain_weights = retain_weights
         self.execution_order = ExecutionOrder()
         self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
-        self._execution_window = 0
-        self._deferred_prefetches: WeakKeyDictionary[nn.Module, tuple[int, int, Phase]] = (
-            WeakKeyDictionary()
-        )
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -205,48 +207,41 @@ class FsdpContext:
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
         self.current_stream().wait_stream(self.reduce_scatter_stream)
+        for module in self._module_names:
+            if any(group.is_unsharded for group in module.parameter_groups):
+                module._reshard_parameter_groups()
         if self.caller_managed_grad_sync:
             self._finish_execution_order()
 
     def _finish_execution_order(self) -> None:
         """Finish recording or validate replay at the execution-window boundary."""
-        if self._deferred_prefetches:
-            raise RuntimeError("FSDP execution ended with an unfinished deferred prefetch.")
         if self._recording_execution_order:
             # A synchronization before any compute must not end recording.
             if self.execution_order.peek() is not None:
                 self._recording_execution_order = False
         elif self.prefetch_order is PrefetchOrder.RECORDED and self.execution_order.position != 0:
             raise RuntimeError("FSDP execution ended before the recorded order was complete.")
-        self._execution_window += 1
 
-    def _defer_prefetch(self, module: nn.Module, position: int, phase: Phase) -> None:
-        """Materialize a future occurrence after this owner's current use releases storage."""
-        pending = self._deferred_prefetches.get(module)
-        if pending is None or position < pending[1]:
-            self._deferred_prefetches[module] = (self._execution_window, position, phase)
-
-    def _consume_prefetch(self, module: nn.Module) -> None:
-        """Cancel a deferred prediction when its occurrence is reached on demand."""
-        pending = self._deferred_prefetches.get(module)
-        if pending is not None and pending[:2] == (
-            self._execution_window,
-            self.execution_order.position,
+    def _record_execution_event(self, event: ExecutionEvent) -> bool:
+        """Record or validate an event; callers advance the cursor after looking ahead."""
+        if (
+            self.prefetch_order is PrefetchOrder.REGISTRATION
+            and event.operation is Operation.RESHARD
         ):
-            del self._deferred_prefetches[module]
-
-    def _prefetch_after_reshard(self, module: nn.Module) -> Phase | None:
-        """Take a still-future prediction without advancing the execution cursor."""
-        pending = self._deferred_prefetches.pop(module, None)
-        if pending is None:
-            return None
-        window, position, phase = pending
-        if window != self._execution_window or position < self.execution_order.position:
-            raise RuntimeError("FSDP deferred prefetch outlived its execution occurrence.")
-        event = self.execution_order.peek(position - self.execution_order.position)
-        if event != ExecutionEvent(module, phase):
-            raise RuntimeError("FSDP deferred prefetch does not match the execution order.")
-        return phase
+            return False
+        if self._recording_execution_order:
+            self.execution_order.append(event)
+            return False
+        if self.execution_order.peek() != event:
+            if self.prefetch_order is PrefetchOrder.REGISTRATION:
+                self.execution_order.seek(event)
+            else:
+                raise RuntimeError(
+                    "FSDP module calls diverged from the expected execution order "
+                    f"at position {self.execution_order.position}: "
+                    f"expected {self.execution_order.peek()}, got {event}."
+                )
+        return True
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""
