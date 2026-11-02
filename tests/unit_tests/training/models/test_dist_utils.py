@@ -6,6 +6,10 @@ import pytest
 import torch
 import torch.nn as nn
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import PrefetchOrder
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
+    current_fully_shard_context,
+)
 from megatron.core.enums import ModelType
 from megatron.core.transformer.module import Float16Module
 from megatron.training.models.dist_utils import (
@@ -378,6 +382,7 @@ class TestDdpWrap:
         mock_fsdp.assert_not_called()
         mock_torch_fsdp.assert_not_called()
 
+    @pytest.mark.parametrize("retain_weights", [None, False, True])
     @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
     @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
@@ -386,16 +391,43 @@ class TestDdpWrap:
     @patch("torch.cuda.current_stream")
     @patch("torch.cuda.Stream")
     def test_uses_megatron_fsdp_when_flagged(
-        self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_ddp, mock_fsdp, mock_torch_fsdp
+        self,
+        mock_stream,
+        mock_curr,
+        mock_ctx,
+        mock_cfg,
+        mock_ddp,
+        mock_fsdp,
+        mock_torch_fsdp,
+        retain_weights,
     ):
         mock_ctx.return_value.__enter__ = Mock(return_value=None)
         mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        self.ddp_config.megatron_fsdp_version = 1 if retain_weights is None else 2
+        self.ddp_config.megatron_fsdp_retain_weights = bool(retain_weights)
+        self.ddp_config.nccl_ub = False
+        contexts = []
+
+        def wrap(**kwargs):
+            context = current_fully_shard_context()
+            if retain_weights is None:
+                assert context is None
+            else:
+                assert context.prefetch_order is PrefetchOrder.RECORDED
+                assert context.retain_weights is retain_weights
+                assert context.caller_managed_grad_sync
+                contexts.append(context)
+            return _make_model_module()
+
+        mock_fsdp.side_effect = wrap
         _ddp_wrap(
             self.model, False, self.ddp_config, False, use_megatron_fsdp=True, pg_collection=self.pg
         )
         assert mock_fsdp.call_count == 2
         mock_ddp.assert_not_called()
         mock_torch_fsdp.assert_not_called()
+        if retain_weights is not None:
+            assert len(contexts) == 2 and contexts[0] is contexts[1]
 
     @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
     @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")

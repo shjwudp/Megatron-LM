@@ -40,6 +40,7 @@ except ImportError:
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    PrefetchOrder,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -312,7 +313,6 @@ def _ddp_wrap(
     else:
         DP = DistributedDataParallel
 
-
     if not use_torch_fsdp2:
         if ddp_config.num_buckets is not None:
             num_parameters = sum(
@@ -390,9 +390,11 @@ def _ddp_wrap(
         construction_context = (
             fully_shard_context(
                 FsdpContext(
+                    prefetch_order=PrefetchOrder.RECORDED,
+                    retain_weights=ddp_config.megatron_fsdp_retain_weights,
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
-                    )
+                    ),
                 )
             )
             if is_mfsdp_v2
