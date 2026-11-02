@@ -75,8 +75,9 @@ class FsdpContext:
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
-            prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
-                registration order. ``RECORDED`` gathers parameters on demand and records
+            prefetch_order: ``REGISTRATION`` uses module registration order as a best-effort
+                prefetch hint, aligning reordered or repeated demand calls with that order.
+                ``RECORDED`` gathers parameters on demand and records
                 module calls until the first ``post_backward()``. With caller-managed
                 gradient synchronization, recording spans the full schedule until
                 ``finish_grad_sync()`` instead. Subsequent
@@ -215,7 +216,7 @@ class FsdpContext:
             # A synchronization before any compute must not end recording.
             if self.execution_order.peek() is not None:
                 self._recording_execution_order = False
-        elif self.execution_order.position != 0:
+        elif self.prefetch_order is PrefetchOrder.RECORDED and self.execution_order.position != 0:
             raise RuntimeError("FSDP execution ended before the recorded order was complete.")
         self._execution_window += 1
 

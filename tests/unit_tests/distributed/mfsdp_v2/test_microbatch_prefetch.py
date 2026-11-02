@@ -99,6 +99,8 @@ class RootCollectives:
         monkeypatch.setattr(self.group, "reduce_partial_gradients", observed_reduce_gradients)
         # Prepend so this observes demand before FSDP's own forward-pre hook.
         self.demand_hook = model.register_forward_pre_hook(self.before_demand, prepend=True)
+        # Append so this marks completion of FSDP's native forward-pre hook.
+        self.ready_hook = model.register_forward_pre_hook(self.after_demand)
 
     def record(self, kind) -> None:
         """Record host submission order and the owner's current lifecycle phase."""
@@ -112,9 +114,15 @@ class RootCollectives:
             assert self.group._unsharded_model_weight.is_allocated
             assert module.weight is self.parameter.unsharded
 
+    def after_demand(self, module, inputs) -> None:
+        """Mark readiness after the native hook has served this root's demand."""
+        self.record("ready")
+
     def assert_window(self) -> None:
         """Require real AG-before-tail-RS submissions for each replayed MB transition."""
         events = [event for event in self.events if event[1] == self.step]
+        assert sum(event[0] == "demand" for event in events) == _NUM_MICROBATCHES
+        assert sum(event[0] == "ready" for event in events) == _NUM_MICROBATCHES
         assert sum(event[0] == "rs" for event in events) == _NUM_MICROBATCHES
         assert sum(event[0] == "ag" for event in events) == 2 * _NUM_MICROBATCHES
         if self.step == 0:
@@ -136,11 +144,14 @@ class RootCollectives:
                 i for i, event in enumerate(events) if event[0] == "demand" and event[2] == mb + 1
             )
             assert gather < tail_rs[0] < next_demand, events
-            # The retained materialization must serve demand without a second AG.
+            next_ready = next(
+                i for i, event in enumerate(events) if event[0] == "ready" and event[2] == mb + 1
+            )
+            assert next_demand < next_ready, events
+            # Demand must reuse the prefetched weights. Later forward work may
+            # legitimately gather this root's weights for backward.
             assert not any(
-                event[0] == "ag" and event[3] is Phase.FORWARD
-                for event in events[next_demand + 1 :]
-                if event[2] == mb + 1
+                event[0] == "ag" for event in events[next_demand + 1 : next_ready]
             ), events
 
 
@@ -269,6 +280,7 @@ def _train_and_compare(distributed_setup, monkeypatch, *, shared: bool) -> None:
                 assert torch.count_nonzero(parameter.detach() - before[name]) > 0, name
     finally:
         observer.demand_hook.remove()
+        observer.ready_hook.remove()
         torch.cuda.synchronize(device)
 
 

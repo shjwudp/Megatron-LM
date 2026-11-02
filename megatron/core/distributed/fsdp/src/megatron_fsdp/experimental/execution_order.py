@@ -72,6 +72,14 @@ class ExecutionOrder:
             yield event
             offset += 1
 
+    def seek(self, event: ExecutionEvent) -> None:
+        """Align a best-effort registration order with the current demand call."""
+        for index, (module_ref, phase) in enumerate(self._items):
+            if module_ref() is event.module and phase is event.phase:
+                self._position = index
+                return
+        raise RuntimeError("FSDP demand call is absent from the registration order.")
+
     def advance(self) -> None:
         """Consume one occurrence and automatically wrap at the end of the trace."""
         if not self._items:

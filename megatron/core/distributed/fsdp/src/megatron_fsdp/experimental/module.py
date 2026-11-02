@@ -29,7 +29,7 @@ from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .context import FsdpContext
+from .context import FsdpContext, PrefetchOrder
 from .countdown import Countdown
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .module_utils import get_parameter_owner, is_in_backward
@@ -342,10 +342,13 @@ class FsdpModule:
         """Validate the current event, prefetch successors, and advance once."""
         event = ExecutionEvent(cast(nn.Module, self), phase)
         if order.peek() != event:
-            raise RuntimeError(
-                "FSDP module calls diverged from the expected execution order "
-                f"at position {order.position}: expected {order.peek()}, got {event}."
-            )
+            if self.context.prefetch_order is PrefetchOrder.REGISTRATION:
+                order.seek(event)
+            else:
+                raise RuntimeError(
+                    "FSDP module calls diverged from the expected execution order "
+                    f"at position {order.position}: expected {order.peek()}, got {event}."
+                )
         self.context._consume_prefetch(cast(nn.Module, self))
         prefetched_size = 0
         for offset, next_event in enumerate(order.successors(), start=1):
@@ -354,7 +357,7 @@ class FsdpModule:
             fsdp_module = cast(FsdpModule, next_event.module)
             if fsdp_module.phase is Phase.RESTING:
                 fsdp_module._unshard_parameter_groups(next_event.phase)
-            else:
+            elif self.context.prefetch_order is PrefetchOrder.RECORDED:
                 # The owner's current post hook would otherwise free a prefetched
                 # buffer. Retry after its full reshard, before launching gradient RS.
                 self.context._defer_prefetch(
