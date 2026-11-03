@@ -15,7 +15,9 @@
 """Shared runtime state for Megatron-FSDP modules."""
 
 import enum
+from collections import deque
 from collections.abc import Callable
+from typing import NamedTuple
 from weakref import WeakKeyDictionary
 
 import torch
@@ -31,6 +33,14 @@ class PrefetchOrder(enum.Enum):
 
     REGISTRATION = enum.auto()
     RECORDED = enum.auto()
+
+
+class _GradBufferBatch(NamedTuple):
+    """Inputs and their last-consumer event, owned by the allocation stream."""
+
+    buffers: tuple[torch.Tensor, ...]
+    done: torch.cuda.Event
+    allocation_stream: torch.cuda.Stream
 
 
 class FsdpContext:
@@ -103,6 +113,7 @@ class FsdpContext:
         self.execution_order = ExecutionOrder()
         self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
+        self._pending_grad_buffers: deque[_GradBufferBatch] = deque()
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
         ] = []
@@ -209,6 +220,7 @@ class FsdpContext:
         """
         current_stream = self.current_stream()
         current_stream.wait_stream(self.reduce_scatter_stream)
+        self._release_grad_buffers()
         for module in self._module_names:
             # Delayed wgrad can keep an owner active after autograd has finished.
             if module.phase is Phase.RESTING and any(
@@ -218,6 +230,22 @@ class FsdpContext:
         current_stream.wait_stream(self.allgather_stream)
         if self.caller_managed_grad_sync:
             self._finish_execution_order()
+
+    def _retain_grad_buffers(
+        self, buffers: list[torch.Tensor], allocation_stream: torch.cuda.Stream
+    ) -> None:
+        """Keep a module's inputs alive through all reduction and local accumulation work."""
+        if buffers:
+            done = self.reduce_scatter_stream.record_event()
+            self._pending_grad_buffers.append(
+                _GradBufferBatch(tuple(buffers), done, allocation_stream)
+            )
+
+    def _release_grad_buffers(self, *, keep: int = 0) -> None:
+        """Order storage reuse on its allocation stream before dropping references."""
+        while len(self._pending_grad_buffers) > keep:
+            batch = self._pending_grad_buffers.popleft()
+            batch.allocation_stream.wait_event(batch.done)
 
     def _finish_execution_order(self) -> None:
         """Finish recording or validate replay at the execution-window boundary."""

@@ -469,21 +469,25 @@ class FsdpModule:
             reduce_scatter_stream = context.reduce_scatter_stream
             current_stream = context.current_stream()
 
-            for group in self._parameter_groups:
-                if not group.requires_grad:
-                    continue
-
-                with torch.cuda.stream(reduce_scatter_stream):
+            groups = [group for group in self._parameter_groups if group.requires_grad]
+            if not groups:
+                return
+            # One retained module plus this module bounds staging to two batches.
+            context._release_grad_buffers(keep=1)
+            buffers = []
+            try:
+                for group in groups:
                     partial_grad = group.allocate_partial_grad_buffer()
+                    buffers.append(partial_grad.local_buffer)
+                    group.copy_gradients_to_partial_buffer(partial_grad)
 
-                current_stream.wait_stream(reduce_scatter_stream)
-                group.copy_gradients_to_partial_buffer(partial_grad)
-
-                reduce_scatter_stream.wait_stream(current_stream)
-                with torch.cuda.stream(reduce_scatter_stream):
-                    group.reduce_partial_gradients(
-                        partial_grad, is_last_microbatch=self.context.is_last_microbatch
-                    )
+                    reduce_scatter_stream.wait_stream(current_stream)
+                    with torch.cuda.stream(reduce_scatter_stream):
+                        group.reduce_partial_gradients(
+                            partial_grad, is_last_microbatch=context.is_last_microbatch
+                        )
+            finally:
+                context._retain_grad_buffers(buffers, current_stream)
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
