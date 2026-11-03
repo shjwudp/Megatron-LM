@@ -393,8 +393,11 @@ def _ddp_wrap(
                     prefetch_order=PrefetchOrder.RECORDED,
                     retain_weights=ddp_config.megatron_fsdp_retain_weights,
                     runtime_policy=RuntimePolicy(
-                        use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
+                        use_symmetric_memory=ddp_config.nccl_ub,
+                        caller_managed_grad_sync=True,
+                        memory_aware_prefetch=ddp_config.megatron_fsdp_memory_aware_prefetch,
                     ),
+                    prefetch_process_group=pg_collection.dp_cp,
                 )
             )
             if is_mfsdp_v2

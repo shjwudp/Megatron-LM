@@ -382,7 +382,10 @@ class TestDdpWrap:
         mock_fsdp.assert_not_called()
         mock_torch_fsdp.assert_not_called()
 
-    @pytest.mark.parametrize("retain_weights", [None, False, True])
+    @pytest.mark.parametrize(
+        "retain_weights,memory_aware_prefetch",
+        [(None, False), (False, False), (True, False), (True, True)],
+    )
     @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
     @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
@@ -400,11 +403,13 @@ class TestDdpWrap:
         mock_fsdp,
         mock_torch_fsdp,
         retain_weights,
+        memory_aware_prefetch,
     ):
         mock_ctx.return_value.__enter__ = Mock(return_value=None)
         mock_ctx.return_value.__exit__ = Mock(return_value=False)
         self.ddp_config.megatron_fsdp_version = 1 if retain_weights is None else 2
         self.ddp_config.megatron_fsdp_retain_weights = bool(retain_weights)
+        self.ddp_config.megatron_fsdp_memory_aware_prefetch = memory_aware_prefetch
         self.ddp_config.nccl_ub = False
         contexts = []
 
@@ -416,6 +421,8 @@ class TestDdpWrap:
                 assert context.prefetch_order is PrefetchOrder.RECORDED
                 assert context.retain_weights is retain_weights
                 assert context.caller_managed_grad_sync
+                assert context.memory_aware_prefetch is memory_aware_prefetch
+                assert context._prefetch_process_group is self.pg.dp_cp
                 contexts.append(context)
             return _make_model_module()
 
