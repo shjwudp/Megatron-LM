@@ -1029,6 +1029,12 @@ def validate_args(args, defaults={}):
     if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
         raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
 
+    if getattr(args, 'megatron_fsdp_memory_aware_prefetch', False):
+        if not args.use_megatron_fsdp or args.megatron_fsdp_version != 2:
+            raise ValueError('--megatron-fsdp-memory-aware-prefetch requires Megatron-FSDP v2')
+        if args.cuda_graph_impl == 'full_iteration' and args.cuda_graph_warmup_steps < 2:
+            raise ValueError('Memory-aware prefetch requires at least two eager warmup iterations')
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -3147,6 +3153,9 @@ def _add_distributed_args(parser):
     group.add_argument('--megatron-fsdp-retain-weights', action='store_true',
                        help='Megatron-FSDP v2 only: retain weights across adjacent recorded '
                        'reshard/unshard pairs for the same module.')
+    group.add_argument('--megatron-fsdp-memory-aware-prefetch', action='store_true',
+                       help='Megatron-FSDP v2 only: record per-event GPU memory and choose '
+                       'prefetches from the available headroom. Requires two eager warmup iterations.')
     group.add_argument('--no-use-layer-wise-param-layout',
                        action='store_false',
                        dest='use_layer_wise_param_layout',

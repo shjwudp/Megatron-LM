@@ -87,6 +87,24 @@ fsdp_model.load_state_dict(ckpt["model"], strict=False)
 optimizer.load_state_dict(ckpt["optimizer"])
 ```
 
+### Recorded memory-aware prefetch (experimental v2)
+
+Enable `--megatron-fsdp-memory-aware-prefetch` with `--megatron-fsdp-version 2` to
+choose a separate prefetch budget for each recorded execution occurrence. The
+first two eager iterations record the schedule and calibrate memory under the
+existing retain/prefetch policy. The learned plan can prefetch at unshard and
+completed backward-reshard points, including across microbatch boundaries.
+
+The plan uses the scheduling group's minimum free-memory headroom, reserves at
+least 1 GiB and 10% of free space, and accounts for gathered buffers and MXFP8
+scale copies. It never fetches an active module or crosses a future reshard of
+the target. Existing positive prefetch limits remain caps; zero disables
+prefetching. CUDA Graph capture requires at least two eager warmup iterations and
+then replays the fixed plan. The flag is disabled by default.
+
+Library users enable `RuntimePolicy(memory_aware_prefetch=True)` on a recorded
+`FsdpContext` and supply its explicit `prefetch_process_group`.
+
 ## ⚙️ `fully_shard` / `MegatronFSDP` API - Advanced Features
 
 Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fine-tuning your model's performance.

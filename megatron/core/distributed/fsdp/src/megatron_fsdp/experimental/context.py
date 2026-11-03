@@ -15,15 +15,19 @@
 """Shared runtime state for Megatron-FSDP modules."""
 
 import enum
+import hashlib
 from collections import deque
 from collections.abc import Callable
 from typing import NamedTuple
 from weakref import WeakKeyDictionary
 
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.distributed import ProcessGroup
 
 from .execution_order import ExecutionEvent, ExecutionOrder, Operation
+from .memory_prefetch import MemorySnapshot, compile_prefetch_plan
 from .phase import Phase
 from .runtime_policy import RuntimePolicy
 
@@ -73,6 +77,7 @@ class FsdpContext:
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION,
         retain_weights: bool = False,
+        prefetch_process_group: ProcessGroup | None = None,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -96,6 +101,8 @@ class FsdpContext:
                 Discard the context if recording fails.
             retain_weights: Skip adjacent recorded reshard/unshard pairs for the same
                 module. Requires ``RECORDED`` order and retains no weights across updates.
+            prefetch_process_group: Ranks sharing the recorded schedule. Required for
+                memory-aware prefetch, so its budgets and collective order agree.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -103,6 +110,12 @@ class FsdpContext:
             raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
         if retain_weights and prefetch_order is not PrefetchOrder.RECORDED:
             raise ValueError("Weight retain requires PrefetchOrder.RECORDED.")
+        if runtime_policy.memory_aware_prefetch and (
+            prefetch_order is not PrefetchOrder.RECORDED or prefetch_process_group is None
+        ):
+            raise ValueError(
+                "Memory-aware prefetch requires RECORDED order and a prefetch_process_group."
+            )
 
         self.is_last_microbatch = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
@@ -110,6 +123,14 @@ class FsdpContext:
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
         self.prefetch_order = prefetch_order
         self.retain_weights = retain_weights
+        self.memory_aware_prefetch = runtime_policy.memory_aware_prefetch
+        self._prefetch_process_group = prefetch_process_group
+        self._event_memory: list[MemorySnapshot] = []
+        # Record once, calibrate with baseline retain/prefetch, then freeze before capture.
+        self._memory_profile_pass = 0
+        self._memory_events_in_iteration = 0
+        self._memory_prefetch_plan: tuple[tuple[int, ...], ...] | None = None
+        self._memory_prefetch_budgets: list[int] = []
         self.execution_order = ExecutionOrder()
         self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
@@ -276,6 +297,91 @@ class FsdpContext:
                 self._recording_execution_order = False
         elif self.prefetch_order is PrefetchOrder.RECORDED and self.execution_order.position != 0:
             raise RuntimeError("FSDP execution ended before the recorded order was complete.")
+        if self.memory_aware_prefetch and self._memory_events_in_iteration:
+            if self._memory_events_in_iteration != len(self.execution_order):
+                raise RuntimeError("The memory profile did not cover the complete execution order.")
+            if self._memory_profile_pass == 1:
+                self._compile_memory_prefetch_plan()
+            self._memory_profile_pass += 1
+            self._memory_events_in_iteration = 0
+
+    def _sample_memory(self) -> MemorySnapshot:
+        """Sample only during the two eager profiling iterations."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Memory-aware prefetch requires two eager iterations before CUDA graph capture."
+            )
+        device = self.allgather_stream.device
+        free, total = torch.cuda.mem_get_info(device)
+        return MemorySnapshot(
+            torch.cuda.memory_allocated(device), torch.cuda.memory_reserved(device), free, total
+        )
+
+    def _record_memory(self, position: int) -> None:
+        """Keep separate samples for repeated module occurrences, not just module names."""
+        if self._memory_profile_pass >= 2:
+            return
+        sample = self._sample_memory()
+        if position == len(self._event_memory):
+            self._event_memory.append(sample)
+        else:
+            self._event_memory[position] = sample
+        self._memory_events_in_iteration += 1
+
+    def _compile_memory_prefetch_plan(self) -> None:
+        """Use common headroom and conservative costs on the explicit scheduling group."""
+        events = list(self.execution_order)
+        modules = list(dict.fromkeys(event.module for event in events))
+        indices = {module: index for index, module in enumerate(modules)}
+        metadata = {module: module.prefetch_memory for module in modules}
+        signature = repr(
+            (
+                [(indices[e.module], e.phase.name, e.operation.name) for e in events],
+                [
+                    (m.forward_limit, m.backward_limit, m.backward_all_planes)
+                    for m in metadata.values()
+                ],
+                [module.name for module in modules],
+                self.retain_weights,
+            )
+        )
+        digest = int.from_bytes(hashlib.sha256(signature.encode()).digest()[:8], "little")
+        digest &= (1 << 62) - 1
+        header = torch.tensor(
+            [len(events), -len(events), len(modules), -len(modules), digest, -digest],
+            dtype=torch.int64,
+            device=self.allgather_stream.device,
+        )
+        dist.all_reduce(header, op=dist.ReduceOp.MIN, group=self._prefetch_process_group)
+        values = header.tolist()
+        if any(values[i] != -values[i + 1] for i in range(0, len(values), 2)):
+            raise RuntimeError("Memory-aware prefetch schedules differ across ranks.")
+
+        # Driver-free memory excludes allocator caches and non-PyTorch allocations.
+        # Reserve at least 1 GiB and ten percent of this measured free space.
+        headroom = [
+            max(0, sample.free_bytes - max(1 << 30, sample.free_bytes // 10))
+            for sample in self._event_memory
+        ]
+        payload = headroom + [
+            -value
+            for info in metadata.values()
+            for value in (info.buffer_bytes, info.parameter_elements, int(not info.shared_phases))
+        ]
+        common = torch.tensor(payload, dtype=torch.int64, device=self.allgather_stream.device)
+        dist.all_reduce(common, op=dist.ReduceOp.MIN, group=self._prefetch_process_group)
+        values = common.tolist()
+        self._memory_prefetch_budgets = values[: len(events)]
+        for index, module in enumerate(modules):
+            offset = len(events) + 3 * index
+            metadata[module] = metadata[module]._replace(
+                buffer_bytes=-values[offset],
+                parameter_elements=-values[offset + 1],
+                shared_phases=not bool(-values[offset + 2]),
+            )
+        self._memory_prefetch_plan = compile_prefetch_plan(
+            events, self._memory_prefetch_budgets, metadata, self.retain_weights
+        )
 
     def _record_execution_event(self, event: ExecutionEvent) -> bool:
         """Record or validate an event; callers advance the cursor after looking ahead."""
@@ -286,6 +392,8 @@ class FsdpContext:
             return False
         if self._recording_execution_order:
             self.execution_order.append(event)
+            if self.memory_aware_prefetch:
+                self._record_memory(len(self.execution_order) - 1)
             return False
         if self.execution_order.peek() != event:
             if self.prefetch_order is PrefetchOrder.REGISTRATION:
@@ -296,6 +404,8 @@ class FsdpContext:
                     f"at position {self.execution_order.position}: "
                     f"expected {self.execution_order.peek()}, got {event}."
                 )
+        if self.memory_aware_prefetch:
+            self._record_memory(self.execution_order.position)
         return True
 
     def post_backward(self) -> None:

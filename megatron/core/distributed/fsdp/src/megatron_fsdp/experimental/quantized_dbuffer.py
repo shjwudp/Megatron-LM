@@ -15,6 +15,7 @@
 """Transformer Engine MXFP8 distributed buffers composed from physical planes."""
 
 import functools
+import math
 from collections.abc import Iterable
 
 import torch
@@ -261,6 +262,19 @@ class QuantizedDBuffer:
     def is_columnwise_allocated(self) -> bool:
         """Whether columnwise data and scales are allocated."""
         return self.columnwise_data.is_allocated and self.columnwise_scale.is_allocated
+
+    @property
+    def storage_size_bytes(self) -> int:
+        """Bound both physical planes and TE's independently padded scale copies."""
+        size = sum(
+            buffer.local_buffer.numel() * buffer.local_buffer.element_size()
+            for buffer in self.planes_for(rowwise=True, columnwise=True)
+        )
+        quantizer = _get_quantizer(rowwise=True, columnwise=True)
+        for shape in self.rowwise_data.layout.tensor_shapes:
+            for columnwise in (False, True):
+                size += math.prod(quantizer.get_scale_shape(shape, columnwise=columnwise))
+        return size
 
     def get_tensor_view(self, index: int) -> MXFP8Tensor:
         """Return a compact, unswizzled MXFP8 view that aliases every allocated plane pair.

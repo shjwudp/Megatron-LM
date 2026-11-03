@@ -31,7 +31,9 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
+from .dbuffer import DBuffer
 from .execution_order import ExecutionEvent, Operation
+from .memory_prefetch import PrefetchMemory
 from .module_utils import get_parameter_owner, is_in_backward
 from .parameter_group import (
     FsdpParameter,
@@ -302,6 +304,8 @@ class FsdpModule:
         before this when ``self.is_root()``; the automatic forward path
         performs that root sync in ``pre_forward()`` immediately before this.
         """
+        if prefetch and phase not in (Phase.FORWARD, Phase.BACKWARD):
+            raise ValueError("Prefetching requires a FORWARD or BACKWARD phase.")
         with self._nvtx_range("unshard"):
             compute_stream = self.context.current_stream()
             if prefetch and phase is Phase.FORWARD and cast(nn.Module, self).training:
@@ -313,12 +317,17 @@ class FsdpModule:
                 for group in self._parameter_groups:
                     group.wait_for_unshard(phase)
 
-            if not prefetch:
+            if not prefetch or not cast(nn.Module, self).training:
                 return
             self.prefetch(phase)
 
-    def prefetch(self, phase: Phase) -> None:
-        """Record a compute event or prefetch its successors in the selected order."""
+    def prefetch(self, phase: Phase, *, position: int | None = None) -> None:
+        """Record an unshard and prefetch successors, or apply a completed event's plan.
+
+        The normal call records and consumes this module's unshard occurrence.
+        ``position`` instead names an already-consumed backward reshard occurrence;
+        post_backward uses it after this module has become resting.
+        """
         match phase:
             case Phase.FORWARD:
                 budget = self._schedule_policy.forward_prefetch_size
@@ -333,10 +342,22 @@ class FsdpModule:
             # Evaluation has a different (forward-only) schedule. Gather on demand
             # without modifying the training trace or its cursor.
             return
-        event = ExecutionEvent(cast(nn.Module, self), phase)
-        if not context._record_execution_event(event):
-            return
         order = context.execution_order
+        current_event = position is None
+        if current_event:
+            if not context._record_execution_event(ExecutionEvent(cast(nn.Module, self), phase)):
+                return
+            position = order.position
+        if context._memory_prefetch_plan is not None:
+            for target in context._memory_prefetch_plan[position]:
+                successor = order.peek(target - order.position)
+                fsdp_module = cast(FsdpModule, successor.module)
+                if fsdp_module.phase is not Phase.RESTING:
+                    raise RuntimeError("A recorded memory prefetch target is still active.")
+                fsdp_module._unshard_parameter_groups(successor.phase)
+            if current_event:
+                order.advance()
+            return
         prefetched_size = 0
         for next_event in order.successors():
             if next_event.operation is Operation.RESHARD:
@@ -349,7 +370,8 @@ class FsdpModule:
             if budget is None:
                 break
             prefetched_size += fsdp_module.num_parameter_elements
-        order.advance()
+        if current_event:
+            order.advance()
 
     def _unshard_parameter_groups(self, phase: Phase | None) -> None:
         """Ask each group to gather missing weights on the all-gather stream."""
@@ -458,10 +480,13 @@ class FsdpModule:
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
+        position = self.context.execution_order.position
         self.reshard()
         self.context.validate_grad_sync()
         self._reduce_gradient_groups()
         self.phase = Phase.RESTING
+        if self.context._memory_prefetch_plan is not None:
+            self.prefetch(Phase.BACKWARD, position=position)
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
@@ -503,6 +528,22 @@ class FsdpModule:
             parameter.unsharded.numel()
             for group in self._parameter_groups
             for parameter in group.fsdp_parameters
+        )
+
+    @property
+    def prefetch_memory(self) -> PrefetchMemory:
+        """Describe a full materialization without allocating any gathered storage."""
+        return PrefetchMemory(
+            buffer_bytes=sum(group.unshard_storage_size for group in self._parameter_groups),
+            parameter_elements=self.num_parameter_elements,
+            shared_phases=all(
+                isinstance(group._unsharded_model_weight, DBuffer)
+                or group._unsharded_model_weight is group.model_weight
+                for group in self._parameter_groups
+            ),
+            backward_all_planes=self._schedule_policy.unshard_all_planes_in_backward,
+            forward_limit=self._schedule_policy.forward_prefetch_size,
+            backward_limit=self._schedule_policy.backward_prefetch_size,
         )
 
     def _nvtx_label(self, operation: str) -> str:

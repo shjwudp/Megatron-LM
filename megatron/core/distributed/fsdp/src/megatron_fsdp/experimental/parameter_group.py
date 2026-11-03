@@ -466,6 +466,16 @@ class FsdpParameterGroup:
         return bool(self._unshard_events)
 
     @property
+    def unshard_storage_size(self) -> int:
+        """Conservative bytes for materializing every phase, excluding persistent weights."""
+        buffer = self._unsharded_model_weight
+        if buffer is self.model_weight:
+            return 0
+        if isinstance(buffer, DBuffer):
+            return buffer.local_buffer.numel() * buffer.local_buffer.element_size()
+        return buffer.storage_size_bytes
+
+    @property
     def is_rowwise_unsharded(self) -> bool:
         """Whether MXFP8 rowwise planes occupy temporary gathered storage."""
         buffer = self._unsharded_model_weight

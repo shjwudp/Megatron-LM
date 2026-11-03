@@ -30,8 +30,11 @@ class RuntimePolicy:
             while retaining automatic weight cleanup. The caller must call
             finish_grad_sync() after all backward work, including delayed weight
             gradients, and before reading or modifying gradients.
+        memory_aware_prefetch: Use two eager iterations to record execution and
+            memory, then choose per-occurrence prefetches from the recorded headroom.
     """
 
     use_symmetric_memory: bool = False
     unify_communication_stream: bool = False
     caller_managed_grad_sync: bool = False
+    memory_aware_prefetch: bool = False

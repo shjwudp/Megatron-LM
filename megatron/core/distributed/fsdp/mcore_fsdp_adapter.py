@@ -734,11 +734,19 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     prefetch_order=PrefetchOrder.RECORDED,
                     retain_weights=ddp_config.megatron_fsdp_retain_weights,
                     runtime_policy=RuntimePolicy(
-                        use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
+                        use_symmetric_memory=ddp_config.nccl_ub,
+                        caller_managed_grad_sync=True,
+                        memory_aware_prefetch=ddp_config.megatron_fsdp_memory_aware_prefetch,
                     ),
+                    prefetch_process_group=pg_collection.dp_cp,
                 )
             )
         else:
+            if (
+                ddp_config.megatron_fsdp_memory_aware_prefetch
+                and not active_context.memory_aware_prefetch
+            ):
+                raise ValueError("The ambient FsdpContext must enable memory-aware prefetch.")
             if not active_context.caller_managed_grad_sync:
                 raise ValueError(
                     "MCore MFSDP v2 requires shared contexts to be constructed with "
