@@ -2458,7 +2458,8 @@ def wrap_model_chunks_with_ddp(
                 retain_weights=ddp_config.megatron_fsdp_retain_weights,
                 runtime_policy=RuntimePolicy(
                     use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
-                )
+                ),
+                prefetch_process_group=pg_collection.dp_cp if pg_collection is not None else None,
             )
         )
         if is_mfsdp_v2
