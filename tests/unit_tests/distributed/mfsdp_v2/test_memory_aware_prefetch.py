@@ -240,14 +240,24 @@ def test_occurrence_budgets_use_rank_consensus_and_preserve_sgd(
             dist.all_reduce(parameter.grad, group=mesh.get_group(0))
             parameter.grad.div_(setup.world_size)
         actual = _train(model, context, optimizer, inputs[step])
-        # ZeRO-3 uses AG/RS, so any all-reduce here would be an extra control collective.
+        # Retirement consensus is required even with memory planning disabled.
+        # Only its first recording may add control collectives; replay must not.
+        control_collectives = []
+        all_reduce = dist.all_reduce
         with monkeypatch.context() as guard:
 
-            def unexpected_all_reduce(*args, **kwargs):
-                raise AssertionError("Disabled memory planning added an all-reduce.")
+            def observe_all_reduce(*args, **kwargs):
+                control_collectives.append((kwargs.get("op"), kwargs.get("group")))
+                return all_reduce(*args, **kwargs)
 
-            guard.setattr(dist, "all_reduce", unexpected_all_reduce)
+            guard.setattr(dist, "all_reduce", observe_all_reduce)
             baseline = _train(disabled, disabled_context, disabled_optimizer, inputs[step])
+        expected_collectives = (
+            [(dist.ReduceOp.MIN, mesh.get_group(0)), (dist.ReduceOp.MAX, mesh.get_group(0))]
+            if step == 0
+            else []
+        )
+        assert control_collectives == expected_collectives
         assert disabled_context._memory_profile_pass == 0
         assert disabled_context._memory_prefetch_plan is None
         torch.testing.assert_close(actual[0], torch.stack(losses), rtol=1e-5, atol=1e-6)

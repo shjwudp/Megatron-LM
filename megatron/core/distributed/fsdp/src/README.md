@@ -105,6 +105,13 @@ then replays the fixed plan. The flag is disabled by default.
 Library users enable `RuntimePolicy(memory_aware_prefetch=True)` on a recorded
 `FsdpContext` and supply its explicit `prefetch_process_group`.
 
+Recorded gradient-input retirement also uses this group, independently of the
+memory-aware prefetch flag. After the first eager recording, ranks agree on each
+input's latest observed forward retirement occurrence. Inputs without a forward
+retirement on every rank stay alive until backward or gradient synchronization.
+Replay uses producer identities and fixed occurrences, without event queries or
+new collectives. Without an explicit group, forward retirement is disabled.
+
 ## ⚙️ `fully_shard` / `MegatronFSDP` API - Advanced Features
 
 Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fine-tuning your model's performance.

@@ -60,6 +60,7 @@ def test_grad_buffer_lifetime_matches_reference(distributed_setup, monkeypatch, 
         FsdpContext(
             device=device,
             prefetch_order=PrefetchOrder.RECORDED,
+            prefetch_process_group=mesh.get_group(0),
             runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
         )
     ) as context:
@@ -202,6 +203,7 @@ def test_forward_release_replays_the_recorded_occurrence(distributed_setup, monk
         FsdpContext(
             device=device,
             prefetch_order=PrefetchOrder.RECORDED,
+            prefetch_process_group=mesh.get_group(0),
             runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
         )
     ) as context:
@@ -228,27 +230,38 @@ def test_forward_release_replays_the_recorded_occurrence(distributed_setup, monk
         return ref(source)
 
     with torch.cuda.stream(stream):
+        context.allgather_stream.wait_stream(stream)
         model.unshard(Phase.FORWARD, prefetch=True)
     source_ref = submit()
     context._pending_grad_buffers[0].done.synchronize()
     with torch.cuda.stream(stream):
+        context.allgather_stream.wait_stream(stream)
         model.unshard(Phase.FORWARD, prefetch=True)
         context.finish_grad_sync()
     assert source_ref() is None
-    assert context._grad_buffer_release_plan == {1: 1}
+    assert context._grad_buffer_release_plan == {1: (0,)}
 
     def unexpected_query(event):
         raise AssertionError("Replay must use the recorded plan, not query events")
 
     monkeypatch.setattr(torch.cuda.Event, "query", unexpected_query)
+
+    def unexpected_collective(*args, **kwargs):
+        raise AssertionError("Replay must not compile another retirement plan")
+
+    monkeypatch.setattr(dist, "all_reduce", unexpected_collective)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        source_ref = submit()
+        context.allgather_stream.wait_stream(stream)
         model.unshard(Phase.FORWARD, prefetch=True)
+        source_ref = submit()
+        assert context._pending_grad_buffers[0].position == 0
         assert source_ref() is not None
+        context.allgather_stream.wait_stream(stream)
         model.unshard(Phase.FORWARD, prefetch=True)
         assert source_ref() is None
         assert not context._pending_grad_buffers
+        context.finish_grad_sync()
         replacement = torch.empty_like(result)
         replacement.fill_(-9.0)
     for _ in range(3):
