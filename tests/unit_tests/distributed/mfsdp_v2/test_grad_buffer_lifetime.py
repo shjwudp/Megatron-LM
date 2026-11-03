@@ -76,6 +76,9 @@ def test_te_fused_gradients_match_reference(
     class Projection(nn.Module):
         def __init__(self):
             super().__init__()
+            # Keep a second compute dtype in this owner so fused TE outputs and
+            # ordinary gradients share one module-level reduction/lifetime batch.
+            self.bias32 = nn.Parameter(torch.zeros(64, dtype=torch.float32, device=device))
             if kind == "linear":
                 self.proj = te.Linear(
                     64,
@@ -91,23 +94,49 @@ def test_te_fused_gradients_match_reference(
                 )
             else:
                 self.proj = GroupedLinear(
-                    2, 64, 64, dtype=torch.bfloat16, device=device, accumulate_into_main_grad=True
+                    2,
+                    64,
+                    64,
+                    dtype=torch.bfloat16,
+                    device="meta" if quantized else device,
+                    accumulate_into_main_grad=True,
+                    single_grouped_weight=False,
+                    single_grouped_bias=False,
                 )
-            self.register_buffer("splits", torch.tensor([16, 16], device=device))
+                if quantized:
+                    # Follow TEGroupedMLP._make_fused_ops: classic TE owns primary
+                    # parameters and their preserved FP32 initialization; the ops
+                    # shell uses those same objects rather than reinitializing them.
+                    initialized = te.GroupedLinear(
+                        2,
+                        64,
+                        64,
+                        params_dtype=torch.bfloat16,
+                        device=device,
+                        fuse_wgrad_accumulation=True,
+                        single_grouped_weight=False,
+                        single_grouped_bias=False,
+                    )
+                    self.proj.register_parameter("weight", None)
+                    self.proj.register_parameter("bias", None)
+                    for name, parameter in initialized.named_parameters(recurse=False):
+                        self.proj.register_parameter(name, parameter)
+            # MXFP8 columnwise quantization uses 32-row blocks per group.
+            self.register_buffer("splits", torch.tensor([32, 32], device=device))
             if kind != "grouped" and not delayed:
                 self.proj.weight.zero_out_wgrad = True
 
         def forward(self, value):
             if kind == "grouped":
-                return self.proj(value, self.splits)
-            if delayed:
-                return self.proj(value)
-            # Two uses of one TE weight, plus a real ordinary-autograd contribution.
-            # TE's zero dummy must not hide the latter or double the fused GEMM output.
-            result = self.proj(value) + self.proj(value * 0.5)
-            if not delayed:
+                result = self.proj(value, self.splits)
+            elif delayed:
+                result = self.proj(value)
+            else:
+                # Two uses of one TE weight, plus a real autograd contribution.
+                # Zero dummies must not hide it or double the fused GEMM output.
+                result = self.proj(value) + self.proj(value * 0.5)
                 result = result + nn.functional.linear(value, self.proj.weight) * 0.125
-            return result
+            return result.float() + self.bias32
 
     def build():
         torch.manual_seed(1729)
@@ -117,10 +146,34 @@ def test_te_fused_gradients_match_reference(
             return Projection()
 
     model, reference = build(), build()
+    for candidate in (model, reference):
+        weights = [param for name, param in candidate.named_parameters() if "weight" in name]
+        assert weights
+        assert all(isinstance(param, MXFP8Tensor) == quantized for param in weights)
+        if quantized:
+            assert all(
+                callable(getattr(param, "get_high_precision_init_val", None)) for param in weights
+            )
     reference_parameters = dict(reference.named_parameters())
+    for name, parameter in model.named_parameters():
+        expected = reference_parameters[name]
+        if isinstance(parameter, MXFP8Tensor):
+            torch.testing.assert_close(
+                parameter.get_high_precision_init_val(),
+                expected.get_high_precision_init_val(),
+                rtol=0,
+                atol=0,
+            )
+            actual_compute, expected_compute = parameter.dequantize(), expected.dequantize()
+        else:
+            actual_compute, expected_compute = parameter.detach(), expected.detach()
+        torch.testing.assert_close(actual_compute, expected_compute, rtol=0, atol=0)
     reference_main = {
         name: (
-            param.get_high_precision_init_val().detach().float().clone()
+            param.get_high_precision_init_val()
+            .detach()
+            .to(device=device, dtype=torch.float32)
+            .clone()
             if isinstance(param, MXFP8Tensor)
             else param.detach().float().clone()
         )
@@ -201,7 +254,9 @@ def test_te_fused_gradients_match_reference(
         monkeypatch.setattr(te_impl, name, observe)
 
     torch.manual_seed(19 + distributed_setup.rank)
-    inputs = torch.randn(3, 32, 64, dtype=torch.bfloat16, device=device)
+    inputs = torch.randn(
+        3, 64 if kind == "grouped" else 32, 64, dtype=torch.bfloat16, device=device
+    )
 
     def train():
         nonlocal record_model
@@ -249,6 +304,11 @@ def test_te_fused_gradients_match_reference(
         failures = []
 
         def compare(actual_tensor, expected, label):
+            if (
+                not torch.isfinite(actual_tensor).all().item()
+                or not torch.isfinite(expected).all().item()
+            ):
+                failures.append(f"{label}: nonfinite values")
             try:
                 torch.testing.assert_close(actual_tensor, expected, rtol=1e-5, atol=1e-6)
             except AssertionError as error:
