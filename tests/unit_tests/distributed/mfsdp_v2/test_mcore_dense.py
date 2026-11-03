@@ -471,11 +471,19 @@ def test_finish_grad_sync_waits_for_delayed_wgrad(process_group_collection, dist
         graph.replay()
 
 
-def test_delayed_wgrad_matches_immediate(process_group_collection, distributed_setup):
+@pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
+def test_delayed_wgrad_matches_immediate(
+    process_group_collection, distributed_setup, gradient_accumulation_fusion
+):
     """Delaying weight gradients preserves training losses with microbatch accumulation."""
     num_microbatches = 3
     config = TransformerConfig(
-        num_layers=1, hidden_size=16, num_attention_heads=4, bf16=True, params_dtype=torch.bfloat16
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        gradient_accumulation_fusion=gradient_accumulation_fusion,
     )
 
     def build_layer(delay_wgrad_compute):
@@ -486,7 +494,7 @@ def test_delayed_wgrad_matches_immediate(process_group_collection, distributed_s
             params_dtype=config.params_dtype,
             device=distributed_setup.device,
             delay_wgrad_compute=delay_wgrad_compute,
-            fuse_wgrad_accumulation=False,
+            fuse_wgrad_accumulation=gradient_accumulation_fusion,
         )
 
     immediate_layer = build_layer(delay_wgrad_compute=False)

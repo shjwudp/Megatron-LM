@@ -143,6 +143,7 @@ class FsdpParameterGroup:
         # TODO: Revisit passing owner assignments into the group constructor in a future PR.
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         shard_layout: ShardLayout = ShardLayout.PADDED,
+        gradient_accumulation_fusion: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -173,6 +174,8 @@ class FsdpParameterGroup:
         self.mesh = mesh
         self.grad_scale = grad_scale
         self.shard_layout = shard_layout
+        self.gradient_accumulation_fusion = gradient_accumulation_fusion
+        self.fused_grad_buffer: DBuffer | None = None
         if shard_layout is ShardLayout.UNPADDED and use_symmetric_memory:
             raise ValueError(
                 "ShardLayout.UNPADDED is incompatible with use_symmetric_memory: NCCL "
@@ -197,6 +200,13 @@ class FsdpParameterGroup:
             use_symmetric_memory,
         )
         self.fsdp_parameters = self._build_fsdp_parameters(parameter_to_fqns)
+        if gradient_accumulation_fusion and self.requires_grad:
+            for parameter in self.fsdp_parameters:
+                parameter.unsharded.grad_added_to_main_grad = False
+                # Preserve genuine non-TE contributions to tied embedding/output weights.
+                # Untied weights use TE's ordinary throwaway dummy, which we never read.
+                if len(parameter.fqns) > 1:
+                    parameter.unsharded.zero_out_wgrad = True
 
         # Building Parameter views requires live storage. Release temporary gather
         # storage afterward; replicated weights keep their persistent buffer.
@@ -621,9 +631,53 @@ class FsdpParameterGroup:
             if rowwise_only and weight._columnwise_data is not None:
                 weight.update_usage(rowwise_usage=False)
 
+    def prepare_fused_gradients(self) -> None:
+        """Bind full TE output views once per backward window, including repeated uses.
+
+        Some TE grouped-linear forwards require a main_grad attribute already bound.
+        Normal forward views are released at post_forward; TE looks up the views again
+        during backward. Recompute must preserve an already active backward buffer.
+        """
+        if not self.gradient_accumulation_fusion or not self.requires_grad:
+            return
+        if self.fused_grad_buffer is not None:
+            return
+        assert self.main_grad is not None
+        self.fused_grad_buffer = DBuffer(
+            mesh=self.mesh,
+            placements=[Partial("avg")] * self.mesh.ndim,
+            layout=self.main_weight.layout,
+            dtype=self.main_grad.dtype,
+            device=self.main_weight.device,
+        )
+        self.fused_grad_buffer.local_buffer.zero_()
+        for index, parameter in enumerate(self.fsdp_parameters):
+            parameter.unsharded.main_grad = self.fused_grad_buffer.get_tensor_view(index)
+            parameter.unsharded.grad_added_to_main_grad = False
+
+    def release_fused_gradients(self) -> None:
+        """Drop parameter aliases; reduction callers retain storage until RS completes."""
+        if self.fused_grad_buffer is None:
+            return
+        for parameter in self.fsdp_parameters:
+            parameter.unsharded.main_grad = None
+        self.fused_grad_buffer = None
+
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
+
+        if self.fused_grad_buffer is not None:
+            if self.fused_grad_buffer.dtype == self.grad_comm_dtype:
+                return self.fused_grad_buffer
+            with self._symmetric_memory_context():
+                return DBuffer(
+                    mesh=self.mesh,
+                    placements=[Partial("avg")] * self.mesh.ndim,
+                    layout=self.main_weight.layout,
+                    dtype=self.grad_comm_dtype,
+                    device=self.main_weight.device,
+                )
 
         grads: list[torch.Tensor] = []
         for fsdp_parameter in self.fsdp_parameters:
@@ -641,7 +695,23 @@ class FsdpParameterGroup:
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
-        # A future fused-wgrad path can write directly into these buffer views.
+        if self.fused_grad_buffer is not None:
+            for index, parameter in enumerate(self.fsdp_parameters):
+                grad = parameter.unsharded.grad
+                if grad is None and not parameter.unsharded.grad_added_to_main_grad:
+                    raise RuntimeError(f"Missing gradient for FSDP parameter {parameter.fqns!r}.")
+                # TE's zero dummy contributes nothing; ordinary autograd contributions
+                # (including tied embedding gradients) must still be added exactly once.
+                if grad is not None and (
+                    not parameter.unsharded.grad_added_to_main_grad
+                    or getattr(parameter.unsharded, "zero_out_wgrad", False)
+                ):
+                    self.fused_grad_buffer.get_tensor_view(index).add_(grad)
+                parameter.unsharded.grad = None
+            if partial_grad is not self.fused_grad_buffer:
+                partial_grad.local_buffer.copy_(self.fused_grad_buffer.local_buffer)
+            self.release_fused_gradients()
+            return
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
             fsdp_parameter.unsharded.grad = None

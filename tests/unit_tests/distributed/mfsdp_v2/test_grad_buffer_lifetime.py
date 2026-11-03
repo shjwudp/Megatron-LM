@@ -2,15 +2,20 @@
 
 """Check bounded gradient staging against a reference, with and without graph replay."""
 
+import importlib
 from copy import deepcopy
 from weakref import ref
 
 import pytest
 import torch
 import torch.distributed as dist
+import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
+from transformer_engine.common.recipe import MXFP8BlockScaling
+from transformer_engine.pytorch.ops.basic import BasicLinear, GroupedLinear
+from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
@@ -26,6 +31,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_gro
     FsdpParameterGroup,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import ShardLayout
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
 
@@ -39,6 +45,256 @@ class MixedLayer(nn.Module):
 
     def forward(self, x):
         return nn.functional.linear(x, self.weight, self.bias.to(torch.bfloat16).float())
+
+
+@pytest.mark.parametrize(
+    "kind,quantized,strategy,layout,capture,delayed",
+    [
+        ("linear", False, "optim_grads_params", ShardLayout.PADDED, False, False),
+        ("linear", False, "optim", ShardLayout.UNPADDED, False, False),
+        ("linear", True, "optim_grads_params", ShardLayout.UNPADDED, False, False),
+        ("linear", True, "optim_grads_params", ShardLayout.PADDED, True, False),
+        ("linear", True, "optim", ShardLayout.UNPADDED, True, False),
+        ("basic", False, "optim_grads_params", ShardLayout.PADDED, True, False),
+        ("grouped", False, "optim_grads_params", ShardLayout.PADDED, True, False),
+        ("grouped", True, "optim", ShardLayout.UNPADDED, True, False),
+        ("linear", False, "optim_grads_params", ShardLayout.PADDED, False, True),
+    ],
+)
+def test_te_fused_gradients_match_reference(
+    distributed_setup, monkeypatch, kind, quantized, strategy, layout, capture, delayed
+):
+    """Real TE wgrad output, repeated uses, resets, mixed contributions and graph replay.
+
+    Reference wgrad GEMMs also accumulate into FP32, avoiding a BF16 intermediate
+    gradient or FP32 -> BF16 -> MXFP8 weight-refresh difference between the two paths.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    recipe = MXFP8BlockScaling()
+
+    class Projection(nn.Module):
+        def __init__(self):
+            super().__init__()
+            if kind == "linear":
+                self.proj = te.Linear(
+                    64,
+                    64,
+                    params_dtype=torch.bfloat16,
+                    device=device,
+                    fuse_wgrad_accumulation=True,
+                    delay_wgrad_compute=delayed,
+                )
+            elif kind == "basic":
+                self.proj = BasicLinear(
+                    64, 64, dtype=torch.bfloat16, device=device, accumulate_into_main_grad=True
+                )
+            else:
+                self.proj = GroupedLinear(
+                    2, 64, 64, dtype=torch.bfloat16, device=device, accumulate_into_main_grad=True
+                )
+            self.register_buffer("splits", torch.tensor([16, 16], device=device))
+            if kind != "grouped" and not delayed:
+                self.proj.weight.zero_out_wgrad = True
+
+        def forward(self, value):
+            if kind == "grouped":
+                return self.proj(value, self.splits)
+            if delayed:
+                return self.proj(value)
+            # Two uses of one TE weight, plus a real ordinary-autograd contribution.
+            # TE's zero dummy must not hide the latter or double the fused GEMM output.
+            result = self.proj(value) + self.proj(value * 0.5)
+            if not delayed:
+                result = result + nn.functional.linear(value, self.proj.weight) * 0.125
+            return result
+
+    def build():
+        torch.manual_seed(1729)
+        with te.quantized_model_init(
+            enabled=quantized, recipe=recipe, preserve_high_precision_init_val=True
+        ):
+            return Projection()
+
+    model, reference = build(), build()
+    reference_parameters = dict(reference.named_parameters())
+    reference_main = {
+        name: (
+            param.get_high_precision_init_val().detach().float().clone()
+            if isinstance(param, MXFP8Tensor)
+            else param.detach().float().clone()
+        )
+        for name, param in reference_parameters.items()
+    }
+    for param in reference_parameters.values():
+        param.main_grad = torch.zeros(param.shape, dtype=torch.float32, device=device)
+        param.grad_added_to_main_grad = False
+        param.zero_out_wgrad = True
+    sharded = strategy == "optim_grads_params"
+    with fully_shard_context(
+        FsdpContext(
+            device=device,
+            prefetch_order=PrefetchOrder.RECORDED,
+            runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
+        )
+    ) as context:
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=Placements(
+                dp_axes=[0],
+                parameter=[Shard(0) if sharded else Replicate()],
+                gradient=[Shard(0) if sharded else Partial("avg")],
+                optimizer=[Shard(0)],
+            ),
+            mixed_precision_policy=MixedPrecisionPolicy(
+                main_params_dtype=torch.float32,
+                main_grads_dtype=torch.float32,
+                grad_comm_dtype=torch.float32,
+            ),
+            grad_scale=0.25,
+            gradient_accumulation_fusion=True,
+            shard_layout=layout,
+        )
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    fully_shard_optimizer(optimizer)
+    # Instrument the actual TE backward GEMM, not just the public fusion flag.
+    te_impl = importlib.import_module(
+        "transformer_engine.pytorch.module.linear"
+        if kind == "linear"
+        else (
+            "transformer_engine.pytorch.ops.basic.basic_linear"
+            if kind == "basic"
+            else "transformer_engine.pytorch.ops.basic.grouped_linear"
+        )
+    )
+    observed = []
+    record_model = False
+    for name in ("general_gemm", "general_grouped_gemm", "general_grouped_gemm_for_grouped_tensor"):
+        if not hasattr(te_impl, name):
+            continue
+        original = getattr(te_impl, name)
+
+        def observe(*args, _original=original, **kwargs):
+            if record_model and kwargs.get("layout") == "NT":
+                output = kwargs.get("out", args[2] if len(args) > 2 else None)
+                outputs = output if isinstance(output, list) else [output]
+                pointers = {
+                    parameter.unsharded.main_grad.data_ptr()
+                    for group in model.parameter_groups
+                    for parameter in group.fsdp_parameters
+                }
+                for tensor in outputs:
+                    if tensor is not None:
+                        tensor = getattr(tensor, "rowwise_data", tensor)
+                        assert tensor.dtype == torch.float32
+                        assert tensor.data_ptr() in pointers
+                observed.append(
+                    {
+                        "has_out": output is not None,
+                        "out_dtype": kwargs.get("out_dtype"),
+                        "accumulate": kwargs.get("accumulate"),
+                    }
+                )
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(te_impl, name, observe)
+
+    torch.manual_seed(19 + distributed_setup.rank)
+    inputs = torch.randn(3, 32, 64, dtype=torch.bfloat16, device=device)
+
+    def train():
+        nonlocal record_model
+        record_model = True
+        optimizer.zero_grad(set_to_none=False)
+        losses = []
+        for mb, value in enumerate(inputs):
+            with microbatch(context, is_last=mb == 2):
+                with te.autocast(enabled=quantized, recipe=recipe):
+                    loss = model(value).float().square().mean() / 3
+                loss.backward()
+                if delayed:
+                    model.proj.backward_dw()
+            losses.append(loss.detach())
+        context.finish_grad_sync()
+        assert not context._pending_grad_buffers
+        # Save pre-update shards: the optimizer must consume these exact gradients.
+        grads = {id(p): p.grad.to_local().detach().clone() for p in model.parameters()}
+        optimizer.step()
+        record_model = False
+        return torch.stack(losses), grads
+
+    @torch.no_grad()
+    def check(actual):
+        actual_losses, actual_grads = actual
+        expected_losses = []
+        for param in reference_parameters.values():
+            param.grad = None
+            param.main_grad.zero_()
+            param.grad_added_to_main_grad = False
+        with torch.enable_grad():
+            for value in inputs:
+                with te.autocast(enabled=quantized, recipe=recipe):
+                    loss = reference(value).float().square().mean() / 3
+                loss.backward()
+                if delayed:
+                    reference.proj.backward_dw()
+                expected_losses.append(loss.detach())
+        torch.testing.assert_close(
+            actual_losses, torch.stack(expected_losses), rtol=1e-5, atol=1e-6
+        )
+        for param in reference_parameters.values():
+            if param.grad is not None:
+                param.main_grad.add_(param.grad)
+            dist.all_reduce(param.main_grad, op=dist.ReduceOp.AVG, group=mesh.get_group())
+            param.main_grad.mul_(0.25)
+        for group in model.parameter_groups:
+            for index, parameter in enumerate(group.fsdp_parameters):
+                (name,) = parameter.fqns
+                baseline = reference_parameters[name]
+                owned = group.main_weight._get_owned_range(index)
+                actual_grad = actual_grads[id(parameter.sharded)]
+                reference_main[name].add_(baseline.main_grad, alpha=-0.01)
+                if owned is not None:
+                    for actual_tensor, expected in (
+                        (actual_grad, baseline.main_grad),
+                        (group.main_weight.get_tensor_view(index), reference_main[name]),
+                    ):
+                        shard = expected.flatten().narrow(
+                            0, owned.tensor_relative_offset, owned.numel
+                        )
+                        torch.testing.assert_close(
+                            actual_tensor.flatten(), shard, rtol=1e-5, atol=1e-6
+                        )
+                else:
+                    assert actual_grad.numel() == 0
+                if isinstance(baseline, MXFP8Tensor):
+                    baseline.quantize_(reference_main[name])
+                else:
+                    baseline.copy_(reference_main[name])
+        assert any(record["accumulate"] and record["has_out"] for record in observed)
+
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    for _ in range(2):
+        with torch.cuda.stream(stream):
+            actual = train()
+        torch.cuda.current_stream(device).wait_stream(stream)
+        check(actual)
+        stream.wait_stream(torch.cuda.current_stream(device))
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual = train()
+    for _ in range(3):
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            if capture:
+                graph.replay()
+            else:
+                actual = train()
+        torch.cuda.current_stream(device).wait_stream(stream)
+        check(actual)
 
 
 @pytest.mark.parametrize("strategy", ["optim", "optim_grads_params"])
