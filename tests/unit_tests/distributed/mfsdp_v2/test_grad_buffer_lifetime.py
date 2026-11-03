@@ -240,12 +240,22 @@ def test_te_fused_gradients_match_reference(
                 if delayed:
                     reference.proj.backward_dw()
                 expected_losses.append(loss.detach())
-        torch.testing.assert_close(
-            actual_losses, torch.stack(expected_losses), rtol=1e-5, atol=1e-6
-        )
+                # Match DDP/FSDP's per-microbatch promotion, not PyTorch's BF16
+                # accumulation across microbatches for ordinary bias/embedding grads.
+                for param in reference_parameters.values():
+                    if param.grad is not None:
+                        param.main_grad.add_(param.grad)
+                        param.grad = None
+        failures = []
+
+        def compare(actual_tensor, expected, label):
+            try:
+                torch.testing.assert_close(actual_tensor, expected, rtol=1e-5, atol=1e-6)
+            except AssertionError as error:
+                failures.append(f"{label}: {error}")
+
+        compare(actual_losses, torch.stack(expected_losses), "loss")
         for param in reference_parameters.values():
-            if param.grad is not None:
-                param.main_grad.add_(param.grad)
             dist.all_reduce(param.main_grad, op=dist.ReduceOp.AVG, group=mesh.get_group())
             param.main_grad.mul_(0.25)
         for group in model.parameter_groups:
@@ -263,16 +273,21 @@ def test_te_fused_gradients_match_reference(
                         shard = expected.flatten().narrow(
                             0, owned.tensor_relative_offset, owned.numel
                         )
-                        torch.testing.assert_close(
-                            actual_tensor.flatten(), shard, rtol=1e-5, atol=1e-6
-                        )
+                        compare(actual_tensor.flatten(), shard, name)
                 else:
-                    assert actual_grad.numel() == 0
+                    if actual_grad.numel() != 0:
+                        failures.append(f"{name}: an unowned shard is not empty")
                 if isinstance(baseline, MXFP8Tensor):
                     baseline.quantize_(reference_main[name])
                 else:
                     baseline.copy_(reference_main[name])
-        assert any(record["accumulate"] and record["has_out"] for record in observed)
+        if not any(record["accumulate"] and record["has_out"] for record in observed):
+            failures.append("No actual TE wgrad GEMM accumulated into full main_grad")
+        # A rank-local owned-shard assertion must not strand peers in the next
+        # reference collective or fixture teardown barrier.
+        all_failures = [None] * distributed_setup.world_size
+        dist.all_gather_object(all_failures, failures, group=mesh.get_group())
+        assert not any(all_failures), all_failures
 
     stream = torch.cuda.Stream(device)
     stream.wait_stream(torch.cuda.current_stream(device))
