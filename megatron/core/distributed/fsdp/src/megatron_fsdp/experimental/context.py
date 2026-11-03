@@ -310,9 +310,18 @@ class FsdpContext:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Gradient-input retirement requires one eager recording iteration.")
         events = list(self.execution_order)
+        indices = {module: index for index, module in enumerate(self._module_names)}
         signature = repr(
             (
-                [(event.module.name, event.phase.name, event.operation.name) for event in events],
+                [
+                    (
+                        indices[event.module],
+                        event.module.name,
+                        event.phase.name,
+                        event.operation.name,
+                    )
+                    for event in events
+                ],
                 self._recorded_grad_buffer_positions,
             )
         )
