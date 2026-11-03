@@ -304,6 +304,8 @@ class FsdpModule:
         """
         with self._nvtx_range("unshard"):
             compute_stream = self.context.current_stream()
+            if prefetch and phase is Phase.FORWARD and cast(nn.Module, self).training:
+                self.context._release_grad_buffers_in_forward()
             self._unshard_parameter_groups(phase)
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).

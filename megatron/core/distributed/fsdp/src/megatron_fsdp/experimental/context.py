@@ -114,6 +114,8 @@ class FsdpContext:
         self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
         self._pending_grad_buffers: deque[_GradBufferBatch] = deque()
+        # Execution occurrence -> number of oldest gradient-input batches to release.
+        self._grad_buffer_release_plan: dict[int, int] = {}
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
         ] = []
@@ -246,6 +248,25 @@ class FsdpContext:
         while len(self._pending_grad_buffers) > keep:
             batch = self._pending_grad_buffers.popleft()
             batch.allocation_stream.wait_event(batch.done)
+
+    def _release_grad_buffers_in_forward(self) -> None:
+        """Record completed inputs at this occurrence, then replay their reuse waits."""
+        if self.prefetch_order is not PrefetchOrder.RECORDED or not self._pending_grad_buffers:
+            return
+        if self._recording_execution_order:
+            with torch.cuda.device(self.allgather_stream.device):
+                if torch.cuda.is_current_stream_capturing():
+                    return
+            released = 0
+            while self._pending_grad_buffers and self._pending_grad_buffers[0].done.query():
+                self._pending_grad_buffers.popleft()
+                released += 1
+            if released:
+                self._grad_buffer_release_plan[len(self.execution_order)] = released
+        else:
+            released = self._grad_buffer_release_plan.get(self.execution_order.position, 0)
+            if released:
+                self._release_grad_buffers(keep=max(0, len(self._pending_grad_buffers) - released))
 
     def _finish_execution_order(self) -> None:
         """Finish recording or validate replay at the execution-window boundary."""

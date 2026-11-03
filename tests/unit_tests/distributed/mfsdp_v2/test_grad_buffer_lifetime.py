@@ -25,6 +25,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     FsdpParameterGroup,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
 
@@ -190,3 +191,70 @@ def test_grad_buffer_release_orders_reuse_on_allocation_stream(distributed_setup
     torch.cuda.current_stream(device).wait_stream(allocation_stream)
     torch.testing.assert_close(result, torch.full_like(result, 7.0), rtol=0, atol=0)
     torch.testing.assert_close(replacement, torch.full_like(replacement, -9.0), rtol=0, atol=0)
+
+
+def test_forward_release_replays_the_recorded_occurrence(distributed_setup, monkeypatch):
+    """Repeated calls retire inputs at the recorded occurrence, including graph replay."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Identity()
+    with fully_shard_context(
+        FsdpContext(
+            device=device,
+            prefetch_order=PrefetchOrder.RECORDED,
+            runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
+        )
+    ) as context:
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=Placements(
+                dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+            ),
+        )
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        result = torch.empty(4096, device=device)
+
+    def submit():
+        with torch.cuda.stream(stream):
+            source = torch.full_like(result, 7.0)
+        context.reduce_scatter_stream.wait_stream(stream)
+        with torch.cuda.stream(context.reduce_scatter_stream):
+            torch.cuda._sleep(100_000)
+            result.copy_(source)
+        context._retain_grad_buffers([source], stream)
+        return ref(source)
+
+    with torch.cuda.stream(stream):
+        model.unshard(Phase.FORWARD, prefetch=True)
+    source_ref = submit()
+    context._pending_grad_buffers[0].done.synchronize()
+    with torch.cuda.stream(stream):
+        model.unshard(Phase.FORWARD, prefetch=True)
+        context.finish_grad_sync()
+    assert source_ref() is None
+    assert context._grad_buffer_release_plan == {1: 1}
+
+    def unexpected_query(event):
+        raise AssertionError("Replay must use the recorded plan, not query events")
+
+    monkeypatch.setattr(torch.cuda.Event, "query", unexpected_query)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        source_ref = submit()
+        model.unshard(Phase.FORWARD, prefetch=True)
+        assert source_ref() is not None
+        model.unshard(Phase.FORWARD, prefetch=True)
+        assert source_ref() is None
+        assert not context._pending_grad_buffers
+        replacement = torch.empty_like(result)
+        replacement.fill_(-9.0)
+    for _ in range(3):
+        with torch.cuda.stream(stream):
+            graph.replay()
+        torch.cuda.current_stream(device).wait_stream(stream)
+        torch.testing.assert_close(result, torch.full_like(result, 7.0), rtol=0, atol=0)
+        torch.testing.assert_close(replacement, torch.full_like(replacement, -9.0), rtol=0, atol=0)
+        stream.wait_stream(torch.cuda.current_stream(device))
