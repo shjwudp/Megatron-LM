@@ -2,6 +2,7 @@
 
 """Dense MCore adapter and optimizer integration tests for MFSDP v2."""
 
+import importlib
 from dataclasses import replace
 
 import pytest
@@ -19,9 +20,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     fully_shard_context,
     fully_shard_optimizer,
+    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import ShardLayout
+from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -33,6 +36,8 @@ from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -562,6 +567,207 @@ def test_delayed_wgrad_matches_immediate(
     immediate_losses = train(immediate_layer)
     delayed_losses = train(delayed_layer, delayed_layer.backward_dw)
     torch.testing.assert_close(delayed_losses, immediate_losses, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("capture", [False, True], ids=["eager", "graph"])
+def test_mxfp8_shared_mtp_head_fused_gradients(
+    process_group_collection, distributed_setup, monkeypatch, capture
+):
+    """Keep both MTP/main head contributions when FP8 first-microbatch tracking is active."""
+    device = distributed_setup.device
+    recipe = MXFP8BlockScaling()
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=64,
+        num_attention_heads=4,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        fp8="hybrid",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        fp8_output_proj=True,
+        gradient_accumulation_fusion=True,
+        mtp_num_layers=1,
+        cuda_graph_impl="full_iteration" if capture else "none",
+    )
+    monkeypatch.setattr(
+        MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1 / 3, device=device)
+    )
+
+    class SharedHead(MegatronModule):
+        def __init__(self, cfg):
+            super().__init__(cfg)
+            self.head = TELMHeadColumnParallelLinear(
+                64,
+                128,
+                config=cfg,
+                init_method=cfg.init_method,
+                bias=False,
+                pg_collection=process_group_collection,
+            )
+
+        def forward(self, value):
+            # Actual HybridModel ordering: the auxiliary head runs before the main
+            # head, and MTPLossAutoScaler injects its gradient after the main head.
+            auxiliary, _ = self.head(value)
+            auxiliary_loss = auxiliary.float().square().mean() * 0.25
+            hidden = MTPLossAutoScaler.apply(value, auxiliary_loss)
+            main, _ = self.head(hidden * 0.5)
+            return main.float().square().mean()
+
+    with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
+        module = SharedHead(config)
+        reference = SharedHead(replace(config, disable_parameter_transpose_cache=True))
+    assert isinstance(module.head.weight, MXFP8Tensor)
+    assert isinstance(reference.head.weight, MXFP8Tensor)
+    master = (
+        module.head.weight.get_high_precision_init_val()
+        .to(device=device, dtype=torch.float32)
+        .clone()
+    )
+    with torch.no_grad():
+        reference.head.weight.quantize_(master)
+    reference.head.weight.clear_high_precision_init_val()
+    reference.head.weight.main_grad = torch.zeros_like(master)
+    reference.head.weight.grad_added_to_main_grad = False
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            data_parallel_sharding_strategy="optim_grads_params",
+            fp8_param_gather=True,
+            megatron_fsdp_main_grads_dtype=torch.float32,
+            megatron_fsdp_cuda_graph_mode=capture,
+        ),
+        module=module,
+        pg_collection=process_group_collection,
+    )
+    context = model.module.context
+    (group,) = model.module.parameter_groups
+    (parameter,) = group.fsdp_parameters
+    owned = group.main_weight._get_owned_range(0)
+    assert owned is not None
+    torch.testing.assert_close(
+        group.main_weight.get_tensor_view(0).flatten(),
+        master.flatten().narrow(0, owned.tensor_relative_offset, owned.numel),
+        rtol=0,
+        atol=0,
+    )
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    fully_shard_optimizer(optimizer)
+    torch.manual_seed(723 + distributed_setup.rank)
+    inputs = torch.randn(3, 32, 64, device=device, dtype=torch.bfloat16)
+    record_model = False
+    flags, accumulation = [], []
+    linear_forward = te.Linear.forward
+    te_impl = importlib.import_module("transformer_engine.pytorch.module.linear")
+    gemm = te_impl.general_gemm
+
+    def observe_forward(layer, *args, **kwargs):
+        if record_model and layer is model.module.head:
+            flags.append(kwargs.get("is_first_microbatch"))
+        return linear_forward(layer, *args, **kwargs)
+
+    def observe_gemm(*args, **kwargs):
+        if record_model and kwargs.get("layout") == "NT":
+            out = kwargs.get("out")
+            assert out is not None and out.dtype == torch.float32
+            assert out.data_ptr() == parameter.unsharded.main_grad.data_ptr()
+            accumulation.append(kwargs.get("accumulate"))
+        return gemm(*args, **kwargs)
+
+    monkeypatch.setattr(te.Linear, "forward", observe_forward)
+    monkeypatch.setattr(te_impl, "general_gemm", observe_gemm)
+
+    def train():
+        nonlocal record_model
+        record_model = True
+        optimizer.zero_grad(set_to_none=False)
+        model.module.set_is_first_microbatch()
+        losses = []
+        for mb, value in enumerate(inputs):
+            with microbatch(context, is_last=mb == 2):
+                loss = model(value) / 3
+                loss.backward()
+            losses.append(loss.detach())
+        model.finish_grad_sync()
+        grad = parameter.sharded.grad.to_local().clone()
+        optimizer.step()
+        record_model = False
+        return torch.stack(losses), grad
+
+    @torch.no_grad()
+    def check(actual):
+        losses, grad = actual
+        expected_losses = []
+        ref_weight = reference.head.weight
+        ref_weight.main_grad.zero_()
+        ref_weight.grad_added_to_main_grad = False
+        reference.set_is_first_microbatch()
+        with torch.enable_grad():
+            for value in inputs:
+                ref_weight.grad = None
+                loss = reference(value) / 3
+                loss.backward()
+                expected_losses.append(loss.detach())
+        assert ref_weight.grad_added_to_main_grad
+        torch.distributed.all_reduce(
+            ref_weight.main_grad,
+            op=torch.distributed.ReduceOp.AVG,
+            group=process_group_collection.dp_cp,
+        )
+        master.add_(ref_weight.main_grad, alpha=-0.01)
+        failures = []
+        for value, expected, label in (
+            (losses, torch.stack(expected_losses), "loss"),
+            (
+                grad.flatten(),
+                ref_weight.main_grad.flatten().narrow(0, owned.tensor_relative_offset, owned.numel),
+                "gradient",
+            ),
+            (
+                group.main_weight.get_tensor_view(0).flatten(),
+                master.flatten().narrow(0, owned.tensor_relative_offset, owned.numel),
+                "updated_master",
+            ),
+        ):
+            try:
+                assert torch.isfinite(value).all() and torch.isfinite(expected).all()
+                torch.testing.assert_close(value, expected, rtol=1e-5, atol=1e-6)
+            except AssertionError as error:
+                failures.append(f"{label}: {error}")
+        print("MTP_HEAD_FUSED_FLAGS", {"flags": flags, "accumulation": accumulation}, flush=True)
+        if not accumulation or not all(accumulation):
+            failures.append("Shared quantized head overwrote a fused gradient contribution")
+        all_failures = [None] * distributed_setup.world_size
+        torch.distributed.all_gather_object(
+            all_failures, failures, group=process_group_collection.dp_cp
+        )
+        assert not any(all_failures), all_failures
+        ref_weight.quantize_(master)
+
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    for _ in range(2):
+        with torch.cuda.stream(stream):
+            actual = train()
+        torch.cuda.current_stream(device).wait_stream(stream)
+        check(actual)
+        stream.wait_stream(torch.cuda.current_stream(device))
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual = train()
+    for _ in range(3):
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            if capture:
+                graph.replay()
+            else:
+                actual = train()
+        torch.cuda.current_stream(device).wait_stream(stream)
+        check(actual)
 
 
 def test_build_train_and_step(process_group_collection):
