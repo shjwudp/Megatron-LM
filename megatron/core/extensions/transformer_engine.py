@@ -2023,6 +2023,9 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         # [vocab, hidden] add whose result is discarded. TE versions that read this attribute
         # return a ZeroTensor dummy, which costs nothing to add; older versions ignore it.
         self.weight.zero_tensor_dummy_wgrad = True
+        # MTP calls the same head before the main projection. Its saved first-
+        # microbatch flag must not overwrite another use's wgrad in backward.
+        self.is_repeated_layer = bool(config.mtp_num_layers)
 
         self.input_size = input_size
         self.output_size = output_size

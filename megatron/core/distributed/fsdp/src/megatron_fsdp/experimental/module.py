@@ -72,6 +72,7 @@ class FsdpModule:
         register_hooks: bool = True,
         grad_accumulation_count: int | None = None,
         shard_layout: ShardLayout = ShardLayout.PADDED,
+        gradient_accumulation_fusion: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module.
 
@@ -108,6 +109,7 @@ class FsdpModule:
                     use_symmetric_memory=use_symmetric_memory,
                     parameter_to_owner=context.parameter_to_owner,
                     shard_layout=shard_layout,
+                    gradient_accumulation_fusion=gradient_accumulation_fusion,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
@@ -286,6 +288,8 @@ class FsdpModule:
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
         self.unshard(Phase.FORWARD, prefetch=not is_recomputing)
+        for group in self._parameter_groups:
+            group.prepare_fused_gradients()
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
@@ -373,6 +377,8 @@ class FsdpModule:
             self._release_unsharded_storage(rowwise_only=True)
         else:
             self.reshard()
+            for group in self._parameter_groups:
+                group.release_fused_gradients()
         if self.phase is Phase.FORWARD:
             self.phase = Phase.RESTING
         torch.cuda.nvtx.range_pop()
@@ -455,6 +461,8 @@ class FsdpModule:
             context.reduce_scatter_stream.wait_stream(current_stream)
 
         self.unshard(Phase.BACKWARD, prefetch=True)
+        for group in self._parameter_groups:
+            group.prepare_fused_gradients()
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
@@ -481,6 +489,11 @@ class FsdpModule:
                 for group in groups:
                     partial_grad = group.allocate_partial_grad_buffer()
                     buffers.append(partial_grad.local_buffer)
+                    if (
+                        group.fused_grad_buffer is not None
+                        and group.fused_grad_buffer is not partial_grad
+                    ):
+                        buffers.append(group.fused_grad_buffer.local_buffer)
                     group.copy_gradients_to_partial_buffer(partial_grad)
 
                     reduce_scatter_stream.wait_stream(current_stream)

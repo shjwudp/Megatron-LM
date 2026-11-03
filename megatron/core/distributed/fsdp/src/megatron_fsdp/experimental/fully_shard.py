@@ -98,6 +98,7 @@ def fully_shard(
     register_hooks: bool = True,
     grad_accumulation_count: int | None = None,
     shard_layout: ShardLayout = ShardLayout.PADDED,
+    gradient_accumulation_fusion: bool = False,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -137,6 +138,8 @@ def fully_shard(
             ``ShardLayout.PADDED`` (default) pads every group to equal shards;
             ``ShardLayout.UNPADDED`` packs each group without padding and splits it at row
             boundaries (32-row block boundaries for MXFP8) into generally unequal shards.
+        gradient_accumulation_fusion: Expose full, main-gradient-dtype views to TE fused
+            wgrad kernels. These views are independent of the sharded optimizer gradients.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -170,6 +173,7 @@ def fully_shard(
             register_hooks=register_hooks,
             grad_accumulation_count=grad_accumulation_count,
             shard_layout=shard_layout,
+            gradient_accumulation_fusion=gradient_accumulation_fusion,
         )
     except Exception:
         module.__class__ = original_cls
