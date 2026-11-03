@@ -121,8 +121,9 @@ def test_te_fused_gradients_match_reference(
                     self.proj.register_parameter("bias", None)
                     for name, parameter in initialized.named_parameters(recurse=False):
                         self.proj.register_parameter(name, parameter)
-            # MXFP8 columnwise quantization uses 32-row blocks per group.
-            self.register_buffer("splits", torch.tensor([32, 32], device=device))
+            # TE's group_quantize_mxfp8 requires a first logical dimension
+            # divisible by128, beyond the basic MXFP8 block-size requirement.
+            self.register_buffer("splits", torch.tensor([128, 128], device=device))
             if kind != "grouped" and not delayed:
                 self.proj.weight.zero_out_wgrad = True
 
@@ -255,7 +256,7 @@ def test_te_fused_gradients_match_reference(
 
     torch.manual_seed(19 + distributed_setup.rank)
     inputs = torch.randn(
-        3, 64 if kind == "grouped" else 32, 64, dtype=torch.bfloat16, device=device
+        3, 256 if kind == "grouped" else 32, 64, dtype=torch.bfloat16, device=device
     )
 
     def train():
