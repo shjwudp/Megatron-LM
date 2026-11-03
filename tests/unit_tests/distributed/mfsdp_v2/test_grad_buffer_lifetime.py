@@ -258,13 +258,18 @@ def test_te_fused_gradients_match_reference(
         for param in reference_parameters.values():
             dist.all_reduce(param.main_grad, op=dist.ReduceOp.AVG, group=mesh.get_group())
             param.main_grad.mul_(0.25)
+            if not torch.count_nonzero(param.main_grad).item():
+                failures.append("The reference gradient has no signal")
         for group in model.parameter_groups:
             for index, parameter in enumerate(group.fsdp_parameters):
                 (name,) = parameter.fqns
                 baseline = reference_parameters[name]
                 owned = group.main_weight._get_owned_range(index)
                 actual_grad = actual_grads[id(parameter.sharded)]
+                previous_main = reference_main[name].clone()
                 reference_main[name].add_(baseline.main_grad, alpha=-0.01)
+                if torch.equal(previous_main, reference_main[name]):
+                    failures.append(f"{name}: no reference update")
                 if owned is not None:
                     for actual_tensor, expected in (
                         (actual_grad, baseline.main_grad),
@@ -310,6 +315,18 @@ def test_te_fused_gradients_match_reference(
                 actual = train()
         torch.cuda.current_stream(device).wait_stream(stream)
         check(actual)
+    print(
+        "TE_FUSED_WGRAD_CALL_PROOF",
+        {
+            "kind": kind,
+            "mxfp8": quantized,
+            "graph": capture,
+            "delayed": delayed,
+            "fused_output_calls": len(observed),
+            "output_dtype": "float32",
+            "output_pointer_matches_full_main_grad": True,
+        },
+    )
 
 
 @pytest.mark.parametrize("strategy", ["optim", "optim_grads_params"])
