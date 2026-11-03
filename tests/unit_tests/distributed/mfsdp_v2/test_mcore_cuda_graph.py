@@ -10,7 +10,10 @@ import torch
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
@@ -51,25 +54,36 @@ def process_group_collection(distributed_setup, outer_dp_size):
     ids=["zero3", "hybrid_zero2"],
 )
 @pytest.mark.parametrize("retain_weights", [False, True])
+@pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
 def test_full_iteration_and_optimizer_cuda_graph_match_eager(
-    process_group_collection, outer_dp_size, inner_strategy, retain_weights
+    process_group_collection,
+    outer_dp_size,
+    inner_strategy,
+    retain_weights,
+    gradient_accumulation_fusion,
 ):
     """Compare graph replay with an otherwise identical eager MFSDP v2 run."""
     eager_config = TransformerConfig(
         num_layers=2,
-        hidden_size=16,
+        hidden_size=128 if gradient_accumulation_fusion else 16,
         num_attention_heads=4,
         bf16=True,
         params_dtype=torch.bfloat16,
         attention_dropout=0.0,
         hidden_dropout=0.0,
+        gradient_accumulation_fusion=gradient_accumulation_fusion,
     )
     graph_config = replace(eager_config, cuda_graph_impl="full_iteration")
 
     def build_model_and_optimizer(
         config: TransformerConfig, enable_cuda_graph: bool
     ) -> tuple[torch.nn.Module, FullyShardedOptimizer]:
-        model = TransformerBlock(config=config, spec=get_gpt_layer_local_spec()).to(
+        spec = (
+            get_gpt_layer_with_transformer_engine_spec()
+            if gradient_accumulation_fusion
+            else get_gpt_layer_local_spec()
+        )
+        model = TransformerBlock(config=config, spec=spec).to(
             device="cuda", dtype=config.params_dtype
         )
         model = FullyShardedDataParallel(
@@ -92,6 +106,11 @@ def test_full_iteration_and_optimizer_cuda_graph_match_eager(
             pg_collection=process_group_collection,
         )
         assert model.module.context.retain_weights == retain_weights
+        if gradient_accumulation_fusion:
+            assert any(
+                getattr(module, "fuse_wgrad_accumulation", False)
+                for module in model.module.modules()
+            )
         optimizer = get_megatron_optimizer(
             OptimizerConfig(
                 optimizer="adam",
