@@ -32,6 +32,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     model_parallel_cuda_manual_seed,
@@ -570,10 +571,11 @@ def test_delayed_wgrad_matches_immediate(
 
 
 @pytest.mark.parametrize("capture", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("native_bf16", [False, True], ids=["mxfp8", "native_bf16"])
 def test_mxfp8_shared_mtp_head_fused_gradients(
-    process_group_collection, distributed_setup, monkeypatch, capture
+    process_group_collection, distributed_setup, monkeypatch, capture, native_bf16
 ):
-    """Keep both MTP/main head contributions when FP8 first-microbatch tracking is active."""
+    """Keep both head contributions and the current backward buffer through graph replay."""
     device = distributed_setup.device
     recipe = MXFP8BlockScaling()
     config = TransformerConfig(
@@ -582,10 +584,10 @@ def test_mxfp8_shared_mtp_head_fused_gradients(
         num_attention_heads=4,
         bf16=True,
         params_dtype=torch.bfloat16,
-        fp8="hybrid",
+        fp8=None if native_bf16 else "hybrid",
         fp8_recipe="mxfp8",
-        fp8_param=True,
-        fp8_output_proj=True,
+        fp8_param=not native_bf16,
+        fp8_output_proj=not native_bf16,
         gradient_accumulation_fusion=True,
         mtp_num_layers=1,
         cuda_graph_impl="full_iteration" if capture else "none",
@@ -597,13 +599,20 @@ def test_mxfp8_shared_mtp_head_fused_gradients(
     class SharedHead(MegatronModule):
         def __init__(self, cfg):
             super().__init__(cfg)
-            self.head = TELMHeadColumnParallelLinear(
+            head_type = ColumnParallelLinear if native_bf16 else TELMHeadColumnParallelLinear
+            kwargs = (
+                {"tp_group": process_group_collection.tp, "output_dtype": torch.float32}
+                if native_bf16
+                else {}
+            )
+            self.head = head_type(
                 64,
                 128,
                 config=cfg,
                 init_method=cfg.init_method,
                 bias=False,
                 pg_collection=process_group_collection,
+                **kwargs,
             )
 
         def forward(self, value):
@@ -615,19 +624,26 @@ def test_mxfp8_shared_mtp_head_fused_gradients(
             main, _ = self.head(hidden * 0.5)
             return main.float().square().mean()
 
-    with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
+    with te.quantized_model_init(
+        enabled=not native_bf16, recipe=recipe, preserve_high_precision_init_val=True
+    ):
         module = SharedHead(config)
         reference = SharedHead(replace(config, disable_parameter_transpose_cache=True))
-    assert isinstance(module.head.weight, MXFP8Tensor)
-    assert isinstance(reference.head.weight, MXFP8Tensor)
+    assert isinstance(module.head.weight, MXFP8Tensor) == (not native_bf16)
+    assert isinstance(reference.head.weight, MXFP8Tensor) == (not native_bf16)
+    assert module.head.weight.dtype == reference.head.weight.dtype == torch.bfloat16
     master = (
-        module.head.weight.get_high_precision_init_val()
+        (module.head.weight if native_bf16 else module.head.weight.get_high_precision_init_val())
+        .detach()
         .to(device=device, dtype=torch.float32)
         .clone()
     )
     with torch.no_grad():
-        reference.head.weight.quantize_(master)
-    reference.head.weight.clear_high_precision_init_val()
+        if native_bf16:
+            reference.head.weight.copy_(master)
+        else:
+            reference.head.weight.quantize_(master)
+            reference.head.weight.clear_high_precision_init_val()
     reference.head.weight.main_grad = torch.zeros_like(master)
     reference.head.weight.grad_added_to_main_grad = False
     model = FullyShardedDataParallel(
@@ -636,7 +652,7 @@ def test_mxfp8_shared_mtp_head_fused_gradients(
             use_megatron_fsdp=True,
             megatron_fsdp_version=2,
             data_parallel_sharding_strategy="optim_grads_params",
-            fp8_param_gather=True,
+            fp8_param_gather=not native_bf16,
             megatron_fsdp_main_grads_dtype=torch.float32,
             megatron_fsdp_cuda_graph_mode=capture,
         ),
@@ -646,6 +662,17 @@ def test_mxfp8_shared_mtp_head_fused_gradients(
     context = model.module.context
     (group,) = model.module.parameter_groups
     (parameter,) = group.fsdp_parameters
+    pack_gradients = group.copy_gradients_to_partial_buffer
+    packed_aliases = []
+
+    def check_packed_alias(partial_grad):
+        # A saved forward main_grad must not replace the new backward destination.
+        expected = group.fused_grad_buffer.get_tensor_view(0)
+        assert parameter.unsharded.main_grad.data_ptr() == expected.data_ptr()
+        packed_aliases.append(True)
+        return pack_gradients(partial_grad)
+
+    monkeypatch.setattr(group, "copy_gradients_to_partial_buffer", check_packed_alias)
     owned = group.main_weight._get_owned_range(0)
     assert owned is not None
     torch.testing.assert_close(
@@ -661,8 +688,15 @@ def test_mxfp8_shared_mtp_head_fused_gradients(
     record_model = False
     flags, accumulation = [], []
     linear_forward = te.Linear.forward
-    te_impl = importlib.import_module("transformer_engine.pytorch.module.linear")
-    gemm = te_impl.general_gemm
+    gemm_impl = (
+        importlib.import_module(
+            "megatron.core.tensor_parallel.layers"
+        ).fused_weight_gradient_mlp_cuda
+        if native_bf16
+        else importlib.import_module("transformer_engine.pytorch.module.linear")
+    )
+    gemm_name = "wgrad_gemm_accum_fp32" if native_bf16 else "general_gemm"
+    gemm = getattr(gemm_impl, gemm_name)
 
     def observe_forward(layer, *args, **kwargs):
         if record_model and layer is model.module.head:
@@ -670,15 +704,15 @@ def test_mxfp8_shared_mtp_head_fused_gradients(
         return linear_forward(layer, *args, **kwargs)
 
     def observe_gemm(*args, **kwargs):
-        if record_model and kwargs.get("layout") == "NT":
-            out = kwargs.get("out")
+        if record_model and (native_bf16 or kwargs.get("layout") == "NT"):
+            out = args[2] if native_bf16 else kwargs.get("out")
             assert out is not None and out.dtype == torch.float32
             assert out.data_ptr() == parameter.unsharded.main_grad.data_ptr()
-            accumulation.append(kwargs.get("accumulate"))
+            accumulation.append(True if native_bf16 else kwargs.get("accumulate"))
         return gemm(*args, **kwargs)
 
     monkeypatch.setattr(te.Linear, "forward", observe_forward)
-    monkeypatch.setattr(te_impl, "general_gemm", observe_gemm)
+    monkeypatch.setattr(gemm_impl, gemm_name, observe_gemm)
 
     def train():
         nonlocal record_model
@@ -739,13 +773,18 @@ def test_mxfp8_shared_mtp_head_fused_gradients(
                 failures.append(f"{label}: {error}")
         print("MTP_HEAD_FUSED_FLAGS", {"flags": flags, "accumulation": accumulation}, flush=True)
         if not accumulation or not all(accumulation):
-            failures.append("Shared quantized head overwrote a fused gradient contribution")
+            failures.append("Shared head did not accumulate both fused gradient contributions")
+        if not packed_aliases:
+            failures.append("No packed main_grad alias was checked")
         all_failures = [None] * distributed_setup.world_size
         torch.distributed.all_gather_object(
             all_failures, failures, group=process_group_collection.dp_cp
         )
         assert not any(all_failures), all_failures
-        ref_weight.quantize_(master)
+        if native_bf16:
+            ref_weight.copy_(master)
+        else:
+            ref_weight.quantize_(master)
 
     stream = torch.cuda.Stream(device)
     stream.wait_stream(torch.cuda.current_stream(device))

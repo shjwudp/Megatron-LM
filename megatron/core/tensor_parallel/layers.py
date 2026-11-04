@@ -761,7 +761,11 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         output_dtype,
     ):
         """Forward."""
-        if gradient_accumulation_fusion and hasattr(weight, "main_grad"):
+        if (
+            gradient_accumulation_fusion
+            and hasattr(weight, "main_grad")
+            and not hasattr(weight, "_mfsdp_parameter_group")
+        ):
             main_grad = weight.main_grad
         else:
             main_grad = None
@@ -818,7 +822,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         handle = None
         tp_group = ctx.tp_group
 
-        if ctx.gradient_accumulation_fusion:
+        # MFSDP v2 binds a fresh backward buffer after releasing forward storage.
+        if ctx.gradient_accumulation_fusion and not hasattr(weight, "_mfsdp_parameter_group"):
             weight.main_grad = main_grad
 
         wgrad_compute = True
