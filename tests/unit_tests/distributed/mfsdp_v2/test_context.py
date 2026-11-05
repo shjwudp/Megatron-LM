@@ -6,6 +6,7 @@ Test prefetch-order construction here; test communication/computation overlap
 in ``test_overlap.py``.
 """
 
+from copy import deepcopy
 from unittest.mock import Mock
 from weakref import ref
 
@@ -27,6 +28,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionEvent,
+    ExecutionOrder,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
@@ -134,8 +136,8 @@ def test_recorded_execution_order(distributed_setup):
     model(inputs).sum().backward()
 
 
-def test_registration_order_rejects_reordered_execution(distributed_setup):
-    """Execution must follow registration order when recording is disabled."""
+def test_registration_order_seeks_reordered_execution(distributed_setup):
+    """The branch supports reordered pipeline calls but still rejects unknown events."""
 
     class Model(nn.Module):
         def __init__(self):
@@ -148,12 +150,28 @@ def test_registration_order_rejects_reordered_execution(distributed_setup):
 
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    torch.manual_seed(1234)
     model = Model().to(device)
-    with fully_shard_context(FsdpContext(device=device)):
+    reference = deepcopy(model)
+    with fully_shard_context(FsdpContext(device=device)) as context:
         for layer in model.children():
             fully_shard(layer, mesh, _default_placements())
         fully_shard(model, mesh, _default_placements())
 
+    for _ in range(3):
+        model.zero_grad(set_to_none=True)
+        reference.zero_grad(set_to_none=True)
+        inputs = torch.ones(2, 4, device=device, requires_grad=True)
+        reference_inputs = inputs.detach().clone().requires_grad_(True)
+        actual = model(inputs)
+        expected = reference(reference_inputs)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        actual.sum().backward()
+        expected.sum().backward()
+        torch.testing.assert_close(inputs.grad, reference_inputs.grad, atol=0, rtol=0)
+
+    # Seeking is allowed only for events already present in the execution trace.
+    context.execution_order = ExecutionOrder([ExecutionEvent(model, Phase.FORWARD)])
     with pytest.raises(RuntimeError, match="diverged from the expected execution order"):
         model(torch.ones(2, 4, device=device))
 
@@ -292,23 +310,33 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
     finish_grad_sync.assert_called_once_with()
 
 
-def test_nested_prefetch_orders_use_dfs(distributed_setup):
+@pytest.mark.parametrize("recorded", [False, True])
+def test_nested_prefetch_orders_use_dfs(distributed_setup, recorded):
     """Nested FsdpModules should use DFS orders for one-step prefetch."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = NestedSiblingModel(dim=4).to(device)
 
-    with fully_shard_context(FsdpContext(device=device)):
+    with fully_shard_context(
+        FsdpContext(
+            device=device,
+            prefetch_order=PrefetchOrder.RECORDED if recorded else PrefetchOrder.REGISTRATION,
+            prefetch_process_group=mesh.get_group(0),
+            runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
+        )
+    ):
         fully_shard(model.left.inner, mesh=mesh, placements=_default_placements())
         fully_shard(model.left, mesh=mesh, placements=_default_placements())
         fully_shard(model.right, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
-    with torch.no_grad():
-        model(torch.ones(2, 4, device=device))
-
+    model(torch.ones(2, 4, device=device, requires_grad=True)).sum().backward()
     context = model.context
+    context.finish_grad_sync()
+    if recorded:
+        assert set(context._recorded_grad_buffer_positions) == {4, 5, 6, 7}
+        assert len(context._recorded_grad_buffer_positions) == 4
     assert list(context.execution_order) == [
         ExecutionEvent(module, Phase.FORWARD)
         for module in [model, model.left, model.left.inner, model.right]
