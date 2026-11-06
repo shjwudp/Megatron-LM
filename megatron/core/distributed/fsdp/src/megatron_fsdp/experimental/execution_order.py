@@ -77,3 +77,20 @@ class ExecutionOrder:
         if not self._items:
             raise RuntimeError("Cannot advance an empty FSDP execution order.")
         self._position = (self._position + 1) % len(self._items)
+
+    def seek(self, event: ExecutionEvent) -> bool:
+        """Move the cursor to the next occurrence of ``event`` at or after the cursor.
+
+        Pipeline schedules interleave forward and backward passes of different microbatches,
+        so module calls do not consume a preset forward-then-backward trace in order. Searching
+        forward (wrapping once) restores the previous demand-call behaviour. Returns False when
+        ``event`` is not in the trace.
+        """
+        n = len(self._items)
+        for offset in range(n):
+            index = (self._position + offset) % n
+            module_ref, phase = self._items[index]
+            if phase is event.phase and module_ref() is event.module:
+                self._position = index
+                return True
+        return False

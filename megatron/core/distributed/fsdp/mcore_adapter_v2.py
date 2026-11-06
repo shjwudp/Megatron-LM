@@ -398,8 +398,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             if pg_collection.expt_dp is None:
                 raise ValueError("MFSDP v2 with EP requires an explicit expert-DP process group.")
-            if not any(isinstance(submodule, MoELayer) for submodule in module.modules()):
-                raise ValueError("MFSDP v2 with EP requires MoE transformer layers.")
+            # EP describes the global topology; a PP/VPP chunk may contain only
+            # dense layers or embeddings. Reject unsupported expert parameters,
+            # not a valid dense-only chunk of an MoE model.
+            if not any(isinstance(submodule, MoELayer) for submodule in module.modules()) and any(
+                not getattr(parameter, "allreduce", True) for parameter in module.parameters()
+            ):
+                raise ValueError("MFSDP v2 expert parameters require MoE transformer layers.")
         if (
             ddp_config.outer_dp_sharding_strategy != "no_shard"
             and ddp_config.num_distributed_optimizer_instances <= 1
@@ -426,9 +431,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             config.pipeline_model_parallel_size != 1
             or ddp_config.num_distributed_optimizer_instances != 1
         ):
-            raise ValueError(
+            log_single_rank(
+                logger,
+                logging.WARNING,
                 "MFSDP v2 per-token loss has not been tested with PP>1 "
-                "or multiple optimizer instances."
+                "or multiple optimizer instances.",
             )
         if config.fp4 or ddp_config.fp4_param_gather:
             raise ValueError("MFSDP v2 does not currently support FP4.")
@@ -609,7 +616,11 @@ def _build_expert_mesh_and_placements(
 
     inner_strategy = get_sharding_strategy(ddp_config, is_expert_param=True)
 
-    if ddp_config.num_distributed_optimizer_instances > 1:
+    expert_has_outer_axis = (
+        ddp_config.num_distributed_optimizer_instances > 1
+        and pg_collection.intra_expt_dp.size() != pg_collection.expt_dp.size()
+    )
+    if expert_has_outer_axis:
         # Match v1 topology: dense and expert parameters share the outer DP axis,
         # while experts use the existing expert-DP inner group. Only placements differ.
         dp_mesh = _build_hybrid_dp_mesh(

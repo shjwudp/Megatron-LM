@@ -331,7 +331,7 @@ class FsdpModule:
     def _prefetch_parameter_groups(self, order: ExecutionOrder, prefetch_size: int | None) -> None:
         """Validate the current event, prefetch successors, and advance once."""
         event = ExecutionEvent(cast(nn.Module, self), self.phase)
-        if order.peek() != event:
+        if order.peek() != event and not order.seek(event):
             raise RuntimeError(
                 "FSDP module calls diverged from the expected execution order "
                 f"at position {order.position}: expected {order.peek()}, got {event}."

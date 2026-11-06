@@ -454,6 +454,18 @@ class DBuffer:
             for axis in changed_axes
         ):
             return self.allgather(changed_axes, out=out)
+        if len(changed_axes) > 1 and all(
+            isinstance(self.placements[axis], Partial) for axis in changed_axes
+        ):
+            # HSDP/HFSDP with an unsharded inner gradient (ZeRO-1) finalizes both DP axes at
+            # once. Reduce one axis at a time, innermost first; AVG over equal-size groups
+            # composes to the global AVG.
+            current = self
+            for axis in reversed(changed_axes[1:]):
+                step_placements = list(current.placements)
+                step_placements[axis] = new_placements[axis]
+                current = current.redistribute(step_placements)
+            return current.redistribute(new_placements, out=out)
         if len(changed_axes) != 1:
             raise NotImplementedError(
                 "Only all-gather and sharding views support multiple changed placement axes."

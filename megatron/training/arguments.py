@@ -527,6 +527,21 @@ def validate_args(args, defaults={}):
     if args.expert_tensor_parallel_size is None:
         args.expert_tensor_parallel_size = args.tensor_model_parallel_size
 
+    if args.num_distributed_optimizer_instances > 1 and args.num_experts is not None:
+        expert_data_parallel_size = args.world_size // (
+            args.expert_tensor_parallel_size
+            * args.expert_model_parallel_size
+            * args.pipeline_model_parallel_size
+        )
+        if expert_data_parallel_size % args.num_distributed_optimizer_instances != 0:
+            # parallel_state then keeps experts on one instance over their full DP group.
+            # Only MFSDP v2 builds per-class meshes that support this split.
+            assert args.use_megatron_fsdp and args.megatron_fsdp_version == 2, (
+                f"expert data parallel size ({expert_data_parallel_size}) must be divisible by "
+                f"--num-distributed-optimizer-instances "
+                f"({args.num_distributed_optimizer_instances}) unless Megatron-FSDP v2 is used."
+            )
+
     # Deprecated arguments.
     assert args.batch_size is None, '--batch-size argument is no longer ' \
         'valid, use --micro-batch-size instead'

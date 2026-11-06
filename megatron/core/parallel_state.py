@@ -149,6 +149,8 @@ _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 # Partial Data parallel group information with context parallel combined.
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
+# Dense inter-instance group (one rank per intra-partial DP slice).
+_INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 
 # combined parallel group of TP and CP
 _TENSOR_AND_CONTEXT_PARALLEL_GROUP = None
@@ -998,6 +1000,7 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    global _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     assert _DATA_PARALLEL_GROUP is None, "data parallel group is already initialized"
 
     num_weight_replicas = len(weight_replica_rank_sets[0])
@@ -1087,6 +1090,19 @@ def initialize_model_parallel(
                     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
                         intra_partial_dp_group_with_cp_gloo
                     )
+            # Dense inter-instance groups: one rank from each intra-partial slice.
+            for offset in range(intra_partial_data_parallel_size):
+                inter_partial_dp_ranks_with_cp = ranks_with_cp[
+                    offset::intra_partial_data_parallel_size
+                ]
+                inter_partial_dp_group_with_cp = create_group(
+                    inter_partial_dp_ranks_with_cp,
+                    timeout=timeout,
+                    pg_options=get_nccl_options("inter_dp_cp", nccl_comm_cfgs),
+                    group_desc="INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP",
+                )
+                if rank in inter_partial_dp_ranks_with_cp:
+                    _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = inter_partial_dp_group_with_cp
         else:
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
@@ -1601,11 +1617,18 @@ def initialize_model_parallel(
         _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is None
     ), "Inter partial expert data group is already initialized"
 
-    assert (
-        expert_data_parallel_size % num_distributed_optimizer_instances == 0
-    ), "Expert data parallel size should be divisible by partial DistOpt shard factor"
+    # When the expert DP domain is smaller than (or not divisible by) the number of
+    # distributed-optimizer instances, experts keep a single instance over their whole DP
+    # group and only dense parameters use the hybrid outer axis. Callers must use a data
+    # parallel wrapper that supports this split (validated in megatron/training/arguments.py).
+    expert_uses_dist_opt_instances = (
+        num_distributed_optimizer_instances > 1
+        and expert_data_parallel_size % num_distributed_optimizer_instances == 0
+    )
     intra_partial_expert_data_parallel_size = (
         expert_data_parallel_size // num_distributed_optimizer_instances
+        if expert_uses_dist_opt_instances
+        else expert_data_parallel_size
     )
 
     # Gloo only on the non-EGTP path (EGTP + Gloo out of scope; the EGTP optimizer uses DCP).
@@ -1628,7 +1651,7 @@ def initialize_model_parallel(
             _EXPERT_DATA_PARALLEL_GROUP = group
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
 
-        if num_distributed_optimizer_instances > 1:
+        if expert_uses_dist_opt_instances:
             # Create groups for Partial DistOpt, one for intra-partial DP domain
             # Another for inter-partial DP domain
 
@@ -1667,6 +1690,9 @@ def initialize_model_parallel(
         else:
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
+    if num_distributed_optimizer_instances > 1 and not expert_uses_dist_opt_instances:
+        # Experts keep one instance; the shared inter-instance group comes from dense DP.
+        _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     # Full expert data-distribution group: spans gtp_remat explicitly. Used only
     # where distinct-data distribution matters; no Gloo. Aliases the default when EGTP is inactive.
     global _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT
@@ -2901,6 +2927,8 @@ def destroy_model_parallel():
 
     global _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
+    global _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
     # End of expert parallelism destroy.
 
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
