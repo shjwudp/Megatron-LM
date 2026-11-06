@@ -7,6 +7,9 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_transformer_block_with_experimental_attention_variant_spec,
+)
 from megatron.core.transformer import MLATransformerConfig, ModuleSpec
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
@@ -853,6 +856,7 @@ class TestMtpBlockSpec:
         config.transformer.transformer_impl = transformer_impl
         config.transformer.normalization = "LayerNorm"
         config.transformer.qk_l2_norm = False
+        config.transformer.experimental_attention_variant = None
         return config
 
     def test_returns_none_when_mtp_num_layers_is_none(self):
@@ -895,6 +899,74 @@ class TestMtpBlockSpec:
         passed_spec = mock_get_mtp.call_args.args[1]
         assert passed_spec is fallback_spec
         assert mock_get_mtp.call_args.kwargs["pp_rank"] == 7
+
+    @pytest.mark.parametrize("attention_variant", ["gdn", "gdn2", "dsa", "dsv4_hybrid"])
+    @patch("megatron.training.models.gpt._te_or_local_layer_spec")
+    @patch(
+        "megatron.training.models.gpt.get_transformer_layer_with_experimental_attention_variant_spec"
+    )
+    @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
+    def test_standalone_mtp_preserves_attention_variant(
+        self, mock_get_mtp, mock_variant_specs, mock_standard_spec, attention_variant
+    ):
+        config = self._make_config(mtp_num_layers=1)
+        config.transformer.experimental_attention_variant = attention_variant
+        layers = [ModuleSpec(module=object), ModuleSpec(module=object)]
+        mock_variant_specs.return_value = layers
+
+        mtp_block_spec(config, TransformerBlockSubmodules(layer_specs=[]), vp_stage=2, pp_rank=3)
+
+        mock_variant_specs.assert_called_once_with(config=config.transformer)
+        mock_standard_spec.assert_not_called()
+        mock_get_mtp.assert_called_once_with(
+            config.transformer, layers[-1], use_transformer_engine=True, vp_stage=2, pp_rank=3
+        )
+
+    @pytest.mark.parametrize(
+        "layers, pp, vp, layout", [(44, 4, 3, "Etttt|(tttt|)*10,mL"), (3, 2, 2, "Et|t|t|mL")]
+    )
+    def test_csa_standalone_mtp_actual_layout(self, layers, pp, vp, layout):
+        transformer = MLATransformerConfig(
+            num_layers=layers,
+            hidden_size=7168,
+            num_attention_heads=128,
+            ffn_hidden_size=20480,
+            num_moe_experts=128 if layers == 44 else 16,
+            moe_grouped_gemm=True,
+            moe_ffn_hidden_size=5120,
+            pipeline_model_parallel_size=pp,
+            virtual_pipeline_model_parallel_size=vp,
+            pipeline_model_parallel_layout=layout,
+            context_parallel_size=4,
+            attention_cp_layout="contiguous",
+            pipeline_dtype=torch.bfloat16,
+            bf16=True,
+            mtp_num_layers=1,
+            multi_latent_attention=True,
+            experimental_attention_variant="dsv4_hybrid",
+            csa_compress_ratios=[4] * (layers + 1),
+            q_lora_rank=1536,
+            v_head_dim=512,
+            qk_pos_emb_head_dim=64,
+            output_projection_groups=16,
+            output_projection_lora_rank=1024,
+            dsa_kernel_backend="none",
+        )
+        config = GPTModelConfig(transformer=transformer, vocab_size=200064)
+        # Layout helpers still read this global even with explicit PP/VP ranks.
+        with patch(
+            "megatron.core.parallel_state.get_virtual_pipeline_model_parallel_world_size",
+            return_value=vp,
+        ):
+            decoder = get_transformer_block_with_experimental_attention_variant_spec(
+                config=transformer, vp_stage=vp - 1, pp_rank=pp - 1
+            )
+        assert decoder.layer_specs == []
+        assert transformer.qk_head_dim == 448
+        mtp = mtp_block_spec(config, decoder, vp_stage=vp - 1, pp_rank=pp - 1)
+        attention = mtp.layer_specs[0].submodules.mtp_model_layer.submodules.self_attention
+        assert attention.module.__name__ == "DSv4HybridSelfAttention"
+        assert attention.submodules.core_attention.func.__name__ == "CompressedSparseAttention"
 
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
     def test_passes_vp_stage_and_use_te_to_get_gpt_mtp_block_spec(self, mock_get_mtp):

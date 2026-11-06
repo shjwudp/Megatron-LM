@@ -12,6 +12,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
 )
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import get_fsdp_root
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     ScheduleNode,
@@ -390,6 +391,10 @@ def combined_forward_backward_step(
             assert isinstance(
                 f_schedule_plan, AbstractSchedulePlan
             ), "first output of forward_step_func must be one instance of AbstractSchedulePlan"
+            if hasattr(f_schedule_plan, "_model_chunk_state"):
+                # Training may shard Float16Module, while plan construction
+                # unwraps it to GPTModel. Retain the actual parameter owner.
+                f_schedule_plan._model_chunk_state.fsdp_root = get_fsdp_root(f_model)
 
         # Wire per-layer FSDP parameter release callbacks.  The EP overlap
         # schedule bypasses normal FSDP forward/backward hooks, so we release

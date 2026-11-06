@@ -1,6 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import gc
+import weakref
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,6 +18,29 @@ class _TestScheduleNode(ScheduleNode):
     @contextmanager
     def stream_acquire_context(self, name=None):
         yield
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_unused_loss_node_releases_chunk_state_without_gc(device):
+    """Intermediate PP loss nodes must not pin inputs and grads until manual GC."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        input_tensor = torch.empty((32, 32), device=device, requires_grad=True)
+        input_tensor.grad = torch.empty_like(input_tensor)
+        node = ScheduleNode(lambda tensor: tensor, stream=None, event=None, name="loss_func")
+        node.chunk_state = SimpleNamespace(input_tensor=input_tensor)
+        refs = [weakref.ref(value) for value in (node, input_tensor, input_tensor.grad)]
+
+        # On non-final pipeline chunks this node never runs backward/_release_state.
+        del input_tensor, node
+        assert all(ref() is None for ref in refs)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+        gc.collect()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ScheduleNode requires CUDA")

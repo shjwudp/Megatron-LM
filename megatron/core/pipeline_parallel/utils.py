@@ -297,8 +297,13 @@ class ScheduleNode:
         # retained; the layer-level full recompute path replays it with grad at backward.
         self.forward_no_grad = False
 
-    def default_backward_func(self, output_edges, output_grads):
-        """Default backward function"""
+    @staticmethod
+    def default_backward_func(output_edges, output_grads):
+        """Run backward without creating a bound-method cycle on the node.
+
+        Intermediate pipeline loss nodes do not execute backward. Keeping this
+        callback unbound lets their chunk state be released even with GC disabled.
+        """
         # The engine accepts GradientEdge roots despite the legacy `tensors` argument name.
         if output_edges:
             Variable._execution_engine.run_backward(

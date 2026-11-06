@@ -79,6 +79,34 @@ def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
+def test_gradient_copy_retains_source_on_another_stream(distributed_setup):
+    """A combined schedule can collect gradients produced on a different CUDA stream."""
+    if distributed_setup.device.type != "cuda":
+        pytest.skip("CUDA stream lifetime regression")
+    mesh = init_device_mesh("cuda", (distributed_setup.world_size,))
+    model = nn.Linear(1024, 1024, bias=False, device=distributed_setup.device)
+    with fully_shard_context(FsdpContext(device=distributed_setup.device)):
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+    group = model.parameter_groups[0]
+    parameter = group.fsdp_parameters[0].unsharded
+    producer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
+    producer.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(producer):
+        parameter.grad = torch.full_like(parameter, 3.0)
+    consumer.wait_stream(producer)
+    with torch.cuda.stream(consumer):
+        partial = group.allocate_partial_grad_buffer()
+        # Leave time for the producer allocator to reuse an unrecorded source.
+        torch.cuda._sleep(50_000_000)
+        group.copy_gradients_to_partial_buffer(partial)
+    with torch.cuda.stream(producer):
+        overwrite = torch.full_like(parameter, float('nan'))
+    consumer.synchronize()
+    torch.testing.assert_close(partial.get_tensor_view(0), torch.full_like(parameter, 3.0))
+    producer.synchronize()
+    del overwrite
+
+
 def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
     """An outer FsdpModule owns direct parameters but not nested child FsdpModule parameters."""
     world_size = distributed_setup.world_size

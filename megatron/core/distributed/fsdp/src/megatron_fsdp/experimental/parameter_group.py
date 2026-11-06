@@ -638,7 +638,12 @@ class FsdpParameterGroup:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
         # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
+            grad = fsdp_parameter.unsharded.grad
+            partial_grad.get_tensor_view(index).copy_(grad)
+            # Combined schedules can finish a module on a different stream
+            # from the one that allocated a gradient. Keep its storage alive
+            # until this copy completes, even after clearing the owning .grad.
+            grad.record_stream(torch.cuda.current_stream())
             fsdp_parameter.unsharded.grad = None
 
     def _has_sharded_grads(self) -> bool:

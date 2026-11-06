@@ -91,9 +91,13 @@ def build_mtp_layer_callables(layer):
         assert (
             node.chunk_state.context is None
         ), f"multi token prediction + cross attention is not yet supported."
-        assert (
-            node.chunk_state.packed_seq_params is None
-        ), f"multi token prediction + sequence packing is not yet supported."
+        # The contiguous packed path shares document-aware token/mask rolls and
+        # loss processing with ordinary MTP. Keep other layouts gated until their
+        # combined-schedule boundary semantics have been validated.
+        if node.chunk_state.packed_seq_params is not None:
+            assert (
+                layer.config.attention_cp_layout == "contiguous"
+            ), "MTP + EP overlap with packed sequences requires contiguous CP layout."
 
         if layer.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()

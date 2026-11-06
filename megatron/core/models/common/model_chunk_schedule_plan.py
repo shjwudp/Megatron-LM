@@ -6,7 +6,10 @@ import torch
 from torch import Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import reshard_fsdp_module
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
+    finish_fsdp_backward,
+    reshard_fsdp_module,
+)
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -617,6 +620,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # save the inputs of model.forward() to ModelChunkState
         self._model_chunk_state.input_ids = input_ids
+        self._model_chunk_state.fsdp_root = model if isinstance(model, FsdpModule) else None
         self._model_chunk_state.position_ids = position_ids
         self._model_chunk_state.attention_mask = attention_mask
         self._model_chunk_state.decoder_input = decoder_input
@@ -930,11 +934,15 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_schedule_plan.wait_current_stream()
         if b_schedule_plan:
             b_schedule_plan.wait_current_stream()
-            model = b_schedule_plan._model_chunk_state.model
-            if isinstance(model, FsdpModule):
+            fsdp_root = b_schedule_plan._model_chunk_state.fsdp_root
+            if fsdp_root is not None:
+                # Root parameters can contribute in several graph segments (for
+                # example, embeddings in preprocessing and packed MTP). Reduce
+                # once all segments and delayed wgrads have accumulated.
+                finish_fsdp_backward(fsdp_root)
                 # This schedule bypasses the root's autograd completion callback.
                 # Finish this microbatch's weight cleanup; gradient sync stays caller-managed.
-                model.context.post_backward()
+                fsdp_root.context.post_backward()
             # Release reference as early as possible, this helps avoid memory leak.
             b_schedule_plan.release_state()
 

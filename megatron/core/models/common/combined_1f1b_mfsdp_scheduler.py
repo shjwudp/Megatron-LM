@@ -3,6 +3,15 @@
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
 
+def get_fsdp_root(model) -> FsdpModule | None:
+    """Find the FSDP root through DDP/mixed-precision wrapper layers."""
+    while model is not None:
+        if isinstance(model, FsdpModule):
+            return model
+        model = getattr(model, "module", None)
+    return None
+
+
 def _make_unshard_forward_hook(owner: FsdpModule):
     """Create a forward pre-hook that unshards the owning FSDP module before the submodule
     forward."""
@@ -26,7 +35,8 @@ def _make_unshard_backward_hook(owner: FsdpModule):
     return hook
 
 
-def _module_post_backward_hook(module: FsdpModule) -> None:
+def finish_fsdp_backward(module: FsdpModule) -> None:
+    """Release weights and reduce a completed unit's accumulated gradients."""
     module.reshard()
     module._reduce_gradient_groups()
 
@@ -55,5 +65,10 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     register_hooks(module, module)
 
     for submodule in module.modules():
-        if isinstance(submodule, FsdpModule):
-            submodule.register_post_backward_hook(_module_post_backward_hook)
+        # VPP registers hooks while the shared construction context is still
+        # open, before is_root() is available. The supplied chunk is its root.
+        if isinstance(submodule, FsdpModule) and submodule is not module:
+            submodule.register_post_backward_hook(finish_fsdp_backward)
+    # The schedule finishes the root explicitly after all backward segments.
+    # A root embedding can contribute from both preprocessing and MTP, so a
+    # parameter-count callback can fire before its final contribution arrives.
