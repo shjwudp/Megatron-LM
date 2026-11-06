@@ -2,6 +2,7 @@
 """Packed CSA/MTP parity across real CP and EP groups and interleaved microbatches."""
 
 import gc
+from collections import Counter
 from contextlib import nullcontext
 from dataclasses import replace
 
@@ -26,7 +27,10 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import _RecomputeRegion, model_parallel_cuda_manual_seed
+from megatron.core.transformer.experimental_attention_variant.csa_utils.output_recompute import (
+    CSAOutputRecompute,
+)
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import fused_a2a
 from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler, MTPLossLoggingHelper
@@ -138,7 +142,7 @@ def _batches(pg):
 @pytest.mark.experimental
 @pytest.mark.parametrize("fsdp", [False, True], ids=["unsharded", "hfsdp"])
 @pytest.mark.parametrize("delay_wgrad", [False, True])
-@pytest.mark.parametrize("recompute", [False, True])
+@pytest.mark.parametrize("recompute", [False, True, "local-bf16", "local-mxfp8"])
 def test_packed_csa_mtp_outputs_and_all_parameter_gradients(
     delay_wgrad, recompute, fsdp, monkeypatch
 ):
@@ -154,14 +158,18 @@ def test_packed_csa_mtp_outputs_and_all_parameter_gradients(
         pg = ProcessGroupCollection.use_mpu_process_groups()
         torch.manual_seed(198)
         model_parallel_cuda_manual_seed(198)
+        local_recompute = isinstance(recompute, str)
         config = _make_config(
-            num_layers=1,
+            num_layers=2 if local_recompute else 1,
+            moe_layer_freq=[0, 1] if local_recompute else 1,
+            fp8="e4m3" if recompute == "local-mxfp8" else None,
+            fp8_recipe="mxfp8",
             hidden_size=256,
             num_attention_heads=64,
             v_head_dim=512,
             qk_pos_emb_head_dim=64,
             q_lora_rank=128,
-            csa_compress_ratios=[4, 4],
+            csa_compress_ratios=[4, 4, 4] if local_recompute else [4, 4],
             csa_window_size=128,
             dsa_indexer_n_heads=64,
             dsa_indexer_head_dim=128,
@@ -197,8 +205,16 @@ def test_packed_csa_mtp_outputs_and_all_parameter_gradients(
             ),
         )
         reference = _model(config)
+        extra_modules = (
+            ["dense_fc1_act", "moe_fc1", "csa_o_proj", "csa_core_output"] if local_recompute else []
+        )
         candidate = _model(
-            replace(config, overlap_moe_expert_parallel_comm=True, delay_wgrad_compute=delay_wgrad)
+            replace(
+                config,
+                overlap_moe_expert_parallel_comm=True,
+                delay_wgrad_compute=delay_wgrad,
+                recompute_modules=list(config.recompute_modules) + extra_modules,
+            )
         )
         candidate.load_state_dict(reference.state_dict())
         if fsdp:
@@ -222,6 +238,23 @@ def test_packed_csa_mtp_outputs_and_all_parameter_gradients(
                 loss.backward(data["loss_mask"])
         if fsdp:
             reference.finish_grad_sync()
+        rebuilds = Counter()
+        original_rebuild = _RecomputeRegion.rebuild
+        original_output_rebuild = CSAOutputRecompute.rebuild
+
+        def count_rebuild(region):
+            fn = region._function
+            if fn is not None:
+                rebuilds[getattr(fn, "__name__", type(fn).__name__)] += 1
+            return original_rebuild(region)
+
+        def count_output_rebuild(region):
+            if region._inputs is not None:
+                rebuilds["csa_core_output"] += 1
+            return original_output_rebuild(region)
+
+        monkeypatch.setattr(_RecomputeRegion, "rebuild", count_rebuild)
+        monkeypatch.setattr(CSAOutputRecompute, "rebuild", count_output_rebuild)
         set_streams()
         candidate_model = candidate.module.module if fsdp else candidate
         plans = [candidate_model.build_schedule_plan(**data) for data in batches]
@@ -259,6 +292,12 @@ def test_packed_csa_mtp_outputs_and_all_parameter_gradients(
                     raise AssertionError(f"{name}: {error}") from error
                 checked += 1
         assert checked > 30
+        if local_recompute:
+            assert rebuilds["_fc1_act"] == 3, rebuilds
+            assert rebuilds["TEColumnParallelGroupedLinear"] == 6, rebuilds
+            assert rebuilds["_grouped_output_projection"] == 9, rebuilds
+            assert rebuilds["csa_core_output"] == 9, rebuilds
+            assert rebuilds["qkv_up_proj_and_rope_apply"] == 9, rebuilds
         del reference, candidate, plans, outputs
     finally:
         torch.cuda.synchronize()

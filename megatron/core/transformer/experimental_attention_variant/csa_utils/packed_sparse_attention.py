@@ -316,6 +316,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         logical_window_width: int,
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None,
         out_rope: Optional[OutputRopeParams] = None,
+        output_recompute=None,
     ) -> Tuple[Tensor, Tensor]:
         """Run packed attention with positive indexer loss and deferred CP reductions."""
         if loss_coeff <= 0:
@@ -344,6 +345,8 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             indexer_topk=0,
         )
         topk_idxs.clamp_min_(0)
+        # cuDNN's padded-row placeholder below is not a FlashMLA forward length.
+        replay_topk_length = topk_length.clone() if output_recompute is not None else None
         if q_padding_mask is not None:
             # Keep padded sink-only rows out of cuDNN DSA's zero-tile path.
             # Backward masks their dO and LSE before using this placeholder.
@@ -515,6 +518,20 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         ctx.indexer_grad_is_sequence_major = not sparse_loss
         if out_rope is not None:
             out_rope.apply_(out_flat)
+        if output_recompute is not None:
+            if kv_reconstruction_parts is None:
+                raise ValueError("csa_core_output requires mla_up_proj KV reconstruction.")
+            output_recompute.record(
+                query,
+                kv_reconstruction_parts,
+                attn_sink,
+                topk_idxs,
+                replay_topk_length,
+                softmax_scale,
+                out_rope,
+                out_flat,
+                lse,
+            )
         ctx.out_rope = out_rope
         ctx.num_forward_inputs = len(ctx.needs_input_grad)
         ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
@@ -690,6 +707,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             None,
             grad_local_k_indexer,
             grad_local_compressed_kv,
+            None,
             None,
             None,
             None,

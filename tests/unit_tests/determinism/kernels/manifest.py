@@ -104,6 +104,16 @@ C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="csa_output_recompute",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/output_recompute.py",
+        ),
+        tests=(K + "test_csa_output_recompute.py",),
+        kind="dispatch",
+        notes="Real FlashMLA O/LSE replay is bit-exact, including output RoPE and padding. "
+        "CP2 BF16/MXFP8 gradients use existing CSA similarity gates; no extra collectives.",
+    ),
+    KernelEntry(
         name="csa_output_rope_reconstruction",
         sources=("megatron/core/ops/attention/csa/output_rope.py",),
         tests=(K + "test_csa_output_rope.py",),

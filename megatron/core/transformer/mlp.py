@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from megatron.core import tensor_parallel
 from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
@@ -256,10 +257,18 @@ class MLP(MegatronModule):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
-    def forward(
-        self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
-    ):
-        """Perform the forward pass through the MLP block."""
+        self.recompute_fc1_act = (
+            config.recompute_granularity == "selective"
+            and "dense_fc1_act" in config.recompute_modules
+            and not is_expert
+        )
+        if self.recompute_fc1_act and (config.fp8 or config.fp4):
+            from megatron.core.extensions.transformer_engine import set_save_original_input
+
+            set_save_original_input(self.linear_fc2)
+
+    def _fc1_act(self, hidden_states, per_token_scale=None):
+        """Run the local FC1 and activation region, without the FC2 projection."""
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")
         intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
@@ -371,6 +380,21 @@ class MLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
         nvtx_range_pop(suffix="activation")
 
+        return intermediate_parallel
+
+    def forward(
+        self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
+    ):
+        """Perform the forward pass through the MLP block."""
+        checkpoint = None
+        if self.recompute_fc1_act and self.training and torch.is_grad_enabled():
+            checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=self.config.fp8)
+            intermediate_parallel = checkpoint.checkpoint(
+                self._fc1_act, hidden_states, per_token_scale
+            )
+        else:
+            intermediate_parallel = self._fc1_act(hidden_states, per_token_scale)
+
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
 
@@ -385,6 +409,11 @@ class MLP(MegatronModule):
             output += output_bias.unsqueeze(0) * per_token_scale.unsqueeze(-1)
             output_bias = None
 
+        if checkpoint is not None:
+            checkpoint.discard_output_and_register_recompute(output)
+            # Outer pre-MLP layernorm hooks must restore our input before FC1 replay.
+            # The view creates an earlier backward node without allocating storage.
+            output = output.view_as(output)
         return output, output_bias
 
     # pylint: disable=missing-function-docstring

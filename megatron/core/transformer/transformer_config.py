@@ -706,10 +706,18 @@ class TransformerConfig(ModelParallelConfig):
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
     "shared_experts", "gdn", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", "residual_stream", "dsa_simple_routing",
-    "dsa_indexer_k", "dsa_selected_scores".
+    "dsa_indexer_k", "dsa_selected_scores", "dense_fc1_act", "moe_fc1", "csa_o_proj",
+    "csa_core_output".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
+    "dense_fc1_act": recompute dense FC1 and activation, discarding the FC2 input (TP1).
+    "moe_fc1": recompute routed FC1 after dispatch; requires moe_act and ETP1.
+    "csa_o_proj": recompute the DSv4 grouped output projection, discarding its output.
+    "csa_core_output": restore packed CSA O/LSE with local FlashMLA forward; requires
+            mla_up_proj, CP>1, fused RoPE and positive indexer loss. Reuses gathered KV.
+            These four options support eager BF16/MXFP8, including MoE expert overlap,
+            without activation offloading, TE operation fusion, or GTP.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
     "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
     "mlp": recompute the dense MLP submodule.
@@ -2980,6 +2988,10 @@ class TransformerConfig(ModelParallelConfig):
                 allowed_modules = {
                     "core_attn",
                     "moe_act",
+                    "moe_fc1",
+                    "dense_fc1_act",
+                    "csa_o_proj",
+                    "csa_core_output",
                     "layernorm",
                     "mla_up_proj",
                     "mlp",
@@ -3006,6 +3018,55 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_act in recompute_modules is only supported with moe_grouped_gemm."
                 )
+
+            local_recompute = {"dense_fc1_act", "moe_fc1", "csa_o_proj", "csa_core_output"} & set(
+                self.recompute_modules
+            )
+            if local_recompute:
+                if self.fine_grained_activation_offloading or self.use_transformer_engine_op_fuser:
+                    raise ValueError(
+                        f"{local_recompute} requires unfused modules without activation offloading."
+                    )
+                if self.fp4 or (self.fp8 and self.fp8_recipe != "mxfp8"):
+                    raise ValueError(f"{local_recompute} supports BF16 or MXFP8 only.")
+                if self.cuda_graph_impl != "none":
+                    raise ValueError(f"{local_recompute} requires eager execution.")
+                if self.gtp_weight_remat_size > 1:
+                    raise ValueError(
+                        f"{local_recompute} does not support GTP weight rematerialization."
+                    )
+            if "dense_fc1_act" in local_recompute:
+                if self.tensor_model_parallel_size != 1 or "mlp" in self.recompute_modules:
+                    raise ValueError("dense_fc1_act requires TP1 and cannot be combined with mlp.")
+            if "moe_fc1" in local_recompute:
+                if (
+                    not self.moe_grouped_gemm
+                    or self.transformer_impl != "transformer_engine"
+                    or "moe_act" not in self.recompute_modules
+                    or "moe" in self.recompute_modules
+                    or self.add_bias_linear
+                    or self.expert_tensor_parallel_size != 1
+                ):
+                    raise ValueError(
+                        "moe_fc1 requires TE grouped GEMM, ETP1, no linear bias, and moe_act; "
+                        "it cannot be combined with moe."
+                    )
+            if "csa_o_proj" in local_recompute:
+                if self.experimental_attention_variant != "dsv4_hybrid":
+                    raise ValueError("csa_o_proj requires dsv4_hybrid attention.")
+            if "csa_core_output" in local_recompute:
+                if (
+                    self.experimental_attention_variant != "dsv4_hybrid"
+                    or "mla_up_proj" not in self.recompute_modules
+                    or self.context_parallel_size <= 1
+                    or not self.apply_rope_fusion
+                    or not self.dsa_indexer_loss_coeff
+                    or self.dsa_indexer_loss_coeff <= 0
+                ):
+                    raise ValueError(
+                        "csa_core_output requires dsv4_hybrid, mla_up_proj, CP>1, "
+                        "fused RoPE and positive indexer loss."
+                    )
 
             if "mla_up_proj" in self.recompute_modules and not self.multi_latent_attention:
                 raise ValueError(

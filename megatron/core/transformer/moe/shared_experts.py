@@ -129,6 +129,10 @@ class SharedExpertMLP(MLP):
         "please set '--disable-bias-linear' instead."
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
+        if config.recompute_modules is not None:
+            config.recompute_modules = [
+                module for module in config.recompute_modules if module != "dense_fc1_act"
+            ]
         super().__init__(
             config=config,
             submodules=submodules,

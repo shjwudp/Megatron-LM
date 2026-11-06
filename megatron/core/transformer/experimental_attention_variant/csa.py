@@ -923,6 +923,7 @@ class CompressedSparseAttentionInterface(Protocol):
         boundary_hidden: torch.Tensor | None = None,
         boundary_kv: torch.Tensor | None = None,
         out_rope: Optional[OutputRopeParams] = None,
+        output_recompute=None,
     ) -> torch.Tensor:
         """Apply compressed sparse attention."""
         ...
@@ -1211,6 +1212,7 @@ class CompressedSparseAttention(MegatronModule):
         boundary_hidden: torch.Tensor | None = None,
         boundary_kv: torch.Tensor | None = None,
         out_rope: Optional[OutputRopeParams] = None,
+        output_recompute=None,
     ) -> torch.Tensor:
         """Forward pass for CompressedSparseAttention.
 
@@ -1242,7 +1244,15 @@ class CompressedSparseAttention(MegatronModule):
                 boundary_hidden = x.new_empty((0, *x.shape[1:]))
                 boundary_kv = key.new_empty((0, *key.shape[1:]))
             return self._forward_packed(
-                query, key, x, qr, boundary_hidden, boundary_kv, packed_seq_params, out_rope
+                query,
+                key,
+                x,
+                qr,
+                boundary_hidden,
+                boundary_kv,
+                packed_seq_params,
+                out_rope,
+                output_recompute,
             )
         if attention_mask is not None:
             raise ValueError(
@@ -1400,6 +1410,7 @@ class CompressedSparseAttention(MegatronModule):
         boundary_kv: Optional[torch.Tensor],
         packed_seq_params: PackedSeqParams,
         out_rope: Optional[OutputRopeParams] = None,
+        output_recompute=None,
     ) -> torch.Tensor:
         """THD-packed context-parallel branch.
 
@@ -1602,6 +1613,8 @@ class CompressedSparseAttention(MegatronModule):
         use_indexer_loss = (
             training_with_grad and compressed_topk is not None and indexer_loss_coeff > 0
         )
+        if output_recompute is not None and not use_indexer_loss:
+            raise ValueError("csa_core_output requires the packed CSA indexer-loss path.")
 
         # ---- Step 6: concatenate the raw local KV sources -------------------
         # The fused training path owns both CP reduce-scatters. Detach the
@@ -1697,6 +1710,7 @@ class CompressedSparseAttention(MegatronModule):
                 self.window_size,
                 kv_reconstruction_parts,
                 out_rope,
+                output_recompute,
             )
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=indexer_loss,

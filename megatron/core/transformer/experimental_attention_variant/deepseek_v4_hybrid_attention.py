@@ -24,6 +24,9 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionBuilder,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+from megatron.core.transformer.experimental_attention_variant.csa_utils.output_recompute import (
+    CSAOutputRecompute,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -135,6 +138,13 @@ class DSv4HybridAttention(Attention):
             and "mla_up_proj" in self.config.recompute_modules
         )
         self.qkv_up_checkpoint = None
+        self.recompute_o_proj = (
+            config.recompute_granularity == "selective" and "csa_o_proj" in config.recompute_modules
+        )
+        self.recompute_csa_output = (
+            config.recompute_granularity == "selective"
+            and "csa_core_output" in config.recompute_modules
+        )
 
         self.softmax_scale = None
 
@@ -369,6 +379,11 @@ class DSv4HybridAttention(Attention):
         # core attention computation
         # ==================================
         # Need corresponding TE change
+        output_recompute = None
+        if self.recompute_csa_output and self.training and torch.is_grad_enabled():
+            if not use_thd_cp or out_rope is None:
+                raise ValueError("csa_core_output requires packed CP and fused output RoPE.")
+            output_recompute = CSAOutputRecompute()
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
         )
@@ -384,6 +399,7 @@ class DSv4HybridAttention(Attention):
                 boundary_hidden=boundary_hidden,
                 boundary_kv=boundary_kv,
                 out_rope=out_rope,
+                output_recompute=output_recompute,
             )
         forced_released_tensors = [query, key, value]
         if boundary_kv is not None:
@@ -399,6 +415,7 @@ class DSv4HybridAttention(Attention):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
 
+        qkv_up_checkpoint = self.qkv_up_checkpoint
         if self.recompute_up_proj:
             assert self.qkv_up_checkpoint is not None
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
@@ -521,6 +538,38 @@ class DSv4HybridAttention(Attention):
                 core_attn_out = torch.cat([content_part, rot_part], dim=-1)
             core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
 
+        o_proj_checkpoint = None
+        if self.recompute_o_proj and self.training and torch.is_grad_enabled():
+            o_proj_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=None)
+            core_attn_out = o_proj_checkpoint.checkpoint(
+                self._grouped_output_projection, core_attn_out
+            )
+        else:
+            core_attn_out = self._grouped_output_projection(core_attn_out)
+
+        # =================
+        # Output. [sq, b, h]
+        # =================
+        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+        with attn_proj_manager as core_attn_out:
+            output, bias = self.linear_proj(core_attn_out)
+        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+
+        if output_recompute is not None:
+            # Restore the upstream values before replaying FlashMLA, then the
+            # grouped projection. The old O hook remains an idempotent fallback.
+            qkv_up_checkpoint.discard_output_and_register_recompute(output)
+            output_recompute.discard_output_and_register_recompute(output)
+        if o_proj_checkpoint is not None:
+            o_proj_checkpoint.discard_output_and_register_recompute(output)
+        if output_recompute is not None:
+            # The outer input-LN hook on this view must run BEFORE the hooks on
+            # output above: Q/KV replay reads that discarded normalized input.
+            output = output.view_as(output)
+        return output, bias
+
+    def _grouped_output_projection(self, core_attn_out):
+        """Project per-head attention output into the grouped low-rank space."""
         # Grouped output
         core_attn_out = core_attn_out.view(
             core_attn_out.size(0), core_attn_out.size(1), self.output_projection_local_groups, -1
@@ -531,15 +580,7 @@ class DSv4HybridAttention(Attention):
         core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
-        # =================
-        # Output. [sq, b, h]
-        # =================
-        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
-        with attn_proj_manager as core_attn_out:
-            output, bias = self.linear_proj(core_attn_out)
-        output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
-
-        return output, bias
+        return core_attn_out
 
 
 class DSv4HybridSelfAttention(DSv4HybridAttention):

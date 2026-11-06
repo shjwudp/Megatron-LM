@@ -404,6 +404,10 @@ class TEGroupedMLP(MegatronModule):
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
         )
+        self.fc1_recompute = (
+            self.config.recompute_granularity == "selective"
+            and "moe_fc1" in self.config.recompute_modules
+        )
         if self.activation_recompute and (self.config.fp8 or self.config.fp4):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
@@ -1149,6 +1153,9 @@ class TEGroupedMLP(MegatronModule):
         # CheckpointFunction invokes this forward once under no_grad and again under
         # enable_grad during backward, and self.training is True in both cases.
         setup_activation_checkpoint = self.activation_recompute and torch.is_grad_enabled()
+        fc1_checkpoint = None
+        if self.fc1_recompute and torch.is_grad_enabled():
+            fc1_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=self.config.fp8)
 
         # With both unfused groups enabled, offload fc1 + activation as ONE group named
         # "fused_group_mlp", like the fused path: the saved-tensor hooks catch everything saved
@@ -1176,9 +1183,16 @@ class TEGroupedMLP(MegatronModule):
                 offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
             )
             with expert_fc1_manager as permuted_local_hidden_states:
-                fc1_output, bias_parallel = apply_module(self.linear_fc1)(
-                    permuted_local_hidden_states, tokens_per_expert
-                )
+                if fc1_checkpoint is not None:
+                    fc1_output, bias_parallel = fc1_checkpoint.checkpoint(
+                        apply_module(self.linear_fc1),
+                        permuted_local_hidden_states,
+                        tokens_per_expert,
+                    )
+                else:
+                    fc1_output, bias_parallel = apply_module(self.linear_fc1)(
+                        permuted_local_hidden_states, tokens_per_expert
+                    )
             fc1_output = expert_fc1_manager.group_offload(
                 fc1_output,
                 forced_released_tensors=[permuted_local_hidden_states],
@@ -1200,6 +1214,9 @@ class TEGroupedMLP(MegatronModule):
         # recompute its saved input is discarded (storage resized to 0) right after fc2, and an
         # offload group must not hold such a tensor. The commit still happens after fc2 (below).
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
+        if fc1_checkpoint is not None:
+            # Hooks run FIFO: restore FC1 output before activation replay reads it.
+            fc1_checkpoint.discard_output_and_register_recompute(output)
         if setup_activation_checkpoint:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
 
