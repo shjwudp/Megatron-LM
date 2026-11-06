@@ -1049,6 +1049,9 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
+    moe_router_force_load_balancing_mode: Literal["random", "round_robin"] = "random"
+    """Benchmark routing: random logits or deterministic consecutive expert assignments."""
+
     moe_router_force_biased: Optional[float] = None
     """Apply random expert bias in normal distribution with specified std
     to router logits. Shared seed across all ranks ensures identical bias.

@@ -25,6 +25,7 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     apply_biased_logits,
     apply_random_logits,
+    apply_round_robin_logits,
     apply_router_token_dropping,
     compute_normalized_router_scores,
     compute_routing_scores_for_aux_loss,
@@ -88,6 +89,7 @@ class Router(ABC, MegatronModule):
         self.is_mtp_layer = is_mtp_layer
         self.hash_moe_layer_threshold = hash_moe_layer_threshold
         self.tp_group = pg_collection.tp
+        self.ep_group = pg_collection.ep
         self.expt_tp_group = pg_collection.expt_tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
@@ -1339,8 +1341,17 @@ class TopKRouter(Router):
                     )
 
         if self.config.moe_router_force_load_balancing:
-            # Apply force load balancing with random logits for benchmark
-            logits = apply_random_logits(logits)
+            if self.config.moe_router_force_load_balancing_mode == "round_robin":
+                if (
+                    self.config.moe_router_num_groups
+                    or self.config.moe_router_force_biased is not None
+                ):
+                    raise ValueError("round_robin requires unrestricted top-k and no forced bias")
+                logits = apply_round_robin_logits(logits, self.topk, self.ep_group.rank())
+            elif self.config.moe_router_force_load_balancing_mode == "random":
+                logits = apply_random_logits(logits)
+            else:
+                raise ValueError("Unknown moe_router_force_load_balancing_mode")
 
         if self.config.moe_router_force_biased is not None:
             # Apply biased logits with shared random bias across all ranks

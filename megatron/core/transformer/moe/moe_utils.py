@@ -1467,6 +1467,39 @@ class RandomSTE(torch.autograd.Function):
         return grad_output
 
 
+class _RoundRobinLogits(torch.autograd.Function):
+    """Deterministic benchmark assignments with an identity gradient for the gate.
+
+    Token i selects k consecutive experts starting at (rank * tokens + i) % E.
+    Counts are exact when each rank's token count is divisible by E. For arbitrary
+    or padded token counts, boundary/padding imbalance can remain.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, topk, ep_rank):
+        """Construct the selected expert window using only tensor metadata."""
+        shape = logits.shape
+        flat = logits.reshape(-1, shape[-1])
+        if not 0 < topk <= shape[-1]:
+            raise ValueError('round_robin requires 0 < topk <= num_experts')
+        start = torch.arange(flat.shape[0], device=logits.device) + ep_rank * flat.shape[0]
+        offsets = torch.arange(topk, device=logits.device)
+        indices = (start[:, None] + offsets) % shape[-1]
+        result = torch.full_like(flat, -1.0e4)
+        result.scatter_(1, indices, 1.0e4)
+        return result.reshape(shape)
+
+    @staticmethod
+    def backward(ctx, gradient):
+        """Use the same straight-through gradient contract as random forcing."""
+        return gradient, None, None
+
+
+def apply_round_robin_logits(logits: torch.Tensor, topk: int, ep_rank: int) -> torch.Tensor:
+    """Replace gate values only for performance experiments; preserve its gradient edge."""
+    return _RoundRobinLogits.apply(logits, topk, ep_rank)
+
+
 def apply_random_logits(logits: torch.Tensor) -> torch.Tensor:
     """
     Apply the RandomSTE function to the logits.
