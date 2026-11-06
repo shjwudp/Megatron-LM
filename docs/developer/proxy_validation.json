@@ -1,0 +1,111 @@
+{
+  "tested_runtime_commit": "708e44495",
+  "runtime_equivalence": "Matches the source runtime except the requested EventTracker dump-only behavior; optimizer formatting is AST-equivalent.",
+  "timer_environment": {
+    "ENABLE_PP_TIMER_DUMP_ONLY": "1",
+    "ENABLE_PP_TIMER": "0",
+    "ENABLE_PP_TIMER_INTERVAL": "20",
+    "ENABLE_PP_TIMER_ITER": "99-99",
+    "ENABLE_PP_TIMER_CPU": "1"
+  },
+  "unit_checks": {
+    "dense_chunk": 2,
+    "gpt_and_schedule": 78,
+    "local_recompute": 12,
+    "cp2_recompute_per_rank": 4,
+    "round_robin": 2,
+    "observability_and_flops": 77,
+    "calculator_node": 19
+  },
+  "browser_checks": {
+    "passed": true,
+    "checks": [
+      "two presets",
+      "default batch preserved",
+      "EP2",
+      "ZeRO selector",
+      "export/import",
+      "auto batch",
+      "removed preset fallback"
+    ],
+    "page_errors": []
+  },
+  "runs": {
+    "ddp": {
+      "status": "Completed",
+      "iterations": 40,
+      "ranks": 8,
+      "exit_code": 0,
+      "finite_loss_and_gradient": true,
+      "nan_or_skipped_iterations": 0,
+      "timer": {
+        "rank_iterations": 320,
+        "valid_ranges": 129808,
+        "invalid": 0
+      },
+      "cpu_dump_files": 320,
+      "gpu_dump_files": 320,
+      "snapshot_files": 4,
+      "nsys": {
+        "cuda_kernels": 118698,
+        "complete_nvtx": 36236
+      },
+      "memory": {
+        "max_allocated_GiB": 71.5720067024231,
+        "max_reserved_GiB": 76.353515625,
+        "device_sampled_peak_GiB": 87.45208740234375,
+        "allocated_range_bytes": 35754496
+      },
+      "gc_boundary_change_max_bytes": 0
+    },
+    "hfsdp": {
+      "status": "Completed",
+      "iterations": 40,
+      "ranks": 8,
+      "exit_code": 0,
+      "finite_loss_and_gradient": true,
+      "nan_or_skipped_iterations": 0,
+      "timer": {
+        "rank_iterations": 320,
+        "valid_ranges": 176960,
+        "invalid": 0
+      },
+      "cpu_dump_files": 320,
+      "gpu_dump_files": 320,
+      "snapshot_files": 4,
+      "nsys": {
+        "cuda_kernels": 121933,
+        "complete_nvtx": 49423,
+        "feature_ranges": {
+          "scope": "All ranks in the two-iteration nsys capture window; completed NVTX ranges",
+          "counts": {
+            "ncclAllGather": 620,
+            "ncclReduceScatter": 408,
+            "optimizer mfsdp grads reduce scatter axis0": 152,
+            "optimizer mfsdp grads reduce scatter axis1": 512,
+            "optimizer mfsdp param gather axis0": 344,
+            "optimizer mfsdp param gather axis1": 248,
+            "recompute csa_core_output": 128,
+            "recompute csa_o_proj": 128,
+            "recompute dense_fc1_act": 32,
+            "recompute layernorm": 224,
+            "recompute mla_up_proj": 128,
+            "recompute moe_act": 96,
+            "recompute moe_fc1": 96,
+            "recompute shared_experts": 96,
+            "sparse_attn_score_recompute": 128,
+            "sparse_indexer_score_recompute": 128
+          }
+        }
+      },
+      "memory": {
+        "max_allocated_GiB": 81.94864654541016,
+        "max_reserved_GiB": 109.92578125,
+        "device_sampled_peak_GiB": 122.70989990234375,
+        "allocated_range_bytes": 35754496
+      },
+      "gc_boundary_change_max_bytes": 0
+    }
+  },
+  "mock_batches_identical": true
+}

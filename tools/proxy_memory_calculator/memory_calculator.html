@@ -1,0 +1,902 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Proxy model · CSA 显存估算器</title>
+  <style>
+    :root {
+      --bg: #f4f6f8; --paper: #fff; --ink: #172b3a; --muted: #536775;
+      --line: #dce4e9; --accent: #066e68; --soft: #e7f4ef;
+      --static: #166f73; --saved: #6c77c6; --transient: #d89b42;
+      --danger: #a73527; --radius: 16px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Microsoft YaHei", sans-serif;
+      color: var(--ink); background: var(--bg); font-size: 14px;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    [hidden] { display: none !important; }
+    button, input, select, textarea { font: inherit; }
+    button, select, input[type="checkbox"] { cursor: pointer; }
+    button { border: 1px solid var(--line); background: white; border-radius: 9px;
+      color: var(--ink); padding: 9px 13px; font-weight: 600; }
+    button:hover { background: #edf3f4; border-color: #a5b8c2; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    button.primary, button[aria-pressed="true"] { background: var(--accent);
+      color: white; border-color: var(--accent); }
+    :focus-visible { outline: 3px solid #88bbb5; outline-offset: 3px; }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: clamp(25px, 3vw, 36px); letter-spacing: -.8px; line-height: 1.25; }
+    h2 { font-size: 18px; }
+    h3 { font-size: 15px; }
+    code, .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    code { overflow-wrap: anywhere; }
+    .shell { max-width: 1560px; margin: 0 auto; padding: 32px 28px; }
+    .hero { display: flex; align-items: center; justify-content: space-between;
+      gap: 24px; margin-bottom: 22px; }
+    .eyebrow { color: var(--accent); font-size: 12px; font-weight: 700;
+      letter-spacing: 1.8px; margin-bottom: 10px; }
+    .subtitle { color: var(--muted); margin-top: 10px; line-height: 1.7; }
+    .badge { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
+      border: 1px solid #c8e1d7; color: var(--accent); background: var(--soft);
+      border-radius: 30px; font-size: 12px; padding: 7px 11px; }
+    .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%;
+      background: var(--accent); }
+    .notice { border: 1px solid #ecd3a0; border-left: 4px solid #c38b28;
+      border-radius: 11px; padding: 14px 17px; background: #fffaed;
+      color: #654b1a; line-height: 1.75; margin-bottom: 22px; }
+    .notice strong { display: block; }
+    .workspace { display: grid; grid-template-columns: 370px minmax(0, 1fr);
+      gap: 22px; align-items: start; }
+    .panel { background: var(--paper); border: 1px solid var(--line);
+      border-radius: var(--radius); overflow: hidden; box-shadow: 0 3px 12px #253a4d04; }
+    .panel-head { display: flex; justify-content: space-between; align-items: center;
+      gap: 12px; padding: 20px 20px 15px; }
+    .hint { color: var(--muted); font-size: 12px; line-height: 1.7; }
+    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
+    .presets { padding: 0 20px 18px; }
+    .section { margin: 0; padding: 18px 20px; border: 0; border-top: 1px solid var(--line); }
+    .section h3 { margin-bottom: 14px; }
+    .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px 12px; }
+    .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+    .field-label { font-size: 12px; color: var(--muted); }
+    input[type="number"], select, textarea { width: 100%; min-width: 0; border: 1px solid #cbd7de;
+      border-radius: 8px; background: #fbfcfd; color: var(--ink); padding: 9px 10px; }
+    input[type="number"] { font-variant-numeric: tabular-nums; }
+    input[readonly] { background: #edf2f4; color: var(--muted); }
+    textarea { resize: vertical; line-height: 1.6; }
+    .wide { grid-column: 1 / -1; }
+    .field .hint { margin-top: -1px; }
+    details.section > summary { cursor: pointer; font-weight: 600; }
+    details.section[open] > summary { margin-bottom: 16px; }
+    .checks { display: grid; gap: 10px; }
+    .check { display: flex; gap: 9px; align-items: flex-start; font-size: 13px; line-height: 1.5; }
+    input[type="checkbox"] { width: 16px; height: 16px; flex: 0 0 16px;
+      margin: 2px 0 0; accent-color: var(--accent); }
+    .check code { display: block; color: var(--muted); font-size: 11px; }
+    .recompute-origin { display: inline-block; margin-left: 7px; padding: 0 5px;
+      border: 1px solid var(--line); border-radius: 4px; color: var(--muted); font-size: 11px; }
+    .form-bottom { padding: 18px 20px; border-top: 1px solid var(--line); }
+    .form-bottom button { width: 100%; }
+    .form-bottom p { text-align: center; margin-top: 8px; }
+    .results { min-width: 0; display: grid; gap: 18px; }
+    .result-body { display: grid; gap: 18px; }
+    .status { min-height: 22px; color: var(--muted); line-height: 1.6; font-size: 13px; }
+    .error { padding: 18px 20px; border: 1px solid #edc5bd; border-radius: 12px;
+      background: #fff3f0; color: var(--danger); line-height: 1.7; white-space: pre-wrap;
+      overflow-wrap: anywhere; }
+    .empty { padding: 38px 25px; text-align: center; color: var(--muted); line-height: 1.8; }
+    .metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .metric { padding: 19px 18px; }
+    .metric:first-child { background: #edf7f3; border-color: #c9e2d8; }
+    .metric .value { font-size: clamp(23px, 2.5vw, 33px); font-weight: 700;
+      letter-spacing: -1px; margin: 9px 0 5px; font-variant-numeric: tabular-nums; }
+    .metric .value span { font-size: 13px; font-weight: 500; letter-spacing: 0; }
+    .derived { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+      padding: 16px 20px; gap: 18px 12px; }
+    .derived dt { font-size: 11px; color: var(--muted); margin-bottom: 5px; }
+    .derived dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums;
+      overflow-wrap: anywhere; }
+    .warning-list { margin: 0; padding: 14px 18px 14px 35px; color: #76571c;
+      border: 1px solid #ecdcb9; background: #fffaf0; border-radius: 12px; line-height: 1.7; }
+    .legend { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+    .legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .dot { width: 9px; height: 9px; border-radius: 3px; display: inline-block; }
+    .static { background: var(--static); }
+    .saved { background: var(--saved); }
+    .transient { background: var(--transient); }
+    .bars { display: grid; gap: 13px; padding: 8px 20px 21px; }
+    .bar-row { display: grid; grid-template-columns: 55px minmax(0, 1fr) 90px;
+      gap: 12px; align-items: center; font-size: 12px; }
+    .bar-row button { padding: 5px 4px; font-size: 12px; font-weight: 500; }
+    .bar-track { height: 25px; background: #f0f3f6; border-radius: 5px;
+      display: flex; overflow: hidden; }
+    .segment { height: 100%; }
+    .bar-number { text-align: right; font-variant-numeric: tabular-nums; }
+    .table-scroll { overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; font-size: 12px; }
+    th { background: #f8fafb; color: var(--muted); font-weight: 500; text-align: right; }
+    th, td { padding: 11px 13px; border-bottom: 1px solid #e8eef2;
+      text-align: right; font-variant-numeric: tabular-nums; }
+    th:first-child, td:first-child { text-align: left; }
+    tbody tr:last-child td { border-bottom: 0; }
+    .zero-table { min-width: 420px; }
+    .zero-table .current { background: #edf7f3; font-weight: 600; }
+    .zero-table tfoot { border-top: 1px solid var(--line); font-weight: 600; }
+    .stage-table { min-width: 760px; }
+    .stage-table td:nth-child(2) { text-align: left; max-width: 220px; overflow-wrap: anywhere; }
+    .stage-table td { vertical-align: top; }
+    .stage-table button { padding: 3px 7px; font-size: 12px; white-space: nowrap; }
+    .stage-table tr.selected { background: #edf7f3; }
+    .chunk { display: block; margin-bottom: 3px; }
+    .chunk:last-child { margin: 0; }
+    .panel-note { padding: 0 20px 16px; }
+    .detail-select { width: 125px; }
+    .detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px; padding: 0 20px 20px; }
+    .detail-card { min-width: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+    .detail-card h3 { padding: 13px; font-size: 13px; }
+    .detail-card table { table-layout: fixed; }
+    .detail-card th:last-child, .detail-card td:last-child { width: 90px; }
+    .detail-card td:first-child { overflow-wrap: anywhere; }
+    .detail-card tfoot { background: #f8fafb; font-weight: 600; }
+    .explanation { padding: 18px 20px; line-height: 1.8; color: var(--muted); font-size: 12px; }
+    .explanation strong { color: var(--ink); }
+    .json-box { margin-top: 12px; min-height: 150px; font-size: 12px; }
+    .json-status { margin-top: 10px; }
+    footer { margin-top: 24px; color: var(--muted); font-size: 12px;
+      display: flex; justify-content: space-between; gap: 16px; line-height: 1.7; }
+    @media (max-width: 1120px) {
+      .workspace { grid-template-columns: 320px minmax(0, 1fr); }
+      .metrics { grid-template-columns: 1fr; }
+      .metric .value { font-size: 27px; }
+      .detail-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 820px) {
+      .shell { padding: 22px 16px; }
+      .workspace { grid-template-columns: 1fr; }
+      .hero { align-items: flex-start; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .metric { padding: 15px 12px; }
+      .metric .value { font-size: 24px; }
+    }
+    @media (max-width: 520px) {
+      .hero { flex-direction: column; gap: 12px; }
+      .metrics { grid-template-columns: 1fr; }
+      .derived { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .panel-head { align-items: flex-start; flex-wrap: wrap; }
+      .bar-row { grid-template-columns: 50px minmax(0, 1fr) 77px; gap: 7px; }
+      footer { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Proxy model / CSA / MFSDP V2</p>
+        <h1>每张卡的显存，拆开看。</h1>
+        <p class="subtitle">调整模型、并行拓扑与重算策略，估算各 PP stage 的显存开销。</p>
+      </div>
+      <span class="badge">离线计算 · 数据保留在本机</span>
+    </header>
+
+    <aside class="notice" aria-label="批次与分片设置说明">
+      <strong>Proxy model 显存估算：只提供16机和EP2两种预设。</strong>
+      World = EDP 倍数 × PP × EP。手动修改拓扑时，默认 G = PP、GBS = DP × MBS × 4G；可覆盖这两个值。
+      预设保留各自的批次配置。默认关闭 FSDP padded shards；打开后按源码的矩阵行宽对齐估算额外开销。
+    </aside>
+
+    <div class="workspace">
+      <form id="config-form" class="panel" novalidate>
+        <div class="panel-head"><h2>配置</h2><span id="preset-name" class="hint">16机 · Proxy model</span></div>
+        <div class="toolbar presets">
+          <button type="button" id="preset-hfsdp16" aria-pressed="true">16机 · Proxy model</button>
+          <button type="button" id="preset-local" aria-pressed="false">EP2 · Proxy model</button>
+          <p class="hint">默认 Dense ZeRO-2；16机使用 Outer optim，EP2使用 Outer no_shard。</p>
+        </div>
+        <section class="section" aria-labelledby="topology-heading">
+          <h3 id="topology-heading">01 / 并行与分片</h3>
+          <div id="topology-fields" class="fields"></div>
+        </section>
+        <section class="section" aria-labelledby="batch-heading">
+          <h3 id="batch-heading">02 / 批次与流水线</h3>
+          <div id="batch-fields" class="fields"></div>
+          <p class="hint" style="margin-top:12px">默认 G = PP、GBS = DP × MBS × 4G。两项均可直接修改；手动填写的值不随其他参数变化。</p>
+          <div class="toolbar" style="margin-top:10px">
+            <button type="button" id="batch-auto">恢复自动推算</button>
+            <span id="batch-mode" class="hint" role="status"></span>
+          </div>
+        </section>
+        <details class="section" open>
+          <summary>03 / 模型维度</summary>
+          <div id="model-fields" class="fields"></div>
+        </details>
+        <details class="section">
+          <summary>04 / CSA 注意力与索引器</summary>
+          <div id="attention-fields" class="fields"></div>
+        </details>
+        <section class="section" aria-labelledby="recompute-heading">
+          <h3 id="recompute-heading">05 / 选择性重算</h3>
+          <div id="recompute-fields" class="checks"></div>
+          <p class="hint" style="margin-top:12px">勾选表示启用重算。来源按本工作树的 main 基线区分；“本分支新增”为本分支加入的四项重算。O 重算释放跨层保存的 O/LSE，反向仍需恢复一层临时量。</p>
+        </section>
+        <section class="section" aria-labelledby="reserve-heading">
+          <h3 id="reserve-heading">06 / 显存碎片预估与非 Torch</h3>
+          <div id="reserve-fields" class="fields"></div>
+          <p class="hint" style="margin-top:12px">显存碎片预估与非 Torch 开销可按实际环境调整；包含显存碎片预估的总量不代表 GPU 容量。</p>
+        </section>
+        <div class="form-bottom">
+          <button type="submit" class="primary">重新计算显存</button>
+          <p class="hint">修改参数后自动计算 · 所有显存数值使用 GiB</p>
+        </div>
+        <details class="section">
+          <summary>配置 JSON · 导入 / 导出</summary>
+          <p class="hint">可粘贴完整或部分配置。提供的 GBS、G 按手动值保留；未提供的字段沿用当前设置。World 按 EDP 倍数推算，层数按布局推算；旧 JSON 的 World 自动换算成倍数。</p>
+          <label for="config-json" class="hint">配置内容</label>
+          <textarea id="config-json" class="json-box mono" spellcheck="false"
+            placeholder='{"cp": 8, "denseZeroStage": 3}'></textarea>
+          <div class="toolbar" style="margin-top:10px">
+            <button type="button" id="json-export">导出到文本框</button>
+            <button type="button" id="json-download">下载 JSON</button>
+            <button type="button" id="json-import">导入并计算</button>
+          </div>
+          <p id="json-status" class="hint json-status" role="status"></p>
+        </details>
+      </form>
+
+      <section class="results" aria-label="显存估算结果" aria-busy="false" id="results">
+        <p id="status" class="status" role="status" aria-live="polite">正在加载计算模型…</p>
+        <div id="error" class="error" role="alert" hidden></div>
+        <div id="empty" class="panel empty">加载模型后显示估算结果。</div>
+        <div id="result-body" class="result-body" hidden>
+          <div class="metrics">
+            <section class="panel metric">
+              <p class="hint">预算上界 · 含显存碎片预估</p>
+              <p id="budget-value" class="value"></p>
+              <p id="budget-caption" class="hint"></p>
+            </section>
+            <section class="panel metric">
+              <p class="hint">估计 allocated · 最大 stage</p>
+              <p id="total-value" class="value"></p>
+              <p id="total-caption" class="hint"></p>
+            </section>
+            <section class="panel metric">
+              <p class="hint">显存碎片预估 + 非 Torch</p>
+              <p id="reserve-value" class="value"></p>
+              <p id="reserve-caption" class="hint"></p>
+            </section>
+            <section class="panel metric">
+              <p class="hint">FSDP padded shards · 最大增量</p>
+              <p id="padding-value" class="value"></p>
+              <p id="padding-caption" class="hint"></p>
+            </section>
+          </div>
+          <dl id="derived" class="panel derived"></dl>
+          <ul id="warnings" class="warning-list" aria-label="模型提醒" hidden></ul>
+
+          <section class="panel" aria-labelledby="zero-heading">
+            <div class="panel-head"><h2 id="zero-heading">Dense ZeRO · 各 PP rank 最高显存</h2></div>
+            <p id="zero-caption" class="hint panel-note"></p>
+            <div class="table-scroll">
+              <table class="zero-table">
+                <thead><tr><th scope="col">PP rank</th><th scope="col" data-zero="1">ZeRO-1 · GiB</th>
+                  <th scope="col" data-zero="2">ZeRO-2 · GiB</th><th scope="col" data-zero="3">ZeRO-3 · GiB</th></tr></thead>
+                <tbody id="zero-rows"></tbody>
+                <tfoot id="zero-max"></tfoot>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="stages-heading">
+            <div class="panel-head"><h2 id="stages-heading">PP stage 显存分布</h2>
+              <div class="legend" aria-label="图例">
+                <span><i class="dot static"></i>常驻静态</span>
+                <span><i class="dot saved"></i>保存激活</span>
+                <span><i class="dot transient"></i>临时峰值</span>
+              </div>
+            </div>
+            <p class="hint panel-note">同一比例尺，单位 GiB；allocated 已包含 FSDP staging 与完整 wgrad。预算另加显存碎片预估与非 Torch。点击 PP rank 查看明细。</p>
+            <div id="stage-bars" class="bars"></div>
+            <div class="table-scroll">
+              <table class="stage-table">
+                <thead><tr><th scope="col">PP rank</th><th scope="col">VPP chunks / 峰值份数</th>
+                  <th scope="col">静态 GiB</th><th scope="col">激活 GiB</th>
+                  <th scope="col">临时 GiB</th><th scope="col">RS 上界 GiB</th>
+                  <th scope="col">allocated GiB</th><th scope="col">预算上界 GiB</th>
+                </tr></thead>
+                <tbody id="stage-rows"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="detail-heading">
+            <div class="panel-head"><h2 id="detail-heading">单卡明细</h2>
+              <label class="hint">PP rank
+                <select id="rank-select" class="detail-select" aria-label="选择 PP rank"></select>
+              </label>
+            </div>
+            <p id="rank-caption" class="hint panel-note"></p>
+            <div class="detail-grid">
+              <div class="detail-card"><h3>常驻静态 · 参数 / 梯度 / 优化器</h3><div id="static-detail"></div></div>
+              <div class="detail-card"><h3>FSDP 临时 buffer · 已计入 allocated</h3><div id="fsdp-detail"></div><p id="fsdp-units" class="hint"></p></div>
+              <div class="detail-card"><h3>保存激活 · 各组件</h3><div id="saved-detail"></div></div>
+            </div>
+          </section>
+
+          <section class="panel" aria-labelledby="layer-heading">
+            <div class="panel-head"><h2 id="layer-heading">单层 · 单份保存激活</h2></div>
+            <p class="hint panel-note">展示模型返回的单份开销，尚未按 stage 层数与峰值份数累加。</p>
+            <div class="detail-grid">
+              <div class="detail-card"><h3>Dense 层</h3><div id="dense-detail"></div></div>
+              <div class="detail-card"><h3>MoE 层</h3><div id="moe-detail"></div></div>
+            </div>
+          </section>
+        </div>
+        <aside class="panel explanation">
+          <strong>这是模型估算，不是显存实测。</strong>
+          估计 allocated = 常驻静态 + 保存激活 + 临时峰值。
+          临时峰值 = 计算临时量 + FSDP staging + 完整 wgrad + 参数 Gather；预算 = 估计 allocated + 显存碎片预估 + 非 Torch 开销。各项峰值未精确排程，可能不同时出现。
+          两者均由计算模型汇总；实际分配还受 kernel 工作区、通信、
+          allocator、调度与专家负载影响。请结合 snapshot 或运行峰值校准非 Torch 开销和显存碎片预估。
+          <a href="./memory_calculator.md">查看计算口径与假设</a>。1 GiB = 2³⁰ bytes。
+          重算与梯度 staging 使用源码公式估算；性能和显存峰值需以相同 proxy 配置的实测校验。
+        </aside>
+      </section>
+    </div>
+    <footer><span>CSA 显存估算器 · 直接打开本页即可使用</span>
+      <span>本页、memory_buffers.js 与 memory_model.js 放在同一目录，无需联网。</span></footer>
+    <noscript><p class="error">请启用浏览器 JavaScript 以使用显存估算器。</p></noscript>
+  </main>
+  <!-- Keep each v equal to the first 12 SHA256 digits when its script changes. -->
+  <script src="./memory_buffers.js?v=5e4b919bb164"></script>
+  <script src="./memory_model.js?v=b4f96fc7dee8"></script>
+  <script>
+    "use strict";
+    (() => {
+      const $ = (id) => document.getElementById(id);
+      const GiB = 2 ** 30;
+      const numberFormat = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
+      const gib = (bytes) => {
+        const value = bytes / GiB;
+        return value > 0 && value < 0.01 ? "<0.01" : numberFormat.format(value);
+      };
+      const fields = [
+        ["topology", "world", "总 GPU 数 · World（推算）"],
+        ["topology", "edpMultiplier", "World 倍数 · EDP"],
+        ["topology", "pp", "流水线并行 · PP"],
+        ["topology", "tp", "张量并行 · TP"],
+        ["topology", "cp", "上下文并行 · CP"],
+        ["topology", "ep", "专家并行 · EP"],
+        ["topology", "inner", "Dense 内层分片 · Inner"],
+        ["batch", "seq", "序列长度 · Seq"],
+        ["batch", "mbs", "微批大小 · MBS"],
+        ["batch", "gbs", "全局批大小 · GBS"],
+        ["batch", "group", "微批分组大小 · G"],
+        ["model", "layers", "Transformer 层数 · 自动计算"],
+        ["model", "denseLayers", "其中 Dense 层数", 0],
+        ["model", "hidden", "隐藏维度 · Hidden"],
+        ["model", "ffn", "Dense FFN 维度"],
+        ["model", "experts", "专家数 · Experts"],
+        ["model", "topk", "路由 Top-K"],
+        ["model", "moeFfn", "MoE FFN 维度"],
+        ["model", "sharedFfn", "共享专家 FFN 维度", 0],
+        ["model", "vocab", "词表大小 · Vocab"],
+        ["attention", "heads", "注意力头数"],
+        ["attention", "headDim", "注意力头维度"],
+        ["attention", "qLora", "Q LoRA 秩"],
+        ["attention", "oGroups", "输出投影分组数"],
+        ["attention", "oLora", "输出 LoRA 秩"],
+        ["attention", "indexHeads", "索引器头数"],
+        ["attention", "indexDim", "索引器头维度"],
+        ["attention", "indexTopk", "索引器 Top-K"],
+        ["attention", "ratio", "CSA 压缩比"],
+        ["attention", "window", "CSA 滑窗大小"],
+        ["reserve", "reserveGiB", "显存碎片预估 · GiB", 0, "any"],
+        ["reserve", "nonTorchGiB", "非 Torch 开销 · GiB", 0, "any"],
+        ["reserve", "expertLoad", "专家负载系数", 1, "any"],
+      ];
+      const recomputeLabels = {
+        mla_up_proj: "MLA 上投影与 RoPE",
+        layernorm: "层归一化",
+        moe_act: "MoE 激活",
+        dense_fc1_act: "Dense FC1＋激活",
+        moe_fc1: "MoE FC1（需要 moe_act）",
+        csa_o_proj: "CSA 分组输出投影",
+        csa_core_output: "CSA FlashMLA O＋LSE（需要 mla_up_proj）",
+        shared_experts: "共享专家",
+        dsa_selected_scores: "DSA 选中分数",
+      };
+      const numericKeys = new Set(fields.map((field) => field[1]));
+      const derivedKeys = new Set(["layers", "world"]);
+      const manualBatch = new Set();
+      const keys = [...numericKeys, "layout", "denseZeroStage", "denseOuter", "fp8Gather", "paddedShards", "epOverlap", "recompute"];
+      let result = null;
+      let selectedRank = null;
+      let timer = null;
+
+      function element(tag, className, text) {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined) node.textContent = text;
+        return node;
+      }
+
+      function fieldLabel(key, title, control, wide = false) {
+        const label = element("label", wide ? "field wide" : "field");
+        label.htmlFor = key;
+        label.append(element("span", "field-label", title));
+        control.id = key;
+        control.name = key;
+        label.append(control);
+        return label;
+      }
+
+      for (const [section, key, label, min = 1, step = 1] of fields) {
+        const input = element("input");
+        input.type = "number";
+        input.min = min;
+        input.step = step;
+        input.required = true;
+        if (derivedKeys.has(key)) {
+          input.readOnly = true;
+          input.title = key === "world" ? "World = EDP 倍数 × PP × EP" : "按 PP Layout 展开后的 t 计数，不含 MTP（m）";
+          input.placeholder = "请检查配置";
+        }
+        const wrapper = fieldLabel(key, label, input);
+        if (key === "edpMultiplier") wrapper.append(element("span", "hint", "World = 倍数 × PP × EP"));
+        $(section + "-fields").append(wrapper);
+      }
+      const zero = element("select");
+      for (const [value, title] of [[1, "ZeRO-1 · 优化器分片"],
+        [2, "ZeRO-2 · 优化器 + 梯度分片"], [3, "ZeRO-3 · 优化器 + 梯度 + 参数分片"]]) {
+        zero.add(new Option(title, String(value)));
+      }
+      const zeroLabel = fieldLabel("denseZeroStage", "Dense ZeRO 级别 · Inner", zero, true);
+      zeroLabel.append(element("span", "hint", "包含 Attention、Dense MLP、Shared Expert 和词表参数；Routed Experts 固定 ZeRO-1。"));
+      const zeroHint = element("span", "hint");
+      zeroHint.id = "dense-zero-hint";
+      zeroLabel.append(zeroHint);
+      $("topology-fields").append(zeroLabel);
+      const outer = element("select");
+      for (const [value, title] of [["optim", "optim · 优化器跨 Outer 分片"],
+        ["no_shard", "no_shard · 优化器仅 Inner 分片"]]) {
+        outer.add(new Option(title, value));
+      }
+      $("topology-fields").append(fieldLabel("denseOuter", "Dense 外层优化器策略", outer, true));
+      const fp8 = element("input");
+      fp8.type = "checkbox";
+      fp8.id = "fp8Gather";
+      fp8.name = "fp8Gather";
+      const fp8Label = element("label", "check wide");
+      fp8Label.append(fp8, element("span", "", "启用 FP8 参数 Gather"));
+      $("topology-fields").append(fp8Label);
+      const paddedShards = element("input");
+      paddedShards.type = "checkbox";
+      paddedShards.id = "paddedShards";
+      paddedShards.name = "paddedShards";
+      paddedShards.checked = false;
+      const paddedLabel = element("label", "check wide");
+      const paddedText = element("span", "", "启用 FSDP padded shards（默认关闭）");
+      paddedText.append(element("code", "", "关闭对应 --no-megatron-fsdp-padded-shards"));
+      paddedText.append(element("span", "hint", "ZeRO-1 按无 padding 增量场景计算；此开关影响 ZeRO-2/3。"));
+      paddedLabel.append(paddedShards, paddedText);
+      $("topology-fields").append(paddedLabel);
+      const overlap = element("input");
+      overlap.type = "checkbox";
+      overlap.id = "epOverlap";
+      const overlapLabel = element("label", "check wide");
+      overlapLabel.append(overlap, element("span", "", "MoE 通信重叠 · combined 1F1B（计入共享专家侧输出）"));
+      $("topology-fields").append(overlapLabel);
+      const layout = element("textarea", "mono");
+      layout.rows = 2;
+      layout.spellcheck = false;
+      const layoutLabel = fieldLabel("layout", "流水线布局 · PP Layout", layout, true);
+      layoutLabel.append(element("span", "hint", "E：Embedding · t：Transformer · m：MTP · L：Loss；| 分隔 chunks。Transformer 层数按展开后的 t 自动计算，不含 m。"));
+      $("batch-fields").append(layoutLabel);
+      for (const [key, title] of Object.entries(recomputeLabels)) {
+        const label = element("label", "check");
+        const input = element("input");
+        input.type = "checkbox";
+        input.id = "recompute-" + key;
+        input.name = "recompute";
+        input.value = key;
+        const text = element("span", "", title);
+        text.append(element("span", "recompute-origin", model().recomputeOrigins[key]));
+        text.append(element("code", "", key));
+        label.append(input, text);
+        $("recompute-fields").append(label);
+      }
+
+      function updateLayerCount() {
+        $("layers").value = "";
+        // PP=1 counts the layout independently of whether the current PP divides it.
+        const chunks = CSAMemory.parseLayout($("layout").value, 1, 0);
+        const count = chunks.flat().reduce((n, chunk) => n + chunk.dense + chunk.moe, 0);
+        $("layers").value = count;
+        return count;
+      }
+
+      function updateWorldSize() {
+        const world = $("edpMultiplier").valueAsNumber * $("pp").valueAsNumber * $("ep").valueAsNumber;
+        $("world").value = Number.isSafeInteger(world) && world > 0 ? world : "";
+        return world;
+      }
+
+      function updateBatchSize() {
+        const topology = Object.fromEntries(["world", "pp", "tp", "cp", "mbs"].map(key => [key, $(key).valueAsNumber]));
+        if (manualBatch.has("group")) topology.group = $("group").valueAsNumber;
+        const batch = model().batchSchedule(topology);
+        for (const [key, value] of Object.entries(batch)) {
+          if (!manualBatch.has(key)) $(key).value = Number.isSafeInteger(value) && value > 0 ? value : "";
+        }
+        $("batch-mode").textContent = `G：${manualBatch.has("group") ? "手动" : "自动"} · GBS：${manualBatch.has("gbs") ? "手动" : "自动"}`;
+      }
+
+      function readConfig() {
+        const world = updateWorldSize();
+        updateBatchSize();
+        const config = {world, layers: updateLayerCount()};
+        for (const [, key, label, min = 1, step = 1] of fields) {
+          if (derivedKeys.has(key)) continue;
+          const input = $(key);
+          const value = input.valueAsNumber;
+          if (!Number.isFinite(value) || value < min || (step === 1 && !Number.isSafeInteger(value))) {
+            throw new Error(`${label}：请输入不小于 ${min} 的${step === 1 ? "整数" : "数值"}。`);
+          }
+          config[key] = value;
+        }
+        config.layout = $("layout").value.trim();
+        config.denseOuter = $("denseOuter").value;
+        config.denseZeroStage = Number($("denseZeroStage").value);
+        config.fp8Gather = $("fp8Gather").checked;
+        config.paddedShards = $("paddedShards").checked;
+        config.epOverlap = $("epOverlap").checked;
+        config.edpMultiplier = config.world / (config.pp * config.ep);
+        config.recompute = Object.keys(recomputeLabels).filter((key) => $("recompute-" + key).checked);
+        return config;
+      }
+
+      function writeConfig(config) {
+        for (const key of numericKeys) $(key).value = config[key] ?? "";
+        $("layout").value = config.layout ?? "";
+        $("denseOuter").value = config.denseOuter ?? "optim";
+        $("denseZeroStage").value = String(config.denseZeroStage ?? 2);
+        $("fp8Gather").checked = Boolean(config.fp8Gather);
+        $("paddedShards").checked = config.paddedShards ?? false;
+        $("epOverlap").checked = config.epOverlap ?? true;
+        for (const key of Object.keys(recomputeLabels)) {
+          $("recompute-" + key).checked = (config.recompute || []).includes(key);
+        }
+        updateWorldSize();
+        updateBatchSize();
+        updateLayerCount();
+      }
+
+      function setPresetLabel(name) {
+        $("preset-name").textContent = name === "local" ? "EP2 · Proxy model" : name === "hfsdp16" ? "16机 · Proxy model" : "自定义配置";
+        if (name === "hfsdp16") $("preset-name").textContent = "16机 · Proxy model";
+        for (const preset of ["local", "hfsdp16"]) {
+          $("preset-" + preset).setAttribute("aria-pressed", String(name === preset));
+        }
+      }
+
+      function invalidate(message) {
+        clearTimeout(timer);
+        result = null;
+        $("result-body").hidden = true;
+        $("error").hidden = true;
+        $("empty").hidden = false;
+        $("empty").textContent = message;
+        $("status").textContent = message;
+      }
+
+      function showError(error) {
+        invalidate("当前没有有效的估算结果。请检查配置后重新计算。");
+        $("error").textContent = "无法计算：" + (error instanceof Error ? error.message : String(error));
+        $("error").hidden = false;
+        $("results").setAttribute("aria-busy", "false");
+      }
+
+      function metric(id, bytes) {
+        $(id).replaceChildren(document.createTextNode(gib(bytes) + " "), element("span", "", "GiB"));
+      }
+
+      function componentTable(target, items, total) {
+        const table = element("table");
+        const head = table.createTHead().insertRow();
+        for (const text of ["组件", "GiB"]) {
+          const th = element("th", "", text);
+          th.scope = "col";
+          head.append(th);
+        }
+        const body = table.createTBody();
+        for (const [label, bytes] of Object.entries(items)) {
+          const row = body.insertRow();
+          row.append(element("td", "", label), element("td", "", gib(bytes)));
+        }
+        if (!body.rows.length) {
+          const cell = body.insertRow().insertCell();
+          cell.colSpan = 2;
+          cell.textContent = "无组件";
+        }
+        table.createTFoot().insertRow().append(element("td", "", "合计"), element("td", "", gib(total)));
+        $(target).replaceChildren(table);
+      }
+
+      function selectRank(rank) {
+        if (!result) return;
+        const stage = result.stages.find((item) => String(item.rank) === String(rank));
+        if (!stage) return;
+        selectedRank = String(stage.rank);
+        $("rank-select").value = selectedRank;
+        componentTable("static-detail", stage.staticItems, stage.staticBytes);
+        componentTable("saved-detail", stage.savedItems, stage.savedBytes);
+        componentTable("fsdp-detail", stage.fsdpTemporaryItems, stage.fsdpTemporaryBytes);
+        $("fsdp-units").textContent = "staging 选取：" + (stage.gradientWorkspace.retained.map(unit => `${unit.name} ${gib(unit.partialBytes)} GiB`).join(" + ") || "DDP ZeRO-1 对照，无 FSDP staging") + "。按完整 unit 汇总所有 dtype；与激活峰值的同时存活量是容量近似。";
+        $("rank-caption").textContent = `PP ${stage.rank} · 计算临时量 ${gib(stage.computeWorkspaceBytes)} GiB + FSDP 临时量 ${gib(stage.fsdpTemporaryBytes)} GiB · 估计 allocated ${gib(stage.totalBytes)} GiB · 含显存碎片预估与非 Torch 的预算 ${gib(stage.budgetBytes)} GiB`;
+        for (const row of $("stage-rows").children) {
+          row.classList.toggle("selected", row.dataset.rank === selectedRank);
+        }
+        document.querySelectorAll("button[data-rank]").forEach((button) => {
+          button.setAttribute("aria-pressed", String(button.dataset.rank === selectedRank));
+        });
+      }
+
+      function rankButton(rank, text) {
+        const button = element("button", "", text);
+        button.type = "button";
+        button.dataset.rank = String(rank);
+        button.setAttribute("aria-label", `查看 PP ${rank} 显存明细`);
+        button.addEventListener("click", () => selectRank(rank));
+        return button;
+      }
+
+      function render(output) {
+        const { config, derived, stages, zeroComparison, paddingImpact } = output;
+        const strategy = {1: "optim", 2: "optim_grads", 3: "optim_grads_params"}[config.denseZeroStage];
+        const placement = {1: "参数/梯度完整", 2: "参数完整，梯度按 Inner 分片", 3: "参数/梯度按 Inner 分片"}[config.denseZeroStage];
+        $("dense-zero-hint").textContent = `--data-parallel-sharding-strategy ${strategy}；${placement}，优化器范围由 Outer 策略决定。`;
+        if (!stages.length) throw new Error("计算模型未返回 PP stage。");
+        const maxBudget = output.maxStage;
+        const maxTotal = stages.reduce((a, b) => a.totalBytes >= b.totalBytes ? a : b);
+        metric("budget-value", maxBudget.budgetBytes);
+        metric("total-value", maxTotal.totalBytes);
+        metric("reserve-value", (config.reserveGiB + config.nonTorchGiB) * GiB);
+        $("budget-caption").textContent = `PP ${maxBudget.rank} · 预估 allocated + 显存碎片预估 + 非 Torch`;
+        $("total-caption").textContent = `PP ${maxTotal.rank} · 静态 + 保存激活 + 临时峰值`;
+        $("reserve-caption").textContent = `显存碎片预估 ${numberFormat.format(config.reserveGiB)} + 非 Torch ${numberFormat.format(config.nonTorchGiB)} GiB`;
+        const padding = paddingImpact.maxAllocated;
+        metric("padding-value", padding.totalBytes);
+        $("padding-caption").textContent = config.denseZeroStage === 1
+          ? "ZeRO-1 按无 padded-shard 增量场景计算，始终为 0。"
+          : `ZeRO-${config.denseZeroStage} · PP ${padding.rank} · 开启相对关闭的 allocated 增量（常驻 ${gib(padding.staticBytes)} + Gather ${gib(padding.parameterGatherBytes)} + 梯度暂存 ${gib(padding.gradientWorkspaceBytes)} GiB）；${config.paddedShards ? "当前已计入" : "当前未计入"}。预算最大增量 ${gib(paddingImpact.maxBudget.budgetBytes)} GiB（PP ${paddingImpact.maxBudget.rank}）。`;
+        $("zero-caption").textContent = `估计 allocated 峰值，含 Gather、梯度暂存与 wgrad，不含显存碎片预估；按均衡路由、平均 shard 估算每张卡。ZeRO-2/3 padding ${config.paddedShards ? "开启" : "关闭"}，ZeRO-1 始终按无 padding 增量场景。高亮当前 ZeRO-${config.denseZeroStage}。`;
+        $("zero-rows").replaceChildren();
+        for (const stage of stages) {
+          const row = element("tr");
+          row.append(element("td", "", `PP ${stage.rank}`));
+          for (const comparison of zeroComparison) {
+            row.append(element("td", comparison.denseZeroStage === config.denseZeroStage ? "current" : "",
+              gib(comparison.stages[stage.rank].totalBytes)));
+          }
+          $("zero-rows").append(row);
+        }
+        const maxRow = element("tr");
+        maxRow.append(element("td", "", "全局最高"));
+        for (const comparison of zeroComparison) {
+          maxRow.append(element("td", comparison.denseZeroStage === config.denseZeroStage ? "current" : "",
+            `${gib(comparison.maxAllocated.totalBytes)} · PP ${comparison.maxAllocated.rank}`));
+        }
+        $("zero-max").replaceChildren(maxRow);
+        document.querySelectorAll("th[data-zero]").forEach(th => {
+          th.classList.toggle("current", Number(th.dataset.zero) === config.denseZeroStage);
+        });
+        $("derived").replaceChildren();
+        for (const [label, value] of [
+          ["数据并行 DP", derived.dp], ["专家数据并行 EDP", derived.edp],
+          ["虚拟流水线 VPP", derived.vpp], ["微批次数 M", derived.microbatches],
+          ["分组大小 G", config.group], ["Dense DP × CP", derived.dp * config.cp],
+          ["Dense Outer", derived.dp * config.cp / config.inner], ["每 CP rank Tokens", derived.tokens],
+        ]) {
+          const item = element("div");
+          item.append(element("dt", "", label), element("dd", "", numberFormat.format(value)));
+          $("derived").append(item);
+        }
+        $("warnings").replaceChildren(...output.warnings.map((warning) => element("li", "", warning)));
+        $("warnings").hidden = output.warnings.length === 0;
+        $("stage-bars").replaceChildren();
+        $("stage-rows").replaceChildren();
+        $("rank-select").replaceChildren();
+        const scale = Math.max(...stages.map((stage) => stage.staticBytes + stage.savedBytes + stage.transientBytes), 1);
+        for (const stage of stages) {
+          $("rank-select").add(new Option(`PP ${stage.rank}`, String(stage.rank)));
+          const barRow = element("div", "bar-row");
+          const track = element("div", "bar-track");
+          const descriptions = [];
+          for (const [kind, label, bytes] of [
+            ["static", "常驻静态", stage.staticBytes],
+            ["saved", "保存激活", stage.savedBytes],
+            ["transient", "临时峰值", stage.transientBytes],
+          ]) {
+            const segment = element("span", "segment " + kind);
+            segment.style.width = (bytes / scale * 100) + "%";
+            segment.title = `${label} ${gib(bytes)} GiB`;
+            descriptions.push(segment.title);
+            track.append(segment);
+          }
+          track.setAttribute("role", "img");
+          track.setAttribute("aria-label", `PP ${stage.rank}：${descriptions.join("，")}`);
+          barRow.append(rankButton(stage.rank, `PP ${stage.rank}`), track,
+            element("span", "bar-number", gib(stage.totalBytes) + " GiB"));
+          $("stage-bars").append(barRow);
+
+          const row = element("tr");
+          row.dataset.rank = String(stage.rank);
+          const rankCell = element("td");
+          rankCell.append(rankButton(stage.rank, `PP ${stage.rank}`));
+          const chunks = element("td");
+          stage.chunks.forEach((chunk, index) => {
+            chunks.append(element("span", "chunk mono", `${chunk.label} × ${stage.peakCounts[index] ?? "—"}`));
+          });
+          row.append(rankCell, chunks);
+          for (const key of ["staticBytes", "savedBytes", "transientBytes", "rsWorkspaceBytes", "totalBytes", "budgetBytes"]) {
+            row.append(element("td", "", gib(stage[key])));
+          }
+          $("stage-rows").append(row);
+        }
+        componentTable("dense-detail", output.layers.dense.items, output.layers.dense.total);
+        componentTable("moe-detail", output.layers.moe.items, output.layers.moe.total);
+        result = output;
+        selectRank(stages.some((stage) => String(stage.rank) === selectedRank) ? selectedRank : maxTotal.rank);
+        $("empty").hidden = true;
+        $("result-body").hidden = false;
+        $("status").textContent = `估算已更新 · ${stages.length} 个 PP stage · 每张卡 / GiB`;
+      }
+
+      function model() {
+        if (!window.CSABuffers) {
+          throw new Error("未能加载 memory_buffers.js。请将它与本页、memory_model.js 放在同一目录，然后刷新页面。");
+        }
+        if (!window.CSAMemory || typeof window.CSAMemory.calculate !== "function") {
+          throw new Error("未能加载 memory_model.js。请确认它与本页位于同一目录，然后刷新页面。");
+        }
+        return window.CSAMemory;
+      }
+
+      function calculate() {
+        invalidate("正在计算当前配置…");
+        $("results").setAttribute("aria-busy", "true");
+        try {
+          render(model().compare(readConfig()));
+        } catch (error) {
+          showError(error);
+        } finally {
+          $("results").setAttribute("aria-busy", "false");
+        }
+      }
+
+      function applyPreset(name) {
+        try {
+          const preset = model().presets[name];
+          if (!preset) throw new Error(`计算模型缺少 ${name} 预设。`);
+          manualBatch.clear();
+          manualBatch.add("gbs");
+          manualBatch.add("group");
+          writeConfig(preset);
+          selectedRank = null;
+          setPresetLabel(name);
+          $("json-status").textContent = "";
+          calculate();
+        } catch (error) {
+          showError(error);
+        }
+      }
+
+      $("preset-hfsdp16").addEventListener("click", () => applyPreset("hfsdp16"));
+      $("preset-local").addEventListener("click", () => applyPreset("local"));
+      $("batch-auto").addEventListener("click", () => {
+        manualBatch.clear();
+        setPresetLabel("custom");
+        calculate();
+      });
+      $("config-form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        calculate();
+      });
+      $("config-form").addEventListener("input", (event) => {
+        if (event.target.id === "config-json") return;
+        if (["gbs", "group"].includes(event.target.id)) manualBatch.add(event.target.id);
+        setPresetLabel("custom");
+        invalidate("配置已修改，正在更新估算…");
+        timer = setTimeout(calculate, 180);
+      });
+      // Remove number-input wheel stepping while allowing the page to scroll.
+      $("config-form").addEventListener("wheel", (event) => {
+        if (event.target instanceof HTMLInputElement && event.target.type === "number") {
+          event.target.blur();
+        }
+      }, {passive: true});
+      $("rank-select").addEventListener("change", (event) => selectRank(event.target.value));
+
+      function exportConfig(download) {
+        try {
+          const json = JSON.stringify(readConfig(), null, 2);
+          $("config-json").value = json;
+          if (download) {
+            const url = URL.createObjectURL(new Blob([json + "\n"], { type: "application/json" }));
+            const link = element("a");
+            link.href = url;
+            link.download = "csa-memory-config.json";
+            document.body.append(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+          }
+          $("json-status").textContent = download ? "已生成配置下载。" : "当前配置已导出到文本框。";
+        } catch (error) {
+          showError(error);
+          $("json-status").textContent = "导出失败：" + error.message;
+        }
+      }
+      $("json-export").addEventListener("click", () => exportConfig(false));
+      $("json-download").addEventListener("click", () => exportConfig(true));
+      $("json-import").addEventListener("click", () => {
+        try {
+          const parsed = JSON.parse($("config-json").value);
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            throw new Error("JSON 顶层必须是配置对象。");
+          }
+          for (const [key, value] of Object.entries(parsed)) {
+            if (!keys.includes(key)) throw new Error(`未知配置字段：${key}`);
+            if (numericKeys.has(key) && (typeof value !== "number" || !Number.isFinite(value))) {
+              throw new Error(`${key} 必须是有限数值。`);
+            }
+            if (key === "fp8Gather" && typeof value !== "boolean") throw new Error("fp8Gather 必须是布尔值。");
+            if (key === "paddedShards" && typeof value !== "boolean") throw new Error("paddedShards 必须是布尔值。");
+            if (key === "epOverlap" && typeof value !== "boolean") throw new Error("epOverlap 必须是布尔值。");
+            if (key === "layout" && typeof value !== "string") throw new Error("layout 必须是字符串。");
+            if (key === "denseOuter" && !["optim", "no_shard"].includes(value)) throw new Error("denseOuter 必须为 optim 或 no_shard。");
+            if (key === "denseZeroStage" && ![1, 2, 3].includes(value)) throw new Error("denseZeroStage 必须为数字 1、2 或 3。");
+            if (key === "recompute" && (!Array.isArray(value) || value.some((name) => !Object.hasOwn(recomputeLabels, name)))) {
+              throw new Error("recompute 必须是支持的重算模块名称数组。");
+            }
+          }
+          // Full imports can repair an invalid form; partial imports retain the current fields.
+          const current = {};
+          for (const key of numericKeys) current[key] = $(key).valueAsNumber;
+          current.layout = $("layout").value;
+          current.denseOuter = $("denseOuter").value;
+          current.denseZeroStage = Number($("denseZeroStage").value);
+          current.fp8Gather = $("fp8Gather").checked;
+          current.paddedShards = $("paddedShards").checked;
+          current.epOverlap = $("epOverlap").checked;
+          current.recompute = Object.keys(recomputeLabels).filter((key) => $("recompute-" + key).checked);
+          const imported = { ...current, ...parsed };
+          if (!("edpMultiplier" in parsed) && "world" in parsed) {
+            imported.edpMultiplier = parsed.world / (imported.pp * imported.ep);
+          }
+          model().calculate(imported);
+          // Complete exports from before the ZeRO selector used fixed ZeRO-2.
+          if (!("denseZeroStage" in parsed) && keys.filter(key => !["denseZeroStage", "edpMultiplier"].includes(key)).every(key => key in parsed)) {
+            imported.denseZeroStage = 2;
+          }
+          for (const key of ["gbs", "group"]) if (Object.hasOwn(parsed, key)) manualBatch.add(key);
+          writeConfig(imported);
+          setPresetLabel("custom");
+          calculate();
+          $("json-status").textContent = result ? "配置已导入并完成估算。" : "配置已导入；请修正上方错误。";
+        } catch (error) {
+          showError(error);
+          $("json-status").textContent = "导入失败：" + error.message;
+        }
+      });
+      const requestedPreset = new URLSearchParams(location.search).get("preset");
+      applyPreset(["local", "hfsdp16"].includes(requestedPreset) ? requestedPreset : "hfsdp16");
+    })();
+  </script>
+</body>
+</html>

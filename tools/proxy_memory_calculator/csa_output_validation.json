@@ -1,0 +1,100 @@
+{
+  "snapshots": [
+    {
+      "case": "baseline",
+      "rank": 0,
+      "pp_rank": 0,
+      "peak_fc_bytes": 38413296344
+    },
+    {
+      "case": "baseline",
+      "rank": 1,
+      "pp_rank": 0,
+      "peak_fc_bytes": 38294552528
+    },
+    {
+      "case": "baseline",
+      "rank": 2,
+      "pp_rank": 0,
+      "peak_fc_bytes": 38527025276
+    },
+    {
+      "case": "baseline",
+      "rank": 3,
+      "pp_rank": 0,
+      "peak_fc_bytes": 38348086308
+    },
+    {
+      "case": "baseline",
+      "rank": 4,
+      "pp_rank": 1,
+      "peak_fc_bytes": 66477496980
+    },
+    {
+      "case": "baseline",
+      "rank": 5,
+      "pp_rank": 1,
+      "peak_fc_bytes": 66983517384
+    },
+    {
+      "case": "baseline",
+      "rank": 6,
+      "pp_rank": 1,
+      "peak_fc_bytes": 66455319708
+    },
+    {
+      "case": "baseline",
+      "rank": 7,
+      "pp_rank": 1,
+      "peak_fc_bytes": 66737996012
+    },
+    {
+      "case": "output",
+      "rank": 0,
+      "pp_rank": 0,
+      "peak_fc_bytes": 28904843640
+    },
+    {
+      "case": "output",
+      "rank": 1,
+      "pp_rank": 0,
+      "peak_fc_bytes": 28646932560
+    },
+    {
+      "case": "output",
+      "rank": 2,
+      "pp_rank": 0,
+      "peak_fc_bytes": 28869803996
+    },
+    {
+      "case": "output",
+      "rank": 3,
+      "pp_rank": 0,
+      "peak_fc_bytes": 28635740368
+    },
+    {
+      "case": "output",
+      "rank": 4,
+      "pp_rank": 1,
+      "peak_fc_bytes": 58915293928
+    },
+    {
+      "case": "output",
+      "rank": 5,
+      "pp_rank": 1,
+      "peak_fc_bytes": 59307715072
+    },
+    {
+      "case": "output",
+      "rank": 6,
+      "pp_rank": 1,
+      "peak_fc_bytes": 58893224736
+    },
+    {
+      "case": "output",
+      "rank": 7,
+      "pp_rank": 1,
+      "peak_fc_bytes": 59246036256
+    }
+  ]
+}

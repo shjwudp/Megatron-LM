@@ -1,0 +1,84 @@
+{
+  "config": {
+    "world": 128,
+    "edpMultiplier": 1,
+    "pp": 4,
+    "tp": 1,
+    "cp": 4,
+    "ep": 32,
+    "inner": 8,
+    "group": 4,
+    "seq": 32768,
+    "mbs": 1,
+    "gbs": 64,
+    "layers": 44,
+    "denseLayers": 4,
+    "hidden": 7168,
+    "ffn": 20480,
+    "experts": 128,
+    "topk": 4,
+    "moeFfn": 5120,
+    "sharedFfn": 5120,
+    "heads": 128,
+    "headDim": 512,
+    "qLora": 1536,
+    "oGroups": 16,
+    "oLora": 1024,
+    "indexHeads": 64,
+    "indexDim": 128,
+    "indexTopk": 1024,
+    "ratio": 4,
+    "window": 128,
+    "vocab": 200064,
+    "layout": "Etttt|(tttt|)*10,mL",
+    "fp8Gather": true,
+    "epOverlap": true,
+    "denseZeroStage": 2,
+    "denseOuter": "optim",
+    "paddedShards": false,
+    "recompute": [
+      "mla_up_proj",
+      "moe_act",
+      "layernorm",
+      "shared_experts",
+      "dsa_selected_scores",
+      "dense_fc1_act",
+      "moe_fc1",
+      "csa_o_proj",
+      "csa_core_output"
+    ],
+    "reserveGiB": 8,
+    "nonTorchGiB": 20,
+    "expertLoad": 1
+  },
+  "stages": [
+    {
+      "pp": 0,
+      "max_allocated_GiB": 143.08881282806396,
+      "snapshot": {
+        "fsdp_partial_at_peak_GiB": 8.217123985290527
+      }
+    },
+    {
+      "pp": 1,
+      "max_allocated_GiB": 161.69992113113403,
+      "snapshot": {
+        "fsdp_partial_at_peak_GiB": 3.2884130477905273
+      }
+    },
+    {
+      "pp": 2,
+      "max_allocated_GiB": 152.21333265304565,
+      "snapshot": {
+        "fsdp_partial_at_peak_GiB": 3.2884130477905273
+      }
+    },
+    {
+      "pp": 3,
+      "max_allocated_GiB": 142.9268674850464,
+      "snapshot": {
+        "fsdp_partial_at_peak_GiB": 12.332438468933105
+      }
+    }
+  ]
+}
