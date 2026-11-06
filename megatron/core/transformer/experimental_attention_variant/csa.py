@@ -516,6 +516,8 @@ class Compressor(MegatronModule):
         )
         config.init_method(_ape)
         self.ape = mark_keep_in_fp32(nn.Parameter(_ape))
+        # Per-position bias table, not a projection matrix: keep it on the scalar optimizer.
+        setattr(self.ape, 'use_muon', False)
 
         norm_config = copy.copy(config)
         norm_config.normalization = "RMSNorm"

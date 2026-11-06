@@ -36,6 +36,44 @@ class _FsdpGroupAssignment:
     tensor_to_owner_rank: dict[int, int]
 
 
+_sub_mesh_cache: dict[tuple[int, str], Any] = {}
+
+
+def _sub_mesh(mesh: Any, dim_name: str) -> Any:
+    """Return the 1-D sub-mesh of ``mesh`` along ``dim_name``, cached per mesh object."""
+    key = (id(mesh), dim_name)
+    if key not in _sub_mesh_cache:
+        _sub_mesh_cache[key] = mesh[dim_name]
+    return _sub_mesh_cache[key]
+
+
+def _shard_view(buffer: DBuffer) -> DBuffer:
+    """Return the buffer view on which owner gather/scatter runs.
+
+    A buffer sharded on every mesh axis (plain DP, or HFSDP optimizer placements) is
+    returned unchanged. For a hybrid mesh whose other axes are all Replicate (HSDP),
+    every replica holds identical shards, so the view lives on the 1-D sub-mesh of the
+    Shard axis and owner gather/scatter runs inside each shard group independently.
+    """
+    if all(placement.is_shard() for placement in buffer.placements):
+        # 1-D FSDP, or HFSDP with the optimizer sharded over every axis: every rank owns a
+        # distinct range, and owner gather/scatter runs over the whole mesh.
+        return buffer
+    shard_axes = [
+        axis for axis, placement in enumerate(buffer.placements) if not placement.is_replicate()
+    ]
+    if len(shard_axes) != 1 or not buffer.placements[shard_axes[0]].is_shard():
+        raise NotImplementedError(
+            "FsdpMuon supports placements sharded on every mesh axis, or exactly one "
+            f"sharded axis and Replicate elsewhere, got placements {buffer.placements}."
+        )
+    axis = shard_axes[0]
+    sub_mesh = _sub_mesh(buffer.mesh, buffer.mesh.mesh_dim_names[axis])
+    return DBuffer.from_local(
+        buffer.local_buffer, sub_mesh, (buffer.placements[axis],), buffer.layout
+    )
+
+
 # Design choice: integrating Emerging Optimizers (EO) into FsdpMuon.
 #
 # 1. Inherit from EO's Muon (chosen).
@@ -98,10 +136,24 @@ class FsdpMuon(Muon):
                     raise ValueError("FsdpMuon requires parameters sharded by MFSDP v2.")
                 fsdp_groups[fsdp_group] = None
                 param_to_optimizer_group_index[param] = group_index
+        # Owner work is balanced per DP mesh: dense and expert (EP) parameter groups live
+        # on different meshes and must not be mixed in one assignment.
+        shard_views = {group: _shard_view(group.main_weight) for group in fsdp_groups}
+        groups_by_mesh: dict[tuple[int, ...], list[FsdpParameterGroup]] = {}
+        for fsdp_group in fsdp_groups:
+            mesh_key = tuple(shard_views[fsdp_group].mesh.mesh.flatten().tolist())
+            groups_by_mesh.setdefault(mesh_key, []).append(fsdp_group)
+        owner_assignments: dict[FsdpParameterGroup, dict[int, int]] = {}
+        for mesh_groups in groups_by_mesh.values():
+            for fsdp_group, assignment in zip(
+                mesh_groups,
+                assign_owner_work(shard_views[group] for group in mesh_groups),
+                strict=True,
+            ):
+                owner_assignments[fsdp_group] = assignment
         self._fsdp_group_assignments = []
-        for fsdp_group, tensor_to_owner_rank in zip(
-            fsdp_groups, assign_owner_work(group.main_weight for group in fsdp_groups), strict=True
-        ):
+        for fsdp_group in fsdp_groups:
+            tensor_to_owner_rank = owner_assignments[fsdp_group]
             self._fsdp_group_assignments.append(
                 _FsdpGroupAssignment(
                     fsdp_group=fsdp_group,
@@ -119,11 +171,10 @@ class FsdpMuon(Muon):
         """Validate optimizer parameters and the FSDP buffers that contain them."""
         for assignment in self._fsdp_group_assignments:
             fsdp_group: FsdpParameterGroup = assignment.fsdp_group
-            if fsdp_group.mesh.ndim != 1:
-                raise NotImplementedError("FsdpMuon requires a one-dimensional DP mesh.")
             for buffer in (fsdp_group.main_weight, fsdp_group.main_grad):
                 if not isinstance(buffer, DBuffer):
                     raise ValueError("FsdpMuon requires non-quantized main weights and gradients.")
+            _shard_view(fsdp_group.main_weight)
 
     @torch.no_grad()
     def step(self, closure: Callable[[], float] | None = None) -> None:
@@ -159,11 +210,11 @@ class FsdpMuon(Muon):
                 mapped to indices into ``self.param_groups`` for their optimizer settings.
             tensor_to_owner: The same active tensor indices mapped to global owner ranks.
         """
-        buffer: DBuffer = fsdp_group.main_weight
-        momentum_inputs: DBuffer = self._compute_momentum_inputs(
-            fsdp_group, tensor_to_optimizer_group_index
+        buffer: DBuffer = _shard_view(fsdp_group.main_weight)
+        momentum_inputs: DBuffer = _shard_view(
+            self._compute_momentum_inputs(fsdp_group, tensor_to_optimizer_group_index)
         )
-        this_rank: int = fsdp_group.mesh.get_rank()
+        this_rank: int = buffer.mesh.get_rank()
         full_updates: dict[int, torch.Tensor] = {
             i: torch.empty(buffer.layout.tensor_shapes[i], dtype=buffer.dtype, device=buffer.device)
             for i, owner in tensor_to_owner.items()

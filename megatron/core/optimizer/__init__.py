@@ -66,6 +66,7 @@ from .emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
+    _kwargs_from_config,
 )
 from .fully_sharded_optimizer import FullyShardedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
@@ -707,6 +708,20 @@ def _get_megatron_optimizer_based_on_param_groups(
                 momentum=config.sgd_momentum,
             )
             init_state_fn = None
+        elif config.optimizer == 'muon' and isinstance(model_chunks[0], FullyShardedDataParallelV2):
+            # Owner-compute Muon over MFSDP v2 sharded buffers. The scalar optimizer for the
+            # remaining parameters is built separately and chained by the caller.
+            from ..distributed.fsdp.src.megatron_fsdp.experimental.muon import FsdpMuon
+
+            kwargs = _kwargs_from_config(FsdpMuon, "muon", config)
+            optimizer = FsdpMuon(param_groups, **kwargs)
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if p.ndim == 2 and len(opt.state[p]) == 0:
+                            opt.state[p]['momentum_buffer'] = torch.zeros_like(p)
+
         else:
             raise Exception('{} optimizer is not supported.'.format(config.optimizer))
     else:
@@ -845,7 +860,9 @@ def _get_megatron_emerging_optimizer(
         use_layer_wise = True
 
     if isinstance(model_chunks[0], FullyShardedDataParallelV2):
-        raise NotImplementedError("MFSDP v2 with emerging optimizers is not currently validated.")
+        raise NotImplementedError(
+            "MFSDP v2 emerging optimizers are built by get_megatron_optimizer (FsdpMuon)."
+        )
 
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(
@@ -1091,6 +1108,86 @@ def _get_megatron_emerging_optimizer(
     return ChainedOptimizer(results)
 
 
+def _get_megatron_optimizer_for_mfsdp_v2_muon(
+    config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
+    use_gloo_process_groups: bool,
+    pg_collection: Optional[ProcessGroupCollection],
+) -> MegatronOptimizer:
+    """Build a chained Muon + scalar (Adam) optimizer over MFSDP v2 sharded parameters.
+
+    Muon-managed 2-D matrices use :class:`FsdpMuon`, which keeps momentum sharded and
+    orthogonalizes each matrix on one owner rank. Every other parameter (embeddings, output
+    layer, router, norms, biases, and anything tagged ``use_muon=False``) uses the scalar
+    optimizer chosen by ``config.muon_scalar_optimizer``. Both are wrapped in
+    :class:`FullyShardedOptimizer`, so gradient statistics come from the DTensor layouts.
+    """
+    if not HAVE_EMERGING_OPTIMIZERS:
+        raise ImportError(
+            "emerging-optimizers package is required for optimizer='muon'. "
+            "Install it with: pip install emerging-optimizers"
+        )
+    if config.use_layer_wise_distributed_optimizer:
+        raise ValueError("MFSDP v2 does not support the layer-wise distributed optimizer.")
+    if config.muon_tp_mode not in ('duplicated', 'auto'):
+        raise ValueError("MFSDP v2 Muon supports TP=1 only; use --muon-tp-mode duplicated.")
+    config_overrides = dict(config_overrides or {})
+    default_param_overrides = copy.deepcopy(_EMERGING_OPTIMIZERS['muon'].default_param_overrides)
+    for override in default_param_overrides.values():
+        if override.get('optimizer') in ('adam', 'lion'):
+            override['optimizer'] = config.muon_scalar_optimizer
+    config_overrides.update(default_param_overrides)
+
+    # MFSDP v2 reads gradient layouts from DTensors and never uses Gloo groups.
+    process_groups_dict = ProcessGroupCollection.setup_process_groups_for_optimizer(
+        pg_collection, model_chunks, use_gloo_process_groups and pg_collection is None
+    )
+    all_param_groups = _get_param_groups(model_chunks, config, config_overrides, None)
+    if not is_te_min_version("2.18.0"):
+        # See the MFSDP v2 branch of get_megatron_optimizer: TE < 2.18 FusedAdam skips
+        # updates when a group ends in an empty local shard. FsdpMuon groups must keep
+        # every parameter: ranks agree on the participating tensors of each owner gather.
+        for param_group in all_param_groups:
+            if param_group.get('optimizer', 'muon') == 'muon':
+                continue
+            param_group['params'] = [
+                parameter for parameter in param_group['params'] if parameter.to_local().numel() > 0
+            ]
+        all_param_groups = [group for group in all_param_groups if group['params']]
+
+    grouped_param_groups = defaultdict(list)
+    for group in all_param_groups:
+        grouped_param_groups[group.get('optimizer', 'muon')].append(group)
+
+    optimizers = []
+    for opt_name in sorted(grouped_param_groups):
+        groups = grouped_param_groups[opt_name]
+        opt_config = copy.copy(config)
+        opt_config.optimizer = opt_name
+        optimizer = _get_megatron_optimizer_based_on_param_groups(
+            config=opt_config,
+            model_chunks=model_chunks,
+            param_groups=groups,
+            per_model_buffers=None,
+            model_parallel_group=process_groups_dict['mp_group'],
+            data_parallel_group=process_groups_dict['dp_cp_group'],
+            data_parallel_group_gloo=process_groups_dict['intra_dp_cp_group_gloo'],
+            data_parallel_group_idx=get_pg_rank(process_groups_dict['mp_group']),
+            intra_dist_opt_group=process_groups_dict['intra_dist_opt_group'],
+            distributed_optimizer_instance_id=0,
+            pg_collection=pg_collection,
+        )
+        # ChainedOptimizer requires one shared config object.
+        optimizer.config = config
+        optimizers.append(optimizer)
+
+    _clear_high_precision_initializers(model_chunks)
+    if len(optimizers) == 1:
+        return optimizers[0]
+    return ChainedOptimizer(optimizers)
+
+
 def _clear_high_precision_initializers(model_chunks: List[MegatronModule]) -> None:
     """Release saved initializers after all local optimizer master weights are constructed.
 
@@ -1162,6 +1259,14 @@ def get_megatron_optimizer(
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
     if config.optimizer not in ('adam', 'sgd'):
+        if is_mfsdp_v2:
+            if config.optimizer != 'muon':
+                raise NotImplementedError(
+                    "MFSDP v2 supports only the muon emerging optimizer (FsdpMuon) for now."
+                )
+            return _get_megatron_optimizer_for_mfsdp_v2_muon(
+                config, model_chunks, config_overrides, use_gloo_process_groups, pg_collection
+            )
         optimizer = _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,

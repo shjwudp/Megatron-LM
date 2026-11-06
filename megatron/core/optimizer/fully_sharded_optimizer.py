@@ -18,7 +18,11 @@ from ..transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 from ..transformer.module import MegatronModule
 from ..utils import is_te_min_version
 from .grad_scaler import MegatronGradScaler
-from .optimizer import MixedPrecisionOptimizer
+from .optimizer import (
+    SEPARATE_GRAD_NORM_GROUPS,
+    MixedPrecisionOptimizer,
+    _get_param_grad_norm_group,
+)
 from .optimizer_config import OptimizerConfig
 
 
@@ -87,6 +91,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 raise ValueError("All MFSDP v2 model chunks must share the same ddp_config.")
         self.is_stub_optimizer = optimizer is None
         self._casted_grads = []
+        # ChainedOptimizer computes this optimizer's statistics through its own methods.
+        self._mfsdp_v2_grad_stats = True
         # Each parameter's globally unique checkpoint name, mirroring
         # :class:`DistributedOptimizer`'s ``param_to_name``. Keyed by parameter because that
         # is the direction the checkpoint path resolves, and because the optimizer names each
@@ -320,10 +326,14 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         ``get_data_parallel_group_if_dtensor`` always sees plain tensors, returns None,
         and the layout is gone by the time the norm is taken.
         """
+        return self._get_grad_norm_for_parameters(self.get_parameters())
+
+    def _get_grad_norm_for_parameters(self, parameters: List[torch.nn.Parameter]):
+        """DTensor-aware L2 norm over ``parameters`` reduced on the grad-stats group."""
         total_norm_squared = torch.zeros(
             (), dtype=torch.float32, device=torch.cuda.current_device()
         )
-        for parameter in self.get_parameters():
+        for parameter in parameters:
             # MFSDP v2 reduces into parameter.grad; it never populates decoupled_grad,
             # which is a v1 param-and-grad-buffer concept.
             grad = parameter.grad
@@ -340,6 +350,32 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             group=self.get_grad_stats_parallel_group(),
         )
         return total_norm_squared.sqrt()
+
+    def _get_grad_norm_for_group(self, grad_norm_group: str):
+        """Grad norm of the parameters in a separate grad-norm group."""
+        return self._get_grad_norm_for_parameters(
+            [p for p in self.get_parameters() if _get_param_grad_norm_group(p) == grad_norm_group]
+        )
+
+    @override
+    def _compute_grad_norms_by_group(self):
+        self.grad_norms_by_group = {}
+        for grad_norm_group in SEPARATE_GRAD_NORM_GROUPS:
+            if self.has_grad_norm_group(grad_norm_group):
+                self.grad_norms_by_group[grad_norm_group] = self._get_grad_norm_for_group(
+                    grad_norm_group
+                )
+        return self.grad_norms_by_group
+
+    @override
+    @torch.no_grad()
+    def get_dsa_split_grad_norms(self):
+        """DSA indexer / non-indexer grad norms from the DTensor layouts (see get_grad_norm)."""
+        indexer_params, non_indexer_params = self.get_dsa_split_parameters()
+        return (
+            self._get_grad_norm_for_parameters(indexer_params),
+            self._get_grad_norm_for_parameters(non_indexer_params),
+        )
 
     @override
     def count_zeros(self) -> float:
@@ -424,7 +460,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
     def _copy_main_params_to_model_params(self) -> None:
         """Refresh MFSDP V2 compute weights after updating optimizer weights."""
-        sync_model_weights_from_main_weights(self.get_parameters())
+        # Use every trainable model parameter: older TE optimizers omit empty local shards
+        # from param_groups, and skipping their groups here leaves those ranks without the
+        # stale-weight mark, so they skip the next ZeRO-1/2 weight all-gather their peers run.
+        sync_model_weights_from_main_weights(self._param_to_fqn.keys())
 
     def _copy_model_params_to_main_params(self, state_dict=None) -> None:
         """No-op: model loads already write into MFSDP v2's main weights."""

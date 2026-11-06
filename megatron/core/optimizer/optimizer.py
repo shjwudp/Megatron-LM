@@ -2151,7 +2151,16 @@ class ChainedOptimizer(MegatronOptimizer):
         return self._step()
 
     def grads_states_parallel_group_is_shared(self):
-        """Check if all optimizers share the same gradient statistics parallel group."""
+        """Check if all optimizers share the same gradient statistics parallel group.
+
+        MFSDP v2 optimizers read each gradient's own DTensor layout, so their norms must be
+        computed per optimizer and combined, never through the flat grad list path.
+        """
+        if any(
+            getattr(optimizer, "_mfsdp_v2_grad_stats", False)
+            for optimizer in self.chained_optimizers
+        ):
+            return False
         reference_group = self.chained_optimizers[0].get_grad_stats_parallel_group()
         return all(
             optimizer.get_grad_stats_parallel_group() == reference_group
@@ -2275,11 +2284,14 @@ class ChainedOptimizer(MegatronOptimizer):
         else:
             group_norms = []
             for optimizer in self.chained_optimizers:
-                grouped_grads = optimizer.get_grads_for_grad_norm(grad_norm_group)
-                norm = get_grad_norm_fp32(
-                    grouped_grads,
-                    grad_stats_parallel_group=optimizer.get_grad_stats_parallel_group(),
-                )
+                if getattr(optimizer, "_mfsdp_v2_grad_stats", False):
+                    norm = optimizer._get_grad_norm_for_group(grad_norm_group)
+                else:
+                    grouped_grads = optimizer.get_grads_for_grad_norm(grad_norm_group)
+                    norm = get_grad_norm_fp32(
+                        grouped_grads,
+                        grad_stats_parallel_group=optimizer.get_grad_stats_parallel_group(),
+                    )
                 group_norms.append(norm if norm else 0.0)
             return math.sqrt(sum([x**2 for x in group_norms]))
 

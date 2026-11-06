@@ -9,7 +9,7 @@ Owner-compute P2P gather/scatter for MFSDP v2.
 
 The sharded side is a `DBuffer`, which supplies the data, mesh, layout, and placements.
 `tensor_to_owner` selects participating tensors and maps their indices to owner global ranks.
-Both operations support one-dimensional meshes with sharded placements.
+Both operations support meshes whose placements are sharded on every axis.
 Each tensor's owner holds a shard, so any peer pair shares at most one tensor across their
 disjoint buffer ranges. Tensor traversal order therefore need not match across ranks.
 
@@ -27,15 +27,31 @@ from .range import Range, intersect_ranges
 
 
 def _get_sorted_rank_ranges(buffer: DBuffer) -> dict[int, Range]:
-    """Return sharded buffer ranges keyed by global rank, in buffer offset order."""
+    """Return sharded buffer ranges keyed by global rank, in buffer offset order.
+
+    Every mesh axis must be sharded, so each rank owns a distinct range. A multi-axis
+    mesh (e.g. HFSDP optimizer placements sharded over DP-outer and DP-inner) is treated
+    as one flattened shard domain using the layout's own rank-to-segment mapping.
+    """
     mesh = buffer.mesh
-    if mesh.ndim != 1 or not isinstance(buffer.placements[0], Shard):
-        raise NotImplementedError("Owner gather/scatter requires a 1-D sharded DBuffer.")
+    if not all(isinstance(placement, Shard) for placement in buffer.placements):
+        raise NotImplementedError(
+            "Owner gather/scatter requires a DBuffer sharded on every mesh axis."
+        )
     rank_ranges = [
         (rank, buffer.layout.get_rank_range(mesh, buffer.placements, rank))
-        for rank in mesh.mesh.tolist()
+        for rank in mesh.mesh.flatten().tolist()
     ]
     return dict(sorted(rank_ranges, key=lambda item: item[1].start))
+
+
+def _get_p2p_group(buffer: DBuffer) -> dist.ProcessGroup | None:
+    """Process group for owner P2P ops: the mesh group, or the default group for N-D meshes.
+
+    P2P peers are global ranks, so any group containing all mesh ranks works. N-D meshes
+    have no single group; the default group contains every rank.
+    """
+    return buffer.mesh.get_group() if buffer.mesh.ndim == 1 else None
 
 
 def gather(
@@ -65,7 +81,7 @@ def gather(
     this_rank = mesh.get_rank()
     layout = source.layout
     rank_ranges = _get_sorted_rank_ranges(source)
-    group = mesh.get_group()
+    group = _get_p2p_group(source)
 
     # Build the P2P ops: send non-owned chunks to their owners, receive owned ones.
     ops: list[dist.P2POp] = []
@@ -132,7 +148,7 @@ def scatter(
     this_rank = mesh.get_rank()
     layout = destination.layout
     rank_ranges = _get_sorted_rank_ranges(destination)
-    group = mesh.get_group()
+    group = _get_p2p_group(destination)
 
     # Build the P2P ops: send owned result chunks, receive the ones held here.
     ops: list[dist.P2POp] = []

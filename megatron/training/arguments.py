@@ -1052,8 +1052,11 @@ def validate_args(args, defaults={}):
                 "regular DDP/distributed optimizer path until Megatron-FSDP supports TE "
                 "GroupedTensor param buffers."
             )
-        # Optimizer compatibility check.
-        assert args.optimizer in ('sgd', 'adam'), \
+        # Optimizer compatibility check. MFSDP v2 also supports muon via FsdpMuon.
+        supported_fsdp_optimizers = ('sgd', 'adam')
+        if args.megatron_fsdp_version == 2:
+            supported_fsdp_optimizers += ('muon',)
+        assert args.optimizer in supported_fsdp_optimizers, \
             f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         # Expert parameters may be sharded differently from non-expert parameters, in which
@@ -1671,8 +1674,11 @@ def validate_args(args, defaults={}):
 
     if args.optimizer not in ('sgd', 'adam'):
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+        if args.use_megatron_fsdp:
+            assert args.megatron_fsdp_version == 2 and args.optimizer == 'muon', \
+                "Megatron-FSDP supports emerging optimizers only as muon with MFSDP v2."
+        else:
+            assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
