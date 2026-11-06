@@ -8,14 +8,8 @@ from typing import Callable, Optional
 import torch
 from torch.autograd import Variable
 
-from megatron.core.utils import (
-    get_pg_rank,
-    get_pg_size,
-    log_single_rank,
-    make_viewless_tensor,
-    nvtx_range_pop,
-    nvtx_range_push,
-)
+from megatron.core.event_tracker import event_tracker
+from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank, make_viewless_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -439,14 +433,13 @@ class ScheduleNode:
             name: Optional name for NVTX range profiling
         """
         self.event.wait(self.stream)
-        if name:
-            nvtx_range_push(name)
         try:
-            with torch.cuda.stream(self.stream):
+            with (
+                torch.cuda.stream(self.stream),
+                event_tracker.schedule_node(self, name.rsplit(' ', 1)[-1] if name else 'compute'),
+            ):
                 yield
         finally:
-            if name:
-                nvtx_range_pop(name)
             self.event.record(self.stream)
 
     def _release_state(self):

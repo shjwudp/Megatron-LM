@@ -24,6 +24,7 @@ from typing_extensions import override
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.event_tracker import event_tracker
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
@@ -3801,6 +3802,7 @@ def te_checkpoint(
     from transformer_engine.pytorch.distributed import checkpoint
 
     initial_forward = True
+    recompute_label = event_tracker.recompute_label(forward_func)
 
     def forward_func_without_recomputed_observations(*forward_args, **forward_kwargs):
         nonlocal initial_forward
@@ -3808,7 +3810,7 @@ def te_checkpoint(
             initial_forward = False
             return forward_func(*forward_args, **forward_kwargs)
 
-        with suspend_tensor_observations():
+        with suspend_tensor_observations(), event_tracker.recompute_scope(recompute_label):
             return forward_func(*forward_args, **forward_kwargs)
 
     if is_te_min_version("1.5.0"):

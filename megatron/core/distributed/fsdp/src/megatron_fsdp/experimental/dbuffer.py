@@ -27,6 +27,7 @@ from torch.distributed.tensor.placement_types import Placement
 from . import layout_builder
 from .layout import GlobalLayout, Shape, non_leading_numel
 from .placement import BlockAtomic, ShardLayout, TensorAtomic
+from .profiling import profile_operation, profile_scope
 from .range import Range, intersect_ranges
 
 
@@ -536,9 +537,10 @@ class DBuffer:
                 # group, so rendezvous the output on the same mesh axis as the all-gather.
                 if out.is_symmetric_memory:
                     out.rendezvous(axis)
-                dist.all_gather_into_tensor(
-                    output_tensor=view.local_buffer, input_tensor=local_buffer, group=group
-                )
+                with profile_scope(f"optimizer-mfsdp-param-gather-axis{axis}"):
+                    dist.all_gather_into_tensor(
+                        output_tensor=view.local_buffer, input_tensor=local_buffer, group=group
+                    )
             else:
                 # Uneven all_gather uses grouped NCCL broadcasts, which cannot use
                 # symmetric-memory kernels: https://github.com/pytorch/pytorch/issues/198344.
@@ -547,10 +549,12 @@ class DBuffer:
                         "Symmetric-memory allgather() requires equal shard sizes."
                     )
                 chunks = self._peer_chunks(view, input_placements, axis)
-                dist.all_gather(chunks, local_buffer, group=group)
+                with profile_scope(f"optimizer-mfsdp-param-gather-axis{axis}"):
+                    dist.all_gather(chunks, local_buffer, group=group)
             local_buffer = view.local_buffer
         return out
 
+    @profile_operation("optimizer-mfsdp-grads-all-reduce")
     def allreduce(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
         """All-reduce a Partial axis into Replicate placement."""
         axis = mesh_axis
@@ -599,12 +603,14 @@ class DBuffer:
                 reduce_op = dist.ReduceOp.SUM
 
         if self.layout.has_equal_shard_sizes:
-            dist.reduce_scatter_tensor(
-                output=out.local_buffer, input=self.local_buffer, op=reduce_op, group=group
-            )
+            with profile_scope(f"optimizer-mfsdp-grads-reduce-scatter-axis{axis}"):
+                dist.reduce_scatter_tensor(
+                    output=out.local_buffer, input=self.local_buffer, op=reduce_op, group=group
+                )
         else:
             chunks = self._peer_chunks(self, placements, axis)
-            dist.reduce_scatter(out.local_buffer, chunks, op=reduce_op, group=group)
+            with profile_scope(f"optimizer-mfsdp-grads-reduce-scatter-axis{axis}"):
+                dist.reduce_scatter(out.local_buffer, chunks, op=reduce_op, group=group)
 
         if self.is_symmetric_memory and partial_placement.reduce_op == "avg":
             out.local_buffer.div_(self.mesh.size(axis))

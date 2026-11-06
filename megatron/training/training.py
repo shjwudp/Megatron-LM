@@ -62,6 +62,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
 )
 from megatron.core.enums import ModelType
+from megatron.core.event_tracker import event_tracker, trace_step
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -167,6 +168,7 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.kernel_warmup import warmup_training_kernels
+from megatron.training.logging.csa_flops import csa_attention_flops
 from megatron.training.logging.dsa_flops import dsa_indexer_flops, dsa_layer_flops
 
 # Retain the training.py import path used by existing multimodal callers.
@@ -1148,8 +1150,8 @@ def num_floating_point_operations(
         # causal mask of packed attention.
         if args.multi_latent_attention:
             assert not args.group_query_attention
-        if args.experimental_attention_variant == "dsa":
-            # DSA attention and its indexer are counted separately below.
+        if args.experimental_attention_variant in ("dsa", "dsv4_hybrid"):
+            # Sparse attention and its indexer are counted separately below.
             standard_self_attn_term = 0
             standard_self_attn_core_term = 0
         elif args.multi_latent_attention:
@@ -1424,6 +1426,12 @@ def num_floating_point_operations(
                 mtp_num_layers=mtp_num_layers,
                 mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
                 dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+            )
+        elif args.experimental_attention_variant == "dsv4_hybrid":
+            total_floating_point_operations += csa_attention_flops(
+                args,
+                total_tokens=total_real_tokens_in_batch,
+                seqlen_squared_sum=seqlen_squared_sum_in_batch,
             )
         return total_floating_point_operations
 
@@ -3292,6 +3300,7 @@ def _get_model_pg_collection(
     return pg_collection
 
 
+@trace_step
 def train_step(
     forward_step_func,
     data_iterator,
@@ -3446,7 +3455,7 @@ def train_step(
                 iteration=iteration,
                 pg_collection=metric_pg_collection,
             )
-        with grad_context, tensor_metric_context, _fb_cm:
+        with grad_context, tensor_metric_context, _fb_cm, event_tracker.scope("forward-backward"):
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=forward_backward_data_iterator,
@@ -3534,7 +3543,7 @@ def train_step(
         span_cm("megatron.train.iteration.optimizer", tracer=_otel_step_tracer)
         if _otel_sg_enabled('optimizer') and _otel_step_tracer is not None else nullcontext()
     )
-    with _opt_cm as _opt_span:
+    with _opt_cm as _opt_span, event_tracker.scope("optimizer-megatron-step"):
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
         if _opt_span is not None:
             _otel_set_attrs(_opt_span, {

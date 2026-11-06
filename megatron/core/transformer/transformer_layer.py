@@ -16,6 +16,8 @@ import torch
 import torch.distributed
 from torch import Tensor
 
+from megatron.core.event_tracker import trace_module
+
 try:
     from nemo.lens.helpers import managed_span as _otel_managed_span
 except ImportError:
@@ -766,6 +768,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
         return self._run_cross_attention(hidden_states, context, context_mask, inference_context)
 
+    @trace_module("attn")
     def _forward_attention(
         self,
         hidden_states: Tensor,
@@ -1344,6 +1347,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         return mlp_output_with_bias, residual
 
+    @trace_module("mlp")
     def _forward_mlp(
         self,
         hidden_states: Tensor,

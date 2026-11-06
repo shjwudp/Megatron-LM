@@ -9,6 +9,7 @@ from typing import Optional, Protocol
 import torch
 
 from megatron.core import utils
+from megatron.core.event_tracker import trace_module
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
@@ -632,6 +633,7 @@ class MoELayer(BaseMoELayer):
             )
         return hidden_states, probs
 
+    @trace_module("moe_dispatch")
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
 
@@ -644,6 +646,7 @@ class MoELayer(BaseMoELayer):
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
+    @trace_module("shared_experts_compute")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
         """Computes the output of the shared experts.
 
@@ -663,6 +666,7 @@ class MoELayer(BaseMoELayer):
         return shared_expert_output
 
     @internal_api
+    @trace_module("routed_experts_compute")
     def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Computes the output of the routed experts on the dispatched tokens.
 
@@ -700,6 +704,7 @@ class MoELayer(BaseMoELayer):
 
         return output, mlp_bias
 
+    @trace_module("moe_combine")
     def combine(self, output: torch.Tensor):
         """Combines expert outputs via communication and adds shared expert output.
 

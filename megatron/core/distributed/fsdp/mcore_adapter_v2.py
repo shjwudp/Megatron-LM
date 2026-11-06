@@ -30,6 +30,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
+from megatron.core.event_tracker import event_tracker
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -62,8 +63,12 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
         sync_model_weights_from_main_weights,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.profiling import (
+        set_profile_scope_factory,
+    )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import get_sharding_strategy
 
+    set_profile_scope_factory(event_tracker.scope)
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
     IMPORT_MEGATRON_FSDP_ERROR = import_megatron_fsdp_error

@@ -23,6 +23,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import Shard
 
 from .dbuffer import DBuffer
+from .profiling import profile_operation
 from .range import Range, intersect_ranges
 
 
@@ -54,6 +55,7 @@ def _get_p2p_group(buffer: DBuffer) -> dist.ProcessGroup | None:
     return buffer.mesh.get_group() if buffer.mesh.ndim == 1 else None
 
 
+@profile_operation("optimizer-muon-gather")
 def gather(
     source: DBuffer, destination: dict[int, torch.Tensor], *, tensor_to_owner: dict[int, int]
 ) -> None:
@@ -120,6 +122,7 @@ def gather(
         work.wait()
 
 
+@profile_operation("optimizer-muon-scatter")
 def scatter(
     source: dict[int, torch.Tensor], destination: DBuffer, *, tensor_to_owner: dict[int, int]
 ) -> None:

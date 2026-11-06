@@ -6,6 +6,12 @@ import torch
 from torch import Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.event_tracker import (
+    _schedule_label,
+    event_tracker,
+    trace_layer_schedule,
+    trace_schedule_plan,
+)
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
     finish_fsdp_backward,
     reshard_fsdp_module,
@@ -17,7 +23,6 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
 class ModelChunkState:
@@ -162,11 +167,12 @@ class RecomputeSegment:
         with _fork_rng():
             _set_all_rng_states(*self.rng_states)
             f_input = segment_input
-            for i, seg_layer in enumerate(self.layers):
-                nvtx_msg = f"recompute_layer_{self.start_index + i}"
-                nvtx_range_push(nvtx_msg)
-                f_input = seg_layer.recompute_forward(f_input)
-                nvtx_range_pop(nvtx_msg)
+            for seg_layer in self.layers:
+                label = event_tracker.recompute_label(
+                    'full_layer', state=cs, layer=seg_layer.layer.layer_number
+                )
+                with event_tracker.recompute_scope(label):
+                    f_input = seg_layer.recompute_forward(f_input)
         self.rng_states = None
 
 
@@ -279,6 +285,7 @@ class TransformerLayerSchedulePlan:
         extra_args["num_local_experts"] = num_local_experts
         extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
         extra_args["is_mtp"] = is_mtp
+        extra_args["layer_number"] = self.layer.layer_number
 
         # wrapper to help create TransformerLayerNode
         def create_node(stream, module, name):
@@ -427,6 +434,7 @@ class TransformerLayerSchedulePlan:
         return self.layer.get_inner_quantization_context()
 
     @staticmethod
+    @trace_layer_schedule
     def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False):
         """Schedule one-forward-one-backward operations for a single transformer layer.
 
@@ -620,6 +628,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # save the inputs of model.forward() to ModelChunkState
         self._model_chunk_state.input_ids = input_ids
+        self._model_chunk_state.microbatch_id = 0
+        self._model_chunk_state.vp_stage = model.vp_stage
         self._model_chunk_state.fsdp_root = model if isinstance(model, FsdpModule) else None
         self._model_chunk_state.position_ids = position_ids
         self._model_chunk_state.attention_mask = attention_mask
@@ -800,6 +810,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             self.post_process = None
 
     @staticmethod
+    @trace_schedule_plan
     def run(
         f_schedule_plan,
         b_schedule_plan,
@@ -866,8 +877,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         for i in range(overlapped_layers):
             f_layer = f_schedule_plan.get_layer(i)
             b_layer = b_schedule_plan.pop_layer()
-            nvtx_msg = f"layer_{i}f-layer_{b_schedule_plan.num_layers()}b"
-            nvtx_range_push(nvtx_msg)
             f_input, b_grad = TransformerLayerSchedulePlan.run(
                 f_layer,
                 b_layer,
@@ -877,27 +886,20 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             )
             if i < b_num_layers - 1:
                 b_layer.release_state()
-            nvtx_range_pop(nvtx_msg)
 
         # backward pass for the remaining layers
         for i in range(overlapped_layers, b_num_layers):
             b_layer = b_schedule_plan.pop_layer()
-            nvtx_msg = f"layer_{b_schedule_plan.num_layers()}b"
-            nvtx_range_push(nvtx_msg)
             _, b_grad = TransformerLayerSchedulePlan.run(
                 None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
             )
             if i < b_num_layers - 1:
                 b_layer.release_state()
-            nvtx_range_pop(nvtx_msg)
 
         # forward pass for the remaining layers
         for i in range(overlapped_layers, f_num_layers):
             f_layer = f_schedule_plan.get_layer(i)
-            nvtx_msg = f"layer_{i}f"
-            nvtx_range_push(nvtx_msg)
             f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
-            nvtx_range_pop(nvtx_msg)
 
         if f_schedule_plan is not None and post_forward is not None:
             # post_forward()/send_forward_recv_forward() is running in the communication stream,
@@ -916,7 +918,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # of the first layer) for overlapping with the p2p comm.
         if b_num_layers > 0:
             assert b_layer is not None
-            b_layer.pre_dispatch_computation.backward_dw()
+            with event_tracker.nvtx_scope(_schedule_label('layer', None, b_layer) + '_wgrad'):
+                b_layer.pre_dispatch_computation.backward_dw()
             b_layer.release_state()
 
         # post process forward

@@ -2,6 +2,7 @@
 """Packed CSA/MTP parity across real CP and EP groups and interleaved microbatches."""
 
 import gc
+import json
 from collections import Counter
 from contextlib import nullcontext
 from dataclasses import replace
@@ -17,6 +18,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     RuntimePolicy,
     fully_shard_context,
 )
+from megatron.core.event_tracker import event_tracker
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import get_fsdp_root
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -144,7 +146,7 @@ def _batches(pg):
 @pytest.mark.parametrize("delay_wgrad", [False, True])
 @pytest.mark.parametrize("recompute", [False, True, "local-bf16", "local-mxfp8"])
 def test_packed_csa_mtp_outputs_and_all_parameter_gradients(
-    delay_wgrad, recompute, fsdp, monkeypatch
+    delay_wgrad, recompute, fsdp, monkeypatch, tmp_path
 ):
     """Compare ordinary execution with a genuine F(n+1)/B(n) schedule, including embeddings."""
     if Utils.world_size < 4:
@@ -259,7 +261,15 @@ def test_packed_csa_mtp_outputs_and_all_parameter_gradients(
         candidate_model = candidate.module.module if fsdp else candidate
         plans = [candidate_model.build_schedule_plan(**data) for data in batches]
         for index, plan in enumerate(plans):
+            plan._model_chunk_state.microbatch_id = index
             plan._model_chunk_state.fsdp_root = get_fsdp_root(candidate)
+        trace = delay_wgrad and recompute
+        if trace:
+            monkeypatch.setenv('ENABLE_PP_TIMER', '1')
+            monkeypatch.setenv('ENABLE_PP_TIMER_CPU', '1')
+            monkeypatch.setenv('ENABLE_PP_TIMER_ITER', '2')
+            monkeypatch.setenv('ENABLE_PP_TIMER_DUMP_DIR', str(tmp_path))
+            assert event_tracker.begin(2)
         outputs = []
         with candidate.no_sync() if fsdp else nullcontext():
             outputs.append(TransformerModelChunkSchedulePlan.run(plans[0], None))
@@ -272,6 +282,17 @@ def test_packed_csa_mtp_outputs_and_all_parameter_gradients(
         TransformerModelChunkSchedulePlan.run(None, plans[-1], b_grad=batches[-1]["loss_mask"])
         if fsdp:
             candidate.finish_grad_sync()
+        if trace:
+            event_tracker.finish()
+            payload = json.loads(next(tmp_path.glob('event_times_iter2_*.json')).read_text())
+            events = payload['events']
+            assert 'forward-backward-0-1-0-0/start' in events
+            assert any('-mlp-wgrad/start' in key for key in events)
+            for batch in range(3):
+                assert any(f'batch{batch}-chunk0-' in key for key in events)
+            for key, start in events.items():
+                if key.endswith('/start'):
+                    assert events[key.removesuffix('/start') + '/end'] >= start
         for actual, wanted in zip(outputs, expected):
             torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
         assert len(mtp_metrics) == 2 * len(batches)
@@ -301,6 +322,7 @@ def test_packed_csa_mtp_outputs_and_all_parameter_gradients(
         del reference, candidate, plans, outputs
     finally:
         torch.cuda.synchronize()
+        event_tracker.reset()
         fused_a2a._buffer = None
         gc.collect()
         Utils.destroy_model_parallel()

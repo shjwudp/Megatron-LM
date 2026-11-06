@@ -16,11 +16,12 @@ from typing import Callable
 
 import torch
 
+from megatron.core.event_tracker import event_tracker
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
-from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import internal_api
 
 
 def weak_method(method):
@@ -261,6 +262,7 @@ class TransformerLayerNode(ScheduleNode):
         self.detached = tuple()
         self.before_detached = tuple()
         self.is_mtp = extra_args.get("is_mtp", False)
+        self.layer_number = extra_args.get("layer_number")
         self.post_wgrad_grad_acc_hooks = None
 
         self.is_first_layer = extra_args.get("is_first_layer", False)
@@ -350,12 +352,9 @@ class TransformerLayerNode(ScheduleNode):
             return
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with torch.cuda.stream(self.stream):
-            nvtx_msg = f"{self.name} wgrad"
-            nvtx_range_push(nvtx_msg)
+        with torch.cuda.stream(self.stream), event_tracker.schedule_node(self, 'wgrad'):
             for module in self.bwd_dw_callables:
                 module.backward_dw()
-            nvtx_range_pop(nvtx_msg)
 
         # Collect ``post_wgrad_grad_acc_hook`` from params whose grads were
         # produced by *this* slot's wgrad callables. The hook must run on the

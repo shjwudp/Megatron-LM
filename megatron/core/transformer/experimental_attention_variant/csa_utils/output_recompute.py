@@ -3,6 +3,7 @@
 
 import torch
 
+from megatron.core.event_tracker import event_tracker
 from megatron.core.tensor_parallel.random import _get_share_storage
 
 from .fused_sparse_attention import _csa_fwd_flash_mla
@@ -25,6 +26,7 @@ class CSAOutputRecompute:
         """Retain aliases after forward has completed the indexer loss and output RoPE."""
         if self._inputs is not None:
             raise RuntimeError("A CSA output replay can only record one forward.")
+        self._recompute_label = event_tracker.recompute_label('csa_core_output')
         self._inputs = (
             query.detach(),
             tuple(part.detach() for part in kv_parts),
@@ -52,16 +54,17 @@ class CSAOutputRecompute:
             return
         if not self._released:
             raise RuntimeError("CSA output replay ran before its outputs were released.")
-        query, kv_parts, sink, indices, lengths, scale, out_rope = self._inputs
-        kv_full = torch.cat(kv_parts, dim=0)
-        out, lse, _ = _csa_fwd_flash_mla(
-            query, kv_full, indices, scale, attn_sink=sink, topk_length=lengths
-        )
-        if out_rope is not None:
-            out_rope.apply_(out)
-        # Repoint StorageImpl rather than TensorImpl: every saved view must see
-        # the restored data, without incrementing autograd version counters.
-        share_storage = _get_share_storage()
-        for saved, restored in zip(self._outputs, (out, lse)):
-            share_storage(saved, restored)
+        with event_tracker.recompute_scope(self._recompute_label):
+            query, kv_parts, sink, indices, lengths, scale, out_rope = self._inputs
+            kv_full = torch.cat(kv_parts, dim=0)
+            out, lse, _ = _csa_fwd_flash_mla(
+                query, kv_full, indices, scale, attn_sink=sink, topk_length=lengths
+            )
+            if out_rope is not None:
+                out_rope.apply_(out)
+            # Repoint StorageImpl rather than TensorImpl: every saved view must see
+            # the restored data, without incrementing autograd version counters.
+            share_storage = _get_share_storage()
+            for saved, restored in zip(self._outputs, (out, lse)):
+                share_storage(saved, restored)
         self._inputs = self._outputs = None

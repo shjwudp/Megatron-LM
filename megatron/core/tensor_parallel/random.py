@@ -19,6 +19,7 @@ from torch.utils.checkpoint import detach_variable
 from torch.utils.cpp_extension import load_inline
 from typing_extensions import TypeVarTuple, Unpack
 
+from megatron.core.event_tracker import event_tracker
 from megatron.core.parallel_state import (
     get_expert_gtp_weight_remat_rank,
     get_expert_gtp_weight_remat_world_size,
@@ -718,6 +719,7 @@ class CheckpointFunction(torch.autograd.Function):
         _set_checkpointing()
 
         ctx.run_function = run_function
+        ctx.recompute_label = event_tracker.recompute_label(run_function)
         ctx.distribute_saved_activations = distribute_saved_activations
         # Activation recomputation must use the same autocast policy as the original forward.
         # Otherwise it replays under the ambient autocast state.
@@ -776,7 +778,12 @@ class CheckpointFunction(torch.autograd.Function):
                 enabled=ctx.autocast_enabled,
                 cache_enabled=ctx.autocast_cache_enabled,
             )
-            with torch.enable_grad(), autocast_context, suspend_tensor_observations():
+            with (
+                torch.enable_grad(),
+                autocast_context,
+                suspend_tensor_observations(),
+                event_tracker.recompute_scope(ctx.recompute_label),
+            ):
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
@@ -934,6 +941,7 @@ class _RecomputeRegion:
     ):
         self.state: Optional[_RegionState] = None
         self._function = function
+        self._recompute_label = event_tracker.recompute_label(function)
         self._layout = _ArgLayout(args)
         # Taken before the function draws any random number.
         self._rng_states = _get_all_rng_states()
@@ -993,7 +1001,12 @@ class _RecomputeRegion:
         leaves = self._unstash_inputs()
         with _fork_rng():
             _set_all_rng_states(*self._rng_states)
-            with torch.enable_grad(), self._te_context.second_pass(), suspend_tensor_observations():
+            with (
+                torch.enable_grad(),
+                self._te_context.second_pass(),
+                suspend_tensor_observations(),
+                event_tracker.recompute_scope(self._recompute_label),
+            ):
                 outputs = _as_tuple(self._function(*self._layout.rebuild(leaves)))
 
         self._share_rebuilt_storages(outputs)

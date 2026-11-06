@@ -9,6 +9,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.event_tracker import event_tracker
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -493,6 +494,13 @@ def forward_step(
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
 
+    if event_tracker.enabled:
+        event_tracker.batch = current_microbatch if current_microbatch is not None else 0
+        event_tracker.chunk = vp_stage if vp_stage is not None else 0
+        event_tracker.in_backward = False
+        pp_event = event_tracker.unique(f'forward-{event_tracker.chunk}-{event_tracker.batch}')
+        event_tracker.record(pp_event, 'start')
+
     if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
         model.set_is_first_microbatch()
     if current_microbatch is not None:
@@ -542,6 +550,9 @@ def forward_step(
         is_last_stage,
     )
 
+    if event_tracker.enabled:
+        event_tracker.record(pp_event, "end")
+
     if unwrap_output_tensor:
         return output_tensor, num_tokens
     return [output_tensor], num_tokens
@@ -562,6 +573,11 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
 
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
+
+    if event_tracker.enabled:
+        event_tracker.in_backward = True
+        pp_event = event_tracker.unique(f'backward-{event_tracker.chunk}-{event_tracker.batch}')
+        event_tracker.record(pp_event, 'start')
 
     # Retain the grad on the input_tensor.
     unwrap_input_tensor_grad = False
@@ -608,6 +624,9 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     if config.timers is not None:
         config.timers('backward-compute').stop()
 
+    if event_tracker.enabled:
+        event_tracker.record(pp_event, 'end')
+        event_tracker.in_backward = False
     return input_tensor_grad
 
 
@@ -1458,6 +1477,9 @@ def forward_backward_pipelining_with_interleaving(
             virtual_microbatch_id, model_chunk_id
         )
 
+        if event_tracker.enabled:
+            event_tracker.chunk = model_chunk_id
+            event_tracker.batch = microbatch_id_table[virtual_microbatch_id]
         input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
         backward_step_helper_postprocess(virtual_microbatch_id)
@@ -1503,6 +1525,31 @@ def forward_backward_pipelining_with_interleaving(
         else:  # Conventional interleaved 1F1B path
             forward_output_tensor = None
             backward_input_tensor_grad = None
+            if event_tracker.enabled:
+                f_chunk = (
+                    get_model_chunk_id(f_virtual_microbatch_id, forward=True)
+                    if f_virtual_microbatch_id is not None
+                    else -1
+                )
+                f_batch = (
+                    get_microbatch_id_in_model_chunk(f_virtual_microbatch_id, forward=True)
+                    if f_virtual_microbatch_id is not None
+                    else -1
+                )
+                b_chunk = (
+                    get_model_chunk_id(b_virtual_microbatch_id, forward=False)
+                    if b_virtual_microbatch_id is not None
+                    else -1
+                )
+                b_batch = (
+                    microbatch_id_table[b_virtual_microbatch_id]
+                    if b_virtual_microbatch_id is not None
+                    else -1
+                )
+                pp_pair = event_tracker.unique(
+                    f'forward-backward-{f_chunk}-{f_batch}-{b_chunk}-{b_batch}'
+                )
+                event_tracker.record(pp_pair, 'start')
             # forward pass
             if f_virtual_microbatch_id is not None:
                 forward_model_chunk_id = get_model_chunk_id(f_virtual_microbatch_id, forward=True)
@@ -1522,6 +1569,8 @@ def forward_backward_pipelining_with_interleaving(
                 backward_input_tensor_grad = backward_step_helper(b_virtual_microbatch_id)
                 if post_backward is not None:
                     backward_input_tensor_grad = post_backward(backward_input_tensor_grad)
+            if event_tracker.enabled:
+                event_tracker.record(pp_pair, 'end')
             return forward_output_tensor, backward_input_tensor_grad
 
     # ==============================main logic=========================================

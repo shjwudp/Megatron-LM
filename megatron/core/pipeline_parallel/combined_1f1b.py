@@ -391,7 +391,10 @@ def combined_forward_backward_step(
             assert isinstance(
                 f_schedule_plan, AbstractSchedulePlan
             ), "first output of forward_step_func must be one instance of AbstractSchedulePlan"
+            # Persist identity on the plan: a later backward runs alongside a
+            # different microbatch, so the model's mutable counter is insufficient.
             if hasattr(f_schedule_plan, "_model_chunk_state"):
+                f_schedule_plan._model_chunk_state.microbatch_id = current_microbatch or 0
                 # Training may shard Float16Module, while plan construction
                 # unwraps it to GPTModel. Retain the actual parameter owner.
                 f_schedule_plan._model_chunk_state.fsdp_root = get_fsdp_root(f_model)
@@ -489,6 +492,7 @@ def combined_forward_backward_step(
         loss_node = ScheduleNode(
             loss_func, get_comp_stream, f_schedule_plan.event, name="loss_func"
         )
+        loss_node.chunk_state = getattr(f_schedule_plan, "_model_chunk_state", None)
         loss_func = loss_node.forward
         output_tensor, num_tokens = forward_step_calc_loss(
             f_model,

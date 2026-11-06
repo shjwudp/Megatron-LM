@@ -15,6 +15,7 @@ from torch.distributed import _coalescing_manager
 
 import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
+from megatron.core.event_tracker import event_tracker, tracked_coalescing_manager
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
@@ -482,6 +483,9 @@ class _ParamAndGradBucketGroup:
             local_rank = self.intra_distributed_optimizer_instance_rank
             group = self.intra_distributed_optimizer_instance_group
             layerwise_work_handles = []
+            if event_tracker.enabled:
+                pp_gather = event_tracker.unique('optimizer-dp-muon-param-gather')
+                event_tracker.record(pp_gather, 'start')
             for bucket in self.buckets:
                 # Use param dtype (e.g., bf16), NOT grad dtype (which may be
                 # fp32 when grad_reduce_in_fp32 is enabled).
@@ -536,6 +540,13 @@ class _ParamAndGradBucketGroup:
                 if async_op and work is not None:
                     layerwise_work_handles.append(work)
 
+            if event_tracker.enabled:
+                if async_op:
+                    event_tracker.record_completion(
+                        pp_gather, _LayerwiseAllGatherHandle(layerwise_work_handles), group
+                    )
+                else:
+                    event_tracker.record(pp_gather, 'end')
             if async_op:
                 self.param_gather_handle = _LayerwiseAllGatherHandle(layerwise_work_handles)
             else:
@@ -562,8 +573,10 @@ class _ParamAndGradBucketGroup:
             # Standard distributed optimizer path: use _coalescing_manager.
             # all_gather_into_tensor writes directly into a contiguous output buffer and
             # does not need a copy-back step, so coalescing works correctly.
-            with _coalescing_manager(
-                self.intra_distributed_optimizer_instance_group, async_ops=async_op
+            with tracked_coalescing_manager(
+                "optimizer-dp-param-gather",
+                self.intra_distributed_optimizer_instance_group,
+                async_ops=async_op,
             ) as cm:
                 for idx, bucket in enumerate(self.buckets):
                     if self.cached_param_buffer_shard_list[idx] is None:
@@ -766,7 +779,12 @@ class _ParamAndGradBucketGroup:
 
         # Coalesce communication kernels across buckets in the bucket group.
         grad_reduce_handle = None
-        with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
+        with (
+            stream_context,
+            tracked_coalescing_manager(
+                "optimizer-dp-grads-reduce", communication_group, async_ops=async_op
+            ) as cm,
+        ):
             for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
                     if self.cached_grad_buffer_shard_list[idx] is None:
