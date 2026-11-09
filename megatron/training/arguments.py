@@ -2705,6 +2705,14 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-split-head', action='store_true',
+                       help='Split fused QKV and indexer Q by head for TP=1 Muon')
+    group.add_argument('--muon-split-fc1', action='store_true',
+                       help='Split Muon FC1 gate/up matrices for TP=1')
+    group.add_argument('--muon-split-eh', action='store_true',
+                       help='Split Muon MTP embedding/hidden input columns for TP=1')
+    group.add_argument('--muon-ns-eps', type=float, default=None,
+                       help='NS normalization epsilon (default: EO default; TP=1 only)')
     group.add_argument('--muon-nesterov', action='store_true',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',

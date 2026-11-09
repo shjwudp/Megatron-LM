@@ -1,7 +1,7 @@
 # Proxy model feature index
 
-The reconstructed history has seven local feature commits and five independent upstream
-PR commits. Each row points to its consolidated documentation; detailed raw experiment
+The reconstructed baseline has seven local feature commits and five independent upstream
+PR commits. The subsequent optimizer alignment fix is documented below. Each row points to its consolidated documentation; detailed raw experiment
 records and training launchers remain outside this source history.
 
 | Feature | Consolidated guide |
@@ -18,5 +18,8 @@ records and training launchers remain outside this source history.
 | Upstream #8918 | [UB initialization](mfsdp_v2/pr_8918_native_nccl_ub.md) |
 | Upstream #8950 | [All-gather registration](mfsdp_v2/pr_8950_allgather_input_registration.md) |
 | Proxy memory calculator | [Calculator](proxy_memory_calculator.md) |
+| Adam/Muon algorithm and parameter-policy alignment | [Optimizer task result](../tasks/proxy-optimizer-alignment/Result.md) |
 
 [Combined branch validation](proxy_validation.md) records the new eight-GPU checks.
+[Source release provenance](proxy_experiment_release.md) identifies the executed
+source archive and the separately distributed reproduction inputs.

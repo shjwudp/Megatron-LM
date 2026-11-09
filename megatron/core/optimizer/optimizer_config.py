@@ -276,6 +276,18 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    muon_split_head: bool = False
+    """Split fused QKV and indexer Q weights by head (TP=1, no GTP remat)."""
+
+    muon_split_fc1: bool = False
+    """Orthogonalize FC1 gate/up halves separately (TP=1, no GTP remat)."""
+
+    muon_split_eh: bool = False
+    """Orthogonalize MTP embedding/hidden input halves separately (TP=1)."""
+
+    muon_ns_eps: Optional[float] = None
+    """NS normalization epsilon. None preserves the EO default; custom values need TP=1."""
+
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 

@@ -298,6 +298,9 @@ def _is_separate_grad_norm_group(grad_norm_group: Optional[str]) -> bool:
 
 def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
     """Copy optimizer-relevant metadata when creating param views/copies."""
+    for attribute in ("muon_split_kind", "muon_head_dim"):
+        if hasattr(source, attribute):
+            setattr(destination, attribute, getattr(source, attribute))
     if hasattr(source, 'allreduce'):
         destination.allreduce = source.allreduce
     if hasattr(source, 'shared'):

@@ -129,3 +129,103 @@ def test_muon_matches_reference(
     reference_losses = _train(reference, (reference_optimizer, reference_other), inputs)
     losses = _train(model, (optimizer, other_optimizer), inputs)
     torch.testing.assert_close(losses, reference_losses, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("strategy", ["sharded", "hybrid"])
+def test_configured_muon_matches_split_reference(distributed_setup, strategy):
+    """Configured owner-compute Muon must match complete-matrix reference updates."""
+    from types import SimpleNamespace
+
+    from megatron.core.optimizer import OptimizerConfig
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
+    from megatron.core.optimizer.fsdp_muon import MCoreFsdpMuon
+
+    world = distributed_setup.world_size
+    if world < 4 or world % 4:
+        pytest.skip("Needs a multiple of four ranks")
+    mesh = init_device_mesh("cuda", (world // 4, 2, 2), mesh_dim_names=("copy", "outer", "inner"))
+    mesh = mesh["outer", "inner"] if strategy == "hybrid" else mesh["inner"]
+    torch.manual_seed(171)
+    model = TinyModel().to(distributed_setup.device)
+    reference = copy.deepcopy(model)
+    with fully_shard_context(FsdpContext(device=distributed_setup.device)):
+        for layer in (m for m in model.modules() if isinstance(m, nn.Linear)):
+            fully_shard(
+                layer,
+                mesh=mesh,
+                placements=Placements(
+                    dp_axes=list(range(mesh.ndim)),
+                    parameter=[RowAtomic()] * mesh.ndim,
+                    gradient=[RowAtomic()] * mesh.ndim,
+                    optimizer=[RowAtomic()] * mesh.ndim,
+                ),
+            )
+    params, refs = dict(model.named_parameters()), dict(reference.named_parameters())
+    for name, kind in (
+        ("block1.0.weight", "fc1"),
+        ("block1.2.weight", "eh"),
+        ("block2.0.weight", "index_q"),
+    ):
+        for mapping in (params, refs):
+            mapping[name].muon_split_kind = kind
+            mapping[name].muon_head_dim = 4
+    scalar = ("block2.3.weight", "block2.3.bias")
+    matrices = [name for name in params if name not in scalar]
+    config = OptimizerConfig(
+        lr=0.01,
+        weight_decay=0.1,
+        muon_momentum=0.95,
+        muon_nesterov=True,
+        muon_fp32_matmul_prec="high",
+        muon_coefficient_type="r2s10",
+        muon_num_ns_steps=10,
+        muon_extra_scale_factor=0.2,
+        muon_ns_eps=1e-15,
+        muon_split_qkv=False,
+        muon_split_head=True,
+        muon_split_fc1=True,
+        muon_split_eh=True,
+    )
+    optimizer = MCoreFsdpMuon(
+        [params[n] for n in matrices],
+        config,
+        SimpleNamespace(num_attention_heads=2, num_query_groups=2, kv_channels=4),
+    )
+    ref_optimizer = TensorParallelMuon(
+        [refs[n] for n in matrices],
+        lr=0.01,
+        weight_decay=0.1,
+        momentum=0.95,
+        nesterov=True,
+        fp32_matmul_prec="high",
+        coefficient_type="r2s10",
+        num_ns_steps=10,
+        extra_scale_factor=0.2,
+        ns_eps=1e-15,
+        split_qkv=False,
+        split_head=True,
+        split_fc1=True,
+        split_eh=True,
+    )
+    scalar_optimizer = torch.optim.AdamW([params[n] for n in scalar], lr=0.01, foreach=False)
+    fully_shard_optimizer(scalar_optimizer)
+    ref_scalar = torch.optim.AdamW([refs[n] for n in scalar], lr=0.01, foreach=False)
+    inputs = torch.randn(5, 4, 8, device=distributed_setup.device)
+    ref_losses = _train(reference, (ref_optimizer, ref_scalar), inputs)
+    losses = _train(model, (optimizer, scalar_optimizer), inputs)
+    torch.testing.assert_close(losses, ref_losses, atol=0, rtol=0)
+    from torch.distributed.tensor import Replicate
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+        get_containing_parameter_group,
+    )
+
+    # RowAtomic packs several tensors into one buffer. A tensor's row owner can
+    # differ from ordinary DTensor Shard(0); reconstruct through the buffer layout.
+    names_by_id = {id(p): name for name, p in params.items()}
+    groups = dict.fromkeys(get_containing_parameter_group(p) for p in params.values())
+    for group in groups:
+        full = group.main_weight.redistribute([Replicate()] * group.mesh.ndim)
+        for i, parameter in enumerate(group.fsdp_parameters):
+            name = names_by_id[id(parameter.sharded)]
+            torch.testing.assert_close(full.get_tensor_view(i), refs[name], atol=0, rtol=0)

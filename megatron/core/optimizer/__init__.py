@@ -66,11 +66,11 @@ from .emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
-    _kwargs_from_config,
 )
 from .fully_sharded_optimizer import FullyShardedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
+from .muon_matrix import tag_muon_parameters
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -711,10 +711,9 @@ def _get_megatron_optimizer_based_on_param_groups(
         elif config.optimizer == 'muon' and isinstance(model_chunks[0], FullyShardedDataParallelV2):
             # Owner-compute Muon over MFSDP v2 sharded buffers. The scalar optimizer for the
             # remaining parameters is built separately and chained by the caller.
-            from ..distributed.fsdp.src.megatron_fsdp.experimental.muon import FsdpMuon
+            from .fsdp_muon import MCoreFsdpMuon
 
-            kwargs = _kwargs_from_config(FsdpMuon, "muon", config)
-            optimizer = FsdpMuon(param_groups, **kwargs)
+            optimizer = MCoreFsdpMuon(param_groups, config, get_model_config(model_chunks[0]))
 
             def init_state_fn(opt, config=None):
                 for group in opt.param_groups:
@@ -885,6 +884,8 @@ def _get_megatron_emerging_optimizer(
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
+    if eopt_name in ("muon", "adaptive_muon"):
+        tag_muon_parameters(model_chunks)
     # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
     for model_chunk in model_chunks:
         qkv_split_shapes = None
@@ -1119,7 +1120,7 @@ def _get_megatron_optimizer_for_mfsdp_v2_muon(
 
     Muon-managed 2-D matrices use :class:`FsdpMuon`, which keeps momentum sharded and
     orthogonalizes each matrix on one owner rank. Every other parameter (embeddings, output
-    layer, router, norms, biases, and anything tagged ``use_muon=False``) uses the scalar
+    layer, norms, biases, and anything tagged ``use_muon=False``) uses the scalar
     optimizer chosen by ``config.muon_scalar_optimizer``. Both are wrapped in
     :class:`FullyShardedOptimizer`, so gradient statistics come from the DTensor layouts.
     """
@@ -1139,6 +1140,7 @@ def _get_megatron_optimizer_for_mfsdp_v2_muon(
             override['optimizer'] = config.muon_scalar_optimizer
     config_overrides.update(default_param_overrides)
 
+    tag_muon_parameters(model_chunks)
     # MFSDP v2 reads gradient layouts from DTensors and never uses Gloo groups.
     process_groups_dict = ProcessGroupCollection.setup_process_groups_for_optimizer(
         pg_collection, model_chunks, use_gloo_process_groups and pg_collection is None

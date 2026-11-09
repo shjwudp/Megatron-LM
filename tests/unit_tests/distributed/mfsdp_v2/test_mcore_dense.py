@@ -694,3 +694,70 @@ def test_gradient_clipping_reaches_global_norm(
     torch.testing.assert_close(
         global_norm([p.grad.to_local() for p in parameters]), clip_grad, rtol=1e-3, atol=0
     )
+
+
+def test_muon_factory_forwards_effective_config(process_group_collection):
+    """Regression: the variadic FsdpMuon signature must not swallow MCore settings."""
+    from megatron.core.optimizer.fsdp_muon import MCoreFsdpMuon
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        ffn_hidden_size=32,
+        gated_linear_unit=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+    )
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads",
+        ),
+        module=TransformerBlock(config=config, spec=get_gpt_layer_local_spec()).to(
+            device="cuda", dtype=config.params_dtype
+        ),
+        pg_collection=process_group_collection,
+    )
+    optimizer_config = OptimizerConfig(
+        optimizer="muon",
+        lr=0.001,
+        weight_decay=0.1,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        clip_grad=0.0,
+        muon_momentum=0.91,
+        muon_nesterov=True,
+        muon_num_ns_steps=10,
+        muon_fp32_matmul_prec="high",
+        muon_extra_scale_factor=0.2,
+        muon_coefficient_type="r2s10",
+        muon_ns_eps=1e-15,
+        muon_split_qkv=False,
+        muon_split_head=True,
+        muon_split_fc1=True,
+        muon_split_eh=True,
+    )
+    optimizer = get_megatron_optimizer(optimizer_config, [model])
+    leaves = [wrapped.optimizer for wrapped in optimizer.chained_optimizers]
+    muon = next(leaf for leaf in leaves if isinstance(leaf, MCoreFsdpMuon))
+    assert muon.nesterov is True
+    assert muon.fp32_matmul_prec == "high"
+    assert muon.defaults["momentum"] == 0.91
+    kernel = muon.matrix_orthogonalizer
+    assert (kernel.num_ns_steps, kernel.coefficient_type, kernel.ns_eps) == (10, "r2s10", 1e-15)
+    assert kernel.extra_scale_factor == 0.2
+    kinds = {getattr(p, "muon_split_kind", None) for g in muon.param_groups for p in g["params"]}
+    assert {"qkv", "fc1"} <= kinds
+    hidden = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+    optimizer.zero_grad(set_to_none=True)
+    run_forward_backward_on_microbatches(
+        model, lambda: model(hidden_states=hidden, attention_mask=None).float().square().mean()
+    )
+    success, _, _ = optimizer.step()
+    assert success

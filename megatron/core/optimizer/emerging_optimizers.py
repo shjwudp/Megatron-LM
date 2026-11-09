@@ -25,6 +25,7 @@ from megatron.core.utils import (
     log_single_rank,
 )
 
+from .muon_matrix import MuonMatrixOrthogonalizer
 from .optimizer_config import ParamKey, ParamPredicate
 
 try:
@@ -65,7 +66,7 @@ def get_supported_coefficient_types() -> tuple[str, ...]:
     assert (
         HAVE_EMERGING_OPTIMIZERS
     ), "emerging_optimizers >= 0.2 is required for NSCoeffT. Please install or upgrade it."
-    return get_args(NSCoeffT)
+    return (*get_args(NSCoeffT), "r2s10")
 
 
 def validate_coefficient_type(coefficient_type: str) -> None:
@@ -276,7 +277,38 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        split_head: bool = False,
+        split_fc1: bool = False,
+        split_eh: bool = False,
+        ns_eps: float | None = None,
     ) -> None:
+        self.matrix_orthogonalizer = None
+        if split_head or split_fc1 or split_eh or ns_eps is not None or coefficient_type == "r2s10":
+            if pg_collection is not None and any(
+                group is not None and get_pg_size(group) > 1
+                for group in (
+                    pg_collection.tp,
+                    pg_collection.expt_tp,
+                    getattr(pg_collection, "gtp_remat", None),
+                )
+            ):
+                raise ValueError(
+                    "Muon head/FC1/EH splits, r2s10 and custom NS epsilon "
+                    "require TP=ETP=1 and no GTP remat"
+                )
+            self.matrix_orthogonalizer = MuonMatrixOrthogonalizer(
+                coefficient_type=coefficient_type,
+                num_ns_steps=num_ns_steps,
+                scale_mode=scale_mode,
+                extra_scale_factor=extra_scale_factor,
+                ns_eps=ns_eps,
+                split_qkv=split_qkv,
+                split_head=split_head,
+                split_fc1=split_fc1,
+                split_eh=split_eh,
+                qkv_split_shapes=tuple(qkv_split_shapes) if qkv_split_shapes else None,
+                use_syrk=use_syrk,
+            )
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
         if use_syrk and not is_emerging_optimizers_min_version(_SYRK_MIN_EO_VERSION):
@@ -614,6 +646,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         Returns:
             The orthogonalized gradient tensor.
         """
+        if self.matrix_orthogonalizer is not None:
+            if getattr(p, "is_gtp_weight_remat", False):
+                raise ValueError(
+                    "Muon matrix splits require complete parameters, without GTP remat"
+                )
+            return self.matrix_orthogonalizer(p, grad)
         # TODO(deyuf): switch to group
         if self.pg_collection:
             tp_group = (
@@ -697,6 +735,10 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
+        split_head: bool = False,
+        split_fc1: bool = False,
+        split_eh: bool = False,
+        ns_eps: float | None = None,
     ) -> None:
         TensorParallelMuon.__init__(
             self,
@@ -717,6 +759,10 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             pg_collection=pg_collection,
             tp_mode=tp_mode,
             use_syrk=use_syrk,
+            split_head=split_head,
+            split_fc1=split_fc1,
+            split_eh=split_eh,
+            ns_eps=ns_eps,
         )
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor
@@ -791,6 +837,17 @@ def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
     cls = _muon_config_to_cls(config)
     if cls is TensorParallelMuon:
         return kwargs
+    # The layer-sharded NS implementation does not use the shared matrix kernel.
+    if (
+        any(kwargs[k] for k in ("split_head", "split_fc1", "split_eh"))
+        or kwargs["ns_eps"] is not None
+        or kwargs["coefficient_type"] == "r2s10"
+    ):
+        raise ValueError(
+            "layer_sharded Muon does not support logical splits, r2s10 or custom NS epsilon"
+        )
+    for key in ("split_head", "split_fc1", "split_eh", "ns_eps"):
+        kwargs.pop(key)
     # LayerShardedMuon: its own muon-prefixed kwargs (ns_batch_size, concurrent_groups, ...).
     kwargs.update(_kwargs_from_config(cls, "muon", config))
     # 'layer_sharded' selected the class; it is not a TensorParallelMuon mode, so the
