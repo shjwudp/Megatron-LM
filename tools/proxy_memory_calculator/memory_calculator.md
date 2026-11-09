@@ -4,7 +4,20 @@ The calculator exposes exactly two independent proxy presets: `hfsdp16` (default
 `local` (EP2). The presets are calculation examples, not production model descriptions.
 There is no parent production preset, hidden CLI preset or production-sized golden test.
 
-Open memory_calculator.html with its sibling scripts, or run:
+Download or copy `memory_calculator.html` and open it directly. Presets, buffer
+accounting and estimation logic are embedded, so calculation and configuration
+import/export work offline without sibling JavaScript files. The linked Markdown
+guide is optional documentation, not a calculation dependency.
+
+The standalone JavaScript files remain the source for both the browser and Node.
+After editing either model, refresh the embedded copies and check their consistency:
+
+```bash
+node tools/proxy_memory_calculator/bundle_calculator.js
+node tools/proxy_memory_calculator/bundle_calculator.js --check
+```
+
+For command-line estimates and model regression checks, run:
 
 ```bash
 node tools/proxy_memory_calculator/memory_model.js hfsdp16

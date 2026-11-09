@@ -13,3 +13,10 @@ are preserved until the user requests automatic batch calculation.
 Verification: 19 Node regressions passed on the merged implementation. Historical
 snapshot values are identified as calibration; reconstructed-branch training and browser
 results are recorded in the [branch validation summary](proxy_validation.md).
+
+The downloadable HTML now embeds both JavaScript models. A single-file browser
+check with networking disabled verified both presets, editable budgets, ZeRO and
+recompute controls, and JSON import/export/download. Its preset estimates matched
+the Node model, and all 19 model regressions still passed. After editing a model,
+run `node tools/proxy_memory_calculator/bundle_calculator.js`; use `--check` to
+verify that the embedded copies match the source files.
