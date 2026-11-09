@@ -23,3 +23,5 @@ records and training launchers remain outside this source history.
 [Combined branch validation](proxy_validation.md) records the new eight-GPU checks.
 [Source release provenance](proxy_experiment_release.md) identifies the executed
 source archive and the separately distributed reproduction inputs.
+[Commit mapping](../../proxy_model_commits.md) lists the consolidated commits,
+their original source commits, and the validation recorded for each feature.
