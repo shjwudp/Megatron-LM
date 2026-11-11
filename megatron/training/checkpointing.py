@@ -2040,9 +2040,9 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
     """Preprocess every model chunk and its owned optimizer state in local module space.
 
     Handlers resolve parameters against live, chunk-local paths. Only after they run are
-    model and optimizer layer paths translated to global checkpoint names. Load requests
-    use the same translation; the caller restores the raw dictionaries after DCP fills
-    their shared tensor storage in place.
+    model and optimizer layer paths translated to global checkpoint names. All chunks
+    share the model namespace so PP/VPP changes do not change checkpoint keys. The caller
+    restores the raw dictionaries after DCP fills their shared tensor storage in place.
     """
     model_chunks = model if isinstance(model, (list, tuple)) else [model]
     state_dict = raw_state_dict.copy()
@@ -2052,11 +2052,12 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
         handlers.append(handle_swiglu_in_state_dict)
     handlers.extend((handle_mla_down_proj_in_state_dict, handle_mtp_in_state_dict))
 
+    global_model_state = {}
     for chunk_index, (chunk, layer_names) in enumerate(zip(model_chunks, layer_maps)):
         model_key = "model" if len(model_chunks) == 1 else f"model{chunk_index}"
         if model_key not in state_dict:
             continue
-        model_state_dict = state_dict[model_key].copy()
+        model_state_dict = state_dict.pop(model_key).copy()
         handle_fp8_extra_state_case(model_state_dict)
         for handler in handlers:
             model_state_dict, _ = handler(chunk, model_state_dict, None)
@@ -2064,10 +2065,13 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
             model_state_dict = handle_experts_in_state_dict(
                 model_state_dict, config.num_moe_experts
             )
-        state_dict[model_key] = {
-            _map_fsdp_dtensor_layer_name(name, layer_names): value
-            for name, value in model_state_dict.items()
-        }
+        global_model_state.update(
+            {
+                _map_fsdp_dtensor_layer_name(name, layer_names): value
+                for name, value in model_state_dict.items()
+            }
+        )
+    state_dict["model"] = global_model_state
 
     if "optimizer" in state_dict:
         owners = {}
@@ -2625,6 +2629,7 @@ def _load_base_checkpoint(
         if raw_optimizer_state_dict is not None:
             state_dict['optimizer'] = raw_optimizer_state_dict
 
+        state_dict.pop("model")
         state_dict.update(raw_model_state_dicts)
     else:
         raise NotImplementedError(f'checkpoint format {ckpt_format} not supported')

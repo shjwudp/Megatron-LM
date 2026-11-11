@@ -298,11 +298,15 @@ def test_fsdp_dtensor_preprocess_all_chunks(
     processed = checkpointing.preprocess_fsdp_dtensor_state_dict(config, raw_state, model)
 
     preprocess_metadata.assert_called_once_with(processed)
+    assert set(processed["model"]) == {
+        chunk.global_name + suffix for chunk in chunks for suffix in ("_w", "_v")
+    }
     for chunk_index, chunk in enumerate(chunks):
         model_key = "model" if num_chunks == 1 else f"model{chunk_index}"
-        assert set(processed[model_key]) == {chunk.global_name + "_w", chunk.global_name + "_v"}
+        if num_chunks > 1:
+            assert model_key not in processed
         assert set(raw_state[model_key]) == {chunk.local_name, "ignored._extra_state"}
-        assert bytes(processed[model_key][chunk.global_name + "_w"]) == bytes([chunk_index + 1] * 2)
+        assert bytes(processed["model"][chunk.global_name + "_w"]) == bytes([chunk_index + 1] * 2)
     if optimizer_layout == "none":
         assert "optimizer" not in processed
         return
@@ -333,10 +337,13 @@ def test_fsdp_dtensor_load_restores_all_raw_chunks(
     raw_state["_model"] = chunks
 
     def load_views(state_dict, **kwargs):
-        for chunk_index, chunk in enumerate(chunks):
-            model_state = state_dict[f"model{chunk_index}"]
-            assert set(model_state) == {chunk.global_name + "_w", chunk.global_name + "_v"}
-            for value in model_state.values():
+        model_state = state_dict["model"]
+        assert set(model_state) == {
+            chunk.global_name + suffix for chunk in chunks for suffix in ("_w", "_v")
+        }
+        for chunk in chunks:
+            for suffix in ("_w", "_v"):
+                value = model_state[chunk.global_name + suffix]
                 value[:] = bytes([77] * len(value))
         if optimizer_layout != "none":
             optimizer_state = state_dict["optimizer"]
@@ -425,8 +432,7 @@ def test_fsdp_dtensor_pipeline_stages_have_disjoint_model_names(fsdp_dtensor_che
         processed_stages.append(
             checkpointing.preprocess_fsdp_dtensor_state_dict(config, raw_state, chunks)
         )
-    for model_key in ("model0", "model1"):
-        assert set(processed_stages[0][model_key]).isdisjoint(processed_stages[1][model_key])
+    assert set(processed_stages[0]["model"]).isdisjoint(processed_stages[1]["model"])
 
 
 @pytest.mark.parametrize("first_layer_number", [1, 3, 11])
