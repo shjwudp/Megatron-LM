@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Run with one pytest coordinator on four GPUs, without an outer torchrun."""
 
+import json
 import os
 import subprocess
 import sys
@@ -116,6 +117,22 @@ def test_fsdp_checkpoint_resharding(tmp_path, source, target):
     assert (
         metadata_states[0] == metadata_states[1]
     ), "Optimizer steps and scheduler must survive resharding"
+    report = {
+        "source_pp_vpp": source,
+        "target_pp_vpp": target,
+        "iteration": 2,
+        "tensor_count": len(states[0]),
+        "tensor_elements": sum(value.numel() for value in states[0].values()),
+        "fp32_main_weight_count": len(weights),
+        "adam_tensor_counts": {
+            field: sum(field in name for name in states[0]) for field in ("exp_avg", "exp_avg_sq")
+        },
+        "tensor_max_abs_error": 0,
+        "metadata_exact": True,
+        "metadata_keys": metadata_keys,
+    }
+    report_path = tmp_path / "verification.json"
+    report_path.write_text(json.dumps(report, indent=2) + "\n")
 
     train("resumed", target, *resume_args)
     losses = [
@@ -133,3 +150,14 @@ def test_fsdp_checkpoint_resharding(tmp_path, source, target):
         rtol=1e-3,
         atol=1e-4,
     )
+    report["losses"] = {
+        step: {
+            "source": float(losses[0][step]),
+            "resumed": float(losses[1][step]),
+            "abs_error": float(abs(losses[1][step] - losses[0][step])),
+            "rel_error": float(abs(losses[1][step] - losses[0][step]) / abs(losses[0][step])),
+        }
+        for step in (3, 4)
+    }
+    report.update(loss_rtol=1e-3, loss_atol=1e-4, passed=True)
+    report_path.write_text(json.dumps(report, indent=2) + "\n")
