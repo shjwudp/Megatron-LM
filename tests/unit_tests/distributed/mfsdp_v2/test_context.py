@@ -92,7 +92,8 @@ def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
-def test_recorded_execution_order(distributed_setup):
+@pytest.mark.parametrize("caller_managed_grad_sync", [False, True])
+def test_recorded_execution_order(distributed_setup, caller_managed_grad_sync):
     """Recorded orders follow execution when submodules are registered in reverse."""
 
     class Model(nn.Module):
@@ -109,7 +110,11 @@ def test_recorded_execution_order(distributed_setup):
     model = Model().to(device)
     unsharded_weights = {layer: layer.weight for layer in model.children()}
     with fully_shard_context(
-        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
+        FsdpContext(
+            device=device,
+            prefetch_order=PrefetchOrder.RECORDED,
+            runtime_policy=RuntimePolicy(caller_managed_grad_sync=caller_managed_grad_sync),
+        )
     ) as context:
         for layer in model.children():
             fully_shard(layer, mesh, _default_placements())
@@ -117,11 +122,21 @@ def test_recorded_execution_order(distributed_setup):
 
     inputs = torch.ones(2, 4, device=device)
     assert context.is_recording_execution_order
-    model(inputs).sum().backward()
+    microbatches = 2 if caller_managed_grad_sync else 1
+    outputs = [model(inputs).sum() for _ in range(microbatches)]
+    for output in reversed(outputs):
+        output.backward()
+        assert context.is_recording_execution_order == caller_managed_grad_sync
+    if caller_managed_grad_sync:
+        context.finish_grad_sync()
     assert not context.is_recording_execution_order
     assert list(context.execution_order) == [
-        ExecutionEvent(module, Phase.FORWARD) for module in [model, model.first, model.second]
-    ] + [ExecutionEvent(module, Phase.BACKWARD) for module in [model, model.second, model.first]]
+        ExecutionEvent(module, Phase.FORWARD)
+        for module in [model, model.first, model.second] * microbatches
+    ] + [
+        ExecutionEvent(module, Phase.BACKWARD)
+        for module in [model, model.second, model.first] * microbatches
+    ]
 
     def check_prefetched(layer, _args):
         storage_bytes = unsharded_weights[layer].untyped_storage().nbytes()
@@ -132,7 +147,11 @@ def test_recorded_execution_order(distributed_setup):
         layer.register_forward_pre_hook(check_prefetched, prepend=True)
         layer.register_full_backward_pre_hook(check_prefetched, prepend=True)
     model.zero_grad(set_to_none=True)
-    model(inputs).sum().backward()
+    outputs = [model(inputs).sum() for _ in range(microbatches)]
+    for output in reversed(outputs):
+        output.backward()
+    if caller_managed_grad_sync:
+        context.finish_grad_sync()
 
 
 def test_registration_order_rejects_reordered_execution(distributed_setup):

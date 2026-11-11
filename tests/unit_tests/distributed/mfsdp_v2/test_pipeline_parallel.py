@@ -106,3 +106,17 @@ class TestMfsdpV2PipelineSharedContext:
         # The helper left no ambient context behind: the chunks joined its scope and
         # that scope, which owned the only finalize call, has since exited.
         assert current_fully_shard_context() is None
+
+        # Warmup repeats a chunk's forward before the schedule starts backward.
+        inputs = torch.ones(2, 16, device=device, dtype=torch.bfloat16)
+        for _ in range(2):
+            for chunk in wrapped_chunks:
+                chunk.zero_grad(set_to_none=True)
+            outputs = [chunk(inputs).sum() for chunk in wrapped_chunks for _ in range(2)]
+            for output in reversed(outputs):
+                output.backward()
+            first_context.finish_grad_sync()
+            for chunk in wrapped_chunks:
+                for parameter in chunk.parameters():
+                    gradient = parameter.grad.to_local()
+                    torch.testing.assert_close(gradient, torch.full_like(gradient, 4))

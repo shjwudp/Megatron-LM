@@ -58,6 +58,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    PrefetchOrder,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -2543,11 +2544,17 @@ def wrap_model_chunks_with_ddp(
     construction_context = (
         fully_shard_context(
             FsdpContext(
+                # Pipeline warmup repeats chunk forwards before the first backward.
+                prefetch_order=(
+                    PrefetchOrder.RECORDED
+                    if config.pipeline_model_parallel_size > 1 or len(model_chunks) > 1
+                    else PrefetchOrder.REGISTRATION
+                ),
                 runtime_policy=RuntimePolicy(
                     use_symmetric_memory=ddp_config.nccl_ub,
                     caller_managed_grad_sync=True,
                     overlap_outer_communication=ddp_config.overlap_outer_communication,
-                )
+                ),
             )
         )
         if is_mfsdp_v2

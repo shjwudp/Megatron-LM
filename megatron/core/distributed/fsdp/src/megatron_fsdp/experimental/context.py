@@ -77,8 +77,9 @@ class FsdpContext:
                 ignored. Tensors are packed by owner without changing logical parameter order.
             prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
                 registration order. ``RECORDED`` gathers parameters on demand and records
-                module calls until the first ``post_backward()``. Subsequent passes must
-                repeat the complete sequence consistently across data-parallel ranks.
+                module calls until the first ``post_backward()``, or ``finish_grad_sync()``
+                with caller-managed gradient synchronization. Subsequent passes must repeat
+                the complete sequence consistently across data-parallel ranks.
                 Recording currently requires the ordinary module hooks; combined 1F1B
                 bypasses them. Discard the context if the recorded pass raises.
         """
@@ -221,11 +222,13 @@ class FsdpContext:
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
+        self._recording_execution_order = False
 
     def post_backward(self) -> None:
         """Finish backward cleanup and synchronize gradients when finalization is enabled."""
         self._run_delayed_post_backward_callbacks()
-        self._recording_execution_order = False
+        if not self.caller_managed_grad_sync:
+            self._recording_execution_order = False
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
