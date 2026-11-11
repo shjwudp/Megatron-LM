@@ -24,6 +24,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard i
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
+from megatron.training.models.dist_utils import _ddp_wrap
 from megatron.training.training import wrap_model_chunks_with_ddp
 from tests.unit_tests.test_utilities import Utils
 
@@ -33,6 +34,7 @@ class _VirtualPipelineChunk(nn.Module):
 
     def __init__(self, dim: int = 16) -> None:
         super().__init__()
+        self.config = _compute_config()
         self.fc = nn.Linear(dim, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -68,7 +70,10 @@ class TestMfsdpV2PipelineSharedContext:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 CUDA devices.")
-    def test_shared_context_across_virtual_pipeline_chunks(self, distributed_setup):
+    @pytest.mark.parametrize("use_model_builder", [False, True])
+    def test_shared_context_across_virtual_pipeline_chunks(
+        self, distributed_setup, use_model_builder
+    ):
         """Multiple virtual-pipeline chunks wrapped in one call share one FsdpContext."""
         device = distributed_setup.device
 
@@ -78,14 +83,24 @@ class TestMfsdpV2PipelineSharedContext:
         # chunk count.
         chunks = [_VirtualPipelineChunk().to(device=device, dtype=torch.bfloat16) for _ in range(2)]
 
-        wrapped_chunks = wrap_model_chunks_with_ddp(
-            chunks,
-            _compute_config(),
-            _mfsdp_v2_ddp_config(),
-            DP=FullyShardedDataParallel,
-            pg_collection=self.pg_collection,
-            disable_bucketing_per_chunk=[False] * len(chunks),
-        )
+        if use_model_builder:
+            wrapped_chunks = _ddp_wrap(
+                chunks,
+                False,
+                _mfsdp_v2_ddp_config(),
+                False,
+                use_megatron_fsdp=True,
+                pg_collection=self.pg_collection,
+            )
+        else:
+            wrapped_chunks = wrap_model_chunks_with_ddp(
+                chunks,
+                _compute_config(),
+                _mfsdp_v2_ddp_config(),
+                DP=FullyShardedDataParallel,
+                pg_collection=self.pg_collection,
+                disable_bucketing_per_chunk=[False] * len(chunks),
+            )
 
         # Every chunk is an MFSDP v2 wrapper whose root is an FsdpModule.
         assert len(wrapped_chunks) == len(chunks)

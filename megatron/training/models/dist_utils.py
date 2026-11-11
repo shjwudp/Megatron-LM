@@ -40,6 +40,7 @@ except ImportError:
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    PrefetchOrder,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -312,7 +313,6 @@ def _ddp_wrap(
     else:
         DP = DistributedDataParallel
 
-
     if not use_torch_fsdp2:
         num_parameters = sum(p.nelement() for chunk in model for p in chunk.parameters())
         ddp_config.resolve_bucket_size(
@@ -338,7 +338,8 @@ def _ddp_wrap(
         # DistOpt-style buffer.
         tag_params_for_buffer_routing(model)
 
-    cuda_graph_impl = get_model_config(model[0]).cuda_graph_impl
+    config = get_model_config(model[0])
+    cuda_graph_impl = config.cuda_graph_impl
     current_stream = torch.cuda.current_stream()
     if cuda_graph_impl == "full_iteration":
         # DDP initialization must use the full-iteration capture stream so its retained
@@ -378,11 +379,17 @@ def _ddp_wrap(
         construction_context = (
             fully_shard_context(
                 FsdpContext(
+                    # Pipeline warmup repeats chunk forwards before the first backward.
+                    prefetch_order=(
+                        PrefetchOrder.RECORDED
+                        if config.pipeline_model_parallel_size > 1 or len(model) > 1
+                        else PrefetchOrder.REGISTRATION
+                    ),
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub,
                         caller_managed_grad_sync=True,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
-                    )
+                    ),
                 )
             )
             if is_mfsdp_v2
