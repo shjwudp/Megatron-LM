@@ -93,8 +93,11 @@ def test_fsdp_checkpoint_resharding(tmp_path, source, target):
         for path in (saved, restored)
     ]
     assert states[0].keys() == states[1].keys()
-    for field in ("exp_avg", "exp_avg_sq", "fp32_param"):
+    for field in ("exp_avg", "exp_avg_sq"):
         assert any(field in name for name in states[0]), f"Missing optimizer coverage: {field}"
+    # V2 exposes FP32 main weights directly in the model state dict.
+    weights = {name: value for name, value in states[0].items() if name.startswith("model")}
+    assert weights and all(value.dtype == torch.float32 for value in weights.values())
     for name in states[0]:
         torch.testing.assert_close(states[0][name], states[1][name], rtol=0, atol=0, msg=name)
     for path in (saved, restored):
