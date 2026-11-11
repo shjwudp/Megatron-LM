@@ -100,10 +100,22 @@ def test_fsdp_checkpoint_resharding(tmp_path, source, target):
     assert weights and all(value.dtype == torch.float32 for value in weights.values())
     for name in states[0]:
         torch.testing.assert_close(states[0][name], states[1][name], rtol=0, atol=0, msg=name)
+    metadata_keys = dcp.FileSystemReader(saved).read_metadata().state_dict_metadata
+    metadata_keys = [
+        name
+        for name, value in metadata_keys.items()
+        if name == "iteration"
+        or (name.startswith(("optimizer.", "opt_param_scheduler.")) and not hasattr(value, "size"))
+    ]
+    metadata_states = []
     for path in (saved, restored):
-        metadata = {"iteration": None}
+        metadata = dict.fromkeys(metadata_keys)
         dcp.load(metadata, checkpoint_id=path, no_dist=True)
         assert metadata["iteration"] == 2
+        metadata_states.append(metadata)
+    assert (
+        metadata_states[0] == metadata_states[1]
+    ), "Optimizer steps and scheduler must survive resharding"
 
     train("resumed", target, *resume_args)
     losses = [
