@@ -125,7 +125,8 @@ def test_fsdp_checkpoint_resharding(tmp_path, source, target):
         "tensor_elements": sum(value.numel() for value in states[0].values()),
         "fp32_main_weight_count": len(weights),
         "adam_tensor_counts": {
-            field: sum(field in name for name in states[0]) for field in ("exp_avg", "exp_avg_sq")
+            field: sum(field in name.split(".") for name in states[0])
+            for field in ("exp_avg", "exp_avg_sq")
         },
         "tensor_max_abs_error": 0,
         "metadata_exact": True,
