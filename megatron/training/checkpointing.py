@@ -2038,17 +2038,17 @@ def _translate_fsdp_dtensor_fqn(name, layer_names):
 def handle_pp_in_state_dict(model, model_state_dict, optimizer_state_dict):
     """Translate a chunk's model and optimizer layer FQNs to global checkpoint names."""
     layer_names = _get_fsdp_dtensor_layer_fqn_map(model)
-    model_state_dict = {
-        _translate_fsdp_dtensor_fqn(name, layer_names): value
-        for name, value in model_state_dict.items()
-    }
+
+    def translate_keys(state_dict):
+        return {
+            _translate_fsdp_dtensor_fqn(name, layer_names): value
+            for name, value in state_dict.items()
+        }
+
     if optimizer_state_dict is not None:
         optimizer_state_dict = optimizer_state_dict.copy()
-        optimizer_state_dict["state"] = {
-            _translate_fsdp_dtensor_fqn(name, layer_names): value
-            for name, value in optimizer_state_dict["state"].items()
-        }
-    return model_state_dict, optimizer_state_dict
+        optimizer_state_dict["state"] = translate_keys(optimizer_state_dict["state"])
+    return translate_keys(model_state_dict), optimizer_state_dict
 
 
 def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
@@ -2067,31 +2067,22 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
     """
     model_chunks = model if isinstance(model, (list, tuple)) else [model]
     state_dict = raw_state_dict.copy()
-    handlers = []
-    if config.gated_linear_unit and config.activation_func is torch.nn.functional.silu:
-        handlers.append(handle_swiglu_in_state_dict)
-    handlers.extend(
-        (handle_mla_down_proj_in_state_dict, handle_mtp_in_state_dict, handle_pp_in_state_dict)
-    )
-
-    global_model_state = {}
-    for chunk_index, chunk in enumerate(model_chunks):
+    model_states = {}
+    for chunk_index in range(len(model_chunks)):
         model_key = "model" if len(model_chunks) == 1 else f"model{chunk_index}"
-        if model_key not in state_dict:
-            continue
-        model_state_dict = state_dict.pop(model_key).copy()
-        handle_fp8_extra_state_case(model_state_dict)
-        for handler in handlers:
-            model_state_dict, _ = handler(chunk, model_state_dict, None)
-        if config.num_moe_experts:
-            model_state_dict = handle_experts_in_state_dict(
-                model_state_dict, config.num_moe_experts
-            )
-        global_model_state.update(model_state_dict)
-    state_dict["model"] = global_model_state
+        if model_key in state_dict:
+            model_states[chunk_index] = state_dict.pop(model_key).copy()
+            handle_fp8_extra_state_case(model_states[chunk_index])
 
+    optimizer_partitions = []
     if "optimizer" in state_dict:
-        layer_maps = [_get_fsdp_dtensor_layer_fqn_map(chunk) for chunk in model_chunks]
+        local_layer_names = [
+            {
+                global_name: name
+                for name, global_name in _get_fsdp_dtensor_layer_fqn_map(chunk).items()
+            }
+            for chunk in model_chunks
+        ]
         owners = {}
         for chunk_index, chunk in enumerate(model_chunks):
             global_parameters, _ = handle_pp_in_state_dict(
@@ -2107,13 +2098,12 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
                     raise ValueError(f"Non-unique Megatron-FSDP optimizer parameter name: {name}")
                 owners.setdefault(name, (chunk_index, parameter))
 
-        def preprocess_optimizer(optimizer_state_dict):
-            """Preserve chained optimizer structure and param-group metadata."""
+        def partition_optimizer(optimizer_state_dict):
             if "state" not in optimizer_state_dict:
                 return {
-                    key: preprocess_optimizer(value) for key, value in optimizer_state_dict.items()
+                    key: partition_optimizer(value) for key, value in optimizer_state_dict.items()
                 }
-            partitioned_state = [{} for _ in model_chunks]
+            partitions = [{**optimizer_state_dict, "state": {}} for _ in model_chunks]
             for name, value in optimizer_state_dict["state"].items():
                 canonical_name = _strip_wrapper_prefixes(name)
                 if canonical_name not in owners:
@@ -2121,25 +2111,44 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
                         f"Megatron-FSDP optimizer parameter has no model owner: {name}"
                     )
                 chunk_index = owners[canonical_name][0]
-                partitioned_state[chunk_index][name] = value
-
+                local_name = _translate_fsdp_dtensor_fqn(name, local_layer_names[chunk_index])
+                partitions[chunk_index]["state"][local_name] = value
             result = optimizer_state_dict.copy()
-            result["state"] = {}
-            for chunk, layer_names, partition in zip(model_chunks, layer_maps, partitioned_state):
-                if not partition:
-                    continue
-                local_names = {global_name: name for name, global_name in layer_names.items()}
-                local_optimizer = optimizer_state_dict.copy()
-                local_optimizer["state"] = {
-                    _translate_fsdp_dtensor_fqn(name, local_names): value
-                    for name, value in partition.items()
-                }
-                for handler in handlers:
-                    _, local_optimizer = handler(chunk, {}, local_optimizer)
-                result["state"].update(local_optimizer["state"])
+            optimizer_partitions.append((result, partitions))
             return result
 
-        state_dict["optimizer"] = preprocess_optimizer(state_dict["optimizer"])
+        state_dict["optimizer"] = partition_optimizer(state_dict["optimizer"])
+
+    def apply(handler):
+        """Run a state dict handler over the model and, when present, the optimizer state."""
+        for chunk_index, model_state in model_states.items():
+            model_states[chunk_index], _ = handler(model_chunks[chunk_index], model_state, None)
+        for _, partitions in optimizer_partitions:
+            for chunk_index, (chunk, partition) in enumerate(zip(model_chunks, partitions)):
+                if partition["state"]:
+                    _, partitions[chunk_index] = handler(chunk, {}, partition)
+
+    if config.gated_linear_unit and config.activation_func is torch.nn.functional.silu:
+        apply(handle_swiglu_in_state_dict)
+    # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
+    # layout used on disk. No-op for unfused models.
+    apply(handle_mla_down_proj_in_state_dict)
+    if config.num_moe_experts:
+        for chunk_index, model_state in model_states.items():
+            model_states[chunk_index] = handle_experts_in_state_dict(
+                model_state, config.num_moe_experts
+            )
+    # MTP renaming follows handlers that look up the original module paths.
+    apply(handle_mtp_in_state_dict)
+    apply(handle_pp_in_state_dict)
+
+    state_dict["model"] = {
+        name: value for model_state in model_states.values() for name, value in model_state.items()
+    }
+    for result, partitions in optimizer_partitions:
+        result["state"] = {
+            name: value for partition in partitions for name, value in partition["state"].items()
+        }
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict
