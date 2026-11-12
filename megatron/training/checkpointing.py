@@ -2013,8 +2013,8 @@ def _localize_redundant_extra_states(state_dict):
     dict_list_map_inplace(_maybe_localize, state_dict)
 
 
-def _fsdp_dtensor_layer_name_map(model):
-    """Map chunk-local transformer layer paths to globally numbered checkpoint paths."""
+def _fsdp_dtensor_chunk_layer_to_global_fqn_map(model):
+    """Map PP/VPP chunk-local layer FQNs to global checkpoint layer FQNs."""
     layer_names = {}
     for name, module in model.named_modules():
         name = _strip_wrapper_prefixes(name)
@@ -2045,7 +2045,7 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
     """
     model_chunks = model if isinstance(model, (list, tuple)) else [model]
     state_dict = raw_state_dict.copy()
-    layer_maps = [_fsdp_dtensor_layer_name_map(chunk) for chunk in model_chunks]
+    layer_maps = [_fsdp_dtensor_chunk_layer_to_global_fqn_map(chunk) for chunk in model_chunks]
     handlers = []
     if config.gated_linear_unit and config.activation_func is torch.nn.functional.silu:
         handlers.append(handle_swiglu_in_state_dict)

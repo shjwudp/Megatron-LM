@@ -445,7 +445,7 @@ def test_fsdp_dtensor_layer_name_mapping_is_reversible(first_layer_number):
     chunk.named_modules.return_value = [
         (f"module.decoder.layers.{layer_index}", layer) for layer_index, layer in enumerate(layers)
     ]
-    layer_names = checkpointing._fsdp_dtensor_layer_name_map(chunk)
+    layer_names = checkpointing._fsdp_dtensor_chunk_layer_to_global_fqn_map(chunk)
     inverse_names = {global_name: name for name, global_name in layer_names.items()}
     if first_layer_number == 1:
         assert not layer_names
