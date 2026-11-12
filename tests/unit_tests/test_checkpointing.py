@@ -451,13 +451,13 @@ def test_fsdp_dtensor_layer_name_mapping_is_reversible(first_layer_number):
         assert not layer_names
     for layer_index in range(2):
         local_name = f"module.decoder.layers.{layer_index}.mlp.linear_fc1.weight_w"
-        global_name = checkpointing._map_fsdp_dtensor_layer_name(local_name, layer_names)
+        global_name = checkpointing._translate_fsdp_dtensor_fqn(local_name, layer_names)
         assert global_name == (
             f"module.decoder.layers.{first_layer_number + layer_index - 1}.mlp.linear_fc1.weight_w"
         )
-        assert checkpointing._map_fsdp_dtensor_layer_name(global_name, inverse_names) == local_name
+        assert checkpointing._translate_fsdp_dtensor_fqn(global_name, inverse_names) == local_name
     adjacent_name = "module.decoder.layers.100.mlp.linear_fc1.weight"
-    assert checkpointing._map_fsdp_dtensor_layer_name(adjacent_name, layer_names) == adjacent_name
+    assert checkpointing._translate_fsdp_dtensor_fqn(adjacent_name, layer_names) == adjacent_name
 
 
 class MockModel(MegatronModule):

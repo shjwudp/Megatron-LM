@@ -2025,8 +2025,8 @@ def _get_fsdp_dtensor_layer_fqn_map(model):
     return layer_names
 
 
-def _map_fsdp_dtensor_layer_name(name, layer_names):
-    """Translate a layer prefix without changing wrapper prefixes or parameter suffixes."""
+def _translate_fsdp_dtensor_fqn(name, layer_names):
+    """Translate local/global FQNs using the layer map, preserving wrappers and parameter suffixes."""
     local_name = _strip_wrapper_prefixes(name)
     wrapper = name[: len(name) - len(local_name)]
     for source, destination in sorted(layer_names.items(), key=lambda item: -len(item[0])):
@@ -2066,7 +2066,7 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
             )
         global_model_state.update(
             {
-                _map_fsdp_dtensor_layer_name(name, layer_names): value
+                _translate_fsdp_dtensor_fqn(name, layer_names): value
                 for name, value in model_state_dict.items()
             }
         )
@@ -2076,7 +2076,7 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
         owners = {}
         for chunk_index, (chunk, layer_names) in enumerate(zip(model_chunks, layer_maps)):
             global_parameters = {
-                _map_fsdp_dtensor_layer_name(name, layer_names): parameter
+                _translate_fsdp_dtensor_fqn(name, layer_names): parameter
                 for name, parameter in chunk.named_parameters()
             }
             if config.num_moe_experts:
@@ -2113,14 +2113,14 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
                 local_names = {global_name: name for name, global_name in layer_names.items()}
                 local_optimizer = optimizer_state_dict.copy()
                 local_optimizer["state"] = {
-                    _map_fsdp_dtensor_layer_name(name, local_names): value
+                    _translate_fsdp_dtensor_fqn(name, local_names): value
                     for name, value in partition.items()
                 }
                 for handler in handlers:
                     _, local_optimizer = handler(chunk, {}, local_optimizer)
                 result["state"].update(
                     {
-                        _map_fsdp_dtensor_layer_name(name, layer_names): value
+                        _translate_fsdp_dtensor_fqn(name, layer_names): value
                         for name, value in local_optimizer["state"].items()
                     }
                 )
