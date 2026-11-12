@@ -2076,7 +2076,7 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
     1. Merge PP/VPP model chunks under ``model`` using global layer FQNs.
     2. Apply FP8, SwiGLU, MLA, expert-name and MTP checkpoint transforms using
        global parameter/module lookups. Optimizer names stay global throughout.
-    3. Preserve chained optimizer structure and parameter-group metadata.
+    3. Preserve optimizer parameter-group metadata.
     4. Attach DCP chunk metadata for uneven DTensor shards.
 
     Tensor views share their original storage. The caller performs I/O and
@@ -2096,27 +2096,19 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
     model = _get_fsdp_dtensor_checkpoint_model(config, model_chunks)
     handle_fp8_extra_state_case(state_dict['model'])
 
-    def map_optimizer(state, transform):
-        if "state" in state:
-            return transform(state)
-        return {key: map_optimizer(value, transform) for key, value in state.items()}
-
-    def validate_parameters(state):
-        for name in state["state"]:
+    if 'optimizer' in state_dict:
+        for name in state_dict['optimizer']['state']:
             if _strip_wrapper_prefixes(name) not in model.parameters_by_fqn:
                 raise ValueError(f"Megatron-FSDP optimizer parameter has no model owner: {name}")
-        return state
-
-    if 'optimizer' in state_dict:
-        map_optimizer(state_dict['optimizer'], validate_parameters)
 
     def apply(handler):
         """Run a state dict handler over the model and, when present, the optimizer state."""
-        state_dict['model'], _ = handler(model, state_dict['model'], None)
+        model_state_dict, optimizer_state_dict = handler(
+            model, state_dict['model'], state_dict.get('optimizer')
+        )
+        state_dict['model'] = model_state_dict
         if 'optimizer' in state_dict:
-            state_dict['optimizer'] = map_optimizer(
-                state_dict['optimizer'], lambda state: handler(model, {}, state)[1]
-            )
+            state_dict['optimizer'] = optimizer_state_dict
 
     if config.gated_linear_unit and config.activation_func is torch.nn.functional.silu:
         apply(handle_swiglu_in_state_dict)

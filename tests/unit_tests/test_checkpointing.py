@@ -277,18 +277,13 @@ def fsdp_dtensor_checkpoint_case(monkeypatch):
             optimizer_state["param_to_group_meta"][global_name] = {"lr": 0.01}
         if optimizer_layout == "single":
             state_dict["optimizer"] = optimizer_state
-        elif optimizer_layout == "chained":
-            state_dict["optimizer"] = {
-                0: optimizer_state,
-                1: {"state": {}, "param_to_group_meta": {}},
-            }
         return config, chunks, state_dict, preprocess_metadata
 
     return make_case
 
 
 @pytest.mark.parametrize("num_chunks", [1, 2])
-@pytest.mark.parametrize("optimizer_layout", ["none", "single", "chained"])
+@pytest.mark.parametrize("optimizer_layout", ["none", "single"])
 @pytest.mark.parametrize("experts", [False, True])
 def test_fsdp_dtensor_preprocess_all_chunks(
     fsdp_dtensor_checkpoint_case, num_chunks, optimizer_layout, experts
@@ -319,10 +314,6 @@ def test_fsdp_dtensor_preprocess_all_chunks(
 
     processed_optimizer = processed["optimizer"]
     raw_optimizer = raw_state["optimizer"]
-    if optimizer_layout == "chained":
-        assert processed_optimizer[1] == raw_optimizer[1]
-        processed_optimizer = processed_optimizer[0]
-        raw_optimizer = raw_optimizer[0]
     assert processed_optimizer["param_to_group_meta"] is raw_optimizer["param_to_group_meta"]
     assert set(processed_optimizer["state"]) == {
         "module." + chunk.global_name + suffix for chunk in chunks for suffix in ("_w", "_v")
@@ -335,7 +326,7 @@ def test_fsdp_dtensor_preprocess_all_chunks(
         )
 
 
-@pytest.mark.parametrize("optimizer_layout", ["none", "single", "chained"])
+@pytest.mark.parametrize("optimizer_layout", ["none", "single"])
 @pytest.mark.parametrize("gpt_compat", [False, True])
 def test_fsdp_dtensor_load_restores_all_raw_chunks(
     fsdp_dtensor_checkpoint_case, run_config, monkeypatch, optimizer_layout, gpt_compat
@@ -358,8 +349,6 @@ def test_fsdp_dtensor_load_restores_all_raw_chunks(
                 value[:] = bytes([77] * len(value))
         if optimizer_layout != "none":
             optimizer_state = state_dict["optimizer"]
-            if optimizer_layout == "chained":
-                optimizer_state = optimizer_state[0]
             for state in optimizer_state["state"].values():
                 state["exp_avg"][:] = bytes([88] * len(state["exp_avg"]))
 
@@ -405,8 +394,6 @@ def test_fsdp_dtensor_load_restores_all_raw_chunks(
         assert model_state[chunk.local_name] == bytearray([77] * 4)
     if optimizer_layout != "none":
         optimizer_state = loaded["optimizer"]
-        if optimizer_layout == "chained":
-            optimizer_state = optimizer_state[0]
         assert set(optimizer_state["state"]) == {"module." + chunk.global_name for chunk in chunks}
         for state in optimizer_state["state"].values():
             assert state["exp_avg"] == bytearray([88] * 4)
