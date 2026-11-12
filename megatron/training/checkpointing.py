@@ -2035,6 +2035,22 @@ def _translate_fsdp_dtensor_fqn(name, layer_names):
     return name
 
 
+def handle_pp_in_state_dict(model, model_state_dict, optimizer_state_dict):
+    """Translate a chunk's model and optimizer layer FQNs to global checkpoint names."""
+    layer_names = _get_fsdp_dtensor_layer_fqn_map(model)
+    model_state_dict = {
+        _translate_fsdp_dtensor_fqn(name, layer_names): value
+        for name, value in model_state_dict.items()
+    }
+    if optimizer_state_dict is not None:
+        optimizer_state_dict = optimizer_state_dict.copy()
+        optimizer_state_dict["state"] = {
+            _translate_fsdp_dtensor_fqn(name, layer_names): value
+            for name, value in optimizer_state_dict["state"].items()
+        }
+    return model_state_dict, optimizer_state_dict
+
+
 def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
     """Prepare model and optimizer state for ``fsdp_dtensor`` checkpoint save/load.
 
@@ -2051,14 +2067,15 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
     """
     model_chunks = model if isinstance(model, (list, tuple)) else [model]
     state_dict = raw_state_dict.copy()
-    layer_maps = [_get_fsdp_dtensor_layer_fqn_map(chunk) for chunk in model_chunks]
     handlers = []
     if config.gated_linear_unit and config.activation_func is torch.nn.functional.silu:
         handlers.append(handle_swiglu_in_state_dict)
-    handlers.extend((handle_mla_down_proj_in_state_dict, handle_mtp_in_state_dict))
+    handlers.extend(
+        (handle_mla_down_proj_in_state_dict, handle_mtp_in_state_dict, handle_pp_in_state_dict)
+    )
 
     global_model_state = {}
-    for chunk_index, (chunk, layer_names) in enumerate(zip(model_chunks, layer_maps)):
+    for chunk_index, chunk in enumerate(model_chunks):
         model_key = "model" if len(model_chunks) == 1 else f"model{chunk_index}"
         if model_key not in state_dict:
             continue
@@ -2070,21 +2087,16 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
             model_state_dict = handle_experts_in_state_dict(
                 model_state_dict, config.num_moe_experts
             )
-        global_model_state.update(
-            {
-                _translate_fsdp_dtensor_fqn(name, layer_names): value
-                for name, value in model_state_dict.items()
-            }
-        )
+        global_model_state.update(model_state_dict)
     state_dict["model"] = global_model_state
 
     if "optimizer" in state_dict:
+        layer_maps = [_get_fsdp_dtensor_layer_fqn_map(chunk) for chunk in model_chunks]
         owners = {}
-        for chunk_index, (chunk, layer_names) in enumerate(zip(model_chunks, layer_maps)):
-            global_parameters = {
-                _translate_fsdp_dtensor_fqn(name, layer_names): parameter
-                for name, parameter in chunk.named_parameters()
-            }
+        for chunk_index, chunk in enumerate(model_chunks):
+            global_parameters, _ = handle_pp_in_state_dict(
+                chunk, dict(chunk.named_parameters()), None
+            )
             if config.num_moe_experts:
                 global_parameters = handle_experts_in_state_dict(
                     global_parameters, config.num_moe_experts
@@ -2124,12 +2136,7 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
                 }
                 for handler in handlers:
                     _, local_optimizer = handler(chunk, {}, local_optimizer)
-                result["state"].update(
-                    {
-                        _translate_fsdp_dtensor_fqn(name, layer_names): value
-                        for name, value in local_optimizer["state"].items()
-                    }
-                )
+                result["state"].update(local_optimizer["state"])
             return result
 
         state_dict["optimizer"] = preprocess_optimizer(state_dict["optimizer"])

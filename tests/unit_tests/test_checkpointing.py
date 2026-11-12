@@ -308,6 +308,10 @@ def test_fsdp_dtensor_preprocess_all_chunks(
             assert model_key not in processed
         assert set(raw_state[model_key]) == {chunk.local_name, "ignored._extra_state"}
         assert bytes(processed["model"][chunk.global_name + "_w"]) == bytes([chunk_index + 1] * 2)
+        assert (
+            processed["model"][chunk.global_name + "_w"].obj
+            is raw_state[model_key][chunk.local_name]
+        )
     if optimizer_layout == "none":
         assert "optimizer" not in processed
         return
@@ -323,6 +327,11 @@ def test_fsdp_dtensor_preprocess_all_chunks(
         "module." + chunk.global_name + suffix for chunk in chunks for suffix in ("_w", "_v")
     }
     assert set(raw_optimizer["state"]) == {"module." + chunk.global_name for chunk in chunks}
+    for chunk in chunks:
+        assert (
+            processed_optimizer["state"]["module." + chunk.global_name + "_w"]["exp_avg"].obj
+            is raw_optimizer["state"]["module." + chunk.global_name]["exp_avg"]
+        )
 
 
 @pytest.mark.parametrize("optimizer_layout", ["none", "single", "chained"])
