@@ -194,11 +194,12 @@ def test_fsdp_dtensor_preserves_checkpoint_adapter(ckpt_format, version, preserv
 
 @pytest.fixture
 def fsdp_dtensor_checkpoint_case(monkeypatch):
-    def split_handler(chunk, model_state, optimizer_state):
+    parameters = set()
+
+    def split_handler(model, model_state, optimizer_state):
         split_model = {}
         for name, value in model_state.items():
-            assert name == chunk.local_name
-            assert chunk.get_parameter(name) is chunk.parameter
+            assert model.get_parameter("module." + name) in parameters
             split_model[name + "_w"] = memoryview(value)[:2]
             split_model[name + "_v"] = memoryview(value)[2:]
         if optimizer_state is None:
@@ -207,10 +208,10 @@ def fsdp_dtensor_checkpoint_case(monkeypatch):
         split_optimizer["state"] = {}
         for name, value in optimizer_state["state"].items():
             local_name = name.removeprefix("module.")
-            if chunk.experts:
+            if model.config.num_moe_experts:
                 local_name = local_name.replace("weight2", "weight0")
-            assert local_name == chunk.local_name
-            assert chunk.get_parameter(local_name) is chunk.parameter
+            assert model.get_parameter(name) in parameters
+            assert model.get_parameter(local_name) is model.get_parameter(name)
             for suffix, section in (("_w", slice(0, 2)), ("_v", slice(2, 4))):
                 split_optimizer["state"][name + suffix] = {
                     "exp_avg": memoryview(value["exp_avg"])[section]
@@ -245,11 +246,12 @@ def fsdp_dtensor_checkpoint_case(monkeypatch):
         )
         state_dict = {"iteration": 17}
         chunks = []
+        parameters.clear()
         optimizer_state = {"state": {}, "param_to_group_meta": {}}
         for chunk_index in range(num_chunks):
             chunk = mock.Mock()
             chunk.parameter = object()
-            chunk.experts = experts
+            parameters.add(chunk.parameter)
             mlp = "mlp.experts.linear_fc1.weight0" if experts else "mlp.linear_fc1.weight"
             chunk.local_name = f"decoder.layers.0.{mlp}"
             chunk.global_name = chunk.local_name.replace(
@@ -257,7 +259,6 @@ def fsdp_dtensor_checkpoint_case(monkeypatch):
             )
             if experts:
                 chunk.global_name = chunk.global_name.replace("weight0", "weight2")
-            chunk.get_parameter.side_effect = {chunk.local_name: chunk.parameter}.__getitem__
             layer = mock.Mock(spec=fsdp_dtensor_checkpoint.TransformerLayer)
             layer.layer_number = 3 + 4 * chunk_index
             layer.parameters.return_value = [chunk.parameter]
@@ -451,6 +452,7 @@ def test_fsdp_dtensor_layer_name_mapping_is_reversible(first_layer_number):
     layers = [mock.Mock(spec=fsdp_dtensor_checkpoint.TransformerLayer) for _ in range(2)]
     for layer_index, layer in enumerate(layers):
         layer.layer_number = first_layer_number + layer_index
+        layer.config = SimpleNamespace(gated_linear_unit=bool(layer_index))
     chunk.named_modules.return_value = [
         (f"module.decoder.layers.{layer_index}", layer) for layer_index, layer in enumerate(layers)
     ]
@@ -467,6 +469,26 @@ def test_fsdp_dtensor_layer_name_mapping_is_reversible(first_layer_number):
         assert checkpointing._translate_fsdp_dtensor_fqn(global_name, inverse_names) == local_name
     adjacent_name = "module.decoder.layers.100.mlp.linear_fc1.weight"
     assert checkpointing._translate_fsdp_dtensor_fqn(adjacent_name, layer_names) == adjacent_name
+
+    parameters = [object(), object()]
+    chunk.named_parameters.return_value = [
+        (f"module.decoder.layers.{index}.mlp.linear_fc1.weight", parameter)
+        for index, parameter in enumerate(parameters)
+    ]
+    model = checkpointing._get_fsdp_dtensor_checkpoint_model(
+        SimpleNamespace(num_moe_experts=None), [chunk]
+    )
+    for index, parameter in enumerate(parameters):
+        layer_name = f"decoder.layers.{first_layer_number + index - 1}"
+        parameter_name = f"{layer_name}.mlp.linear_fc1.weight"
+        assert model.get_parameter(parameter_name) is parameter
+        assert model.get_parameter("module." + parameter_name) is parameter
+        assert dict(model.named_modules())[layer_name] is layers[index]
+
+    # The global GELU layer must not fall back to SwiGLU splitting.
+    gelu_state = {f"decoder.layers.{first_layer_number - 1}.mlp.linear_fc1.weight": object()}
+    processed, _ = fsdp_dtensor_checkpoint.handle_swiglu_in_state_dict(model, gelu_state, None)
+    assert processed == gelu_state
 
 
 class MockModel(MegatronModule):
