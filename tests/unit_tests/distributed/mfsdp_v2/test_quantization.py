@@ -18,6 +18,7 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    RuntimePolicy,
     SchedulePolicy,
     fully_shard,
     fully_shard_context,
@@ -130,21 +131,29 @@ requires_mxfp8 = pytest.mark.skipif(
 )
 
 
-def _unsharded_mxfp8_weight(module):
-    """Return the unsharded buffer of the module's single MXFP8 parameter group."""
-    groups = [g for g in module.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)]
-    assert len(groups) == 1, f"Expected one MXFP8 parameter group, got {len(groups)}."
-    return groups[0]._unsharded_model_weight
+def _unsharded_mxfp8_weights(module):
+    """Return every quantized group's unsharded buffer without allowing an empty check."""
+    weights = [
+        group._unsharded_model_weight
+        for group in module.parameter_groups
+        if isinstance(group.model_weight, QuantizedDBuffer)
+    ]
+    assert weights, "Expected at least one MXFP8 parameter group."
+    return weights
 
 
 def _is_rowwise_allocated(module):
-    """Return whether the module's unsharded MXFP8 rowwise planes are allocated."""
-    return _unsharded_mxfp8_weight(module).is_rowwise_allocated
+    """Check every group's rowwise allocation, including when checking for release."""
+    states = {weight.is_rowwise_allocated for weight in _unsharded_mxfp8_weights(module)}
+    assert len(states) == 1, "MXFP8 groups have inconsistent rowwise allocation states."
+    return states.pop()
 
 
 def _is_columnwise_allocated(module):
-    """Return whether the module's unsharded MXFP8 columnwise planes are allocated."""
-    return _unsharded_mxfp8_weight(module).is_columnwise_allocated
+    """Check every group's columnwise allocation, including when checking for release."""
+    states = {weight.is_columnwise_allocated for weight in _unsharded_mxfp8_weights(module)}
+    assert len(states) == 1, "MXFP8 groups have inconsistent columnwise allocation states."
+    return states.pop()
 
 
 def _check_recompute_matches_no_recompute(distributed_setup, recipe, build, use_reentrant):
@@ -185,6 +194,8 @@ def _check_mxfp8_mlp_matches_reference(
     placements,
     num_microbatches,
     shard_layout: ShardLayout = ShardLayout.PADDED,
+    *,
+    use_symmetric_memory: bool = False,
 ):
     """Train an MXFP8 MLP with MFSDP and check its losses track an unsharded reference."""
     device = distributed_setup.device
@@ -194,20 +205,32 @@ def _check_mxfp8_mlp_matches_reference(
         model = _make_mlp(device)
         torch.manual_seed(2026)
         reference = _make_mlp(device)
-    with fully_shard_context(FsdpContext(device=device)) as context:
+    with fully_shard_context(
+        FsdpContext(
+            device=device, runtime_policy=RuntimePolicy(use_symmetric_memory=use_symmetric_memory)
+        )
+    ) as context:
         fully_shard(model, mesh=mesh, placements=placements, shard_layout=shard_layout)
 
-    # MLP weights share one quantized group; biases use a regular DBuffer.
-    [weight_group] = [
+    # Different weight row widths use separate quantized groups to bound padding;
+    # biases still share a regular DBuffer.
+    weight_groups = [
         g for g in model.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)
     ]
-    assert len(weight_group.fsdp_parameters) == 2
-    assert weight_group.main_weight.placements == tuple(
-        BlockAtomic(32) if isinstance(placement, Shard) else placement
-        for placement in placements.optimizer
+    assert len(weight_groups) == 2
+    assert sum(len(group.fsdp_parameters) for group in weight_groups) == 2
+    if use_symmetric_memory:
+        assert all(group.model_weight.is_symmetric_memory for group in weight_groups)
+    assert all(
+        group.main_weight.placements
+        == tuple(
+            BlockAtomic(32) if isinstance(placement, Shard) else placement
+            for placement in placements.optimizer
+        )
+        for group in weight_groups
     )
-    [bias_group] = [g for g in model.parameter_groups if g is not weight_group]
-    assert isinstance(bias_group.model_weight, DBuffer)
+    [bias_group] = [g for g in model.parameter_groups if isinstance(g.model_weight, DBuffer)]
+    assert len(bias_group.fsdp_parameters) == 2
 
     optimizer = FusedAdam(model.parameters(), lr=0.01)
     fully_shard_optimizer(optimizer)
@@ -296,6 +319,21 @@ def test_mxfp8_mlp_training_on_2d_mesh_matches_reference(
         distributed_setup.device.type, (2, world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
     )
     _check_mxfp8_mlp_matches_reference(distributed_setup, mesh, placements, num_microbatches)
+
+
+@pytest.mark.launch_on_gb200
+@requires_mxfp8
+@pytest.mark.parametrize("placements", _MXFP8_PLACEMENTS[:2] + _MXFP8_2D_PLACEMENTS)
+def test_mxfp8_symmetric_memory_training_matches_reference(distributed_setup, placements):
+    """Symmetric buffers perform real MXFP8 gathers and gradient reductions on padded layouts."""
+    world_size = distributed_setup.world_size
+    if world_size < 4 or world_size % 2:
+        pytest.skip("Symmetric-memory hybrid coverage requires an even number of at least 4 ranks.")
+    shape = (world_size,) if len(placements.dp_axes) == 1 else (2, world_size // 2)
+    mesh = init_device_mesh(distributed_setup.device.type, shape)
+    _check_mxfp8_mlp_matches_reference(
+        distributed_setup, mesh, placements, num_microbatches=3, use_symmetric_memory=True
+    )
 
 
 @pytest.mark.launch_on_gb200
