@@ -1062,9 +1062,6 @@ def get_global_unique_param_name(model_chunks, param):
     """
     Get the global unique parameter name for a given model and parameter.
 
-    PP/VPP chunks reuse local layer indices. Once the parameter is found, keep its
-    owning chunk for the global layer-number lookup below.
-
     Args:
         model_chunks: List of model chunks to search for the parameter.
         param: The parameter to find the name for.
@@ -1080,6 +1077,9 @@ def get_global_unique_param_name(model_chunks, param):
                 param_name = name
                 break
         if param_name is not None:
+            # Otherwise `model` moves to the last VPP chunk. The lookup below would
+            # miss parameters from earlier chunks and leave e.g. `layers.0` in the
+            # checkpoint name instead of the global `layers.4`.
             break
     if param_name is None:
         raise ValueError("Parameter not found in model chunks")
