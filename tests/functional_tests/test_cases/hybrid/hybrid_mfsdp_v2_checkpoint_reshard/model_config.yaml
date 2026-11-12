@@ -1,4 +1,4 @@
-# A small dense HybridModel; only PP/VPP and the resulting DP sharding change.
+# A dense GELU HybridModel; only PP/VPP and the resulting DP sharding change.
 MODEL_ARGS:
   --hidden-size: 128
   --ffn-hidden-size: 256
@@ -8,7 +8,6 @@ MODEL_ARGS:
   --spec: [megatron.core.models.hybrid.hybrid_layer_specs, hybrid_stack_spec]
   --position-embedding-type: rope
   --normalization: RMSNorm
-  --swiglu: true
   --disable-bias-linear: true
   --untie-embeddings-and-output-weights: true
   --transformer-impl: transformer_engine

@@ -13,7 +13,10 @@ import torch.distributed.checkpoint
 import yaml
 
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallel,
+    FullyShardedDataParallelV2,
+)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.num_microbatches_calculator import (
@@ -24,6 +27,7 @@ from megatron.core.parallel_state import get_data_parallel_world_size
 from megatron.core.rerun_state_machine import RerunMode, RerunState, RerunStateMachine
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule, WideResidualConfig, fsdp_dtensor_checkpoint
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training import checkpointing
@@ -174,9 +178,6 @@ def test_fsdp_global_param_name_uses_owning_model_chunk(owning_chunk):
     [("fsdp_dtensor", 2, True), ("fsdp_dtensor", 1, False), ("torch_dist", 2, False)],
 )
 def test_fsdp_dtensor_preserves_checkpoint_adapter(ckpt_format, version, preserve_adapter):
-    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
-    from megatron.core.transformer.module import Float16Module
-
     inner = torch.nn.Linear(2, 2)
     adapter = FullyShardedDataParallelV2.__new__(FullyShardedDataParallelV2)
     torch.nn.Module.__init__(adapter)

@@ -87,6 +87,8 @@ from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_succe
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
 
 try:
+    from megatron.core.distributed import DistributedDataParallel, TorchFullyShardedDataParallel
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
         preprocess_state_dict_for_uneven_dtensor,
     )
@@ -100,6 +102,7 @@ try:
         print_diff_in_state_dicts,
         validate_fsdp_dtensor_model_load,
     )
+    from megatron.core.transformer.module import Float16Module
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
     HAVE_MEGATRON_FSDP = True
@@ -751,10 +754,6 @@ def _unwrap_checkpoint_model(model, ckpt_format, ddp_config):
     """Keep MFSDP v2 checkpoint adapters while removing outer training wrappers."""
     if ckpt_format != "fsdp_dtensor" or ddp_config is None or ddp_config.megatron_fsdp_version != 2:
         return unwrap_model(model)
-
-    from megatron.core.distributed import DistributedDataParallel, TorchFullyShardedDataParallel
-    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
-    from megatron.core.transformer.module import Float16Module
 
     return unwrap_model(
         model,
