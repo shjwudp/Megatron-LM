@@ -2036,11 +2036,18 @@ def _translate_fsdp_dtensor_fqn(name, layer_names):
 
 
 def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
-    """Translate PP/VPP chunk-local names to global FQNs for checkpoint save/load.
+    """Prepare model and optimizer state for ``fsdp_dtensor`` checkpoint save/load.
 
-    Merge model chunks under ``model`` and translate their optimizer state names.
-    On load, DCP writes into shared tensor storage before the caller restores the
-    original chunk dictionaries.
+    1. Remove FP8 extra state and apply each chunk's SwiGLU, MLA, MTP and
+       expert-name checkpoint transforms.
+    2. Translate PP/VPP chunk-local layer names to global FQNs and merge all
+       local model chunks under ``model``.
+    3. Transform optimizer state with its owning chunk, preserving chained
+       optimizer structure and parameter-group metadata.
+    4. Attach DCP chunk metadata for uneven DTensor shards.
+
+    Returned tensor views share storage with the original state dict. The caller
+    performs I/O and restores the original chunk dictionaries after loading.
     """
     model_chunks = model if isinstance(model, (list, tuple)) else [model]
     state_dict = raw_state_dict.copy()
