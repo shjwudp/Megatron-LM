@@ -2035,7 +2035,7 @@ def _translate_fsdp_dtensor_fqn(name, layer_names):
     return name
 
 
-def handle_pp_in_state_dict(model, model_state_dict, optimizer_state_dict):
+def translate_chunk_layer_fqns_to_global(model, model_state_dict, optimizer_state_dict):
     """Translate chunk-local model FQNs; optimizer checkpoint FQNs are already global."""
     layer_names = _get_fsdp_dtensor_layer_fqn_map(model)
     return {
@@ -2088,7 +2088,9 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
     for chunk_index, chunk in enumerate(model_chunks):
         model_key = "model" if len(model_chunks) == 1 else f"model{chunk_index}"
         if model_key in state_dict:
-            chunk_state, _ = handle_pp_in_state_dict(chunk, state_dict.pop(model_key), None)
+            chunk_state, _ = translate_chunk_layer_fqns_to_global(
+                chunk, state_dict.pop(model_key), None
+            )
             model_state_dict.update(chunk_state)
     state_dict['model'] = model_state_dict
     model = _get_fsdp_dtensor_checkpoint_model(config, model_chunks)
