@@ -645,7 +645,7 @@ selected events in this source:
 ```python
 from megatron_fsdp.experimental.execution_order import ExecutionAction
 
-entries = context.prefetch_order_view
+unshards = context.prefetch_order_view
 weights = context.execution_order.view(
     actions=(ExecutionAction.UNSHARD, ExecutionAction.RESHARD)
 )
@@ -662,12 +662,13 @@ gradients = context.execution_order.view(
 A view's `position` counts only its selected events. `peek().event_id` gives the
 ID in the full source. Moving one view leaves other cursors unchanged. Views
 created before recording see later appends without copying event records.
-Prefetch uses the `MODULE_ENTRY` view, so its F/B positions stay unchanged when
-other actions appear in the source.
+Prefetch uses the `UNSHARD` view. An unshard event marks a request for full
+weights in its F/B phase; weights already prepared by prefetch can be reused
+without another all-gather. Other actions do not advance the prefetch cursor.
 
-With `PrefetchOrder.RECORDED`, the first eager execution window records module
-entries. `finish_grad_sync()` stops recording through the context's recording
-flag. Registration mode builds a static module-entry order. The other lifecycle
+With `PrefetchOrder.RECORDED`, the first eager execution window records F/B
+unshard requests. `finish_grad_sync()` stops recording through the context's
+recording flag. Registration mode builds a static F/B unshard order. Other lifecycle
 actions define the shared schema.
 Recording those actions and applying retain/window policies need separate
 changes. Future policies should store omit/reuse decisions in plans keyed by

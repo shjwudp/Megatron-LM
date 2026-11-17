@@ -317,11 +317,15 @@ class FsdpModule:
             match phase:
                 case Phase.FORWARD:
                     self._prefetch_parameter_groups(
-                        context.prefetch_order_view, self._schedule_policy.forward_prefetch_size
+                        context.prefetch_order_view,
+                        self._schedule_policy.forward_prefetch_size,
+                        phase=phase,
                     )
                 case Phase.BACKWARD:
                     self._prefetch_parameter_groups(
-                        context.prefetch_order_view, self._schedule_policy.backward_prefetch_size
+                        context.prefetch_order_view,
+                        self._schedule_policy.backward_prefetch_size,
+                        phase=phase,
                     )
                 case _:
                     raise ValueError(
@@ -329,10 +333,10 @@ class FsdpModule:
                     )
 
     def _prefetch_parameter_groups(
-        self, order: ExecutionOrderView, prefetch_size: int | None
+        self, order: ExecutionOrderView, prefetch_size: int | None, *, phase: Phase
     ) -> None:
-        """Consume one module entry while ignoring other actions in the shared source."""
-        event = ExecutionEvent(cast(nn.Module, self), self.phase)
+        """Consume one unshard request while ignoring other actions in the shared source."""
+        event = ExecutionEvent(cast(nn.Module, self), phase)
         if order.peek() != event and not order.seek(event):
             raise RuntimeError(
                 "FSDP module calls diverged from the expected execution order "

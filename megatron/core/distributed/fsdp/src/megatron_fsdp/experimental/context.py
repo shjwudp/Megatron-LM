@@ -46,7 +46,7 @@ class FsdpContext:
     is_last_microbatch: bool
     use_symmetric_memory: bool
     caller_managed_grad_sync: bool
-    # Prefetch reads only module-entry events from the shared source.
+    # Prefetch reads only unshard requests from the shared source.
     execution_order: ExecutionOrder
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
@@ -143,14 +143,14 @@ class FsdpContext:
 
     @property
     def prefetch_order_view(self) -> ExecutionOrderView:
-        """Module-entry sequence and cursor used by prefetch.
+        """Unshard requests and cursor used by prefetch.
 
         Other actions in the shared source do not advance this view's cursor.
         Replacing ``execution_order`` creates a fresh view and cursor.
         """
         view = self._prefetch_order_view
         if view is None or view.source is not self.execution_order:
-            view = self.execution_order.view(actions=(ExecutionAction.MODULE_ENTRY,))
+            view = self.execution_order.view(actions=(ExecutionAction.UNSHARD,))
             self._prefetch_order_view = view
         return view
 

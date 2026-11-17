@@ -26,13 +26,14 @@ from .phase import Phase
 
 
 class ExecutionAction(enum.Enum):
-    """Module entries and weight/gradient lifecycle boundaries.
+    """Weight requests and weight/gradient lifecycle boundaries.
+
+    UNSHARD records a weight request, including reuse of already gathered weights.
 
     These describe the unoptimized schedule. A future plan may omit a boundary,
     but must keep that decision separate from the recorded event source.
     """
 
-    MODULE_ENTRY = enum.auto()
     UNSHARD = enum.auto()
     RESHARD = enum.auto()
     GRAD_ALLOC = enum.auto()
@@ -54,7 +55,7 @@ class ExecutionEvent:
 
     module: nn.Module
     phase: Phase | None
-    action: ExecutionAction = ExecutionAction.MODULE_ENTRY
+    action: ExecutionAction = ExecutionAction.UNSHARD
     group_index: int | None = None
     buffer_bytes: int | None = field(default=None, compare=False)
     allocated_bytes: int | None = field(default=None, compare=False)

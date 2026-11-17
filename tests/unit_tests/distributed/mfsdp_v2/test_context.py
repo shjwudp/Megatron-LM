@@ -96,17 +96,17 @@ def _default_placements() -> Placements:
 
 
 def test_prefetch_order_view_filters_actions_and_rebuilds():
-    """Prefetch uses module entries and rebuilds its view when the source is replaced."""
+    """Prefetch uses unshard requests and rebuilds its view when the source is replaced."""
     context = object.__new__(FsdpContext)
     context.execution_order = ExecutionOrder()
     context._prefetch_order_view = None
     current, following = nn.Identity(), nn.Identity()
-    current.phase = Phase.FORWARD
+    current.phase = Phase.BACKWARD
     following._unshard_parameter_groups = Mock()
     order = context.execution_order
     view = context.prefetch_order_view
     other_view = order.view(actions=ExecutionAction)
-    order.append(ExecutionEvent(current, Phase.FORWARD, ExecutionAction.UNSHARD))
+    order.append(ExecutionEvent(current, Phase.FORWARD, ExecutionAction.GRAD_ALLOC))
     current_id = order.append(ExecutionEvent(current, Phase.FORWARD))
     order.append(ExecutionEvent(current, Phase.FORWARD, ExecutionAction.RESHARD))
     following_id = order.append(ExecutionEvent(following, Phase.BACKWARD))
@@ -115,7 +115,7 @@ def test_prefetch_order_view_filters_actions_and_rebuilds():
 
     assert context.prefetch_order_view is view
     assert view.event_ids == (current_id, following_id)
-    FsdpModule._prefetch_parameter_groups(current, view, None)
+    FsdpModule._prefetch_parameter_groups(current, view, None, phase=Phase.FORWARD)
     following._unshard_parameter_groups.assert_called_once_with(Phase.BACKWARD)
     assert view.position == 1 and other_view.position == 2
 

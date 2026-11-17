@@ -28,7 +28,7 @@ def test_cursor_wraps_across_phases():
         ExecutionEvent(first, Phase.BACKWARD),
     ]
     order = ExecutionOrder(events)
-    view = order.view(actions=[ExecutionAction.MODULE_ENTRY])
+    view = order.view(actions=[ExecutionAction.UNSHARD])
     for _ in range(2):
         for index, event in enumerate(events):
             assert view.peek() == event
@@ -41,7 +41,7 @@ def test_cursor_wraps_across_phases():
 def test_empty_order_can_be_populated():
     """Recording does not move the cursor, so replay starts at the first event."""
     order = ExecutionOrder()
-    view = order.view(actions=[ExecutionAction.MODULE_ENTRY])
+    view = order.view(actions=[ExecutionAction.UNSHARD])
     assert view.peek() is None
     with pytest.raises(RuntimeError, match="empty"):
         view.advance()
@@ -65,7 +65,7 @@ def test_order_does_not_keep_modules_alive():
     gc.collect()
     assert second_ref() is None
     assert list(order) == [ExecutionEvent(first, Phase.FORWARD)]
-    assert list(order.view(actions=[ExecutionAction.MODULE_ENTRY]).successors()) == []
+    assert list(order.view(actions=[ExecutionAction.UNSHARD]).successors()) == []
 
 
 def test_global_ids_are_append_positions_including_repeated_events():
@@ -82,7 +82,7 @@ def test_global_ids_are_append_positions_including_repeated_events():
     assert [order.seek(index).event_id for index in (2, 0, 1)] == [2, 0, 1]
     assert order.seek(-1) is None
     assert order.seek(3) is None
-    assert order.view(actions=[ExecutionAction.MODULE_ENTRY]).event_ids == (0, 2)
+    assert order.view(actions=[ExecutionAction.UNSHARD]).event_ids == (0, 2)
 
 
 def test_views_filter_actions_without_sharing_cursors():
@@ -97,8 +97,8 @@ def test_views_filter_actions_without_sharing_cursors():
             ExecutionEvent(first, Phase.BACKWARD),
         ]
     )
-    prefetch = order.view(actions=[ExecutionAction.MODULE_ENTRY])
-    other_prefetch = order.view(actions=[ExecutionAction.MODULE_ENTRY])
+    prefetch = order.view(actions=[ExecutionAction.UNSHARD])
+    other_prefetch = order.view(actions=[ExecutionAction.UNSHARD])
     gradients = order.view(actions=[ExecutionAction.GRAD_COPY_IN, ExecutionAction.GRAD_REDUCE])
     assert prefetch.source is other_prefetch.source is gradients.source is order
     assert prefetch.event_ids == (0, 2, 4)
@@ -118,7 +118,7 @@ def test_empty_view_tracks_later_appends_without_consuming_them():
     """A view created before recording sees newly appended matching occurrences."""
     module = nn.Module()
     order = ExecutionOrder()
-    view = order.view(actions=[ExecutionAction.MODULE_ENTRY])
+    view = order.view(actions=[ExecutionAction.UNSHARD])
     assert view.event_ids == () and view.peek() is None
     with pytest.raises(RuntimeError, match="empty"):
         view.advance()
@@ -159,13 +159,13 @@ def test_filtered_seek_preserves_occurrences_and_wraps_once():
     order = ExecutionOrder(
         [
             ExecutionEvent(first, Phase.FORWARD),
-            ExecutionEvent(first, Phase.FORWARD, ExecutionAction.UNSHARD),
+            ExecutionEvent(first, Phase.FORWARD, ExecutionAction.GRAD_ALLOC),
             ExecutionEvent(second, Phase.FORWARD),
             ExecutionEvent(first, Phase.FORWARD),
             ExecutionEvent(first, Phase.BACKWARD),
         ]
     )
-    view = order.view(actions=[ExecutionAction.MODULE_ENTRY])
+    view = order.view(actions=[ExecutionAction.UNSHARD])
     target = ExecutionEvent(first, Phase.FORWARD)
     assert view.seek(target) and view.position == 0
     view.advance()
@@ -216,7 +216,7 @@ def test_filtered_peek_and_successors_do_not_wrap():
             ExecutionEvent(module, Phase.BACKWARD),
         ]
     )
-    view = order.view(actions=[ExecutionAction.MODULE_ENTRY])
+    view = order.view(actions=[ExecutionAction.UNSHARD])
     assert view.peek(-1) is None and view.peek(2) is None
     assert [event.event_id for event in view.successors()] == [2]
     view.advance()
@@ -232,7 +232,7 @@ def test_dead_middle_event_keeps_ids_and_stops_prefetch_lookahead():
     order = ExecutionOrder(
         [ExecutionEvent(module, Phase.FORWARD) for module in (first, middle, last)]
     )
-    view = order.view(actions=[ExecutionAction.MODULE_ENTRY])
+    view = order.view(actions=[ExecutionAction.UNSHARD])
     middle_ref = ref(middle)
     del middle
     gc.collect()
