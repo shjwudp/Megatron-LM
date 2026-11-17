@@ -143,17 +143,18 @@ class ExecutionOrder:
 class ExecutionOrderView:
     """An action-filtered index into one source, with its own local cursor.
 
-    Views include matching events appended after their creation. Cursor positions
-    count only selected events; returned events keep their IDs from the source.
-    Only IDs are cached, so neither source nor view keeps modules alive.
+    Views select events present at creation. Cursor positions count only selected
+    events; returned events keep their IDs from the source. Only IDs are stored,
+    so neither source nor view keeps modules alive.
     """
 
     def __init__(self, source: ExecutionOrder, *, actions: Iterable[ExecutionAction]) -> None:
         """Create a view of ``source`` with its own cursor."""
         self._source = source
-        self._actions = frozenset(actions)
-        self._event_ids: list[int] = []
-        self._scanned = 0
+        actions = frozenset(actions)
+        self._event_ids = tuple(
+            event_id for event_id, item in enumerate(source._items) if item.action in actions
+        )
         self._position = 0
 
     @property
@@ -163,25 +164,16 @@ class ExecutionOrderView:
 
     @property
     def event_ids(self) -> tuple[int, ...]:
-        """Selected IDs from the source, including events with expired modules."""
-        self._refresh()
-        return tuple(self._event_ids)
+        """Selected IDs at creation, including events with expired modules."""
+        return self._event_ids
 
     @property
     def position(self) -> int:
         """Local index of the next event to consume, distinct from its event ID."""
         return self._position
 
-    def _refresh(self) -> None:
-        size = len(self._source)
-        for event_id in range(self._scanned, size):
-            if self._source._items[event_id].action in self._actions:
-                self._event_ids.append(event_id)
-        self._scanned = size
-
     def __len__(self) -> int:
         """Number of selected events, including those with expired modules."""
-        self._refresh()
         return len(self._event_ids)
 
     def __iter__(self) -> Iterator[ExecutionEvent]:

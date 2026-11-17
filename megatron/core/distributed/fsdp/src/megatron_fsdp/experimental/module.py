@@ -31,7 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import ExecutionEvent, ExecutionOrderView
+from .execution_order import ExecutionAction, ExecutionEvent, ExecutionOrderView
 from .module_utils import get_parameter_owner, is_in_backward
 from .parameter_group import (
     FsdpParameter,
@@ -281,11 +281,11 @@ class FsdpModule:
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
-        if context.is_recording_execution_order and not is_recomputing:
-            context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
         self.unshard(
             Phase.FORWARD, prefetch=not is_recomputing and not context.is_recording_execution_order
         )
+        if not is_recomputing:
+            self._record_execution_event(ExecutionAction.UNSHARD)
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
@@ -317,15 +317,11 @@ class FsdpModule:
             match phase:
                 case Phase.FORWARD:
                     self._prefetch_parameter_groups(
-                        context.prefetch_order_view,
-                        self._schedule_policy.forward_prefetch_size,
-                        phase=phase,
+                        context.prefetch_order_view, self._schedule_policy.forward_prefetch_size
                     )
                 case Phase.BACKWARD:
                     self._prefetch_parameter_groups(
-                        context.prefetch_order_view,
-                        self._schedule_policy.backward_prefetch_size,
-                        phase=phase,
+                        context.prefetch_order_view, self._schedule_policy.backward_prefetch_size
                     )
                 case _:
                     raise ValueError(
@@ -333,10 +329,10 @@ class FsdpModule:
                     )
 
     def _prefetch_parameter_groups(
-        self, order: ExecutionOrderView, prefetch_size: int | None, *, phase: Phase
+        self, order: ExecutionOrderView, prefetch_size: int | None
     ) -> None:
         """Consume one unshard request while ignoring other actions in the shared source."""
-        event = ExecutionEvent(cast(nn.Module, self), phase)
+        event = ExecutionEvent(cast(nn.Module, self), self.phase)
         if order.peek() != event and not order.seek(event):
             raise RuntimeError(
                 "FSDP module calls diverged from the expected execution order "
@@ -383,6 +379,7 @@ class FsdpModule:
         """Reshard this FsdpModule's parameter groups."""
         with self._nvtx_range("reshard"):
             self._reshard_parameter_groups()
+            self._record_execution_event(ExecutionAction.RESHARD)
 
     def _reshard_parameter_groups(self) -> None:
         """Reshard parameter groups and release unsharded storage after compute."""
@@ -431,8 +428,6 @@ class FsdpModule:
         self.phase = Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
-        if context.is_recording_execution_order:
-            context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.BACKWARD))
         current_stream = context.current_stream()
         if self.is_root():
             context.register_post_backward_hook()
@@ -450,6 +445,7 @@ class FsdpModule:
             # _reduce_gradient_groups.
 
         self.unshard(Phase.BACKWARD, prefetch=not context.is_recording_execution_order)
+        self._record_execution_event(ExecutionAction.UNSHARD)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
@@ -471,19 +467,43 @@ class FsdpModule:
             inner_reduction_stream = context.inner_reduction_stream
             current_stream = context.current_stream()
 
-            for group in self._parameter_groups:
+            for group_index, group in enumerate(self._parameter_groups):
                 if not group.requires_grad:
                     continue
 
                 with torch.cuda.stream(inner_reduction_stream):
                     partial_grad = group.allocate_partial_grad_buffer()
+                    buffer_bytes = (
+                        partial_grad.local_buffer.nbytes
+                        if context.is_recording_execution_order
+                        else None
+                    )
+                    self._record_execution_event(
+                        ExecutionAction.GRAD_ALLOC,
+                        group_index=group_index,
+                        buffer_bytes=buffer_bytes,
+                    )
 
                 current_stream.wait_stream(inner_reduction_stream)
                 group.copy_gradients_to_partial_buffer(partial_grad)
+                self._record_execution_event(
+                    ExecutionAction.GRAD_COPY_IN, group_index=group_index, buffer_bytes=buffer_bytes
+                )
 
                 inner_reduction_stream.wait_stream(current_stream)
                 with torch.cuda.stream(inner_reduction_stream):
                     group.reduce_inner_gradients(partial_grad)
+                    self._record_execution_event(
+                        ExecutionAction.GRAD_REDUCE,
+                        group_index=group_index,
+                        buffer_bytes=buffer_bytes,
+                    )
+                    del partial_grad
+                    self._record_execution_event(
+                        ExecutionAction.GRAD_RELEASE,
+                        group_index=group_index,
+                        buffer_bytes=buffer_bytes,
+                    )
 
                 if not context.is_last_microbatch:
                     continue
@@ -496,6 +516,27 @@ class FsdpModule:
                     context.outer_reduction_stream.wait_stream(inner_reduction_stream)
                 with torch.cuda.stream(context.outer_reduction_stream):
                     group.reduce_outer_gradients()
+
+    def _record_execution_event(
+        self,
+        action: ExecutionAction,
+        *,
+        group_index: int | None = None,
+        buffer_bytes: int | None = None,
+    ) -> None:
+        """Sample a completed host operation only during the eager recording pass."""
+        context = self.context
+        if context.is_recording_execution_order:
+            context.execution_order.append(
+                ExecutionEvent(
+                    cast(nn.Module, self),
+                    self.phase,
+                    action,
+                    group_index,
+                    buffer_bytes,
+                    torch.cuda.memory_allocated(context.allgather_stream.device),
+                )
+            )
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:

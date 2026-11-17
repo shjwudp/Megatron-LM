@@ -661,20 +661,29 @@ gradients = context.execution_order.view(
 
 A view's `position` counts only its selected events. `peek().event_id` gives the
 ID in the full source. Moving one view leaves other cursors unchanged. Views
-created before recording see later appends without copying event records.
+snapshot the matching IDs at creation; create them after recording finishes.
+Later appends require a new view, without copying event records.
 Prefetch uses the `UNSHARD` view. An unshard event marks a request for full
 weights in its F/B phase; weights already prepared by prefetch can be reused
 without another all-gather. Other actions do not advance the prefetch cursor.
 
 With `PrefetchOrder.RECORDED`, the first eager execution window records F/B
-unshard requests. `finish_grad_sync()` stops recording through the context's
-recording flag. Registration mode builds a static F/B unshard order. Other lifecycle
-actions define the shared schema.
-Recording those actions and applying retain/window policies need separate
-changes. Future policies should store omit/reuse decisions in plans keyed by
-event ID and leave the recorded sequence unchanged.
+unshard requests, reshards, and each trainable parameter group's gradient-buffer
+allocation, copy-in, inner reduction and release. `finish_grad_sync()` ends
+recording and invalidates any earlier prefetch snapshot. Subsequent passes reuse
+the complete unshard-request view without appending events or sampling memory.
+Registration mode builds a static F/B unshard order without lifecycle observations.
+Recording requires the ordinary FSDP hooks; combined 1F1B bypasses them.
 
-Events can include `buffer_bytes` and rank-local `allocated_bytes`. These byte
-counts are optional and must be supplied by the caller; the container does not
-measure memory. Missing values stay `None`. These observations do not affect
-event matching. Host event order does not imply CUDA completion across streams.
+`GRAD_RELEASE` marks relinquishing the temporary reduce-scatter input after its
+inner reduction; the reduced gradient shard remains available. DP-outer reduction
+uses the persistent accumulator and is finalized separately. Retain/window policies
+are outside this change; their decisions should use event IDs without editing
+the recorded source.
+
+Recorded operations sample rank-local `allocated_bytes` after they are submitted.
+Gradient events also include the input buffer's `buffer_bytes`, including padding.
+The event container itself does not measure memory; manually appended observations
+remain optional, with missing values represented by `None`. These observations do
+not affect event matching. Host event order does not imply CUDA completion across
+streams, and a release event does not guarantee an immediate drop in allocated bytes.

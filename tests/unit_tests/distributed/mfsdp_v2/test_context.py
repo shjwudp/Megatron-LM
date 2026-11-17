@@ -33,6 +33,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_ord
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    uneven_dtensor_to_full_tensor,
+)
 
 
 class NestedModel(nn.Module):
@@ -95,93 +98,9 @@ def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
-def test_prefetch_order_view_filters_actions_and_rebuilds():
-    """Prefetch uses unshard requests and rebuilds its view when the source is replaced."""
-    context = object.__new__(FsdpContext)
-    context.execution_order = ExecutionOrder()
-    context._prefetch_order_view = None
-    current, following = nn.Identity(), nn.Identity()
-    current.phase = Phase.BACKWARD
-    following._unshard_parameter_groups = Mock()
-    order = context.execution_order
-    view = context.prefetch_order_view
-    other_view = order.view(actions=ExecutionAction)
-    order.append(ExecutionEvent(current, Phase.FORWARD, ExecutionAction.GRAD_ALLOC))
-    current_id = order.append(ExecutionEvent(current, Phase.FORWARD))
-    order.append(ExecutionEvent(current, Phase.FORWARD, ExecutionAction.RESHARD))
-    following_id = order.append(ExecutionEvent(following, Phase.BACKWARD))
-    other_view.advance()
-    other_view.advance()
-
-    assert context.prefetch_order_view is view
-    assert view.event_ids == (current_id, following_id)
-    FsdpModule._prefetch_parameter_groups(current, view, None, phase=Phase.FORWARD)
-    following._unshard_parameter_groups.assert_called_once_with(Phase.BACKWARD)
-    assert view.position == 1 and other_view.position == 2
-
-    replacement = ExecutionOrder([ExecutionEvent(following, Phase.FORWARD)])
-    context.execution_order = replacement
-    assert context.prefetch_order_view is not view
-    assert context.prefetch_order_view.source is replacement
-    assert context.prefetch_order_view.position == 0
-    assert view.source is order and view.position == 1
-
-
 @pytest.mark.parametrize("caller_managed", [False, True])
-def test_recorded_execution_order_stops_at_sync_boundary(caller_managed):
-    """Stop recording at gradient sync without freezing the source or moving views."""
-    context = object.__new__(FsdpContext)
-    context.execution_order = ExecutionOrder()
-    context._prefetch_order_view = None
-    context._recording_execution_order = True
-    context.caller_managed_grad_sync = caller_managed
-    context._delayed_post_backward_callbacks = []
-    context._post_backward_hook_registered = False
-    context.is_last_microbatch = False
-    context.inner_reduction_stream = Mock()
-    context.outer_reduction_stream = Mock()
-    compute_stream = Mock()
-    context.current_stream = Mock(return_value=compute_stream)
-    boundary = context.finish_grad_sync if caller_managed else context.post_backward
-    module = nn.Identity()
-    order = context.execution_order
-
-    context.finish_grad_sync()
-    assert context.is_recording_execution_order
-    order.append(ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_ALLOC))
-    context.finish_grad_sync()
-    assert context.is_recording_execution_order
-
-    order.append(ExecutionEvent(module, Phase.FORWARD))
-    order.append(ExecutionEvent(module, Phase.BACKWARD))
-    context.post_backward()
-    assert context.is_recording_execution_order
-    order.append(ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_REDUCE))
-    order.append(ExecutionEvent(module, Phase.FORWARD))
-    order.append(ExecutionEvent(module, Phase.BACKWARD))
-    context.is_last_microbatch = True
-    context.post_backward()
-    if caller_managed:
-        assert context.is_recording_execution_order
-        context.finish_grad_sync()
-    assert not context.is_recording_execution_order
-    view = context.prefetch_order_view
-    assert view.event_ids == (1, 2, 4, 5)
-    compute_stream.wait_stream.assert_any_call(context.inner_reduction_stream)
-    compute_stream.wait_stream.assert_any_call(context.outer_reduction_stream)
-    other_view = order.view(actions=ExecutionAction)
-    other_view.advance()
-    view.advance()
-    boundary()
-    assert view.position == 1 and other_view.position == 1
-    assert order.append(ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_RELEASE)) == 6
-    assert view.event_ids == (1, 2, 4, 5)
-    assert other_view.event_ids == tuple(range(7))
-    assert not context.is_recording_execution_order
-
-
-def test_recorded_execution_order(distributed_setup):
-    """Recorded orders follow execution when submodules are registered in reverse."""
+def test_recorded_execution_order(distributed_setup, caller_managed):
+    """Record a complete training step, then prefetch without extending its source."""
 
     class Model(nn.Module):
         def __init__(self):
@@ -194,22 +113,74 @@ def test_recorded_execution_order(distributed_setup):
 
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    torch.manual_seed(1234)
     model = Model().to(device)
+    reference = deepcopy(model)
     unsharded_weights = {layer: layer.weight for layer in model.children()}
     with fully_shard_context(
-        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
+        FsdpContext(
+            device=device,
+            prefetch_order=PrefetchOrder.RECORDED,
+            runtime_policy=RuntimePolicy(caller_managed_grad_sync=caller_managed),
+        )
     ) as context:
         for layer in model.children():
             fully_shard(layer, mesh, _default_placements())
         fully_shard(model, mesh, _default_placements())
 
-    inputs = torch.ones(2, 4, device=device)
-    assert context.is_recording_execution_order
-    model(inputs).sum().backward()
-    assert not context.is_recording_execution_order
-    assert list(context.execution_order) == [
-        ExecutionEvent(module, Phase.FORWARD) for module in [model, model.first, model.second]
-    ] + [ExecutionEvent(module, Phase.BACKWARD) for module in [model, model.second, model.first]]
+    def forward_backward():
+        model.zero_grad(set_to_none=True)
+        reference.zero_grad(set_to_none=True)
+        recording = context.is_recording_execution_order
+        for index in range(2):
+            inputs = torch.full((2, 4), index + 1.0, device=device, requires_grad=True)
+            reference_inputs = inputs.detach().clone().requires_grad_(True)
+            with microbatch(context, is_last=index == 1):
+                actual = model(inputs)
+                expected = reference(reference_inputs)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                actual.sum().backward()
+                expected.sum().backward()
+                torch.testing.assert_close(inputs.grad, reference_inputs.grad, atol=0, rtol=0)
+            assert context.is_recording_execution_order == (
+                recording and (caller_managed or index == 0)
+            )
+        if caller_managed:
+            context.finish_grad_sync()
+        assert not context.is_recording_execution_order
+        for parameter, expected in zip(model.parameters(), reference.parameters()):
+            torch.testing.assert_close(uneven_dtensor_to_full_tensor(parameter.grad), expected.grad)
+
+    forward_backward()
+    events = list(context.execution_order)
+    assert (
+        list(context.prefetch_order_view)
+        == (
+            [ExecutionEvent(module, Phase.FORWARD) for module in [model, model.first, model.second]]
+            + [
+                ExecutionEvent(module, Phase.BACKWARD)
+                for module in [model, model.second, model.first]
+            ]
+        )
+        * 2
+    )
+    for layer in model.children():
+        layer_events = [event for event in events if event.module is layer]
+        assert [event.action for event in layer_events] == [
+            ExecutionAction.UNSHARD,
+            ExecutionAction.RESHARD,
+            ExecutionAction.UNSHARD,
+            ExecutionAction.RESHARD,
+            ExecutionAction.GRAD_ALLOC,
+            ExecutionAction.GRAD_COPY_IN,
+            ExecutionAction.GRAD_REDUCE,
+            ExecutionAction.GRAD_RELEASE,
+        ] * 2
+        assert [event.group_index for event in layer_events] == ([None] * 4 + [0] * 4) * 2
+        assert all(
+            event.buffer_bytes > 0 for event in layer_events if event.group_index is not None
+        )
+    assert all(event.allocated_bytes is not None for event in events)
 
     def check_prefetched(layer, _args):
         storage_bytes = unsharded_weights[layer].untyped_storage().nbytes()
@@ -219,8 +190,8 @@ def test_recorded_execution_order(distributed_setup):
         # Check before FSDP's own hooks, so on-demand unsharding cannot satisfy the assertion.
         layer.register_forward_pre_hook(check_prefetched, prepend=True)
         layer.register_full_backward_pre_hook(check_prefetched, prepend=True)
-    model.zero_grad(set_to_none=True)
-    model(inputs).sum().backward()
+    forward_backward()
+    assert len(context.execution_order) == len(events)
 
 
 def test_registration_order_seeks_reordered_execution(distributed_setup):
