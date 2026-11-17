@@ -22,7 +22,7 @@ def test_shared_source_and_independent_filtered_snapshots():
     order = ExecutionOrder()
     repeated = ExecutionEvent(module, Phase.FORWARD, buffer_bytes=0, event_id=900)
     assert order.append(repeated) == 0
-    assert order.append(ExecutionEvent(module, None, ExecutionAction.GRAD_ALLOC, 0)) == 1
+    assert order.append(ExecutionEvent(module, None, ExecutionAction.GRAD_ALLOC)) == 1
     assert order.append(repeated) == 2
     assert order.append(ExecutionEvent(following, Phase.BACKWARD)) == 3
     view = order.view(actions=[ExecutionAction.UNSHARD])

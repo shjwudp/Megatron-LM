@@ -46,17 +46,14 @@ class ExecutionAction(enum.Enum):
 class ExecutionEvent:
     """An event with optional byte observations.
 
-    ``group_index`` is relative to this module's parameter groups; ``None`` means
-    a module-level event. ``event_id`` is assigned by the owning ExecutionOrder,
-    not a microbatch or module ID. Byte observations and IDs do not affect event
-    matching. Callers supply the observations. Missing measurements stay None,
-    distinct from a real zero.
+    ``event_id`` is assigned by the owning ExecutionOrder, not a microbatch or
+    module ID. Byte observations and IDs do not affect event matching. Callers
+    supply the observations. Missing measurements stay None, distinct from a real zero.
     """
 
     module: nn.Module
     phase: Phase | None
     action: ExecutionAction = ExecutionAction.UNSHARD
-    group_index: int | None = None
     buffer_bytes: int | None = field(default=None, compare=False)
     allocated_bytes: int | None = field(default=None, compare=False)
     event_id: int | None = field(default=None, compare=False)
@@ -66,7 +63,6 @@ class _StoredEvent(NamedTuple):
     module: ref[nn.Module]
     phase: Phase | None
     action: ExecutionAction
-    group_index: int | None
     buffer_bytes: int | None
     allocated_bytes: int | None
 
@@ -86,19 +82,14 @@ class ExecutionOrder:
 
     def append(self, item: ExecutionEvent) -> int:
         """Append an event and return its assigned ID without advancing any view."""
-        for name in ("group_index", "buffer_bytes", "allocated_bytes"):
+        for name in ("buffer_bytes", "allocated_bytes"):
             value = getattr(item, name)
             if value is not None and (type(value) is not int or value < 0):
                 raise ValueError(f"{name} must be a nonnegative integer or None.")
         event_id = len(self._items)
         self._items.append(
             _StoredEvent(
-                ref(item.module),
-                item.phase,
-                item.action,
-                item.group_index,
-                item.buffer_bytes,
-                item.allocated_bytes,
+                ref(item.module), item.phase, item.action, item.buffer_bytes, item.allocated_bytes
             )
         )
         return event_id
@@ -126,13 +117,7 @@ class ExecutionOrder:
         if module is None:
             return None
         return ExecutionEvent(
-            module,
-            item.phase,
-            item.action,
-            item.group_index,
-            item.buffer_bytes,
-            item.allocated_bytes,
-            event_id,
+            module, item.phase, item.action, item.buffer_bytes, item.allocated_bytes, event_id
         )
 
     def view(self, *, actions: Iterable[ExecutionAction]) -> "ExecutionOrderView":
@@ -196,7 +181,7 @@ class ExecutionOrderView:
         self._position = (self._position + 1) % len(self._event_ids)
 
     def seek(self, event: ExecutionEvent) -> bool:
-        """Move the cursor to the next matching module/phase/action/group.
+        """Move the cursor to the next matching module/phase/action.
 
         Search from the current position and wrap at most once. Repeated events
         are kept. IDs and byte observations do not affect matching, so demand
@@ -210,7 +195,6 @@ class ExecutionOrderView:
                 candidate.module() is event.module
                 and candidate.phase is event.phase
                 and candidate.action is event.action
-                and candidate.group_index == event.group_index
             ):
                 self._position = index
                 return True

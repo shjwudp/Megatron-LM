@@ -466,40 +466,41 @@ class FsdpModule:
             context = self.context
             inner_reduction_stream = context.inner_reduction_stream
             current_stream = context.current_stream()
+            last_trainable_group = next(
+                (group for group in reversed(self._parameter_groups) if group.requires_grad), None
+            )
 
-            for group_index, group in enumerate(self._parameter_groups):
+            for group in self._parameter_groups:
                 if not group.requires_grad:
                     continue
 
                 with torch.cuda.stream(inner_reduction_stream):
                     partial_grad = group.allocate_partial_grad_buffer()
                     buffer_bytes = partial_grad.local_buffer.nbytes
-                    self._record_execution_event(
-                        ExecutionAction.GRAD_ALLOC,
-                        group_index=group_index,
-                        buffer_bytes=buffer_bytes,
-                    )
+                    if group is last_trainable_group:
+                        self._record_execution_event(
+                            ExecutionAction.GRAD_ALLOC, buffer_bytes=buffer_bytes
+                        )
 
                 current_stream.wait_stream(inner_reduction_stream)
                 group.copy_gradients_to_partial_buffer(partial_grad)
-                self._record_execution_event(
-                    ExecutionAction.GRAD_COPY_IN, group_index=group_index, buffer_bytes=buffer_bytes
-                )
+                if group is last_trainable_group:
+                    self._record_execution_event(
+                        ExecutionAction.GRAD_COPY_IN, buffer_bytes=buffer_bytes
+                    )
 
                 inner_reduction_stream.wait_stream(current_stream)
                 with torch.cuda.stream(inner_reduction_stream):
                     group.reduce_inner_gradients(partial_grad)
-                    self._record_execution_event(
-                        ExecutionAction.GRAD_REDUCE,
-                        group_index=group_index,
-                        buffer_bytes=buffer_bytes,
-                    )
+                    if group is last_trainable_group:
+                        self._record_execution_event(
+                            ExecutionAction.GRAD_REDUCE, buffer_bytes=buffer_bytes
+                        )
                     del partial_grad
-                    self._record_execution_event(
-                        ExecutionAction.GRAD_RELEASE,
-                        group_index=group_index,
-                        buffer_bytes=buffer_bytes,
-                    )
+                    if group is last_trainable_group:
+                        self._record_execution_event(
+                            ExecutionAction.GRAD_RELEASE, buffer_bytes=buffer_bytes
+                        )
 
                 if not context.is_last_microbatch:
                     continue
@@ -514,11 +515,7 @@ class FsdpModule:
                     group.reduce_outer_gradients()
 
     def _record_execution_event(
-        self,
-        action: ExecutionAction,
-        *,
-        group_index: int | None = None,
-        buffer_bytes: int | None = None,
+        self, action: ExecutionAction, *, buffer_bytes: int | None = None
     ) -> None:
         """Sample a completed host operation only during the eager recording pass."""
         context = self.context
@@ -528,7 +525,6 @@ class FsdpModule:
                     cast(nn.Module, self),
                     self.phase,
                     action,
-                    group_index,
                     buffer_bytes,
                     torch.cuda.memory_allocated(context.allgather_stream.device),
                 )

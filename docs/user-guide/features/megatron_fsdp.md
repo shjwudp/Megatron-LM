@@ -626,64 +626,20 @@ NCCL (`v2.27+`) supports symmetric allocation or registration for communicators 
 
 These optimizations significantly reduce SM resource contention for overlapped compute and communication kernels in FSDP. Symmetric registration, allocation, and pooling is also supported in PyTorch: [`torch.distributed._symmetric_memory`](https://docs.pytorch.org/docs/stable/symmetric_memory.html).
 
-
 ### Experimental execution events and views
 
-An `ExecutionOrder` stores the events for one FSDP context. Each event identifies
-a module, its phase and action, and an optional index into that module's parameter
-groups. Appending an event gives it the next ID, starting at zero, so repeated
-module calls have separate IDs. The source holds weak module references. A
-collected module leaves its slot in place, with later IDs unchanged. Returned
-events keep their module alive while the caller holds them.
+With `PrefetchOrder.RECORDED`, the first eager training window records each FSDP
+module's weight requests, reshards and gradient lifecycle in
+`context.execution_order`. Gradient allocation, copy-in, inner reduction and
+temporary input-buffer release mark the module's last trainable parameter group.
+Events have stable IDs and rank-local allocated bytes. Gradient buffer bytes
+describe that group's padded input, not the module total. `finish_grad_sync()`
+ends recording. Later passes reuse the trace without adding events or sampling
+memory.
 
-The source has no cursor. `seek(event_id)` reads an event by ID;
-`ExecutionOrderView.seek(event)` moves a view's cursor to a matching event.
-
-`ExecutionOrder.view(actions=...)` gives a consumer its own cursor over the
-selected events in this source:
-
-```python
-from megatron_fsdp.experimental.execution_order import ExecutionAction
-
-unshards = context.prefetch_order_view
-weights = context.execution_order.view(
-    actions=(ExecutionAction.UNSHARD, ExecutionAction.RESHARD)
-)
-gradients = context.execution_order.view(
-    actions=(
-        ExecutionAction.GRAD_ALLOC,
-        ExecutionAction.GRAD_COPY_IN,
-        ExecutionAction.GRAD_REDUCE,
-        ExecutionAction.GRAD_RELEASE,
-    )
-)
-```
-
-A view's `position` counts only its selected events. `peek().event_id` gives the
-ID in the full source. Moving one view leaves other cursors unchanged. Views
-snapshot the matching IDs at creation; create them after recording finishes.
-Later appends require a new view, without copying event records.
-Prefetch uses the `UNSHARD` view. An unshard event marks a request for full
-weights in its F/B phase; weights already prepared by prefetch can be reused
-without another all-gather. Other actions do not advance the prefetch cursor.
-
-With `PrefetchOrder.RECORDED`, the first eager execution window records F/B
-unshard requests, reshards, and each trainable parameter group's gradient-buffer
-allocation, copy-in, inner reduction and release. `finish_grad_sync()` ends
-recording. Subsequent passes create and reuse
-the complete unshard-request view without appending events or sampling memory.
-Registration mode builds a static F/B unshard order without lifecycle observations.
-Recording requires the ordinary FSDP hooks; combined 1F1B bypasses them.
-
-`GRAD_RELEASE` marks relinquishing the temporary reduce-scatter input after its
-inner reduction; the reduced gradient shard remains available. DP-outer reduction
-uses the persistent accumulator and is finalized separately. Retain/window policies
-are outside this change; their decisions should use event IDs without editing
-the recorded source.
-
-Recorded operations sample rank-local `allocated_bytes` after they are submitted.
-Gradient events also include the input buffer's `buffer_bytes`, including padding.
-The event container itself does not measure memory; manually appended observations
-remain optional, with missing values represented by `None`. These observations do
-not affect event matching. Host event order does not imply CUDA completion across
-streams, and a release event does not guarantee an immediate drop in allocated bytes.
+Create `context.execution_order.view(actions=...)` after recording finishes to get
+a fixed filtered view with its own cursor. Prefetch consumes only weight-request
+(`UNSHARD`) events. Recording requires ordinary FSDP hooks, which combined 1F1B
+bypasses. Release drops the local reference to the inner-reduction input; the
+gradient accumulator remains available for DP-outer reduction. Events mark host
+submissions, not CUDA completion.
