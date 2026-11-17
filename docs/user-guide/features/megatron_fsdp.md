@@ -666,8 +666,9 @@ Prefetch uses the `MODULE_ENTRY` view, so its F/B positions stay unchanged when
 other actions appear in the source.
 
 With `PrefetchOrder.RECORDED`, the first eager execution window records module
-entries and seals the source when it ends. Registration mode builds a static
-module-entry order. The other lifecycle actions define the shared schema.
+entries. `finish_grad_sync()` stops recording through the context's recording
+flag. Registration mode builds a static module-entry order. The other lifecycle
+actions define the shared schema.
 Recording those actions and applying retain/window policies need separate
 changes. Future policies should store omit/reuse decisions in plans keyed by
 event ID and leave the recorded sequence unchanged.

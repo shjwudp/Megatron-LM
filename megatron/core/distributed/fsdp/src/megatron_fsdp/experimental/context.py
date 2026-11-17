@@ -233,19 +233,8 @@ class FsdpContext:
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
-        self._finish_execution_order()
-
-    def _finish_execution_order(self) -> None:
-        """Seal the first recording or validate replay at the execution-window boundary."""
-        if self._recording_execution_order:
-            # A synchronization before any module entry must not end recording.
-            if self.prefetch_order_view.peek() is not None:
-                self.execution_order.seal()
-                self._recording_execution_order = False
-        elif (
-            self.prefetch_order is PrefetchOrder.RECORDED and self.prefetch_order_view.position != 0
-        ):
-            raise RuntimeError("FSDP execution ended before the recorded order was complete.")
+        if len(self.prefetch_order_view):
+            self._recording_execution_order = False
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""

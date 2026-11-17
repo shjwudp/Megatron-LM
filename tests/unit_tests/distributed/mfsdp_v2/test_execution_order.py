@@ -132,6 +132,10 @@ def test_empty_view_tracks_later_appends_without_consuming_them():
     assert view.position == 0
     view.advance()
     assert view.peek().event_id == 3
+    assert order.append(ExecutionEvent(module, Phase.FORWARD)) == 4
+    assert view.event_ids == (1, 3, 4) and view.position == 1
+    view.advance()
+    assert view.peek().event_id == 4
 
 
 def test_action_filter_is_snapshotted_and_empty_selection_stays_empty():
@@ -245,25 +249,6 @@ def test_dead_middle_event_keeps_ids_and_stops_prefetch_lookahead():
     assert view.peek().event_id == 2
     assert order.append(ExecutionEvent(first, Phase.BACKWARD)) == 3
     assert view.event_ids == (0, 1, 2, 3)
-
-
-def test_sealing_freezes_the_source_but_not_view_cursors():
-    """Sealing blocks appends while each view keeps its own cursor."""
-    module = nn.Module()
-    order = ExecutionOrder(
-        [ExecutionEvent(module, Phase.FORWARD), ExecutionEvent(module, Phase.BACKWARD)]
-    )
-    view = order.view(actions=[ExecutionAction.MODULE_ENTRY])
-    assert not order.is_sealed
-    order.seal()
-    assert order.is_sealed
-    with pytest.raises(RuntimeError):
-        order.append(ExecutionEvent(module, Phase.FORWARD))
-    assert len(order) == 2 and view.event_ids == (0, 1)
-    view.advance()
-    assert view.peek().event_id == 1
-    assert view.seek(ExecutionEvent(module, Phase.FORWARD)) and view.position == 0
-    assert order.view(actions=[ExecutionAction.MODULE_ENTRY]).event_ids == (0, 1)
 
 
 @pytest.mark.parametrize("value", [None, 0, 2**60])

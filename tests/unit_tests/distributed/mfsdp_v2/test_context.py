@@ -128,8 +128,8 @@ def test_prefetch_order_view_filters_actions_and_rebuilds():
 
 
 @pytest.mark.parametrize("caller_managed", [False, True])
-def test_recorded_execution_order_seals_at_sync_boundary(caller_managed):
-    """Seal only at the chosen complete-step boundary, using module-entry coordinates."""
+def test_recorded_execution_order_stops_at_sync_boundary(caller_managed):
+    """Stop recording at gradient sync without freezing the source or moving views."""
     context = object.__new__(FsdpContext)
     context.execution_order = ExecutionOrder()
     context._prefetch_order_view = None
@@ -148,41 +148,37 @@ def test_recorded_execution_order_seals_at_sync_boundary(caller_managed):
     order = context.execution_order
 
     context.finish_grad_sync()
-    assert context.is_recording_execution_order and not order.is_sealed
+    assert context.is_recording_execution_order
     order.append(ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_ALLOC))
     context.finish_grad_sync()
-    assert context.is_recording_execution_order and not order.is_sealed
+    assert context.is_recording_execution_order
 
     order.append(ExecutionEvent(module, Phase.FORWARD))
     order.append(ExecutionEvent(module, Phase.BACKWARD))
     context.post_backward()
-    assert context.is_recording_execution_order and not order.is_sealed
+    assert context.is_recording_execution_order
     order.append(ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_REDUCE))
     order.append(ExecutionEvent(module, Phase.FORWARD))
     order.append(ExecutionEvent(module, Phase.BACKWARD))
     context.is_last_microbatch = True
     context.post_backward()
     if caller_managed:
-        assert context.is_recording_execution_order and not order.is_sealed
+        assert context.is_recording_execution_order
         context.finish_grad_sync()
-    assert not context.is_recording_execution_order and order.is_sealed
+    assert not context.is_recording_execution_order
     view = context.prefetch_order_view
     assert view.event_ids == (1, 2, 4, 5)
     compute_stream.wait_stream.assert_any_call(context.inner_reduction_stream)
     compute_stream.wait_stream.assert_any_call(context.outer_reduction_stream)
-    with pytest.raises(RuntimeError, match="sealed"):
-        order.append(ExecutionEvent(module, Phase.FORWARD))
-
     other_view = order.view(actions=ExecutionAction)
     other_view.advance()
     view.advance()
-    with pytest.raises(RuntimeError, match="recorded order was complete"):
-        boundary()
-    assert other_view.position == 1
-    for _ in range(len(view) - 1):
-        view.advance()
     boundary()
-    assert view.position == 0 and other_view.position == 1
+    assert view.position == 1 and other_view.position == 1
+    assert order.append(ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_RELEASE)) == 6
+    assert view.event_ids == (1, 2, 4, 5)
+    assert other_view.event_ids == tuple(range(7))
+    assert not context.is_recording_execution_order
 
 
 def test_recorded_execution_order(distributed_setup):

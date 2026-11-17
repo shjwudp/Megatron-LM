@@ -79,23 +79,12 @@ class ExecutionOrder:
 
     def __init__(self, items: Iterable[ExecutionEvent] = ()) -> None:
         """Create a source that records repeated events separately."""
-        self._items: list[_StoredEvent] | tuple[_StoredEvent, ...] = []
+        self._items: list[_StoredEvent] = []
         for item in items:
             self.append(item)
 
-    @property
-    def is_sealed(self) -> bool:
-        """Whether recording has finished and appending is disabled."""
-        return isinstance(self._items, tuple)
-
-    def seal(self) -> None:
-        """Freeze the event source while leaving view cursors independent."""
-        self._items = tuple(self._items)
-
     def append(self, item: ExecutionEvent) -> int:
         """Append an event and return its assigned ID without advancing any view."""
-        if not isinstance(self._items, list):
-            raise RuntimeError("Cannot append to a sealed FSDP execution order.")
         for name in ("group_index", "buffer_bytes", "allocated_bytes"):
             value = getattr(item, name)
             if value is not None and (type(value) is not int or value < 0):
