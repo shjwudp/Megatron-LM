@@ -616,7 +616,30 @@ class FsdpParameterGroup:
             if rowwise_only and weight._columnwise_data is not None:
                 weight.update_usage(rowwise_usage=False)
 
-    def allocate_partial_grad_buffer(self) -> DBuffer:
+    @property
+    def has_inner_network_reduction(self) -> bool:
+        """Whether Partial local gradients communicate before reaching main_grad."""
+        return self.main_grad is not None and any(
+            self.mesh.size(axis) > 1 and not isinstance(placement, Partial)
+            for axis, placement in enumerate(self.main_grad.placements)
+        )
+
+    @property
+    def gradient_window_storage_bytes(self) -> int:
+        """Full-precision accumulation plus an original-dtype flush input if needed."""
+        if self.main_grad is None:
+            return 0
+        placements = (Partial("avg"),) * self.mesh.ndim
+        numel = self.main_weight.layout.get_local_range(self.mesh, placements).numel
+        accumulator_bytes = torch.finfo(self.main_grad.dtype).bits // 8
+        communication_bytes = (
+            torch.finfo(self.grad_comm_dtype).bits // 8
+            if self.grad_comm_dtype != self.main_grad.dtype
+            else 0
+        )
+        return numel * (accumulator_bytes + communication_bytes)
+
+    def allocate_partial_grad_buffer(self, *, dtype: torch.dtype | None = None) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
 
@@ -630,16 +653,25 @@ class FsdpParameterGroup:
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 layout=self.main_weight.layout,
-                dtype=self.grad_comm_dtype,
+                dtype=self.grad_comm_dtype if dtype is None else dtype,
                 device=grads[0].device,
             )
 
-    def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
+    def copy_gradients_to_partial_buffer(
+        self, partial_grad: DBuffer, *, accumulate: bool = False
+    ) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
         # A future fused-wgrad path can write directly into these buffer views.
+        for fsdp_parameter in self.fsdp_parameters:
+            if fsdp_parameter.unsharded.grad is None:
+                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             grad = fsdp_parameter.unsharded.grad
-            partial_grad.get_tensor_view(index).copy_(grad)
+            destination = partial_grad.get_tensor_view(index)
+            if accumulate:
+                destination.add_(grad)
+            else:
+                destination.copy_(grad)
             # Combined schedules can finish a module on a different stream
             # from the one that allocated a gradient. Keep its storage alive
             # until this copy completes, even after clearing the owning .grad.

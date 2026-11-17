@@ -467,19 +467,23 @@ class FsdpModule:
             inner_reduction_stream = context.inner_reduction_stream
             current_stream = context.current_stream()
 
-            for group in self._parameter_groups:
+            for group_index, group in enumerate(self._parameter_groups):
                 if not group.requires_grad:
                     continue
-
+                if context.accumulate_gradient_window(self, group, group_index=group_index):
+                    continue
                 with torch.cuda.stream(inner_reduction_stream):
                     partial_grad = group.allocate_partial_grad_buffer()
-
                 current_stream.wait_stream(inner_reduction_stream)
                 group.copy_gradients_to_partial_buffer(partial_grad)
 
                 inner_reduction_stream.wait_stream(current_stream)
                 with torch.cuda.stream(inner_reduction_stream):
-                    group.reduce_inner_gradients(partial_grad)
+                    context._flush_inner_gradient_window(
+                        group,
+                        reason=context.gradient_window_reason(group),
+                        partial_grad=partial_grad,
+                    )
 
                 if not context.is_last_microbatch:
                     continue
@@ -488,10 +492,7 @@ class FsdpModule:
                 # persistent accumulator and its optimizer-layout view stay alive across
                 # the handoff. When disabled the stream aliases inner_reduction_stream and
                 # this stays serialized.
-                if context.outer_reduction_stream is not inner_reduction_stream:
-                    context.outer_reduction_stream.wait_stream(inner_reduction_stream)
-                with torch.cuda.stream(context.outer_reduction_stream):
-                    group.reduce_outer_gradients()
+                context._finalize_gradient_outer(group)
 
     def _record_execution_event(self, action: ExecutionAction) -> None:
         """Sample a completed host operation only during the eager recording pass."""

@@ -3,20 +3,26 @@
 """CUDA graph tests for Megatron-FSDP."""
 
 import logging
+from copy import deepcopy
 
 import pytest
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    PrefetchOrder,
     RuntimePolicy,
     fully_shard,
     fully_shard_context,
+    microbatch,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    uneven_dtensor_to_full_tensor,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,3 +149,104 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
         f"first={loss_values[0]:.6f}, "
         f"last={loss_values[-1]:.6f}, trace={loss_values}"
     )
+
+
+@pytest.mark.parametrize("window_size", [1, 4])
+def test_gradient_window_eager_and_capture_match_baseline(distributed_setup, window_size):
+    """Keep HFSDP gradients and updates correct through recording, tails and replay."""
+    device, world_size = distributed_setup.device, distributed_setup.world_size
+    if world_size < 4 or world_size % 2:
+        pytest.skip("Gradient-window HFSDP coverage requires an even world size of at least 4.")
+    mesh = init_device_mesh(device.type, (2, world_size // 2))
+    placements = Placements(
+        dp_axes=[0, 1],
+        parameter=[Replicate(), Shard(0)],
+        gradient=[Partial("avg"), Shard(0)],
+        optimizer=[Shard(0), Shard(0)],
+    )
+    torch.manual_seed(1234)
+    initial = NestedModel(dim=8, num_children=2).to(device)
+    models, contexts, optimizers = [], [], []
+    for enabled in (False, True, True):
+        model = deepcopy(initial)
+        with fully_shard_context(
+            FsdpContext(
+                device=device,
+                runtime_policy=RuntimePolicy(
+                    caller_managed_grad_sync=True, overlap_outer_communication=True
+                ),
+                prefetch_order=PrefetchOrder.RECORDED,
+                prefetch_process_group=dist.group.WORLD,
+            )
+        ) as context:
+            for layer in model.layers:
+                fully_shard(layer, mesh=mesh, placements=placements)
+            fully_shard(model, mesh=mesh, placements=placements)
+        if enabled:
+            budget = sum(
+                group.gradient_window_storage_bytes
+                for layer in model.layers
+                for group in layer.parameter_groups
+            )
+            context.configure_gradient_window(
+                window_size=window_size, budget_bytes=budget, eligible_modules=model.layers
+            )
+        models.append(model)
+        contexts.append(context)
+        optimizers.append(torch.optim.SGD(model.parameters(), lr=0.125, foreach=False))
+    inputs = torch.full((2, 8), (distributed_setup.rank + 1) / 8, device=device)
+
+    def step(index):
+        model, context, optimizer = models[index], contexts[index], optimizers[index]
+        optimizer.zero_grad(set_to_none=False)
+        losses = []
+        for microbatch_index in range(5):
+            with microbatch(context, is_last=microbatch_index == 4):
+                loss = model(inputs).square().mean()
+                loss.backward()
+                losses.append(loss.detach())
+        context.finish_grad_sync()
+        optimizer.step()
+        return torch.stack(losses).sum()
+
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    graph = torch.cuda.CUDAGraph()
+    try:
+        for iteration in range(5):
+            stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(stream):
+                expected, eager = step(0), step(1)
+                if iteration == 0:
+                    actual = step(2)  # The only eager recording window.
+                else:
+                    if iteration == 1:
+                        contexts[2].prepare_for_cuda_graph_capture()
+                        with torch.cuda.graph(graph, stream=stream):
+                            actual = step(2)
+                    contexts[2].validate_gradient_window_capture()
+                    graph.replay()
+            torch.cuda.current_stream(device).wait_stream(stream)
+            torch.testing.assert_close(eager, expected)
+            torch.testing.assert_close(actual, expected)
+            for model in models[1:]:
+                for parameter, reference in zip(model.parameters(), models[0].parameters()):
+                    torch.testing.assert_close(
+                        uneven_dtensor_to_full_tensor(parameter.grad),
+                        uneven_dtensor_to_full_tensor(reference.grad),
+                    )
+                    torch.testing.assert_close(
+                        uneven_dtensor_to_full_tensor(parameter),
+                        uneven_dtensor_to_full_tensor(reference),
+                    )
+            for context in contexts[1:]:
+                policy = context._gradient_window
+                expected_reductions = (
+                    15 if iteration == 0 else 5 + 2 * ((5 + window_size - 1) // window_size)
+                )
+                assert policy.last_step_statistics["inner_reductions"] == expected_reductions
+                assert policy.peak_reserved_bytes <= policy.budget_bytes
+                assert not (policy.pending or policy.retiring or policy.reserved_bytes)
+    finally:
+        torch.cuda.synchronize(device)
+        graph.reset()

@@ -638,3 +638,26 @@ Create `context.execution_order.view(action=ExecutionAction.UNSHARD)` after
 recording finishes to get a fixed filtered view with its own cursor. Prefetch
 consumes `UNSHARD` events. Recording requires ordinary FSDP hooks, which combined
 1F1B bypasses. Events mark host submissions, not CUDA completion.
+
+### Experimental gradient windows
+
+After FSDP construction, call
+`context.configure_gradient_window(window_size=4, budget_bytes=budget, eligible_modules=layers)`
+before compute. This requires ordinary module hooks, caller-managed gradient
+synchronization and an explicit `prefetch_process_group` whose ranks share the
+same contribution sequence. The first complete eager step records that private
+sequence and agrees on it across the group. Later steps must repeat it.
+
+Eligible groups accumulate in the main-gradient dtype and reduce in the original
+communication dtype. The shared FIFO byte budget includes held accumulators,
+communication casts and reduction inputs awaiting retirement. It excludes
+persistent gradients and ineligible groups' baseline staging. A full window,
+last microbatch or budget eviction submits an inner reduction; call
+`finish_grad_sync()` after all backward work to flush tails before the optimizer.
+`window_size=1` uses the original reduction path and needs no window budget.
+
+For native CUDA graphs, call `prepare_for_cuda_graph_capture()` after the eager
+step and `validate_gradient_window_capture()` before replay. Keep gradient views
+installed with `zero_grad(set_to_none=False)`. The full-iteration wrapper performs
+these checks with an explicit job-wide `control_group`. Windows larger than one
+require ordinary communication storage and do not support symmetric memory.

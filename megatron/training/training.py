@@ -2468,7 +2468,8 @@ def wrap_model_chunks_with_ddp(
                     use_symmetric_memory=ddp_config.nccl_ub,
                     caller_managed_grad_sync=True,
                     overlap_outer_communication=ddp_config.overlap_outer_communication,
-                )
+                ),
+                prefetch_process_group=pg_collection.dp_cp if pg_collection is not None else None,
             )
         )
         if is_mfsdp_v2
@@ -4916,6 +4917,11 @@ def train(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
+            control_group=(
+                torch.distributed.group.WORLD
+                if args.use_megatron_fsdp and args.megatron_fsdp_version == 2
+                else None
+            ),
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
@@ -5651,6 +5657,11 @@ def evaluate(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
+            control_group=(
+                torch.distributed.group.WORLD
+                if args.use_megatron_fsdp and args.megatron_fsdp_version == 2
+                else None
+            ),
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:

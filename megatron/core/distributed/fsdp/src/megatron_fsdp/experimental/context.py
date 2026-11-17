@@ -20,8 +20,10 @@ from weakref import WeakKeyDictionary
 
 import torch
 from torch import nn
+from torch.distributed import ProcessGroup
 
 from .execution_order import ExecutionAction, ExecutionEvent, ExecutionOrder, ExecutionOrderView
+from .gradient_window import GradientWindow
 from .phase import Phase
 from .runtime_policy import RuntimePolicy
 
@@ -63,6 +65,7 @@ class FsdpContext:
         runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION,
+        prefetch_process_group: ProcessGroup | None = None,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -84,6 +87,8 @@ class FsdpContext:
                 data-parallel ranks.
                 Recording currently requires the ordinary module hooks; combined 1F1B
                 bypasses them. Discard the context if the recorded pass raises.
+            prefetch_process_group: Explicit agreement group whose ranks share the same
+                gradient contribution trace. Required only for configured gradient windows.
         """
         overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
         overlap_outer_communication = runtime_policy.overlap_outer_communication
@@ -96,6 +101,8 @@ class FsdpContext:
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
         self.prefetch_order = prefetch_order
+        self._prefetch_process_group = prefetch_process_group
+        self._gradient_window: GradientWindow | None = None
         self.execution_order = ExecutionOrder()
         self._prefetch_order_view: ExecutionOrderView | None = None
         self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
@@ -224,16 +231,103 @@ class FsdpContext:
         )
 
     def finish_grad_sync(self) -> None:
-        """Wait on submitted gradient reductions.
+        """Submit gradient-window tails and wait on submitted reductions.
 
         Call after all backward work, including delayed weight-gradient computation,
-        and before reading or modifying gradients. This enqueues a stream dependency;
-        it does not block the CPU or wait for reductions that have not yet been launched.
+        and before reading or modifying gradients. Stream waits enqueue dependencies
+        without blocking the CPU. The first recorded gradient window also performs
+        rank agreement and reads its result on the CPU before compiling the policy.
         """
+        if self._gradient_window is not None:
+            if self._delayed_post_backward_callbacks:
+                raise RuntimeError("Finish delayed backward callbacks before gradient-window sync.")
+            self._gradient_window.finish_step()
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
         self._recording_execution_order = False
+
+    def configure_gradient_window(
+        self, *, window_size: int, budget_bytes: int, eligible_modules
+    ) -> None:
+        """Bound local accumulation before inner reduction, configured before compute.
+
+        The byte budget includes main-gradient-dtype accumulators, communication
+        casts and submitted inputs until retirement. Persistent gradients and
+        ineligible groups' baseline staging are outside this budget.
+        """
+        self.ensure_finalized()
+        if any(not module._schedule_policy.register_hooks for module in self._module_names):
+            raise ValueError("Gradient windows require ordinary FSDP module hooks.")
+        if self._gradient_window is not None:
+            raise RuntimeError("FSDP gradient windows have already been configured.")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Configure gradient windows before graph capture.")
+        if not self.caller_managed_grad_sync or self._prefetch_process_group is None:
+            raise ValueError(
+                "Gradient windows require caller-managed sync and an explicit agreement group."
+            )
+        if window_size > 1 and self.use_symmetric_memory:
+            raise ValueError("Bounded gradient windows do not support symmetric-memory staging.")
+        if self._delayed_post_backward_callbacks or any(
+            group._unshard_events
+            for module in self._module_names
+            for group in module.parameter_groups
+        ):
+            raise RuntimeError("Configure gradient windows at a clean synchronization boundary.")
+        self._gradient_window = GradientWindow(
+            self, self._module_names, eligible_modules, window_size, budget_bytes
+        )
+
+    def prepare_for_cuda_graph_capture(self) -> None:
+        """Pin the completed eager gradient trace before entering graph capture."""
+        if self._gradient_window is None:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Prepare gradient windows before graph capture.")
+        if self._delayed_post_backward_callbacks or self.is_recording_execution_order:
+            raise RuntimeError(
+                "Gradient capture requires a complete eager synchronization boundary."
+            )
+        self._gradient_window.prepare_capture()
+
+    def accumulate_gradient_window(self, module, group, *, group_index: int) -> bool:
+        """Consume one completed local contribution, or select the unchanged baseline path."""
+        return self._gradient_window is not None and self._gradient_window.contribute(
+            module, group, group_index
+        )
+
+    def gradient_window_reason(self, group) -> str:
+        return "baseline" if self._gradient_window is None else self._gradient_window.reason(group)
+
+    def _flush_inner_gradient_window(self, group, *, reason: str, partial_grad=None) -> None:
+        """The actual inner reduction boundary for baseline and merged contributions."""
+        if partial_grad is not None:
+            group.reduce_inner_gradients(partial_grad)
+            if self._gradient_window is not None:
+                self._gradient_window.legacy_flush(reason=reason)
+        else:
+            if self._gradient_window is None:
+                raise RuntimeError("Cannot flush an unconfigured gradient window.")
+            self._gradient_window.flush(group, reason=reason)
+
+    def _finalize_gradient_outer(self, group) -> None:
+        """Finalize the original DP-outer stage after this group's inner tail."""
+        if self.outer_reduction_stream is not self.inner_reduction_stream:
+            self.outer_reduction_stream.wait_stream(self.inner_reduction_stream)
+        with torch.cuda.stream(self.outer_reduction_stream):
+            group.reduce_outer_gradients()
+        if self._gradient_window is not None:
+            self._gradient_window.outer_finished(group)
+
+    def validate_gradient_window_capture(self) -> None:
+        """Validate policy before replay; captured sharded gradient views must remain installed."""
+        policy = self._gradient_window
+        if policy is None:
+            return
+        policy.validate_capture()
+        if any(not group._has_sharded_grads() for group in policy.seen_groups):
+            raise RuntimeError("Captured gradient windows require zero_grad(set_to_none=False).")
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""

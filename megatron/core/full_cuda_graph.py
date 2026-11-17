@@ -241,11 +241,18 @@ class FullCudaGraphWrapper:
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
 
-    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False):
+    def __init__(
+        self,
+        forward_backward_func,
+        cuda_graph_warmup_steps=1,
+        use_single_mempool=False,
+        control_group=None,
+    ):
         self.forward_backward_func = forward_backward_func
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
         self.use_single_mempool = use_single_mempool
+        self.control_group = control_group
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
@@ -280,6 +287,58 @@ class FullCudaGraphWrapper:
                     data_list.append(None)
         return data_list
 
+    def _check_fsdp_policies(self, model, *, prepare):
+        """Agree on FSDP gradient-window policies before captured collectives."""
+        error = None
+        policy_contexts = ()
+        try:
+            contexts = {}
+            chunks = model if isinstance(model, (list, tuple)) else (model,)
+            for chunk in chunks:
+                modules = getattr(chunk, 'modules', None)
+                for module in modules() if callable(modules) else (chunk,):
+                    context = getattr(module, '_context', None)
+                    if context is not None and (
+                        getattr(context, '_gradient_window', None) is not None
+                    ):
+                        contexts[id(context)] = context
+            policy_contexts = tuple(
+                (key, id(getattr(context, '_gradient_window', None)))
+                for key, context in sorted(contexts.items())
+            )
+            if not prepare and policy_contexts != getattr(self, '_fsdp_graph_policy_contexts', ()):
+                raise RuntimeError('FSDP graph policy contexts were removed, replaced or added')
+            if contexts and self.control_group is None:
+                raise ValueError("Gradient-window graph checks require an explicit control group.")
+            for context in contexts.values():
+                if prepare:
+                    context.prepare_for_cuda_graph_capture()
+                else:
+                    context.validate_gradient_window_capture()
+        except Exception as exc:
+            error = exc
+        if self.control_group is not None:
+            # Stages without eligible owners still participate: a failed
+            # check on another stage must not leave peers replaying collectives.
+            status = torch.tensor([int(error is not None)], dtype=torch.int64, device='cuda')
+            torch.distributed.all_reduce(
+                status, op=torch.distributed.ReduceOp.MAX, group=self.control_group
+            )
+            if status.item():
+                if error is not None:
+                    raise error
+                raise RuntimeError('FSDP gradient-window graph validation failed on another rank')
+        elif error is not None:
+            raise error
+        if prepare:
+            self._fsdp_graph_policy_contexts = policy_contexts
+            # Keep the pinned objects alive so removing a policy cannot let a
+            # replacement reuse its identity while the graph is still live.
+            self._fsdp_graph_policy_context_refs = tuple(
+                (context, getattr(context, '_gradient_window', None))
+                for _, context in sorted(contexts.items())
+            )
+
     def __call__(self, *args, **kwargs):
         assert len(args) == 0, 'forward_backward_func does not accept positional args'
         assert all(
@@ -305,6 +364,8 @@ class FullCudaGraphWrapper:
         training_str = 'training' if training else 'validation'
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
+            if training:
+                self._check_fsdp_policies(model, prepare=True)
             logger.info(f'Capture CUDA graph for {training_str}!!!')
             if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
                 torch.autograd.graph.set_override_stale_capture_stream(True)
@@ -346,6 +407,8 @@ class FullCudaGraphWrapper:
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
         else:
+            if training:
+                self._check_fsdp_policies(model, prepare=False)
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
         self.next_iter(training_str)
         # Validate before returning to the training loop's rerun/update decision.
@@ -371,6 +434,8 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph['training'] = None
             FullCudaGraphWrapper.result['training'] = None
             FullCudaGraphWrapper.curr_iteration['training'] = 0
+            self._fsdp_graph_policy_contexts = ()
+            self._fsdp_graph_policy_context_refs = ()
             get_rerun_state_machine().clear_deferred_validations("training")
         if stage is None or stage == 'validation':
             if FullCudaGraphWrapper.cuda_graph['validation'] is not None:
