@@ -163,11 +163,6 @@ class ExecutionOrderView:
         return self._source
 
     @property
-    def event_ids(self) -> tuple[int, ...]:
-        """Selected IDs at creation, including events with expired modules."""
-        return self._event_ids
-
-    @property
     def position(self) -> int:
         """Local index of the next event to consume, distinct from its event ID."""
         return self._position
@@ -195,11 +190,10 @@ class ExecutionOrderView:
             offset += 1
 
     def advance(self) -> None:
-        """Advance one event, wrapping at the end of this view."""
-        size = len(self)
-        if not size:
+        """Consume one occurrence and automatically wrap at the end of the trace."""
+        if not self._event_ids:
             raise RuntimeError("Cannot advance an empty FSDP execution order.")
-        self._position = (self._position + 1) % size
+        self._position = (self._position + 1) % len(self._event_ids)
 
     def seek(self, event: ExecutionEvent) -> bool:
         """Move the cursor to the next matching module/phase/action/group.

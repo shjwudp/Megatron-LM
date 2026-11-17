@@ -233,9 +233,7 @@ class FsdpContext:
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
-        if self._recording_execution_order:
-            self._recording_execution_order = False
-            self._prefetch_order_view = None
+        self._recording_execution_order = False
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""

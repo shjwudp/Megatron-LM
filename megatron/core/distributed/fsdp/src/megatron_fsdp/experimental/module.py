@@ -331,7 +331,7 @@ class FsdpModule:
     def _prefetch_parameter_groups(
         self, order: ExecutionOrderView, prefetch_size: int | None
     ) -> None:
-        """Consume one unshard request while ignoring other actions in the shared source."""
+        """Validate the current event, prefetch successors, and advance once."""
         event = ExecutionEvent(cast(nn.Module, self), self.phase)
         if order.peek() != event and not order.seek(event):
             raise RuntimeError(
@@ -473,11 +473,7 @@ class FsdpModule:
 
                 with torch.cuda.stream(inner_reduction_stream):
                     partial_grad = group.allocate_partial_grad_buffer()
-                    buffer_bytes = (
-                        partial_grad.local_buffer.nbytes
-                        if context.is_recording_execution_order
-                        else None
-                    )
+                    buffer_bytes = partial_grad.local_buffer.nbytes
                     self._record_execution_event(
                         ExecutionAction.GRAD_ALLOC,
                         group_index=group_index,

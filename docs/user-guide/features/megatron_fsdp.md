@@ -670,7 +670,7 @@ without another all-gather. Other actions do not advance the prefetch cursor.
 With `PrefetchOrder.RECORDED`, the first eager execution window records F/B
 unshard requests, reshards, and each trainable parameter group's gradient-buffer
 allocation, copy-in, inner reduction and release. `finish_grad_sync()` ends
-recording and invalidates any earlier prefetch snapshot. Subsequent passes reuse
+recording. Subsequent passes create and reuse
 the complete unshard-request view without appending events or sampling memory.
 Registration mode builds a static F/B unshard order without lifecycle observations.
 Recording requires the ordinary FSDP hooks; combined 1F1B bypasses them.

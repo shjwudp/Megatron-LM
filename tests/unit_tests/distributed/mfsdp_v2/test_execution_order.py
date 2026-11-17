@@ -29,7 +29,8 @@ def test_shared_source_and_independent_filtered_snapshots():
     independent = order.view(actions=[ExecutionAction.UNSHARD])
     assert view.source is independent.source is order
     assert order.append(ExecutionEvent(module, Phase.BACKWARD)) == 4
-    assert view.event_ids == independent.event_ids == (0, 2, 3)
+    assert [event.event_id for event in view] == [0, 2, 3]
+    assert list(view) == list(independent)
     assert [event.event_id for event in order] == [0, 1, 2, 3, 4]
     assert order.seek(0).buffer_bytes == 0
 
@@ -63,7 +64,6 @@ def test_weak_source_preserves_expired_slots_and_empty_view_errors():
     gc.collect()
     assert middle_ref() is None
     assert len(order) == len(view) == 3
-    assert view.event_ids == (0, 1, 2)
     assert order.seek(1) is None and order.seek(2).module is last
     assert [event.event_id for event in order] == [0, 2]
     assert [event.event_id for event in view] == [0, 2]
