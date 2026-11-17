@@ -31,7 +31,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import ExecutionEvent, ExecutionOrder
+from .execution_order import ExecutionEvent, ExecutionOrderView
 from .module_utils import get_parameter_owner, is_in_backward
 from .parameter_group import (
     FsdpParameter,
@@ -317,19 +317,21 @@ class FsdpModule:
             match phase:
                 case Phase.FORWARD:
                     self._prefetch_parameter_groups(
-                        context.execution_order, self._schedule_policy.forward_prefetch_size
+                        context.prefetch_order_view, self._schedule_policy.forward_prefetch_size
                     )
                 case Phase.BACKWARD:
                     self._prefetch_parameter_groups(
-                        context.execution_order, self._schedule_policy.backward_prefetch_size
+                        context.prefetch_order_view, self._schedule_policy.backward_prefetch_size
                     )
                 case _:
                     raise ValueError(
                         f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
                     )
 
-    def _prefetch_parameter_groups(self, order: ExecutionOrder, prefetch_size: int | None) -> None:
-        """Validate the current event, prefetch successors, and advance once."""
+    def _prefetch_parameter_groups(
+        self, order: ExecutionOrderView, prefetch_size: int | None
+    ) -> None:
+        """Consume one module entry while ignoring other actions in the shared source."""
         event = ExecutionEvent(cast(nn.Module, self), self.phase)
         if order.peek() != event and not order.seek(event):
             raise RuntimeError(

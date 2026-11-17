@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Weak, phase-tagged execution sequences with a sequential cursor."""
+"""One weak lifecycle event source with independent filtered cursors."""
 
+import enum
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
 from typing import NamedTuple
 from weakref import ref
 
@@ -23,74 +25,218 @@ from torch import nn
 from .phase import Phase
 
 
-class ExecutionEvent(NamedTuple):
-    """A module and its compute phase."""
+class ExecutionAction(enum.Enum):
+    """Module entries and weight/gradient lifecycle boundaries.
+
+    These describe the unoptimized schedule. A future plan may omit a boundary,
+    but must keep that decision separate from the recorded event source.
+    """
+
+    MODULE_ENTRY = enum.auto()
+    UNSHARD = enum.auto()
+    RESHARD = enum.auto()
+    GRAD_ALLOC = enum.auto()
+    GRAD_COPY_IN = enum.auto()
+    GRAD_REDUCE = enum.auto()
+    GRAD_RELEASE = enum.auto()
+
+
+@dataclass(frozen=True)
+class ExecutionEvent:
+    """An event with optional byte observations.
+
+    ``group_index`` is relative to this module's parameter groups; ``None`` means
+    a module-level event. ``event_id`` is assigned by the owning ExecutionOrder,
+    not a microbatch or module ID. Byte observations and IDs do not affect event
+    matching. Callers supply the observations. Missing measurements stay None,
+    distinct from a real zero.
+    """
 
     module: nn.Module
-    phase: Phase
+    phase: Phase | None
+    action: ExecutionAction = ExecutionAction.MODULE_ENTRY
+    group_index: int | None = None
+    buffer_bytes: int | None = field(default=None, compare=False)
+    allocated_bytes: int | None = field(default=None, compare=False)
+    event_id: int | None = field(default=None, compare=False)
+
+
+class _StoredEvent(NamedTuple):
+    module: ref[nn.Module]
+    phase: Phase | None
+    action: ExecutionAction
+    group_index: int | None
+    buffer_bytes: int | None
+    allocated_bytes: int | None
 
 
 class ExecutionOrder:
-    """Store an execution trace with one sequential cursor across all phases."""
+    """Own an append-only weak event source, without a consumer cursor.
+
+    IDs are zero-based append indices local to this source. Expired modules do
+    not remove or renumber events. Plans refer to IDs without editing the source.
+    """
 
     def __init__(self, items: Iterable[ExecutionEvent] = ()) -> None:
-        """Create a weak sequence, preserving every repeated occurrence."""
-        self._items: list[tuple[ref[nn.Module], Phase]] = []
-        self._position = 0
+        """Create a source that records repeated events separately."""
+        self._items: list[_StoredEvent] | tuple[_StoredEvent, ...] = []
         for item in items:
             self.append(item)
 
     @property
-    def position(self) -> int:
-        """Index of the next event to consume."""
-        return self._position
+    def is_sealed(self) -> bool:
+        """Whether recording has finished and appending is disabled."""
+        return isinstance(self._items, tuple)
 
-    def append(self, item: ExecutionEvent) -> None:
-        """Append an event without consuming it."""
-        self._items.append((ref(item.module), item.phase))
+    def seal(self) -> None:
+        """Freeze the event source while leaving view cursors independent."""
+        self._items = tuple(self._items)
+
+    def append(self, item: ExecutionEvent) -> int:
+        """Append an event and return its assigned ID without advancing any view."""
+        if not isinstance(self._items, list):
+            raise RuntimeError("Cannot append to a sealed FSDP execution order.")
+        for name in ("group_index", "buffer_bytes", "allocated_bytes"):
+            value = getattr(item, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{name} must be a nonnegative integer or None.")
+        event_id = len(self._items)
+        self._items.append(
+            _StoredEvent(
+                ref(item.module),
+                item.phase,
+                item.action,
+                item.group_index,
+                item.buffer_bytes,
+                item.allocated_bytes,
+            )
+        )
+        return event_id
+
+    def __len__(self) -> int:
+        """Number of events, including those whose modules have expired."""
+        return len(self._items)
 
     def __iter__(self) -> Iterator[ExecutionEvent]:
-        """Iterate over live occurrences without retaining their modules."""
-        for module_ref, phase in self._items:
-            module = module_ref()
-            if module is not None:
-                yield ExecutionEvent(module, phase)
+        """Iterate over live events without changing any view cursor."""
+        for event_id in range(len(self._items)):
+            if (event := self.seek(event_id)) is not None:
+                yield event
+
+    def seek(self, event_id: int) -> ExecutionEvent | None:
+        """Read an event by ID without moving a cursor.
+
+        Return None if the ID is absent or its module has expired. The returned
+        event holds a strong reference to its module.
+        """
+        if not 0 <= event_id < len(self._items):
+            return None
+        item = self._items[event_id]
+        module = item.module()
+        if module is None:
+            return None
+        return ExecutionEvent(
+            module,
+            item.phase,
+            item.action,
+            item.group_index,
+            item.buffer_bytes,
+            item.allocated_bytes,
+            event_id,
+        )
+
+    def view(self, *, actions: Iterable[ExecutionAction]) -> "ExecutionOrderView":
+        """Select actions without copying event records or sharing cursor state."""
+        return ExecutionOrderView(self, actions=actions)
+
+
+class ExecutionOrderView:
+    """An action-filtered index into one source, with its own local cursor.
+
+    Views include matching events appended after their creation. Cursor positions
+    count only selected events; returned events keep their IDs from the source.
+    Only IDs are cached, so neither source nor view keeps modules alive.
+    """
+
+    def __init__(self, source: ExecutionOrder, *, actions: Iterable[ExecutionAction]) -> None:
+        """Create a view of ``source`` with its own cursor."""
+        self._source = source
+        self._actions = frozenset(actions)
+        self._event_ids: list[int] = []
+        self._scanned = 0
+        self._position = 0
+
+    @property
+    def source(self) -> ExecutionOrder:
+        """The sole owner of this view's event records."""
+        return self._source
+
+    @property
+    def event_ids(self) -> tuple[int, ...]:
+        """Selected IDs from the source, including events with expired modules."""
+        self._refresh()
+        return tuple(self._event_ids)
+
+    @property
+    def position(self) -> int:
+        """Local index of the next event to consume, distinct from its event ID."""
+        return self._position
+
+    def _refresh(self) -> None:
+        size = len(self._source)
+        for event_id in range(self._scanned, size):
+            if self._source._items[event_id].action in self._actions:
+                self._event_ids.append(event_id)
+        self._scanned = size
+
+    def __len__(self) -> int:
+        """Number of selected events, including those with expired modules."""
+        self._refresh()
+        return len(self._event_ids)
+
+    def __iter__(self) -> Iterator[ExecutionEvent]:
+        """Iterate over live selected events without advancing this cursor."""
+        for index in range(len(self)):
+            if (event := self._source.seek(self._event_ids[index])) is not None:
+                yield event
 
     def peek(self, offset: int = 0) -> ExecutionEvent | None:
-        """Read an event relative to the cursor without wrapping or advancing."""
+        """Read relative to this cursor without wrapping or advancing."""
         index = self._position + offset
-        if not 0 <= index < len(self._items):
-            return None
-        module_ref, phase = self._items[index]
-        module = module_ref()
-        return None if module is None else ExecutionEvent(module, phase)
+        return self._source.seek(self._event_ids[index]) if 0 <= index < len(self) else None
 
     def successors(self) -> Iterator[ExecutionEvent]:
-        """Look ahead from the current occurrence without wrapping or advancing."""
+        """Look ahead without wrapping, stopping at an expired module reference."""
         offset = 1
         while (event := self.peek(offset)) is not None:
             yield event
             offset += 1
 
     def advance(self) -> None:
-        """Consume one occurrence and automatically wrap at the end of the trace."""
-        if not self._items:
+        """Advance one event, wrapping at the end of this view."""
+        size = len(self)
+        if not size:
             raise RuntimeError("Cannot advance an empty FSDP execution order.")
-        self._position = (self._position + 1) % len(self._items)
+        self._position = (self._position + 1) % size
 
     def seek(self, event: ExecutionEvent) -> bool:
-        """Move the cursor to the next occurrence of ``event`` at or after the cursor.
+        """Move the cursor to the next matching module/phase/action/group.
 
-        Pipeline schedules interleave forward and backward passes of different microbatches,
-        so module calls do not consume a preset forward-then-backward trace in order. Searching
-        forward (wrapping once) restores the previous demand-call behaviour. Returns False when
-        ``event`` is not in the trace.
+        Search from the current position and wrap at most once. Repeated events
+        are kept. IDs and byte observations do not affect matching, so demand
+        calls can recover the cursor position in an interleaved schedule.
         """
-        n = len(self._items)
-        for offset in range(n):
-            index = (self._position + offset) % n
-            module_ref, phase = self._items[index]
-            if phase is event.phase and module_ref() is event.module:
+        size = len(self)
+        for offset in range(size):
+            index = (self._position + offset) % size
+            candidate = self._source.seek(self._event_ids[index])
+            if (
+                candidate is not None
+                and candidate.module is event.module
+                and candidate.phase is event.phase
+                and candidate.action is event.action
+                and candidate.group_index == event.group_index
+            ):
                 self._position = index
                 return True
         return False

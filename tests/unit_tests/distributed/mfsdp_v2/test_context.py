@@ -27,9 +27,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionAction,
     ExecutionEvent,
     ExecutionOrder,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 
@@ -91,6 +93,95 @@ class NestedSiblingModel(nn.Module):
 
 def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+
+
+def test_prefetch_order_view_filters_actions_and_rebuilds():
+    """Prefetch uses module entries and rebuilds its view when the source is replaced."""
+    context = object.__new__(FsdpContext)
+    context.execution_order = ExecutionOrder()
+    context._prefetch_order_view = None
+    current, following = nn.Identity(), nn.Identity()
+    current.phase = Phase.FORWARD
+    following._unshard_parameter_groups = Mock()
+    order = context.execution_order
+    view = context.prefetch_order_view
+    other_view = order.view(actions=ExecutionAction)
+    order.append(ExecutionEvent(current, Phase.FORWARD, ExecutionAction.UNSHARD))
+    current_id = order.append(ExecutionEvent(current, Phase.FORWARD))
+    order.append(ExecutionEvent(current, Phase.FORWARD, ExecutionAction.RESHARD))
+    following_id = order.append(ExecutionEvent(following, Phase.BACKWARD))
+    other_view.advance()
+    other_view.advance()
+
+    assert context.prefetch_order_view is view
+    assert view.event_ids == (current_id, following_id)
+    FsdpModule._prefetch_parameter_groups(current, view, None)
+    following._unshard_parameter_groups.assert_called_once_with(Phase.BACKWARD)
+    assert view.position == 1 and other_view.position == 2
+
+    replacement = ExecutionOrder([ExecutionEvent(following, Phase.FORWARD)])
+    context.execution_order = replacement
+    assert context.prefetch_order_view is not view
+    assert context.prefetch_order_view.source is replacement
+    assert context.prefetch_order_view.position == 0
+    assert view.source is order and view.position == 1
+
+
+@pytest.mark.parametrize("caller_managed", [False, True])
+def test_recorded_execution_order_seals_at_sync_boundary(caller_managed):
+    """Seal only at the chosen complete-step boundary, using module-entry coordinates."""
+    context = object.__new__(FsdpContext)
+    context.execution_order = ExecutionOrder()
+    context._prefetch_order_view = None
+    context.prefetch_order = PrefetchOrder.RECORDED
+    context._recording_execution_order = True
+    context.caller_managed_grad_sync = caller_managed
+    context._delayed_post_backward_callbacks = []
+    context._post_backward_hook_registered = False
+    context.is_last_microbatch = True
+    context.inner_reduction_stream = Mock()
+    context.outer_reduction_stream = Mock()
+    compute_stream = Mock()
+    context.current_stream = Mock(return_value=compute_stream)
+    boundary = context.finish_grad_sync if caller_managed else context.post_backward
+    module = nn.Identity()
+    order = context.execution_order
+
+    boundary()
+    assert context.is_recording_execution_order and not order.is_sealed
+    order.append(ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_ALLOC))
+    boundary()
+    assert context.is_recording_execution_order and not order.is_sealed
+
+    order.append(ExecutionEvent(module, Phase.FORWARD))
+    order.append(ExecutionEvent(module, Phase.BACKWARD))
+    context.post_backward()
+    if caller_managed:
+        assert context.is_recording_execution_order and not order.is_sealed
+        order.append(ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_REDUCE))
+        order.append(ExecutionEvent(module, Phase.FORWARD))
+        order.append(ExecutionEvent(module, Phase.BACKWARD))
+        context.post_backward()
+        assert context.is_recording_execution_order and not order.is_sealed
+        context.finish_grad_sync()
+    assert not context.is_recording_execution_order and order.is_sealed
+    view = context.prefetch_order_view
+    assert view.event_ids == ((1, 2, 4, 5) if caller_managed else (1, 2))
+    compute_stream.wait_stream.assert_any_call(context.inner_reduction_stream)
+    compute_stream.wait_stream.assert_any_call(context.outer_reduction_stream)
+    with pytest.raises(RuntimeError, match="sealed"):
+        order.append(ExecutionEvent(module, Phase.FORWARD))
+
+    other_view = order.view(actions=ExecutionAction)
+    other_view.advance()
+    view.advance()
+    with pytest.raises(RuntimeError, match="recorded order was complete"):
+        boundary()
+    assert other_view.position == 1
+    for _ in range(len(view) - 1):
+        view.advance()
+    boundary()
+    assert view.position == 0 and other_view.position == 1
 
 
 def test_recorded_execution_order(distributed_setup):

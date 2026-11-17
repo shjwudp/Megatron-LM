@@ -21,7 +21,7 @@ from weakref import WeakKeyDictionary
 import torch
 from torch import nn
 
-from .execution_order import ExecutionEvent, ExecutionOrder
+from .execution_order import ExecutionAction, ExecutionEvent, ExecutionOrder, ExecutionOrderView
 from .phase import Phase
 from .runtime_policy import RuntimePolicy
 
@@ -46,7 +46,7 @@ class FsdpContext:
     is_last_microbatch: bool
     use_symmetric_memory: bool
     caller_managed_grad_sync: bool
-    # Prefetch uses construction order unless execution-order recording is enabled.
+    # Prefetch reads only module-entry events from the shared source.
     execution_order: ExecutionOrder
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
@@ -78,8 +78,10 @@ class FsdpContext:
                 ignored. Tensors are packed by owner without changing logical parameter order.
             prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
                 registration order. ``RECORDED`` gathers parameters on demand and records
-                module calls until the first ``post_backward()``. Subsequent passes must
-                repeat the complete sequence consistently across data-parallel ranks.
+                module calls until the first ``post_backward()``. With caller-managed
+                gradient synchronization, recording spans the full schedule until
+                ``finish_grad_sync()`` instead. Subsequent passes must repeat the
+                complete sequence consistently across data-parallel ranks.
                 Recording currently requires the ordinary module hooks; combined 1F1B
                 bypasses them. Discard the context if the recorded pass raises.
         """
@@ -93,7 +95,9 @@ class FsdpContext:
         self.is_last_microbatch = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
+        self.prefetch_order = prefetch_order
         self.execution_order = ExecutionOrder()
+        self._prefetch_order_view: ExecutionOrderView | None = None
         self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
@@ -136,6 +140,19 @@ class FsdpContext:
     def is_recording_execution_order(self) -> bool:
         """Whether module calls are being recorded for subsequent prefetching."""
         return self._recording_execution_order
+
+    @property
+    def prefetch_order_view(self) -> ExecutionOrderView:
+        """Module-entry sequence and cursor used by prefetch.
+
+        Other actions in the shared source do not advance this view's cursor.
+        Replacing ``execution_order`` creates a fresh view and cursor.
+        """
+        view = self._prefetch_order_view
+        if view is None or view.source is not self.execution_order:
+            view = self.execution_order.view(actions=(ExecutionAction.MODULE_ENTRY,))
+            self._prefetch_order_view = view
+        return view
 
     def register_module(self, module: nn.Module) -> None:
         """Register a module after its FSDP initialization completes in this context."""
@@ -216,11 +233,26 @@ class FsdpContext:
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
+        if self.caller_managed_grad_sync:
+            self._finish_execution_order()
+
+    def _finish_execution_order(self) -> None:
+        """Seal the first recording or validate replay at the execution-window boundary."""
+        if self._recording_execution_order:
+            # A synchronization before any module entry must not end recording.
+            if self.prefetch_order_view.peek() is not None:
+                self.execution_order.seal()
+                self._recording_execution_order = False
+        elif (
+            self.prefetch_order is PrefetchOrder.RECORDED and self.prefetch_order_view.position != 0
+        ):
+            raise RuntimeError("FSDP execution ended before the recorded order was complete.")
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""
         self._run_delayed_post_backward_callbacks()
-        self._recording_execution_order = False
+        if not self.caller_managed_grad_sync:
+            self._finish_execution_order()
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself

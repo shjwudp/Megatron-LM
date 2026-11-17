@@ -8,8 +8,8 @@ and different dense/expert optimizer-instance topologies.
 MFSDPv2 owns its gradient reductions. The training loop must not install the legacy
 no-op grad_sync_func, which otherwise prevents non-first pipeline stages from leaving
 no_sync on their last microbatch. Both inner and outer axes then finish reduction.
-ExecutionOrder.seek tolerates interleaved demand calls while rejecting events absent
-from the trace. Multiple changed Partial axes reduce from inner to outer before writing
+ExecutionOrderView.seek supports interleaved demand calls and returns false for
+events absent from the trace. Multiple changed Partial axes reduce from inner to outer before writing
 into the requested output. Per-token loss no longer fails a conservative PP check.
 
 ## Dense and expert topology

@@ -625,3 +625,54 @@ NCCL (`v2.27+`) supports symmetric allocation or registration for communicators 
 - **High-Precision Reduction**: When training large models, high-precision gradient reduction and accumulation is desired for accuracy and convergence, but communicating FP32 gradients is expensive. With symmetric registration, FP32 accumulators enable gradients to be reduced in FP32 but communicated in BF16, which decreases gradient RS communication latency while maintaining high accuracy during training. Megatron-FSDP supports FP32 main gradient accumulation but BF16 gradient communication, customizable through `megatron_fsdp.MixedPrecisionPolicy`.
 
 These optimizations significantly reduce SM resource contention for overlapped compute and communication kernels in FSDP. Symmetric registration, allocation, and pooling is also supported in PyTorch: [`torch.distributed._symmetric_memory`](https://docs.pytorch.org/docs/stable/symmetric_memory.html).
+
+
+### Experimental execution events and views
+
+An `ExecutionOrder` stores the events for one FSDP context. Each event identifies
+a module, its phase and action, and an optional index into that module's parameter
+groups. Appending an event gives it the next ID, starting at zero, so repeated
+module calls have separate IDs. The source holds weak module references. A
+collected module leaves its slot in place, with later IDs unchanged. Returned
+events keep their module alive while the caller holds them.
+
+The source has no cursor. `seek(event_id)` reads an event by ID;
+`ExecutionOrderView.seek(event)` moves a view's cursor to a matching event.
+
+`ExecutionOrder.view(actions=...)` gives a consumer its own cursor over the
+selected events in this source:
+
+```python
+from megatron_fsdp.experimental.execution_order import ExecutionAction
+
+entries = context.prefetch_order_view
+weights = context.execution_order.view(
+    actions=(ExecutionAction.UNSHARD, ExecutionAction.RESHARD)
+)
+gradients = context.execution_order.view(
+    actions=(
+        ExecutionAction.GRAD_ALLOC,
+        ExecutionAction.GRAD_COPY_IN,
+        ExecutionAction.GRAD_REDUCE,
+        ExecutionAction.GRAD_RELEASE,
+    )
+)
+```
+
+A view's `position` counts only its selected events. `peek().event_id` gives the
+ID in the full source. Moving one view leaves other cursors unchanged. Views
+created before recording see later appends without copying event records.
+Prefetch uses the `MODULE_ENTRY` view, so its F/B positions stay unchanged when
+other actions appear in the source.
+
+With `PrefetchOrder.RECORDED`, the first eager execution window records module
+entries and seals the source when it ends. Registration mode builds a static
+module-entry order. The other lifecycle actions define the shared schema.
+Recording those actions and applying retain/window policies need separate
+changes. Future policies should store omit/reuse decisions in plans keyed by
+event ID and leave the recorded sequence unchanged.
+
+Events can include `buffer_bytes` and rank-local `allocated_bytes`. These byte
+counts are optional and must be supplied by the caller; the container does not
+measure memory. Missing values stay `None`. These observations do not affect
+event matching. Host event order does not imply CUDA completion across streams.
