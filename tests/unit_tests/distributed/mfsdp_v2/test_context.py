@@ -133,7 +133,6 @@ def test_recorded_execution_order_stops_at_sync_boundary(caller_managed):
     context = object.__new__(FsdpContext)
     context.execution_order = ExecutionOrder()
     context._prefetch_order_view = None
-    context.prefetch_order = PrefetchOrder.RECORDED
     context._recording_execution_order = True
     context.caller_managed_grad_sync = caller_managed
     context._delayed_post_backward_callbacks = []

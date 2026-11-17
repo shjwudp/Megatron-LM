@@ -219,10 +219,9 @@ class ExecutionOrderView:
         size = len(self)
         for offset in range(size):
             index = (self._position + offset) % size
-            candidate = self._source.seek(self._event_ids[index])
+            candidate = self._source._items[self._event_ids[index]]
             if (
-                candidate is not None
-                and candidate.module is event.module
+                candidate.module() is event.module
                 and candidate.phase is event.phase
                 and candidate.action is event.action
                 and candidate.group_index == event.group_index

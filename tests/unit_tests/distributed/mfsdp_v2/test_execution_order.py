@@ -3,6 +3,7 @@
 """Coverage for the weak event source and independent filtered execution cursors."""
 
 import gc
+from dataclasses import replace
 from weakref import ref
 
 import pytest
@@ -32,6 +33,8 @@ def test_cursor_wraps_across_phases():
     for _ in range(2):
         for index, event in enumerate(events):
             assert view.peek() == event
+            assert view.peek(-1) == (events[index - 1] if index else None)
+            assert view.peek(len(events) - index) is None
             assert list(view.successors()) == events[index + 1 :]
             assert view.peek() == event
             view.advance()
@@ -40,32 +43,55 @@ def test_cursor_wraps_across_phases():
 
 def test_empty_order_can_be_populated():
     """Recording does not move the cursor, so replay starts at the first event."""
+    module = nn.Module()
     order = ExecutionOrder()
     view = order.view(actions=[ExecutionAction.UNSHARD])
-    assert view.peek() is None
+    assert view.event_ids == () and view.peek() is None
     with pytest.raises(RuntimeError, match="empty"):
         view.advance()
-    event = ExecutionEvent(nn.Module(), Phase.FORWARD)
+    order.append(ExecutionEvent(module, None, ExecutionAction.GRAD_ALLOC))
+    assert len(view) == 0
+    event = ExecutionEvent(module, Phase.FORWARD)
     order.append(event)
-    assert view.peek() == event
+    assert view.event_ids == (1,) and view.peek() == event
     for _ in range(2):
         assert list(view.successors()) == []
         view.advance()
         assert view.peek() == event
+    order.append(ExecutionEvent(module, Phase.FORWARD, ExecutionAction.RESHARD))
+    order.append(ExecutionEvent(module, Phase.BACKWARD))
+    assert view.event_ids == (1, 3) and view.position == 0
+    view.advance()
+    assert view.peek().event_id == 3
+    assert order.append(ExecutionEvent(module, Phase.FORWARD)) == 4
+    assert view.event_ids == (1, 3, 4) and view.position == 1
+    view.advance()
+    assert view.peek().event_id == 4
 
 
 def test_order_does_not_keep_modules_alive():
-    """The sequence holds weak references and iteration skips dead modules."""
-    first, second = nn.Module(), nn.Module()
+    """Views retain no modules and cannot prefetch past an expired occurrence."""
+    first, middle, last = nn.Module(), nn.Module(), nn.Module()
     order = ExecutionOrder(
-        [ExecutionEvent(first, Phase.FORWARD), ExecutionEvent(second, Phase.FORWARD)]
+        [ExecutionEvent(module, Phase.FORWARD) for module in (first, middle, last)]
     )
-    second_ref = ref(second)
-    del second
+    view = order.view(actions=[ExecutionAction.UNSHARD])
+    middle_ref = ref(middle)
+    del middle
     gc.collect()
-    assert second_ref() is None
-    assert list(order) == [ExecutionEvent(first, Phase.FORWARD)]
-    assert list(order.view(actions=[ExecutionAction.UNSHARD]).successors()) == []
+    assert middle_ref() is None
+    assert len(order) == len(view) == 3
+    assert view.event_ids == (0, 1, 2)
+    assert order.seek(1) is None and order.seek(2).module is last
+    assert [event.event_id for event in order] == [0, 2]
+    assert [event.event_id for event in view] == [0, 2]
+    assert list(view.successors()) == []
+    view.advance()
+    assert view.peek() is None
+    view.advance()
+    assert view.peek().event_id == 2
+    assert order.append(ExecutionEvent(first, Phase.BACKWARD)) == 3
+    assert view.event_ids == (0, 1, 2, 3)
 
 
 def test_global_ids_are_append_positions_including_repeated_events():
@@ -107,35 +133,12 @@ def test_views_filter_actions_without_sharing_cursors():
     gradients.advance()
     assert order.seek(0).event_id == 0
     assert prefetch.position == 1 and prefetch.peek().event_id == 2
+    assert prefetch.peek(-1).event_id == 0 and prefetch.peek(2) is None
     assert other_prefetch.position == 0 and other_prefetch.peek().event_id == 0
     assert gradients.position == 1 and gradients.peek().event_id == 3
     assert [event.event_id for event in prefetch.successors()] == [4]
     assert [event.event_id for event in prefetch] == [0, 2, 4]
     assert prefetch.position == 1
-
-
-def test_empty_view_tracks_later_appends_without_consuming_them():
-    """A view created before recording sees newly appended matching occurrences."""
-    module = nn.Module()
-    order = ExecutionOrder()
-    view = order.view(actions=[ExecutionAction.UNSHARD])
-    assert view.event_ids == () and view.peek() is None
-    with pytest.raises(RuntimeError, match="empty"):
-        view.advance()
-    order.append(ExecutionEvent(module, None, ExecutionAction.GRAD_ALLOC))
-    assert len(view) == 0
-    order.append(ExecutionEvent(module, Phase.FORWARD))
-    assert view.event_ids == (1,) and view.peek().event_id == 1
-    order.append(ExecutionEvent(module, Phase.FORWARD, ExecutionAction.RESHARD))
-    order.append(ExecutionEvent(module, Phase.BACKWARD))
-    assert view.event_ids == (1, 3)
-    assert view.position == 0
-    view.advance()
-    assert view.peek().event_id == 3
-    assert order.append(ExecutionEvent(module, Phase.FORWARD)) == 4
-    assert view.event_ids == (1, 3, 4) and view.position == 1
-    view.advance()
-    assert view.peek().event_id == 4
 
 
 def test_action_filter_is_snapshotted_and_empty_selection_stays_empty():
@@ -180,75 +183,20 @@ def test_filtered_seek_preserves_occurrences_and_wraps_once():
 def test_seek_distinguishes_action_phase_and_owner_local_group():
     """Seek matches module, phase, action and group, ignoring byte counts and IDs."""
     module = nn.Module()
-    order = ExecutionOrder(
-        [
-            ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_COPY_IN, 0),
-            ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_COPY_IN, 1),
-            ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_REDUCE, 0),
-            ExecutionEvent(module, None, ExecutionAction.GRAD_REDUCE, 0),
-        ]
-    )
+    events = [
+        ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_COPY_IN, 0),
+        ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_COPY_IN, 1),
+        ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_REDUCE, 0),
+        ExecutionEvent(module, None, ExecutionAction.GRAD_REDUCE, 0),
+    ]
+    order = ExecutionOrder(events)
     view = order.view(actions=[ExecutionAction.GRAD_COPY_IN, ExecutionAction.GRAD_REDUCE])
-    for expected_id, (phase, action, group_index) in enumerate(
-        [
-            (Phase.BACKWARD, ExecutionAction.GRAD_COPY_IN, 0),
-            (Phase.BACKWARD, ExecutionAction.GRAD_COPY_IN, 1),
-            (Phase.BACKWARD, ExecutionAction.GRAD_REDUCE, 0),
-            (None, ExecutionAction.GRAD_REDUCE, 0),
-        ]
-    ):
-        query = ExecutionEvent(
-            module, phase, action, group_index, buffer_bytes=999, allocated_bytes=888, event_id=777
-        )
+    for expected_id, event in enumerate(events):
+        query = replace(event, buffer_bytes=999, allocated_bytes=888, event_id=777)
         assert view.seek(query)
         assert view.peek().event_id == expected_id
     assert not view.seek(ExecutionEvent(module, None, ExecutionAction.GRAD_REDUCE, group_index=1))
     assert view.position == 3
-
-
-def test_filtered_peek_and_successors_do_not_wrap():
-    """Only advance wraps; lookahead respects the filtered sequence boundary."""
-    module = nn.Module()
-    order = ExecutionOrder(
-        [
-            ExecutionEvent(module, Phase.FORWARD),
-            ExecutionEvent(module, None, ExecutionAction.GRAD_ALLOC),
-            ExecutionEvent(module, Phase.BACKWARD),
-        ]
-    )
-    view = order.view(actions=[ExecutionAction.UNSHARD])
-    assert view.peek(-1) is None and view.peek(2) is None
-    assert [event.event_id for event in view.successors()] == [2]
-    view.advance()
-    assert view.peek(-1).event_id == 0
-    assert view.peek(1) is None and list(view.successors()) == []
-    view.advance()
-    assert view.position == 0 and view.peek().event_id == 0
-
-
-def test_dead_middle_event_keeps_ids_and_stops_prefetch_lookahead():
-    """Views retain no modules and cannot prefetch past an expired occurrence."""
-    first, middle, last = nn.Module(), nn.Module(), nn.Module()
-    order = ExecutionOrder(
-        [ExecutionEvent(module, Phase.FORWARD) for module in (first, middle, last)]
-    )
-    view = order.view(actions=[ExecutionAction.UNSHARD])
-    middle_ref = ref(middle)
-    del middle
-    gc.collect()
-    assert middle_ref() is None
-    assert len(order) == len(view) == 3
-    assert view.event_ids == (0, 1, 2)
-    assert order.seek(1) is None and order.seek(2).module is last
-    assert [event.event_id for event in order] == [0, 2]
-    assert [event.event_id for event in view] == [0, 2]
-    assert list(view.successors()) == []
-    view.advance()
-    assert view.peek() is None
-    view.advance()
-    assert view.peek().event_id == 2
-    assert order.append(ExecutionEvent(first, Phase.BACKWARD)) == 3
-    assert view.event_ids == (0, 1, 2, 3)
 
 
 @pytest.mark.parametrize("value", [None, 0, 2**60])
