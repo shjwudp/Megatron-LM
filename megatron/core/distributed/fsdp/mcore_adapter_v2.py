@@ -276,7 +276,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         caller_managed_grad_sync=True,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
                     ),
-                    prefetch_process_group=pg_collection.dp_cp,
                 )
             )
         else:
