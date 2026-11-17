@@ -150,7 +150,7 @@ class FsdpContext:
         """
         view = self._prefetch_order_view
         if view is None or view.source is not self.execution_order:
-            view = self.execution_order.view(actions=(ExecutionAction.UNSHARD,))
+            view = self.execution_order.view(action=ExecutionAction.UNSHARD)
             self._prefetch_order_view = view
         return view
 

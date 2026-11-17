@@ -629,17 +629,12 @@ These optimizations significantly reduce SM resource contention for overlapped c
 ### Experimental execution events and views
 
 With `PrefetchOrder.RECORDED`, the first eager training window records each FSDP
-module's weight requests, reshards and gradient lifecycle in
-`context.execution_order`. Gradient allocation, copy-in, inner reduction and
-temporary input-buffer release mark the module's last trainable parameter group.
-Events have stable IDs and rank-local allocated bytes. Gradient buffer bytes
-describe that group's padded input, not the module total. `finish_grad_sync()`
-ends recording. Later passes reuse the trace without adding events or sampling
-memory.
+module's weight requests (`UNSHARD`) and reshards (`RESHARD`) in
+`context.execution_order`, with stable event IDs and rank-local allocated bytes.
+`finish_grad_sync()` ends recording after backward. Later passes reuse the trace
+without adding events or sampling memory.
 
-Create `context.execution_order.view(actions=...)` after recording finishes to get
-a fixed filtered view with its own cursor. Prefetch consumes only weight-request
-(`UNSHARD`) events. Recording requires ordinary FSDP hooks, which combined 1F1B
-bypasses. Release drops the local reference to the inner-reduction input; the
-gradient accumulator remains available for DP-outer reduction. Events mark host
-submissions, not CUDA completion.
+Create `context.execution_order.view(action=ExecutionAction.UNSHARD)` after
+recording finishes to get a fixed filtered view with its own cursor. Prefetch
+consumes `UNSHARD` events. Recording requires ordinary FSDP hooks, which combined
+1F1B bypasses. Events mark host submissions, not CUDA completion.

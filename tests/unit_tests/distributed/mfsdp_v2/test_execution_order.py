@@ -20,21 +20,21 @@ def test_shared_source_and_independent_filtered_snapshots():
     """Repeated events keep source IDs while snapshot consumers move independently."""
     module, following = nn.Module(), nn.Module()
     order = ExecutionOrder()
-    repeated = ExecutionEvent(module, Phase.FORWARD, buffer_bytes=0, event_id=900)
+    repeated = ExecutionEvent(module, Phase.FORWARD, allocated_bytes=0, event_id=900)
     assert order.append(repeated) == 0
-    assert order.append(ExecutionEvent(module, None, ExecutionAction.GRAD_ALLOC)) == 1
+    assert order.append(ExecutionEvent(module, None, ExecutionAction.RESHARD)) == 1
     assert order.append(repeated) == 2
     assert order.append(ExecutionEvent(following, Phase.BACKWARD)) == 3
-    view = order.view(actions=[ExecutionAction.UNSHARD])
-    independent = order.view(actions=[ExecutionAction.UNSHARD])
+    view = order.view(action=ExecutionAction.UNSHARD)
+    independent = order.view(action=ExecutionAction.UNSHARD)
     assert view.source is independent.source is order
     assert order.append(ExecutionEvent(module, Phase.BACKWARD)) == 4
     assert [event.event_id for event in view] == [0, 2, 3]
     assert list(view) == list(independent)
     assert [event.event_id for event in order] == [0, 1, 2, 3, 4]
-    assert order.seek(0).buffer_bytes == 0
+    assert order.seek(0).allocated_bytes == 0
 
-    assert view.seek(ExecutionEvent(module, Phase.FORWARD, buffer_bytes=999))
+    assert view.seek(ExecutionEvent(module, Phase.FORWARD, allocated_bytes=999))
     view.advance()
     assert view.seek(repeated) and view.peek().event_id == 2
     assert independent.position == 0 and independent.peek().event_id == 0
@@ -54,11 +54,11 @@ def test_weak_source_preserves_expired_slots_and_empty_view_errors():
     order = ExecutionOrder(
         [ExecutionEvent(module, Phase.FORWARD) for module in (first, middle, last)]
     )
-    empty = order.view(actions=[])
+    empty = ExecutionOrder().view(action=ExecutionAction.UNSHARD)
     assert empty.peek() is None
     with pytest.raises(RuntimeError, match="empty"):
         empty.advance()
-    view = order.view(actions=[ExecutionAction.UNSHARD])
+    view = order.view(action=ExecutionAction.UNSHARD)
     middle_ref = ref(middle)
     del middle
     gc.collect()

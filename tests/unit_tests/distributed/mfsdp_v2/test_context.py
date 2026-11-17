@@ -171,22 +171,7 @@ def test_recorded_execution_order(distributed_setup, caller_managed):
             ExecutionAction.RESHARD,
             ExecutionAction.UNSHARD,
             ExecutionAction.RESHARD,
-            ExecutionAction.GRAD_ALLOC,
-            ExecutionAction.GRAD_COPY_IN,
-            ExecutionAction.GRAD_REDUCE,
-            ExecutionAction.GRAD_RELEASE,
         ] * 2
-        assert all(
-            event.buffer_bytes > 0
-            for event in layer_events
-            if event.action
-            in (
-                ExecutionAction.GRAD_ALLOC,
-                ExecutionAction.GRAD_COPY_IN,
-                ExecutionAction.GRAD_REDUCE,
-                ExecutionAction.GRAD_RELEASE,
-            )
-        )
     assert all(event.allocated_bytes is not None for event in events)
 
     def check_prefetched(layer, _args):

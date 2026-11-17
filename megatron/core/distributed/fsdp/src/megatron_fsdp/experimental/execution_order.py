@@ -26,20 +26,13 @@ from .phase import Phase
 
 
 class ExecutionAction(enum.Enum):
-    """Weight requests and weight/gradient lifecycle boundaries.
+    """Weight requests and reshards.
 
     UNSHARD records a weight request, including reuse of already gathered weights.
-
-    These describe the unoptimized schedule. A future plan may omit a boundary,
-    but must keep that decision separate from the recorded event source.
     """
 
     UNSHARD = enum.auto()
     RESHARD = enum.auto()
-    GRAD_ALLOC = enum.auto()
-    GRAD_COPY_IN = enum.auto()
-    GRAD_REDUCE = enum.auto()
-    GRAD_RELEASE = enum.auto()
 
 
 @dataclass(frozen=True)
@@ -54,7 +47,6 @@ class ExecutionEvent:
     module: nn.Module
     phase: Phase | None
     action: ExecutionAction = ExecutionAction.UNSHARD
-    buffer_bytes: int | None = field(default=None, compare=False)
     allocated_bytes: int | None = field(default=None, compare=False)
     event_id: int | None = field(default=None, compare=False)
 
@@ -63,7 +55,6 @@ class _StoredEvent(NamedTuple):
     module: ref[nn.Module]
     phase: Phase | None
     action: ExecutionAction
-    buffer_bytes: int | None
     allocated_bytes: int | None
 
 
@@ -82,15 +73,12 @@ class ExecutionOrder:
 
     def append(self, item: ExecutionEvent) -> int:
         """Append an event and return its assigned ID without advancing any view."""
-        for name in ("buffer_bytes", "allocated_bytes"):
-            value = getattr(item, name)
-            if value is not None and (type(value) is not int or value < 0):
-                raise ValueError(f"{name} must be a nonnegative integer or None.")
+        value = item.allocated_bytes
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError("allocated_bytes must be a nonnegative integer or None.")
         event_id = len(self._items)
         self._items.append(
-            _StoredEvent(
-                ref(item.module), item.phase, item.action, item.buffer_bytes, item.allocated_bytes
-            )
+            _StoredEvent(ref(item.module), item.phase, item.action, item.allocated_bytes)
         )
         return event_id
 
@@ -116,13 +104,11 @@ class ExecutionOrder:
         module = item.module()
         if module is None:
             return None
-        return ExecutionEvent(
-            module, item.phase, item.action, item.buffer_bytes, item.allocated_bytes, event_id
-        )
+        return ExecutionEvent(module, item.phase, item.action, item.allocated_bytes, event_id)
 
-    def view(self, *, actions: Iterable[ExecutionAction]) -> "ExecutionOrderView":
-        """Select actions without copying event records or sharing cursor state."""
-        return ExecutionOrderView(self, actions=actions)
+    def view(self, *, action: ExecutionAction) -> "ExecutionOrderView":
+        """Select an action without copying event records or sharing cursor state."""
+        return ExecutionOrderView(self, action=action)
 
 
 class ExecutionOrderView:
@@ -133,12 +119,11 @@ class ExecutionOrderView:
     so neither source nor view keeps modules alive.
     """
 
-    def __init__(self, source: ExecutionOrder, *, actions: Iterable[ExecutionAction]) -> None:
+    def __init__(self, source: ExecutionOrder, *, action: ExecutionAction) -> None:
         """Create a view of ``source`` with its own cursor."""
         self._source = source
-        actions = frozenset(actions)
         self._event_ids = tuple(
-            event_id for event_id, item in enumerate(source._items) if item.action in actions
+            event_id for event_id, item in enumerate(source._items) if item.action is action
         )
         self._position = 0
 
