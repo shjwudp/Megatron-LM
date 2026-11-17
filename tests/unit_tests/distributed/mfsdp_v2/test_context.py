@@ -138,7 +138,7 @@ def test_recorded_execution_order_seals_at_sync_boundary(caller_managed):
     context.caller_managed_grad_sync = caller_managed
     context._delayed_post_backward_callbacks = []
     context._post_backward_hook_registered = False
-    context.is_last_microbatch = True
+    context.is_last_microbatch = False
     context.inner_reduction_stream = Mock()
     context.outer_reduction_stream = Mock()
     compute_stream = Mock()
@@ -147,26 +147,27 @@ def test_recorded_execution_order_seals_at_sync_boundary(caller_managed):
     module = nn.Identity()
     order = context.execution_order
 
-    boundary()
+    context.finish_grad_sync()
     assert context.is_recording_execution_order and not order.is_sealed
     order.append(ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_ALLOC))
-    boundary()
+    context.finish_grad_sync()
     assert context.is_recording_execution_order and not order.is_sealed
 
     order.append(ExecutionEvent(module, Phase.FORWARD))
     order.append(ExecutionEvent(module, Phase.BACKWARD))
     context.post_backward()
+    assert context.is_recording_execution_order and not order.is_sealed
+    order.append(ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_REDUCE))
+    order.append(ExecutionEvent(module, Phase.FORWARD))
+    order.append(ExecutionEvent(module, Phase.BACKWARD))
+    context.is_last_microbatch = True
+    context.post_backward()
     if caller_managed:
-        assert context.is_recording_execution_order and not order.is_sealed
-        order.append(ExecutionEvent(module, Phase.BACKWARD, ExecutionAction.GRAD_REDUCE))
-        order.append(ExecutionEvent(module, Phase.FORWARD))
-        order.append(ExecutionEvent(module, Phase.BACKWARD))
-        context.post_backward()
         assert context.is_recording_execution_order and not order.is_sealed
         context.finish_grad_sync()
     assert not context.is_recording_execution_order and order.is_sealed
     view = context.prefetch_order_view
-    assert view.event_ids == ((1, 2, 4, 5) if caller_managed else (1, 2))
+    assert view.event_ids == (1, 2, 4, 5)
     compute_stream.wait_stream.assert_any_call(context.inner_reduction_stream)
     compute_stream.wait_stream.assert_any_call(context.outer_reduction_stream)
     with pytest.raises(RuntimeError, match="sealed"):

@@ -78,10 +78,10 @@ class FsdpContext:
                 ignored. Tensors are packed by owner without changing logical parameter order.
             prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
                 registration order. ``RECORDED`` gathers parameters on demand and records
-                module calls until the first ``post_backward()``. With caller-managed
-                gradient synchronization, recording spans the full schedule until
-                ``finish_grad_sync()`` instead. Subsequent passes must repeat the
-                complete sequence consistently across data-parallel ranks.
+                module calls until ``finish_grad_sync()``. This runs automatically after
+                the last microbatch unless gradient synchronization is caller-managed.
+                Subsequent passes must repeat the complete sequence consistently across
+                data-parallel ranks.
                 Recording currently requires the ordinary module hooks; combined 1F1B
                 bypasses them. Discard the context if the recorded pass raises.
         """
@@ -233,8 +233,7 @@ class FsdpContext:
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
-        if self.caller_managed_grad_sync:
-            self._finish_execution_order()
+        self._finish_execution_order()
 
     def _finish_execution_order(self) -> None:
         """Seal the first recording or validate replay at the execution-window boundary."""
@@ -251,8 +250,6 @@ class FsdpContext:
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""
         self._run_delayed_post_backward_callbacks()
-        if not self.caller_managed_grad_sync:
-            self._finish_execution_order()
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
