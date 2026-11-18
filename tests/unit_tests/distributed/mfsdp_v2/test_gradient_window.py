@@ -48,6 +48,7 @@ class _Buffer:
 
 class _Group:
     requires_grad = True
+    fsdp_parameters = ()
 
     def __init__(self, context, charge=10, communication_dtype=torch.float32, network=True):
         self.context, self.gradient_window_storage_bytes = context, charge

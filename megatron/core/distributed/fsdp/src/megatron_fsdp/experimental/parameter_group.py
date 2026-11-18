@@ -658,16 +658,28 @@ class FsdpParameterGroup:
             )
 
     def copy_gradients_to_partial_buffer(
-        self, partial_grad: DBuffer, *, accumulate: bool = False
+        self,
+        partial_grad: DBuffer,
+        *,
+        accumulate: bool = False,
+        bound_grad_dtypes: dict[int, torch.dtype | None] | None = None,
     ) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
-        # A future fused-wgrad path can write directly into these buffer views.
         for fsdp_parameter in self.fsdp_parameters:
             if fsdp_parameter.unsharded.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            grad = fsdp_parameter.unsharded.grad
+            parameter = fsdp_parameter.unsharded
+            grad = parameter.grad
             destination = partial_grad.get_tensor_view(index)
+            if bound_grad_dtypes is not None and index in bound_grad_dtypes:
+                if not grad.is_set_to(destination):
+                    raise RuntimeError("Autograd replaced a bound FSDP gradient view.")
+                parameter.grad = None
+                dtype = bound_grad_dtypes[index]
+                if getattr(parameter, "grad_dtype", parameter.dtype) != dtype:
+                    parameter.grad_dtype = dtype
+                continue
             if accumulate:
                 destination.add_(grad)
             else:
@@ -676,7 +688,7 @@ class FsdpParameterGroup:
             # from the one that allocated a gradient. Keep its storage alive
             # until this copy completes, even after clearing the owning .grad.
             grad.record_stream(torch.cuda.current_stream())
-            fsdp_parameter.unsharded.grad = None
+            parameter.grad = None
 
     def _has_sharded_grads(self) -> bool:
         has_any_grad = False

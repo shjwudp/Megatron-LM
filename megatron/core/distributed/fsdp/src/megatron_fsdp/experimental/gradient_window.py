@@ -16,7 +16,7 @@
 
 import hashlib
 from collections import Counter, OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import NamedTuple
 from weakref import WeakKeyDictionary, ref
@@ -51,6 +51,7 @@ class _Lease:
     ready: object = None
     communication_buffer: object = None
     done: object = None
+    bound_grad_dtypes: dict[int, torch.dtype | None] = field(default_factory=dict)
 
 
 class GradientWindow:
@@ -111,6 +112,60 @@ class GradientWindow:
         self.last_step_statistics = {}
         self.signature, self.frozen, self._frozen_state = None, False, None
         self._compiled_state = None
+        if window_size > 1:
+            self._register_grad_view_hooks()
+
+    def _register_grad_view_hooks(self):
+        window_ref = ref(self)
+        for group in self.capacities:
+            group_ref = ref(group)
+            for index, fsdp_parameter in enumerate(group.fsdp_parameters):
+                parameter = fsdp_parameter.unsharded
+                if type(parameter) is not torch.nn.Parameter or getattr(
+                    parameter, "skip_backward_post_hook", False
+                ):
+                    continue
+
+                def bind(grad, group_ref=group_ref, index=index):
+                    window, group = window_ref(), group_ref()
+                    if window is not None and group is not None:
+                        window._bind_grad_view(group, index, grad)
+
+                parameter.register_hook(bind)
+
+    def _bind_grad_view(self, group, index, grad):
+        """Give AccumulateGrad a view only while this lease is safe to write."""
+        lease = self.pending.get(group)
+        if lease is None or lease.ready is None or torch.is_grad_enabled():
+            return
+        if type(grad) is not torch.Tensor or grad.layout != torch.strided:
+            return
+        # Another contribution could evict this lease, so only the next group can borrow it.
+        if self.position == len(self.events) or self.events[self.position].group() is not group:
+            return
+        stream = self.context().current_stream()
+        if stream != lease.allocation_stream:
+            return
+        parameter = group.fsdp_parameters[index].unsharded
+        if parameter.grad is not None:
+            return
+        view = lease.buffer.get_tensor_view(index)
+        if (
+            view.shape != parameter.shape
+            or view.device != parameter.device
+            or view.stride() != parameter.stride()
+        ):
+            return
+        dtype = getattr(parameter, "grad_dtype", parameter.dtype)
+        if dtype is not None and dtype != view.dtype:
+            if not hasattr(torch.Tensor, "grad_dtype"):
+                return
+            # Keep the incoming gradient dtype and let AccumulateGrad promote the add.
+            parameter.grad_dtype = None
+        if not lease.bound_grad_dtypes:
+            stream.wait_event(lease.ready)
+        parameter.grad = view
+        lease.bound_grad_dtypes[index] = dtype
 
     def reason(self, group):
         if self.recording:
@@ -163,9 +218,17 @@ class GradientWindow:
                 stream,
             )
         lease = self.pending[group]
-        if lease.ready is not None:
-            stream.wait_event(lease.ready)
-        group.copy_gradients_to_partial_buffer(lease.buffer, accumulate=bool(lease.count))
+        if lease.bound_grad_dtypes:
+            if stream != lease.allocation_stream:
+                stream.wait_stream(lease.allocation_stream)
+            group.copy_gradients_to_partial_buffer(
+                lease.buffer, accumulate=True, bound_grad_dtypes=lease.bound_grad_dtypes
+            )
+            lease.bound_grad_dtypes.clear()
+        else:
+            if lease.ready is not None:
+                stream.wait_event(lease.ready)
+            group.copy_gradients_to_partial_buffer(lease.buffer, accumulate=bool(lease.count))
         lease.count += 1
         lease.ready = stream.record_event()
         if event.is_last or lease.count == self.window_size:
@@ -192,7 +255,10 @@ class GradientWindow:
 
     def flush(self, group, *, reason):
         """Submit one actual inner reduction for the sum of this lease's contributions."""
-        lease = self.pending.pop(group)
+        lease = self.pending[group]
+        if lease.bound_grad_dtypes:
+            raise RuntimeError("Cannot reduce a gradient window with active autograd views.")
+        del self.pending[group]
         if not lease.count or lease.ready is None:
             raise RuntimeError("Cannot flush an empty gradient accumulation lease.")
         context = self.context()
